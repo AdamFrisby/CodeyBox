@@ -24,24 +24,20 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 {
     private readonly IClaudeTokenRotationPusher? _rotationPusher;
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
 
-    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null) { }
+    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null) { }
 
-    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null) { }
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null) { }
 
-    /// <summary>
-    /// Optional <paramref name="rotationPusher"/> hooks the runner into the
-    /// host-side credential watcher: while a Claude invocation is running in a
-    /// sandbox, host-side rotations of <c>~/.claude/.credentials.json</c> are
-    /// pushed into the VM's <c>~/.claude/.credentials.json</c> so the in-VM
-    /// CLI does not 401 on its next Anthropic call. Disposing the registration
-    /// (handled automatically by the <c>using</c> wrapper) removes the sandbox
-    /// from the active set on completion of the run.
-    /// </summary>
-    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults, IClaudeTokenRotationPusher? rotationPusher)
+    public ClaudeAgentRunner(
+        AgentDefaultsSnapshot? defaults,
+        IClaudeTokenRotationPusher? rotationPusher,
+        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null)
     {
         _defaults = defaults;
         _rotationPusher = rotationPusher;
+        _sanitizerConfig = sanitizerConfig;
     }
 
     public override AgentKind Kind => AgentKind.Claude;
@@ -79,6 +75,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// the host's currently-fresh token. The legacy
     /// <c>CLAUDE_CODE_OAUTH_TOKEN</c> env var remains the primary auth path;
     /// this hook is purely additive.
+    ///
+    /// <para>
+    /// When a <paramref name="resume"/> context is supplied (preempt-recovery
+    /// path), this method also sanitises the restored session JSONL transcripts
+    /// under <c>~/.claude/projects/**/*.jsonl</c> so a replayed conversation
+    /// cannot 400 with "thinking blocks cannot be modified"
+    /// (anthropics/claude-code #63335). Gated by
+    /// <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
+    /// </para>
     /// </summary>
     protected override async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
@@ -87,6 +92,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentResumeContext? resume,
         CancellationToken ct = default)
     {
+        // Preventive transcript sanitisation — runs before the CLI sees the
+        // restored session files. A failed sanitisation short-circuits the
+        // run; the orchestrator treats this as a normal agent failure and
+        // may retry with a fresh sandbox.
+        if (resume is not null && (_sanitizerConfig is null || _sanitizerConfig.Enabled))
+        {
+            var sanitized = await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(sandbox, ct)
+                .ConfigureAwait(false);
+            if (sanitized is not null)
+                return sanitized;
+        }
+
         // Skip the bash hook entirely when no OAuth bundle is present (e.g.
         // ANTHROPIC_API_KEY flows); the CLI uses whichever env-var auth path
         // the credential pipeline plugged in.
@@ -168,6 +185,28 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             stdoutChunkCallback,
             effectiveCaptureStructuredStream).ConfigureAwait(false);
 
+        // Reactive thinking-block 400 retry: sanitise transcripts and retry
+        // once before surfacing failure.
+        if (!result.Success
+            && (_sanitizerConfig is null || _sanitizerConfig.Enabled)
+            && ClaudeSessionSanitizer.IsThinkingBlockFailure(result))
+        {
+            if (await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(sandbox, ct)
+                    .ConfigureAwait(false) is null)
+            {
+                result = await base.RunAsync(
+                    sandbox,
+                    workingDirectory,
+                    prompt,
+                    credential,
+                    modelId,
+                    reasoningMode,
+                    ct,
+                    stdoutChunkCallback,
+                    effectiveCaptureStructuredStream).ConfigureAwait(false);
+            }
+        }
+
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
@@ -191,7 +230,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // the same sandbox and is equally vulnerable to a mid-run host
         // rotation invalidating its access_token.
         using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
-        return await base.RunResumedAsync(
+        var result = await base.RunResumedAsync(
             sandbox,
             workingDirectory,
             prompt,
@@ -201,6 +240,30 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             reasoningMode,
             ct,
             stdoutChunkCallback).ConfigureAwait(false);
+
+        // Reactive thinking-block 400 retry: sanitise transcripts and retry
+        // once before surfacing failure.
+        if (!result.Success
+            && (_sanitizerConfig is null || _sanitizerConfig.Enabled)
+            && ClaudeSessionSanitizer.IsThinkingBlockFailure(result))
+        {
+            if (await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(sandbox, ct)
+                    .ConfigureAwait(false) is null)
+            {
+                result = await base.RunResumedAsync(
+                    sandbox,
+                    workingDirectory,
+                    prompt,
+                    credential,
+                    resume,
+                    modelId,
+                    reasoningMode,
+                    ct,
+                    stdoutChunkCallback).ConfigureAwait(false);
+            }
+        }
+
+        return result;
     }
 
     protected override AgentInvocation BuildInvocation(

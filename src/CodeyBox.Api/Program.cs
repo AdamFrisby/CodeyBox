@@ -905,6 +905,17 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
     return new CodeyBox.Core.AgentDefaultsSnapshot(dict);
 });
 
+// ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
+// thinking-block transcript sanitiser + reactive retry path.
+builder.Services.AddSingleton<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig
+    {
+        Enabled = opts.ClaudeThinkingBlockSanitizer.Enabled,
+    };
+});
+
 builder.Services.AddSingleton<AgentBurnEstimatorOptions>(sp =>
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentBurnEstimator);
 builder.Services.AddSingleton<AgentBurnEstimator>(sp => new AgentBurnEstimator(
@@ -1684,6 +1695,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<AgentBurnEstimator>(),
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
         defaults: sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
+        sanitizerConfig: sp.GetRequiredService<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(),
         costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
@@ -2487,6 +2499,15 @@ namespace CodeyBox.Api
         /// and rarer merge-time conflicts). Off by default. Hot-reloadable.
         /// </summary>
         public IncrementalRebaseOptions IncrementalRebase { get; set; } = new();
+
+        /// <summary>
+        /// Claude thinking-block transcript sanitizer configuration.
+        /// Bound from <c>CodeyBox:ClaudeThinkingBlockSanitizer</c>.
+        /// Gate behind this flag (default <c>true</c>) while the upstream
+        /// thinking-block immutability bug is open; disable once Anthropic
+        /// ships a fix.
+        /// </summary>
+        public ClaudeThinkingBlockSanitizerOptions ClaudeThinkingBlockSanitizer { get; set; } = new();
     }
 
     /// <summary>
@@ -2501,6 +2522,20 @@ namespace CodeyBox.Api
         /// dev/UAT hosts still come up.
         /// </summary>
         public bool FailOnUnknownModel { get; set; } = false;
+    }
+
+    /// <summary>
+    /// Claude thinking-block transcript sanitizer configuration.
+    /// Bound from <c>CodeyBox:ClaudeThinkingBlockSanitizer</c>.
+    /// </summary>
+    public sealed class ClaudeThinkingBlockSanitizerOptions
+    {
+        /// <summary>
+        /// Master switch. Default <c>true</c> while the upstream
+        /// thinking-block immutability bug is open. Disable once
+        /// Anthropic ships a fix.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig
