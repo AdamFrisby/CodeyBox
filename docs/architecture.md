@@ -109,6 +109,26 @@ deletes, renames, edits to non-conflicted files, missing conflicted-file edits,
 and whitespace-only edits outside the allowed ranges are rejected and the work
 item enters `MergeConflictResolutionFailed`.
 
+The resolver has two payload modes, switched per iteration on file size:
+
+* **Whole-file** (default for files under `Audit.MergeScopeResolverMaxBytes`,
+  128 KiB by default): each conflicted file is sent in full; the resolver
+  returns full resolved contents.
+* **Hunk-scoped** (used when any file exceeds the cap): each conflict region
+  is sent as its own payload — the marker span plus
+  `Audit.MergeScopeResolverContextLines` lines of orientation context on each
+  side (default 50). The resolver returns only the replacement for the
+  conflict region; the host splices it back at the conflict coordinates. This
+  keeps a small conflict inside a large file (e.g. a 30-line hunk inside a
+  5600-line file) well under the payload cap.
+
+When a single hunk's marker span alone still exceeds the cap with zero
+context, the work item enters `MergeConflictResolutionFailed` with an error
+naming the exact `path:start-end` range — the documented fallback for
+genuinely oversized hunks. Operators can either raise
+`Audit.MergeScopeResolverMaxBytes` for that project or split the change into
+a smaller conflict before retrying.
+
 This deterministic scope fence is the security boundary. The optional merge
 security review is an LLM text review over the resolved conflict diff in a
 pure text-in/text-out call with no repository checkout, shell, filesystem, agent

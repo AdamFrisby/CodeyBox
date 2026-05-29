@@ -282,8 +282,62 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task OversizedRebaseConflictFileFailsBeforeResolver()
+    public async Task LargeFileWithSmallConflictResolvesViaHunkScopedMode()
     {
+        // ~200 KB file with a small conflict region in the middle. Previously
+        // this hard-failed at safe-read because the whole-file payload exceeded
+        // the 128 KiB resolver cap; the resolver now slices per-hunk so the
+        // tiny conflict fits well under the cap.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem() with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+
+        // ~144 KB per side ⇒ ~288 KB conflicted file, well above the 128 KiB cap.
+        var prefix = string.Concat(Enumerable.Repeat("prefix line\n", 12_000));
+        var suffix = string.Concat(Enumerable.Repeat("suffix line\n", 12_000));
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "big.txt",
+            prefix + "work side\n" + suffix,
+            "work changes big");
+        await CommitToSeedAsync(seed, "big.txt", prefix + "main side\n" + suffix, "main changes big");
+
+        tp.Agent.ConflictResolutionHunkPlan.Enqueue(hunks =>
+        {
+            var hunk = Assert.Single(hunks);
+            Assert.Equal("big.txt", hunk.Path);
+            Assert.Contains("<<<<<<<", hunk.Content);
+            Assert.Contains("main side", hunk.Content);
+            Assert.Contains("work side", hunk.Content);
+            // Slice is small even though the surrounding file is ~200 KB.
+            Assert.True(hunk.Content.Length < 10_000,
+                $"per-hunk slice should be small but was {hunk.Content.Length} bytes");
+            return new Dictionary<int, string>
+            {
+                [hunk.Index] = "main side\nwork side",
+            };
+        });
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(tp.Agent.ConflictResolutionHunkPlan);
+        var resolved = await ShowAsync(barePath, $"{item.WorkBranch}:big.txt");
+        Assert.Equal(prefix + "main side\nwork side\n" + suffix, resolved);
+    }
+
+    [Fact]
+    public async Task GenuinelyOversizedHunkFailsWithPreciseHunkLocation()
+    {
+        // The conflict region itself (markers + both sides) is ~180 KB —
+        // larger than the 128 KiB resolver payload cap even with zero
+        // context. The documented fallback names the exact file:line range
+        // so an operator can intervene; the work branch stays at original tip.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
         var item = NewItem() with { State = WorkItemState.WorkComplete };
@@ -297,15 +351,17 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
             "work changes readme");
 
         await CommitToSeedAsync(seed, "README.md", new string('m', 90_000) + "\n", "main changes readme");
-        tp.Agent.ConflictResolutionPlan.Enqueue(_ => throw new InvalidOperationException("resolver should not receive oversized content"));
+        tp.Agent.ConflictResolutionHunkPlan.Enqueue(_ => throw new InvalidOperationException("resolver should not receive oversized hunk"));
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
-        Assert.Contains("exceeds the 131072 byte resolver input limit", final.LastError);
-        Assert.Single(tp.Agent.ConflictResolutionPlan);
+        Assert.Contains("README.md", final.LastError);
+        Assert.Contains("conflict hunk at", final.LastError);
+        Assert.Contains("exceeds the", final.LastError);
+        Assert.Single(tp.Agent.ConflictResolutionHunkPlan);
         Assert.Equal(originalTip, await RevParseAsync(barePath, item.WorkBranch!));
     }
 
