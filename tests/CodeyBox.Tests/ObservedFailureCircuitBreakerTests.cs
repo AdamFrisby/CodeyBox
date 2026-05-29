@@ -128,15 +128,21 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     [Fact]
     public void PipelineRunner_UsesConcreteRunnerDefaultForObservedFailureKey()
     {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-7",
+                ["codex"] = "gpt-5.5",
+            });
         Assert.Equal(
             "claude-opus-4-7",
-            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(), modelId: null));
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(defaults), modelId: null));
         Assert.Equal(
             "gpt-5.5",
-            PipelineRunner.ResolveObservedModelId(new CodexAgentRunner(), modelId: null));
+            PipelineRunner.ResolveObservedModelId(new CodexAgentRunner(defaults), modelId: null));
         Assert.Equal(
             "claude-sonnet-4-6",
-            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(), "claude-sonnet-4-6"));
+            PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(defaults), "claude-sonnet-4-6"));
     }
 
     [Fact]

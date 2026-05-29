@@ -10,8 +10,8 @@ namespace CodeyBox.Api;
 /// <summary>
 /// Hosted service that subscribes to <see cref="IOptionsMonitor{TOptions}"/>
 /// for <see cref="CodeyBoxOptions"/> and pushes per-block reloads into the
-/// router, orchestrator, burn estimator, and cost calculator without a process
-/// restart.
+/// router, orchestrator, burn estimator, cost calculator, and agent default
+/// model IDs without a process restart.
 ///
 /// <para>
 /// Five blocks are hot-reloadable here:
@@ -28,6 +28,7 @@ namespace CodeyBox.Api;
 ///   (atomically swaps the budget windows/limits; the calculator holds no
 ///   snapshot cache — it recomputes from the live usage store on every call —
 ///   so the new windows take effect on the next gate/visibility read).</item>
+/// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
 /// </list>
 /// </para>
 ///
@@ -53,6 +54,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentClassRouter _router;
     private readonly AgentBurnEstimator _burnEstimator;
     private readonly IAgentBudgetConfigReloadable? _budgetReloader;
+    private readonly AgentDefaultsSnapshot? _defaults;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly ILogger<AgentConfigHotReload> _log;
@@ -66,6 +68,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastRouter = "";
     private string _lastPricing = "";
     private string _lastBudgets = "";
+    private string _lastDefaults = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -75,6 +78,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentClassRouter router,
         AgentBurnEstimator burnEstimator,
         ILogger<AgentConfigHotReload> log,
+        AgentDefaultsSnapshot? defaults = null,
         AgentCostCalculator? costCalculator = null,
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null)
@@ -91,6 +95,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _router = router;
         _burnEstimator = burnEstimator;
         _budgetReloader = budgetReloader;
+        _defaults = defaults;
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _log = log;
@@ -107,11 +112,12 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentScoreModifiers);
         _lastPricing = SerializePricing(initial.AgentPricing);
         _lastBudgets = SerializeBudgets(initial.AgentBudgets);
+        _lastDefaults = SerializeDefaults(initial.AgentDefaults);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
-            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen}",
-            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length);
+            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen}",
+            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length);
         return Task.CompletedTask;
     }
 
@@ -136,6 +142,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyBurnIfChanged(opts);
             ApplyPricingIfChanged(opts);
             ApplyBudgetsIfChanged(opts);
+            ApplyDefaultsIfChanged(opts);
         }
     }
 
@@ -265,6 +272,32 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    private void ApplyDefaultsIfChanged(CodeyBoxOptions opts)
+    {
+        if (_defaults is null) return;
+
+        var next = SerializeDefaults(opts.AgentDefaults);
+        if (string.Equals(_lastDefaults, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastDefaults;
+        try
+        {
+            var dict = new Dictionary<string, string?>(opts.AgentDefaults, opts.AgentDefaults.Comparer);
+            _defaults.Replace(dict);
+            _lastDefaults = next;
+            AuditLog.ConfigReloaded("AgentDefaults", prev, next);
+            _log.LogInformation("Hot-reloaded AgentDefaults: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of AgentDefaults rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private static string SerializeConcurrency(AgentConcurrencyOptions opts) =>
         JsonSerializer.Serialize(
             new
@@ -360,5 +393,11 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     })
                     .ToArray(),
             },
+            JsonOpts);
+
+    private static string SerializeDefaults(Dictionary<string, string?> defaults) =>
+        JsonSerializer.Serialize(
+            defaults.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
             JsonOpts);
 }

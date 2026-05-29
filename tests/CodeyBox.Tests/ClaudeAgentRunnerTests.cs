@@ -18,7 +18,12 @@ public sealed class ClaudeAgentRunnerTests
     public async Task RunAsync_NoModelIdOverride_PassesDefaultModelFlag()
     {
         var sandbox = new CapturingSandbox();
-        var runner = new ClaudeAgentRunner(); // DefaultModelId = "claude-opus-4-7"
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-7",
+            });
+        var runner = new ClaudeAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: null);
 
@@ -32,7 +37,12 @@ public sealed class ClaudeAgentRunnerTests
     public async Task RunAsync_WithExplicitModelId_UsesOverrideNotDefault()
     {
         var sandbox = new CapturingSandbox();
-        var runner = new ClaudeAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-7",
+            });
+        var runner = new ClaudeAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: "claude-sonnet-4-6");
 
@@ -46,7 +56,9 @@ public sealed class ClaudeAgentRunnerTests
     public async Task RunAsync_DefaultModelId_OverriddenToNull_NoModelFlag()
     {
         var sandbox = new CapturingSandbox();
-        var runner = new ClaudeAgentRunner { DefaultModelId = null };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: null);
 
@@ -56,7 +68,12 @@ public sealed class ClaudeAgentRunnerTests
     [Fact]
     public void DefaultModelId_IsOpus47()
     {
-        var runner = new ClaudeAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-7",
+            });
+        var runner = new ClaudeAgentRunner(defaults);
         Assert.Equal("claude-opus-4-7", runner.DefaultModelId);
     }
 
@@ -249,7 +266,9 @@ public sealed class ClaudeAgentRunnerTests
         // rotation that lands later does not).
         var sandbox = new CapturingSandbox();
         var pusher = new RecordingRotationPusher();
-        var runner = new ClaudeAgentRunner(pusher);
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, pusher);
 
         Assert.Empty(pusher.ActiveDuringRun);
 
@@ -282,7 +301,9 @@ public sealed class ClaudeAgentRunnerTests
         // register too.
         var sandbox = new CapturingSandbox();
         var pusher = new RecordingRotationPusher();
-        var runner = new ClaudeAgentRunner(pusher);
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, pusher);
 
         await runner.RunResumedAsync(sandbox, "/work", "prompt", credential: null,
             resume: new AgentResumeContext(""));
@@ -396,6 +417,49 @@ public sealed class ClaudeAgentRunnerTests
         var result = await runner.RunTextOnlyAsync("hello", cred);
         Assert.False(result.Success);
         Assert.Contains("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY", result.Error);
+    }
+
+    // ── Text-only model plumbing ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunTextOnlyAsync_ConfiguredDefault_SetsModelInRequestBody()
+    {
+        // When a default is configured, the text-only call proceeds past the
+        // model-resolve guard (though the sandbox-less HTTP call will fail
+        // against a bogus endpoint — we pin that the failure is NOT the new
+        // "no default configured" guard).
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-haiku-4-5",
+            });
+        var runner = new ClaudeAgentRunner(defaults);
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        Assert.DoesNotContain("no default configured", result.Summary);
+        Assert.DoesNotContain("no default configured", result.Error);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_MissingDefault_ReturnsError()
+    {
+        // When no default is configured and no modelId is passed, the new
+        // guard must return a meaningful error instead of sending model=null
+        // to the Anthropic API.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("no default configured", result.Error);
     }
 }
 

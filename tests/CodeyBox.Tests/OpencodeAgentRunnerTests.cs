@@ -43,7 +43,12 @@ public sealed class OpencodeAgentRunnerTests
         // the other registered agents. Operators retune the exact id via
         // `opencode models`; this test pins the prefix only.
         var sandbox = new CapturingSandbox();
-        var runner = new OpencodeAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["opencode"] = "deepseek/deepseek-coder",
+            });
+        var runner = new OpencodeAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "x", credential: null);
 
@@ -74,7 +79,9 @@ public sealed class OpencodeAgentRunnerTests
     public async Task RunAsync_OmitsModelFlag_WhenDefaultModelClearedAndNoOverride()
     {
         var sandbox = new CapturingSandbox();
-        var runner = new OpencodeAgentRunner { DefaultModelId = null };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new OpencodeAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "x", credential: null);
 
@@ -374,7 +381,12 @@ public sealed class OpencodeAgentRunnerTests
     {
         const string prompt = "resolve this conflict";
         var sandbox = new TextOnlyRecordingSandbox("resolved json");
-        var runner = new OpencodeAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["opencode"] = "deepseek/deepseek-coder",
+            });
+        var runner = new OpencodeAgentRunner(defaults);
         var cred = OpencodeCred("""{"token":"x"}""");
 
         var result = await runner.RunTextOnlyAsync(prompt, cred, sandbox: sandbox, workingDirectory: "/work");

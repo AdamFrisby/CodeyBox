@@ -15,10 +15,12 @@ namespace CodeyBox.Agents.Claude;
 public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly HttpClient TextOnlyHttp = new();
-
     private readonly IClaudeTokenRotationPusher? _rotationPusher;
+    private readonly AgentDefaultsSnapshot? _defaults;
 
-    public ClaudeAgentRunner() : this(rotationPusher: null) { }
+    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null) { }
+
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null) { }
 
     /// <summary>
     /// Optional <paramref name="rotationPusher"/> hooks the runner into the
@@ -29,8 +31,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// (handled automatically by the <c>using</c> wrapper) removes the sandbox
     /// from the active set on completion of the run.
     /// </summary>
-    public ClaudeAgentRunner(IClaudeTokenRotationPusher? rotationPusher)
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults, IClaudeTokenRotationPusher? rotationPusher)
     {
+        _defaults = defaults;
         _rotationPusher = rotationPusher;
     }
 
@@ -43,10 +46,11 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     public string Binary { get; init; } = "claude";
 
     /// <summary>
-    /// Default model passed to <c>--model</c> when no per-item override is provided.
-    /// Pinned to Opus to avoid the CLI defaulting to a lighter model.
+    /// Default model passed to <c>--model</c> when no per-item override is
+    /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/> so
+    /// operator edits take effect on the next dispatched run without restart.
     /// </summary>
-    public string? DefaultModelId { get; init; } = "claude-opus-4-7";
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 
@@ -240,9 +244,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
         try
         {
+            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId : modelId;
+            if (string.IsNullOrWhiteSpace(effectiveModel))
+                return new TextOnlyAgentResult(false, "missing model id for Claude text-only call", null, "No model id available (no default configured); set a default in CodeyBox:AgentDefaults or supply an explicit modelId.");
+
             var body = JsonSerializer.Serialize(new
             {
-                model = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId ?? "claude-haiku-4-5-20251001" : modelId,
+                model = effectiveModel,
                 max_tokens = 8192,
                 messages = new[] { new { role = "user", content = prompt } },
             });

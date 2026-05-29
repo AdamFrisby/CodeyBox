@@ -12,7 +12,12 @@ public sealed class CursorAgentRunnerTests
     public async Task RunAsync_InvokesAgentBinaryWithPrintAndDefaultModel()
     {
         var sandbox = new RecordingSandbox();
-        var runner = new CursorAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] = "composer-2.5",
+            });
+        var runner = new CursorAgentRunner(defaults);
 
         var result = await runner.RunAsync(
             sandbox,
@@ -32,7 +37,12 @@ public sealed class CursorAgentRunnerTests
     public async Task RunAsync_OverrideModelId_FlowsToArgv()
     {
         var sandbox = new RecordingSandbox();
-        var runner = new CursorAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] = "composer-2.5",
+            });
+        var runner = new CursorAgentRunner(defaults);
 
         await runner.RunAsync(sandbox, "/work", "p", credential: null, modelId: "composer-3-preview");
 
@@ -160,7 +170,12 @@ public sealed class CursorAgentRunnerTests
     [Fact]
     public void DefaultModelId_IsComposer25()
     {
-        var runner = new CursorAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] = "composer-2.5",
+            });
+        var runner = new CursorAgentRunner(defaults);
         Assert.Equal("composer-2.5", runner.DefaultModelId);
     }
 
@@ -216,7 +231,12 @@ public sealed class CursorAgentRunnerTests
     {
         const string prompt = "resolve this conflict";
         var sandbox = new RecordingSandbox(agentStdout: "assistant text");
-        var runner = new CursorAgentRunner();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["cursor"] = "composer-2.5",
+            });
+        var runner = new CursorAgentRunner(defaults);
         var cred = new AgentCredential(
             AgentKind.Cursor,
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },

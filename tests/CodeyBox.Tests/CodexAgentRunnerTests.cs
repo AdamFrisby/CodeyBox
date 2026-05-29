@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -188,6 +189,100 @@ public sealed class CodexAgentRunnerTests
         Assert.True(writeIdx >= 0, "script must still have a printf-from-env fallback");
         Assert.True(earlyExitIdx < writeIdx,
             "early-exit guard must come before the env-var write so an existing auth.json is preserved");
+    }
+
+    // ── Default model from config ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_NoModelIdOverride_PassesDefaultModelFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+        var runner = new CodexAgentRunner(defaults);
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0, "argv must contain --model when DefaultModelId is set");
+        Assert.Equal("gpt-5.5", argv[modelIdx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithExplicitModelId_UsesOverrideNotDefault()
+    {
+        var sandbox = new CapturingSandbox();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+        var runner = new CodexAgentRunner(defaults);
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: "gpt-4o-mini");
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0);
+        Assert.Equal("gpt-4o-mini", argv[modelIdx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_DefaultModelId_NullWhenNoDefaultConfigured_NoModelFlag()
+    {
+        var sandbox = new CapturingSandbox();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new CodexAgentRunner(defaults);
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.DoesNotContain("--model", sandbox.CapturedExec!.Argv);
+    }
+
+    // ── Text-only model plumbing ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunTextOnlyAsync_ConfiguredDefault_SetsModelInRequestBody()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+        var runner = new CodexAgentRunner(defaults);
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        // The call will fail because the sandbox resolves to a bogus host, but
+        // we can still verify the error message signals a model-aware failure
+        // rather than a null-model reject.
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        // API will reject with a 4xx or DNS failure, but NOT with our new
+        // "no default configured" guard.
+        Assert.DoesNotContain("no default configured", result.Summary);
+        Assert.DoesNotContain("no default configured", result.Error);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_MissingDefault_ReturnsError()
+    {
+        var runner = new CodexAgentRunner();
+        var cred = new AgentCredential(AgentKind.Codex,
+            new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("no default configured", result.Error);
     }
 
     private sealed class RecordingSandbox : ISandbox

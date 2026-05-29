@@ -21,6 +21,15 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
     private static readonly HttpClient TextOnlyHttp = new();
 
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    public CodexAgentRunner() : this(defaults: null) { }
+
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults)
+    {
+        _defaults = defaults;
+    }
+
     public override AgentKind Kind => AgentKind.Codex;
 
     public string Binary { get; init; } = "codex";
@@ -30,9 +39,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
-    /// Default model passed to <c>--model</c> when no per-item override is provided.
+    /// Default model passed to <c>--model</c> when no per-item override is
+    /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/>.
     /// </summary>
-    public string? DefaultModelId { get; init; } = "gpt-5.5";
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
         await DetectStructuredStreamFlagAsync(sandbox, ct).ConfigureAwait(false) is not null;
@@ -145,9 +155,13 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
         try
         {
+            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId : modelId;
+            if (string.IsNullOrWhiteSpace(effectiveModel))
+                return new TextOnlyAgentResult(false, "missing model id for Codex text-only call", null, "No model id available (no default configured); set a default in CodeyBox:AgentDefaults or supply an explicit modelId.");
+
             var body = new Dictionary<string, object?>
             {
-                ["model"] = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId ?? "gpt-4o-mini" : modelId,
+                ["model"] = effectiveModel,
                 ["input"] = prompt,
                 ["max_output_tokens"] = 8192,
             };

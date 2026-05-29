@@ -843,6 +843,18 @@ builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
 // PipelineRunner would keep gating against the pre-reload caps until restart.
 builder.Services.AddSingleton<AgentConcurrencySnapshot>(sp =>
     new AgentConcurrencySnapshot(sp.GetRequiredService<AgentConcurrencyOptions>()));
+
+// AgentDefaultsSnapshot — per-agent default model ids, swappable by the
+// hot-reload coordinator. Every runner reads through this same instance so
+// an operator edit to CodeyBox:AgentDefaults takes effect on the next
+// dispatched agent run without a process restart.
+builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var dict = new Dictionary<string, string?>(opts.AgentDefaults, opts.AgentDefaults.Comparer);
+    return new CodeyBox.Core.AgentDefaultsSnapshot(dict);
+});
+
 builder.Services.AddSingleton<AgentBurnEstimatorOptions>(sp =>
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentBurnEstimator);
 builder.Services.AddSingleton<AgentBurnEstimator>(sp => new AgentBurnEstimator(
@@ -1534,9 +1546,10 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<AgentClassRouter>(),
         sp.GetRequiredService<AgentBurnEstimator>(),
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
-        sp.GetRequiredService<AgentCostCalculator>(),
-        pricingState,
-        sp.GetRequiredService<IAgentBudgetConfigReloadable>());
+        defaults: sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
+        costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
+        pricingState: pricingState,
+        budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2101,6 +2114,17 @@ namespace CodeyBox.Api
 
         /// <summary>Per-agent/per-model multi-window spend budgets (synthetic quota for the router).</summary>
         public AgentBudgetOptions AgentBudgets { get; set; } = new();
+
+        /// <summary>
+        /// Per-agent default model IDs. Keyed by <c>AgentKind.Value</c>
+        /// (case-insensitive). The runner uses this value in <c>--model</c>
+        /// when no per-item override is provided and the class member does
+        /// not carry an explicit <c>ModelId</c>. Edits hot-reload via
+        /// <see cref="Core.AgentDefaultsSnapshot"/> and take effect on the
+        /// next dispatched agent run.
+        /// </summary>
+        public Dictionary<string, string?> AgentDefaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();

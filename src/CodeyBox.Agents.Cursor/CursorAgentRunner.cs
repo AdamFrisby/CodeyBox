@@ -30,6 +30,15 @@ namespace CodeyBox.Agents.Cursor;
 /// </summary>
 public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    public CursorAgentRunner() : this(defaults: null) { }
+
+    public CursorAgentRunner(AgentDefaultsSnapshot? defaults)
+    {
+        _defaults = defaults;
+    }
+
     public override AgentKind Kind => AgentKind.Cursor;
 
     /// <summary>
@@ -41,11 +50,9 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
 
     /// <summary>
     /// Default model passed to <c>--model</c> when no per-item override is
-    /// provided. <c>composer-2.5</c> is operator-graded as Opus-4.6-equivalent
-    /// quality and is the model the operator pays for under their Cursor
-    /// subscription.
+    /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/>.
     /// </summary>
-    public string? DefaultModelId { get; init; } = "composer-2.5";
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 

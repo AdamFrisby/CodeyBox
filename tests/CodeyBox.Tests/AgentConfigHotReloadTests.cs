@@ -1,4 +1,8 @@
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cursor;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -916,6 +920,186 @@ public sealed class AgentConfigHotReloadTests
             => Task.FromResult(new AgentUsageWindowAggregate(_sum, null, _sum > 0 ? 1 : 0));
 
         public Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default) => Task.FromResult(0);
+    }
+
+    // ── AgentDefaults hot-reload ────────────────────────────────────────────
+
+    [Fact]
+    public async Task AgentDefaults_HotReload_ChangesModelFlagOnNextRun()
+    {
+        var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["claude"] = "claude-opus-4-7",
+        };
+        var snapshot = new AgentDefaultsSnapshot(initialDefaults);
+        var runner = new ClaudeAgentRunner(snapshot);
+
+        var sandbox = new CapturingSandbox();
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0);
+        Assert.Equal("claude-opus-4-7", argv[modelIdx + 1]);
+
+        // Hot-reload: swap default model to a lighter variant.
+        var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["claude"] = "claude-haiku-4-5",
+        };
+        snapshot.Replace(updatedDefaults);
+
+        var sandbox2 = new CapturingSandbox();
+        await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+
+        var argv2 = sandbox2.CapturedExec!.Argv.ToList();
+        var modelIdx2 = argv2.IndexOf("--model");
+        Assert.True(modelIdx2 >= 0);
+        Assert.Equal("claude-haiku-4-5", argv2[modelIdx2 + 1]);
+    }
+
+    [Fact]
+    public async Task AgentDefaults_HotReload_ChangesModelFlagOnNextRun_Codex()
+    {
+        var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["codex"] = "gpt-5.5",
+        };
+        var snapshot = new AgentDefaultsSnapshot(initialDefaults);
+        var runner = new CodexAgentRunner(snapshot);
+
+        var sandbox = new CapturingSandbox();
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0);
+        Assert.Equal("gpt-5.5", argv[modelIdx + 1]);
+
+        var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["codex"] = "gpt-4o-mini",
+        };
+        snapshot.Replace(updatedDefaults);
+
+        var sandbox2 = new CapturingSandbox();
+        await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+
+        var argv2 = sandbox2.CapturedExec!.Argv.ToList();
+        var modelIdx2 = argv2.IndexOf("--model");
+        Assert.True(modelIdx2 >= 0);
+        Assert.Equal("gpt-4o-mini", argv2[modelIdx2 + 1]);
+    }
+
+    [Fact]
+    public async Task AgentDefaults_HotReload_ChangesModelFlagOnNextRun_Cursor()
+    {
+        var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["cursor"] = "composer-2.5",
+        };
+        var snapshot = new AgentDefaultsSnapshot(initialDefaults);
+        var runner = new CursorAgentRunner(snapshot);
+
+        var sandbox = new CapturingSandbox();
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0);
+        Assert.Equal("composer-2.5", argv[modelIdx + 1]);
+
+        var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["cursor"] = "composer-3-preview",
+        };
+        snapshot.Replace(updatedDefaults);
+
+        var sandbox2 = new CapturingSandbox();
+        await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+
+        var argv2 = sandbox2.CapturedExec!.Argv.ToList();
+        var modelIdx2 = argv2.IndexOf("--model");
+        Assert.True(modelIdx2 >= 0);
+        Assert.Equal("composer-3-preview", argv2[modelIdx2 + 1]);
+    }
+
+    [Fact]
+    public async Task AgentDefaults_HotReload_ChangesModelFlagOnNextRun_Opencode()
+    {
+        var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["opencode"] = "deepseek/deepseek-coder",
+        };
+        var snapshot = new AgentDefaultsSnapshot(initialDefaults);
+        var runner = new OpencodeAgentRunner(snapshot);
+
+        var sandbox = new CapturingSandbox();
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0);
+        Assert.Equal("deepseek/deepseek-coder", argv[modelIdx + 1]);
+
+        var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["opencode"] = "anthropic/claude-sonnet-4-6",
+        };
+        snapshot.Replace(updatedDefaults);
+
+        var sandbox2 = new CapturingSandbox();
+        await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+
+        var argv2 = sandbox2.CapturedExec!.Argv.ToList();
+        var modelIdx2 = argv2.IndexOf("--model");
+        Assert.True(modelIdx2 >= 0);
+        Assert.Equal("anthropic/claude-sonnet-4-6", argv2[modelIdx2 + 1]);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_AgentDefaultsPushesToSnapshot()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            AgentDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-opus-4-7",
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(initial.AgentDefaults, initial.AgentDefaults.Comparer));
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            defaults: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal("claude-opus-4-7", snapshot.GetDefault("claude"));
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-haiku-4-5",
+            },
+        });
+
+        Assert.Equal("claude-haiku-4-5", snapshot.GetDefault("claude"));
+
+        await coordinator.StopAsync(CancellationToken.None);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

@@ -263,7 +263,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         // same-kind auditor, so usage must bucket on ctx.ModelId — the same window
         // EvaluateAuditCandidateQuotaAsync gates. Returning null here would
         // understate the gated window and fail-open its cap.
-        var auditRunner = new ClaudeAgentRunner { DefaultModelId = "claude-opus-4-8" };
+        var auditRunner = new ClaudeAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["claude"] = "claude-opus-4-8" }));
         var resolved = PipelineRunner.ResolveAuditUsageModelId(
             auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
 
@@ -277,7 +278,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         // drops the vendor-specific work model (ModelId = null), so usage must
         // bucket on the audit runner's DefaultModelId — never the work item's
         // model, which the audit runner never dispatched on.
-        var auditRunner = new CodexAgentRunner { DefaultModelId = "gpt-5.5" };
+        var auditRunner = new CodexAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = "gpt-5.5" }));
         var resolved = PipelineRunner.ResolveAuditUsageModelId(
             auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
 
@@ -290,7 +292,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         // Same-kind with no explicit work model: ResolveObservedModelId falls
         // through to the runner default rather than null, so spend still lands in
         // a concrete bucket instead of the NULL/default bucket by accident.
-        var auditRunner = new ClaudeAgentRunner { DefaultModelId = "claude-opus-4-8" };
+        var auditRunner = new ClaudeAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["claude"] = "claude-opus-4-8" }));
         var resolved = PipelineRunner.ResolveAuditUsageModelId(
             auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: null);
 

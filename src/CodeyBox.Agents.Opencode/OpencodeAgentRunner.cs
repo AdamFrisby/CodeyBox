@@ -23,6 +23,15 @@ namespace CodeyBox.Agents.Opencode;
 /// </summary>
 public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private readonly AgentDefaultsSnapshot? _defaults;
+
+    public OpencodeAgentRunner() : this(defaults: null) { }
+
+    public OpencodeAgentRunner(AgentDefaultsSnapshot? defaults)
+    {
+        _defaults = defaults;
+    }
+
     public override AgentKind Kind => AgentKind.Opencode;
 
     /// <summary>Path to the opencode binary inside the sandbox.</summary>
@@ -30,12 +39,9 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
     /// <summary>
     /// Default model passed to <c>--model</c> when the agent-class member
-    /// does not override it. A DeepSeek-coder variant; operators tune the
-    /// exact id to match what their opencode subscription enumerates as the
-    /// best DeepSeek-coder option (run <c>opencode models</c> on the host
-    /// to confirm).
+    /// does not override it. Sourced live from <see cref="AgentDefaultsSnapshot"/>.
     /// </summary>
-    public string? DefaultModelId { get; init; } = "deepseek/deepseek-coder";
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".local/share/opencode", ".config/opencode"];
 
