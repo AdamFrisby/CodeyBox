@@ -54,8 +54,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly ITimingStore? _timings;
     private readonly IWorkItemCostStore? _costStore;
     private readonly IAgentUsageStore? _usageStore;
-    // Local operator-budget provider. The audit-phase quota gate
-    // (EvaluateAuditCandidateQuotaAsync) consults it and takes MIN with the real
+    // Local operator-budget provider. The shared quota gate
+    // (EvaluateCandidateQuotaAsync) consults it and takes MIN with the real
     // probe, mirroring AgentClassRouter.ApplyBudgetAsync so the work and audit
     // phases gate on the same synthetic budget quota. Optional: when unwired the
     // audit gate falls back to probe-only behaviour.
@@ -114,12 +114,15 @@ public sealed class PipelineRunner : IPipelineRunner
     internal static readonly TimeSpan MaxParsedQuotaResetWindow = TimeSpan.FromHours(24);
     // Subscription-billed quota probes, keyed by AgentKind. PayPerApi / Null probes are
     // routing utilities (not real quota sources) and intentionally excluded.
-    // Used by both ResolveAuditAgentRunnerAsync (audit-agent quota gate) and
-    // InvokeAgentWithQuotaFallbackAsync (work-agent mid-iteration probe write-back) —
-    // a single probe set serves both because the production wiring registers one
-    // IAgentQuotaProbe singleton per agent kind regardless of caller.
+    // Shared by every orchestration site that needs to gate an agent call against
+    // live subscription quota — audit-agent selection
+    // (ResolveAuditAgentRunnerAsync), mid-iteration work-agent probe write-back
+    // (InvokeAgentWithQuotaFallbackAsync), and pickup-time rebase-resolver
+    // candidate selection (BuildAgenticConflictCandidatesAsync) — because the
+    // production wiring registers one IAgentQuotaProbe singleton per agent kind
+    // regardless of caller.
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _quotaProbesByKind;
-    private readonly QuotaRouterOptions _auditQuotaOptions;
+    private readonly QuotaRouterOptions _quotaOptions;
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
@@ -165,8 +168,8 @@ public sealed class PipelineRunner : IPipelineRunner
         ILogger<PipelineRunner> log,
         CredentialSmokeGate? smokeGate = null,
         ISuggestionStore? suggestions = null,
-        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
-        QuotaRouterOptions? auditQuotaOptions = null,
+        IEnumerable<IAgentQuotaProbe>? quotaProbes = null,
+        QuotaRouterOptions? quotaOptions = null,
         IAuditReportStore? auditReports = null,
         ITimingStore? timingStore = null,
         IWorkItemCostStore? costStore = null,
@@ -194,7 +197,9 @@ public sealed class PipelineRunner : IPipelineRunner
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
+        QuotaRouterOptions? auditQuotaOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -243,11 +248,12 @@ public sealed class PipelineRunner : IPipelineRunner
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent
         // and only genuine subscription probes receive mid-iteration write-back.
-        _quotaProbesByKind = auditQuotaProbes is null ? null
-            : auditQuotaProbes
+        var effectiveQuotaProbes = quotaProbes ?? auditQuotaProbes;
+        _quotaProbesByKind = effectiveQuotaProbes is null ? null
+            : effectiveQuotaProbes
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
-        _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
+        _quotaOptions = quotaOptions ?? auditQuotaOptions ?? new QuotaRouterOptions();
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
@@ -1562,11 +1568,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// for a single rebase or merge. The configured
     /// <see cref="ProjectAudit.AuditAgent"/> is the primary when it is set and
     /// registered, falling back to the work runner otherwise. Candidates are
-    /// quota-gated with the same audit quota router path, then at-cap agents are
-    /// pushed to the back while retaining them as last-resort candidates.
-    /// Gate rejection reasons are preserved so reroute and unavailable events
-    /// report the real cause, such as quota exhaustion, rather than a generic
-    /// credential failure.
+    /// gated by the same live quota path used by audit-agent selection and
+    /// work-agent fallback, then at-cap agents are pushed to the back while
+    /// retained as last-resort candidates. Gate rejection reasons are preserved
+    /// so reroute and unavailable events report the real cause, such as quota
+    /// exhaustion, rather than a generic credential failure.
     /// </summary>
     internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
         WorkItem item,
@@ -1577,8 +1583,10 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         var seenKinds = new HashSet<AgentKind>();
-        var skipReasons = new List<string>();
+        var candidateReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
+        var quotaRejections = 0;
+        var registrationRejections = 0;
 
         var resolverPrimary = primaryRunner;
         var resolverPrimaryModelId = item.ModelId;
@@ -1618,7 +1626,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (!_agents.TryGet(member.Agent, out var memberRunner))
                 {
                     seenKinds.Add(member.Agent);
-                    skipReasons.Add($"{member.Agent.Value}: no runner registered");
+                    registrationRejections++;
+                    candidateReasons.Add($"{member.Agent.Value}: no runner registered");
                     continue;
                 }
 
@@ -1632,12 +1641,21 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (collected.Count == 0)
         {
-            var reasons = skipReasons.Count == 0
+            var reasons = candidateReasons.Count == 0
                 ? "no candidate runner registered"
-                : string.Join("; ", skipReasons);
+                : string.Join("; ", candidateReasons);
+            var allLocalBudgetRejections = candidateReasons.Count > 0
+                && candidateReasons.All(static r => r.Contains("local budget exhausted", StringComparison.Ordinal));
+            var headline = quotaRejections > 0 && registrationRejections == 0
+                ? allLocalBudgetRejections
+                    ? "no agent has viable credentials or quota"
+                    : "all candidate agents are quota-exhausted"
+                : quotaRejections > 0
+                    ? "no candidate agent is available (registration and quota both blocking candidates)"
+                    : "no candidate runner registered";
             AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
             throw new AgentUnavailableException(
-                $"pickup-time rebase resolver could not run: no agent has viable credentials or quota ({reasons})",
+                $"pickup-time rebase resolver could not run: {headline} ({reasons})",
                 reasons);
         }
 
@@ -1690,11 +1708,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 return null;
 
             var quotaMember = BuildQuotaMember(candidate, configuredMember, modelId, reasoningMode);
-            var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(candidate.Kind, quotaMember, token);
+            var (quotaOk, quotaReason) = await EvaluateCandidateQuotaAsync(candidate.Kind, quotaMember, token);
             if (!quotaOk)
             {
+                quotaRejections++;
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
-                skipReasons.Add(reason);
+                candidateReasons.Add(reason);
                 return reason;
             }
 
@@ -1721,23 +1740,18 @@ public sealed class PipelineRunner : IPipelineRunner
             string? modelId,
             string? reasoningMode)
         {
-            var observedModelId = ResolveObservedModelId(candidate, modelId);
+            // Prefer the catalog AgentMembership when the caller resolved one
+            // (correct Billing / QualityScore / canonical ModelId so per-model
+            // probe buckets key on operator-configured ids). The candidate still
+            // carries its dispatch ModelId / ReasoningMode separately.
             if (configuredMember is not null)
-            {
-                return modelId is null
-                    ? configuredMember
-                    : configuredMember with
-                    {
-                        ModelId = observedModelId,
-                        ReasoningMode = reasoningMode ?? configuredMember.ReasoningMode,
-                    };
-            }
+                return configuredMember;
 
             return new AgentMembership
             {
                 Agent = candidate.Kind,
                 Billing = AgentBilling.Subscription,
-                ModelId = observedModelId,
+                ModelId = ResolveObservedModelId(candidate, modelId),
                 ReasoningMode = reasoningMode,
                 QualityScore = 100,
             };
@@ -2172,7 +2186,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     agentResult.Summary,
                     agentResult.Stderr,
                     agentEndedAt,
-                    _auditQuotaOptions.ObservedFailureRetention,
+                    _quotaOptions.ObservedFailureRetention,
                     ct,
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);
@@ -2190,7 +2204,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 agentResult.Summary,
                 agentResult.Stderr,
                 agentEndedAt,
-                _auditQuotaOptions.ObservedFailureRetention,
+                _quotaOptions.ObservedFailureRetention,
                 ct,
                 projectId: item.ProjectId,
                 stdout: agentResult.Stdout);
@@ -3635,7 +3649,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (needsCreds)
         {
             // Record usage under the model the auditor actually dispatched on, so
-            // spend lands in the same bucket EvaluateAuditCandidateQuotaAsync gates
+            // spend lands in the same bucket EvaluateCandidateQuotaAsync gates
             // on (see BuildUsageEvent). ExecAuditorAsync dispatches with
             // ModelId = crossKind ? null : ctx.ModelId, so mirror that here:
             // same-kind keeps the work item's model, cross-kind falls back to the
@@ -3681,7 +3695,7 @@ public sealed class PipelineRunner : IPipelineRunner
             run.Result.AgentSummary,
             run.Result.AgentStderr,
             DateTimeOffset.UtcNow,
-            _auditQuotaOptions.ObservedFailureRetention,
+            _quotaOptions.ObservedFailureRetention,
             ct,
             projectId: projectId,
             stdout: run.Result.AgentStdout);
@@ -3850,7 +3864,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var preferredAvailability = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, item.BaselineImageRef, ct);
         var preferredAvailable = preferredAvailability.Available;
 
-        var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
+        var (preferredOk, preferredReason) = await EvaluateCandidateQuotaAsync(
             preferredKind.Value, preferredProbeMember, ct);
         if (preferredAvailable && preferredOk)
             return preferredRunner;
@@ -3896,7 +3910,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     classId, member.Agent.Value, auditorName);
                 continue;
             }
-            var (memberOk, memberReason) = await EvaluateAuditCandidateQuotaAsync(member.Agent, member, ct);
+            var (memberOk, memberReason) = await EvaluateCandidateQuotaAsync(member.Agent, member, ct);
             if (!memberOk)
             {
                 _log.LogInformation(
@@ -3929,24 +3943,15 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Returns <c>(true, reason)</c> when the candidate passes both the
-    /// observed-failure breaker and the live quota probe (reason is a short
-    /// human-readable description like "available (80.0%)" or
-    /// "quota unknown; fail-open"); otherwise returns <c>(false, reason)</c>
-    /// describing which gate rejected the candidate. Mirrors the gating logic
-    /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
-    /// on what counts as "available".
-    /// </summary>
-    /// <summary>
     /// Reads the operator's local spend budget for (<paramref name="kind"/>,
-    /// <paramref name="modelId"/>) and classifies it for the mid-iteration fallback
-    /// gates. Returns the budget <c>AvailablePct</c> (or <c>-1</c> when no budget is
-    /// configured) and a <c>FailedClosed</c> flag set when the provider itself threw
-    /// — that means the operator's spend cap cannot be verified, so callers must gate
-    /// dispatch rather than silently drop the constraint. Shared by the audit-candidate
-    /// gate and the work-phase fallback so both honour MIN(probe, local budget).
-    /// <see cref="OperationCanceledException"/> propagates (shutdown/abort is not an
-    /// accounting outage).
+    /// <paramref name="modelId"/>) and classifies it for routing gates. Returns
+    /// the budget <c>AvailablePct</c> (or <c>-1</c> when no budget is configured)
+    /// and a <c>FailedClosed</c> flag set when the provider itself threw — that
+    /// means the operator's spend cap cannot be verified, so callers must gate
+    /// dispatch rather than silently drop the constraint. Shared by audit-agent,
+    /// work-fallback, and conflict-resolver routing so all honour MIN(probe,
+    /// local budget). <see cref="OperationCanceledException"/> propagates
+    /// (shutdown/abort is not an accounting outage).
     /// </summary>
     private async Task<(double Pct, bool FailedClosed)> ReadCandidateBudgetAsync(
         AgentKind kind, string? modelId, CancellationToken ct)
@@ -3968,20 +3973,28 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task<(bool Allowed, string Reason)> EvaluateAuditCandidateQuotaAsync(
+    /// <summary>
+    /// Returns <c>(true, reason)</c> when the candidate passes the observed-failure
+    /// breaker, local spend budget, and live quota probe; otherwise returns
+    /// <c>(false, reason)</c> describing which gate rejected the candidate.
+    /// Mirrors the gating logic in <see cref="AgentClassRouter"/> so every
+    /// orchestration site that gates an agent invocation against subscription
+    /// quota agrees on what counts as "available".
+    /// </summary>
+    private async Task<(bool Allowed, string Reason)> EvaluateCandidateQuotaAsync(
         AgentKind kind, AgentMembership member, CancellationToken ct)
     {
         if (_quotaFailures is not null
             && await _quotaFailures.HasRecentAsync(
                 kind, member.ModelId,
-                _auditQuotaOptions.ObservedFailureWindow,
+                _quotaOptions.ObservedFailureWindow,
                 DateTimeOffset.UtcNow, ct))
         {
             return (false, "recent observed quota failure");
         }
 
         // Local operator-budget snapshot. Acceptance criterion: quota routing
-        // takes MIN(real probe, local budget), so the audit fallthrough must not
+        // takes MIN(real probe, local budget), so the fallthrough paths must not
         // dispatch an agent whose operator spend budget is exhausted just because
         // the subscription probe still has headroom. budgetPct < 0 means "no
         // budget configured" (the budget gate is then absent).
@@ -3992,7 +4005,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // A configured budget that is itself below the threshold gates regardless
         // of the probe — MIN(probe, budget) would be below threshold anyway, and
         // this avoids a probe round-trip we know cannot pass.
-        if (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct)
+        if (budgetPct >= 0 && budgetPct < _quotaOptions.MinQuotaPct)
             return (false, $"local budget exhausted ({budgetPct:F1}%)");
 
         if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
@@ -4013,12 +4026,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Probe threw (transient API error). Treat it as unknown (-1) and fall
-            // through to the MIN(real probe, local budget) logic below rather than
-            // short-circuiting: a healthy configured budget must still gate, and an
-            // exhausted one was already rejected above. Bypassing the budget here
-            // would fail-open the operator spend cap on a probe blip.
-            _log.LogDebug(ex, "Audit quota probe for {Agent} threw; treating as unknown", kind.Value);
+            // Probe threw (transient API error). Treat it as unknown (-1) and
+            // still apply the local budget gate. This preserves fail-cautious
+            // behaviour when no budget is configured while avoiding a fail-open
+            // spend-cap bypass on a probe blip.
+            _log.LogDebug(ex, "Quota probe for {Agent} threw; treating as unknown", kind.Value);
             probePct = -1;
         }
 
@@ -4030,13 +4042,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? probePct
                 : Math.Min(probePct, budgetPct);
 
-        if (combinedPct >= _auditQuotaOptions.MinQuotaPct)
+        if (combinedPct >= _quotaOptions.MinQuotaPct)
             return (true, $"available ({combinedPct:F1}%)");
 
         if (combinedPct >= 0)
             return (false, $"quota exhausted ({combinedPct:F1}%)");
 
-        return _auditQuotaOptions.UnknownPolicy switch
+        return _quotaOptions.UnknownPolicy switch
         {
             QuotaUnknownPolicy.FailOpen => (true, "quota unknown; fail-open"),
             QuotaUnknownPolicy.FailCautious => (false, "quota unknown; fail-cautious"),
@@ -4304,7 +4316,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (_quotaFailures is not null
                     && await _quotaFailures.HasRecentAsync(
                         candidate.Agent, candidate.ModelId,
-                        _auditQuotaOptions.ObservedFailureWindow,
+                        _quotaOptions.ObservedFailureWindow,
                         DateTimeOffset.UtcNow, ct))
                 {
                     _log.LogInformation(
@@ -4321,7 +4333,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 var (budgetPct, budgetFailedClosed) =
                     await ReadCandidateBudgetAsync(candidate.Agent, candidate.ModelId, ct);
                 if (budgetFailedClosed
-                    || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
+                    || (budgetPct >= 0 && budgetPct < _quotaOptions.MinQuotaPct))
                 {
                     _log.LogInformation(
                         "Class '{ClassId}' member {Agent}/{Model} local budget exhausted ({Pct}); skipping for fallback (work item {WorkItemId})",
@@ -5016,7 +5028,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         agentResult.Summary,
                         agentResult.Stderr,
                         mergeEndedAt,
-                        _auditQuotaOptions.ObservedFailureRetention,
+                        _quotaOptions.ObservedFailureRetention,
                         ct,
                         projectId: item.ProjectId,
                         stdout: agentResult.Stdout);
@@ -5030,7 +5042,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     agentResult.Summary,
                     agentResult.Stderr,
                     mergeEndedAt,
-                    _auditQuotaOptions.ObservedFailureRetention,
+                    _quotaOptions.ObservedFailureRetention,
                     ct,
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);

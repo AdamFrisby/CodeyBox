@@ -122,7 +122,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
     }
 
-    // ── Probe-throws + UnknownPolicy branches in EvaluateAuditCandidateQuotaAsync ─
+    // ── Probe-throws + UnknownPolicy branches in EvaluateCandidateQuotaAsync ─
 
     [Fact]
     public async Task PreferredProbeThrows_FailOpen_AuditorRunsOnPreferredAgent()
@@ -226,7 +226,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
-    // ── Local-budget MIN gate in EvaluateAuditCandidateQuotaAsync ────────────
+    // ── Local-budget MIN gate in EvaluateCandidateQuotaAsync ────────────────
 
     [Fact]
     public async Task PreferredBudgetExhausted_ProbeHealthy_AuditFallsThroughToClassMember()
@@ -484,8 +484,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: registerAuditProbes ? probes : null,
-            auditQuotaOptions: new QuotaRouterOptions
+            quotaProbes: registerAuditProbes ? probes : null,
+            quotaOptions: new QuotaRouterOptions
             {
                 MinQuotaPct = 10.0,
                 UnknownPolicy = unknownPolicy,

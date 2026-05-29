@@ -186,8 +186,8 @@ public sealed class QuotaFallthroughTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             smokeGate: null,
             suggestions: null,
-            auditQuotaProbes: auditProbes,
-            auditQuotaOptions: quotaOptions);
+            quotaProbes: auditProbes,
+            quotaOptions: quotaOptions);
 
         return new QuotaTestPipeline(pipeline, store, claudeAgent, webhooks);
     }

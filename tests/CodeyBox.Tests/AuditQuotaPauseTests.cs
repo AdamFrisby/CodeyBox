@@ -244,7 +244,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: probes,
+            quotaProbes: probes,
             retryScheduler: scheduler,
             classRouter: router,
             fallbackHistory: fallbackHistory,

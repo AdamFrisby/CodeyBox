@@ -97,7 +97,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
                 item, fixture.Project, claude, CancellationToken.None));
 
-        Assert.Contains("no agent has viable credentials", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("all candidate agents are quota-exhausted", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("has viable credentials", ex.Message, StringComparison.Ordinal);
         Assert.Contains("claude:", ex.CandidateReasons, StringComparison.Ordinal);
         Assert.Contains("quota exhausted", ex.CandidateReasons, StringComparison.Ordinal);
     }
@@ -399,7 +400,11 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("agent_unavailable", final.FailureKind);
-        Assert.Contains("no agent has viable credentials", final.LastError);
+        // The exception headline must reflect the actual blocking gate (quota),
+        // not the legacy "missing credentials" template that misled operators
+        // into a credential-debugging detour.
+        Assert.Contains("all candidate agents are quota-exhausted", final.LastError);
+        Assert.DoesNotContain("has viable credentials", final.LastError);
         Assert.Contains("claude:", final.LastError);
         Assert.Contains("quota exhausted", final.LastError);
         Assert.Empty(claude.AgenticConflictInvocations);
@@ -550,7 +555,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("agent_unavailable", final.FailureKind);
-        Assert.Contains("no agent has viable credentials", final.LastError);
+        Assert.Contains("all candidate agents are quota-exhausted", final.LastError);
+        Assert.DoesNotContain("has viable credentials", final.LastError);
         Assert.Contains("claude:", final.LastError);
         Assert.Contains("quota exhausted", final.LastError);
         Assert.Empty(claude.AgenticConflictInvocations);
@@ -623,8 +629,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: probes,
-            auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaProbes: probes,
+            quotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
             classRouter: router);
 
         return new CandidateFixture(pipeline, store, project);
@@ -740,8 +746,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: probes,
-            auditQuotaOptions: probes is null ? null : new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaProbes: probes,
+            quotaOptions: probes is null ? null : new QuotaRouterOptions { MinQuotaPct = 10.0 },
             classRouter: router,
             agentRunningCounters: runningCounters,
             agentConcurrency: agentConcurrency);
