@@ -840,7 +840,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
         sp.GetService<AgentAvailabilityRegistry>(),
-        sp.GetService<IAgentBudgetProvider>());
+        sp.GetService<IAgentBudgetProvider>(),
+        sp.GetService<AgentConcurrencySnapshot>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
