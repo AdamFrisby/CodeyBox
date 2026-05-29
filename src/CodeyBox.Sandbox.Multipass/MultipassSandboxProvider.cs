@@ -2977,12 +2977,9 @@ public sealed record MultipassSandboxOptions
 
     /// <summary>
     /// Optional delay applied after acquiring the provisioning gate and
-    /// before the actual multipass launch/start. Each holder incurs this
-    /// delay individually; up to <see cref="MaxConcurrentBoots"/> holders
-    /// can be in the delay phase concurrently. Acquiers beyond
-    /// MaxConcurrentBoots are gated behind releasing slots, producing
-    /// inter-boot stagger so that CPU/IO spikes don't align. 0 means no
-    /// delay.
+    /// before the actual multipass launch/start. While a holder delays,
+    /// the next acquirer is gated behind it, producing inter-boot stagger
+    /// so that CPU/IO spikes don't align. 0 means no delay.
     /// </summary>
     public TimeSpan BootLaunchDelay { get; init; } = DefaultBootLaunchDelay;
 }
