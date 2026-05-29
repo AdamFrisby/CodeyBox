@@ -412,6 +412,30 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task MixedQuotaAndRegistrationFailures_ThrowsCombinedHeadline()
+    {
+        var claude = new FakeAgentRunner(AgentKind.Claude);
+        using var fixture = BuildCandidateFixture(
+            [claude],
+            quotas: new() { [AgentKind.Claude] = 1.0 },
+            classMembers: [AgentKind.Claude, AgentKind.Codex]);
+
+        var item = NewItem(AgentKind.Claude);
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<AgentUnavailableException>(() =>
+            fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+                item, fixture.Project, claude, CancellationToken.None));
+
+        Assert.Contains("registration and quota both blocking candidates", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("all candidate agents are quota-exhausted", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("claude:", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("quota exhausted", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("codex:", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no runner registered", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task AuditAgentUnregistered_ResolverFallsBackToWorkAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -567,7 +591,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     private CandidateFixture BuildCandidateFixture(
         IReadOnlyList<IAgentRunner> runners,
         AgentKind? auditAgent = null,
-        Dictionary<AgentKind, double>? quotas = null)
+        Dictionary<AgentKind, double>? quotas = null,
+        IReadOnlyList<AgentKind>? classMembers = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -578,15 +603,16 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var registry = new AgentRegistry(runners);
+        var memberKinds = classMembers ?? runners.Select(static runner => runner.Kind).ToArray();
 
         var agentClass = new AgentClass
         {
             Id = "frontier",
             DisplayName = "Frontier",
-            Members = runners
-                .Select((runner, idx) => new AgentMembership
+            Members = memberKinds
+                .Select((kind, idx) => new AgentMembership
                 {
-                    Agent = runner.Kind,
+                    Agent = kind,
                     Billing = AgentBilling.Subscription,
                     QualityScore = 100 - idx,
                 })

@@ -1591,7 +1591,11 @@ public sealed class PipelineRunner : IPipelineRunner
         var resolverPrimary = primaryRunner;
         var resolverPrimaryModelId = item.ModelId;
         var resolverPrimaryReasoningMode = item.ReasoningMode;
-        var resolverPrimaryMember = FindCandidateMember(primaryRunner.Kind, item.ModelId);
+        // For the primary, look up the catalog membership by kind alone
+        // (modelId: null), matching audit-agent routing. The candidate still
+        // carries item.ModelId for dispatch, but quota probes key on the
+        // operator-configured catalog member when one exists.
+        var resolverPrimaryMember = FindCandidateMember(primaryRunner.Kind, modelId: null);
 
         if (project.Audit.AuditAgent is { } auditKind && auditKind != primaryRunner.Kind)
         {
@@ -1644,15 +1648,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var reasons = candidateReasons.Count == 0
                 ? "no candidate runner registered"
                 : string.Join("; ", candidateReasons);
-            var allLocalBudgetRejections = candidateReasons.Count > 0
-                && candidateReasons.All(static r => r.Contains("local budget exhausted", StringComparison.Ordinal));
-            var headline = quotaRejections > 0 && registrationRejections == 0
-                ? allLocalBudgetRejections
-                    ? "no agent has viable credentials or quota"
-                    : "all candidate agents are quota-exhausted"
-                : quotaRejections > 0
-                    ? "no candidate agent is available (registration and quota both blocking candidates)"
-                    : "no candidate runner registered";
+            var headline = BuildUnavailableHeadline();
             AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
             throw new AgentUnavailableException(
                 $"pickup-time rebase resolver could not run: {headline} ({reasons})",
@@ -1697,6 +1693,22 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         return ordered;
 
+        string BuildUnavailableHeadline()
+        {
+            if (quotaRejections <= 0)
+                return "no candidate runner registered";
+
+            var allLocalBudgetRejections = candidateReasons.Count > 0
+                && candidateReasons.All(static r => r.Contains("local budget exhausted", StringComparison.Ordinal));
+
+            if (registrationRejections > 0)
+                return "no candidate agent is available (registration and quota both blocking candidates)";
+
+            return allLocalBudgetRejections
+                ? "no agent has viable credentials or quota"
+                : "all candidate agents are quota-exhausted";
+        }
+
         async Task<string?> TryAddAsync(
             IAgentRunner candidate,
             string? modelId,
@@ -1714,7 +1726,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 quotaRejections++;
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
                 candidateReasons.Add(reason);
-                return reason;
+                return quotaReason;
             }
 
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
@@ -1741,9 +1753,11 @@ public sealed class PipelineRunner : IPipelineRunner
             string? reasoningMode)
         {
             // Prefer the catalog AgentMembership when the caller resolved one
-            // (correct Billing / QualityScore / canonical ModelId so per-model
-            // probe buckets key on operator-configured ids). The candidate still
-            // carries its dispatch ModelId / ReasoningMode separately.
+            // (correct Billing / QualityScore / canonical ModelId so the
+            // probe's PerModel bucket lookup keys on the operator's configured
+            // ids, not an undated CLI alias from item.ModelId). The synthesised
+            // fallback only fires when no class is wired (legacy single-agent
+            // setups) - that path has no PerModel bucket to miss against.
             if (configuredMember is not null)
                 return configuredMember;
 
