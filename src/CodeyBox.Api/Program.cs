@@ -896,7 +896,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
-        sp.GetService<AgentAvailabilityRegistry>(),
+        sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
         sp.GetService<IInVmSmokeGate>());
@@ -1689,7 +1689,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(),
     sp.GetService<ITaskQueue>(),
     sp.GetService<OrchestratorOptions>(),
-    sp.GetService<AgentAvailabilityRegistry>(),
+    sp.GetService<IAgentAvailabilityRegistry>(),
     sp.GetService<IAgentRunningCounters>(),
     sp.GetService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<IPreMergeVerifier>(),

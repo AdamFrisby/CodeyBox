@@ -491,6 +491,29 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureAvailableAsync_AlreadyExcluded_SkipsProbe_NoProvision()
+    {
+        // The gate short-circuits when the registry already marks the agent
+        // unavailable: there is no point provisioning a probe VM for an agent the
+        // router will skip regardless, and a redundant probe could reconcile away
+        // or overwrite an exclusion earned from another source. Pre-bench cursor
+        // (via the host-smoke source, distinct from in-VM) and assert the gate
+        // returns the excluded verdict without ever creating a sandbox.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        registry.MarkSmokeResult(AgentKind.Cursor,
+            new AgentSmokeResult(false, "host smoke benched it", TimeSpan.Zero), SmokeExclusionSource.HostSmoke);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.False(av.Available);
+        Assert.Equal(0, provider.CreateCount); // no redundant provision for an already-skipped agent
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_PinnedBaselineRef_ProbesAndCachesAgainstPinnedImage()
     {
         // B1 pinning: the dispatch gate must probe the work item's pinned baseline

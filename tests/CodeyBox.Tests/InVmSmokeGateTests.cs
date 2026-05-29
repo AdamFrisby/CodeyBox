@@ -65,14 +65,48 @@ public sealed class InVmSmokeGateTests
             inVmSmokeGate: gate);
     }
 
-    private static WorkItem MakeItem() => new()
+    private static WorkItem MakeItem(string? baselineImageRef = null) => new()
     {
         Id = WorkItemId.New(),
         ProjectId = new ProjectId("proj"),
         Title = "t",
         Prompt = "p",
         AgentClassId = "frontier",
+        BaselineImageRef = baselineImageRef,
     };
+
+    [Fact]
+    public async Task ResolveAsync_ForwardsWorkItemBaselineRef_ToGate()
+    {
+        // B1 pinning: a work item pinned to a specific baseline must probe THAT
+        // image (the one dispatch will clone), not the active baseline. Guards the
+        // router→gate wiring: a regression passing null from ResolveAsync would
+        // probe the wrong image yet still route, so assert the gate saw the ref.
+        var gate = new RecordingGate();
+        var router = BuildRouter(NewRegistry(), gate);
+
+        await router.ResolveAsync(MakeItem(baselineImageRef: "base-PINNED"), project: null, CancellationToken.None);
+
+        Assert.Contains("base-PINNED", gate.SeenBaselineRefs);
+    }
+
+    /// <summary>
+    /// Records the baselineRef forwarded by the router and reports every agent as
+    /// available so routing proceeds normally.
+    /// </summary>
+    private sealed class RecordingGate : IInVmSmokeGate
+    {
+        public List<string?> SeenBaselineRefs { get; } = [];
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+        {
+            SeenBaselineRefs.Add(baselineRef);
+            return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+    }
 
     [Fact]
     public async Task InVmSmokeFailure_CausesRouterToSkipCursor()

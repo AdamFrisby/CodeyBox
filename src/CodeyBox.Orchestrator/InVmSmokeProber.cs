@@ -178,9 +178,14 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // The gate runs on the router hot path and must never throw. The
             // expected transient faults are already handled inside ProbeAgentAsync
             // (per the fault policy), so reaching here is an unexpected fault
-            // worth surfacing at Warning rather than hiding at Debug — but we
-            // still swallow it so a probe fault cannot take down dispatch.
-            _log.LogWarning(ex, "In-VM smoke gate: probe for {Agent} threw unexpectedly; leaving availability unchanged", kind.Value);
+            // worth surfacing at Warning rather than hiding at Debug. We still
+            // swallow the exception so a probe fault cannot take down dispatch,
+            // but we must honour the fail-closed policy: an unexpected throw
+            // reached no in-VM verdict, so under FailClosedOnProbeFault we bench
+            // the agent (never cached → self-heals on the next clean probe)
+            // rather than leaving an unverified CLI routable.
+            _log.LogWarning(ex, "In-VM smoke gate: probe for {Agent} threw unexpectedly", kind.Value);
+            BenchTransientFaultIfRequested(kind, "probe threw unexpectedly", _opts.FailClosedOnProbeFault);
         }
     }
 
