@@ -287,13 +287,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             reason, summary, _opts.MaxConcurrentWorkers);
     }
 
+    /// <inheritdoc />
+    public int CurrentlyRunningTotal => Volatile.Read(ref _currentlyRunning);
+
     /// <summary>
     /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
     /// global cap, configured per-agent caps, and live per-agent in-flight counts.
     /// </summary>
-    /// <inheritdoc />
-    public int CurrentlyRunningTotal => Volatile.Read(ref _currentlyRunning);
-
     public ConcurrencyStateSnapshot GetConcurrencyState()
     {
         var opts = _concurrencySnapshot.Current;

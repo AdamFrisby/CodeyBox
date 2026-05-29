@@ -148,6 +148,41 @@ public sealed class ObservableMetricsTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task WorkItemActiveGauge_RetainsLastGoodSnapshot_WhenStoreRefreshFails()
+    {
+        // First refresh (in StartAsync) succeeds and populates the snapshot;
+        // every later refresh throws. The gauge must keep serving the last good
+        // values and the boundary failure must be logged at Warning — a
+        // regression that cleared the snapshot on failure, or swallowed the
+        // error silently, would trip one of the two assertions below.
+        var store = new FlakyFleetCountsStore(
+            good: [("proj", (int)WorkItemState.Queued, 3, "2026-01-01T00:00:00Z")]);
+        var logger = new CapturingLogger<CodeyBoxObservableMetrics>();
+        using var svc = new CodeyBoxObservableMetrics(
+            store,
+            new InertSandboxProvider(),
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            logger,
+            workerPool: new FakeWorkerPool(0),
+            quotaSnapshot: null,
+            refreshInterval: TimeSpan.FromMilliseconds(50));
+
+        await svc.StartAsync(CancellationToken.None);
+
+        // Wait for the timer to drive at least one failing refresh.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (store.Calls < 2 && DateTime.UtcNow < deadline)
+            await Task.Delay(25);
+        Assert.True(store.Calls >= 2, "expected the refresh timer to trigger a second (failing) refresh");
+
+        var observed = CollectLong(svc, "state", "codeybox.work_item.active");
+        Assert.Contains(observed, m => m.Tag == "Queued" && m.Value == 3);
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
     // ── Fakes ─────────────────────────────────────────────────────────────────
 
     private sealed class FakeWorkerPool(int total) : IWorkerPoolOccupancy
@@ -196,5 +231,56 @@ public sealed class ObservableMetricsTests : IDisposable
             throw new NotSupportedException();
         public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// IWorkItemStore that returns <paramref name="good"/> on the first
+    /// <see cref="GetFleetStateCountsAsync"/> call and throws on every call
+    /// after that. Only the fleet-counts read is exercised by
+    /// <see cref="CodeyBoxObservableMetrics"/>; the rest of the surface throws so
+    /// any unexpected call fails loudly.
+    /// </summary>
+    private sealed class FlakyFleetCountsStore(
+        IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)> good) : IWorkItemStore
+    {
+        private int _calls;
+        public int Calls => Volatile.Read(ref _calls);
+
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(
+            CancellationToken ct = default)
+        {
+            var n = Interlocked.Increment(ref _calls);
+            return n == 1
+                ? Task.FromResult(good)
+                : Task.FromException<IReadOnlyList<(string, int, int, string)>>(
+                    new InvalidOperationException("store unavailable"));
+        }
+
+        public Task CreateAsync(WorkItem item, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 }

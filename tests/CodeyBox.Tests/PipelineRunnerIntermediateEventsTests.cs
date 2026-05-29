@@ -328,6 +328,41 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         Assert.True(completedIdx < IndexOf(names, "merge.completed"));
     }
 
+    [Fact]
+    public async Task ResumeFromPreemptRework_EmitsReworkPhaseSpanAndDuration()
+    {
+        // Companion to PipelineRunnerQuotaFallbackTests.AuditDrivenRework_*: that
+        // test covers the audit-loop rework scope; this one covers the distinct
+        // resume-preempt branch (entry == Reworking && PreemptCheckpoint set),
+        // which opens its own BeginPhaseScope(item, "rework"). A regression that
+        // dropped or mis-tagged that scope would leave the resumed rework with no
+        // phase span / duration sample and slip past the webhook-only assertions.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = BuildPipeline(_workspace, seed, webhooks);
+
+        var workBranch = "feature/preempt-rework-telemetry";
+        var item = MakeItem(workBranch) with { State = WorkItemState.Reworking };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+        await tp.Store.CreateAsync(item);
+        await PushPreemptCheckpointAsync(tp.GitHost, item, seed);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("resumed-rework.txt", "resumed\n"));
+
+        using var spans = new SpanCapture("CodeyBox.Pipeline");
+        using var metrics = new MetricCapture("codeybox.phase.duration_ms");
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await tp.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        Assert.True(spans.Any("phase.rework", ("codeybox.phase", "rework")),
+            "expected a phase.rework span on the resume-preempt rework path");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "rework")),
+            "expected a codeybox.phase.duration_ms{phase=rework} measurement on resume-preempt rework");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task PushPreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed)

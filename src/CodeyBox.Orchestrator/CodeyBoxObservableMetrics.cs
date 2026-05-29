@@ -93,12 +93,14 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     private IEnumerable<Measurement<long>> ObserveActiveSandboxes()
     {
-        // Only providers with a persistent VM lifecycle (multipass) report a
-        // meaningful count; process/bubblewrap sandboxes are ephemeral and the
-        // capability is absent, so the gauge reports 0 for them.
+        // Providers with a persistent VM lifecycle (multipass) expose a native
+        // snapshot of suspendable-active VMs. Ephemeral providers
+        // (process/bubblewrap) have no such snapshot, so they feed the
+        // process-wide created-but-not-disposed counter instead; that keeps the
+        // gauge meaningful on the default local paths rather than reporting 0.
         var count = _sandboxes is ISuspendingSandboxProvider suspending
             ? suspending.SnapshotSuspendableActive().Count
-            : 0;
+            : SandboxLiveCounter.Active;
         return [new Measurement<long>(count, new KeyValuePair<string, object?>("provider", _sandboxes.Name))];
     }
 

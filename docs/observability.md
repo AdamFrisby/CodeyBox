@@ -32,6 +32,7 @@ CodeyBox honors the conventional OpenTelemetry environment variables so a deploy
 | Env var | Overrides | Notes |
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `OtlpEndpoint` | When set, telemetry can be enabled without an appsettings endpoint (`Enabled=true` alone suffices). The OTel SDK reads it directly, including the `httpprotobuf` path-append semantics. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `ExportProtocol` | When set, the SDK's own protocol selection is left in place (`grpc` / `http/protobuf`) rather than forcing the appsettings `ExportProtocol`, so an env-only deployment to an HTTP/protobuf collector exports correctly without also setting appsettings. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `OtlpHeaders` | Same `key=value,key2=value2` format as the appsettings CSV. |
 | `OTEL_SERVICE_NAME` | `ServiceName` | Sets the `service.name` resource attribute. |
 | `OTEL_RESOURCE_ATTRIBUTES` | `ResourceAttributes` | `key=value,key2=value2` pairs; applied last so env pairs win over appsettings on key collision. |

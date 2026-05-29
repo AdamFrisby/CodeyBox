@@ -100,6 +100,7 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
         }
 
         var sandbox = new BubblewrapSandbox(id, root, spec, binds, _opts, _log, timingStore, timingItemId, timingPhase);
+        SandboxLiveCounter.Increment();
         var hasNet = spec.Network.AllowedHosts.Count > 0 || spec.Network.HostGitEndpoint is not null;
         if (hasNet)
             _log.LogWarning(
@@ -315,6 +316,7 @@ internal sealed class BubblewrapSandbox : ISandbox
     {
         if (_disposed) return;
         _disposed = true;
+        SandboxLiveCounter.Decrement();
         await using var teardownScope = await TimingScope.BeginAsync(
             _timings, _timingItemId, _timingPhase, "bwrap.teardown", log: _log);
         try

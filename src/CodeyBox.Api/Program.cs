@@ -296,9 +296,16 @@ static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
     if (string.IsNullOrWhiteSpace(envEndpoint) && !string.IsNullOrWhiteSpace(opts.OtlpEndpoint))
         o.Endpoint = new Uri(opts.OtlpEndpoint);
 
-    o.Protocol = opts.ExportProtocol == "httpprotobuf"
-        ? OtlpExportProtocol.HttpProtobuf
-        : OtlpExportProtocol.Grpc;
+    // OTEL_EXPORTER_OTLP_PROTOCOL is part of the same env contract: when it is
+    // set the SDK reads it itself, so forcing the appsettings protocol here would
+    // silently override an env-only deployment (e.g. http/protobuf on :4318 while
+    // appsettings still defaults to grpc). Only assign from CodeyBox:Otel when the
+    // env var is absent.
+    var envProtocol = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_PROTOCOL");
+    if (string.IsNullOrWhiteSpace(envProtocol))
+        o.Protocol = opts.ExportProtocol == "httpprotobuf"
+            ? OtlpExportProtocol.HttpProtobuf
+            : OtlpExportProtocol.Grpc;
 
     var envHeaders = Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_HEADERS");
     if (string.IsNullOrWhiteSpace(envHeaders) && !string.IsNullOrEmpty(opts.OtlpHeaders))

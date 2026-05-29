@@ -458,14 +458,17 @@ public sealed class PipelineRunner : IPipelineRunner
             // the fail-quiet "Agent produced no changes to commit" symptom.
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
-            if (entry is WorkItemState.Queued
-                && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+            using (BeginPhaseScope(item, "pickup"))
             {
-                await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
-            }
-            else if (!skipWork || !skipAudit || !skipMerge)
-            {
-                await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+                if (entry is WorkItemState.Queued
+                    && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+                {
+                    await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
+                }
+                else if (!skipWork || !skipAudit || !skipMerge)
+                {
+                    await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+                }
             }
 
             // Compose auditors up-front: the work-phase prompt advises the
