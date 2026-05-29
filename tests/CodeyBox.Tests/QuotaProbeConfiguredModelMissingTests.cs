@@ -190,12 +190,12 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     public async Task Cursor_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
     {
         // remaining/limit drive the headline (see CursorQuotaProbe HEADLINE-METRIC):
-        // 900/1000 -> 90% available. autoBucketModels populates perModel with
+        // 1800/2000 -> 90% available. autoBucketModels populates perModel with
         // composer-2, so the configured ModelId "composer-99-unknown" doesn't
         // match and ApplyMemberGate emits the diagnostic Notes string.
         var body = """
         {
-          "planUsage": { "remaining": 900, "limit": 1000, "autoPercentUsed": 10, "apiPercentUsed": 0 },
+          "planUsage": { "remaining": 1800, "limit": 2000, "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2"]
         }
         """;
@@ -218,13 +218,13 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_ConfiguredModelPresentInPerModel_UsesParsedQuota()
     {
-        // 700/1000 -> 70% overall available. autoBucketModels lists composer-2.5
+        // 1400/2000 -> 70% overall available. autoBucketModels lists composer-2.5
         // (DefaultRoutedModelId), and autoPercentUsed=25 -> auto bucket at 75%
         // which is then capped by overall to 70%. Configured ModelId matches a
         // populated perModel key, so ApplyMemberGate leaves the snapshot intact.
         var body = """
         {
-          "planUsage": { "remaining": 700, "limit": 1000, "autoPercentUsed": 25, "apiPercentUsed": 0 },
+          "planUsage": { "remaining": 1400, "limit": 2000, "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2.5"]
         }
         """;
@@ -247,7 +247,7 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_NoConfiguredModelId_PreservesOverallAvailability()
     {
-        var body = """{"planUsage":{"remaining":700,"limit":1000}}""";
+        var body = """{"planUsage":{"remaining":1400,"limit":2000,"totalPercentUsed":30}}""";
         var probe = BuildCursorProbe(body);
 
         var member = new AgentMembership

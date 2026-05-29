@@ -1158,6 +1158,127 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StopAsync(CancellationToken.None);
     }
 
+    // ── ClaudeThinkingBlockSanitizer hot-reload ──────────────────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_SanitizerTogglePushesToConfig()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = true },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var sanitizerConfig = new ClaudeThinkingBlockSanitizerConfig { Enabled = initial.ClaudeThinkingBlockSanitizer.Enabled };
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            sanitizerConfig: sanitizerConfig);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.True(sanitizerConfig.Enabled);
+
+        // Toggle disabled via config change.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = false },
+        });
+
+        Assert.False(sanitizerConfig.Enabled);
+
+        // Toggle back to enabled.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = true },
+        });
+
+        Assert.True(sanitizerConfig.Enabled);
+
+        // Same-value fire should be a no-op (no crash, no change).
+        monitor.Fire(new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = true },
+        });
+
+        Assert.True(sanitizerConfig.Enabled);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_SanitizerNoOpWhenConfigNull()
+    {
+        // When no sanitizerConfig is registered, the coordinator should not
+        // crash — ApplySanitizerIfChanged returns early.
+        var initial = new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = true },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // No sanitizerConfig — the coordinator handles null gracefully.
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            sanitizerConfig: null);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Fire a config change — must not throw.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            ClaudeThinkingBlockSanitizer = new ClaudeThinkingBlockSanitizerOptions { Enabled = false },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task SanitizerConfig_Disabled_SuppressesReactiveRetryViaHotReload()
+    {
+        // Start with sanitizer enabled.
+        var sanitizerConfig = new ClaudeThinkingBlockSanitizerConfig { Enabled = true };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, null, sanitizerConfig);
+
+        // First run with enabled config — retry fires on thinking-block 400.
+        var sandbox1 = new ThinkingBlockRetrySandbox(
+            initialFailures: 1, sanitizerExitsZero: true);
+        var result1 = await runner.RunAsync(sandbox1, "/work", "prompt", credential: null);
+        Assert.True(result1.Success);
+        Assert.True(sandbox1.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude") >= 2);
+
+        // Hot-reload: disable the sanitizer via the shared config object.
+        sanitizerConfig.Enabled = false;
+
+        // Second run with disabled config — no retry.
+        var sandbox2 = new ThinkingBlockRetrySandbox(
+            initialFailures: 1, sanitizerExitsZero: true);
+        var result2 = await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+        Assert.False(result2.Success);
+        Assert.Equal(1, sandbox2.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude"));
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()

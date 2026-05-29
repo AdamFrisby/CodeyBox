@@ -160,8 +160,6 @@ public sealed class ClaudeSessionSanitizerTests
     [Fact]
     public void SanitizeLine_ThinkingBlockInsideToolUseInput_Preserved()
     {
-        // tool_use blocks are NOT filtered — only top-level assistant
-        // content blocks of type thinking/redacted_thinking are stripped.
         var line = """
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"edit","input":{"thinking":"nested value"}},{"type":"thinking","thinking":"strip me"}]}}
             """;
@@ -247,7 +245,6 @@ public sealed class ClaudeSessionSanitizerTests
     [Fact]
     public void DeinterleaveTranscript_InterleavedAssistantChunks_CoalescesByMsgId()
     {
-        // Simulates streaming chunks from two different msg_ids interleaved.
         var input = """
             {"type":"user","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial A"}],"id":"msg_1"}}
@@ -257,18 +254,16 @@ public sealed class ClaudeSessionSanitizerTests
 
         var result = ClaudeSessionSanitizer.DeinterleaveTranscript(input);
 
-        // The best line for msg_1 (more content blocks) should be kept.
         var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        // msg_1's "final A" line has 3 "type" entries (text, thinking + one in the JSON key) vs "partial A" has 1.
-        // msg_2's "partial B" has 1.
-        // user has 1 "type".
-        var assistantLinesWithId = new HashSet<string>();
-        foreach (var line in lines)
-        {
-            if (line.Contains("\"msg_1\"") || line.Contains("\"msg_2\""))
-                assistantLinesWithId.Add(line);
-        }
-        Assert.Equal(2, assistantLinesWithId.Count);
+        Assert.Equal(3, lines.Length);
+
+        // Line 0 must be user message
+        Assert.True(lines[0].Contains("\"user\"", StringComparison.Ordinal));
+        // Line 1 must be msg_1 (the best/coalesced line for msg_1 — "final A" has more content blocks)
+        Assert.True(lines[1].Contains("\"msg_1\"", StringComparison.Ordinal));
+        Assert.True(lines[1].Contains("\"final A\"", StringComparison.Ordinal));
+        // Line 2 must be msg_2 remaining at its original position
+        Assert.True(lines[2].Contains("\"msg_2\"", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -281,8 +276,13 @@ public sealed class ClaudeSessionSanitizerTests
 
         var result = ClaudeSessionSanitizer.DeinterleaveTranscript(input);
 
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
         Assert.Contains("response", result, StringComparison.Ordinal);
         Assert.Contains("hello", result, StringComparison.Ordinal);
+        // Verify ordering: user first, assistant second
+        Assert.True(lines[0].Contains("\"user\"", StringComparison.Ordinal));
+        Assert.True(lines[1].Contains("\"msg_1\"", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -295,6 +295,8 @@ public sealed class ClaudeSessionSanitizerTests
 
         var result = ClaudeSessionSanitizer.DeinterleaveTranscript(input);
 
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
         Assert.Contains("\"a\"", result, StringComparison.Ordinal);
     }
 
@@ -303,6 +305,30 @@ public sealed class ClaudeSessionSanitizerTests
     {
         Assert.Equal(string.Empty, ClaudeSessionSanitizer.DeinterleaveTranscript(""));
         Assert.Equal(string.Empty, ClaudeSessionSanitizer.DeinterleaveTranscript("  "));
+    }
+
+    [Fact]
+    public void DeinterleaveTranscript_PreservesMessageOrdering()
+    {
+        // Verify that after de-interleaving, messages appear in their original
+        // chronological order (not all assistant lines first).
+        var input = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"first"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"part1"}],"id":"msg_a"}}
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"part2"}],"id":"msg_a"}}
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"third"}]}}
+            """;
+
+        var result = ClaudeSessionSanitizer.DeinterleaveTranscript(input);
+
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(4, lines.Length);
+        // Order: user("first"), coalesced msg_a ("part2" has more content), user("second"), user("third")
+        Assert.True(lines[0].Contains("\"first\"", StringComparison.Ordinal));
+        Assert.True(lines[1].Contains("\"msg_a\"", StringComparison.Ordinal));
+        Assert.True(lines[2].Contains("\"second\"", StringComparison.Ordinal));
+        Assert.True(lines[3].Contains("\"third\"", StringComparison.Ordinal));
     }
 
     // ── EnumerateContentBlocks ────────────────────────────────────────────────
@@ -334,18 +360,19 @@ public sealed class ClaudeSessionSanitizerTests
         Assert.Empty(blocks);
     }
 
-    // ── GenerateSanitizationScript ────────────────────────────────────────────
+    // ── BuildFileListAndBackupScript ──────────────────────────────────────────
 
     [Fact]
-    public void GenerateSanitizationScript_ProducesValidNonEmptyScript()
+    public void BuildFileListAndBackupScript_ProducesValidNonEmptyScript()
     {
-        var script = ClaudeSessionSanitizer.GenerateSanitizationScript();
+        var script = ClaudeSessionSanitizer.BuildFileListAndBackupScript();
 
         Assert.NotEmpty(script);
         Assert.Contains("session_root", script, StringComparison.Ordinal);
         Assert.Contains("claude/projects", script, StringComparison.Ordinal);
         Assert.Contains("backup", script, StringComparison.Ordinal);
         Assert.Contains("cp", script, StringComparison.Ordinal);
+        Assert.Contains("cp -P", script, StringComparison.Ordinal);
     }
 
     // ── Synthetic session JSONL (integration-style verification) ──────────────
@@ -360,19 +387,7 @@ public sealed class ClaudeSessionSanitizerTests
             {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"done"},{"type":"text","text":"all tests pass"}]}}
             """;
 
-        var lines = transcript.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        var result = new StringBuilder();
-
-        foreach (var line in lines)
-        {
-            var trimmed = line.Trim();
-            if (trimmed.Length == 0) continue;
-            var sanitized = ClaudeSessionSanitizer.SanitizeLine(trimmed);
-            if (result.Length > 0) result.Append('\n');
-            result.Append(sanitized);
-        }
-
-        var output = result.ToString();
+        var output = ClaudeSessionSanitizer.SanitizeFullTranscript(transcript);
 
         // User messages preserved verbatim
         Assert.Contains("\"type\":\"user\"", output, StringComparison.Ordinal);
@@ -398,21 +413,116 @@ public sealed class ClaudeSessionSanitizerTests
         }
     }
 
-    // ── Config toggle ─────────────────────────────────────────────────────────
+    // ── Trailing API-error tail ───────────────────────────────────────────────
 
     [Fact]
-    public void SanitizerEnabled_CtorDefaultsToNull_IsEnabledByDefault()
+    public void StripTrailingApiErrorTail_RemovesTrailingNonConversationLine()
     {
-        // Default construction should enable sanitization (null config → enabled).
-        var runner = new ClaudeAgentRunner();
+        var input = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+            {"type":"result","subtype":"error","is_error":true,"result":"something went wrong"}
+            """;
 
-        // Without a config, the runner treats null as enabled.
-        // Verify through the sanitizer being called (tested via integration).
-        Assert.NotNull(runner);
+        var result = ClaudeSessionSanitizer.StripTrailingApiErrorTail(input);
+
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
+        Assert.Contains("\"type\":\"user\"", result, StringComparison.Ordinal);
+        Assert.Contains("\"type\":\"assistant\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("went wrong", result, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void SanitizerDisabled_ExplicitlyFalse()
+    public void StripTrailingApiErrorTail_KeepsRecognisedLinesAfterError()
+    {
+        // An error line that appears BEFORE the last recognised turn should be kept.
+        // (It will be treated as a non-conversation line, but since it's not
+        // strictly trailing it passes through.)
+        var input = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+            {"type":"result","subtype":"error","is_error":true,"result":"warning"}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+            """;
+
+        var result = ClaudeSessionSanitizer.StripTrailingApiErrorTail(input);
+
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(3, lines.Length);
+    }
+
+    [Fact]
+    public void StripTrailingApiErrorTail_EmptyInput_ReturnsEmpty()
+    {
+        Assert.Equal(string.Empty, ClaudeSessionSanitizer.StripTrailingApiErrorTail(""));
+        Assert.Equal(string.Empty, ClaudeSessionSanitizer.StripTrailingApiErrorTail("  "));
+    }
+
+    [Fact]
+    public void StripTrailingApiErrorTail_AllRecognisedLines_PassesThrough()
+    {
+        var input = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"q"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}
+            """;
+
+        var result = ClaudeSessionSanitizer.StripTrailingApiErrorTail(input);
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
+    }
+
+    // ── SanitizeFullTranscript integration ────────────────────────────────────
+
+    [Fact]
+    public void SanitizeFullTranscript_DeinterleavesAndStripsTrailingTail()
+    {
+        var input = """
+            {"type":"user","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"id":"msg_1"}}
+            {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"complete"}],"id":"msg_1"}}
+            {"type":"result","subtype":"error","api_error_status":400,"result":"thinking blocks cannot be modified"}
+            """;
+
+        var result = ClaudeSessionSanitizer.SanitizeFullTranscript(input);
+
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
+        // De-interleaving: only one assistant line for msg_1, picking the most complete
+        Assert.DoesNotContain("\"partial\"", result, StringComparison.Ordinal);
+        Assert.Contains("\"complete\"", result, StringComparison.Ordinal);
+        // Thinking block stripped
+        Assert.DoesNotContain("\"thinking\"", result, StringComparison.Ordinal);
+        // Trailing error tail removed
+        Assert.DoesNotContain("api_error_status", result, StringComparison.Ordinal);
+    }
+
+    // ── Config toggle ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task SanitizerEnabled_CtorDefaultsToNull_IsEnabledByDefault()
+    {
+        // Default construction (null config) should treat sanitization as enabled.
+        // Verify that the runner can be created and the config gating logic
+        // treats null as enabled.
+        var runner = new ClaudeAgentRunner();
+        Assert.NotNull(runner);
+
+        // Prove the null-as-enabled semantic: build a sandbox that fails with
+        // thinking-block 400 and verify retry fires.
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 1,
+            sanitizerExitsZero: true);
+        // If the default-null config suppressed retry, this would fail rather than
+        // retry and succeed.
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+        Assert.True(result.Success);
+        var claudeCount = sandbox.AllExecs.Count(e =>
+            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        Assert.True(claudeCount >= 2, $"Expected >=2 claude calls (retry fired), got {claudeCount}");
+    }
+
+    [Fact]
+    public async Task SanitizerDisabled_ExplicitlyFalse()
     {
         var config = new ClaudeThinkingBlockSanitizerConfig { Enabled = false };
         var runner = new ClaudeAgentRunner(
@@ -420,9 +530,18 @@ public sealed class ClaudeSessionSanitizerTests
             rotationPusher: null,
             sanitizerConfig: config);
 
-        // When Enabled=false, reactive retry should be suppressed.
-        // Unit tested via the failure result being returned without retry.
         Assert.NotNull(runner);
+
+        // When Enabled=false, reactive retry should be suppressed.
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 1,
+            sanitizerExitsZero: true);
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.False(result.Success);
+        var claudeCount = sandbox.AllExecs.Count(e =>
+            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        Assert.Equal(1, claudeCount);
     }
 
     // ── Reactive retry integration tests ──────────────────────────────────────
@@ -430,12 +549,6 @@ public sealed class ClaudeSessionSanitizerTests
     [Fact]
     public async Task RunResumedAsync_ThinkingBlockFailure_TriggersSanitizeAndRetry()
     {
-        // The full flow:
-        //   RestoreScratchpadAsync (bash) → PrepareSandboxAsync sanitize (bash)
-        //   → claude (fails) → reactive sanitize (bash)
-        //   → RestoreScratchpadAsync in retry (bash) → PrepareSandboxAsync sanitize (bash)
-        //   → claude retry (succeeds)
-        // Total: 5 bash + 2 claude = 7 execs
         var sandbox = new ThinkingBlockRetrySandbox(
             initialFailures: 1,
             sanitizerExitsZero: true);
@@ -450,18 +563,31 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.True(result.Success);
         Assert.Equal("ok", result.Summary);
-        // At least 3 execs (2 claude + at least 1 sanitizer)
-        Assert.True(sandbox.AllExecs.Count >= 3);
-        // Verify sanitizer was invoked (bash exec with "session_root" string)
-        Assert.Contains(sandbox.AllExecs, e =>
-            e.Argv.Count > 0
-            && e.Argv[0] == "bash"
-            && e.Argv[1] == "-c"
-            && (e.Argv[2]?.Contains("session_root") == true));
-        // Verify at least 2 claude calls (original + retry)
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
-        Assert.True(claudeCount >= 2, $"Expected >=2 claude calls, got {claudeCount}");
+
+        // Verify sanitizer ran before the retry claude call.
+        var execs = sandbox.AllExecs;
+        int sanitizerIdx = -1;
+        int lastClaudeIdx = -1;
+        int firstClaudeIdx = -1;
+        for (var i = 0; i < execs.Count; i++)
+        {
+            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "bash"
+                && execs[i].Argv[1] == "-c"
+                && (execs[i].Argv[2]?.Contains("cp -P") == true))
+            {
+                sanitizerIdx = i;
+            }
+            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "claude")
+            {
+                if (firstClaudeIdx < 0) firstClaudeIdx = i;
+                lastClaudeIdx = i;
+            }
+        }
+        // Sanitizer must run between the two claude calls
+        Assert.True(firstClaudeIdx >= 0, "First claude call not found");
+        Assert.True(lastClaudeIdx > firstClaudeIdx, "Retry claude call not found after first");
+        Assert.True(sanitizerIdx > firstClaudeIdx, "Sanitizer should run after first claude failure");
+        Assert.True(sanitizerIdx < lastClaudeIdx, "Sanitizer should run before retry claude call");
     }
 
     [Fact]
@@ -481,17 +607,14 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.False(result.Success);
         Assert.Contains("thinking", result.Stderr, StringComparison.OrdinalIgnoreCase);
-        // Only one claude exec — the restore scratchpad bash also runs but we
-        // only check that no retry claude invocation happened.
         var claudeCount = sandbox.AllExecs.Count(e =>
             e.Argv.Count > 0 && e.Argv[0] == "claude");
         Assert.Equal(1, claudeCount);
-        // No sanitizer bash was run
         Assert.DoesNotContain(sandbox.AllExecs, e =>
             e.Argv.Count > 0
             && e.Argv[0] == "bash"
             && e.Argv[1] == "-c"
-            && (e.Argv[2]?.Contains("session_root") == true));
+            && (e.Argv[2]?.Contains("cp -P") == true));
     }
 
     [Fact]
@@ -510,12 +633,35 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.True(result.Success);
         Assert.Equal("ok", result.Summary);
+
+        // Verify ordering: sanitizer must run between the two claude calls
+        var execs = sandbox.AllExecs;
+        int sanitizerIdx = -1;
+        int lastClaudeIdx = -1;
+        int firstClaudeIdx = -1;
+        for (var i = 0; i < execs.Count; i++)
+        {
+            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "bash"
+                && execs[i].Argv[1] == "-c"
+                && (execs[i].Argv[2]?.Contains("cp -P") == true))
+            {
+                sanitizerIdx = i;
+            }
+            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "claude")
+            {
+                if (firstClaudeIdx < 0) firstClaudeIdx = i;
+                lastClaudeIdx = i;
+            }
+        }
+        Assert.True(firstClaudeIdx >= 0, "First claude call not found");
+        Assert.True(lastClaudeIdx > firstClaudeIdx, "Retry claude call not found after first");
+        Assert.True(sanitizerIdx > firstClaudeIdx, "Sanitizer should run after first claude failure");
+        Assert.True(sanitizerIdx < lastClaudeIdx, "Sanitizer should run before retry claude call");
     }
 
     [Fact]
     public async Task RunResumedAsync_NonThinkingBlockFailure_NoRetry()
     {
-        // Generic failure that doesn't look like thinking-block — no retry.
         var sandbox = new ThinkingBlockRetrySandbox(
             initialFailures: 1,
             sanitizerExitsZero: true,
@@ -531,7 +677,48 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.False(result.Success);
         Assert.Contains("generic failure", result.Stderr, StringComparison.OrdinalIgnoreCase);
-        // Only one claude exec — no retry
+        var claudeCount = sandbox.AllExecs.Count(e =>
+            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        Assert.Equal(1, claudeCount);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_SanitizerExitsNonZero_NoRetry()
+    {
+        // Sanitiser itself fails — no retry should occur, original failure surfaces.
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 1,
+            sanitizerExitsZero: false);
+        var config = new ClaudeThinkingBlockSanitizerConfig { Enabled = true };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, null, config);
+
+        var result = await runner.RunResumedAsync(
+            sandbox, "/work", "prompt", credential: null,
+            resume: new AgentResumeContext("refs/heads/codeybox/preempt/test"));
+
+        Assert.False(result.Success);
+        var claudeCount = sandbox.AllExecs.Count(e =>
+            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        Assert.Equal(1, claudeCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_SanitizerExitsNonZero_NoRetry()
+    {
+        var sandbox = new ThinkingBlockRetrySandbox(
+            initialFailures: 1,
+            sanitizerExitsZero: false);
+        var config = new ClaudeThinkingBlockSanitizerConfig { Enabled = true };
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new ClaudeAgentRunner(defaults, null, config);
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.False(result.Success);
         var claudeCount = sandbox.AllExecs.Count(e =>
             e.Argv.Count > 0 && e.Argv[0] == "claude");
         Assert.Equal(1, claudeCount);
@@ -569,9 +756,18 @@ internal sealed class ThinkingBlockRetrySandbox : ISandbox
 
         // Sanitizer bash calls — return based on configuration
         if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
-            return Task.FromResult(new SandboxExecResult(
-                _sanitizerExitsZero ? 0 : 1, string.Empty,
-                _sanitizerExitsZero ? string.Empty : "sanitizer failed"));
+        {
+            // Detect the sanitizer's backup script by looking for the "cp -P" fingerprint
+            if (exec.Argv.Count >= 3 && exec.Argv[1] == "-c"
+                && (exec.Argv[2]?.Contains("cp -P") == true))
+            {
+                return Task.FromResult(new SandboxExecResult(
+                    _sanitizerExitsZero ? 0 : 1, string.Empty,
+                    _sanitizerExitsZero ? string.Empty : "sanitizer failed"));
+            }
+            // Other bash calls (scratchpad restore, cat, etc.) succeed
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        }
 
         // Claude calls
         _callCount++;
