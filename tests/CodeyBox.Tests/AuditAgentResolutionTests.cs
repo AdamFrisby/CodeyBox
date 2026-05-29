@@ -390,6 +390,18 @@ internal sealed class BenchOnProbeGate : IInVmSmokeGate
     }
 
     public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+    {
+        Probed.Add(kind);
+        if (kind == _benchKind)
+            _registry.MarkSmokeResult(
+                kind,
+                new AgentSmokeResult(false, "in-VM agent --version exit 127", TimeSpan.Zero),
+                SmokeExclusionSource.InVmSmoke,
+                clearsFastFail: false);
+        return Task.FromResult<AgentAvailability?>(_registry.GetAvailability(kind));
+    }
 }
 
 internal sealed class TestPipelineWithCapture : IDisposable

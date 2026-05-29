@@ -106,6 +106,9 @@ public sealed class InVmSmokeGateTests
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 
     [Fact]

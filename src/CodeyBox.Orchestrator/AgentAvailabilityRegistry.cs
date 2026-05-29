@@ -332,6 +332,18 @@ public interface ISmokeAvailabilityRegistry
 
     /// <summary>Benches an agent named in a class but with no registered in-VM probe.</summary>
     AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason);
+
+    /// <summary>
+    /// Clears <paramref name="kind"/>'s exclusion state, fast-fail counter, and
+    /// prior probe timestamps. Lives on the smoke port (which owns the exclusion
+    /// taxonomy) rather than the narrow routing port, so the operator-reset
+    /// adapter (<see cref="AgentAvailabilityReset"/>) can pair it with the in-VM
+    /// cache invalidation through an abstraction instead of binding to the
+    /// concrete registry. Deliberately absent from
+    /// <see cref="IAgentAvailabilityRegistry"/> so routing/dispatch consumers
+    /// cannot clear the registry without also dropping the cache.
+    /// </summary>
+    void Reset(AgentKind kind);
 }
 
 /// <summary>

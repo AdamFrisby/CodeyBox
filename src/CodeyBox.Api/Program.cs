@@ -1160,7 +1160,7 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 // pass to reconcile back onto the registry before the operator's fix is
 // re-verified. The admin endpoint depends on this one contract.
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
-    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<IInVmSmokeCache>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -2195,6 +2195,7 @@ app.MapGet("/concurrency", async (
 app.MapPost("/admin/agent/{name}/smoke", async (
     string name,
     PeriodicSmokeProbeService periodic,
+    IInVmSmokeGate inVmGate,
     IAgentAvailabilityRegistry registry,
     CancellationToken ct) =>
 {
@@ -2203,19 +2204,41 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     // even when the underlying probe was registered. Normalise so case
     // never silently shadows the operator's intent.
     var kind = new AgentKind(name.ToLowerInvariant());
-    var result = await periodic.ProbeAsync(kind, ct);
-    if (result is null)
+
+    // Host-side credential probe (env-var presence on the orchestrator host).
+    var hostResult = await periodic.ProbeAsync(kind, ct);
+
+    // In-VM gate: the real in-sandbox CLI verification the host probe could not
+    // be (exit 127 / auth-path drift / workspace-trust). Force a re-probe so an
+    // operator who just corrected such an issue clears the in-VM bench here
+    // rather than waiting for the next background sweep — otherwise "smoke ok"
+    // from the host probe could mask a standing in-VM exclusion. Routes through
+    // the IInVmSmokeGate port, not the concrete prober. Null when in-VM smoke is
+    // disabled or no in-VM probe is registered for this agent.
+    var inVmAvailability = await inVmGate.ForceProbeAsync(kind, ct);
+
+    // 404 only when neither layer knows this agent — a typo, not a healthy agent
+    // that simply has one probe layer.
+    if (hostResult is null && inVmAvailability is null)
         return Results.NotFound(new { error = $"no smoke probe registered for agent '{name}'" });
+
     var availability = registry.GetAvailability(kind);
+    object? hostSmoke = hostResult is null ? null : new
+    {
+        ok = hostResult.Ok,
+        reason = hostResult.FailureReason,
+        durationMs = (long)hostResult.Duration.TotalMilliseconds,
+    };
+    object? inVmSmoke = inVmAvailability is null ? null : new
+    {
+        available = inVmAvailability.Available,
+        reason = inVmAvailability.Reason,
+    };
     return Results.Ok(new
     {
         agent = kind.Value,
-        smoke = new
-        {
-            ok = result.Ok,
-            reason = result.FailureReason,
-            durationMs = (long)result.Duration.TotalMilliseconds,
-        },
+        smoke = hostSmoke,
+        inVmSmoke,
         availability = new
         {
             available = availability.Available,

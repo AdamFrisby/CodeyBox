@@ -83,6 +83,34 @@ public sealed class AgentAvailabilityAdminEndpointTests
     }
 
     [Fact]
+    public async Task PostSmoke_RoutesThroughInVmGate_SurfacingBenchDespiteHostPass()
+    {
+        // The architectural fix: the operator recovery endpoint must route through
+        // IInVmSmokeGate, not only the host credential probe. A host-side "smoke
+        // ok" must not mask a standing in-VM exclusion (exit 127 / auth-path drift
+        // the host probe cannot observe). Drive the gate to report a bench and
+        // assert it is both invoked and surfaced.
+        _factory.SetProbeResult(AgentKind.Claude, pass: true);
+        _factory.InVmGate.Enabled = true;
+        _factory.InVmGate.ForceProbeResult =
+            new AgentAvailability(false, "in-VM: agent binary not runnable (exit 127)", null);
+
+        var client = _factory.CreateClient();
+        var resp = await client.PostAsync("/admin/agent/claude/smoke", content: null);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        // Host credential probe passed...
+        Assert.True(body.GetProperty("smoke").GetProperty("ok").GetBoolean());
+        // ...but the forced in-VM re-probe verdict is surfaced and shows the bench.
+        var inVm = body.GetProperty("inVmSmoke");
+        Assert.False(inVm.GetProperty("available").GetBoolean());
+        Assert.Contains("exit 127", inVm.GetProperty("reason").GetString());
+        // The endpoint actually drove a forced in-VM re-probe of this agent.
+        Assert.Contains(AgentKind.Claude, _factory.InVmGate.ForceProbeCalls);
+    }
+
+    [Fact]
     public async Task PostSmoke_UnknownAgent_Returns404()
     {
         var client = _factory.CreateClient();
@@ -221,6 +249,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
 
         private readonly ControllableSmokeProbe _claudeProbe = new(AgentKind.Claude);
         private readonly ControllableSmokeProbe _codexProbe = new(AgentKind.Codex);
+        internal readonly ControllableInVmSmokeGate InVmGate = new();
 
         public void SetProbeResult(AgentKind kind, bool pass)
         {
@@ -241,6 +270,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
             registry.Reset(AgentKind.Codex);
             _claudeProbe.ShouldPass = true;
             _codexProbe.ShouldPass = true;
+            InVmGate.Reset();
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -277,6 +307,13 @@ public sealed class AgentAvailabilityAdminEndpointTests
                         AgentKind.Claude,
                         new Dictionary<string, string> { ["k"] = "v" },
                         new Dictionary<string, string>())));
+                // Stub the in-VM gate: the real InVmSmokeProber would try to
+                // provision a sandbox VM (and, fail-closed, bench the agent on the
+                // resulting fault). The fake lets these endpoint tests drive the
+                // gate's verdict deterministically. Disabled by default so the
+                // host-probe-focused tests behave as before.
+                services.RemoveAll<IInVmSmokeGate>();
+                services.AddSingleton<IInVmSmokeGate>(InVmGate);
             });
         }
 
@@ -305,5 +342,39 @@ public sealed class AgentAvailabilityAdminEndpointTests
             => Task.FromResult(ShouldPass
                 ? new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(7))
                 : new AgentSmokeResult(false, "auth", TimeSpan.FromMilliseconds(7)));
+    }
+
+    /// <summary>
+    /// Programmable <see cref="IInVmSmokeGate"/> stub. The real
+    /// <see cref="InVmSmokeProber"/> would provision a sandbox VM (and bench the
+    /// agent fail-closed on the resulting fault), which these HTTP-level endpoint
+    /// tests cannot do; this fake lets a test set the forced-probe verdict and
+    /// observe that the endpoint routed through the gate. Disabled by default so
+    /// host-probe-focused tests are unaffected (ForceProbeAsync then returns null,
+    /// mirroring the real gate when in-VM smoke is disabled).
+    /// </summary>
+    internal sealed class ControllableInVmSmokeGate : IInVmSmokeGate
+    {
+        public bool Enabled { get; set; }
+        public AgentAvailability? ForceProbeResult { get; set; }
+        public List<AgentKind> ForceProbeCalls { get; } = new();
+
+        public void Reset()
+        {
+            Enabled = false;
+            ForceProbeResult = null;
+            ForceProbeCalls.Clear();
+        }
+
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+            => Task.FromResult(new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        {
+            ForceProbeCalls.Add(kind);
+            return Task.FromResult(Enabled ? ForceProbeResult : null);
+        }
     }
 }

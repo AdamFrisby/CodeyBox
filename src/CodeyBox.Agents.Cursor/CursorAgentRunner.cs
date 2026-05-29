@@ -19,14 +19,19 @@ namespace CodeyBox.Agents.Cursor;
 ///
 /// <para><b>Auth model.</b> Cursor's CLI uses subscription auth written by
 /// <c>agent login</c> to a credentials file on the host. The path is operator-
-/// configurable via <c>CODEYBOX_CURSOR_AUTH_FILE</c> with a sensible default
-/// (<c>~/.cursor/credentials.json</c>). The file's contents are shipped to the
-/// sandbox via <c>CODEYBOX_CURSOR_AUTH_JSON</c> and materialised at sandbox-
-/// prepare time (same pattern as Codex's <c>~/.codex/auth.json</c> flow); the
-/// host's credential directory is never bind-mounted into untrusted agent
-/// sandboxes. When the env var is absent, this is a no-op and the in-sandbox
-/// CLI is expected to use whatever auth path the operator provisioned in the
-/// image.</para>
+/// configurable via <c>CODEYBOX_CURSOR_AUTH_FILE</c> with a sensible default of
+/// the XDG path current Cursor CLI versions read — <c>~/.config/cursor/auth.json</c>
+/// (the legacy <c>~/.cursor/credentials.json</c> path is no longer read by the
+/// binary; materialising to it was the PR #138 cascade). The file's contents are
+/// shipped to the sandbox via <c>CODEYBOX_CURSOR_AUTH_JSON</c> and re-materialised
+/// at sandbox-prepare time to the matching in-VM path
+/// (<see cref="AuthMaterialiseScript"/> / <see cref="PrepareSandboxAsync"/> both
+/// write <c>~/.config/cursor/auth.json</c>); the host's credential directory is
+/// never bind-mounted into untrusted agent sandboxes. When the env var is absent,
+/// this is a no-op and the in-sandbox CLI is expected to use whatever auth path
+/// the operator provisioned in the image. The in-VM smoke probe execs this exact
+/// script and an <c>agent status</c> check, so auth-path drift between this runner
+/// and the CLI is caught at smoke time rather than on first dispatch.</para>
 /// </summary>
 public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {

@@ -48,6 +48,24 @@ public interface IInVmSmokeGate
     /// at a time) and never throws. A no-op when disabled.
     /// </summary>
     Task ProbeAllAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Operator-triggered forced re-probe of a single agent against the active
+    /// baseline, used by the <c>/admin/agent/{name}/smoke</c> recovery endpoint
+    /// after a fix (installed binary, rotated credentials, corrected auth path).
+    /// Unlike <see cref="EnsureAvailableAsync"/> this does <em>not</em>
+    /// short-circuit on an already-excluded agent — re-verifying a benched
+    /// agent's in-sandbox CLI is the whole point of the operator call, so an
+    /// in-VM exclusion (exit 127 / auth-path drift / workspace-trust) is cleared
+    /// here rather than waiting for the next background sweep. Routes the admin
+    /// endpoint through this port instead of the host-only credential probe, so
+    /// an operator can no longer get "smoke ok" while an in-VM bench stands.
+    /// Never throws. Returns the agent's availability after the probe, or
+    /// <c>null</c> when in-VM smoke is disabled or no in-VM probe is registered
+    /// for <paramref name="kind"/> (the caller then falls back to the host probe
+    /// verdict for its 404 / response decision).
+    /// </summary>
+    Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct);
 }
 
 /// <summary>

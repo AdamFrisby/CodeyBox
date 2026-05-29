@@ -700,6 +700,60 @@ public sealed class InVmSmokeProberTests
         Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
     }
 
+    [Fact]
+    public async Task EnsureProbedAsync_UnexpectedException_DefaultFailClosed_NeverThrows_AndBenches()
+    {
+        // A bug that escapes ProbeAgentAsync's inner transient-fault handling
+        // (e.g. a throwing IInVmSmokeProbe.BuildSteps, or a fault after a partial
+        // verdict) must be caught by EnsureProbedAsync's OUTER catch
+        // (InVmSmokeProber.cs:176): swallowed (the dispatch hot path must never
+        // throw) but, under the default fail-closed policy, benched so an
+        // unverified CLI is not left routable on the first dispatch. The inner
+        // catches cover credential / provisioning / exec / timeout faults; this
+        // pins the outer net none of those tests force.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            probes: [new ThrowingProbe()]);
+
+        // Must complete without throwing despite the probe blowing up.
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe threw unexpectedly", av.Reason);
+        // The fault throws before any sandbox is created, and the bench is never
+        // cached, so a later (recovered) probe self-heals it.
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_UnexpectedException_FailOpenOptOut_NeverThrows_AndDoesNotBench()
+    {
+        // Companion to the fail-closed case: with FailClosedOnProbeFault:false an
+        // unexpected exception in the outer catch must still be swallowed but must
+        // NOT bench a possibly-working agent.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                FailClosedOnProbeFault = false,
+            },
+            probes: [new ThrowingProbe()]);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
     private static bool IsAgent(SandboxExec exec, string sub) =>
         exec.Argv.Count >= 2 && exec.Argv[0] == CursorAgentRunner.DefaultBinary && exec.Argv[1] == sub;
 
@@ -746,6 +800,19 @@ public sealed class InVmSmokeProberTests
             Task.FromResult(_onExec(exec));
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// In-VM probe whose <see cref="IInVmSmokeProbe.BuildSteps"/> throws an
+    /// unexpected exception — a stand-in for an implementation bug that escapes
+    /// ProbeAgentAsync's inner transient-fault handling and must be caught by
+    /// EnsureProbedAsync's outer net. Kind is cursor so EnsureProbedAsync resolves it.
+    /// </summary>
+    private sealed class ThrowingProbe : IInVmSmokeProbe
+    {
+        public AgentKind Kind => AgentKind.Cursor;
+        public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential) =>
+            throw new InvalidOperationException("probe construction bug");
     }
 
     /// <summary>Credential provider that resolves null for every agent.</summary>

@@ -295,6 +295,12 @@ public sealed class AgentClassRouter
         // claim a quota threshold.
         var subscriptionTotal = sorted.Count(x => x.Member.Billing == AgentBilling.Subscription);
         var subscriptionSmokeExcluded = 0;
+        // Every member the availability gate benched (in-VM smoke / fast-fail /
+        // missing-probe), regardless of billing. The PayPerApi-only fallback below
+        // must never fire one of these: a smoke bench means the binary is broken,
+        // which the "fire despite low quota" fallback exists to override only for
+        // quota inaccuracy, not for a CLI that will exit 127 / fail auth (AC#1).
+        var smokeExcluded = new HashSet<(AgentKind, string?)>();
 
         // PayPerApi members that an exhausted operator budget pushed below threshold:
         // these must NOT be fired by the no-Subscription fallthrough below (doing so
@@ -344,6 +350,7 @@ public sealed class AgentClassRouter
                 var smokeReason = $"smoke gate: {availability.Reason}";
                 _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
+                smokeExcluded.Add((member.Agent, member.ModelId));
                 if (member.Billing == AgentBilling.Subscription)
                     subscriptionSmokeExcluded++;
                 continue;
@@ -533,6 +540,11 @@ public sealed class AgentClassRouter
         // EXCEPTIONS that must NOT be fired:
         //  - budget-exhausted: a configured operator spend cap (fail-open would burn money).
         //  - cap-saturated: the slot gate would refuse the dispatch.
+        //  - smoke-excluded: the in-VM smoke / fast-fail breaker benched the CLI
+        //    because the binary is broken; routing to it would reproduce the
+        //    exit-127 / auth cascade the gate exists to catch (AC#1). The
+        //    "fire despite low quota" fallback exists to override probe
+        //    inaccuracy, not to dispatch to a known-broken binary.
         // Spill through eligible candidates in score order, honouring the caller's
         // slot gate so the per-agent cap remains an authoritative gate for
         // PayPerApi members too.
@@ -540,6 +552,7 @@ public sealed class AgentClassRouter
         {
             if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
+            if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
             var fallback = candidate.Member;
             if (slotGate is not null && !slotGate.TryReserve(fallback.Agent))
             {
@@ -561,7 +574,9 @@ public sealed class AgentClassRouter
         // Build the park interval from whichever blocker is the soonest to clear.
         // budget-reset is typically minutes-to-hours; cap-retry is seconds. Both
         // can be active simultaneously (some PayPerApi members budget-exhausted,
-        // others cap-saturated) so we take the soonest.
+        // others cap-saturated) so we take the soonest. A smoke-only bench is
+        // cleared by the in-VM smoke sweep / operator reset, NOT by quota or
+        // budget reset, so it uses the full quota recheck window.
         var budgetRecheck = _opts.QuotaRecheckInterval;
         if (earliestBudgetReset is { } budgetReset)
         {
@@ -572,8 +587,13 @@ public sealed class AgentClassRouter
         var fallbackCapBlocked = capSaturatedMembers.Count > 0 || atCapAgents.Count > 0;
         if (fallbackCapBlocked && budgetRecheck > _opts.CapRetryRecheckInterval)
             budgetRecheck = _opts.CapRetryRecheckInterval;
+        var allFallbackSmokeExcluded = sorted.Count > 0
+            && sorted.All(x => smokeExcluded.Contains((x.Member.Agent, x.Member.ModelId)));
         string parkReason;
-        if (budgetExhaustedMembers.Count > 0 && fallbackCapBlocked)
+        if (allFallbackSmokeExcluded)
+            parkReason = $"all PayPerApi members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
+                         + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+        else if (budgetExhaustedMembers.Count > 0 && fallbackCapBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted or at their per-agent concurrency cap";
         else if (fallbackCapBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";

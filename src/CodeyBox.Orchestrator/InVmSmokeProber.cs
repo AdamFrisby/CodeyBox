@@ -117,6 +117,22 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
 
     /// <summary>
+    /// <see cref="IInVmSmokeGate.ForceProbeAsync"/>. Operator recovery path: force
+    /// a re-probe of a single agent regardless of its current exclusion (the admin
+    /// endpoint calls this after a fix), so an in-VM bench is cleared here rather
+    /// than only by the background sweep. Never throws. Returns null when disabled
+    /// or no probe is registered for the kind so the admin endpoint can fall back
+    /// to the host-probe verdict for its response / 404 decision.
+    /// </summary>
+    public async Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+    {
+        if (!Enabled) return null;
+        if (_probes.All(p => p.Kind != kind)) return null;
+        await EnsureProbedAsync(kind, baselineRef: null, ct);
+        return _availability.GetAvailability(kind);
+    }
+
+    /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this
     /// one call. Returns the agent's prior availability untouched when the gate

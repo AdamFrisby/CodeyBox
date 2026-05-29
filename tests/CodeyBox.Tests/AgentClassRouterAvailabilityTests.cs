@@ -145,6 +145,13 @@ public sealed class AgentClassRouterAvailabilityTests
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        {
+            Probed.Add(kind);
+            _onProbe(kind);
+            return Task.FromResult<AgentAvailability?>(_reg.GetAvailability(kind));
+        }
     }
 
     // ── Acceptance criterion 4: smoke-pass but fast-fail-127 also excludes ──
