@@ -198,11 +198,33 @@ public sealed record WorkItem
     /// The router picks any member whose base score is at or above this floor.
     /// Default 0: open to ANY agent — most tasks should run on whatever agent is
     /// available, and the quality-score-preferred router still picks the strongest
-    /// free member first. Set a high floor (e.g. 95) only for the few sensitive or
-    /// major-architectural items that must be restricted to frontier agents.
-    /// Persisted; existing records without the column default to 95 on read (legacy backfill).
+    /// free member first.
+    /// <para>
+    /// <b>Deprecated as the eligibility gate.</b> Use <see cref="RequiredCapabilities"/>
+    /// to gate which models may touch sensitive/architectural work. MinModelScore is
+    /// retained alongside the capability gate during the transition window: both must
+    /// pass. Persisted; existing records without the column default to 95 on read
+    /// (legacy backfill).
+    /// </para>
     /// </summary>
     public int MinModelScore { get; init; } = 0;
+
+    /// <summary>
+    /// Clearance tags this work item demands of the agent member that runs it.
+    /// Empty (the default) means "no clearance required" — any member of the
+    /// resolved <see cref="AgentClass"/> is eligible. When non-empty the router
+    /// only routes to members whose <see cref="AgentMembership.Capabilities"/>
+    /// covers EVERY tag here.
+    /// <para>
+    /// Replaces <see cref="MinModelScore"/> as the eligibility/clearance mechanism.
+    /// Capabilities express trust ("this model may handle sensitive work"),
+    /// QualityScore expresses capability/preference ("this eligible model is
+    /// strongest"). The two compose: capabilities gate WHO is eligible, QualityScore
+    /// ranks WHICH eligible member wins.
+    /// </para>
+    /// Tag comparison is ordinal, case-insensitive. Persisted as a JSON array.
+    /// </summary>
+    public IReadOnlyList<string> RequiredCapabilities { get; init; } = [];
 
     /// <summary>
     /// Display and pickup ordering for Queued items. Set to <c>CreatedAt.Ticks</c> on

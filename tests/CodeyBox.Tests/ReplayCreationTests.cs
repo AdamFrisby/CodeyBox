@@ -145,6 +145,26 @@ public sealed class ReplayCreationTests : IDisposable
         }
     }
 
+    // ── Eligibility fields (MinModelScore + RequiredCapabilities) ────────────
+
+    [Fact]
+    public async Task Replay_CopiesMinModelScoreAndRequiredCapabilitiesFromSource()
+    {
+        var source = DoneItem() with
+        {
+            MinModelScore = 95,
+            RequiredCapabilities = new[] { "sensitive", "architectural" },
+        };
+        await _factory.Store.CreateAsync(source);
+
+        var resp = await _client.PostAsJsonAsync($"/workitems/{source.Id}/replay", new { });
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+
+        var dto = await resp.Content.ReadFromJsonAsync<EligibilityResponse>();
+        Assert.Equal(95, dto!.MinModelScore);
+        Assert.Equal(new[] { "sensitive", "architectural" }, dto.RequiredCapabilities);
+    }
+
     // ── Local response shape ─────────────────────────────────────────────────
 
     private sealed record WorkItemResponse(
@@ -158,4 +178,9 @@ public sealed class ReplayCreationTests : IDisposable
         string? WorkBranch,
         string? ReplayOfWorkItemId,
         IReadOnlyList<string> DependsOn);
+
+    private sealed record EligibilityResponse(
+        string Id,
+        int MinModelScore,
+        IReadOnlyList<string> RequiredCapabilities);
 }

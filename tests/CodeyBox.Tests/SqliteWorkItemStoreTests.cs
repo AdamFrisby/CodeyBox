@@ -107,4 +107,59 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.NotNull(read);
         Assert.Empty(read!.DependsOn);
     }
+
+    [Fact]
+    public async Task RoundTrip_RequiredCapabilities_Preserved()
+    {
+        var item = Sample() with { RequiredCapabilities = new[] { "sensitive", "architectural" } };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(new[] { "sensitive", "architectural" }, read!.RequiredCapabilities);
+    }
+
+    [Fact]
+    public async Task RoundTrip_EmptyRequiredCapabilities_Preserved()
+    {
+        var item = Sample() with { RequiredCapabilities = Array.Empty<string>() };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Empty(read!.RequiredCapabilities);
+    }
+
+    [Fact]
+    public async Task UpdateAsync_PersistsRequiredCapabilities()
+    {
+        var item = Sample() with { RequiredCapabilities = Array.Empty<string>() };
+        await _store.CreateAsync(item);
+        var updated = item with { RequiredCapabilities = new[] { "sensitive" } };
+        await _store.UpdateAsync(updated);
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(new[] { "sensitive" }, read!.RequiredCapabilities);
+    }
+
+    [Fact]
+    public async Task ReadRow_CorruptRequiredCapabilitiesJson_FailsClosed()
+    {
+        // Persist normally, then poison the column directly via raw SQLite.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET required_capabilities_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "not-json");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        // Fail closed: surfacing the corruption beats silently routing the item
+        // as if no clearance were required.
+        await Assert.ThrowsAsync<InvalidDataException>(() => _store.GetAsync(item.Id));
+    }
 }

@@ -291,9 +291,10 @@ default.
 
 ### `minModelScore`
 
-The minimum `QualityScore` the router will accept for this item. Default `95`
-allows Gemini-3-Flash with high reasoning (score 95) as a frontier-adjacent
-fallback. Lower it for low-stakes work:
+The minimum `QualityScore` the router will accept for this item. Default `0`
+(open to any agent — the router still picks the strongest free member by
+quality score). Set a high floor only for the few sensitive or major-
+architectural items that must be restricted to frontier agents.
 
 ```jsonc
 {
@@ -308,6 +309,44 @@ Valid range: `0`–`200`. Values outside the range are clamped at the API layer.
 If no class member meets the floor the item **fails immediately** with error
 `ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N` — it is
 not retried. Lower `minModelScore` or add a capable member to the class.
+
+> **Deprecated as the eligibility gate.** `minModelScore` is being replaced by
+> the explicit `requiredCapabilities` mechanism below. Both are honoured during
+> the transition window (a member must pass both gates) so existing items keep
+> working unchanged.
+
+### `requiredCapabilities`
+
+A list of clearance/trust tags every routed agent member must declare. Empty
+or omitted (the default) means "no clearance required" — any member of the
+resolved agent class is eligible. When non-empty, the router only routes the
+item to members whose `Capabilities` list covers every tag here.
+
+```jsonc
+{
+  "projectId": "core",
+  "title": "Rewrite auth middleware",
+  "prompt": "…",
+  "agentClassId": "frontier-coding",
+  "requiredCapabilities": ["sensitive"]
+}
+```
+
+Trust vs. preference:
+
+- `requiredCapabilities` expresses **trust** ("only these models may touch
+  this work") — an explicit, declared property of the agent membership.
+- `QualityScore` continues to drive **preference** ("of the eligible models,
+  pick the strongest") — never the gate.
+
+See [Capability gate in `docs/agent-classes.md`](agent-classes.md#capability-gate)
+for the recommended tag vocabulary, member declaration syntax, and migration
+notes from `minModelScore`.
+
+Tag values are compared case-insensitively; duplicates are de-duped and
+whitespace trimmed at create / patch time. The list is editable via
+`PATCH /workitems/{id}` while the item is still `Queued` and is preserved
+across `/replay`.
 
 ---
 

@@ -183,6 +183,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Partial index used by the BaselineImageReaper's live-ref query.
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_baseline_image_ref ON work_items(baseline_image_ref) WHERE baseline_image_ref IS NOT NULL;");
 
+        // Required-capability eligibility gate. Composes (AND) with min_model_score
+        // during the transition window; min_model_score is slated for removal once
+        // legacy items have migrated. Stored as a JSON array; default '[]' = open
+        // to any member of the routed class.
+        RunMigration("ALTER TABLE work_items ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]';");
+
         // Per-iteration dispatch record. One row per (work_item_id, iteration);
         // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
         // restart-recovery for the same iteration) overwrites the row via
@@ -281,13 +287,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
-                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref)
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
+                        required_capabilities_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
-                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref);
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
+                        $required_capabilities);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -387,7 +395,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
-                    baseline_image_ref = $baseline_image_ref
+                    baseline_image_ref = $baseline_image_ref,
+                    required_capabilities_json = $required_capabilities
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -439,7 +448,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
-                    baseline_image_ref = $baseline_image_ref
+                    baseline_image_ref = $baseline_image_ref,
+                    required_capabilities_json = $required_capabilities
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -1224,6 +1234,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
         cmd.Parameters.AddWithValue("$conflict_rework_attempts", item.ConflictReworkAttempts);
         cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$required_capabilities",
+            JsonSerializer.Serialize(item.RequiredCapabilities));
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1276,7 +1288,36 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),
         ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
         BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
+        RequiredCapabilities = ReadRequiredCapabilities(r),
     };
+
+    private static IReadOnlyList<string> ReadRequiredCapabilities(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("required_capabilities_json");
+        if (r.IsDBNull(ord)) return [];
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return [];
+        try
+        {
+            var arr = JsonSerializer.Deserialize<string[]>(json);
+            return arr is null || arr.Length == 0 ? [] : arr;
+        }
+        catch (JsonException ex)
+        {
+            // Fail closed: a clearance gate must not silently drop requirements
+            // when the persisted value is unreadable. Surface the corruption so
+            // the row is not returned at all (the work item stays unpickable
+            // until an operator repairs the JSON) instead of treating it as
+            // "no requirement" and letting any member route the item.
+            var idOrd = r.GetOrdinal("id");
+            var id = r.IsDBNull(idOrd) ? "(unknown)" : r.GetString(idOrd);
+            throw new InvalidDataException(
+                $"work item {id}: required_capabilities_json is not a valid JSON string array; " +
+                $"refusing to read the row to avoid silently clearing the clearance gate. " +
+                $"Repair the column to a JSON array (e.g. '[]' for open).",
+                ex);
+        }
+    }
 
     private static WorkItemCancellationReason? ReadCancellationReason(SqliteDataReader r)
     {

@@ -10,7 +10,7 @@ namespace CodeyBox.Orchestrator;
 /// Resolution algorithm (per pickup attempt):
 /// <list type="number">
 ///   <item>Determine the class: <see cref="WorkItem.AgentClassId"/> → <see cref="Project.DefaultAgentClass"/> → null (no routing).</item>
-///   <item>Filter members to those whose base <see cref="AgentMembership.QualityScore"/> ≥ <see cref="WorkItem.MinModelScore"/> (eligibility gate; TOD modifiers do not affect the floor check).</item>
+///   <item>Filter to eligible members: must declare every tag in <see cref="WorkItem.RequiredCapabilities"/> AND meet the legacy <see cref="WorkItem.MinModelScore"/> floor (both gates compose with AND during the transition window; TOD modifiers do not affect either check).</item>
 ///   <item>If no member is eligible, fail with <c>ROUTING_NO_ELIGIBLE</c> — no silent downgrade.</item>
 ///   <item>Compute each eligible member's effective score: base + sum of applicable time-of-day modifiers.</item>
 ///   <item>Sort descending by effective score; ties broken by Subscription before PayPerApi, then original config order.</item>
@@ -191,10 +191,13 @@ public sealed class AgentClassRouter
             return new AgentRoutingDecision { Reason = $"unknown agent class '{classId}'" };
         }
 
-        // Step 1: filter by base QualityScore — TOD modifiers do not affect eligibility.
+        // Step 1: filter by eligibility — both the legacy QualityScore floor and
+        // the new capability gate must pass during the transition window.
+        // TOD modifiers do not affect eligibility (they tune routing PREFERENCE only).
         var eligible = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
+            .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
             .ToList();
 
         if (eligible.Count == 0)
@@ -203,18 +206,19 @@ public sealed class AgentClassRouter
                 ? agentClass.Members.Max(m => m.QualityScore)
                 : 0;
             var reason = $"ROUTING_NO_ELIGIBLE: no member of class '{classId}' meets " +
-                         $"MinModelScore={item.MinModelScore} (best available={best})";
+                         $"MinModelScore={item.MinModelScore} / RequiredCapabilities=[{string.Join(",", item.RequiredCapabilities)}] " +
+                         $"(best available={best})";
             _log.LogError("Work item {Id}: {Reason}", item.Id, reason);
-            // Emit scored audit event so below-floor rejects appear in the audit log.
+            // Emit scored audit event so eligibility rejects appear in the audit log.
             var nowUtcFloor = _time.GetUtcNow();
-            var belowFloor = agentClass.Members
+            var below = agentClass.Members
                 .Select(m => (
                     Agent: m.Agent,
                     ModelId: m.ModelId,
                     EffectiveScore: m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtcFloor),
-                    RejectReason: $"below floor ({m.QualityScore} < {item.MinModelScore})"))
+                    RejectReason: DescribeIneligibility(m, item)))
                 .ToList();
-            AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, belowFloor);
+            AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, below);
             return new AgentRoutingDecision { Reason = reason, NoEligibleMembers = true };
         }
 
@@ -237,14 +241,16 @@ public sealed class AgentClassRouter
         // Rejected members accumulate for the audit event.
         var rejected = new List<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)>();
 
-        // Also track which below-floor members were filtered out.
+        // Also track which members were filtered out by eligibility gates so the
+        // audit log shows why they didn't make the sort list (separate from
+        // gate/probe rejections that happen later).
         foreach (var m in agentClass.Members)
         {
-            if (m.QualityScore < item.MinModelScore)
-            {
-                var eff = m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtc);
-                rejected.Add((m.Agent, m.ModelId, eff, $"below floor ({m.QualityScore} < {item.MinModelScore})"));
-            }
+            var failsScore = m.QualityScore < item.MinModelScore;
+            var failsCaps = !MemberCoversRequiredCapabilities(m, item.RequiredCapabilities);
+            if (!failsScore && !failsCaps) continue;
+            var eff = m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtc);
+            rejected.Add((m.Agent, m.ModelId, eff, DescribeIneligibility(m, item)));
         }
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
@@ -452,9 +458,10 @@ public sealed class AgentClassRouter
     /// item leaving Working.
     /// </para>
     /// <para>
-    /// Returns an empty list when no class is configured, the class has no
-    /// members above the work item's <see cref="WorkItem.MinModelScore"/>, or
-    /// every eligible member is currently marked exhausted in this process.
+    /// Returns an empty list when no class is configured, no class member is
+    /// eligible (fails the <see cref="WorkItem.MinModelScore"/> floor or does
+    /// not cover the work item's <see cref="WorkItem.RequiredCapabilities"/>),
+    /// or every eligible member is currently marked exhausted in this process.
     /// </para>
     /// </summary>
     public IReadOnlyList<AgentMembership> OrderedFallbackCandidates(WorkItem item, Project? project)
@@ -478,6 +485,7 @@ public sealed class AgentClassRouter
         return agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
+            .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
             .Where(x => !IsExhausted(x.Member, nowUtc))
             .Where(x => _availability is null || _availability.GetAvailability(x.Member.Agent).Available)
             .Select(x => new
@@ -558,6 +566,11 @@ public sealed class AgentClassRouter
         {
             // PayPerApi members never park on quota.
             if (member.Billing == AgentBilling.PayPerApi) continue;
+            // Skip members the eligibility gates already rule out — there is no
+            // point waiting for their quota to reset when they would still be
+            // rejected at routing time.
+            if (member.QualityScore < item.MinModelScore) continue;
+            if (!MemberCoversRequiredCapabilities(member, item.RequiredCapabilities)) continue;
 
             AgentQuotaSnapshot snapshot;
             try
@@ -785,6 +798,47 @@ public sealed class AgentClassRouter
         return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);
     }
 
+    /// <summary>
+    /// Returns true when <paramref name="member"/> declares every tag in
+    /// <paramref name="required"/>. An empty <paramref name="required"/> list
+    /// returns true (open-by-default). Comparison is ordinal, case-insensitive.
+    /// </summary>
+    internal static bool MemberCoversRequiredCapabilities(
+        AgentMembership member, IReadOnlyList<string> required)
+    {
+        if (required.Count == 0) return true;
+        var declared = member.Capabilities;
+        if (declared.Count == 0) return false;
+        foreach (var tag in required)
+        {
+            var hit = false;
+            foreach (var have in declared)
+            {
+                if (string.Equals(have, tag, StringComparison.OrdinalIgnoreCase))
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) return false;
+        }
+        return true;
+    }
+
+    private static string DescribeIneligibility(AgentMembership member, WorkItem item)
+    {
+        var failsScore = member.QualityScore < item.MinModelScore;
+        var failsCaps = !MemberCoversRequiredCapabilities(member, item.RequiredCapabilities);
+        if (failsScore && failsCaps)
+            return $"below floor ({member.QualityScore} < {item.MinModelScore}); " +
+                   $"missing capabilities (required=[{string.Join(",", item.RequiredCapabilities)}], " +
+                   $"declared=[{string.Join(",", member.Capabilities)}])";
+        if (failsScore)
+            return $"below floor ({member.QualityScore} < {item.MinModelScore})";
+        return $"missing capabilities (required=[{string.Join(",", item.RequiredCapabilities)}], " +
+               $"declared=[{string.Join(",", member.Capabilities)}])";
+    }
+
     private static int ComputeTodModifier(IReadOnlyList<ParsedTodModifier> modifiers, AgentKind agent, DateTimeOffset nowUtc)
     {
         var total = 0;
@@ -903,8 +957,11 @@ public sealed record AgentRoutingDecision
     public string Reason { get; init; } = "";
 
     /// <summary>
-    /// True when no class member meets the work item's MinModelScore floor.
-    /// The caller must fail the item immediately rather than waiting or routing.
+    /// True when no class member is eligible — either the legacy
+    /// <see cref="WorkItem.MinModelScore"/> floor or the new
+    /// <see cref="WorkItem.RequiredCapabilities"/> gate (or both) excludes
+    /// every member. The caller must fail the item immediately rather than
+    /// waiting or routing.
     /// </summary>
     public bool NoEligibleMembers { get; init; }
 }

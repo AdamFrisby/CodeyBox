@@ -378,6 +378,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                                 m.ModelId,
                                 m.QualityScore,
                                 m.ReasoningMode,
+                                Capabilities = m.Capabilities
+                                    .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                                    .ToArray(),
                             })
                             .ToArray(),
                     })

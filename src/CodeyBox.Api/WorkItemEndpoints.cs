@@ -300,6 +300,14 @@ internal static class WorkItemEndpoints
             priority = p;
         }
 
+        IReadOnlyList<string> requiredCapabilities = [];
+        if (req.RequiredCapabilities is { } reqCaps)
+        {
+            var (normalised, capErr) = NormaliseRequiredCapabilities(reqCaps);
+            if (capErr is not null) return capErr;
+            requiredCapabilities = normalised!;
+        }
+
         // Use creation timestamp as default queue position so new items sort after
         // any explicitly reordered items (which get small integers 1, 2, 3 …).
         var item = new WorkItem
@@ -319,6 +327,7 @@ internal static class WorkItemEndpoints
             Priority = priority,
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
+            RequiredCapabilities = requiredCapabilities,
         };
         if (req.WorkTimeoutMinutes is { } w)
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
@@ -704,6 +713,8 @@ internal static class WorkItemEndpoints
             DependsOn = source.DependsOn,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             ReplayOfWorkItemId = source.Id,
+            MinModelScore = source.MinModelScore,
+            RequiredCapabilities = source.RequiredCapabilities,
         };
 
         await store.CreateAsync(replay, ct);
@@ -1158,6 +1169,13 @@ internal static class WorkItemEndpoints
         if (body.MinModelScore is { } minScore)
             updated = updated with { MinModelScore = Math.Clamp(minScore, 0, 200), UpdatedAt = now };
 
+        if (body.RequiredCapabilities is { } patchCaps)
+        {
+            var (normalised, capErr) = NormaliseRequiredCapabilities(patchCaps);
+            if (capErr is not null) return capErr;
+            updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
+        }
+
         // TryUpdateIfStateAsync guards against a race where the orchestrator picks
         // up the item between the GetAsync above and this write.
         var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
@@ -1171,7 +1189,8 @@ internal static class WorkItemEndpoints
             agentChanged: body.Agent is not null,
             workTimeoutChanged: body.WorkTimeoutMinutes is not null,
             mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
-            minModelScoreChanged: body.MinModelScore is not null);
+            minModelScoreChanged: body.MinModelScore is not null,
+            requiredCapabilitiesChanged: body.RequiredCapabilities is not null);
 
         var statesById = new Dictionary<WorkItemId, WorkItemState>();
         var depExternalIds = new Dictionary<WorkItemId, string?>();
@@ -1849,7 +1868,10 @@ internal static class WorkItemEndpoints
             PromptRevision: item.PromptRevision,
             Iterations: iterations?
                 .Select(i => new WorkItemIterationDto(i.Iteration, i.PromptRevisionAtDispatch, i.DispatchedAt))
-                .ToList());
+                .ToList(),
+            RequiredCapabilities: item.RequiredCapabilities.Count == 0
+                ? Array.Empty<string>()
+                : item.RequiredCapabilities.ToList());
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -1869,6 +1891,43 @@ internal static class WorkItemEndpoints
 
     private const int GlobalMinPriority = -1000;
     private const int GlobalMaxPriority = 1000;
+    private const int MaxRequiredCapabilities = 16;
+    private const int MaxCapabilityLength = 64;
+
+    /// <summary>
+    /// Normalises and validates a caller-supplied list of required-capability
+    /// tags. Returns the normalised list, or null + error result on failure.
+    /// Trims whitespace, drops empties, de-duplicates case-insensitively.
+    /// </summary>
+    private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(
+        IReadOnlyList<string> raw)
+    {
+        if (raw.Count > MaxRequiredCapabilities)
+            return (null, Results.BadRequest(new
+            {
+                error = $"requiredCapabilities may contain at most {MaxRequiredCapabilities} entries",
+            }));
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var entry in raw)
+        {
+            if (entry is null) continue;
+            var tag = entry.Trim();
+            if (tag.Length == 0) continue;
+            if (tag.Length > MaxCapabilityLength)
+                return (null, Results.BadRequest(new
+                {
+                    error = $"requiredCapabilities entry '{tag}' exceeds {MaxCapabilityLength} chars",
+                }));
+            if (tag.Any(char.IsControl))
+                return (null, Results.BadRequest(new
+                {
+                    error = "requiredCapabilities entries must not contain control characters",
+                }));
+            if (seen.Add(tag)) result.Add(tag);
+        }
+        return (result, null);
+    }
 
     /// <summary>
     /// Validates a requested priority against the global cap and the project's
@@ -2016,7 +2075,10 @@ public sealed record CreateWorkItemRequest(
     // Namespaced external IDs. The legacy singular `ExternalId` field is
     // accepted as a write-shortcut stored under namespace 'legacy'. Sending
     // both is allowed only when they agree; conflicting values 400.
-    IReadOnlyDictionary<string, string>? ExternalIds = null);
+    IReadOnlyDictionary<string, string>? ExternalIds = null,
+    // Clearance tags the agent member must declare. Empty (default) ⇒ any
+    // member of the resolved AgentClass is eligible.
+    IReadOnlyList<string>? RequiredCapabilities = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -2028,7 +2090,8 @@ public sealed record PatchWorkItemRequest(
     string? Agent = null,
     int? WorkTimeoutMinutes = null,
     int? MergeTimeoutMinutes = null,
-    int? MinModelScore = null);
+    int? MinModelScore = null,
+    IReadOnlyList<string>? RequiredCapabilities = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 
@@ -2096,7 +2159,8 @@ public sealed record WorkItemDto(
     string? CancellationSource = null,
     int TransientCancelRetries = 0,
     int PromptRevision = 1,
-    IReadOnlyList<WorkItemIterationDto>? Iterations = null);
+    IReadOnlyList<WorkItemIterationDto>? Iterations = null,
+    IReadOnlyList<string>? RequiredCapabilities = null);
 
 public sealed record AgentFallbackDto(
     string Id,

@@ -62,6 +62,19 @@ public static class AgentClassesConfigBuilder
                         $"ReasoningMode=\"high\". Either set ReasoningMode=\"high\" (requires @google/gemini-cli ≥0.1.9 " +
                         $"with --thinking support; install via MultipassExtraRuncmd) or lower QualityScore below 90.");
                 GeminiKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, agentKind, m.ModelId, log);
+                // Capabilities are operator-declared tags. Normalise (trim + drop empties)
+                // and de-duplicate case-insensitively so '"sensitive"' and '"Sensitive"'
+                // don't both end up in the list. Tag values themselves are otherwise
+                // free-form — the router compares with OrdinalIgnoreCase.
+                var capabilities = new List<string>();
+                var seenCapabilities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var raw in m.Capabilities)
+                {
+                    if (string.IsNullOrWhiteSpace(raw)) continue;
+                    var tag = raw.Trim();
+                    if (seenCapabilities.Add(tag))
+                        capabilities.Add(tag);
+                }
                 members.Add(new AgentMembership
                 {
                     Agent = agentKind,
@@ -69,6 +82,7 @@ public static class AgentClassesConfigBuilder
                     ModelId = m.ModelId,
                     QualityScore = score,
                     ReasoningMode = m.ReasoningMode,
+                    Capabilities = capabilities,
                 });
             }
 
@@ -121,7 +135,7 @@ public static class AgentClassesConfigBuilder
                 throw new InvalidOperationException(
                     $"AgentScoreModifiers.ByTimeOfDay: modifier for '{entry.Agent}' is {entry.Modifier}; " +
                     $"absolute value must be ≤ 5. Modifiers are tiebreakers, not eligibility gates. " +
-                    $"Use MinModelScore on the work item to gate by capability.");
+                    $"Use RequiredCapabilities on the work item to gate by clearance.");
 
             var parsedWindows = new List<ParsedTimeWindow>();
             foreach (var w in entry.Windows)

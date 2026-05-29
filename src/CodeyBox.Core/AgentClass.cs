@@ -2,9 +2,11 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// A named group of interchangeable agents. When a work item requests a class,
-/// the router picks the member with the highest effective quality score that meets
-/// the work item's MinModelScore floor, then probes quota; it waits if all
-/// subscription-billed eligible members are exhausted.
+/// the router picks the member with the highest effective quality score that is
+/// eligible (covers the work item's <see cref="WorkItem.RequiredCapabilities"/>
+/// AND meets the legacy <see cref="WorkItem.MinModelScore"/> floor during the
+/// transition window), then probes quota; it waits if all subscription-billed
+/// eligible members are exhausted.
 /// </summary>
 public sealed record AgentClass
 {
@@ -57,6 +59,22 @@ public sealed record AgentMembership
     /// config validation rejects Gemini-90+-without-high-reasoning at startup.
     /// </summary>
     public string? ReasoningMode { get; init; }
+
+    /// <summary>
+    /// Operator-declared clearance tags this member is trusted to handle, e.g.
+    /// <c>"sensitive"</c>, <c>"architectural"</c>, <c>"security"</c>. Distinct from
+    /// <see cref="QualityScore"/>: capabilities are an explicit trust/clearance gate
+    /// (which models may touch the work), whereas QualityScore is a routing PREFERENCE
+    /// (which eligible model is strongest).
+    /// <para>
+    /// The router treats a work item with
+    /// <see cref="WorkItem.RequiredCapabilities"/> set as eligible-on-this-member only
+    /// when this list contains every required tag. Members with no declared tags can
+    /// still run any item whose required set is empty (open-by-default).
+    /// </para>
+    /// Tag comparison is ordinal, case-insensitive. Default empty.
+    /// </summary>
+    public IReadOnlyList<string> Capabilities { get; init; } = [];
 }
 
 /// <summary>How the agent is billed, which determines quota-wait behaviour.</summary>

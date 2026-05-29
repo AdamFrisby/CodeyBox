@@ -135,12 +135,13 @@ public static class AuditLog
         bool agentChanged,
         bool workTimeoutChanged = false,
         bool mergeTimeoutChanged = false,
-        bool minModelScoreChanged = false) =>
+        bool minModelScoreChanged = false,
+        bool requiredCapabilitiesChanged = false) =>
         Audit("work_item.patched")
             .Information(
-                "Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged} workTimeout={WorkTimeoutChanged} mergeTimeout={MergeTimeoutChanged} minModelScore={MinModelScoreChanged}",
+                "Work item {WorkItemId} patched: title={TitleChanged} prompt={PromptChanged} agent={AgentChanged} workTimeout={WorkTimeoutChanged} mergeTimeout={MergeTimeoutChanged} minModelScore={MinModelScoreChanged} requiredCapabilities={RequiredCapabilitiesChanged}",
                 id.ToString(), titleChanged, promptChanged, agentChanged,
-                workTimeoutChanged, mergeTimeoutChanged, minModelScoreChanged);
+                workTimeoutChanged, mergeTimeoutChanged, minModelScoreChanged, requiredCapabilitiesChanged);
 
     /// <summary>
     /// Distinct audit event for priority changes. Records the previous and new

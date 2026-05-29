@@ -84,6 +84,7 @@ only a tiebreaker when scores are equal. Keep the obvious order for readability
 | `ModelId` | no | Optional model override passed to the agent CLI as `--model`. |
 | `QualityScore` | **yes** | Operator-curated capability score on a 0–200 scale. No silent default; startup rejects missing scores with a migration message. |
 | `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
+| `Capabilities` | no | List of clearance/trust tags this member is allowed to handle (e.g. `["sensitive", "architectural"]`). Default empty — a member with no tags can only run work items that require no tags. See [Capability gate](#capability-gate) below. |
 
 ---
 
@@ -108,11 +109,16 @@ models means "interchangeable for this work; swap freely".
 
 ### How scores drive selection
 
-1. **Floor filter.** Each work item carries a `MinModelScore` (default 95).
-   Members whose *base* score is below the floor are excluded before any quota
-   probe. The router never silently downgrades to a weaker model.
+Trust/clearance is governed by **`RequiredCapabilities`** on the work item (see
+[Capability gate](#capability-gate) below). `QualityScore` orders the
+already-eligible members by preference. During the legacy-eligibility transition
+window a `MinModelScore` floor still composes (AND) with the capability gate.
+
+1. **Eligibility.** Filter to members that (a) declare every tag in
+   `RequiredCapabilities` and (b) meet the `MinModelScore` floor (default 0 —
+   open-by-default). Both gates ignore TOD modifiers.
 2. **Effective score.** Time-of-day modifiers (see below) are added to the base
-   score to produce each member's *effective* score for this pickup.
+   score to produce each eligible member's *effective* score for this pickup.
 3. **Sort.** Members are sorted descending by effective score. Ties are broken
    by billing (`Subscription` before `PayPerApi`), then original config order.
 4. **Quota probe.** Members are probed in sorted order; the first one with
@@ -120,16 +126,96 @@ models means "interchangeable for this work; swap freely".
 
 The effective score of a member can drop *below* the floor after a TOD modifier
 is applied — that is intentional. The floor check uses the *base* score because
-TOD modifiers are preference-shaping tiebreakers, not capability gates. A model
+TOD modifiers are preference-shaping tiebreakers, not eligibility gates. A model
 with base score 95 remains eligible even if a −1 modifier makes its effective
 score 94.
 
 ### No eligible member
 
-If no member's base score meets the floor, the work item **fails immediately**
-with error `ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N`.
-The item is not retried; the operator must lower `MinModelScore` on the item or
-add a capable member to the class.
+If no member is eligible, the work item **fails immediately** with error
+`ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N /
+RequiredCapabilities=[...]`. The item is not retried; the operator must relax
+the work item's clearance/floor or add a capable member to the class.
+
+---
+
+## Capability gate
+
+`QualityScore` is a **routing preference** — "which eligible model is the
+strongest." It is not the right place to express **trust** — "which models may
+touch this sensitive code at all." Conflating the two means a strong model at
+QS 92 is wrongly excluded from a sensitive item gated at QS 95, and adjusting a
+score for unrelated reasons silently changes who is allowed to do the work.
+
+Each member can declare a `Capabilities` tag list, and each work item can require
+a `RequiredCapabilities` set. The router routes the item only to members whose
+declared capabilities cover every required tag. Members with no tags can still
+run any item whose required set is empty (open-by-default).
+
+```json
+{
+  "Agent": "claude",
+  "Billing": "Subscription",
+  "ModelId": "claude-opus-4-7",
+  "QualityScore": 100,
+  "Capabilities": ["sensitive", "architectural"]
+}
+```
+
+A work item then declares what it needs:
+
+```http
+POST /workitems
+{
+  "projectId": "core",
+  "title": "Rewrite the auth middleware",
+  "prompt": "…",
+  "agentClassId": "frontier-coding",
+  "requiredCapabilities": ["sensitive"]
+}
+```
+
+Eligibility composes:
+
+- `RequiredCapabilities` is the **clearance/trust gate**.
+- `MinModelScore` is the legacy capability floor, retained alongside the
+  capability gate during the transition window. Both must pass.
+- `QualityScore` ranks among eligible members (highest effective score wins).
+  It is **never** the gate.
+
+Recommended tag vocabulary (start small, extend as needs emerge):
+
+| Tag | Use for |
+|-----|---------|
+| `sensitive` | Anything you would not want a weaker or unverified model to touch — auth flows, secrets handling, billing logic. |
+| `architectural` | Cross-cutting refactors and design-doc-shaped work. |
+| `security` | Threat-modelling, dependency vulns, anything in a security review. |
+
+Tag comparison is case-insensitive; values are otherwise free-form so you can
+extend the vocabulary without code changes. The builder de-dupes and trims, so
+`"Sensitive"` and `"sensitive"` collapse to a single tag.
+
+### Default-open
+
+A work item created without `requiredCapabilities` (or with an empty list) is
+eligible on every member of its class. Most items should run on whatever agent
+is free; restrict via `requiredCapabilities` only for the small set of items
+that genuinely demand it.
+
+### Migration from `MinModelScore`
+
+The `MinModelScore` floor still works during the transition window — set both
+on an item and it must pass both gates. To move existing restricted items:
+
+1. Tag your frontier members with the relevant clearance, e.g. add
+   `"Capabilities": ["sensitive"]` to the Claude/Codex frontier members.
+2. Replace `minModelScore: 95` on items that need restriction with
+   `requiredCapabilities: ["sensitive"]`.
+3. The floor can then default to 0; the capability gate carries the trust
+   semantics.
+
+A follow-up item will deprecate and remove `MinModelScore` once existing items
+have migrated.
 
 ---
 
@@ -181,7 +267,10 @@ A startup warning is emitted when a class has only Subscription members.
 On every pickup attempt for a work item with an `AgentClassId`:
 
 1. Resolve the class from the catalog (case-insensitive on `Id`).
-2. **Filter** members to those whose base `QualityScore ≥ item.MinModelScore`.
+2. **Filter** members by eligibility — both gates must pass:
+   - The legacy floor: base `QualityScore ≥ item.MinModelScore`.
+   - The capability gate: the member's `Capabilities` covers every tag in
+     `item.RequiredCapabilities` (an empty required list always passes).
    If none qualify, fail immediately with `ROUTING_NO_ELIGIBLE`.
 3. **Compute effective scores**: `effective = base + sum(active TOD modifiers)`.
 4. **Sort** descending by effective score. Ties: Subscription before PayPerApi,

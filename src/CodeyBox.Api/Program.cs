@@ -2590,6 +2590,13 @@ namespace CodeyBox.Api
         /// members with QualityScore >= 90.
         /// </summary>
         public string? ReasoningMode { get; set; }
+        /// <summary>
+        /// Clearance/capability tags this member is trusted to handle, e.g.
+        /// <c>["sensitive", "architectural"]</c>. Default empty — members with
+        /// no tags can only run work items that require no tags. See
+        /// docs/agent-classes.md for the recommended tag vocabulary.
+        /// </summary>
+        public List<string> Capabilities { get; set; } = [];
     }
 
     /// <summary>Quota router tuning. Bound from CodeyBox:QuotaRouter.</summary>

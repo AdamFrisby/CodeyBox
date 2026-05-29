@@ -123,7 +123,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
                 self => self.BuildScheduler(BuildRouter(availablePct: 100, memberQualityScore: 80), BuildProjects()),
                 () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with { MinModelScore = 95 },
                 "WaitingForQuotaReset",
-                _ => "ROUTING_NO_ELIGIBLE: no member of class 'frontier' meets MinModelScore=95 (best available=80)"
+                _ => "ROUTING_NO_ELIGIBLE: no member of class 'frontier' meets MinModelScore=95 / RequiredCapabilities=[] (best available=80)"
             },
             {
                 "retry-failed",

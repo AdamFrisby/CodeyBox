@@ -79,6 +79,12 @@ Queue a new work item.
   [`external-ids.md`](external-ids.md#dependency-batching-without-round-trips).
   Unknown IDs, self references, and cycles are rejected with `400`. See
   [`work-items.md`](work-items.md) for details.
+* `requiredCapabilities` — optional array of clearance/trust tags every
+  routed agent member must declare (e.g. `["sensitive"]`). Defaults to empty
+  (any member of the resolved agent class is eligible). Tags are trimmed and
+  de-duplicated case-insensitively; max 16 entries, each ≤64 chars. See
+  [`agent-classes.md`](agent-classes.md#capability-gate) for the recommended
+  tag vocabulary.
 
 Response: `201 Created` with the work item record.
 
@@ -771,7 +777,8 @@ provided (non-null) in the body are updated.
   "agent": "optional agent override",
   "workTimeoutMinutes": 240,
   "mergeTimeoutMinutes": 60,
-  "minModelScore": 70
+  "minModelScore": 70,
+  "requiredCapabilities": ["sensitive"]
 }
 ```
 
@@ -779,6 +786,7 @@ provided (non-null) in the body are updated.
 * Returns `409 Conflict` when the item is not in `Queued` state (in-flight items are read-only).
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
 * `workTimeoutMinutes` is clamped to `[1, 480]`, `mergeTimeoutMinutes` to `[1, 240]`, `minModelScore` to `[0, 200]` — out-of-range values pin to the boundary rather than 400, matching the creation surface. This lets an operator bulk-PATCH the queue after a defaults bump without special-casing stray inputs.
+* `requiredCapabilities` is the explicit clearance/trust gate (see [agent-classes.md](agent-classes.md#capability-gate)). Tags are trimmed, de-duplicated case-insensitively, and validated for length (≤64 chars) and count (≤16 entries). Sending the field replaces the existing list; omit it to leave the list unchanged.
 * Priority is not editable here — use `PATCH /workitems/{id}/priority` (works on any non-terminal state, uses a TOCTOU-safe partial UPDATE).
 
 ### `PATCH /workitems/{id}/priority`

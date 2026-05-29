@@ -153,10 +153,10 @@ See [docs/agent-classes.md](agent-classes.md) for the full model including
     "Id": "frontier-coding",
     "DisplayName": "Frontier coding agents",
     "Members": [
-      { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
-      { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100 },
+      { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100, "Capabilities": ["sensitive"] },
+      { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100, "Capabilities": ["sensitive"] },
       { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash-preview", "QualityScore": 95, "ReasoningMode": "high" },
-      { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100 }
+      { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100, "Capabilities": ["sensitive"] }
     ]
   }
 ]
@@ -165,7 +165,8 @@ See [docs/agent-classes.md](agent-classes.md) for the full model including
 Validation at startup: unique `Id`s, non-empty `Members`, valid `Billing`
 values, `QualityScore` present and in 0–200, Gemini members with
 `QualityScore ≥ 90` must have `ReasoningMode="high"`. A class with only
-`Subscription` members emits a warning.
+`Subscription` members emits a warning. `Capabilities` is optional; the
+builder de-dupes case-insensitively and trims whitespace.
 
 ---
 
