@@ -465,7 +465,11 @@ public static class AuditLog
 
     /// <summary>
     /// Emitted when the pickup-time rebase resolver routed past a candidate
-    /// whose non-cap pre-dispatch gate rejected it. <paramref name="reason"/>
+    /// whose non-cap pre-dispatch gate rejected it. <paramref name="rejectedAgent"/>
+    /// is the resolver's primary candidate: the configured
+    /// <c>Project.Audit.AuditAgent</c> when set and registered, otherwise the
+    /// work-phase runner. <paramref name="chosenAgent"/> is the class-chain
+    /// member that took over. <paramref name="reason"/>
     /// carries the actual gate reason (for example
     /// <c>quota exhausted (6.0%)</c>) so operators are not misled into reading
     /// a quota steer as a credential problem. Cap-driven reroutes use

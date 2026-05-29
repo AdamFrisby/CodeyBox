@@ -7,6 +7,8 @@ using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -15,8 +17,18 @@ namespace CodeyBox.Tests;
 /// originally exercised through the deleted text-only rebase resolver harness.
 /// The current resolver is in-VM and agentic, so these tests pin both the
 /// candidate list and the full pickup-rebase path that consumes it.
+///
+/// <para>
+/// In the <c>GlobalSerilog</c> collection (not <c>Pipeline integration</c>):
+/// the routing tests emit <see cref="AuditLog"/> events during a real pipeline
+/// run, and the AC4 coverage below swaps the static <see cref="Log.Logger"/> to
+/// a <see cref="TestSink"/> to assert <c>rebase_resolver.agent_selected</c> /
+/// <c>rebase_resolver.rerouted</c>. Both require serialising against every other
+/// test that mutates the global logger so emissions and assertions stay
+/// deterministic.
+/// </para>
 /// </summary>
-[Collection("Pipeline integration")]
+[Collection("GlobalSerilog")]
 public sealed class RebaseResolverAgentRoutingTests : IDisposable
 {
     private readonly string _workspace =
@@ -289,14 +301,27 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
 
         await fix.Store.CreateAsync(item);
-        await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var final = await fix.Store.GetAsync(item.Id);
+        // AC4: assert the operator-visible audit-log line names the agent the
+        // resolver actually used. Wiring the sink for the full pipeline run (not
+        // just a direct AuditLog call) is what catches a regression where the
+        // resolver runs but the success path never emits
+        // rebase_resolver.agent_selected.
+        var (final, events) = await RunCapturingAuditAsync(fix, item);
+
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Single(cursor.AgenticConflictInvocations);
         Assert.Empty(cursor.ConflictResolutionPlan);
         Assert.Empty(claude.AgenticConflictInvocations);
+
+        // The diagnostic event fired exactly once (the advisory security review
+        // reuses the resolver's chosen pair rather than re-selecting) and names
+        // cursor — the agent the resolver actually ran.
+        var selected = Assert.Single(events,
+            e => GetScalar<string>(e, "EventName") == "rebase_resolver.agent_selected");
+        Assert.Equal("cursor", GetScalar<string>(selected, "ChosenAgent"));
+        Assert.Equal(item.Id.ToString(), GetScalar<string>(selected, "WorkItemId"));
     }
 
     [Fact]
@@ -327,14 +352,26 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
 
         await fix.Store.CreateAsync(item);
-        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+        var (final, events) = await RunCapturingAuditAsync(fix, item);
 
-        var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Empty(claude.AgenticConflictInvocations);
         Assert.Single(cursor.AgenticConflictInvocations);
         Assert.Empty(cursor.ConflictResolutionPlan);
+
+        // The reroute event must name claude as rejected and report the *quota*
+        // gate as the cause — a regression to the old credential-only message
+        // would misreport this AuditAgent-quota steer as a credential problem.
+        var rerouted = Assert.Single(events,
+            e => GetScalar<string>(e, "EventName") == "rebase_resolver.rerouted");
+        Assert.Equal("claude", GetScalar<string>(rerouted, "RejectedAgent"));
+        Assert.Equal("cursor", GetScalar<string>(rerouted, "ChosenAgent"));
+        Assert.Contains("quota", GetScalar<string>(rerouted, "Reason") ?? string.Empty);
+        // The resolver still settled on cursor for the actual call.
+        var selected = Assert.Single(events,
+            e => GetScalar<string>(e, "EventName") == "rebase_resolver.agent_selected");
+        Assert.Equal("cursor", GetScalar<string>(selected, "ChosenAgent"));
     }
 
     [Fact]
@@ -520,6 +557,48 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             classRouter: router);
 
         return new CandidateFixture(pipeline, store, project);
+    }
+
+    // ── Harness ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Runs the pipeline with the static <see cref="Log.Logger"/> swapped to a
+    /// fresh <see cref="TestSink"/> so the resolver's <see cref="AuditLog"/>
+    /// emissions (e.g. <c>rebase_resolver.agent_selected</c>) can be asserted
+    /// end-to-end. Safe only because this class is in the <c>GlobalSerilog</c>
+    /// collection; the previous logger is always restored.
+    /// </summary>
+    private static async Task<(WorkItem? Final, IReadOnlyList<LogEvent> Events)> RunCapturingAuditAsync(
+        RoutingFixture fix, WorkItem item)
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+            var final = await fix.Store.GetAsync(item.Id);
+            return (final, sink.Events);
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
     }
 
     private RoutingFixture BuildRoutingFixture(

@@ -853,10 +853,11 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (AgentUnavailableException ex)
         {
             // Distinct from MergeConflictResolutionFailed: the resolver never
-            // ran because no candidate passed the pre-dispatch resolver gates.
-            // Failure is structured so operators can grep failureKind=agent_unavailable
-            // and fix the routing, quota, or credential gap rather than chasing
-            // a phantom merge bug.
+            // ran because no candidate passed the pre-dispatch resolver gates
+            // (for example quota/budget exhaustion or missing routing support).
+            // Failure is structured so operators can grep
+            // failureKind=agent_unavailable and fix the routing, quota, or
+            // credential gap rather than chasing a phantom merge bug.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
         }
@@ -1188,8 +1189,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (rebaseConflictFiles.Count > 0 && rebaseReviewRunner is not null)
             {
-                // Reuse the cascade member that actually resolved conflicts so
-                // the advisory review never routes back to a failed first choice.
+                // Reuse the exact runner/credential the resolver already chose
+                // for conflict resolution. A non-empty conflict-file set means a
+                // conflict was resolved, so the pair is materialised; reusing it
+                // keeps the advisory review on the same agent and avoids
+                // emitting a second rebase_resolver.agent_selected line for one
+                // work item even if cap/quota state shifts between resolution
+                // and review.
                 if (swallowReviewFailures)
                 {
                     try
@@ -1452,6 +1458,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
         var resolvedAnyConflict = false;
+        var selectedResolverLogged = false;
         IAgentRunner? chosenResolver = null;
         AgentCredential? chosenCredential = null;
         // Candidate list is built lazily on first conflict so a clean rebase
@@ -1496,6 +1503,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 chosenResolver = resolveResult.ChosenRunner;
                 chosenCredential = resolveResult.ChosenCredential;
+                if (!selectedResolverLogged)
+                {
+                    AuditLog.RebaseResolverAgentSelected(item.Id, chosenResolver.Kind);
+                    selectedResolverLogged = true;
+                }
                 resolvedAnyConflict = true;
 
                 rebase = await sandbox.ExecAsync(new SandboxExec
@@ -1528,6 +1540,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
         _ = repoId;
         _ = oldTip;
+        // The chosen runner/credential are non-null whenever a conflict was
+        // actually resolved. Returning them lets the caller reuse the chosen
+        // pair for the advisory merge security review instead of re-running
+        // resolver selection.
         return new PickupRebaseResolutionResult(
             resolvedAnyConflict ? conflictFiles.ToArray() : [],
             resolvedAnyConflict ? chosenResolver : null,
@@ -1654,8 +1670,6 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditLog.RebaseResolverAllAtCap(
                 first.Runner.Kind, GetRunningSafe(first.Runner.Kind), GetCapSafe(first.Runner.Kind));
         }
-        if (auditRebaseRouting)
-            AuditLog.RebaseResolverAgentSelected(item.Id, first.Runner.Kind);
         return ordered;
 
         async Task<string?> TryAddAsync(
