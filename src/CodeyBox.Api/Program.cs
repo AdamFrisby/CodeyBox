@@ -1370,7 +1370,23 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentToolCallCount
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, ClaudeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, CodexQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, GeminiQuotaFailureDetector>();
-builder.Services.AddSingleton<IAgentQuotaFailureDetector, CursorQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
+{
+    // Cursor detector accepts operator-extensible patterns from
+    // CodeyBox:QuotaFailurePatterns:cursor. Defaults already cover the observed
+    // "out of usage" exhaustion shape; the config hook is for follow-on shapes
+    // operators see in production before a code release can land.
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.QuotaFailurePatterns is null
+        ? null
+        : cbOpts.QuotaFailurePatterns
+            .Where(kvp => string.Equals(kvp.Key, AgentKind.Cursor.Value, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(kvp => kvp.Value ?? new List<QuotaFailurePatternOptions>())
+            .Where(p => !string.IsNullOrEmpty(p.Pattern))
+            .Select(p => new QuotaFailurePattern(p.Pattern, p.Kind))
+            .ToArray();
+    return new CursorQuotaFailureDetector(extras);
+});
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
@@ -2257,6 +2273,14 @@ namespace CodeyBox.Api
         public QuotaRouterConfig QuotaRouter { get; set; } = new();
 
         /// <summary>
+        /// Operator-extensible per-agent quota stderr patterns. Keys are agent
+        /// kind values (e.g. <c>cursor</c>); each entry adds a substring + kind
+        /// to the per-provider detector's built-in defaults. See
+        /// docs/quota-gate.md for the schema and supported agent kinds.
+        /// </summary>
+        public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
         /// See docs/configuration.md for the schedule schema.
@@ -2559,6 +2583,20 @@ namespace CodeyBox.Api
         public int ObservedFailureWindowMinutes { get; set; } = 10;
         /// <summary>Minutes observed quota failures are retained in state.db. Default 30.</summary>
         public int ObservedFailureRetentionMinutes { get; set; } = 30;
+    }
+
+    /// <summary>
+    /// One operator-supplied quota-failure pattern entry. Appended to a
+    /// detector's built-in defaults; matched against stderr and stdout
+    /// substring case-insensitively. Bound from
+    /// <c>CodeyBox:QuotaFailurePatterns:&lt;agent-kind&gt;</c>.
+    /// </summary>
+    public sealed class QuotaFailurePatternOptions
+    {
+        /// <summary>The substring to search for in stderr/stdout.</summary>
+        public string Pattern { get; set; } = string.Empty;
+        /// <summary>How to classify the failure when the substring matches.</summary>
+        public QuotaFailureKind Kind { get; set; } = QuotaFailureKind.LimitReached;
     }
 
     /// <summary>

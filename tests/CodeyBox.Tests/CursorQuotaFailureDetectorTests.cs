@@ -83,4 +83,47 @@ public sealed class CursorQuotaFailureDetectorTests
         var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
         Assert.InRange(diff.TotalMinutes, 89, 91);
     }
+
+    [Theory]
+    [InlineData("You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.")]
+    [InlineData("Error: out of usage")]
+    [InlineData("Please Switch to Auto to keep working.")]
+    [InlineData("ask your admin to increase your limit")]
+    public void Detect_CursorOutOfUsageShapes_ClassifyAsLimitReached(string stderr)
+    {
+        // Regression for the cursor subscription-exhausted bug: previously this
+        // stderr fell through detection, the failure was classified as "other",
+        // and the work item hard-failed instead of failing over to the next
+        // eligible class member.
+        var detection = _detector.Detect(stderr, stdout: null);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_OperatorAdditionalPatterns_AreAppendedAfterDefaults()
+    {
+        var detector = new CursorQuotaFailureDetector(
+            additionalPatterns: [new QuotaFailurePattern("cursor-vNext-marker", QuotaFailureKind.LimitReached)]);
+
+        // Built-in defaults still classified.
+        Assert.NotNull(detector.Detect("rate_limit_exceeded", stdout: null));
+
+        // Operator-supplied pattern also classified.
+        var detection = detector.Detect("error: cursor-vNext-marker", stdout: null);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_AdditionalPatternsNullOrEmpty_BehavesLikeDefaultDetector()
+    {
+        var nullCase = new CursorQuotaFailureDetector(additionalPatterns: null);
+        var emptyCase = new CursorQuotaFailureDetector(additionalPatterns: Array.Empty<QuotaFailurePattern>());
+
+        Assert.NotNull(nullCase.Detect("rate_limit_exceeded", stdout: null));
+        Assert.NotNull(emptyCase.Detect("rate_limit_exceeded", stdout: null));
+        Assert.Null(nullCase.Detect("cursor-vNext-marker", stdout: null));
+        Assert.Null(emptyCase.Detect("cursor-vNext-marker", stdout: null));
+    }
 }

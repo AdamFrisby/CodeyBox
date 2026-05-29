@@ -92,6 +92,28 @@ breaker hits apart from probe-derived rejections:
 
 Records are retained for `ObservedFailureRetentionMinutes`.
 
+### Operator-Extensible Patterns
+
+`CodeyBox:QuotaFailurePatterns` lets operators append per-agent stderr/stdout
+patterns to a detector's built-in defaults without recompiling. Each key is an
+agent kind value; each entry is `{ pattern, kind }` where `kind` is one of
+`LimitReached`, `RateLimitExceeded`, `Unauthorized`. Cursor is the first
+supported agent kind:
+
+```json
+"CodeyBox": {
+  "QuotaFailurePatterns": {
+    "cursor": [
+      { "pattern": "exceeded your subscription", "kind": "LimitReached" }
+    ]
+  }
+}
+```
+
+Built-in cursor defaults already cover the observed exhaustion stderr
+(`out of usage`, `Switch to Auto`, `increase your limit`) — the config hook is
+for follow-on shapes that surface before a code release can land.
+
 ## Operator Endpoint
 
 `GET /quota` returns:
