@@ -704,7 +704,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
-        CapRetryInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
+        CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
     };
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>

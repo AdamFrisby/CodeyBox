@@ -15,15 +15,22 @@ public sealed class AgentClassRouterSpillTests
     private static readonly AgentKind Cursor = new("cursor");
     private static readonly AgentKind Claude = AgentKind.Claude;
     private static readonly AgentKind Codex = AgentKind.Codex;
-    private static readonly AgentKind Opencode = new("opencode");
+    private static readonly AgentKind Gemini = new("gemini");
 
     private static AgentClassRouter BuildRouter(
         AgentClass cls,
         IEnumerable<IAgentQuotaProbe> probes,
         AgentAvailabilityRegistry? registry = null,
-        double minQuotaPct = 10.0)
+        IQuotaFailureStore? failures = null,
+        double minQuotaPct = 10.0,
+        TimeSpan? capRetry = null)
     {
-        var opts = new QuotaRouterOptions { MinQuotaPct = minQuotaPct, QuotaRecheckInterval = TimeSpan.FromMinutes(5) };
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = minQuotaPct,
+            QuotaRecheckInterval = TimeSpan.FromMinutes(5),
+            CapRetryRecheckInterval = capRetry ?? TimeSpan.FromSeconds(15),
+        };
         return new AgentClassRouter(
             [cls],
             probes,
@@ -31,7 +38,7 @@ public sealed class AgentClassRouterSpillTests
             NullLogger<AgentClassRouter>.Instance,
             timeProvider: null,
             todModifiers: null,
-            quotaFailures: null,
+            quotaFailures: failures,
             burnEstimator: null,
             runningCounters: null,
             availability: registry);
@@ -60,27 +67,36 @@ public sealed class AgentClassRouterSpillTests
     private static AgentMembership Sub(AgentKind kind, int score = 100) =>
         new() { Agent = kind, Billing = AgentBilling.Subscription, QualityScore = score };
 
+    private static AgentMembership PayPerApi(AgentKind kind, int score = 100) =>
+        new() { Agent = kind, Billing = AgentBilling.PayPerApi, QualityScore = score };
+
     /// <summary>
-    /// Helper that records each <c>reserveSlot</c> invocation and lets the
-    /// test choose which agents succeed. Mirrors the orchestrator's atomic
-    /// reserve-or-fail semantics: returning true means the slot was taken.
+    /// Implements <see cref="IAgentSlotGate"/> for the spill tests, modelling
+    /// the orchestrator's atomic per-agent counters. Records every TryReserve
+    /// invocation so tests can assert the candidate walk.
     /// </summary>
-    private sealed class CapReserver
+    private sealed class FakeSlotGate : IAgentSlotGate
     {
         private readonly Dictionary<AgentKind, int> _caps;
         private readonly Dictionary<AgentKind, int> _running = [];
         public List<AgentKind> ReserveCalls { get; } = [];
 
-        public CapReserver(Dictionary<AgentKind, int> caps) { _caps = caps; }
+        public FakeSlotGate(Dictionary<AgentKind, int> caps) { _caps = caps; }
 
-        public bool TryReserve(AgentMembership member)
+        public bool TryReserve(AgentKind agent)
         {
-            ReserveCalls.Add(member.Agent);
-            if (!_caps.TryGetValue(member.Agent, out var cap)) cap = 0;
-            var cur = _running.GetValueOrDefault(member.Agent);
+            ReserveCalls.Add(agent);
+            if (!_caps.TryGetValue(agent, out var cap)) cap = 0;
+            var cur = _running.GetValueOrDefault(agent);
             if (cap > 0 && cur >= cap) return false;
-            _running[member.Agent] = cur + 1;
+            _running[agent] = cur + 1;
             return true;
+        }
+
+        public void Release(AgentKind agent)
+        {
+            if (_running.TryGetValue(agent, out var cur) && cur > 0)
+                _running[agent] = cur - 1;
         }
 
         public int Running(AgentKind agent) => _running.GetValueOrDefault(agent);
@@ -103,14 +119,14 @@ public sealed class AgentClassRouterSpillTests
             [Cursor] = 1,
             [Claude] = 2,
         };
-        var reserver = new CapReserver(caps);
+        var gate = new FakeSlotGate(caps);
         // Pre-fill Cursor to its cap.
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Claude, decision.Chosen!.Agent);
@@ -118,41 +134,43 @@ public sealed class AgentClassRouterSpillTests
         Assert.False(decision.ShouldWait);
         // The router asked for Cursor first (top score) and got refused;
         // then asked for Claude and got accepted.
-        Assert.Equal([Cursor, Claude], reserver.ReserveCalls);
-        Assert.Equal(1, reserver.Running(Cursor));   // pre-existing
-        Assert.Equal(1, reserver.Running(Claude));   // just reserved
+        Assert.Equal([Cursor, Claude], gate.ReserveCalls);
+        Assert.Equal(1, gate.Running(Cursor));   // pre-existing
+        Assert.Equal(1, gate.Running(Claude));   // just reserved
     }
 
     [Fact]
-    public async Task AllEligibleMembersAtCap_DefersWithAllMembersAtCapFlag()
+    public async Task AllEligibleMembersAtCap_DefersWithAnyMemberAtCapFlag()
     {
         // Every member already at cap → decision must be ShouldWait with
-        // AllMembersAtCap=true and the at-cap agents listed.
+        // AnyMemberAtCap=true and the at-cap agents listed.
         var cls = FrontierClass(Sub(Cursor, score: 95), Sub(Claude, score: 90));
         var router = BuildRouter(cls,
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)]);
 
-        var reserver = new CapReserver(new()
+        var gate = new FakeSlotGate(new()
         {
             [Cursor] = 1,
             [Claude] = 1,
         });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        Assert.True(reserver.TryReserve(Sub(Claude)));
-        reserver.ReserveCalls.Clear();
+        Assert.True(gate.TryReserve(Cursor));
+        Assert.True(gate.TryReserve(Claude));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
-        Assert.True(decision.AllMembersAtCap);
+        Assert.True(decision.AnyMemberAtCap);
         Assert.False(decision.SlotReserved);
         Assert.Equal(new[] { Cursor, Claude }, decision.AtCapAgents);
+        // Cap-retry interval surfaced (not the longer quota recheck).
+        Assert.Equal(TimeSpan.FromSeconds(15), decision.SuggestedRecheckIn);
         // Running counts are unchanged — no spill candidate succeeded.
-        Assert.Equal(1, reserver.Running(Cursor));
-        Assert.Equal(1, reserver.Running(Claude));
+        Assert.Equal(1, gate.Running(Cursor));
+        Assert.Equal(1, gate.Running(Claude));
     }
 
     [Fact]
@@ -160,25 +178,25 @@ public sealed class AgentClassRouterSpillTests
     {
         // Item requires MinModelScore=95 — only Cursor (95) qualifies. With
         // Cursor at cap, the lower-scored Claude must NOT be used as spill;
-        // the item defers with AllMembersAtCap=true.
+        // the item defers with AnyMemberAtCap=true.
         var cls = FrontierClass(Sub(Cursor, score: 95), Sub(Claude, score: 90));
         var router = BuildRouter(cls,
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)]);
 
-        var reserver = new CapReserver(new() { [Cursor] = 1, [Claude] = 2 });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        var gate = new FakeSlotGate(new() { [Cursor] = 1, [Claude] = 2 });
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(minScore: 95), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
-        Assert.True(decision.AllMembersAtCap);
+        Assert.True(decision.AnyMemberAtCap);
         Assert.Equal([Cursor], decision.AtCapAgents);
         // Claude was never asked to reserve — it was filtered out by the floor.
-        Assert.DoesNotContain(Claude, reserver.ReserveCalls);
+        Assert.DoesNotContain(Claude, gate.ReserveCalls);
     }
 
     [Fact]
@@ -196,32 +214,79 @@ public sealed class AgentClassRouterSpillTests
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0), new FakeProbe(Codex, 90.0)],
             reg);
 
-        var reserver = new CapReserver(new()
+        var gate = new FakeSlotGate(new()
         {
             [Cursor] = 1,
             [Claude] = 2,
             [Codex] = 1,
         });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Codex, decision.Chosen!.Agent);
         Assert.True(decision.SlotReserved);
         // The smoke-failed Claude must never have been asked to reserve.
-        Assert.DoesNotContain(Claude, reserver.ReserveCalls);
+        Assert.DoesNotContain(Claude, gate.ReserveCalls);
+    }
+
+    [Fact]
+    public async Task ObservedFailureMembers_NotConsideredAsSpillTargets()
+    {
+        // Top member (Cursor) at cap. Second member (Claude) has a recent
+        // observed quota failure (circuit breaker tripped). Third member
+        // (Codex) is free → choose Codex. Claude's slot must never be
+        // reserved because the observed-failure breaker skips it before
+        // the cap gate is consulted.
+        var cls = FrontierClass(
+            Sub(Cursor, score: 95),
+            Sub(Claude, score: 90),
+            Sub(Codex, score: 80));
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-spill-failures-{Guid.NewGuid():N}.db");
+        using var failures = new SqliteQuotaFailureStore(dbPath);
+        try
+        {
+            await failures.RecordAsync(Claude, modelId: null,
+                QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
+            var router = BuildRouter(cls,
+                [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0), new FakeProbe(Codex, 90.0)],
+                failures: failures);
+
+            var gate = new FakeSlotGate(new()
+            {
+                [Cursor] = 1,
+                [Claude] = 2,
+                [Codex] = 1,
+            });
+            Assert.True(gate.TryReserve(Cursor));
+            gate.ReserveCalls.Clear();
+
+            var decision = await router.ResolveAsync(
+                MakeItem(), project: null, CancellationToken.None,
+                slotGate: gate);
+
+            Assert.NotNull(decision.Chosen);
+            Assert.Equal(Codex, decision.Chosen!.Agent);
+            Assert.True(decision.SlotReserved);
+            // Observed-failure Claude was skipped before the cap gate — never reserved.
+            Assert.DoesNotContain(Claude, gate.ReserveCalls);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+        }
     }
 
     [Fact]
     public async Task QuotaExhaustedMembers_NotConsideredAsSpillTargets()
     {
         // Top member (Cursor) at cap. Second (Claude) is quota-exhausted.
-        // Third (Codex) is free → choose Codex. Claude's reserveSlot must
-        // never be invoked because it fails the quota gate first.
+        // Third (Codex) is free → choose Codex. Claude's slot must never
+        // be reserved because it fails the quota gate first.
         var cls = FrontierClass(
             Sub(Cursor, score: 95),
             Sub(Claude, score: 90),
@@ -233,23 +298,23 @@ public sealed class AgentClassRouterSpillTests
                 new FakeProbe(Codex, 90.0),
             ]);
 
-        var reserver = new CapReserver(new()
+        var gate = new FakeSlotGate(new()
         {
             [Cursor] = 1,
             [Claude] = 2,
             [Codex] = 1,
         });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Codex, decision.Chosen!.Agent);
         Assert.True(decision.SlotReserved);
-        Assert.DoesNotContain(Claude, reserver.ReserveCalls);
+        Assert.DoesNotContain(Claude, gate.ReserveCalls);
     }
 
     [Fact]
@@ -262,26 +327,26 @@ public sealed class AgentClassRouterSpillTests
         var router = BuildRouter(cls,
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)]);
 
-        var reserver = new CapReserver(new() { [Cursor] = 2, [Claude] = 2 });
+        var gate = new FakeSlotGate(new() { [Cursor] = 2, [Claude] = 2 });
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Cursor, decision.Chosen!.Agent);
         Assert.True(decision.SlotReserved);
         // Only Cursor was asked to reserve — Claude never visited.
-        Assert.Equal([Cursor], reserver.ReserveCalls);
-        Assert.Equal(1, reserver.Running(Cursor));
-        Assert.Equal(0, reserver.Running(Claude));
+        Assert.Equal([Cursor], gate.ReserveCalls);
+        Assert.Equal(1, gate.Running(Cursor));
+        Assert.Equal(0, gate.Running(Claude));
     }
 
     [Fact]
-    public async Task NoReserveSlot_BackwardCompatible_StillRoutesFirstMember()
+    public async Task NoSlotGate_BackwardCompatible_StillRoutesFirstMember()
     {
-        // Calling ResolveAsync without the reserveSlot callback preserves the
-        // legacy behavior: no cap check, decision.SlotReserved=false.
+        // Calling ResolveAsync without a slot gate preserves the legacy
+        // behaviour: no cap check, decision.SlotReserved=false.
         var cls = FrontierClass(Sub(Cursor, score: 95), Sub(Claude, score: 90));
         var router = BuildRouter(cls,
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)]);
@@ -294,14 +359,14 @@ public sealed class AgentClassRouterSpillTests
     }
 
     [Fact]
-    public async Task MixedCapAndQuotaRejection_SurfacesAllMembersAtCap()
+    public async Task MixedCapAndQuotaRejection_SurfacesAnyMemberAtCap()
     {
         // One member quota-rejected (below threshold), one at cap. There is
         // no eligible-and-free member, so the item must defer. The router
-        // surfaces AllMembersAtCap=true because at least one eligible
-        // (quota-passing) member was blocked solely by the cap — the
-        // orchestrator picks the short cap-retry rather than waiting the
-        // full quota recheck interval.
+        // surfaces AnyMemberAtCap=true and uses the short cap-retry interval
+        // because waiting for a cap to clear is much faster than the quota
+        // recheck cadence — the Reason text reports the mixed-cause cleanly
+        // so audit-log readers don't mistake it for a pure cap stall.
         var cls = FrontierClass(Sub(Cursor, score: 95), Sub(Claude, score: 90));
         var router = BuildRouter(cls,
             [
@@ -309,18 +374,49 @@ public sealed class AgentClassRouterSpillTests
                 new FakeProbe(Claude, 2.0),   // quota-rejected
             ]);
 
-        var reserver = new CapReserver(new() { [Cursor] = 1, [Claude] = 1 });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        var gate = new FakeSlotGate(new() { [Cursor] = 1, [Claude] = 1 });
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
-        Assert.True(decision.AllMembersAtCap);
+        Assert.True(decision.AnyMemberAtCap);
         Assert.Equal([Cursor], decision.AtCapAgents);
+        Assert.Contains("mixed defer", decision.Reason);
+        Assert.Equal(TimeSpan.FromSeconds(15), decision.SuggestedRecheckIn);
+    }
+
+    [Fact]
+    public async Task QuotaOnlyDefer_DoesNotSetAnyMemberAtCap()
+    {
+        // All eligible members quota-exhausted, none at cap. The decision
+        // must NOT set AnyMemberAtCap (so the caller uses the full quota
+        // recheck interval rather than the cap-retry short delay).
+        var cls = FrontierClass(Sub(Cursor, score: 95), Sub(Claude, score: 90));
+        var router = BuildRouter(cls,
+            [
+                new FakeProbe(Cursor, 2.0),  // quota-rejected
+                new FakeProbe(Claude, 2.0),  // quota-rejected
+            ]);
+
+        var gate = new FakeSlotGate(new() { [Cursor] = 5, [Claude] = 5 });
+
+        var decision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None,
+            slotGate: gate);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.False(decision.AnyMemberAtCap);
+        Assert.Empty(decision.AtCapAgents);
+        // Quota recheck interval, not the cap-retry short delay.
+        Assert.Equal(TimeSpan.FromMinutes(5), decision.SuggestedRecheckIn);
+        // Slot gate was never asked to reserve a quota-rejected member.
+        Assert.Empty(gate.ReserveCalls);
     }
 
     [Fact]
@@ -339,23 +435,145 @@ public sealed class AgentClassRouterSpillTests
                 new FakeProbe(Codex, 90.0),
             ]);
 
-        var reserver = new CapReserver(new()
+        var gate = new FakeSlotGate(new()
         {
             [Cursor] = 1,
             [Claude] = 2,
             [Codex] = 2,
         });
-        Assert.True(reserver.TryReserve(Sub(Cursor)));
-        reserver.ReserveCalls.Clear();
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
 
         var decision = await router.ResolveAsync(
             MakeItem(), project: null, CancellationToken.None,
-            reserveSlot: reserver.TryReserve);
+            slotGate: gate);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Claude, decision.Chosen!.Agent);
         // Should have visited Cursor (rejected by cap) then Claude (chosen);
         // Codex never visited.
-        Assert.Equal([Cursor, Claude], reserver.ReserveCalls);
+        Assert.Equal([Cursor, Claude], gate.ReserveCalls);
+    }
+
+    [Fact]
+    public async Task Spill_MultiHop_SkipsTwoCappedMembersAndChoosesThird()
+    {
+        // Four members ordered by score: A(95), B(90), C(85), D(80).
+        // A and B are at cap; C is free. Spill must walk past two saturated
+        // members to reach C — guards against an off-by-one or premature
+        // exit in the spill loop.
+        var cls = FrontierClass(
+            Sub(Cursor, score: 95),
+            Sub(Claude, score: 90),
+            Sub(Codex, score: 85),
+            Sub(Gemini, score: 80));
+        var router = BuildRouter(cls,
+            [
+                new FakeProbe(Cursor, 90.0),
+                new FakeProbe(Claude, 90.0),
+                new FakeProbe(Codex, 90.0),
+                new FakeProbe(Gemini, 90.0),
+            ]);
+
+        var gate = new FakeSlotGate(new()
+        {
+            [Cursor] = 1,
+            [Claude] = 1,
+            [Codex] = 2,
+            [Gemini] = 2,
+        });
+        // Saturate Cursor and Claude.
+        Assert.True(gate.TryReserve(Cursor));
+        Assert.True(gate.TryReserve(Claude));
+        gate.ReserveCalls.Clear();
+
+        var decision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None,
+            slotGate: gate);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        // The walk visited Cursor → Claude → Codex (chosen). Gemini never visited.
+        Assert.Equal([Cursor, Claude, Codex], gate.ReserveCalls);
+        Assert.Equal(0, gate.Running(Gemini));
+    }
+
+    [Fact]
+    public async Task PayPerApiOnly_AtCap_DefersWithAnyMemberAtCap()
+    {
+        // PayPerApi-only class with the sole member at cap. Goes through
+        // the main loop's spill defer path (not the unreachable fallback),
+        // and the orchestrator should see AnyMemberAtCap=true so it picks
+        // the short cap-retry interval.
+        var cls = FrontierClass(PayPerApi(Cursor, score: 95));
+        var router = BuildRouter(cls, [new PayPerApiQuotaProbe()]);
+
+        var gate = new FakeSlotGate(new() { [Cursor] = 1 });
+        Assert.True(gate.TryReserve(Cursor));
+        gate.ReserveCalls.Clear();
+
+        var decision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None,
+            slotGate: gate);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+        Assert.True(decision.AnyMemberAtCap);
+        Assert.Equal([Cursor], decision.AtCapAgents);
+        // Cap-retry interval (15s), not the longer quota recheck (5m).
+        Assert.Equal(TimeSpan.FromSeconds(15), decision.SuggestedRecheckIn);
+    }
+
+    [Fact]
+    public async Task PayPerApiOnly_BelowCap_ReservesAndChoosesMember()
+    {
+        // PayPerApi-only class with cap available: the router reserves
+        // through the gate via the main loop and stamps SlotReserved=true.
+        var cls = FrontierClass(PayPerApi(Cursor, score: 95));
+        var router = BuildRouter(cls, [new PayPerApiQuotaProbe()]);
+
+        var gate = new FakeSlotGate(new() { [Cursor] = 2 });
+
+        var decision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None,
+            slotGate: gate);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Cursor, decision.Chosen!.Agent);
+        Assert.True(decision.SlotReserved);
+        Assert.Equal(1, gate.Running(Cursor));
+    }
+
+    [Fact]
+    public async Task PayPerApiMixedWithExhaustedSub_HonoursCap()
+    {
+        // Mixed class: a Sub member that fails quota + a PayPerApi member.
+        // The PayPerApi takes the win (Sub is below threshold) — the gate
+        // reserves the PayPerApi slot atomically. When the PayPerApi is at
+        // cap, the main loop spills (no more candidates) and defers with
+        // AnyMemberAtCap=true.
+        var cls = FrontierClass(
+            Sub(Claude, score: 95),
+            PayPerApi(Cursor, score: 90));
+        var router = BuildRouter(cls,
+            [new FakeProbe(Claude, 2.0), new PayPerApiQuotaProbe()]);
+
+        // Below-cap case: PayPerApi wins.
+        var gateFree = new FakeSlotGate(new() { [Claude] = 2, [Cursor] = 2 });
+        var freeDecision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None, slotGate: gateFree);
+        Assert.NotNull(freeDecision.Chosen);
+        Assert.Equal(Cursor, freeDecision.Chosen!.Agent);
+
+        // At-cap case: PayPerApi is at cap, Sub fails quota → defer with cap flag.
+        var gateCapped = new FakeSlotGate(new() { [Claude] = 2, [Cursor] = 1 });
+        Assert.True(gateCapped.TryReserve(Cursor));
+        var cappedDecision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None, slotGate: gateCapped);
+        Assert.Null(cappedDecision.Chosen);
+        Assert.True(cappedDecision.AnyMemberAtCap);
+        Assert.Equal([Cursor], cappedDecision.AtCapAgents);
+        // Reason text reports the mixed cause cleanly.
+        Assert.Contains("mixed defer", cappedDecision.Reason);
     }
 }
