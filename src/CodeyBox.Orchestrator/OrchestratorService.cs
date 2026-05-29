@@ -13,8 +13,54 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IShutdownDispatchGate
 {
+    // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
+    // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
+    // VMs, so the dispatch loop stops picking up new items and creating new
+    // sandboxes that would race the snapshot. In-flight workers continue to
+    // completion until the BackgroundService cancellation token fires later in
+    // the shutdown sequence. Read on every dispatch loop iteration.
+    private int _shutdownDispatchPaused;
+    public bool IsDispatchPaused => Volatile.Read(ref _shutdownDispatchPaused) != 0;
+    public void PauseDispatch()
+    {
+        if (Interlocked.Exchange(ref _shutdownDispatchPaused, 1) == 0)
+        {
+            _log.LogInformation(
+                "OrchestratorService: dispatch paused for shutdown — no new work will be picked up");
+            // Wake the dispatch loop so it observes the flag immediately rather
+            // than blocking on DequeueAsync until the next natural kick. A
+            // default WorkItemId (Guid.Empty) is treated as a spurious kick by
+            // the loop — both the IsDispatchPaused check at the top and the
+            // explicit `kick == default` skip in ExecuteAsync fire before
+            // PickNextEligibleAsync runs and exit the loop cleanly.
+            //
+            // ContinueWith observes (rather than discards) any fault on the
+            // returned task so an asynchronous channel-writer exception during
+            // shutdown surfaces as a debug log instead of an unobserved task
+            // exception bubbling up to TaskScheduler.UnobservedTaskException
+            // (which some deployments promote to a fatal AppDomain.Unhandled —
+            // SIGKILL during shutdown is exactly the wedge case this gate
+            // exists to prevent).
+            try
+            {
+                var kickTask = _queue.EnqueueAsync(default, CancellationToken.None);
+                if (!kickTask.IsCompletedSuccessfully)
+                {
+                    kickTask.AsTask().ContinueWith(
+                        t => _log.LogDebug(t.Exception, "PauseDispatch wake-up kick faulted"),
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "PauseDispatch wake-up kick threw synchronously; queue likely already shutting down");
+            }
+        }
+    }
+
+
     private readonly ITaskQueue _queue;
     private readonly IWorkItemStore _store;
     private readonly IPipelineRunner _pipeline;
@@ -367,6 +413,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Shutdown dispatch gate (R8.1 fix for VM-wedging incident
+            // 2026-05-29): the suspend-on-shutdown handler calls PauseDispatch()
+            // BEFORE it snapshots SnapshotSuspendableActive(), so once the flag
+            // is set the dispatch loop MUST stop picking up new work and
+            // creating new sandboxes that would race the snapshot — those
+            // would otherwise be left mid-launch when the BackgroundService
+            // cancellation token fires later in the shutdown sequence. The
+            // in-flight worker tasks already in flight continue normally.
+            if (IsDispatchPaused) break;
+
             // Pause gate: spin-wait while the queue is paused, without consuming
             // from the channel. In-flight workers continue normally during pause.
             if (!await WaitIfPausedAsync(stoppingToken)) break;
@@ -379,6 +435,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try { kick = await _queue.DequeueAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
             if (kick is null) break;
+
+            // Re-check after dequeue: PauseDispatch may have fired while
+            // DequeueAsync was blocked, and the wake-up kick (a default
+            // WorkItemId enqueued by PauseDispatch itself) must not be allowed
+            // to flow through to PickNextEligibleAsync — that would happily
+            // pick up a real queued item from the store and spawn a new
+            // sandbox that races the snapshot.
+            if (IsDispatchPaused) break;
+
+            // Defence-in-depth: a default WorkItemId is the PauseDispatch
+            // wake-up sentinel — never a real work item. If the IsDispatchPaused
+            // re-check above is ever removed/reordered by a future refactor, or
+            // if some other path enqueues default(WorkItemId), discard it here
+            // rather than letting PickNextEligibleAsync pick up any eligible
+            // store item against the contract.
+            if (kick.Value == default) continue;
 
             // A kick for an item currently sleeping in a defer-requeue delay is
             // treated as an explicit "retry now" signal: clear the deferred mark
@@ -402,6 +474,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // is in-flight is reflected when the gate next frees up.
             try { await _concurrencyGate.WaitAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
+
+            // Late dispatch-pause check: PauseDispatch may have fired while we
+            // were blocked on the concurrency gate. Without this check, one
+            // final worker could be spawned after dispatch was paused (the
+            // very race this gate exists to close — that final sandbox would
+            // miss the SnapshotSuspendableActive snapshot and be torn down
+            // uncleanly when the BackgroundService cancellation token fires).
+            if (IsDispatchPaused)
+            {
+                TryReleaseConcurrencyGate();
+                break;
+            }
 
             // Resolve the next eligible item by priority: highest Priority first,
             // ties broken by CreatedAt ascending. Skips items currently in-flight

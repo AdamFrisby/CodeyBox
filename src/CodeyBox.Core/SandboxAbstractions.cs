@@ -161,6 +161,30 @@ public interface ISuspendableSandbox : ISandbox
     bool IsSuspended => false;
 
     /// <summary>
+    /// True once the suspend-on-shutdown handler has taken ownership of this
+    /// VM's teardown — via Suspend (RAM frozen), Stop (clean shutdown), or
+    /// Dispose (delete --purge). PipelineRunner reads this in its host-shutdown
+    /// OCE catch block to short-circuit the legacy in-VM preempt-checkpoint flow:
+    /// the git add/commit/push inside the VM would hang (Suspend), fail (Stop
+    /// — the VM is no longer running the agent), or fault (Dispose — the VM
+    /// is gone), in any case stalling or breaking the orchestrator exit while
+    /// also leaving the work item Working without a checkpoint. Suspend mode
+    /// flips this implicitly via <see cref="IsSuspended"/>; Stop and Dispose
+    /// modes call <see cref="MarkOwnedByShutdownHandler"/>.
+    /// </summary>
+    bool IsOwnedByShutdownHandler => IsSuspended;
+
+    /// <summary>
+    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
+    /// <c>SandboxSuspendOnShutdownService</c> immediately before non-Suspend
+    /// teardown modes begin so PipelineRunner sees the "skip checkpoint" signal
+    /// even though the suspend path was not taken. Default no-op: fakes that
+    /// don't track teardown ownership keep <see cref="IsOwnedByShutdownHandler"/>
+    /// at the <see cref="IsSuspended"/> fallback.
+    /// </summary>
+    void MarkOwnedByShutdownHandler() { }
+
+    /// <summary>
     /// Best-effort RAM size of this sandbox in bytes, or null when the provider
     /// cannot report it. The suspend-on-shutdown handler scales the per-VM
     /// suspend timeout by this value: <c>multipass suspend</c> writes the whole
@@ -302,6 +326,35 @@ public static class SuspendTimeoutPolicy
 }
 
 /// <summary>
+/// Lets the sandbox shutdown handler pause new work dispatch BEFORE it begins
+/// freezing/stopping VMs. Without this gate the orchestrator's dispatch loop
+/// keeps picking up items and creating new sandboxes while the shutdown handler
+/// is mid-snapshot — the new sandboxes miss the snapshot, then get torn down
+/// uncleanly when the BackgroundService cancellation token finally fires.
+/// Implemented by <c>OrchestratorService</c>; injected (optionally — null is a
+/// no-op for test fixtures that drive the suspend handler directly) into the
+/// shutdown handler so the ordering is enforceable.
+/// </summary>
+public interface IShutdownDispatchGate
+{
+    /// <summary>
+    /// True once <see cref="PauseDispatch"/> has been called. The dispatch loop
+    /// reads this and stops picking up new work; in-flight workers continue
+    /// their current item to completion (or until the BackgroundService token
+    /// fires).
+    /// </summary>
+    bool IsDispatchPaused { get; }
+
+    /// <summary>
+    /// Stop accepting new work for dispatch. Idempotent. Returns immediately;
+    /// in-flight sandboxes that have already been created are still in the
+    /// provider's active set and will be picked up by
+    /// <c>SnapshotSuspendableActive</c>.
+    /// </summary>
+    void PauseDispatch();
+}
+
+/// <summary>
 /// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
 /// The orchestrator's suspend-on-shutdown hosted service uses
 /// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that should
@@ -396,6 +449,33 @@ public interface ISuspendingSandboxProvider
         string refName,
         string commitMessage,
         CancellationToken ct) => Task.FromResult(false);
+
+    /// <summary>
+    /// Startup reconciliation hook: on boot, sweep any managed sandboxes left in
+    /// transitional / suspend-lifecycle state from a prior unclean shutdown and
+    /// attempt to bring them back to a clean state so the standard recovery path
+    /// (resume by mapping, or reaper) can run against settled state.
+    ///
+    /// <para>The hook is supplied the set of VM names the orchestrator still
+    /// has live <c>SuspendedVmName</c> mappings for; the provider MUST NOT touch
+    /// any VM in that set — those are the items the resume handler is about to
+    /// reattach. Everything else in a suspend-lifecycle or unknown state is a
+    /// genuine orphan from a crash mid-shutdown.</para>
+    ///
+    /// <para>Recovery sequence per orphaned VM (provider-specific): try a clean
+    /// stop first to release any qemu disk-image write-lock the orphaned process
+    /// is holding, then proceed to dispose. Surface a clear leak event for
+    /// anything that still won't release after the recovery sequence.</para>
+    ///
+    /// <para>Returns the names of orphaned VMs the provider could not recover
+    /// (still wedged, requiring operator/root attention). Empty list when there
+    /// is nothing to do or recovery succeeded for every orphan. Implementations
+    /// that don't model a persistent suspend lifecycle (non-VM providers) return
+    /// an empty list.</para>
+    /// </summary>
+    Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
+        IReadOnlySet<string> liveSuspendedNames,
+        CancellationToken ct) => Task.FromResult<IReadOnlyList<string>>([]);
 }
 
 /// <summary>

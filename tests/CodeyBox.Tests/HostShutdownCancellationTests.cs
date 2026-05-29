@@ -531,7 +531,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was suspended (or is being suspended) by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         // Sanity: no preempt-checkpoint ref ever made it to origin either.
@@ -625,7 +625,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was suspended (or is being suspended) by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),

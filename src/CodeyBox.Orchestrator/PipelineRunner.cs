@@ -1872,22 +1872,30 @@ public sealed class PipelineRunner : IPipelineRunner
             // the StopAndPreserveAsync so SandboxResumeOnStartupService takes
             // over on the next boot.
             //
-            // The signal is "did the suspend handler persist a SuspendedVmName
-            // mapping for this item", NOT just ISuspendableSandbox.IsSuspended:
-            // the handler persists the mapping BEFORE awaiting multipass suspend,
-            // and on a per-VM suspend timeout it returns with the mapping still
+            // The signal is "did the suspend handler take ownership of this
+            // VM", NOT just ISuspendableSandbox.IsSuspended: the handler
+            // persists SuspendedVmName BEFORE awaiting multipass suspend, and
+            // on a per-VM suspend timeout it returns with the mapping still
             // persisted while IsSuspended is left false (multipassd is still
-            // writing the RAM snapshot). Gating only on IsSuspended would let the
-            // legacy git-checkpoint + multipass-stop path race that in-flight
-            // suspend. We re-read the store under CancellationToken.None (ct is
-            // already cancelled by host shutdown): on the per-VM suspend-timeout
-            // path the handler has persisted SuspendedVmName and returned while
-            // multipassd is still writing the snapshot and IsSuspended is still
-            // false, so the persisted mapping — not the suspend call returning — is
-            // the authoritative signal that the suspend handler owns this VM.
+            // writing the RAM snapshot). Gating only on IsSuspended would let
+            // the legacy git-checkpoint + multipass-stop path race that
+            // in-flight suspend. For Stop / Dispose teardown modes the handler
+            // explicitly calls MarkOwnedByShutdownHandler() on the sandbox
+            // BEFORE tearing the VM down — without that signal PipelineRunner
+            // would run git add/commit/push inside an already-stopped /
+            // already-disposed VM, the in-VM exec would fail, and the work
+            // item would be left Working with no PreemptCheckpoint (the next
+            // boot's DeadWorkerReaper would then mark it Failed). We re-read
+            // the store under CancellationToken.None (ct is already cancelled
+            // by host shutdown): on the per-VM suspend-timeout path the
+            // handler has persisted SuspendedVmName and returned while
+            // multipassd is still writing the snapshot and IsSuspended /
+            // IsOwnedByShutdownHandler may still be false on the sandbox
+            // instance, so the persisted mapping is the authoritative late
+            // signal.
             if (sandbox is ISuspendableSandbox suspendable)
             {
-                var suspendHandled = suspendable.IsSuspended;
+                var suspendHandled = suspendable.IsOwnedByShutdownHandler;
                 if (!suspendHandled)
                 {
                     var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
@@ -1896,7 +1904,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (suspendHandled)
                 {
                     _log.LogInformation(
-                        "Work item {Id}: sandbox {SandboxId} was suspended (or is being suspended) by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen VM",
+                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen / stopped / disposed VM",
                         item.Id, sandbox.Id);
                     throw;
                 }

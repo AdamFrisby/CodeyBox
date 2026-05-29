@@ -228,6 +228,26 @@ public static class AuditLog
             .Information("Suspended sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
                 vmName, workItemId.ToString());
 
+    public static void SandboxStoppedOnShutdown(WorkItemId workItemId, string vmName) =>
+        Audit("sandbox.stopped_on_shutdown")
+            .Information("Stopped sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
+                vmName, workItemId.ToString());
+
+    public static void SandboxDisposedOnShutdown(WorkItemId workItemId, string vmName) =>
+        Audit("sandbox.disposed_on_shutdown")
+            .Information("Disposed sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
+                vmName, workItemId.ToString());
+
+    public static void SandboxStartupReconciled(string vmName, string action) =>
+        Audit("sandbox.startup_reconciled")
+            .Information("Startup reconciler recovered orphaned sandbox {VmName}: {Action}", vmName, action);
+
+    public static void SandboxStartupReconcileFailed(string vmName, string error) =>
+        Audit("sandbox.startup_reconcile_failed")
+            .Warning(
+                "Startup reconciler could not recover orphaned sandbox {VmName}; operator intervention required: {Error}",
+                vmName, error);
+
     public static void SandboxResumedOnStartup(
         WorkItemId workItemId,
         string vmName,
