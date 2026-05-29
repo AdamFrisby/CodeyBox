@@ -57,6 +57,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
+    private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -69,6 +70,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastPricing = "";
     private string _lastBudgets = "";
     private string _lastDefaults = "";
+    private string _lastIncrementalRebase = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -81,7 +83,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentDefaultsSnapshot? defaults = null,
         AgentCostCalculator? costCalculator = null,
         AgentPricingState? pricingState = null,
-        IAgentBudgetConfigReloadable? budgetReloader = null)
+        IAgentBudgetConfigReloadable? budgetReloader = null,
+        IncrementalRebaseSnapshot? incrementalRebase = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -98,6 +101,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _defaults = defaults;
         _costCalculator = costCalculator;
         _pricingState = pricingState;
+        _incrementalRebase = incrementalRebase;
         _log = log;
     }
 
@@ -113,6 +117,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPricing = SerializePricing(initial.AgentPricing);
         _lastBudgets = SerializeBudgets(initial.AgentBudgets);
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
+        _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
@@ -143,6 +148,35 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyPricingIfChanged(opts);
             ApplyBudgetsIfChanged(opts);
             ApplyDefaultsIfChanged(opts);
+            ApplyIncrementalRebaseIfChanged(opts);
+        }
+    }
+
+    private void ApplyIncrementalRebaseIfChanged(CodeyBoxOptions opts)
+    {
+        if (_incrementalRebase is null) return;
+
+        var next = SerializeIncrementalRebase(opts.IncrementalRebase);
+        if (string.Equals(_lastIncrementalRebase, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastIncrementalRebase;
+        try
+        {
+            _incrementalRebase.Replace(new IncrementalRebaseOptions
+            {
+                Enabled = opts.IncrementalRebase.Enabled,
+            });
+            _lastIncrementalRebase = next;
+            AuditLog.ConfigReloaded("IncrementalRebase", prev, next);
+            _log.LogInformation("Hot-reloaded IncrementalRebase: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of IncrementalRebase rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
         }
     }
 
@@ -403,4 +437,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             defaults.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
             JsonOpts);
+
+    private static string SerializeIncrementalRebase(IncrementalRebaseOptions opts) =>
+        JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
 }
