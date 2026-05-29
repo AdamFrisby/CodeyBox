@@ -64,6 +64,14 @@ public sealed class AgentClassRouter
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), DateTimeOffset> _exhausted
         = new();
 
+    // Last quota-availability percentage observed per (agent, model) during
+    // routing. Read by the OpenTelemetry observable gauge so dashboards can
+    // chart subscription headroom without issuing fresh probe round-trips on
+    // the metrics-collection thread. -1 means "unknown" (the probe could not
+    // determine availability). Updated on every ProbeAsync result.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
+        = new();
+
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
@@ -423,6 +431,7 @@ public sealed class AgentClassRouter
                     earliestBudgetReset = r;
             }
 
+            _lastAvailablePct[(member.Agent, member.ModelId ?? string.Empty)] = quota.AvailablePct;
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
@@ -658,6 +667,20 @@ public sealed class AgentClassRouter
     /// ReasoningMode) instead of fabricating a placeholder.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Synchronous snapshot of the most-recent quota-availability percentage
+    /// observed per (agent, model) during routing. Consumed by the OpenTelemetry
+    /// observable gauge. A percentage of <c>-1</c> indicates the probe could not
+    /// determine availability. Returns an empty list before any probe has run.
+    /// </summary>
+    public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
+    {
+        var snap = new List<(AgentKind, string?, double)>(_lastAvailablePct.Count);
+        foreach (var kv in _lastAvailablePct)
+            snap.Add((kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
+        return snap;
+    }
+
     public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
     {
         var cfg = Volatile.Read(ref _routingConfig);

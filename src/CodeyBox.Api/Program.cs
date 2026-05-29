@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Exporter;
+using OpenTelemetry.Logs;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -27,6 +28,7 @@ using CodeyBox.Webhooks;
 using CodeyBox.Notifications;
 using Serilog;
 using Serilog.Events;
+using Serilog.Extensions.Logging;
 using Serilog.Filters;
 using Serilog.Formatting.Compact;
 // Disambiguate: both Serilog and MEL expose an ILogger interface.
@@ -77,7 +79,16 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
         agentStreamOpts,
         bootstrapLoggerFactory.CreateLogger("CodeyBox.AgentStreams"));
 
-    Log.Logger = new LoggerConfiguration()
+    // When OTel export is enabled we forward Serilog events to the MEL provider
+    // pipeline (the OpenTelemetry logging provider added in the OTel section).
+    // UseSerilog(providers:) bridges every registered ILoggerProvider into this
+    // collection and the WriteTo.Providers sink fans events out to them, so the
+    // existing ILogger call sites flow to OTel with trace correlation while the
+    // console / file sinks stay owned by this single logger. Null (OTel off)
+    // keeps the original Serilog-only path with zero added overhead.
+    var otelLogForwarding = cbConf.Otel.Enabled ? new LoggerProviderCollection() : null;
+
+    var serilogConfig = new LoggerConfiguration()
         .MinimumLevel.Information()
         .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
         .MinimumLevel.Override("Microsoft.Hosting.Lifetime", LogEventLevel.Information)
@@ -104,10 +115,14 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
                 retainedFileCountLimit: auditOpts.RetainedDays,
                 fileSizeLimitBytes: auditOpts.MaxFileSizeBytes,
                 rollOnFileSizeLimit: true,
-                shared: false))
-        .CreateLogger();
+                shared: false));
 
-    builder.Host.UseSerilog();
+    if (otelLogForwarding is not null)
+        serilogConfig = serilogConfig.WriteTo.Providers(otelLogForwarding);
+
+    Log.Logger = serilogConfig.CreateLogger();
+
+    builder.Host.UseSerilog(Log.Logger, dispose: false, providers: otelLogForwarding);
 }
 
 // ── OpenTelemetry ─────────────────────────────────────────────────────────
@@ -122,11 +137,29 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 
     if (otelOpts.Enabled)
     {
+        // service.version defaults to the API assembly version when the operator
+        // hasn't pinned a git SHA / release tag.
+        var serviceVersion = otelOpts.ServiceVersion
+            ?? typeof(Program).Assembly.GetName().Version?.ToString();
+
+        // Resource attributes shared by traces, metrics, and logs so the three
+        // signals correlate on identical service identity. service.instance.id
+        // and deployment.environment are added automatically; operator-supplied
+        // ResourceAttributes are applied last so they win on key collision.
+        var instanceId = $"{Environment.MachineName}:{Environment.ProcessId}";
+        var deploymentEnv = builder.Environment.EnvironmentName;
+        void ConfigureResource(ResourceBuilder r)
+        {
+            r.AddService(otelOpts.ServiceName, serviceVersion: serviceVersion, serviceInstanceId: instanceId);
+            if (!string.IsNullOrWhiteSpace(deploymentEnv))
+                r.AddAttributes(new[] { new KeyValuePair<string, object>("deployment.environment", deploymentEnv) });
+            if (otelOpts.ResourceAttributes.Count > 0)
+                r.AddAttributes(otelOpts.ResourceAttributes.Select(
+                    kv => new KeyValuePair<string, object>(kv.Key, kv.Value)));
+        }
+
         builder.Services.AddOpenTelemetry()
-            .ConfigureResource(r => r
-                .AddService(otelOpts.ServiceName, serviceVersion: otelOpts.ServiceVersion)
-                .AddAttributes(otelOpts.ResourceAttributes.Select(
-                    kv => new KeyValuePair<string, object>(kv.Key, kv.Value))))
+            .ConfigureResource(ConfigureResource)
             .WithTracing(t => t
                 .AddSource("CodeyBox.Pipeline")
                 .AddSource("CodeyBox.Sandbox")
@@ -142,6 +175,26 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
                 .AddMeter("CodeyBox.Upstream")
                 .AddRuntimeInstrumentation()
                 .AddOtlpExporter(o => ConfigureOtlp(o, otelOpts)));
+
+        // Route the existing ILogger output through the OpenTelemetry logging
+        // provider. Serilog forwards events here via the LoggerProviderCollection
+        // wired above (writeToProviders); LogRecords are stamped with the active
+        // Activity's TraceId/SpanId for log↔trace correlation.
+        builder.Logging.AddOpenTelemetry(o =>
+        {
+            o.IncludeScopes = true;
+            o.IncludeFormattedMessage = true;
+            o.ParseStateValues = true;
+            var rb = ResourceBuilder.CreateDefault();
+            ConfigureResource(rb);
+            o.SetResourceBuilder(rb);
+            o.AddOtlpExporter(e => ConfigureOtlp(e, otelOpts));
+        });
+
+        // Observable gauges (work items by state, worker pool occupancy, active
+        // sandboxes, quota headroom) are registered only when OTel is enabled to
+        // preserve the zero-overhead disabled path.
+        builder.Services.AddHostedService<CodeyBoxObservableMetrics>();
     }
 }
 

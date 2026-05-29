@@ -42,4 +42,70 @@ public static class CodeyBoxMeters
     /// <summary>Upstream API call duration. Tags: <c>endpoint</c>, <c>status_code</c>.</summary>
     public static readonly Histogram<long> UpstreamApiCallDuration =
         UpstreamMeter.CreateHistogram<long>("codeybox.upstream.api_call.duration_ms");
+
+    /// <summary>Incremented once each time a work item is dispatched to a worker.</summary>
+    public static readonly Counter<long> Dispatches =
+        PipelineMeter.CreateCounter<long>("codeybox.dispatch.count", unit: "{dispatch}");
+
+    /// <summary>
+    /// One increment per agent invocation attempt (work / rework / audit / merge /
+    /// upstream). Tags: <c>agent.kind</c>, <c>model</c>, <c>agent_class</c>,
+    /// <c>phase</c>, <c>outcome</c> (<c>success</c> | <c>error</c> | <c>canceled</c>).
+    /// </summary>
+    public static readonly Counter<long> AgentInvocations =
+        PipelineMeter.CreateCounter<long>("codeybox.agent.invocations", unit: "{invocation}");
+
+    /// <summary>
+    /// One increment per agent fallback event (the routed member was swapped for
+    /// another, or the class was fully exhausted). Tags: <c>from_agent</c>,
+    /// <c>to_agent</c> (<c>(none)</c> when the class exhausted), <c>kind</c>
+    /// (<c>quota</c> | <c>timeout</c>), <c>phase</c>.
+    /// </summary>
+    public static readonly Counter<long> AgentFallbacks =
+        PipelineMeter.CreateCounter<long>("codeybox.agent.fallbacks", unit: "{fallback}");
+
+    /// <summary>Whole-phase wall-clock duration. Tag: <c>phase</c> (work | rework | audit | merge | upstream).</summary>
+    public static readonly Histogram<long> PhaseDuration =
+        PipelineMeter.CreateHistogram<long>("codeybox.phase.duration_ms", unit: "ms");
+
+    /// <summary>
+    /// Tokens consumed by an agent run, summed as they are recorded to the cost
+    /// store. Tags: <c>agent.kind</c>, <c>model</c>, <c>token_type</c>
+    /// (<c>input</c> | <c>cached_input</c> | <c>output</c>).
+    /// </summary>
+    public static readonly Counter<long> AgentTokens =
+        PipelineMeter.CreateCounter<long>("codeybox.agent.tokens", unit: "{token}");
+
+    /// <summary>
+    /// Estimated USD cost of agent runs, summed as recorded to the cost store.
+    /// Tags: <c>agent.kind</c>, <c>model</c>. Aligns with the per-work-item cost
+    /// rows so dashboards do not double-count.
+    /// </summary>
+    public static readonly Counter<double> AgentCostUsd =
+        PipelineMeter.CreateCounter<double>("codeybox.agent.cost_usd", unit: "USD");
+
+    /// <summary>
+    /// Webhook delivery attempts that reached a terminal outcome. Tags:
+    /// <c>endpoint</c>, <c>event</c>, <c>outcome</c> (<c>delivered</c> | <c>failed</c>).
+    /// </summary>
+    public static readonly Counter<long> WebhookDeliveries =
+        PipelineMeter.CreateCounter<long>("codeybox.webhook.deliveries", unit: "{delivery}");
+
+    /// <summary>
+    /// Registers an observable gauge on the <c>CodeyBox.Pipeline</c> meter. The
+    /// returned instrument must be kept alive by the caller (the SDK holds only a
+    /// weak reference); store it in a long-lived field. The callback runs only
+    /// while a MeterProvider is collecting, so registration is free when OTel is
+    /// disabled.
+    /// </summary>
+    public static ObservableGauge<T> CreatePipelineObservableGauge<T>(
+        string name, Func<IEnumerable<Measurement<T>>> observe,
+        string? unit = null, string? description = null) where T : struct =>
+        PipelineMeter.CreateObservableGauge(name, observe, unit, description);
+
+    /// <summary>Registers an observable gauge on the <c>CodeyBox.Sandbox</c> meter. See <see cref="CreatePipelineObservableGauge{T}"/>.</summary>
+    public static ObservableGauge<T> CreateSandboxObservableGauge<T>(
+        string name, Func<IEnumerable<Measurement<T>>> observe,
+        string? unit = null, string? description = null) where T : struct =>
+        SandboxMeter.CreateObservableGauge(name, observe, unit, description);
 }

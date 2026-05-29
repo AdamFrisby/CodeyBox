@@ -629,6 +629,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
 
             var capturedId = id.Value;
+            CodeyBoxMeters.Dispatches.Add(1);
             // Increment before Task.Run so the counter is never transiently negative
             // if the task's finally block executes before we reach the increment.
             Interlocked.Increment(ref _currentlyRunning);
