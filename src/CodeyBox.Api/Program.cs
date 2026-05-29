@@ -2339,8 +2339,8 @@ namespace CodeyBox.Api
         public string GeneratorAgent { get; set; } = "claude";
 
         /// <summary>
-        /// Optional model override for the generator LLM call, e.g. "claude-opus-4-8".
-        /// Defaults to "claude-opus-4-8".
+        /// Optional model override for the generator LLM call, e.g. "claude-opus-4-7".
+        /// Defaults to "claude-opus-4-7".
         /// </summary>
         public string? GeneratorModelId { get; set; }
 

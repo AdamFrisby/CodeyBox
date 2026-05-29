@@ -49,7 +49,7 @@ Global options live under `CodeyBox:Changelog` in `appsettings.json`:
     "Changelog": {
       "Enabled": true,
       "GeneratorAgent": "claude",
-      "GeneratorModelId": "claude-opus-4-8",
+      "GeneratorModelId": "claude-opus-4-7",
       "ChangelogPath": "CHANGELOG.md",
       "SectionHeaderFormat": "## [{tag}] - {date:yyyy-MM-dd}",
       "GitHubWebhookSecretEnvVar": "CODEYBOX_GH_RELEASE_WEBHOOK_SECRET"
@@ -62,7 +62,7 @@ Global options live under `CodeyBox:Changelog` in `appsettings.json`:
 |---|---|---|
 | `Enabled` | `true` | Master switch. Set `false` to disable globally. |
 | `GeneratorAgent` | `"claude"` | LLM agent for generation. Only `"claude"` is currently supported. |
-| `GeneratorModelId` | `"claude-opus-4-8"` | Model ID passed to the Anthropic API. |
+| `GeneratorModelId` | `"claude-opus-4-7"` | Model ID passed to the Anthropic API. |
 | `ChangelogPath` | `"CHANGELOG.md"` | Path to the changelog file within the repo. |
 | `SectionHeaderFormat` | `"## [{tag}] - {date:yyyy-MM-dd}"` | Header template. Supports `{tag}` and `{date:yyyy-MM-dd}`. |
 | `GitHubWebhookSecretEnvVar` | `null` | Name of the env var holding the HMAC secret for GitHub webhooks. When `null`, signatures are not verified (not recommended for production). |

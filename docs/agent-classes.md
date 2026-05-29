@@ -29,10 +29,10 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
         "Id": "frontier-coding",
         "DisplayName": "Frontier coding agents",
         "Members": [
-          { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-8", "QualityScore": 100 },
+          { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
           { "Agent": "codex",  "Billing": "Subscription", "ModelId": "gpt-5.5",         "QualityScore": 100 },
           { "Agent": "gemini", "Billing": "Subscription", "ModelId": "gemini-3-flash-preview", "QualityScore": 95, "ReasoningMode": "high" },
-          { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-8", "QualityScore": 100 }
+          { "Agent": "claude", "Billing": "PayPerApi",    "ModelId": "claude-opus-4-7", "QualityScore": 100 }
         ]
       }
     ]
@@ -96,7 +96,7 @@ capable the member is relative to its peers. Higher = more capable.
 
 | Model | Score | Notes |
 |-------|-------|-------|
-| `claude-opus-4-8` | **100** | Frontier |
+| `claude-opus-4-7` | **100** | Frontier |
 | `gpt-5.5` | **100** | Frontier, tied |
 | Gemini 3 Flash (high reasoning) | **95** | Frontier-adjacent |
 | `claude-sonnet-4-6`, GPT-5 base | **80** | Mid-tier |
@@ -169,7 +169,7 @@ quota cap. The orchestrator never waits for PayPerApi members.
 so items are never blocked indefinitely:
 
 ```json
-{ "Agent": "claude", "Billing": "PayPerApi", "ModelId": "claude-opus-4-8", "QualityScore": 100 }
+{ "Agent": "claude", "Billing": "PayPerApi", "ModelId": "claude-opus-4-7", "QualityScore": 100 }
 ```
 
 A startup warning is emitted when a class has only Subscription members.
