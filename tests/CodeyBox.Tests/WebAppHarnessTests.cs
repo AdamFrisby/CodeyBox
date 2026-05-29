@@ -549,6 +549,10 @@ public sealed class WebAppHarnessTests
         Assert.True(PngRenderedUiReadiness.LooksLikeRenderedUi(followUp.ScreenshotPng));
     }
 
+    /// <summary>
+    /// Minimal web target for the real-multipass integration test: static HTML
+    /// served by Python's http.server, opened in Firefox, readiness via screenshot.
+    /// </summary>
     private static WebAppRecipe IntegrationSmokeRecipe() => new()
     {
         TargetName = "harness-smoke",
