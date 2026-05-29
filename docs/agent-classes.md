@@ -219,6 +219,86 @@ have migrated.
 
 ---
 
+## Capability gate
+
+`QualityScore` is a **routing preference** — "which eligible model is the
+strongest." It is not the right place to express **trust** — "which models may
+touch this sensitive code at all." Conflating the two means a strong model at
+QS 92 is wrongly excluded from a sensitive item gated at QS 95, and adjusting a
+score for unrelated reasons silently changes who is allowed to do the work.
+
+Each member can declare a `Capabilities` tag list, and each work item can require
+a `RequiredCapabilities` set. The router routes the item only to members whose
+declared capabilities cover every required tag. Members with no tags can still
+run any item whose required set is empty (open-by-default).
+
+```json
+{
+  "Agent": "claude",
+  "Billing": "Subscription",
+  "ModelId": "claude-opus-4-7",
+  "QualityScore": 100,
+  "Capabilities": ["sensitive", "architectural"]
+}
+```
+
+A work item then declares what it needs:
+
+```http
+POST /workitems
+{
+  "projectId": "core",
+  "title": "Rewrite the auth middleware",
+  "prompt": "…",
+  "agentClassId": "frontier-coding",
+  "requiredCapabilities": ["sensitive"]
+}
+```
+
+Eligibility composes:
+
+- `RequiredCapabilities` is the **clearance/trust gate**.
+- `MinModelScore` is the legacy capability floor, retained alongside the
+  capability gate during the transition window. Both must pass.
+- `QualityScore` ranks among eligible members (highest effective score wins).
+  It is **never** the gate.
+
+Recommended tag vocabulary (start small, extend as needs emerge):
+
+| Tag | Use for |
+|-----|---------|
+| `sensitive` | Anything you would not want a weaker or unverified model to touch — auth flows, secrets handling, billing logic. |
+| `architectural` | Cross-cutting refactors and design-doc-shaped work. |
+| `security` | Threat-modelling, dependency vulns, anything in a security review. |
+
+Tag comparison is case-insensitive; values are otherwise free-form so you can
+extend the vocabulary without code changes. The builder de-dupes and trims, so
+`"Sensitive"` and `"sensitive"` collapse to a single tag.
+
+### Default-open
+
+A work item created without `requiredCapabilities` (or with an empty list) is
+eligible on every member of its class. Most items should run on whatever agent
+is free; restrict via `requiredCapabilities` only for the small set of items
+that genuinely demand it.
+
+### Migration from `MinModelScore`
+
+The `MinModelScore` floor still works during the transition window — set both
+on an item and it must pass both gates. To move existing restricted items:
+
+1. Tag your frontier members with the relevant clearance, e.g. add
+   `"Capabilities": ["sensitive"]` to the Claude/Codex frontier members.
+2. Replace `minModelScore: 95` on items that need restriction with
+   `requiredCapabilities: ["sensitive"]`.
+3. The floor can then default to 0; the capability gate carries the trust
+   semantics.
+
+A follow-up item will deprecate and remove `MinModelScore` once existing items
+have migrated.
+
+---
+
 ## Time-of-day score modifiers
 
 Small score deltas that fire during defined UTC time windows act as tiebreakers
