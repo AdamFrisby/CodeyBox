@@ -28,7 +28,7 @@ namespace CodeyBox.Agents.Cursor;
 /// CLI is expected to use whatever auth path the operator provisioned in the
 /// image.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Cursor;
 
@@ -141,5 +141,54 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // from the sandbox wrapper's `exec "$@"`. The sandbox wrapper forwards
         // stdin automatically when SandboxExec.Stdin is non-null.
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    protected override AgentInvocation BuildTextOnlyInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+    {
+        _ = credential;
+        // Text-only calls use --print without --trust/--force so the CLI cannot
+        // auto-approve tool prompts on untrusted merge-conflict/resolver input.
+        var argv = new List<string> { Binary, "--print" };
+
+        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
+        {
+            argv.Add("--model");
+            argv.Add(effectiveModel);
+        }
+
+        _ = reasoningMode;
+        return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+        => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+            credential,
+            "CODEYBOX_CURSOR_AUTH_JSON");
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        if (sandbox is null || workingDirectory is null)
+            return RunTextOnlyRequiresSandboxAsync(ct);
+
+        return ExecuteTextOnlyInSandboxAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct);
     }
 }

@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Opencode;
 /// materialises the file from <c>OPENCODE_AUTH_JSON</c> in the credential
 /// bundle before invoking the CLI, mirroring the Codex pattern.</para>
 /// </summary>
-public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider
+public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     public override AgentKind Kind => AgentKind.Opencode;
 
@@ -149,5 +149,39 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
         _ = captureStructuredStream;
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    protected override AgentInvocation BuildTextOnlyInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream: false);
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+        => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+            credential,
+            "OPENCODE_AUTH_JSON");
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        if (sandbox is null || workingDirectory is null)
+            return RunTextOnlyRequiresSandboxAsync(ct);
+
+        return ExecuteTextOnlyInSandboxAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct);
     }
 }

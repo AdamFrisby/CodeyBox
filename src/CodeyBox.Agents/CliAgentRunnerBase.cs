@@ -113,6 +113,114 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Stderr: result.Stderr);
     }
 
+    /// <summary>
+    /// Build argv for text-only sandbox calls. Must not include tool-auto-approve
+    /// flags (<c>--trust</c>, <c>--force</c>, <c>--dangerously-skip-permissions</c>).
+    /// Returns <c>null</c> when this runner has no sandbox text-only CLI path.
+    /// </summary>
+    protected virtual AgentInvocation? BuildTextOnlyInvocation(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null)
+        => null;
+
+    /// <summary>
+    /// Viability probe for subscription CLIs whose sandbox auth materialisation
+    /// no-ops when the auth-json env var is absent (image-baked CLI auth).
+    /// Returns null when text-only may proceed (including with no host credential).
+    /// </summary>
+    protected static string? GetSandboxSubscriptionTextOnlyUnavailabilityReason(
+        AgentCredential? credential,
+        string authJsonEnvVarName)
+    {
+        if (credential is null)
+            return null;
+
+        if (credential.EnvironmentVariables is not { Count: > 0 })
+            return $"{authJsonEnvVarName} is required when a credential bundle is supplied";
+
+        if (credential.EnvironmentVariables.TryGetValue(authJsonEnvVarName, out var json)
+            && !string.IsNullOrWhiteSpace(json))
+            return null;
+
+        // Bundle present but auth JSON absent — PrepareSandboxAsync no-ops; image auth may suffice.
+        return null;
+    }
+
+    /// <summary>
+    /// Runs a one-shot print-mode CLI invocation inside the sandbox for
+    /// text-only resolver/review calls using <see cref="BuildTextOnlyInvocation"/>.
+    /// </summary>
+    protected Task<TextOnlyAgentResult> RunTextOnlyRequiresSandboxAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new TextOnlyAgentResult(
+            false,
+            $"{Kind.Value} text-only must run inside the work-item sandbox",
+            null,
+            null));
+    }
+
+    protected static IReadOnlyDictionary<string, string>? MergeCredentialEnvironment(
+        IReadOnlyDictionary<string, string>? baseEnvironment,
+        AgentCredential? credential)
+    {
+        if (credential?.EnvironmentVariables is not { Count: > 0 } env)
+            return baseEnvironment;
+
+        var merged = baseEnvironment is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(baseEnvironment, StringComparer.Ordinal);
+        foreach (var (key, value) in env)
+            merged[key] = value;
+        return merged;
+    }
+
+    protected async Task<TextOnlyAgentResult> ExecuteTextOnlyInSandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct)
+    {
+        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        if (preparation is not null)
+            return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
+
+        var invocation = BuildTextOnlyInvocation(prompt, credential, modelId, reasoningMode);
+        if (invocation is null)
+        {
+            return new TextOnlyAgentResult(
+                false,
+                $"{Kind.Value} text-only is not supported inside the sandbox",
+                null,
+                null);
+        }
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = invocation.Argv,
+            WorkingDirectory = workingDirectory,
+            Stdin = invocation.Stdin,
+        }, ct);
+
+        if (!result.Success)
+        {
+            var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            return new TextOnlyAgentResult(
+                false,
+                $"{Kind.Value} text-only call failed: exit {result.ExitCode}",
+                result.Stdout,
+                detail.Trim());
+        }
+
+        var output = string.IsNullOrWhiteSpace(result.Stdout) ? result.Stderr : result.Stdout;
+        return new TextOnlyAgentResult(true, "ok", output.Trim(), null);
+    }
+
     public virtual async Task<AgentResult> RunResumedAsync(
         ISandbox sandbox,
         string workingDirectory,

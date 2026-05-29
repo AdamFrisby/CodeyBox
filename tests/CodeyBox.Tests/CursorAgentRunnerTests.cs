@@ -1,5 +1,6 @@
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -179,13 +180,127 @@ public sealed class CursorAgentRunnerTests
         Assert.Equal("agent", runner.Binary);
     }
 
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsNull()
+    {
+        var runner = new CursorAgentRunner();
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyCredentialBundle_ReturnsReason()
+    {
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+        Assert.Equal(
+            "CODEYBOX_CURSOR_AUTH_JSON is required when a credential bundle is supplied",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_WithAuthJson_ReturnsNull()
+    {
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_InvokesAgentPrintWithModelAndStdin()
+    {
+        const string prompt = "resolve this conflict";
+        var sandbox = new RecordingSandbox(agentStdout: "assistant text");
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync(prompt, cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success, $"{result.Summary} | {result.Error}");
+        Assert.Equal("assistant text", result.Output);
+        var agentExec = sandbox.Execs.Last();
+        Assert.Equal("agent", agentExec.Argv[0]);
+        Assert.Contains("--print", agentExec.Argv);
+        Assert.DoesNotContain("--trust", agentExec.Argv);
+        Assert.DoesNotContain("--force", agentExec.Argv);
+        Assert.Contains("--model", agentExec.Argv);
+        Assert.Contains("composer-2.5", agentExec.Argv);
+        Assert.Equal(prompt, agentExec.Stdin);
+        Assert.Null(agentExec.ExtraEnvironment);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_RequiresSandbox()
+    {
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("sandbox", result.Summary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_NonZeroExit_UsesStderrDetail()
+    {
+        var sandbox = new RecordingSandbox(agentExitCode: 2, agentStdout: "", agentStderr: "model unavailable");
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.False(result.Success);
+        Assert.Equal("model unavailable", result.Error);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyInSandboxAsync_EmptyStdout_FallsBackToStderr()
+    {
+        var sandbox = new RecordingSandbox(agentStdout: "", agentStderr: "stderr-only");
+        var runner = new CursorAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = """{"token":"x"}""" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("prompt", cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success);
+        Assert.Equal("stderr-only", result.Output);
+    }
+
     private sealed class RecordingSandbox : ISandbox
     {
         private readonly int _authWriteExitCode;
+        private readonly int _agentExitCode;
+        private readonly string _agentStdout;
+        private readonly string _agentStderr;
 
-        public RecordingSandbox(int authWriteExitCode = 0)
+        public RecordingSandbox(
+            int authWriteExitCode = 0,
+            int agentExitCode = 0,
+            string agentStdout = "ok",
+            string agentStderr = "")
         {
             _authWriteExitCode = authWriteExitCode;
+            _agentExitCode = agentExitCode;
+            _agentStdout = agentStdout;
+            _agentStderr = agentStderr;
         }
 
         public string Id => "recording-cursor";
@@ -201,6 +316,10 @@ public sealed class CursorAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
+
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "agent")
+                return Task.FromResult(new SandboxExecResult(_agentExitCode, _agentStdout, _agentStderr));
+
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }
 

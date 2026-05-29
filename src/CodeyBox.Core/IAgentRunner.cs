@@ -61,21 +61,31 @@ public interface IStructuredStreamAgentRunner : IAgentRunner
 /// </summary>
 public interface ITextOnlyAgentRunner : IAgentRunner
 {
+    /// <summary>
+    /// Runs a text-only model call. Host HTTP runners ignore
+    /// <paramref name="sandbox"/> and <paramref name="workingDirectory"/>.
+    /// Subscription CLIs that must execute inside the work-item sandbox supply
+    /// both parameters; host-side invocation without them returns failure.
+    /// </summary>
     Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null);
 
     /// <summary>
     /// Cheap, credential-only viability probe. Returns <c>null</c> when the
-    /// supplied credential is sufficient for <see cref="RunTextOnlyAsync"/> to
+    /// supplied credential is sufficient for this runner's text-only path to
     /// reach the provider; otherwise returns a short human-readable reason
-    /// (e.g. <c>"GEMINI_API_KEY is required"</c>). The default implementation
-    /// is permissive — runners that need specific env vars override this so
-    /// the rebase-resolver router can walk the class chain past a runner with
-    /// no viable text-only credential rather than hard-failing the work item.
+    /// (e.g. <c>"GEMINI_API_KEY is required"</c>). Subscription CLIs that can
+    /// use image-baked auth return <c>null</c> when <paramref name="credential"/>
+    /// is <c>null</c>. The default implementation is permissive — runners that
+    /// need specific env vars override this so the rebase-resolver router can
+    /// walk the class chain past a runner with no viable text-only credential
+    /// rather than hard-failing the work item.
     /// </summary>
     string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) => null;
 }

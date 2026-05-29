@@ -461,6 +461,48 @@ public static class AuditLog
                 "Pickup-time rebase resolver: every viable agent at per-agent cap; running on '{ChosenAgent}' (running={Running} cap={Cap}) anyway",
                 chosenAgent.Value, chosenRunning, chosenCap);
 
+    /// <summary>
+    /// Emitted once per pickup-time rebase conflict-resolution pass after the
+    /// resolver has chosen an ordered cascade of text-only agents. Lists every
+    /// candidate that will be tried (non-at-cap first) and agents skipped
+    /// during routing (missing interface, credentials, or registration).
+    /// </summary>
+    public static void RebaseResolverCascadePlanned(
+        WorkItemId workItemId,
+        string candidateOrder,
+        string skippedReasons) =>
+        Audit("rebase_resolver.cascade_planned")
+            .Information(
+                "Pickup-time rebase resolver cascade for {WorkItemId}: try order=[{CandidateOrder}]; skipped=[{SkippedReasons}]",
+                workItemId.ToString(), candidateOrder, skippedReasons);
+
+    /// <summary>
+    /// Emitted when a text-only resolver call against one cascade member fails
+    /// and the orchestrator will attempt the next viable class member.
+    /// </summary>
+    public static void RebaseResolverTextOnlyAttemptFailed(
+        WorkItemId workItemId, AgentKind agent, string summary) =>
+        Audit("rebase_resolver.text_only_attempt_failed")
+            .Warning(
+                "Pickup-time rebase resolver: {Agent} text-only call failed ({Summary}); trying next class member for {WorkItemId}",
+                agent.Value, summary, workItemId.ToString());
+
+    /// <summary>
+    /// Emitted when a cascade member successfully resolves pickup-time rebase
+    /// conflicts. <paramref name="attemptedAgents"/> lists prior failed tries;
+    /// <paramref name="skippedReasons"/> repeats routing-time skips for a
+    /// single operator-visible audit line.
+    /// </summary>
+    public static void RebaseResolverSucceeded(
+        WorkItemId workItemId,
+        AgentKind chosenAgent,
+        string attemptedAgents,
+        string skippedReasons) =>
+        Audit("rebase_resolver.succeeded")
+            .Information(
+                "Pickup-time rebase resolver succeeded for {WorkItemId} using '{ChosenAgent}'; tried=[{AttemptedAgents}]; skipped=[{SkippedReasons}]",
+                workItemId.ToString(), chosenAgent.Value, attemptedAgents, skippedReasons);
+
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
         Audit("audit.iteration_complete")
             .Information("Audit iteration {Iteration}/{MaxIterations}: blocking={BlockingCount} non-blocking={NonBlockingCount}",

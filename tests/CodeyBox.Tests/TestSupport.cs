@@ -257,7 +257,7 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
+internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
@@ -293,6 +293,12 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
     /// </summary>
     public string? TextOnlyUnavailabilityReason { get; set; }
     public List<string> TextOnlyInvocations { get; } = new();
+    /// <summary>
+    /// When non-empty, each <see cref="RunTextOnlyAsync"/> call dequeues a
+    /// scripted result before the default conflict-resolution handler runs.
+    /// Used to simulate transient text-only failures during resolver cascade.
+    /// </summary>
+    public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
 
     private sealed record ConflictResolverInputJson(List<ConflictResolverInputFileJson>? Files);
     private sealed record ConflictResolverInputFileJson(string? Path, string? Content);
@@ -319,13 +325,18 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
         _ = credential;
         _ = modelId;
         _ = reasoningMode;
         _ = ct;
+        OnTextOnlyInvoked(sandbox, workingDirectory, prompt);
         TextOnlyInvocations.Add(prompt);
+        if (TextOnlyResults.Count > 0)
+            return Task.FromResult(TextOnlyResults.Dequeue());
         if (prompt.StartsWith("# Merge conflict resolver", StringComparison.Ordinal))
         {
             if (ConflictResolutionPlan.Count == 0)
@@ -352,6 +363,13 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
         }
 
         return Task.FromResult(new TextOnlyAgentResult(false, "unsupported text-only prompt", null, null));
+    }
+
+    protected virtual void OnTextOnlyInvoked(ISandbox? sandbox, string? workingDirectory, string prompt)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = prompt;
     }
 
     public async Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
@@ -447,6 +465,26 @@ internal sealed partial class ScriptedAgent : IAgentRunner, IStructuredStreamAge
 
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`", RegexOptions.CultureInvariant | RegexOptions.Singleline)]
     private static partial Regex MergePromptShape();
+}
+
+/// <summary>
+/// Scripted agent whose text-only path records sandbox-dispatched invocations
+/// separately for orchestrator routing tests.
+/// </summary>
+internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent
+{
+    public SandboxTextOnlyScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
+        : base(mergeStrategies)
+    {
+    }
+
+    public List<string> SandboxTextOnlyInvocations { get; } = new();
+
+    protected override void OnTextOnlyInvoked(ISandbox? sandbox, string? workingDirectory, string prompt)
+    {
+        if (sandbox is not null && workingDirectory is not null)
+            SandboxTextOnlyInvocations.Add(prompt);
+    }
 }
 
 internal sealed record FileWrite(string FileName, string Contents);

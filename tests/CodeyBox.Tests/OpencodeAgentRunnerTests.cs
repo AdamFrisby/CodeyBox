@@ -342,6 +342,78 @@ public sealed class OpencodeAgentRunnerTests
         Assert.Contains("OPENCODE_AUTH_JSON", script);
     }
 
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsNull()
+    {
+        var runner = new OpencodeAgentRunner();
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(credential: null));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_EmptyCredentialBundle_ReturnsReason()
+    {
+        var runner = new OpencodeAgentRunner();
+        var cred = new AgentCredential(
+            AgentKind.Opencode,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+        Assert.Equal(
+            "OPENCODE_AUTH_JSON is required when a credential bundle is supplied",
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_WithAuthJson_ReturnsNull()
+    {
+        var runner = new OpencodeAgentRunner();
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(OpencodeCred("""{"token":"x"}""")));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_InvokesOpencodeRunWithModelAndStdin()
+    {
+        const string prompt = "resolve this conflict";
+        var sandbox = new TextOnlyRecordingSandbox("resolved json");
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"token":"x"}""");
+
+        var result = await runner.RunTextOnlyAsync(prompt, cred, sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success);
+        Assert.Equal("resolved json", result.Output);
+        var agentExec = sandbox.Execs.Last();
+        Assert.Equal("opencode", agentExec.Argv[0]);
+        Assert.Equal("run", agentExec.Argv[1]);
+        Assert.Contains("--model", agentExec.Argv);
+        Assert.Contains("deepseek/deepseek-coder", agentExec.Argv);
+        Assert.Equal(prompt, agentExec.Stdin);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_WithReasoningFlag_AppendsFlagToArgv()
+    {
+        var prior = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");
+        Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", "--reasoning-effort");
+        try
+        {
+            var sandbox = new TextOnlyRecordingSandbox("ok");
+            var runner = new OpencodeAgentRunner();
+            var cred = OpencodeCred("""{"token":"x"}""");
+
+            var result = await runner.RunTextOnlyAsync(
+                "prompt", cred, sandbox: sandbox, workingDirectory: "/work", reasoningMode: "high");
+
+            Assert.True(result.Success);
+            var agentExec = sandbox.Execs.Last();
+            Assert.Contains("--reasoning-effort", agentExec.Argv);
+            Assert.Contains("high", agentExec.Argv);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OPENCODE_REASONING_FLAG", prior);
+        }
+    }
+
     /// <summary>
     /// Sandbox that records every exec invocation and lets the test stub a
     /// specific exit code for the auth-materialisation bash script.
@@ -368,6 +440,31 @@ public sealed class OpencodeAgentRunnerTests
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
+            return Task.FromResult(new SandboxExecResult(0, "ok", ""));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class TextOnlyRecordingSandbox(string agentStdout) : ISandbox
+    {
+        public string Id => "recording-text-only";
+        public List<SandboxExec> Execs { get; } = [];
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Execs.Add(exec);
+            if (exec.Argv.Count >= 3
+                && exec.Argv[0] == "bash"
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "opencode" && exec.Argv[1] == "run")
+                return Task.FromResult(new SandboxExecResult(0, agentStdout, ""));
+
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }
 

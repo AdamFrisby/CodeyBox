@@ -160,8 +160,12 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
     {
+        _ = sandbox;
+        _ = workingDirectory;
         _ = reasoningMode;
         string? apiKey = null;
         credential?.EnvironmentVariables.TryGetValue("GEMINI_API_KEY", out apiKey);

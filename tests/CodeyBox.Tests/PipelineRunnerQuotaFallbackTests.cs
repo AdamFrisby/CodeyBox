@@ -1395,7 +1395,9 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt, AgentCredential? credential,
         string? modelId = null, string? reasoningMode = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
         => Task.FromResult(new TextOnlyAgentResult(false, "not used", null, null));
 }
 

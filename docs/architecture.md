@@ -88,7 +88,11 @@ commit and the work tip in its ancestry. For conflicted merges, the normal
 repository-mounted merge agent runner is not invoked. The host first creates the
 conflicted working tree, reads only the conflicted file contents, records each
 `<<<<<<<` ... `>>>>>>>` hunk as the marker span in the conflicted merge-tree
-file, and sends that text through `ITextOnlyAgentRunner`. That call is pure text-in/text-out:
+file, and sends that text through <see cref="ITextOnlyAgentRunner"/>.
+Host HTTP runners (Claude, Codex, Gemini) answer on the orchestrator host;
+subscription CLIs (Cursor, Opencode) run a tool-less print-mode invocation
+inside the work-item sandbox when <c>sandbox</c> and <c>workingDirectory</c>
+are supplied to <see cref="ITextOnlyAgentRunner.RunTextOnlyAsync"/>. That call is pure text-in/text-out:
 no repository checkout, shell, filesystem, agent tools, writable result file, or
 model-controlled network is exposed to the untrusted conflict text. The resolver
 can only return complete replacement contents for exactly the conflicted paths;
