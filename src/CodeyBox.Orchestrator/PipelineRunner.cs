@@ -1494,10 +1494,13 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         // Bind the snapshot reference once so a concurrent ApplyConcurrencyReload
         // can't tear the read between the existence check and the lookup.
+        // Defence-in-depth on MaxConcurrent: AgentConcurrencyOptions.ValidateAndThrow
+        // rejects values <= 0 at load, but tests can construct an options
+        // instance directly without the validator, so we keep the > 0 guard.
         var opts = _concurrencySnapshot?.Current;
         return opts is not null
             && opts.Members.TryGetValue(agent.Value, out var entry)
-            && entry.MaxConcurrent > 0
+            && entry is { MaxConcurrent: > 0 }
             ? entry.MaxConcurrent
             : 0;
     }

@@ -714,10 +714,11 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     [Fact]
     public async Task NoCapConfigured_ResolverIgnoresRunningCount_UsesPrimary()
     {
-        // Sanity check: when MaxConcurrent=0 (unset / "no per-agent cap"),
-        // the resolver MUST still pick the primary even when running > 0.
-        // Otherwise wiring IAgentRunningCounters would change behaviour in
-        // any configuration that doesn't set an explicit cap.
+        // Sanity check: when the agent has no entry in Members (the supported
+        // "no per-agent cap" expression), the resolver MUST still pick the
+        // primary even when running > 0. Otherwise wiring IAgentRunningCounters
+        // would change behaviour in any configuration that doesn't set an
+        // explicit cap.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
         var claude = new ScriptedAgent([MergeStrategy.RealMerge])
