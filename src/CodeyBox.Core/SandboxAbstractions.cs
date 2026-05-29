@@ -68,12 +68,25 @@ public interface ISandboxProvider
 /// Such sandboxes are intentionally preserved during the configured preempt
 /// retention window and must not be treated as leaks until that window expires.
 /// </param>
+/// <param name="IsSuspendLifecycleOrFrozen">
+/// Provider-computed flag: true when the sandbox is in a suspend lifecycle
+/// state — freezing its RAM image to disk or already frozen — rather than
+/// running or stopped. This abstracts the provider's own lifecycle vocabulary
+/// (e.g. the multipass <c>Suspending</c>/<c>Suspended</c> states) to a single
+/// boolean, the same way <see cref="HasPreemptMarker"/> abstracts a provider
+/// concern. The <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> uses it to
+/// recognise a frozen VM with no live orchestrator mapping as a suspend orphan —
+/// one that must not inherit the long preempt-retention grace — without Core
+/// depending on any backend's CLI state strings. Always false for providers that
+/// do not model a persistent suspend lifecycle.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
     long? DiskBytes,
     bool IsTrackedActive,
-    bool HasPreemptMarker = false);
+    bool HasPreemptMarker = false,
+    bool IsSuspendLifecycleOrFrozen = false);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
@@ -146,6 +159,146 @@ public interface ISuspendableSandbox : ISandbox
     /// model suspension state.
     /// </summary>
     bool IsSuspended => false;
+
+    /// <summary>
+    /// Best-effort RAM size of this sandbox in bytes, or null when the provider
+    /// cannot report it. The suspend-on-shutdown handler scales the per-VM
+    /// suspend timeout by this value: <c>multipass suspend</c> writes the whole
+    /// RAM image to disk, so a 12 GiB VM under load legitimately takes far longer
+    /// than a 1 GiB idle one. Null falls back to the flat floor timeout.
+    /// </summary>
+    long? MemoryBytes => null;
+}
+
+/// <summary>
+/// Shared policy for how long a RAM-snapshot suspend is allowed to take, scaled
+/// by VM RAM size. Centralised so the shutdown suspend handler's per-VM timeout
+/// (<see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>), the
+/// startup resume wait (how long to wait out a still-freezing VM before
+/// <c>multipass start</c>), and the host shutdown grace all derive from one
+/// formula and cannot drift apart. <c>multipass suspend</c> writes the whole RAM
+/// image to disk, so suspend time grows ~linearly with VM size; a uniform cap
+/// either truncates large VMs or wastes time waiting on small ones.
+/// </summary>
+public static class SuspendTimeoutPolicy
+{
+    /// <summary>Floor / fallback used when the VM's RAM size is unknown.</summary>
+    public static readonly TimeSpan DefaultFloor = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Default cap on parallel <c>multipass suspend</c> calls during a shutdown
+    /// drain. Suspend writes the VM's RAM to disk; running too many in parallel
+    /// just contends on disk IO. Kept here (rather than only on the orchestrator
+    /// suspend handler) so the host-shutdown ceiling math in
+    /// <see cref="HostShutdownReserve"/> / <see cref="ResolveHostShutdownTimeout"/>
+    /// and the handler's semaphore share one source of truth.
+    /// </summary>
+    public const int DefaultMaxParallelSuspends = 8;
+
+    /// <summary>
+    /// Extra budget per GiB of VM RAM. The effective budget is
+    /// <c>max(floor, RAM_GiB × perGiB)</c>. 150s/GiB matches the observed
+    /// ~6-minute suspend of a 4 GiB VM under load with headroom, and gives the
+    /// 12 GiB default VM (see <see cref="SandboxResourceLimits.Default"/>) a
+    /// 30-minute ceiling.
+    /// </summary>
+    public static readonly TimeSpan DefaultPerGiB = TimeSpan.FromSeconds(150);
+
+    /// <summary>
+    /// Effective suspend/resume budget for a VM of the given RAM size:
+    /// <c>max(floor, RAM_GiB × perGiB)</c>. Null or non-positive
+    /// <paramref name="memoryBytes"/> falls back to <paramref name="floor"/>
+    /// (never a zero or negative budget that would abandon a suspend instantly).
+    /// </summary>
+    public static TimeSpan For(long? memoryBytes, TimeSpan? floor = null, TimeSpan? perGiB = null)
+    {
+        var effectiveFloor = floor ?? DefaultFloor;
+        var effectivePerGiB = perGiB ?? DefaultPerGiB;
+        if (memoryBytes is not { } bytes || bytes <= 0)
+            return effectiveFloor;
+        var gib = bytes / (double)(1024L * 1024 * 1024);
+        var scaled = effectivePerGiB * gib;
+        return scaled > effectiveFloor ? scaled : effectiveFloor;
+    }
+
+    /// <summary>
+    /// Host-shutdown ceiling (<c>HostOptions.ShutdownTimeout</c>) that must cover
+    /// the worst-case suspend drain, not just a single VM. The suspend-on-shutdown
+    /// handler fans suspends out through a semaphore capped at
+    /// <paramref name="maxParallelSuspends"/> and awaits all of them, so with up to
+    /// <paramref name="maxConcurrentSandboxes"/> in-flight VMs the drain runs
+    /// <c>ceil(N / batch)</c> sequential waves. Each wave is bounded by the per-VM
+    /// budget (<see cref="For"/>) for the largest VM the deployment provisions
+    /// (<paramref name="maxVmMemoryBytes"/>). Sizing the ceiling at
+    /// <c>waves × perVmBudget</c> stops the host SIGKILLing the process mid-snapshot
+    /// before later waves finish — e.g. 16 VMs at the default profile need two
+    /// 30-minute waves, ~60 minutes, not 30. This is a CEILING: a shutdown that
+    /// suspends fewer VMs (or none) returns as soon as the handler completes.
+    /// </summary>
+    public static TimeSpan HostShutdownReserve(
+        int maxConcurrentSandboxes,
+        int maxParallelSuspends,
+        long? maxVmMemoryBytes,
+        TimeSpan? floor = null,
+        TimeSpan? perGiB = null)
+    {
+        var perVm = For(maxVmMemoryBytes, floor, perGiB);
+        var sandboxes = Math.Max(1, maxConcurrentSandboxes);
+        var batch = Math.Max(1, maxParallelSuspends);
+        var waves = (sandboxes + batch - 1) / batch;
+        return perVm * waves;
+    }
+
+    /// <summary>
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Providers
+    /// that suspend on shutdown must not have a healthy RAM snapshot truncated by
+    /// a SIGKILL, so when <paramref name="providerSuspendsOnShutdown"/> is set the
+    /// ceiling is the worst-case suspend drain
+    /// (<see cref="HostShutdownReserve"/>:
+    /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
+    /// per-VM budget) STACKED ON TOP OF the requested <paramref name="grace"/>.
+    /// The two windows are sequential, not overlapping: suspend-on-shutdown runs
+    /// in <c>IHostedLifecycleService.StoppingAsync</c> (before BackgroundService
+    /// cancellation), and the preempt-checkpoint / listener-drain window still
+    /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
+    /// two would let a suspend that consumes its whole reserve leave zero room for
+    /// the post-suspend drain, so the host could SIGKILL the process while
+    /// PipelineRunner is still shutting down. Providers that don't suspend keep the
+    /// tighter <paramref name="grace"/> alone.
+    ///
+    /// <para>This is deliberately capability-driven, not provider-name-driven:
+    /// the caller passes whether the configured provider implements
+    /// <see cref="ISuspendingSandboxProvider"/> (i.e. participates in
+    /// suspend-on-shutdown). Core therefore stays provider-agnostic — a new
+    /// suspend-capable backend raises the ceiling automatically without adding
+    /// another magic string here.</para>
+    ///
+    /// <para>Lives on the Core policy (rather than on the orchestrator suspend
+    /// handler) so the API composition root can size the ceiling without
+    /// depending on a concrete hosted-service type, and so the capability guard
+    /// and the max() logic stay co-located with the suspend/resume budget
+    /// formula they must agree with.</para>
+    /// </summary>
+    /// <param name="providerSuspendsOnShutdown">True when the configured provider implements <see cref="ISuspendingSandboxProvider"/> and so freezes VMs on shutdown.</param>
+    /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
+    /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
+    /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
+    /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
+    public static TimeSpan ResolveHostShutdownTimeout(
+        bool providerSuspendsOnShutdown,
+        TimeSpan grace,
+        int maxConcurrentSandboxes,
+        int maxParallelSuspends = DefaultMaxParallelSuspends,
+        long? maxVmMemoryBytes = null)
+    {
+        if (!providerSuspendsOnShutdown)
+            return grace;
+        var reserve = HostShutdownReserve(
+            maxConcurrentSandboxes,
+            maxParallelSuspends,
+            maxVmMemoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
+        return grace + reserve;
+    }
 }
 
 /// <summary>

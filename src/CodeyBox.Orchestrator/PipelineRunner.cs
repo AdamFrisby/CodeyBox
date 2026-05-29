@@ -1788,22 +1788,44 @@ public sealed class PipelineRunner : IPipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
 
-            // R8-core: if SandboxSuspendOnShutdownService already froze this
-            // VM during IHostedLifecycleService.StoppingAsync (which runs
-            // BEFORE BackgroundService cancellation flows down as
-            // hostShutdownToken), the agent process is paused mid-call and
-            // the VM cannot service `git add/commit/push`. The legacy
-            // preempt-checkpoint flow would block on the frozen VM until the
-            // host's shutdown grace expires. Skip both the checkpoint and
-            // the StopAndPreserveAsync — the suspend handler already
-            // persisted the SuspendedVmName bookkeeping and SandboxResumeOnStartupService
-            // takes over on the next boot.
-            if (sandbox is ISuspendableSandbox { IsSuspended: true })
+            // R8-core: if SandboxSuspendOnShutdownService already took ownership
+            // of this VM during IHostedLifecycleService.StoppingAsync (which runs
+            // and completes BEFORE BackgroundService cancellation flows down as
+            // hostShutdownToken), the agent process is paused (or being paused)
+            // mid-call and the VM cannot service `git add/commit/push`. The
+            // legacy preempt-checkpoint flow would block on the frozen VM until
+            // the host's shutdown grace expires. Skip both the checkpoint and
+            // the StopAndPreserveAsync so SandboxResumeOnStartupService takes
+            // over on the next boot.
+            //
+            // The signal is "did the suspend handler persist a SuspendedVmName
+            // mapping for this item", NOT just ISuspendableSandbox.IsSuspended:
+            // the handler persists the mapping BEFORE awaiting multipass suspend,
+            // and on a per-VM suspend timeout it returns with the mapping still
+            // persisted while IsSuspended is left false (multipassd is still
+            // writing the RAM snapshot). Gating only on IsSuspended would let the
+            // legacy git-checkpoint + multipass-stop path race that in-flight
+            // suspend. We re-read the store under CancellationToken.None (ct is
+            // already cancelled by host shutdown): on the per-VM suspend-timeout
+            // path the handler has persisted SuspendedVmName and returned while
+            // multipassd is still writing the snapshot and IsSuspended is still
+            // false, so the persisted mapping — not the suspend call returning — is
+            // the authoritative signal that the suspend handler owns this VM.
+            if (sandbox is ISuspendableSandbox suspendable)
             {
-                _log.LogInformation(
-                    "Work item {Id}: sandbox {SandboxId} was suspended by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid hanging on the frozen VM",
-                    item.Id, sandbox.Id);
-                throw;
+                var suspendHandled = suspendable.IsSuspended;
+                if (!suspendHandled)
+                {
+                    var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
+                    suspendHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
+                }
+                if (suspendHandled)
+                {
+                    _log.LogInformation(
+                        "Work item {Id}: sandbox {SandboxId} was suspended (or is being suspended) by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen VM",
+                        item.Id, sandbox.Id);
+                    throw;
+                }
             }
 
             Exception? checkpointFailure = null;

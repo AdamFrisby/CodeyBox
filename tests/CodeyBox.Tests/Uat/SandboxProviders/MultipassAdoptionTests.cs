@@ -583,7 +583,14 @@ public sealed class MultipassAdoptionTests
             NullLogger<MultipassSandboxProvider>.Instance,
             timings: null,
             runner: runner,
-            daemonRetryPolicy: policy);
+            daemonRetryPolicy: policy)
+        {
+            // Keep the adoption poll loop off the wall clock: a real 2s
+            // Task.Delay can drift past these tests' short deadlines under a
+            // loaded test host, producing a spurious timeout (null) instead of
+            // the scripted exit code.
+            AdoptionPollIntervalOverride = TimeSpan.FromMilliseconds(5),
+        };
     }
 
     /// <summary>

@@ -129,7 +129,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     public void PipelineRunner_UsesConcreteRunnerDefaultForObservedFailureKey()
     {
         Assert.Equal(
-            "claude-opus-4-7",
+            "claude-opus-4-8",
             PipelineRunner.ResolveObservedModelId(new ClaudeAgentRunner(), modelId: null));
         Assert.Equal(
             "gpt-5.5",

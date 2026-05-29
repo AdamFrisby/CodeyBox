@@ -268,7 +268,10 @@ public sealed class ReleaseBranchCreationTests : IDisposable
 
     private static async Task WaitUntilAsync(Func<Task<bool>> predicate)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        // Generous deadline so the test does not flake under a loaded CI/audit
+        // sandbox; the loop still returns the instant the predicate is satisfied,
+        // so the success path is unaffected.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
         while (DateTimeOffset.UtcNow < deadline)
         {
             if (await predicate())

@@ -122,22 +122,53 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             NullLogger<SandboxSuspendOnShutdownService>.Instance);
         await svc.SuspendAllAsync();
 
+        // The handler persists the (work item → VM) mapping BEFORE awaiting
+        // suspend, so suspend must actually have been attempted...
+        Assert.True(sandbox.SuspendCalled);
         var after = await _store.GetAsync(item.Id);
-        // No persisted bookkeeping when suspend failed — the item flows through
-        // the standard stranded-item recovery path on the next start.
+        // ...and on a genuine (non-cancellation) suspend failure the handler
+        // CLEARS the bookkeeping again: the VM is left Running and DisposeAsync
+        // tears it down, so the item flows through the standard stranded-item
+        // recovery path on the next start with no dangling resume mapping.
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
     }
 
     [Fact]
-    public async Task ShutdownHandler_SuspendTimeout_DoesNotPersistVmName()
+    public async Task ShutdownHandler_WorkItemMissingFromStore_DoesNotSuspend()
+    {
+        // The persist-before-await guard: SuspendOneAsync calls
+        // TryPersistSuspendBookkeepingAsync first, which returns false when the
+        // work item is no longer in the store (e.g. operator-deleted between
+        // dispatch and shutdown). In that case there is nowhere to record the
+        // resume mapping, so the handler must NOT call multipass suspend — a
+        // suspended-but-unmapped VM would just leak.
+        var item = MakeItem();
+        // Intentionally NOT created in the store.
+        var sandbox = new FakeSuspendableSandbox("vm-orphan");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+        await svc.SuspendAllAsync();
+
+        Assert.False(sandbox.SuspendCalled);
+        Assert.Null(await _store.GetAsync(item.Id));
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_SuspendTimeout_PersistsVmNameSoResumeCanReattach()
     {
         // The suspend handler bounds each multipass suspend with a per-VM
         // timeout. When the inner suspend exceeds it (OperationCanceledException),
-        // the handler logs and returns WITHOUT persisting SuspendedVmName so
-        // the item flows through the standard stranded-item recovery path.
-        // Distinct from the generic Exception branch — both must lead to the
-        // same "no bookkeeping" outcome.
+        // multipassd is still writing the RAM snapshot in the background and the
+        // VM WILL reach Suspended — so the handler must leave the persisted
+        // (work item → VM) mapping in place so the next startup can resume that
+        // VM. (Regression: the timeout used to clear the mapping, which is why
+        // R8-core's first real-world test fell back to stranded recovery and
+        // discarded ~2.5h of in-flight work.)
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -152,10 +183,237 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);
-        // Timeout fired before the sandbox SuspendAsync could complete; no
-        // bookkeeping must have been persisted.
-        Assert.Null(after!.SuspendedVmName);
-        Assert.Null(after.SuspendedAt);
+        // Mapping persisted up front and kept on timeout — the VM is still being
+        // suspended by multipassd, so the startup resume handler must know about it.
+        Assert.Equal("vm-slow", after!.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_SuspendOneAsync_UsesRamScaledTimeout_NotTheFlatFloor()
+    {
+        // Regression guard for the core production fix: SuspendOneAsync must build
+        // its per-VM CancellationTokenSource from SuspendTimeoutFor(sandbox)
+        // (RAM-scaled), NOT the flat floor (_perSuspendTimeout). The reported bug
+        // was a loaded 4 GiB VM timing out under the old uniform cap; if the
+        // handler regressed to use the floor again, the SuspendTimeoutFor unit
+        // tests would still pass while large VMs got only the floor.
+        //
+        // Construction: floor = 100ms (would cancel almost immediately), but the
+        // RAM-scaled budget for 4 GiB is 4 × 3000ms = 12s. The fake suspend takes
+        // ~500ms. Under the correct scaled budget it completes cleanly; a
+        // regression to the 100ms floor would cancel it (OperationCanceledException).
+        const long gib = 1024L * 1024 * 1024;
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new MemoryAwareDelaySandbox(
+            "vm-4g", memoryBytes: 4 * gib, delay: TimeSpan.FromMilliseconds(500));
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMilliseconds(100),
+            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000));
+
+        // The budget SuspendOneAsync must apply is the scaled 12s, not the 100ms floor.
+        Assert.Equal(TimeSpan.FromSeconds(12), svc.SuspendTimeoutFor(sandbox));
+
+        await svc.SuspendAllAsync();
+
+        Assert.True(sandbox.Completed,
+            "suspend should run to completion under the RAM-scaled budget");
+        Assert.False(sandbox.TimedOut,
+            "suspend must not be cancelled by the flat floor — that is the regressed behaviour");
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-4g", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_PersistsVmName_BEFORE_AwaitingSuspend()
+    {
+        // Acceptance criterion #3: the (work item → VM) mapping must be written
+        // BEFORE the multipass suspend is awaited, so a SIGKILL landing mid-suspend
+        // still leaves a resume mapping. Asserting the store only AFTER
+        // SuspendAllAsync returns can't distinguish "persisted before the await"
+        // from "persisted in the post-timeout handler" — both leave the same final
+        // row. So here we read the store WHILE SuspendAsync is still blocked and
+        // require the mapping to already be present.
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new SlowSuspendingSandbox("vm-ordering");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        // Long per-VM timeout: the suspend stays blocked (it does NOT time out)
+        // until we explicitly release it, so any persistence we observe must have
+        // happened on the pre-await path, not in the OperationCanceledException
+        // handler.
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMinutes(5));
+
+        var suspendAll = svc.SuspendAllAsync();
+
+        // Wait until the suspend await has actually begun.
+        await sandbox.SuspendEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The mapping is already persisted even though SuspendAsync has NOT returned.
+        var midFlight = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-ordering", midFlight!.SuspendedVmName);
+        Assert.NotNull(midFlight.SuspendedAt);
+
+        // Let the suspend complete cleanly so the handler finishes.
+        sandbox.Release();
+        await suspendAll;
+
+        // Mapping survives a clean suspend too (resume reattaches the frozen VM).
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal("vm-ordering", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task SuspendTimeoutFor_ScalesWithVmMemory_AboveTheFloor()
+    {
+        // A 12 GiB VM has 3× the RAM of a 4 GiB VM to flush to disk, so it must
+        // get a proportionally longer suspend timeout — a uniform cap would
+        // truncate the large VM's snapshot. Below the floor (or with no reported
+        // RAM size) the flat floor applies.
+        var svc = new SandboxSuspendOnShutdownService(
+            new FakeSuspendingProvider(), _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            perSuspendTimeout: TimeSpan.FromMinutes(10),
+            perGiBSuspendBudget: TimeSpan.FromSeconds(150));
+
+        const long gib = 1024L * 1024 * 1024;
+
+        // No reported memory → floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-unknown")));
+
+        // 4 GiB → 4 × 150s = 600s, equal to the floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-4g", memoryBytes: 4 * gib)));
+
+        // 8 GiB → 8 × 150s = 1200s = 20 min, strictly between floor and the
+        // 12 GiB case so a wrong GiB divisor or off-by-one scaling can't pass by
+        // coincidentally landing on the floor or a round endpoint.
+        Assert.Equal(
+            TimeSpan.FromMinutes(20),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-8g", memoryBytes: 8 * gib)));
+
+        // 12 GiB → 12 × 150s = 1800s, well above the floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(30),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-12g", memoryBytes: 12 * gib)));
+
+        // 1 GiB → 150s, below the floor → floor wins (catches a min/max swap:
+        // min would yield 150s here, not the 10-min floor).
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-1g", memoryBytes: 1 * gib)));
+
+        // Zero / negative reported RAM is treated the same as "unknown" → floor,
+        // never a zero or negative timeout that would cancel suspend instantly.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-0", memoryBytes: 0)));
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-neg", memoryBytes: -1)));
+    }
+
+    [Fact]
+    public void SuspendTimeoutFor_DefaultConstructor_UsesShippedConstants()
+    {
+        // The production DI registration constructs this service WITHOUT
+        // injected timeouts, so the regression fix only holds if the default
+        // constructor actually applies the raised floor (10 min) and the
+        // RAM-scaling budget (150s/GiB). Pin both via wall-clock literals so a
+        // silent revert of either constant fails here.
+        Assert.Equal(TimeSpan.FromMinutes(10), SandboxSuspendOnShutdownService.DefaultPerSuspendTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(150), SandboxSuspendOnShutdownService.DefaultPerGiBSuspendBudget);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            new FakeSuspendingProvider(), _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+
+        const long gib = 1024L * 1024 * 1024;
+
+        // No reported RAM → the 10-minute default floor.
+        Assert.Equal(
+            TimeSpan.FromMinutes(10),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-default")));
+
+        // 20 GiB → 20 × 150s = 3000s = 50 min, scaled off the default budget.
+        Assert.Equal(
+            TimeSpan.FromMinutes(50),
+            svc.SuspendTimeoutFor(new FakeSuspendableSandbox("vm-20g", memoryBytes: 20 * gib)));
+    }
+
+    [Fact]
+    public void HostShutdownReserve_ScalesByParallelSuspendWaveCount()
+    {
+        const long gib = 1024L * 1024 * 1024;
+        var floor = TimeSpan.FromMinutes(10);
+        var perGiB = TimeSpan.FromSeconds(150);
+        // Default 12 GiB profile → 30 min per VM.
+        var perVm = SuspendTimeoutPolicy.For(12 * gib, floor, perGiB);
+        Assert.Equal(TimeSpan.FromMinutes(30), perVm);
+
+        // ≤ batch size → a single wave, ceiling == one per-VM budget.
+        Assert.Equal(perVm, SuspendTimeoutPolicy.HostShutdownReserve(1, 8, 12 * gib, floor, perGiB));
+        Assert.Equal(perVm, SuspendTimeoutPolicy.HostShutdownReserve(8, 8, 12 * gib, floor, perGiB));
+
+        // 9 VMs across batches of 8 → 2 waves → 60 min. This is the regression the
+        // single-wave ceiling missed: the host must not SIGKILL before wave 2.
+        Assert.Equal(perVm * 2, SuspendTimeoutPolicy.HostShutdownReserve(9, 8, 12 * gib, floor, perGiB));
+        Assert.Equal(perVm * 2, SuspendTimeoutPolicy.HostShutdownReserve(16, 8, 12 * gib, floor, perGiB));
+
+        // 17 VMs → 3 waves → 90 min.
+        Assert.Equal(perVm * 3, SuspendTimeoutPolicy.HostShutdownReserve(17, 8, 12 * gib, floor, perGiB));
+
+        // Defensive clamps: zero / negative inputs never yield a zero-wave or
+        // divide-by-zero ceiling — at minimum one wave of the floor.
+        Assert.Equal(floor, SuspendTimeoutPolicy.HostShutdownReserve(0, 8, null, floor, perGiB));
+        Assert.Equal(floor, SuspendTimeoutPolicy.HostShutdownReserve(1, 0, null, floor, perGiB));
+    }
+
+    [Fact]
+    public void ResolveHostShutdownTimeout_RaisesCeilingForSuspendingProvidersOnly()
+    {
+        var grace = TimeSpan.FromSeconds(60);
+
+        // Providers that don't suspend on shutdown → ceiling stays at the grace
+        // window regardless of worker count. The decision is capability-driven
+        // (providerSuspendsOnShutdown=false), not a provider-name comparison.
+        Assert.Equal(grace,
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(false, grace, 32));
+
+        // Suspend-capable provider with a single worker → one wave of the default
+        // 12 GiB profile budget (30 min), STACKED on top of the 60s drain grace:
+        // the suspend drain (StoppingAsync) and the post-suspend preempt-checkpoint
+        // / listener drain are sequential windows, not overlapping.
+        Assert.Equal(TimeSpan.FromMinutes(30) + grace,
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 1));
+
+        // More workers than the parallel-suspend cap (8) → the reserve scales by
+        // wave count (16 workers → 2 waves → 60 min), again plus the drain grace.
+        Assert.Equal(TimeSpan.FromMinutes(60) + grace,
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, grace, 16));
+
+        // A long configured grace is ADDED to the suspend reserve, not max()'d
+        // against it: 4h grace + one 30-min wave = 4h30m.
+        var hugeGrace = TimeSpan.FromHours(4);
+        Assert.Equal(hugeGrace + TimeSpan.FromMinutes(30),
+            SuspendTimeoutPolicy.ResolveHostShutdownTimeout(true, hugeGrace, 1));
     }
 
     [Fact]
@@ -635,20 +893,26 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Theory]
+    [InlineData(WorkItemState.Working, "vm-working", true)]
     [InlineData(WorkItemState.Auditing, "vm-auditing", true)]
     [InlineData(WorkItemState.Reworking, "vm-reworking", true)]
     [InlineData(WorkItemState.Merging, "vm-merging", true)]
-    [InlineData(WorkItemState.AuditPassed, "vm-auditpassed", false)]
+    [InlineData(WorkItemState.AuditPassed, "vm-auditpassed", true)]
+    [InlineData(WorkItemState.ReworkingForConflict, "vm-reworkingconflict", true)]
     [InlineData(WorkItemState.Done, "vm-done", false)]
+    [InlineData(WorkItemState.Cancelled, "vm-cancelled", false)]
     public async Task LeakReaper_ProtectsSuspendedVm_ForEveryMidFlightState(
         WorkItemState state, string vmName, bool expectedProtected)
     {
-        // Each of (Working, Auditing, Reworking, Merging) is a mid-flight
-        // state where the agent could legitimately be running inside a
-        // suspended VM. A regression that drops one would cause that state's
-        // suspended VMs to be reaped during the restart window. The
-        // separately-tested terminal cases (Done, AuditPassed-as-resting) act
-        // as negative controls.
+        // Any non-terminal state can hold a live suspended VM: the suspend-on-
+        // shutdown handler persists a (work item → VM) mapping for every entry
+        // SnapshotSuspendableActive returns, regardless of which in-flight phase
+        // it is in (Working, Auditing, Reworking, Merging, AuditPassed,
+        // ReworkingForConflict, ...). The reaper must therefore protect by
+        // "not terminal" rather than an allow-list that silently drops a state
+        // and reaps a VM the startup resume handler is about to reattach. The
+        // terminal cases (Done, Cancelled) are negative controls: a stale
+        // mapping on a terminal item must NOT shield its VM from reaping.
         var item = MakeItem(state);
         await _store.CreateAsync(item with
         {
@@ -703,6 +967,128 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Contains("vm-stale-suspended", provider.DisposedNames);
     }
 
+    [Fact]
+    public async Task LeakReaper_OrphanedSuspendingVm_WithoutMapping_IsReapedAfterSuspendGrace()
+    {
+        // A crash (or per-VM suspend timeout followed by SIGKILL) can leave a VM
+        // in multipass `Suspending`/`Suspended` state with NO live SuspendedVmName
+        // mapping. SuspendAsync drops a .codeybox-preempt marker, so without
+        // suspend-state awareness the reaper would grant such a VM the full 24h
+        // PreemptRetention grace and it would leak for a day. But the reaper must
+        // ALSO not purge it the instant it appears: multipassd may still be writing
+        // the RAM image. The dedicated suspend grace is measured from when the
+        // reaper first observes the VM Suspending, NOT from its (here hour-old)
+        // CreatedAt — so the first sweep leaves it alone and only a later sweep,
+        // once the grace has elapsed, reaps it as an orphaned suspending VM.
+        var provider = new FakeSandboxLeakProvider();
+        // CreatedAt an hour ago: past LeakAgeThreshold (30m) and within
+        // PreemptRetention (24h). A CreatedAt-based gate would purge it immediately.
+        var aged = DateTimeOffset.UtcNow.AddHours(-1);
+        provider.SeedManaged(new("vm-orphan-suspending", aged, 1024L * 1024,
+            IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var clockNow = DateTimeOffset.UtcNow;
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions
+            {
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                PreemptRetention = TimeSpan.FromHours(24),
+                SuspendOrphanGrace = TimeSpan.FromMinutes(10),
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store,
+            () => clockNow);
+
+        // First sweep: just observed Suspending → within the dedicated grace
+        // despite the hour-old CreatedAt → must NOT be purged mid-snapshot.
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.DoesNotContain("vm-orphan-suspending", provider.DisposedNames);
+
+        // Advance past the suspend grace: multipassd had its snapshot window and the
+        // VM is still orphaned with no live mapping → reap it now.
+        clockNow = clockNow.AddMinutes(11);
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains("vm-orphan-suspending", provider.DisposedNames);
+        // Classified specifically as a suspend orphan (not a generic untracked
+        // leak), so the reason wired into the webhook/audit trail can't silently
+        // regress to the wrong bucket.
+        var leakEvent = Assert.Single(
+            webhooks.Events,
+            e => e.Event == "sandbox.leak_detected" &&
+                 e.Details is SandboxLeakDetails d && d.Name == "vm-orphan-suspending");
+        Assert.Equal(
+            SandboxLeakReasons.OrphanedSuspendingVm,
+            ((SandboxLeakDetails)leakEvent.Details!).Reason);
+    }
+
+    [Fact]
+    public async Task LeakReaper_OrphanedSuspendingVm_WithinSuspendGrace_IsNotReaped()
+    {
+        // Negative control for the suspend-orphan path: a Suspending VM with a
+        // preempt marker, no live mapping, and a CreatedAt well past LeakAgeThreshold
+        // must STILL be left alone while it is inside the dedicated suspend grace.
+        // A regression that purged every IsSuspendLifecycleOrFrozen VM immediately
+        // (ignoring the grace) would kill it mid-snapshot — this test fails if that
+        // grace gate is dropped.
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new("vm-fresh-suspending", DateTimeOffset.UtcNow.AddHours(-2),
+            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions
+            {
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                PreemptRetention = TimeSpan.FromHours(24),
+                SuspendOrphanGrace = TimeSpan.FromMinutes(30),
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("vm-fresh-suspending", provider.DisposedNames);
+        Assert.DoesNotContain(
+            webhooks.Events,
+            e => e.Event == "sandbox.leak_detected" &&
+                 e.Details is SandboxLeakDetails d && d.Name == "vm-fresh-suspending");
+    }
+
+    [Fact]
+    public async Task LeakReaper_SuspendingVm_WithLiveMapping_IsStillProtected()
+    {
+        // Control for the orphan case: a Suspending VM that DOES have a live
+        // mid-flight SuspendedVmName mapping is being held across a restart and
+        // must never be reaped, even though its state is transitional.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-mapped-suspending",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new("vm-mapped-suspending", DateTimeOffset.UtcNow.AddHours(-1),
+            1024L * 1024, IsTrackedActive: false, HasPreemptMarker: true, IsSuspendLifecycleOrFrozen: true));
+
+        var webhooks = new CapturingWebhookDispatcher();
+        var reaper = new SandboxLeakReaper(
+            provider, webhooks,
+            () => new SandboxLeakOptions { LeakAgeThreshold = TimeSpan.FromMinutes(30), AutoDispose = true },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("vm-mapped-suspending", provider.DisposedNames);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private SandboxResumeOnStartupService MakeResumeService(ISandboxProvider provider) =>
@@ -748,12 +1134,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         public bool SuspendCalled { get; private set; }
         private readonly bool _shouldThrow;
-        public FakeSuspendableSandbox(string id, bool shouldThrow = false)
+        public FakeSuspendableSandbox(string id, bool shouldThrow = false, long? memoryBytes = null)
         {
             Id = id;
             _shouldThrow = shouldThrow;
+            MemoryBytes = memoryBytes;
         }
         public string Id { get; }
+        public long? MemoryBytes { get; }
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -765,19 +1153,67 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
+    // A suspendable sandbox that reports a RAM size and runs a real (short) delay
+    // inside SuspendAsync, honouring the cancellation token. Lets a test prove the
+    // per-VM timeout the handler applies is the RAM-scaled budget (delay completes)
+    // rather than a smaller flat floor (delay would be cancelled).
+    private sealed class MemoryAwareDelaySandbox : ISuspendableSandbox
+    {
+        private readonly TimeSpan _delay;
+        public MemoryAwareDelaySandbox(string id, long memoryBytes, TimeSpan delay)
+        {
+            Id = id;
+            MemoryBytes = memoryBytes;
+            _delay = delay;
+        }
+        public string Id { get; }
+        public long? MemoryBytes { get; }
+        public bool Completed { get; private set; }
+        public bool TimedOut { get; private set; }
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public async Task SuspendAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                await Task.Delay(_delay, ct);
+                Completed = true;
+            }
+            catch (OperationCanceledException)
+            {
+                TimedOut = true;
+                throw;
+            }
+        }
+    }
+
     private sealed class SlowSuspendingSandbox : ISuspendableSandbox
     {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public SlowSuspendingSandbox(string id) { Id = id; }
         public string Id { get; }
+
+        /// <summary>Completes the moment <see cref="SuspendAsync"/> is entered, so
+        /// a test can observe store state WHILE the suspend await is in flight.</summary>
+        public TaskCompletionSource SuspendEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Lets a test unblock a clean, successful suspend return (instead
+        /// of relying on the per-VM timeout cancelling the call).</summary>
+        public void Release() => _release.TrySetResult();
+
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         public Task SuspendAsync(CancellationToken ct = default)
         {
-            // Block until cancellation fires; the per-suspend timeout in
-            // SandboxSuspendOnShutdownService will cancel this.
+            SuspendEntered.TrySetResult();
+            // Block until either the per-suspend timeout cancels us (the timeout
+            // test) or a test explicitly releases for a clean return (the ordering
+            // test).
             var tcs = new TaskCompletionSource();
             ct.Register(() => tcs.TrySetException(new OperationCanceledException(ct)));
+            _release.Task.ContinueWith(_ => tcs.TrySetResult(), TaskScheduler.Default);
             return tcs.Task;
         }
     }

@@ -176,12 +176,21 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptions
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
 
-builder.Services.Configure<HostOptions>(o =>
-{
-    var cbOpts = builder.Configuration.GetSection("CodeyBox").Get<CodeyBoxOptions>()
-        ?? new CodeyBoxOptions();
-    o.ShutdownTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
-});
+// Sized from the resolved sandbox provider's capability, not its config name:
+// a provider that implements ISuspendingSandboxProvider freezes VMs on shutdown
+// and needs the raised ceiling; everything else keeps the tighter grace. Using
+// the DI-resolved provider keeps the deployment knowledge (name → provider) in
+// the composition root and out of the Core policy. See ComputeHostShutdownTimeout.
+builder.Services.AddOptions<HostOptions>()
+    .Configure<IOptions<CodeyBoxOptions>, ISandboxProvider, ILoggerFactory>(
+        (o, cbOptsAccessor, sandboxProvider, loggerFactory) =>
+        {
+            var providerSuspendsOnShutdown = sandboxProvider is ISuspendingSandboxProvider;
+            o.ShutdownTimeout = Program.ComputeHostShutdownTimeout(
+                cbOptsAccessor.Value,
+                providerSuspendsOnShutdown,
+                loggerFactory.CreateLogger("CodeyBox.HostShutdown"));
+        });
 
 ApiKeyAuth.Configure(builder);
 
@@ -2535,4 +2544,40 @@ namespace CodeyBox.Api
 }
 
 // Exposed for WebApplicationFactory<Program> in integration tests.
-public partial class Program { }
+public partial class Program
+{
+    /// <summary>
+    /// Resolve <c>HostOptions.ShutdownTimeout</c> from operator config and the
+    /// resolved provider's suspend capability. Shutdown:GraceSeconds bounds the
+    /// normal request-drain / preempt-checkpoint window; a suspend-on-shutdown
+    /// provider can legitimately need far longer to let the host finish writing
+    /// each VM's RAM snapshot (the RAM-scaled <see cref="SuspendTimeoutPolicy"/>
+    /// budget — 30 min for the default 12 GiB VM) and drains in parallel batches,
+    /// so a deployment with more in-flight VMs than the batch cap spans
+    /// <c>ceil(N/batch)</c> sequential waves. The ceiling must cover the slowest
+    /// wave-chain PLUS the post-suspend drain grace (suspend runs in StoppingAsync,
+    /// the preempt-checkpoint / listener-drain window runs after), not one VM, or
+    /// the host SIGKILLs us mid-snapshot on a later wave or mid-drain.
+    /// ShutdownTimeout is a CEILING, not a fixed wait: a shutdown with
+    /// nothing to suspend still returns as soon as every hosted service's
+    /// StoppingAsync completes, so raising it only affects the suspend case.
+    ///
+    /// <para>The concurrent-sandbox bound is resolved through
+    /// <see cref="OrchestratorOptionsFactory"/> — the same validation/precedence
+    /// path the orchestrator pool uses (WorkerPool wins, legacy Concurrency is the
+    /// fallback, default 1) — so this ceiling cannot drift below the actual pool
+    /// size. All VMs are provisioned at <see cref="SandboxResourceLimits.Default"/>
+    /// (no per-VM RAM override is wired through SandboxSpec today), so the default
+    /// profile RAM is the largest per-VM suspend budget the host must cover.</para>
+    /// </summary>
+    internal static TimeSpan ComputeHostShutdownTimeout(
+        CodeyBoxOptions cbOpts, bool providerSuspendsOnShutdown, ILogger log)
+    {
+        var grace = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
+        var maxConcurrent = OrchestratorOptionsFactory
+            .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
+            .MaxConcurrentWorkers;
+        return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
+            providerSuspendsOnShutdown, grace, maxConcurrent);
+    }
+}

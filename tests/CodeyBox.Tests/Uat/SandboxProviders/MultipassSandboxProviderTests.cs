@@ -839,6 +839,51 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(expected, managed.CreatedAt);
     }
 
+    [Theory]
+    [InlineData("Suspending", true)]
+    [InlineData("Suspended", true)]
+    [InlineData("Running", false)]
+    [InlineData("Stopped", false)]
+    public async Task ListAllManagedAsync_MapsMultipassStateToSuspendLifecycleFlag(
+        string multipassState, bool expectedFlag)
+    {
+        // SandboxLeakReaper reads ManagedSandboxInfo.IsSuspendLifecycleOrFrozen to
+        // spot VMs frozen/freezing with no live mapping. The multipass state
+        // vocabulary stays inside the provider, which must map BOTH Suspending
+        // (snapshot in progress) and Suspended (complete) to true, and running /
+        // stopped states to false. This pins the JSON-parse → flag wiring so a
+        // regression there can't silently blind the reaper.
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "list", "--format", "json"])
+                return Task.FromResult(new ProcessRunResult(0, """
+                    {"list":[{"name":"codeybox-stateful"}]}
+                    """, ""));
+
+            if (argv.Count >= 4 && argv[1] == "info")
+            {
+                var info = new Dictionary<string, object>
+                {
+                    ["codeybox-stateful"] = new Dictionary<string, object?>
+                    {
+                        ["state"] = multipassState,
+                        ["disks"] = new Dictionary<string, object>(),
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-state-" + multipassState),
+            runner: runner);
+
+        var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Equal(expectedFlag, managed.IsSuspendLifecycleOrFrozen);
+    }
+
     [Fact]
     public async Task BaselineImages_BakeOncePerProfileUnderConcurrentCreatesThenCloneSandboxes()
     {
@@ -1905,8 +1950,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Critical safety contract: a failed `multipass suspend` MUST NOT flip
         // _preserveOnDispose to true. Otherwise the subsequent DisposeAsync
         // becomes a no-op while the VM is still Running on disk — a silent
-        // leak that the SandboxSuspendOnShutdownService caller won't even
-        // know about (the catch handler returns without persisting bookkeeping).
+        // leak. The SandboxSuspendOnShutdownService caller persists the
+        // SuspendedVmName mapping BEFORE awaiting suspend and CLEARS it again
+        // when suspend throws a non-cancellation exception, so this failed,
+        // still-Running VM is left with no resume bookkeeping and DisposeAsync
+        // tears it down.
         var suspendCalls = 0;
         var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
@@ -1937,6 +1985,215 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // suspend.
         await sandbox.DisposeAsync();
         Assert.Equal(1, deleteCalls);
+    }
+
+    [Fact]
+    public async Task SuspendAsync_TimedOut_PreservesVmOnDispose()
+    {
+        // Critical safety contract for the per-VM suspend timeout: when
+        // `multipass suspend` is abandoned by OperationCanceledException (the
+        // SandboxSuspendOnShutdownService per-VM timeout fired while multipassd
+        // was still writing the RAM snapshot), DisposeAsync MUST NOT run
+        // `multipass delete --purge`. multipassd keeps freezing the VM after we
+        // give up; the caller keeps the persisted SuspendedVmName mapping so the
+        // next startup resumes it (or the leak reaper purges it after the
+        // preempt grace). Deleting here would destroy the snapshot mid-write and
+        // defeat the whole persist-before-await fix.
+        var suspendCalls = 0;
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "suspend", _])
+            {
+                suspendCalls++;
+                throw new OperationCanceledException("per-VM suspend timeout");
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            ((ISuspendableSandbox)sandbox).SuspendAsync());
+
+        Assert.True(suspendCalls >= 1);
+        // IsSuspended stays false: the VM is not confirmed frozen, so
+        // PipelineRunner relies on the persisted mapping gate, not IsSuspended.
+        Assert.False(((ISuspendableSandbox)sandbox).IsSuspended);
+
+        // DisposeAsync must be a no-op: the VM multipassd is still snapshotting
+        // is owned by the orchestrator's resume/reaper path, not destroyed here.
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public void MemoryBytes_ReflectsSpecLimits_ForSuspendTimeoutScaling()
+    {
+        // SandboxSuspendOnShutdownService.SuspendTimeoutFor scales the per-VM
+        // suspend timeout by ISuspendableSandbox.MemoryBytes. MultipassSandbox
+        // must surface the provisioned RAM from its SandboxSpec.Limits — and
+        // specifically the *memory* field, not disk — so scaling is fed a real
+        // value rather than the flat floor. DiskBytes is deliberately set to a
+        // different value so a regression that read the wrong field is caught.
+        const long sixGiB = 6L * 1024 * 1024 * 1024;
+        const long fortyGiB = 40L * 1024 * 1024 * 1024;
+        var sandbox = NewMemorySandbox(new SandboxResourceLimits
+        {
+            MemoryBytes = sixGiB,
+            DiskBytes = fortyGiB,
+            CpuCount = 4,
+        });
+
+        Assert.Equal(sixGiB, ((ISuspendableSandbox)sandbox).MemoryBytes);
+
+        // No reported RAM → null, so SuspendTimeoutFor falls back to the flat
+        // floor rather than scaling off a bogus value. A hardcoded non-null
+        // would break this.
+        var unsized = NewMemorySandbox(new SandboxResourceLimits { DiskBytes = fortyGiB });
+        Assert.Null(((ISuspendableSandbox)unsized).MemoryBytes);
+    }
+
+    private MultipassSandbox NewMemorySandbox(SandboxResourceLimits limits) =>
+        new(
+            "codeybox-mem",
+            _workspace,
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Flavor = SandboxProfileFlavor.Headless,
+                Limits = limits,
+            },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) => Task.FromResult(new ProcessRunResult(0, "", ""))));
+
+    [Fact]
+    public async Task ResumeSandboxAsync_WaitsForSuspendingToSettleBeforeStart()
+    {
+        // The previous process may have abandoned `multipass suspend` mid-flight,
+        // leaving the VM in the transitional `Suspending` state. `multipass start`
+        // fails against a Suspending instance, so ResumeSandboxAsync must poll
+        // `multipass info` until the state settles before calling start.
+        var infoCalls = 0;
+        var startCalls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=json"])
+            {
+                infoCalls++;
+                // First two polls report Suspending, then the snapshot completes.
+                var state = infoCalls < 3 ? "Suspending" : "Suspended";
+                var info = new Dictionary<string, object>
+                {
+                    [infoName] = new Dictionary<string, object?>
+                    {
+                        ["state"] = state,
+                        ["memory"] = new Dictionary<string, object> { ["total"] = 1024L * 1024 * 1024 },
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+
+        await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-settling", CancellationToken.None);
+
+        Assert.True(infoCalls >= 3, $"expected the resume to poll info until settled; saw {infoCalls} call(s)");
+        Assert.Equal(["codeybox-settling"], startCalls);
+    }
+
+    [Fact]
+    public async Task ResumeSandboxAsync_WaitLoop_HonoursCancellationWhileStillSuspending()
+    {
+        // The Suspending wait is bounded by the RAM-scaled SuspendTimeoutPolicy
+        // budget (up to 30 min for the default 12 GiB VM), so the loop cannot just
+        // ignore the caller's token and block for that long if shutdown / startup
+        // is itself aborted. With the VM held permanently at Suspending, cancelling
+        // the token must interrupt the wait promptly — the resume surfaces
+        // OperationCanceledException and never reaches `multipass start`.
+        var startCalls = new List<string>();
+        using var cts = new CancellationTokenSource();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=json"])
+            {
+                cts.CancelAfter(TimeSpan.FromMilliseconds(20));
+                var info = new Dictionary<string, object>
+                {
+                    [infoName] = new Dictionary<string, object?>
+                    {
+                        ["state"] = "Suspending",
+                        ["memory"] = new Dictionary<string, object> { ["total"] = 12L * 1024 * 1024 * 1024 },
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-stuck", cts.Token));
+        Assert.Empty(startCalls);
+    }
+
+    [Fact]
+    public async Task ResumeSandboxAsync_StillSuspendingPastBudget_StartsAnyway()
+    {
+        // A VM that never leaves Suspending must not strand the resume: once the
+        // RAM-scaled settle budget elapses, WaitWhileSuspendingAsync logs a
+        // warning and proceeds to `multipass start` regardless, letting start
+        // surface any real error into the standard recovery path. The budget is
+        // floored at 10 min in production, so the test injects a tiny override to
+        // drive the deadline-expiry branch without waiting out real time.
+        var infoCalls = 0;
+        var startCalls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=json"])
+            {
+                infoCalls++;
+                // Permanently Suspending — the snapshot never completes.
+                var info = new Dictionary<string, object>
+                {
+                    [infoName] = new Dictionary<string, object?>
+                    {
+                        ["state"] = "Suspending",
+                        ["memory"] = new Dictionary<string, object> { ["total"] = 4L * 1024 * 1024 * 1024 },
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+        provider.SuspendSettleBudgetOverride = TimeSpan.FromMilliseconds(50);
+
+        await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-stillstuck", CancellationToken.None);
+
+        Assert.True(infoCalls >= 1, $"expected at least the initial Suspending probe; saw {infoCalls} call(s)");
+        Assert.Equal(["codeybox-stillstuck"], startCalls);
     }
 
     [Fact]

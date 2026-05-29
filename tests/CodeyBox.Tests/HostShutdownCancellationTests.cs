@@ -531,10 +531,103 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was suspended by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was suspended (or is being suspended) by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         // Sanity: no preempt-checkpoint ref ever made it to origin either.
+        var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref");
+        Assert.DoesNotContain("codeybox/preempt", showRef.stdout);
+
+        store.Dispose();
+    }
+
+    [Fact]
+    public async Task HostShutdown_WhenSuspendTimedOutButMappingPersisted_SkipsCheckpointAndPreserve()
+    {
+        // Covers the suspend-TIMEOUT branch of the same race: the suspend
+        // handler persisted the (work item → VM) mapping BEFORE awaiting
+        // `multipass suspend`, then the per-VM timeout fired while multipassd is
+        // still writing the snapshot — so IsSuspended is still FALSE but
+        // SuspendedVmName is set in the store. PipelineRunner must treat the
+        // persisted mapping (not just IsSuspended) as "suspend owns recovery"
+        // and short-circuit the legacy checkpoint/preserve flow, otherwise the
+        // git-checkpoint + multipass-stop path races the in-flight suspend.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var wrappingProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var agent = new BlockingAgentRunner();
+        var pipeline = new PipelineRunner(
+            wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            }),
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            logger);
+
+        var item = NewItem();
+        await store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+
+        SuspendableSandboxWrapper? liveSandbox = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            liveSandbox = wrappingProvider.Wrappers.LastOrDefault();
+            if (liveSandbox is not null) break;
+            await Task.Delay(25);
+        }
+        Assert.NotNull(liveSandbox);
+
+        // The suspend handler timed out: mapping persisted, IsSuspended NOT set.
+        Assert.False(liveSandbox.IsSuspended);
+        var persisted = await store.GetAsync(item.Id);
+        await store.UpdateAsync(persisted! with
+        {
+            SuspendedVmName = liveSandbox.Id,
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+
+        var final = await store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.PreemptedAt);
+        Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
+
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("was suspended (or is being suspended) by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
+
         var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
             "show-ref");
         Assert.DoesNotContain("codeybox/preempt", showRef.stdout);

@@ -82,6 +82,20 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
 
     private sealed record SuspendableOwnerEntry(WorkItemId WorkItemId, MultipassSandbox Sandbox);
 
+    // Test seam: override the RAM-scaled Suspending-settle budget used by
+    // WaitWhileSuspendingAsync. Production leaves this null and derives the
+    // budget from SuspendTimeoutPolicy (floored at 10 min), which is far too
+    // long for a unit test to wait out; tests set a tiny value to exercise the
+    // deadline-expiry branch (proceed to `multipass start` while still
+    // Suspending) without controlling wall-clock time.
+    internal TimeSpan? SuspendSettleBudgetOverride { get; set; }
+
+    // Test seam: override the WaitForAdoptedAgentCompletionAsync poll interval.
+    // Production polls every 2s; tests set a small value so the loop is not
+    // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
+    // deadline under thread-pool starvation, making the test flaky).
+    internal TimeSpan? AdoptionPollIntervalOverride { get; set; }
+
     // Cache for ListAllManagedAsync results to avoid hammering multipassd.
     private IReadOnlyList<ManagedSandboxInfo>? _listCache;
     private DateTimeOffset _listCacheExpiry = DateTimeOffset.MinValue;
@@ -405,6 +419,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         if (!IsValidSandboxName(name))
             throw new ArgumentException($"Sandbox name '{name}' contains invalid characters (only [a-z0-9-] allowed).", nameof(name));
 
+        // The previous process may have abandoned `multipass suspend` mid-flight
+        // (per-VM suspend timeout fired, then SIGKILL), leaving multipassd still
+        // writing the RAM snapshot — the VM lingers in `Suspending`. `multipass
+        // start` against a `Suspending` instance fails, which would send the work
+        // item to stranded recovery even though the snapshot is about to finish.
+        // Wait for the transitional state to settle before starting.
+        await WaitWhileSuspendingAsync(opts, name, ct);
+
         var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         // Treat "instance not running" / "already started" as success: the goal
         // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
@@ -445,7 +467,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         // read failure so we do not silently drop output if the file was
         // rotated by some VM-side tool.
         long offset = 0;
-        var pollInterval = TimeSpan.FromSeconds(2);
+        var pollInterval = AdoptionPollIntervalOverride ?? TimeSpan.FromSeconds(2);
         var maxStdoutBytes = 1024 * 1024;
 
         while (!ct.IsCancellationRequested)
@@ -801,10 +823,25 @@ git push origin HEAD:{refName}";
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
-            infos.Add(new ManagedSandboxInfo(name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker));
+            var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
+            infos.Add(new ManagedSandboxInfo(
+                name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
+                IsSuspendLifecycleState(state)));
         }
         return infos;
     }
+
+    /// <summary>
+    /// Maps a multipass lifecycle state string to the provider-agnostic
+    /// "suspend lifecycle or frozen" flag exposed on <see cref="ManagedSandboxInfo"/>.
+    /// True for <c>Suspending</c> (snapshot in progress) and <c>Suspended</c>
+    /// (snapshot complete); the multipass state vocabulary stays inside this
+    /// provider so Core / the leak reaper see only the boolean.
+    /// </summary>
+    private static bool IsSuspendLifecycleState(string? state) =>
+        state is not null &&
+        (state.Equals("Suspending", StringComparison.OrdinalIgnoreCase) ||
+         state.Equals("Suspended", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Runs <c>multipass info --format json</c> for the given VM names and returns
@@ -851,9 +888,14 @@ git push origin HEAD:{refName}";
                 if (total > 0)
                     diskBytes = total;
 
+                string? state = null;
+                if (vmEntry.Value.TryGetProperty("state", out var stateEl) && stateEl.ValueKind == JsonValueKind.String)
+                    state = stateEl.GetString();
+
                 result[vmEntry.Name] = new MultipassSandboxDetails(
                     diskBytes,
-                    TryReadCreatedAt(vmEntry.Value));
+                    TryReadCreatedAt(vmEntry.Value),
+                    state);
             }
         }
         catch (JsonException ex)
@@ -1429,6 +1471,99 @@ test "$work" = present && test "$exec_wrapper" = present
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
         }
         throw new InvalidOperationException($"multipass VM {name} did not reach Stopped state within 2 minutes");
+    }
+
+    /// <summary>
+    /// Polls `multipass info` while the VM is in the transitional <c>Suspending</c>
+    /// state and returns once it has settled (<c>Suspended</c>/<c>Stopped</c>/etc.)
+    /// so a subsequent <c>multipass start</c> does not fail against a half-frozen
+    /// instance. Best-effort: a non-zero `info` exit (VM gone) or an unreadable
+    /// state returns immediately and lets the caller's `start` surface the real
+    /// error.
+    ///
+    /// <para>The wait deadline is the SAME RAM-scaled budget the shutdown suspend
+    /// handler used (<see cref="SuspendTimeoutPolicy"/>), keyed off the VM's own
+    /// reported RAM (falling back to the default VM profile when info can't report
+    /// it). The previous process may have been writing the snapshot for up to that
+    /// budget; a shorter fixed cap here would `multipass start` against a still-
+    /// Suspending VM, fail, and drive the work item into stranded recovery — the
+    /// exact failure mode R8-core exists to prevent. If the snapshot is still
+    /// being written when the deadline elapses we proceed and let `start` surface
+    /// the error into the standard recovery path.</para>
+    /// </summary>
+    private async Task WaitWhileSuspendingAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        CancellationToken ct)
+    {
+        var (state, memoryBytes) = await TryReadStateAndMemoryAsync(opts, name, ct);
+        // VM not found / info failed / unreadable: nothing to wait on — let start
+        // decide. Already settled (not Suspending): proceed immediately.
+        if (state is null || !state.Equals("Suspending", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        // Unknown RAM → assume the default VM profile so the cap still covers the
+        // documented worst case (30 min for the 12 GiB default) rather than
+        // collapsing to the bare floor.
+        var budget = SuspendSettleBudgetOverride
+            ?? SuspendTimeoutPolicy.For(memoryBytes ?? SandboxResourceLimits.Default.MemoryBytes);
+        var deadline = DateTime.UtcNow + budget;
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+            ct.ThrowIfCancellationRequested();
+            (state, _) = await TryReadStateAndMemoryAsync(opts, name, ct);
+            if (state is null || !state.Equals("Suspending", StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+        _log.LogWarning(
+            "multipass VM {Name} was still Suspending after {Budget}; attempting start anyway", name, budget);
+    }
+
+    /// <summary>
+    /// Reads a single VM's lifecycle state and total RAM from
+    /// <c>multipass info &lt;name&gt; --format=json</c>. Returns
+    /// <c>(null, null)</c> when info fails, the VM is absent, or the JSON can't be
+    /// parsed — callers treat that as "nothing to wait on". Parsing the JSON
+    /// <c>state</c>/<c>memory.total</c> fields (rather than substring-matching CSV)
+    /// avoids false positives/negatives on the critical resume path.
+    /// </summary>
+    private async Task<(string? State, long? MemoryBytes)> TryReadStateAndMemoryAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        CancellationToken ct)
+    {
+        var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=json"], stdin: null, ct: ct);
+        if (info.ExitCode != 0) return (null, null);
+        try
+        {
+            using var doc = JsonDocument.Parse(info.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var infoEl) || infoEl.ValueKind != JsonValueKind.Object)
+                return (null, null);
+            foreach (var vmEntry in infoEl.EnumerateObject())
+            {
+                string? state = null;
+                if (vmEntry.Value.TryGetProperty("state", out var stateEl) && stateEl.ValueKind == JsonValueKind.String)
+                    state = stateEl.GetString();
+
+                long? memoryBytes = null;
+                if (vmEntry.Value.TryGetProperty("memory", out var memEl) && memEl.ValueKind == JsonValueKind.Object &&
+                    memEl.TryGetProperty("total", out var totalEl))
+                {
+                    if (totalEl.ValueKind == JsonValueKind.Number && totalEl.TryGetInt64(out var totalNum))
+                        memoryBytes = totalNum;
+                    else if (totalEl.ValueKind == JsonValueKind.String &&
+                             long.TryParse(totalEl.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var totalStr))
+                        memoryBytes = totalStr;
+                }
+                return (state, memoryBytes > 0 ? memoryBytes : null);
+            }
+            return (null, null);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
+        }
     }
 
     /// <summary>
@@ -2139,7 +2274,7 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt);
+internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -2664,6 +2799,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// </summary>
     public bool IsSuspended => _isSuspended;
 
+    /// <summary>
+    /// RAM size this VM was provisioned with, surfaced so the suspend-on-shutdown
+    /// service can scale its per-VM timeout: a larger VM has more RAM to flush to
+    /// disk on <c>multipass suspend</c>.
+    /// </summary>
+    public long? MemoryBytes => _spec.Limits.MemoryBytes;
+
     public MultipassSandbox(string name, string sandboxRoot, SandboxSpec spec, MultipassSandboxOptions opts, ILogger log,
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
         Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,
@@ -3132,7 +3274,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// <c>_preserveOnDispose</c> so the host-side handle's DisposeAsync becomes
     /// a no-op — the orchestrator owns destruction via the startup resume
     /// handler (which will <c>multipass start</c> the same VM) or the leak
-    /// reaper (if the persisted bookkeeping has expired).
+    /// reaper (if the persisted bookkeeping has expired). The flag is also set
+    /// when the call is abandoned by <see cref="OperationCanceledException"/>
+    /// (per-VM suspend timeout): multipassd keeps writing the snapshot after we
+    /// give up, so the VM must not be purged on dispose even though we never
+    /// observed the suspend exit cleanly.
     ///
     /// <para>Writes the same <c>.codeybox-preempt</c> marker as
     /// <see cref="StopAndPreserveAsync"/> so the SandboxLeakReaper applies the
@@ -3152,19 +3298,45 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             _log.LogWarning(ex, "Failed to write preempt marker for suspended multipass VM {Name}", _name);
         }
 
-        var result = await RunMultipassAsync(
-            [_opts.MultipassBinary, "suspend", _name],
-            stdin: null,
-            ct: ct);
+        ProcessRunResult result;
+        try
+        {
+            result = await RunMultipassAsync(
+                [_opts.MultipassBinary, "suspend", _name],
+                stdin: null,
+                ct: ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // The per-VM suspend timeout fired (or host shutdown cancelled the
+            // call) while `multipass suspend` was still running. multipassd
+            // keeps writing the RAM snapshot after our call is abandoned, so the
+            // VM still reaches Suspended on disk. DisposeAsync MUST NOT
+            // `delete --purge` it: the orchestrator owns destruction via the
+            // startup resume handler (which retries `multipass start`) or the
+            // leak reaper (which honours the .codeybox-preempt marker grace
+            // window written above). The caller
+            // (SandboxSuspendOnShutdownService.SuspendOneAsync) keeps the
+            // persisted SuspendedVmName mapping on this OCE so the next startup
+            // can reattach. We deliberately do NOT set _isSuspended: the VM is
+            // not confirmed frozen yet, so PipelineRunner falls back to the
+            // persisted-mapping gate rather than asserting IsSuspended.
+            _preserveOnDispose = true;
+            throw;
+        }
         if (result.ExitCode != 0)
         {
-            // Do NOT set _preserveOnDispose before this point: if the multipass
-            // suspend call fails we still want DisposeAsync to destroy the VM
-            // so a still-Running but un-bookkept VM doesn't silently leak. The
-            // caller (SandboxSuspendOnShutdownService.SuspendOneAsync) treats
-            // any exception here as "don't persist SuspendedVmName"; the next
-            // DisposeAsync (triggered by the orchestrator's host stopping)
-            // then cleanly tears the VM down.
+            // Do NOT set _preserveOnDispose on a non-zero exit: a genuine
+            // suspend failure leaves the VM Running, so DisposeAsync must
+            // destroy it rather than leak a still-Running but un-bookkept VM.
+            // The caller persists the SuspendedVmName mapping BEFORE awaiting
+            // this method, then CLEARS it again on this non-cancellation
+            // exception so the failed VM has no resume bookkeeping; the next
+            // DisposeAsync (triggered by the orchestrator's host stopping) then
+            // cleanly tears the VM down. (A per-VM timeout, by contrast, is the
+            // OperationCanceledException handled above: it keeps the mapping and
+            // preserves the VM so the next startup can resume the snapshot
+            // multipassd is still writing.)
             throw new InvalidOperationException(
                 $"multipass suspend {_name} failed (exit {result.ExitCode}): {result.Stderr}");
         }
