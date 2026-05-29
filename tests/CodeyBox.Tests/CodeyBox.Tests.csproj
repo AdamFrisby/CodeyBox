@@ -20,6 +20,7 @@
     <PackageReference Include="Serilog" Version="4.2.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.4.13" />
   </ItemGroup>
 
   <ItemGroup>
@@ -48,8 +49,7 @@
       prevents the sample types from being loaded into the test's default ALC,
       which would interfere with the AssemblyLoadContext isolation under test.
     -->
-    <ProjectReference Include="..\CodeyBox.PluginSdk.SampleTests\CodeyBox.PluginSdk.SampleTests.csproj"
-                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\CodeyBox.PluginSdk.SampleTests\CodeyBox.PluginSdk.SampleTests.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Gemini\CodeyBox.Agents.Gemini.csproj" />
@@ -67,9 +67,10 @@
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Graphical\CodeyBox.Sandbox.Graphical.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
+    <ProjectReference Include="..\..\tools\CodeyBox.Harness\CodeyBox.Harness.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
-    <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj"
-                      Aliases="CodeyBoxAdminWeb" />
+    <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj" Aliases="CodeyBoxAdminWeb" />
     <!--
       Build dependency only: the CLI UAT tests spawn the CLI as an out-of-process
       child to exercise the real entry point. ReferenceOutputAssembly=false keeps
@@ -78,8 +79,7 @@
       without paying for a per-invocation `dotnet run` rebuild that can exceed
       the test timeout under cold sandbox caches.
     -->
-    <ProjectReference Include="..\..\tools\CodeyBox.Cli\CodeyBox.Cli.csproj"
-                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\tools\CodeyBox.Cli\CodeyBox.Cli.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>
