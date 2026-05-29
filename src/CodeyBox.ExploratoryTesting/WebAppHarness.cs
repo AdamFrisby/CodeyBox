@@ -34,15 +34,11 @@ public sealed class WebAppHarness : IAppUnderTestHarness
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public async Task<AppUnderTestSession> LaunchAsync(AppUnderTestRecipe recipe, CancellationToken ct = default)
+    public async Task<AppUnderTestSession> LaunchAsync(WebAppRecipe recipe, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(recipe);
-        if (recipe is not WebAppRecipe web)
-            throw new NotSupportedException(
-                $"WebAppHarness only handles WebAppRecipe; received {recipe.GetType().Name}. " +
-                "Add a per-modality harness when the next recipe type lands.");
-
-        ValidateRecipe(web);
+        ValidateRecipe(recipe);
+        var web = recipe;
 
         _log.LogInformation(
             "WebAppHarness.LaunchAsync: target={Target} entryUrl={EntryUrl} buildSteps={BuildCount} seedSteps={SeedCount}",

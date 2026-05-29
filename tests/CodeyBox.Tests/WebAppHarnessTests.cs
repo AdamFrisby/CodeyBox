@@ -401,15 +401,6 @@ public sealed class WebAppHarnessTests
     }
 
     [Fact]
-    public async Task LaunchAsync_NonWebRecipe_ThrowsNotSupported()
-    {
-        var harness = new WebAppHarness(new ScriptedSandboxProvider(
-            new RecordingHarnessSandbox(screenshotsToReturn: [])));
-        await Assert.ThrowsAsync<NotSupportedException>(() =>
-            harness.LaunchAsync(new UnknownRecipe { TargetName = "weird" }));
-    }
-
-    [Fact]
     public async Task LaunchAsync_DisposingSessionDisposesSandbox()
     {
         var sandbox = new RecordingHarnessSandbox(screenshotsToReturn: [NonUniformPng]);
@@ -481,15 +472,33 @@ public sealed class WebAppHarnessTests
     }
 
     [Fact]
+    public void ScreenshotReadinessProbe_RejectsUniformPng()
+    {
+        Assert.False(ScreenshotReadinessProbe.LooksLikeRenderedUi(UniformPng));
+    }
+
+    [Fact]
     public void PngRenderedUiReadiness_RejectsNonPng()
     {
         Assert.False(PngRenderedUiReadiness.LooksLikeRenderedUi([0x01, 0x02, 0x03, 0x04]));
     }
 
     [Fact]
+    public void ScreenshotReadinessProbe_RejectsNonPng()
+    {
+        Assert.False(ScreenshotReadinessProbe.LooksLikeRenderedUi([0x01, 0x02, 0x03, 0x04]));
+    }
+
+    [Fact]
     public void PngRenderedUiReadiness_AcceptsNonUniformPng()
     {
         Assert.True(PngRenderedUiReadiness.LooksLikeRenderedUi(NonUniformPng));
+    }
+
+    [Fact]
+    public void ScreenshotReadinessProbe_AcceptsNonUniformPng()
+    {
+        Assert.True(ScreenshotReadinessProbe.LooksLikeRenderedUi(NonUniformPng));
     }
 
     [Fact]
@@ -549,10 +558,6 @@ public sealed class WebAppHarnessTests
         Assert.True(PngRenderedUiReadiness.LooksLikeRenderedUi(followUp.ScreenshotPng));
     }
 
-    /// <summary>
-    /// Minimal web target for the real-multipass integration test: static HTML
-    /// served by Python's http.server, opened in Firefox, readiness via screenshot.
-    /// </summary>
     private static WebAppRecipe IntegrationSmokeRecipe() => new()
     {
         TargetName = "harness-smoke",
@@ -615,8 +620,6 @@ public sealed class WebAppHarnessTests
         BrowserSettleDelay = TimeSpan.Zero,
     };
 
-    private sealed record UnknownRecipe : AppUnderTestRecipe;
-
     private sealed class ScriptedSandboxProvider : ISandboxProvider
     {
         private readonly ISandbox _sandbox;
@@ -653,12 +656,6 @@ public sealed class WebAppHarnessTests
         public int ScreenshotCalls { get; private set; }
         public bool Disposed { get; private set; }
 
-        /// <summary>
-        /// Per-call override: return a custom result for matching argv. Returning
-        /// null falls through to the default "exit 0, empty stdout/stderr".
-        /// <c>callIndex</c> is the 0-based ordinal among ALL ExecAsync calls so
-        /// tests can target a specific later call if needed.
-        /// </summary>
         public Func<IReadOnlyList<string>, int, SandboxExecResult?>? CommandResultPredicate { get; init; }
 
         public Exception? ScreenshotException { get; init; }

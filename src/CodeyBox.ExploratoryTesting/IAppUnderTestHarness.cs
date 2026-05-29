@@ -34,5 +34,5 @@ public interface IAppUnderTestHarness
     /// </summary>
     /// <param name="recipe">Per-target build / seed / run / open instructions.</param>
     /// <param name="ct">Cancellation token; cancellation cleans up any in-flight sandbox.</param>
-    Task<AppUnderTestSession> LaunchAsync(AppUnderTestRecipe recipe, CancellationToken ct = default);
+    Task<AppUnderTestSession> LaunchAsync(WebAppRecipe recipe, CancellationToken ct = default);
 }
