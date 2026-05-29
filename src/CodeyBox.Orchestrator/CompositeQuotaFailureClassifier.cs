@@ -1,4 +1,3 @@
-using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -50,18 +49,17 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
-        // Terminal API crashes (e.g. Claude 400 thinking-block modification)
-        // are not quota exhaustion. Check before provider detectors so stale
-        // quota keywords in earlier NDJSON lines cannot false-positive the final
-        // failure on long multi-turn runs.
-        if (AgentQuotaStreamScope.IsNonQuotaAgentApiCrash(stderr, stdout))
+        if (!_detectors.TryGetValue(agent, out var detector))
             return null;
 
-        var scopedStdout = AgentQuotaStreamScope.ScopeStdoutForQuotaDetection(stdout);
+        // Provider-specific terminal API crashes (e.g. Claude 400 thinking-block
+        // modification) are not quota exhaustion. The detector decides — keeping
+        // this dispatch path agnostic of any single provider's stream-json shape.
+        if (detector.IsTerminalNonQuotaCrash(stderr, stdout))
+            return null;
 
-        return _detectors.TryGetValue(agent, out var detector)
-            ? detector.Detect(stderr, scopedStdout)
-            : null;
+        var scopedStdout = detector.ScopeStdoutForQuotaDetection(stdout);
+        return detector.Detect(stderr, scopedStdout);
     }
 
     public void EmitAdvisoryAuditEvents(AgentKind agent, string? stderr, string? stdout, string phase, string? sandboxName)

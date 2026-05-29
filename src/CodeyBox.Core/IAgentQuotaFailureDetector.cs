@@ -28,6 +28,26 @@ public interface IAgentQuotaFailureDetector
     /// implementation does nothing. Must never throw.
     /// </summary>
     void EmitAdvisoryAuditEvents(string? stderr, string? stdout, string phase, string? sandboxName) { }
+
+    /// <summary>
+    /// Optional hook: returns true when the captured streams represent a
+    /// terminal agent/API crash that is <em>not</em> a quota or rate-limit
+    /// signal (e.g. Claude's API 400 thinking-block modification crash).
+    /// The orchestrator calls this before <see cref="Detect"/>; a true result
+    /// short-circuits classification so the work item enters normal recovery
+    /// rather than being parked in WaitingForQuotaReset. The default
+    /// implementation returns false. Must never throw.
+    /// </summary>
+    bool IsTerminalNonQuotaCrash(string? stderr, string? stdout) => false;
+
+    /// <summary>
+    /// Optional hook: scopes <paramref name="stdout"/> to the slice the detector
+    /// should consider for quota classification. Defaults to returning the input
+    /// unchanged. Claude overrides this to narrow long multi-turn NDJSON buffers
+    /// to their terminal error line, so stale rate-limit text from earlier
+    /// events cannot false-positive the final failure. Must never throw.
+    /// </summary>
+    string? ScopeStdoutForQuotaDetection(string? stdout) => stdout;
 }
 
 /// <summary>
