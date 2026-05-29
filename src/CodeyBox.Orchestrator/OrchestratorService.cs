@@ -1040,17 +1040,47 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             // Quota routing: resolve which agent to use, or decide to wait.
             // Skipped entirely (no probe, no wait) when no agent class is configured.
+            //
+            // We pass TryReserveAgentSlot as the router's per-agent cap gate so
+            // that when the top-ranked eligible member is at its cap, routing
+            // spills to the next eligible member instead of pinning the work
+            // item to a saturated agent and deferring. The router commits the
+            // reservation on the chosen member (decision.SlotReserved=true) so
+            // we must skip the redundant reserve below.
             if (_router is not null)
             {
-                var decision = await _router.ResolveAsync(item, project, ct);
+                var decision = await _router.ResolveAsync(item, project, ct,
+                    reserveSlot: m => TryReserveAgentSlot(m.Agent));
                 if (decision.ShouldWait)
                 {
-                    AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
-                    ScheduleDeferredRequeue(item.Id, decision.SuggestedRecheckIn, ct);
+                    // All-eligible-members-at-cap: defer with the short cap retry
+                    // rather than the quota recheck interval — caps free up much
+                    // faster than a quota window resets, so a 5-minute idle on a
+                    // fleet that's just rate-limited by config is wasted throughput.
+                    var deferDelay = decision.AllMembersAtCap ? _agentCapRetryDelay : decision.SuggestedRecheckIn;
+                    if (decision.AllMembersAtCap)
+                    {
+                        foreach (var atCapAgent in decision.AtCapAgents)
+                        {
+                            AuditLog.ConcurrencyGated(item.Id, atCapAgent,
+                                GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                        }
+                    }
+                    AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
+                    ScheduleDeferredRequeue(item.Id, deferDelay, ct);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
+                {
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
+                    if (decision.SlotReserved)
+                    {
+                        // Router already reserved the slot via the callback we
+                        // passed in — outer finally releases on every exit path.
+                        agentForRelease = chosen.Agent;
+                        agentSlotReserved = true;
+                    }
+                }
                 else if (decision.NoEligibleMembers)
                 {
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
@@ -1066,22 +1096,30 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // is hit, defer-requeue with a short delay so the next pickup (after
             // some agent slot frees up) finds it again. Reservation is held for the
             // life of the worker and released in the outer finally.
-            agentForRelease = item.Agent;
-            if (item.Agent is { } routedAgent)
+            //
+            // Class-routed items (decision.SlotReserved=true above) have already
+            // had their slot reserved by the router, so we skip the re-reserve to
+            // avoid double-counting. The path below handles direct-agent items
+            // (no class configured) and items where the router opted out.
+            if (!agentSlotReserved)
             {
-                if (!TryReserveAgentSlot(routedAgent))
+                agentForRelease = item.Agent;
+                if (item.Agent is { } routedAgent)
                 {
-                    var cap = GetAgentCap(routedAgent);
-                    var running = GetRunning(routedAgent);
-                    _log.LogInformation(
-                        "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
-                        workerIndex, id, routedAgent.Value, running, cap);
-                    AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
-                    ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
-                    return;
+                    if (!TryReserveAgentSlot(routedAgent))
+                    {
+                        var cap = GetAgentCap(routedAgent);
+                        var running = GetRunning(routedAgent);
+                        _log.LogInformation(
+                            "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
+                            workerIndex, id, routedAgent.Value, running, cap);
+                        AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
+                        ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
+                        return;
+                    }
+                    // Reservation successful — outer finally releases on exit.
+                    agentSlotReserved = true;
                 }
-                // Reservation successful — outer finally releases on exit.
-                agentSlotReserved = true;
             }
 
             // Per-project pause gate: check before the budget lock so paused projects

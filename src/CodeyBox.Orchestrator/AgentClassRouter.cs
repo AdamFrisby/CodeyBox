@@ -182,9 +182,26 @@ public sealed class AgentClassRouter
     /// <see cref="AgentRoutingDecision.ShouldWait"/> = false when no agent
     /// class applies — the caller falls back to direct agent pick with no
     /// quota probe, preserving legacy behaviour exactly.
+    ///
+    /// <para>
+    /// When <paramref name="reserveSlot"/> is supplied, the router treats the
+    /// per-agent concurrency cap as an additional gate alongside quota and
+    /// exclusion: each candidate that would otherwise win is first asked to
+    /// reserve a slot via the callback, and members where it returns false
+    /// are skipped (with a <c>"per-agent cap reached"</c> rejection) so a
+    /// lower-ranked but free-and-eligible member can be picked instead.
+    /// This spill prevents items from queuing behind a saturated top
+    /// member while other eligible members sit idle. If every viable member
+    /// is at cap, the decision returns <see cref="AgentRoutingDecision.ShouldWait"/>
+    /// with <see cref="AgentRoutingDecision.AllMembersAtCap"/> = true so the
+    /// caller can choose a short defer interval rather than the full quota
+    /// recheck. On a successful return the slot is already held by the
+    /// callback — the caller MUST release it on every exit path.
+    /// </para>
     /// </summary>
     public async Task<AgentRoutingDecision> ResolveAsync(
-        WorkItem item, Project? project, CancellationToken ct)
+        WorkItem item, Project? project, CancellationToken ct,
+        Func<AgentMembership, bool>? reserveSlot = null)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -270,13 +287,22 @@ public sealed class AgentClassRouter
         DateTimeOffset? earliestBudgetReset = null;
 
         // Members the operator's per-agent concurrency cap pushed past in this
-        // pass: the cap was at its ceiling so we spilled to a lower-ranked
-        // member rather than DEFERring the work item. Recorded so the PayPerApi
-        // fire-anyway fallthrough doesn't pick a cap-saturated member (the
-        // orchestrator's TryReserveAgentSlot would just fail on it) and so the
-        // post-loop wait interval shrinks to the cap-retry window when cap was
-        // the only blocker — a slot opens far sooner than a quota window resets.
+        // pass at the PRE-PROBE check (running counters meet the cap): the cap
+        // was at its ceiling so we skipped to a lower-ranked member rather than
+        // DEFERring the work item. Recorded so the PayPerApi fire-anyway
+        // fallthrough doesn't pick a cap-saturated member (the orchestrator's
+        // TryReserveAgentSlot would just fail on it) and so the post-loop wait
+        // interval shrinks to the cap-retry window when cap was the only
+        // blocker — a slot opens far sooner than a quota window resets.
         var capSaturatedMembers = new HashSet<AgentMembership>();
+
+        // Agents whose per-agent cap blocked them at the POST-GATE reserveSlot
+        // callback (the caller's atomic reserve-or-fail returned false after
+        // the quota gate passed). Surfaced via AtCapAgents on the routing
+        // decision so the caller can emit per-agent audit events without
+        // re-deriving which members were blocked, and used together with
+        // capSaturatedMembers to drive AllMembersAtCap.
+        var atCapAgents = new List<AgentKind>();
 
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in sorted)
@@ -377,6 +403,23 @@ public sealed class AgentClassRouter
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, ct);
             if (gate.Allow)
             {
+                // Per-agent concurrency cap: spill to the next eligible member
+                // when the caller's slot reservation fails. The router only
+                // commits the choice (and stamps SlotReserved on the decision)
+                // when the reservation actually succeeds, so the caller can
+                // skip its own redundant reserve and the race between the
+                // check and the commit is closed by the callback's atomic
+                // increment.
+                if (reserveSlot is not null && !reserveSlot(member))
+                {
+                    var capReason = "per-agent cap reached";
+                    _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
+                        item.Id, member.Agent, member.ModelId ?? "(default)", capReason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
+                    atCapAgents.Add(member.Agent);
+                    continue;
+                }
+
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
                 foreach (var other in sorted.Where(x => x != entry))
                     rejected.Add((other.Member.Agent, other.Member.ModelId, other.EffectiveScore, "ranked lower"));
@@ -398,6 +441,7 @@ public sealed class AgentClassRouter
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
+                    SlotReserved = reserveSlot is not null,
                     Reason = $"{member.Agent}/{member.Billing} score={entry.EffectiveScore}: {quota.AvailablePct:F1}% available",
                 };
             }
@@ -405,8 +449,14 @@ public sealed class AgentClassRouter
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
-        // No member is above the threshold.
-        if (hasSubscription)
+        // No member was chosen. If at least one quota-passing member was
+        // blocked solely by the per-agent concurrency cap, surface
+        // AllMembersAtCap so the caller can defer with the short cap-retry
+        // instead of the full quota recheck — operator-set caps free up much
+        // faster than a quota window resets, and a 5-minute idle on a fleet
+        // that's just rate-limited by config is wasted throughput.
+        var anyAtCap = atCapAgents.Count > 0;
+        if (hasSubscription || anyAtCap)
         {
             // When a Subscription member was blocked only by per-agent cap (not
             // quota), a slot will free up far sooner than a quota window resets.
@@ -429,6 +479,8 @@ public sealed class AgentClassRouter
             {
                 ShouldWait = true,
                 SuggestedRecheckIn = recheck,
+                AllMembersAtCap = anyAtCap || capSaturatedMembers.Count > 0,
+                AtCapAgents = atCapAgents,
                 Reason = waitReason,
             };
         }
@@ -438,19 +490,26 @@ public sealed class AgentClassRouter
         // EXCEPTIONS that must NOT be fired:
         //  - budget-exhausted: a configured operator spend cap (fail-open would burn money).
         //  - cap-saturated: the orchestrator's TryReserveAgentSlot would refuse the dispatch.
-        // Fire the first member that is neither budget-exhausted nor cap-saturated.
-        var fireable = sorted.FirstOrDefault(x =>
-            !budgetExhaustedMembers.Contains(x.Member)
-            && !capSaturatedMembers.Contains(x.Member));
-        if (fireable is not null)
+        // Spill through eligible candidates in score order, honouring the caller's
+        // reserveSlot callback so the per-agent cap remains an authoritative gate
+        // for PayPerApi members too.
+        foreach (var candidate in sorted)
         {
-            var fallback = fireable.Member;
+            if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
+            if (capSaturatedMembers.Contains(candidate.Member)) continue;
+            var fallback = candidate.Member;
+            if (reserveSlot is not null && !reserveSlot(fallback))
+            {
+                atCapAgents.Add(fallback.Agent);
+                continue;
+            }
             _log.LogWarning(
                 "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
                 item.Id, classId, fallback.Agent);
             return new AgentRoutingDecision
             {
                 Chosen = fallback,
+                SlotReserved = reserveSlot is not null,
                 Reason = "only PayPerApi members — firing despite apparent low quota",
             };
         }
@@ -466,12 +525,13 @@ public sealed class AgentClassRouter
             if (untilReset > TimeSpan.Zero && untilReset < budgetRecheck)
                 budgetRecheck = untilReset;
         }
-        if (capSaturatedMembers.Count > 0 && budgetRecheck > _opts.CapRetryInterval)
+        var capBlocked = capSaturatedMembers.Count > 0 || atCapAgents.Count > 0;
+        if (capBlocked && budgetRecheck > _opts.CapRetryInterval)
             budgetRecheck = _opts.CapRetryInterval;
         string parkReason;
-        if (budgetExhaustedMembers.Count > 0 && capSaturatedMembers.Count > 0)
+        if (budgetExhaustedMembers.Count > 0 && capBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted or at their per-agent concurrency cap";
-        else if (capSaturatedMembers.Count > 0)
+        else if (capBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
         else
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted";
@@ -483,6 +543,8 @@ public sealed class AgentClassRouter
         {
             ShouldWait = true,
             SuggestedRecheckIn = budgetRecheck,
+            AllMembersAtCap = capBlocked,
+            AtCapAgents = atCapAgents,
             Reason = parkReason,
         };
     }
@@ -1066,6 +1128,32 @@ public sealed record AgentRoutingDecision
     /// waiting or routing.
     /// </summary>
     public bool NoEligibleMembers { get; init; }
+
+    /// <summary>
+    /// True when the router invoked the caller's per-agent slot reservation
+    /// callback for the chosen member and it succeeded — the caller does NOT
+    /// need to (and must not) re-reserve, and must release the slot on every
+    /// exit path. Always false when <see cref="Chosen"/> is null or when no
+    /// reservation callback was supplied.
+    /// </summary>
+    public bool SlotReserved { get; init; }
+
+    /// <summary>
+    /// True when the only reason no member could be chosen was that every
+    /// quota-passing member was at its per-agent concurrency cap. The caller
+    /// should defer with a short cap-retry rather than the full quota
+    /// recheck interval, since operator-configured caps free up much
+    /// faster than a quota window resets.
+    /// </summary>
+    public bool AllMembersAtCap { get; init; }
+
+    /// <summary>
+    /// Agents whose per-agent concurrency cap blocked them this dispatch.
+    /// Populated when the router spilled past or deferred due to a cap;
+    /// empty otherwise. Used by the caller to emit per-agent audit events
+    /// without re-deriving which members were blocked.
+    /// </summary>
+    public IReadOnlyList<AgentKind> AtCapAgents { get; init; } = [];
 }
 
 /// <summary>
