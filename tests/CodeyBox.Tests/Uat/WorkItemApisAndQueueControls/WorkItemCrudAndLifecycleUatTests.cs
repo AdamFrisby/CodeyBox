@@ -277,8 +277,8 @@ public sealed class WorkItemCrudAndLifecycleUatTests : IDisposable
     }
 
     [Theory]
-    [InlineData("reason=" + "x", "resolutionSha=not-hex", "resolutionSha")]
-    [InlineData("reason=" + "x", "resolutionSha=abc", "resolutionSha")] // too short (<7)
+    [InlineData("reason=x", "resolutionSha=not-hex", "resolutionSha")]
+    [InlineData("reason=x", "resolutionSha=abc", "resolutionSha")] // too short (<7)
     public async Task Cancel_InvalidResolutionSha_ReturnsBadRequest(string reasonPart, string shaPart, string expectedField)
     {
         var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.MergeConflictResolutionFailed);
@@ -298,6 +298,17 @@ public sealed class WorkItemCrudAndLifecycleUatTests : IDisposable
 
         var longReason = new string('r', 501);
         var response = await _client.DeleteAsync($"/workitems/{item.Id}?reason={longReason}");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Cancel_ControlCharReason_ReturnsBadRequest()
+    {
+        var item = WorkItemApisAndQueueControlsHelpers.Item(WorkItemState.MergeConflictResolutionFailed);
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.DeleteAsync($"/workitems/{item.Id}?reason=bad%00char");
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
