@@ -487,6 +487,77 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.Empty(claude.ConflictResolutionPlan);
     }
 
+    [Fact]
+    public async Task PrimaryQuotaExhausted_WithViableFallback_ResolverRoutesToFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        codex.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [file.Path] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        using var fix = BuildRoutingFixture(seed, [claude, codex],
+            quotas: new() { [AgentKind.Claude] = 1.0, [AgentKind.Codex] = 80.0 });
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(claude.AgenticConflictInvocations);
+        Assert.Single(codex.AgenticConflictInvocations);
+        Assert.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", codex.AgenticConflictInvocations[0]);
+        Assert.Empty(codex.ConflictResolutionPlan);
+    }
+
+    [Fact]
+    public async Task AllAgentsQuotaExhausted_FailsWithAgentUnavailable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        using var fix = BuildRoutingFixture(seed, [claude, codex],
+            quotas: new() { [AgentKind.Claude] = 1.0, [AgentKind.Codex] = 2.0 });
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+        var preRebaseTip = await RevParseAsync(barePath, item.WorkBranch!);
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("agent_unavailable", final.FailureKind);
+        Assert.Contains("no agent has viable credentials", final.LastError);
+        Assert.Contains("claude:", final.LastError);
+        Assert.Contains("quota exhausted", final.LastError);
+        Assert.Empty(claude.AgenticConflictInvocations);
+        Assert.Empty(codex.AgenticConflictInvocations);
+        Assert.Equal(preRebaseTip, await RevParseAsync(barePath, item.WorkBranch!));
+    }
+
     private CandidateFixture BuildCandidateFixture(
         IReadOnlyList<IAgentRunner> runners,
         AgentKind? auditAgent = null,
