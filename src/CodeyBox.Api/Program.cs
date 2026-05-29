@@ -1155,6 +1155,13 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
 });
 builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
     new InVmSmokeCache(TimeSpan.FromMinutes(sp.GetRequiredService<InVmSmokeOptions>().CacheTtlMinutes)));
+// Single operator-reset port: clears the availability registry AND invalidates
+// the in-VM smoke cache atomically, so a reset can never leave a stale cached
+// pass to reconcile back onto the registry before the operator's fix is
+// re-verified. The admin endpoint depends on this one contract.
+builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
+    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IInVmSmokeCache>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
@@ -2217,7 +2224,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IInVmSmokeCache inVmCache) =>
+app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IAgentAvailabilityReset reset) =>
 {
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
@@ -2227,10 +2234,10 @@ app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistr
     // never realises the call did nothing.
     if (!agents.Available.Contains(kind))
         return Results.NotFound(new { error = $"unknown agent '{name}'" });
-    registry.Reset(kind);
-    // Drop any cached in-VM verdict too, so the next sweep / dispatch re-execs
-    // the CLI rather than replaying a result captured before the operator's fix.
-    inVmCache.Invalidate(kind);
+    // Single reset port: clears the registry AND invalidates the in-VM smoke
+    // cache together, so a stale cached pass can't reconcile straight back onto
+    // the registry before the operator's fix is re-verified.
+    reset.Reset(kind);
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {

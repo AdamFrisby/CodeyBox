@@ -371,7 +371,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
-        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(agentKind, ct);
+        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(agentKind, item.BaselineImageRef, ct);
         if (!smokeAvailability.Available)
         {
             var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
@@ -3435,7 +3435,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // class-chain walk below already gates its members via
         // OrderedFallbackCandidatesAsync, so without this the preferred fast path
         // was the one hole left open.
-        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, ct);
+        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, item.BaselineImageRef, ct);
         var preferredAvailable = preferredAvailability.Available;
 
         var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
@@ -3644,7 +3644,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Returns true when no availability registry is wired (legacy callers
     /// preserve their prior behaviour).
     /// </summary>
-    private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(AgentKind kind, CancellationToken ct)
+    private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         // The in-VM gate (when wired) owns the read→probe→re-read and returns the
         // reconciled availability — including the exclusion Reason — so callers
@@ -3653,9 +3653,11 @@ public sealed class PipelineRunner : IPipelineRunner
         // IInVmSmokeGate was extracted to remove; re-reading would also degrade
         // the reason to a generic placeholder under gate-only wiring). Falls back
         // to a plain registry read, then to "available" when neither is wired
-        // (legacy callers preserve their prior behaviour).
+        // (legacy callers preserve their prior behaviour). baselineRef pins the
+        // probe to the image this work item will clone (B1), not just the active
+        // baseline.
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return new AgentAvailability(true, null, null);

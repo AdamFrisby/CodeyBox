@@ -462,6 +462,56 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task CredentialResolutionFailure_OnDispatchGate_DefaultFailClosed_Benches()
+    {
+        // Companion to CredentialResolutionFailure_IsTransient_* (which exercises
+        // the sweep / fail-open path): on the DISPATCH gate under the default
+        // fail-closed policy a credential-store fault must bench the agent rather
+        // than leave it routable, so the router never hands work to a CLI whose
+        // auth could not even be resolved. Without this, a regression that only
+        // applied fail-closed to provisioning/exec faults (not the credential
+        // catch) would go uncaught.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        // Build() uses the default InVmSmokeOptions → FailClosedOnProbeFault = true.
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            credentials: new ThrowingCredentialProvider());
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("credential resolution failed", av.Reason);
+        // Never provisioned (the fault is before sandbox create) and never cached,
+        // so a later recovered probe self-heals it.
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_PinnedBaselineRef_ProbesAndCachesAgainstPinnedImage()
+    {
+        // B1 pinning: the dispatch gate must probe the work item's pinned baseline
+        // (the image the dispatch will clone), not the active baseline the
+        // resolver returns. The probe VM's spec and the cache key must both use
+        // the pinned ref so a pass proves the CLI on THAT image.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        // Resolver's active baseline is "base-ACTIVE"; the work item is pinned to
+        // "base-PINNED". The gate must use the pinned one.
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: "base-PINNED", CancellationToken.None);
+
+        Assert.Equal("base-PINNED", provider.LastBaselineRef);
+        Assert.NotNull(cache.TryGet(AgentKind.Cursor, "base-PINNED"));
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-ACTIVE"));
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_FailOpenOptOut_NeverThrows_AndDoesNotBench_OnProbeFault()
     {
         // With the opt-out fail-open policy (FailClosedOnProbeFault:false), a
@@ -482,7 +532,7 @@ public sealed class InVmSmokeProberTests
             });
 
         // Must complete without throwing.
-        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
 
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
@@ -503,7 +553,7 @@ public sealed class InVmSmokeProberTests
         // now defaults to true.
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
 
-        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
 
         var av = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(av.Available);
@@ -577,7 +627,7 @@ public sealed class InVmSmokeProberTests
 
         // The dispatch gate, under fail-closed, benches the agent so the router
         // routes past it instead of dispatching to a CLI it could not verify.
-        await prober.EnsureProbedAsync(AgentKind.Cursor, CancellationToken.None);
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
         var av = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(av.Available);
         Assert.Contains("in-VM probe inconclusive", av.Reason);

@@ -23,16 +23,24 @@ public interface IInVmSmokeGate
 
     /// <summary>
     /// Returns <paramref name="kind"/>'s current availability, having first
-    /// ensured the in-VM smoke verdict against the active baseline is reflected
-    /// in it. The gate owns the full read→probe→re-read sequence so routing
-    /// consumers get a verdict from this one call and never have to bind to the
-    /// availability registry alongside the gate. A cache hit (or an
-    /// already-excluded agent) provisions nothing; only a cache miss on an
-    /// otherwise-available agent runs a probe. Never throws — a probe fault must
-    /// not take down dispatch; on an inconclusive fault the prior availability
-    /// is returned unchanged (subject to <c>FailClosedOnProbeFault</c>).
+    /// ensured the in-VM smoke verdict against the baseline the work item will
+    /// actually be cloned from is reflected in it. The gate owns the full
+    /// read→probe→re-read sequence so routing consumers get a verdict from this
+    /// one call and never have to bind to the availability registry alongside the
+    /// gate. A cache hit (or an already-excluded agent) provisions nothing; only
+    /// a cache miss on an otherwise-available agent runs a probe. Never throws — a
+    /// probe fault must not take down dispatch; on an inconclusive fault the prior
+    /// availability is returned unchanged (subject to <c>FailClosedOnProbeFault</c>).
+    ///
+    /// <para><paramref name="baselineRef"/> is the work item's pinned
+    /// <see cref="WorkItem.BaselineImageRef"/> (B1 pinning) — the image the
+    /// sandbox will be cloned from at dispatch. The gate probes and caches against
+    /// that exact ref so a pass proves the CLI on the <em>pinned</em> image is
+    /// healthy, not merely on whatever baseline happens to be active after a
+    /// rebake. Pass <c>null</c> for unpinned work; the gate then falls back to the
+    /// active baseline resolved internally.</para>
     /// </summary>
-    Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct);
+    Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct);
 
     /// <summary>
     /// Probes every registered agent against the active baseline. Driven by the

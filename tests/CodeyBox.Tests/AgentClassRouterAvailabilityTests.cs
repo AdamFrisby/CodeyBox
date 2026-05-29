@@ -137,7 +137,7 @@ public sealed class AgentClassRouterAvailabilityTests
 
         public bool Enabled => true;
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
         {
             Probed.Add(kind);
             _onProbe(kind);

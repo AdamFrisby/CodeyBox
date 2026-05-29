@@ -330,7 +330,7 @@ public sealed class AgentClassRouter
             // (when wired) also probes an apparently-Available-but-never-probed
             // agent here so the exit-127 / auth cascade is caught on the FIRST
             // dispatch, not on first run; a cache hit is free.
-            var availability = await GetGatedAvailabilityAsync(member.Agent, ct);
+            var availability = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
             if (availability is { Available: false })
             {
                 var smokeReason = $"smoke gate: {availability.Reason}";
@@ -714,7 +714,7 @@ public sealed class AgentClassRouter
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = await GetGatedAvailabilityAsync(member.Agent, ct);
+            var av = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
             if (av is null || av.Available)
                 result.Add(member);
         }
@@ -729,11 +729,14 @@ public sealed class AgentClassRouter
     /// directly. Returns null only when neither is wired (no availability
     /// tracking → legacy behaviour, every candidate is routable). Centralised
     /// so primary routing and fallback selection cannot drift in gate semantics.
+    /// <paramref name="baselineRef"/> is the work item's pinned baseline so the
+    /// gate probes the image the dispatch will clone (B1 pinning), not just the
+    /// active baseline.
     /// </summary>
-    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(AgentKind kind, CancellationToken ct)
+    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return null;

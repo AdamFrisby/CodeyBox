@@ -123,13 +123,16 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// is disabled or the agent is already excluded (no point probing a binary
     /// the router will skip regardless); otherwise probes and returns the
     /// reconciled availability. A cache hit is free.
+    /// <paramref name="baselineRef"/> is the work item's pinned baseline (or null
+    /// for unpinned work → active baseline); the probe runs against the image the
+    /// dispatch will actually clone, not just whatever baseline is active now.
     /// </summary>
-    public async Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+    public async Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         var current = _availability.GetAvailability(kind);
         if (!Enabled || !current.Available)
             return current;
-        await EnsureProbedAsync(kind, ct);
+        await EnsureProbedAsync(kind, baselineRef, ct);
         return _availability.GetAvailability(kind);
     }
 
@@ -142,8 +145,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// background sweep. A cache hit is free (no VM); a miss provisions one VM
     /// and feeds the registry. Never throws — the dispatch path must not be
     /// taken down by a probe fault.
+    /// <paramref name="baselineRef"/> is the work item's pinned baseline ref; the
+    /// probe (and its cache key) target that exact image so a pass proves the CLI
+    /// on the pinned image, not on a freshly rebaked active baseline. Null falls
+    /// back to the active baseline for unpinned work.
     /// </summary>
-    public async Task EnsureProbedAsync(AgentKind kind, CancellationToken ct)
+    public async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         if (!Enabled) return;
         var probe = _probes.FirstOrDefault(p => p.Kind == kind);
@@ -153,8 +160,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             // On the dispatch gate, honour the operator's probe-fault policy:
             // fail-closed temporarily benches the agent when the probe can't run
-            // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault).
-            await ProbeAgentAsync(probe, ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault);
+            // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault). Probe
+            // the pinned baseline when supplied so the verdict matches the image
+            // the dispatch will clone; otherwise fall back to the active baseline.
+            await ProbeAgentAsync(probe, baselineRef ?? ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

@@ -377,7 +377,7 @@ internal sealed class BenchOnProbeGate : IInVmSmokeGate
 
     public bool Enabled => true;
 
-    public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+    public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
     {
         Probed.Add(kind);
         if (kind == _benchKind)

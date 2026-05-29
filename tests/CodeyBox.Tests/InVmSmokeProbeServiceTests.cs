@@ -152,7 +152,7 @@ public sealed class InVmSmokeProbeServiceTests
             return Task.CompletedTask;
         }
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
             => Task.FromResult(new AgentAvailability(true, null, null));
 
         public async Task<bool> WaitForAtLeastAsync(int target, TimeSpan timeout)
