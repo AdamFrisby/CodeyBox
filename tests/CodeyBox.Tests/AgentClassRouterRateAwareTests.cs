@@ -345,6 +345,54 @@ public sealed class AgentClassRouterRateAwareTests
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
         Assert.Equal(Codex, decision.Chosen!.Agent);
     }
+
+    [Fact]
+    public async Task SummariseFitsAsync_TighterBudget_LowersAvailablePctAndFit()
+    {
+        // /concurrency surface must reflect the local budget: SummariseFitsAsync
+        // calls ApplyBudgetAsync before computing AvailablePct and FitInWindow, so
+        // a budget tighter than the probe lowers both. Without that call this test
+        // would see the full probe AvailablePct and a higher fit.
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate { AvgBurnPctPerItem = 25.0, SampleCount = 8 },
+            }
+        };
+        var opts = new QuotaRouterOptions { MinQuotaPct = 5.0 };
+        var router = new AgentClassRouter(
+            [cls], [new FakeProbe(Codex, 100.0)], opts,
+            NullLogger<AgentClassRouter>.Instance,
+            TimeProvider.System,
+            todModifiers: null,
+            quotaFailures: null,
+            burnEstimator: estimator,
+            runningCounters: counters,
+            availability: null,
+            budgetProvider: new StubBudgetProvider(20.0));
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        // Probe 100% MIN budget 20% = 20%; fit = 20 / 25 = 0.8.
+        Assert.Equal(20.0, view.AvailablePct, precision: 6);
+        Assert.Equal(0.8, view.FitInWindow, precision: 6);
+    }
+
+    private sealed class StubBudgetProvider : IAgentBudgetProvider
+    {
+        private readonly double _pct;
+        public StubBudgetProvider(double pct) { _pct = pct; }
+
+        public Task<AgentQuotaSnapshot?> GetBudgetSnapshotAsync(AgentKind agent, string? modelId, CancellationToken ct = default)
+            => Task.FromResult<AgentQuotaSnapshot?>(new AgentQuotaSnapshot { AvailablePct = _pct, Notes = "local budget" });
+
+        public Task<IReadOnlyList<AgentBudgetUsageView>> SummariseAllAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AgentBudgetUsageView>>(Array.Empty<AgentBudgetUsageView>());
+    }
 }
 
 /// <summary>Programmable in-process running counters for router tests.</summary>

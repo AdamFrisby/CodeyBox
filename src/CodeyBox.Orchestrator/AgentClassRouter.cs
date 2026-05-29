@@ -44,6 +44,7 @@ public sealed class AgentClassRouter
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
     private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IAgentBudgetProvider? _budgetProvider;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -65,7 +66,8 @@ public sealed class AgentClassRouter
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
-        AgentAvailabilityRegistry? availability = null)
+        AgentAvailabilityRegistry? availability = null,
+        IAgentBudgetProvider? budgetProvider = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -85,6 +87,61 @@ public sealed class AgentClassRouter
         _burnEstimator = burnEstimator;
         _runningCounters = runningCounters;
         _availability = availability;
+        _budgetProvider = budgetProvider;
+    }
+
+    /// <summary>
+    /// Combines a probe-derived quota with the operator's local budget for the
+    /// same (agent, model): takes MIN of the two available percentages so the
+    /// stronger constraint gates. When the probe reading is unknown (-1) the
+    /// budget percentage stands alone; when no budget is configured the probe
+    /// reading is returned unchanged. <c>ResetAt</c> becomes the earlier of the
+    /// two known resets so the retry scheduler wakes at the soonest opportunity.
+    /// </summary>
+    private async Task<BudgetAdjustedQuota> ApplyBudgetAsync(
+        AgentMembership member, EffectiveQuota probeQuota, CancellationToken ct)
+    {
+        if (_budgetProvider is null) return new BudgetAdjustedQuota(probeQuota, false, null);
+
+        AgentQuotaSnapshot? budget;
+        try
+        {
+            budget = await _budgetProvider.GetBudgetSnapshotAsync(member.Agent, member.ModelId, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The provider itself failing (as opposed to a configured-but-degraded
+            // budget, which the provider already reports as 0%) means we cannot
+            // verify the operator's spend cap. Fail closed: gate dispatch rather
+            // than silently dropping the budget constraint on a transient error.
+            // Mark the result budget-exhausted so a PayPerApi-only fallthrough parks
+            // instead of firing while the cap is unverifiable. OperationCanceledException
+            // (shutdown/abort) is NOT an accounting outage — let it propagate so
+            // dispatch unwinds cleanly instead of being parked as quota-exhausted.
+            _log.LogWarning(ex,
+                "Budget gate: provider threw for {Agent}/{Model}; failing closed",
+                member.Agent.Value, member.ModelId ?? "(default)");
+            return new BudgetAdjustedQuota(probeQuota with { AvailablePct = 0.0 }, true, null);
+        }
+
+        if (budget is null) return new BudgetAdjustedQuota(probeQuota, false, null);
+
+        var combinedPct = probeQuota.AvailablePct < 0
+            ? budget.AvailablePct
+            : Math.Min(probeQuota.AvailablePct, budget.AvailablePct);
+
+        var reset = probeQuota.ResetAt;
+        if (budget.ResetAt is { } br && (reset is null || br < reset))
+            reset = br;
+
+        // A configured budget that is itself below the gate threshold is a real
+        // operator spend cap, not a transient probe quirk: callers use this flag to
+        // refuse the PayPerApi fire-anyway fallthrough that otherwise fail-opens.
+        var budgetExhausted = budget.AvailablePct < _opts.MinQuotaPct;
+        return new BudgetAdjustedQuota(
+            probeQuota with { AvailablePct = combinedPct, ResetAt = reset },
+            budgetExhausted,
+            budget.ResetAt);
     }
 
     /// <summary>
@@ -192,6 +249,12 @@ public sealed class AgentClassRouter
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
 
+        // PayPerApi members that an exhausted operator budget pushed below threshold:
+        // these must NOT be fired by the no-Subscription fallthrough below (doing so
+        // would fail-open the operator spend cap). Tracked with the soonest budget reset.
+        var budgetExhaustedMembers = new HashSet<AgentMembership>();
+        DateTimeOffset? earliestBudgetReset = null;
+
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in sorted)
         {
@@ -231,8 +294,39 @@ public sealed class AgentClassRouter
                 }
             }
 
-            var snapshot = await ProbeAsync(member, ct);
+            AgentQuotaSnapshot snapshot;
+            try
+            {
+                snapshot = await ProbeAsync(member, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Probe threw (transient API error). Treat it as unknown (-1) and
+                // still apply the local-budget MIN below rather than aborting the
+                // whole routing pass: a healthy configured budget must still be
+                // able to gate or admit the member when the subscription probe API
+                // blips. Bypassing the budget here would fail-open the operator
+                // spend cap on a probe error. OperationCanceledException
+                // (shutdown/abort) is allowed to propagate.
+                _log.LogDebug(ex,
+                    "Quota probe for {Agent}/{Model} threw; treating as unknown",
+                    member.Agent.Value, member.ModelId ?? "(default)");
+                snapshot = new AgentQuotaSnapshot
+                {
+                    AvailablePct = -1,
+                    Notes = $"probe threw: {ex.GetType().Name}",
+                };
+            }
             var quota = ResolveMemberQuota(snapshot, member);
+            var budgeted = await ApplyBudgetAsync(member, quota, ct);
+            quota = budgeted.Quota;
+
+            if (member.Billing == AgentBilling.PayPerApi && budgeted.BudgetExhausted)
+            {
+                budgetExhaustedMembers.Add(member);
+                if (budgeted.BudgetReset is { } r && (earliestBudgetReset is null || r < earliestBudgetReset))
+                    earliestBudgetReset = r;
+            }
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
@@ -279,16 +373,42 @@ public sealed class AgentClassRouter
             };
         }
 
-        // Only PayPerApi members reached here — unreachable in normal operation
-        // (PayPerApi always returns 100%), but guard against unusual custom probes.
-        var fallback = sorted[0].Member;
-        _log.LogWarning(
-            "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
-            item.Id, classId, fallback.Agent);
+        // Only PayPerApi members reached here. PayPerApi probes normally report 100%,
+        // so a below-threshold member is usually an unusual custom probe — fire anyway.
+        // EXCEPTION: a member pushed below threshold by a configured operator budget is
+        // hitting a real spend cap. Fire the first member NOT budget-exhausted; if every
+        // member is budget-exhausted, park until the soonest budget window resets rather
+        // than fail-open on the cap.
+        var fireable = sorted.FirstOrDefault(x => !budgetExhaustedMembers.Contains(x.Member));
+        if (fireable is not null)
+        {
+            var fallback = fireable.Member;
+            _log.LogWarning(
+                "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
+                item.Id, classId, fallback.Agent);
+            return new AgentRoutingDecision
+            {
+                Chosen = fallback,
+                Reason = "only PayPerApi members — firing despite apparent low quota",
+            };
+        }
+
+        var budgetRecheck = _opts.QuotaRecheckInterval;
+        if (earliestBudgetReset is { } budgetReset)
+        {
+            var untilReset = budgetReset - nowUtc;
+            if (untilReset > TimeSpan.Zero && untilReset < budgetRecheck)
+                budgetRecheck = untilReset;
+        }
+        _log.LogInformation(
+            "Work item {Id}: class '{ClassId}' has only PayPerApi members and all are budget-exhausted; parking until budget reset",
+            item.Id, classId);
+        AuditLog.QuotaRouterWaiting(classId, item.Id, budgetRecheck);
         return new AgentRoutingDecision
         {
-            Chosen = fallback,
-            Reason = "only PayPerApi members — firing despite apparent low quota",
+            ShouldWait = true,
+            SuggestedRecheckIn = budgetRecheck,
+            Reason = $"all PayPerApi members of class '{classId}' are budget-exhausted",
         };
     }
 
@@ -450,6 +570,7 @@ public sealed class AgentClassRouter
             }
 
             var quota = ResolveMemberQuota(snapshot, member);
+            quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
             // Skip unknown (probe failed / no data) and members above the
             // threshold (would have been chosen by the router and so don't
             // need to gate park-time).
@@ -556,6 +677,7 @@ public sealed class AgentClassRouter
             try { snapshot = await ProbeAsync(member, ct); }
             catch { continue; }
             var quota = ResolveMemberQuota(snapshot, member);
+            quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
 
             AgentBurnEstimate est;
             try { est = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
@@ -710,6 +832,15 @@ public sealed class AgentClassRouter
         int ConfigIndex);
 
     private sealed record QuotaGateDecision(bool Allow, string Reason);
+
+    /// <summary>
+    /// Result of MIN-combining a probe quota with the local operator budget.
+    /// <see cref="BudgetExhausted"/> is true only when a budget is configured and
+    /// is itself below the gate threshold (or the provider failed and we fail
+    /// closed), distinguishing a real spend-cap stop from a transient probe quirk.
+    /// </summary>
+    private readonly record struct BudgetAdjustedQuota(
+        EffectiveQuota Quota, bool BudgetExhausted, DateTimeOffset? BudgetReset);
 }
 
 public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);

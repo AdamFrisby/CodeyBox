@@ -1,0 +1,162 @@
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace CodeyBox.Tests;
+
+public sealed class SqliteAgentUsageStoreTests : IDisposable
+{
+    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-usage-test-{Guid.NewGuid():N}.db");
+    private readonly SqliteAgentUsageStore _store;
+
+    public SqliteAgentUsageStoreTests()
+    {
+        _store = new SqliteAgentUsageStore(_dbPath);
+    }
+
+    public void Dispose()
+    {
+        _store.Dispose();
+        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+    }
+
+    private static AgentUsageEvent Event(
+        DateTimeOffset time, string agent = "opencode", string? model = "m1", long microCents = 10_000) => new()
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            TimeUtc = time,
+            AgentKind = agent,
+            ModelId = model,
+            InputTokens = 100,
+            CachedInputTokens = 10,
+            OutputTokens = 20,
+            CostMicroCents = microCents,
+            WorkItemId = "wi-1",
+        };
+
+    [Fact]
+    public async Task SumWindow_SumsOnlyEventsInRange()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now.AddHours(-1), microCents: 100));
+        await _store.RecordAsync(Event(now.AddHours(-2), microCents: 200));
+        await _store.RecordAsync(Event(now.AddHours(-10), microCents: 999)); // outside 5h window
+
+        var agg = await _store.SumWindowAsync("opencode", "m1", now.AddHours(-5), now.AddHours(1));
+
+        Assert.Equal(300, agg.SumMicroCents);
+        Assert.Equal(2, agg.Count);
+        Assert.NotNull(agg.EarliestUtc);
+    }
+
+    [Fact]
+    public async Task SumWindow_FiltersByAgentAndModel()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 100));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m2", microCents: 500));
+        await _store.RecordAsync(Event(now, agent: "claude", model: "m1", microCents: 700));
+
+        var agg = await _store.SumWindowAsync("opencode", "m1", now.AddHours(-1), now.AddHours(1));
+
+        Assert.Equal(100, agg.SumMicroCents);
+        Assert.Equal(1, agg.Count);
+    }
+
+    [Fact]
+    public async Task SumWindow_NullModel_MatchesOnlyNullModelRows()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now, model: null, microCents: 42));
+        await _store.RecordAsync(Event(now, model: "m1", microCents: 999));
+
+        var agg = await _store.SumWindowAsync("opencode", null, now.AddHours(-1), now.AddHours(1));
+
+        Assert.Equal(42, agg.SumMicroCents);
+        Assert.Equal(1, agg.Count);
+    }
+
+    [Fact]
+    public async Task SumWindow_MatchesAgentAndModelCaseInsensitively()
+    {
+        // The dispatch gate queries with the canonical lowercase AgentKind.Value,
+        // while the /quota visibility summary iterates config dictionary keys
+        // verbatim (e.g. "OpenCode"/"M1"). The COLLATE NOCASE clauses ensure both
+        // paths sum the same rows; without them a casing mismatch would sum to
+        // zero and overstate remaining budget.
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 100));
+        await _store.RecordAsync(Event(now, agent: "opencode", model: "m1", microCents: 200));
+
+        var agg = await _store.SumWindowAsync("OpenCode", "M1", now.AddHours(-1), now.AddHours(1));
+
+        Assert.Equal(300, agg.SumMicroCents);
+        Assert.Equal(2, agg.Count);
+    }
+
+    [Fact]
+    public async Task SumWindow_NoRows_ReturnsZero()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var agg = await _store.SumWindowAsync("opencode", "m1", now.AddHours(-1), now);
+
+        Assert.Equal(0, agg.SumMicroCents);
+        Assert.Equal(0, agg.Count);
+        Assert.Null(agg.EarliestUtc);
+    }
+
+    [Fact]
+    public async Task RecordedRows_DriveBudgetCalculatorSnapshot_EndToEnd()
+    {
+        // End-to-end: events recorded through the real SQLite store must be summed
+        // by AgentBudgetCalculator under real config into the right AvailablePct.
+        // The split fake-based suites (FakeUsageStore + direct store calls) cannot
+        // catch wiring mistakes here: time_utc bounds, the model-key bucket match
+        // between RecordAsync and SumWindowAsync, and the microcents→percent math.
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now.AddHours(-1), microCents: 1_000_000)); // 100c, in window
+        await _store.RecordAsync(Event(now.AddHours(-2), microCents: 800_000));   // 80c, in window
+        await _store.RecordAsync(Event(now.AddHours(-10), microCents: 5_000_000)); // 500c, outside 5h window
+
+        var opts = new AgentBudgetOptions();
+        opts.Members["opencode"] = new AgentBudgetMemberOptions
+        {
+            Models =
+            {
+                ["m1"] = new AgentBudgetModelOptions
+                {
+                    Windows =
+                    {
+                        new AgentBudgetWindowOptions
+                        {
+                            Kind = BudgetWindowKind.Rolling, Hours = 5, LimitCents = 200,
+                        },
+                    },
+                },
+            },
+        };
+        var calc = new AgentBudgetCalculator(_store, opts, NullLogger<AgentBudgetCalculator>.Instance);
+
+        var snapshot = await calc.GetBudgetSnapshotAsync(AgentKind.Opencode, "m1");
+
+        // 180c spent of 200c limit → 10% remaining; the out-of-window 500c row is
+        // excluded by the time bound, not double-counted.
+        Assert.NotNull(snapshot);
+        Assert.Equal(10.0, snapshot!.AvailablePct, precision: 6);
+    }
+
+    [Fact]
+    public async Task Prune_DeletesOnlyEventsOlderThanCutoff()
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _store.RecordAsync(Event(now.AddDays(-100)));
+        await _store.RecordAsync(Event(now.AddDays(-100)));
+        await _store.RecordAsync(Event(now.AddDays(-1)));
+
+        var deleted = await _store.PruneAsync(now.AddDays(-90));
+
+        Assert.Equal(2, deleted);
+        var agg = await _store.SumWindowAsync("opencode", "m1", now.AddYears(-1), now.AddDays(1));
+        Assert.Equal(1, agg.Count);
+    }
+}

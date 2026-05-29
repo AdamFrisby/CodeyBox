@@ -1,11 +1,13 @@
 # Quota Gate
 
-The pre-pickup quota gate has two inputs:
+The pre-pickup quota gate has three inputs:
 
 - quota probes for Claude and Codex subscription accounts
 - observed quota-shaped failures from recent agent stderr
+- operator-configured local spend budgets (see [`agent-budgets.md`](agent-budgets.md))
 
-The router checks both before dispatching a subscription-billed class member.
+The router checks all three before dispatching a subscription-billed class
+member, taking `MIN(real probe AvailablePct, local budget AvailablePct)`.
 Pay-per-API members are not quota-gated.
 
 ## Probe Model

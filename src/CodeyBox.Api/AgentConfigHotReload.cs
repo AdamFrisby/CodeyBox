@@ -14,7 +14,7 @@ namespace CodeyBox.Api;
 /// restart.
 ///
 /// <para>
-/// Four blocks are hot-reloadable here:
+/// Five blocks are hot-reloadable here:
 /// <list type="bullet">
 /// <item><c>CodeyBox:AgentConcurrency</c> → <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/>.</item>
 /// <item><c>CodeyBox:AgentClasses</c> + <c>CodeyBox:AgentScoreModifiers</c> →
@@ -24,6 +24,10 @@ namespace CodeyBox.Api;
 /// <item><c>CodeyBox:AgentBurnEstimator</c> → <see cref="AgentBurnEstimator.ApplyConfigReload"/>.</item>
 /// <item><c>CodeyBox:AgentPricing</c> → re-merge with bundled defaults, then
 ///   <see cref="AgentPricingState.ApplySuccessfulMerge"/>.</item>
+/// <item><c>CodeyBox:AgentBudgets</c> → <see cref="IAgentBudgetConfigReloadable.ApplyConfigReload"/>
+///   (atomically swaps the budget windows/limits; the calculator holds no
+///   snapshot cache — it recomputes from the live usage store on every call —
+///   so the new windows take effect on the next gate/visibility read).</item>
 /// </list>
 /// </para>
 ///
@@ -48,6 +52,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly OrchestratorService _orchestrator;
     private readonly AgentClassRouter _router;
     private readonly AgentBurnEstimator _burnEstimator;
+    private readonly IAgentBudgetConfigReloadable? _budgetReloader;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly ILogger<AgentConfigHotReload> _log;
@@ -60,6 +65,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastBurn = "";
     private string _lastRouter = "";
     private string _lastPricing = "";
+    private string _lastBudgets = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -70,7 +76,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentBurnEstimator burnEstimator,
         ILogger<AgentConfigHotReload> log,
         AgentCostCalculator? costCalculator = null,
-        AgentPricingState? pricingState = null)
+        AgentPricingState? pricingState = null,
+        IAgentBudgetConfigReloadable? budgetReloader = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -83,6 +90,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _orchestrator = orchestrator;
         _router = router;
         _burnEstimator = burnEstimator;
+        _budgetReloader = budgetReloader;
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _log = log;
@@ -98,6 +106,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastBurn = SerializeBurn(initial.AgentBurnEstimator);
         _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentScoreModifiers);
         _lastPricing = SerializePricing(initial.AgentPricing);
+        _lastBudgets = SerializeBudgets(initial.AgentBudgets);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
@@ -126,6 +135,32 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
             ApplyPricingIfChanged(opts);
+            ApplyBudgetsIfChanged(opts);
+        }
+    }
+
+    private void ApplyBudgetsIfChanged(CodeyBoxOptions opts)
+    {
+        if (_budgetReloader is null) return;
+
+        var next = SerializeBudgets(opts.AgentBudgets);
+        if (string.Equals(_lastBudgets, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastBudgets;
+        try
+        {
+            _budgetReloader.ApplyConfigReload(opts.AgentBudgets);
+            _lastBudgets = next;
+            AuditLog.ConfigReloaded("AgentBudgets", prev, next);
+            _log.LogInformation("Hot-reloaded AgentBudgets: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of AgentBudgets rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
         }
     }
 
@@ -252,6 +287,25 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     .ToDictionary(kv => kv.Key, kv => kv.Value),
                 opts.RollingSampleSize,
                 CacheTtlSeconds = opts.CacheTtl.TotalSeconds,
+            },
+            JsonOpts);
+
+    private static string SerializeBudgets(AgentBudgetOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.RetentionDays,
+                Members = opts.Members
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(
+                        kv => kv.Key,
+                        kv => kv.Value.Models
+                            .OrderBy(m => m.Key, StringComparer.OrdinalIgnoreCase)
+                            .ToDictionary(
+                                m => m.Key,
+                                m => m.Value.Windows
+                                    .Select(w => new { w.Kind, w.Hours, w.LimitCents })
+                                    .ToArray())),
             },
             JsonOpts);
 

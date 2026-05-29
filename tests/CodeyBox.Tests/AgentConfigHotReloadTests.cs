@@ -847,6 +847,77 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_PushesBudgetUpdateIntoCalculator()
+    {
+        // End-to-end: an edit to CodeyBox:AgentBudgets must reach the live
+        // AgentBudgetCalculator (new limit applied, snapshot cache dropped)
+        // without a restart. Spend is fixed at 100 cents; halving the limit from
+        // 200c to 100c turns a 50%-remaining budget into a 0%-remaining one.
+        var store = new FixedSumUsageStore(1_000_000); // 100 cents spent
+        var initialBudgets = MakeBudgets(limitCents: 200);
+        var calculator = new AgentBudgetCalculator(
+            store, initialBudgets, NullLogger<AgentBudgetCalculator>.Instance);
+
+        var initial = new CodeyBoxOptions { AgentBudgets = initialBudgets };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            budgetReloader: calculator);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        var before = await calculator.GetBudgetSnapshotAsync(AgentKind.Opencode, "m1");
+        Assert.Equal(50.0, before!.AvailablePct, precision: 6);
+
+        monitor.Fire(new CodeyBoxOptions { AgentBudgets = MakeBudgets(limitCents: 100) });
+
+        var after = await calculator.GetBudgetSnapshotAsync(AgentKind.Opencode, "m1");
+        Assert.Equal(0.0, after!.AvailablePct, precision: 6);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    private static AgentBudgetOptions MakeBudgets(double limitCents)
+    {
+        var opts = new AgentBudgetOptions();
+        opts.Members["opencode"] = new AgentBudgetMemberOptions
+        {
+            Models =
+            {
+                ["m1"] = new AgentBudgetModelOptions
+                {
+                    Windows = [new AgentBudgetWindowOptions { Kind = BudgetWindowKind.Rolling, Hours = 5, LimitCents = limitCents }],
+                },
+            },
+        };
+        return opts;
+    }
+
+    private sealed class FixedSumUsageStore : IAgentUsageStore
+    {
+        private readonly long _sum;
+        public FixedSumUsageStore(long sumMicroCents) { _sum = sumMicroCents; }
+
+        public Task RecordAsync(AgentUsageEvent usage, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<AgentUsageWindowAggregate> SumWindowAsync(
+            string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken ct = default)
+            => Task.FromResult(new AgentUsageWindowAggregate(_sum, null, _sum > 0 ? 1 : 0));
+
+        public Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default) => Task.FromResult(0);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()

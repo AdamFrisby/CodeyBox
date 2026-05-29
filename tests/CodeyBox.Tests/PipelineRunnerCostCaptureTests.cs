@@ -1,5 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -129,6 +131,172 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(2, reworkRows[0].Iteration);
     }
 
+    [Fact]
+    public async Task SuccessfulRun_WritesUsageEvent_MatchingCostRow()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, usageStore: usageStore);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("usage-test.txt", "usage\n"));
+
+        var item = NewItem("feature/usage-work");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // One usage event per cost row, with the extractor's token fields. The
+        // usage row's ModelId is the DISPATCHED model id (null here — no explicit
+        // item.ModelId and ScriptedAgent has no default), NOT the parsed
+        // snapshot.ModelId "fake-model"; the cost row keeps the parsed model for
+        // display. See BuildUsageEvent — keying usage by dispatch model is what
+        // keeps the budget gate's SUM in the same bucket spend lands in.
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+        var ev = usageStore.Recorded[0];
+        Assert.Equal("claude", ev.AgentKind);
+        Assert.Null(ev.ModelId);
+        Assert.Equal("fake-model", costStore.Recorded[0].ModelId);
+        Assert.Equal(1000, ev.InputTokens);
+        Assert.Equal(100, ev.CachedInputTokens);
+        Assert.Equal(200, ev.OutputTokens);
+        Assert.Equal(item.Id.ToString(), ev.WorkItemId);
+
+        // The microcent cost and timestamp must be derived from the same recorded
+        // cost row (not a different field or scale): CostMicroCents is the cost
+        // row's USD run through UsdToMicroCents, and TimeUtc is its EndedAt.
+        var costRow = costStore.Recorded[0];
+        Assert.Equal(AgentUsageEvent.UsdToMicroCents((decimal)costRow.EstimatedUsd), ev.CostMicroCents);
+        Assert.Equal(costRow.EndedAt, ev.TimeUtc);
+    }
+
+    [Fact]
+    public async Task UsageStoreFailure_DoesNotAbortPipeline()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, usageStore: new ThrowingUsageStore());
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("usage-fail-soft.txt", "x\n"));
+
+        var item = NewItem("feature/usage-fail-soft");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Cost capture still succeeded even though usage persistence threw.
+        Assert.NotEmpty(costStore.Recorded);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_ClampsNegativeTokensAndCost_ToZero()
+    {
+        // Hostile/malformed extractor output: negative tokens and a negative USD.
+        // If the Math.Max clamps were removed, these would persist as negative
+        // values, deflate the budget window SUM, and fail-open the spend cap.
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: -1000, CachedInputTokens: -50, OutputTokens: -999_999_999, ModelId: "ignored");
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Opencode, "opencode-go/deepseek-v4-pro", snapshot,
+            usd: -42.5m, new WorkItemId(Guid.NewGuid()), DateTimeOffset.UtcNow);
+
+        Assert.Equal(0, ev.InputTokens);
+        Assert.Equal(0, ev.CachedInputTokens);
+        Assert.Equal(0, ev.OutputTokens);
+        Assert.Equal(0L, ev.CostMicroCents);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_PreservesNonNegativeValues()
+    {
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "parsed-model");
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Opencode, "dispatch-model", snapshot,
+            usd: 1.5m, new WorkItemId(Guid.NewGuid()), DateTimeOffset.UtcNow);
+
+        Assert.Equal(1000, ev.InputTokens);
+        Assert.Equal(100, ev.CachedInputTokens);
+        Assert.Equal(200, ev.OutputTokens);
+        Assert.Equal(AgentUsageEvent.UsdToMicroCents(1.5m), ev.CostMicroCents);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_KeysByDispatchModel_NotParsedSnapshotModel()
+    {
+        // The budget gate sums spend on member.ModelId == the dispatched model id.
+        // Usage rows MUST be keyed by that dispatch model, never the model parsed
+        // from agent output, or spend lands in a different/NULL bucket than the one
+        // being gated (fail-open on the cap).
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 10, CachedInputTokens: 0, OutputTokens: 10, ModelId: "provider-supplied-model");
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Opencode, "opencode-go/deepseek-v4-pro", snapshot,
+            usd: 0.1m, new WorkItemId(Guid.NewGuid()), DateTimeOffset.UtcNow);
+
+        Assert.Equal("opencode-go/deepseek-v4-pro", ev.ModelId);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_NullDispatchModel_PersistsNull_NotParsedModel()
+    {
+        // A footer that emits no model id (snapshot.ModelId set, dispatch null):
+        // the row still keys on the dispatch bucket (null = default-model bucket),
+        // matching how the gate queries when member.ModelId is unset.
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 10, CachedInputTokens: 0, OutputTokens: 10, ModelId: "some-parsed-model");
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Claude, dispatchModelId: null, snapshot,
+            usd: 0.1m, new WorkItemId(Guid.NewGuid()), DateTimeOffset.UtcNow);
+
+        Assert.Null(ev.ModelId);
+    }
+
+    [Fact]
+    public void ResolveAuditUsageModelId_SameKind_KeepsContextModel()
+    {
+        // PostProcessAuditorRunAsync records audit spend under the model the
+        // auditor actually dispatched on. ExecAuditorAsync keeps ctx.ModelId for a
+        // same-kind auditor, so usage must bucket on ctx.ModelId — the same window
+        // EvaluateAuditCandidateQuotaAsync gates. Returning null here would
+        // understate the gated window and fail-open its cap.
+        var auditRunner = new ClaudeAgentRunner { DefaultModelId = "claude-opus-4-8" };
+        var resolved = PipelineRunner.ResolveAuditUsageModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
+
+        Assert.Equal("claude-opus-4-7", resolved);
+    }
+
+    [Fact]
+    public void ResolveAuditUsageModelId_CrossKind_FallsBackToRunnerDefault()
+    {
+        // Cross-review (audit runner kind != work runner kind): ExecAuditorAsync
+        // drops the vendor-specific work model (ModelId = null), so usage must
+        // bucket on the audit runner's DefaultModelId — never the work item's
+        // model, which the audit runner never dispatched on.
+        var auditRunner = new CodexAgentRunner { DefaultModelId = "gpt-5.5" };
+        var resolved = PipelineRunner.ResolveAuditUsageModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
+
+        Assert.Equal("gpt-5.5", resolved);
+    }
+
+    [Fact]
+    public void ResolveAuditUsageModelId_SameKind_NullContextModel_FallsBackToRunnerDefault()
+    {
+        // Same-kind with no explicit work model: ResolveObservedModelId falls
+        // through to the runner default rather than null, so spend still lands in
+        // a concrete bucket instead of the NULL/default bucket by accident.
+        var auditRunner = new ClaudeAgentRunner { DefaultModelId = "claude-opus-4-8" };
+        var resolved = PipelineRunner.ResolveAuditUsageModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: null);
+
+        Assert.Equal("claude-opus-4-8", resolved);
+    }
+
     private static WorkItem NewItem(string branch) => new()
     {
         Id = new WorkItemId(Guid.NewGuid()),
@@ -165,6 +333,50 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
+    public async Task LlmAuditor_ProducesAuditPhaseUsageEvent_KeyedByDispatchModel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore,
+            auditors: [new FakeLlmAuditor()], maxAuditIterations: 1, usageStore: usageStore);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("llm-audit-usage.txt", "a\n"));
+
+        // Explicit work model so the audit usage row's dispatch bucket is a concrete,
+        // assertable value: a same-kind auditor keeps ctx.ModelId per
+        // ResolveAuditUsageModelId, so the audit usage event must key on it — not the
+        // parsed snapshot model ("fake-model"), not null.
+        var item = NewItem("feature/llm-audit-usage") with { ModelId = "claude-opus-4-7" };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // The audit phase records both a cost row and a usage event: a regression
+        // that injects no usage store, skips RecordAsync on the audit path, or
+        // buckets the audit usage under the wrong model would fail one of these.
+        var auditRow = Assert.Single(costStore.Recorded, r => r.Phase == "audit");
+
+        // One usage event per completed invocation, including the audit run.
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+
+        // Correlate the audit usage event to its cost row by EndedAt → TimeUtc, then
+        // assert it is bucketed under the dispatched audit model so it lands in the
+        // same window EvaluateAuditCandidateQuotaAsync gates on.
+        var auditUsage = Assert.Single(
+            usageStore.Recorded, e => e.TimeUtc == auditRow.EndedAt);
+        Assert.Equal("claude", auditUsage.AgentKind);
+        Assert.Equal("claude-opus-4-7", auditUsage.ModelId);
+        Assert.Equal("fake-model", auditRow.ModelId);
+        Assert.Equal(
+            AgentUsageEvent.UsdToMicroCents((decimal)auditRow.EstimatedUsd),
+            auditUsage.CostMicroCents);
+        Assert.Equal(item.Id.ToString(), auditUsage.WorkItemId);
+    }
+
+    [Fact]
     public async Task CostStoreFailure_DoesNotAbortPipeline()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -189,7 +401,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         IWorkItemCostStore costStore,
         bool registerExtractor = true,
         IReadOnlyList<IAuditor>? auditors = null,
-        int maxAuditIterations = 1)
+        int maxAuditIterations = 1,
+        IAgentUsageStore? usageStore = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -237,7 +450,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             timingStore: null,
             costStore: costStore,
             costExtractors: extractors,
-            costCalculator: calculator);
+            costCalculator: calculator,
+            usageStore: usageStore);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }
@@ -319,6 +533,42 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         public Task<decimal> SumEstimatedUsdAsync(
             string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
             => Task.FromResult(0m);
+    }
+
+    // ── Recording / throwing usage stores ─────────────────────────────────────
+
+    internal sealed class RecordingUsageStore : IAgentUsageStore
+    {
+        private readonly List<AgentUsageEvent> _recorded = [];
+
+        public IReadOnlyList<AgentUsageEvent> Recorded
+        {
+            get { lock (_recorded) return [.. _recorded]; }
+        }
+
+        public Task RecordAsync(AgentUsageEvent usage, CancellationToken ct = default)
+        {
+            lock (_recorded) _recorded.Add(usage);
+            return Task.CompletedTask;
+        }
+
+        public Task<AgentUsageWindowAggregate> SumWindowAsync(
+            string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken ct = default)
+            => Task.FromResult(new AgentUsageWindowAggregate(0, null, 0));
+
+        public Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default) => Task.FromResult(0);
+    }
+
+    private sealed class ThrowingUsageStore : IAgentUsageStore
+    {
+        public Task RecordAsync(AgentUsageEvent usage, CancellationToken ct = default)
+            => throw new InvalidOperationException("injected usage store failure");
+
+        public Task<AgentUsageWindowAggregate> SumWindowAsync(
+            string agentKind, string? modelId, DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken ct = default)
+            => Task.FromResult(new AgentUsageWindowAggregate(0, null, 0));
+
+        public Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default) => Task.FromResult(0);
     }
 
     // ── Fake LLM auditor (needsCreds=true path) ───────────────────────────────

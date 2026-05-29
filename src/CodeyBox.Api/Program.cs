@@ -828,7 +828,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
-        sp.GetService<AgentAvailabilityRegistry>());
+        sp.GetService<AgentAvailabilityRegistry>(),
+        sp.GetService<IAgentBudgetProvider>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -857,6 +858,26 @@ builder.Services.AddSingleton<AgentBurnEstimator>(sp => new AgentBurnEstimator(
 // the concrete type to call ApplyConfigReload, the router takes the interface.
 builder.Services.AddSingleton<IAgentBurnEstimator>(sp =>
     sp.GetRequiredService<AgentBurnEstimator>());
+
+// Per-agent/per-model spend budgets → synthetic quota for the router.
+builder.Services.AddSingleton<AgentBudgetCalculator>(sp => new AgentBudgetCalculator(
+    // Deferred resolution mirrors the burn estimator: the usage store backs onto
+    // a SQLite file that may not be initialised when the router subgraph is built.
+    () => sp.GetRequiredService<IAgentUsageStore>(),
+    // Bind the initial options from configuration. There is intentionally no
+    // AgentBudgetOptions DI singleton: it would be a stale snapshot after a
+    // hot-reload (which mutates the calculator's internal copy via
+    // ApplyConfigReload), so future injectors must not read limits from DI.
+    // RetentionDays is read live via IOptionsMonitor where it is consumed.
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentBudgets,
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentBudgetCalculator>(),
+    TimeProvider.System));
+builder.Services.AddSingleton<IAgentBudgetProvider>(sp =>
+    sp.GetRequiredService<AgentBudgetCalculator>());
+// Separate reload abstraction so AgentConfigHotReload depends on a Core contract
+// rather than the concrete calculator implementation type.
+builder.Services.AddSingleton<IAgentBudgetConfigReloadable>(sp =>
+    sp.GetRequiredService<AgentBudgetCalculator>());
 // OrchestratorService implements IAgentRunningCounters. AgentClassRouter also
 // depends on it, and OrchestratorService depends on AgentClassRouter — using a
 // deferred wrapper breaks that cycle by resolving the singleton lazily on the
@@ -1182,6 +1203,11 @@ builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemCostStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IAgentUsageStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAgentUsageStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1401,7 +1427,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IAgentRunningCounters>(),
     sp.GetService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<IPreMergeVerifier>(),
-    sp.GetRequiredService<AgentConcurrencySnapshot>()));
+    sp.GetRequiredService<AgentConcurrencySnapshot>(),
+    sp.GetService<IAgentUsageStore>(),
+    sp.GetService<IAgentBudgetProvider>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1507,7 +1535,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<AgentBurnEstimator>(),
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
         sp.GetRequiredService<AgentCostCalculator>(),
-        pricingState);
+        pricingState,
+        sp.GetRequiredService<IAgentBudgetConfigReloadable>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1541,6 +1570,10 @@ builder.Services.AddHostedService(sp => new AuditReportRetentionService(
 builder.Services.AddHostedService(sp => new IdempotencyKeyRetentionService(
     sp.GetRequiredService<IIdempotencyStore>(),
     sp.GetRequiredService<ILogger<IdempotencyKeyRetentionService>>()));
+builder.Services.AddHostedService(sp => new AgentUsageRetentionService(
+    sp.GetRequiredService<IAgentUsageStore>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AgentBudgets,
+    sp.GetRequiredService<ILogger<AgentUsageRetentionService>>()));
 builder.Services.AddHostedService(sp => new AgentStreamRetentionService(
     sp.GetRequiredService<IAgentStreamStore>(),
     sp.GetRequiredService<ILogger<AgentStreamRetentionService>>()));
@@ -1676,6 +1709,8 @@ app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
+    IAgentBudgetProvider? budgetProvider,
+    ILoggerFactory loggerFactory,
     CancellationToken ct) =>
 {
     var now = DateTimeOffset.UtcNow;
@@ -1732,6 +1767,43 @@ app.MapGet("/quota", async (
         });
     }
 
+    var budgets = new List<object>();
+    bool budgetsError = false;
+    if (budgetProvider is not null)
+    {
+        IReadOnlyList<AgentBudgetUsageView> views;
+        try
+        {
+            views = await budgetProvider.SummariseAllAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            // Surface the failure to operators polling /quota (e.g. during an
+            // incident) rather than masquerading as "no budgets configured".
+            loggerFactory.CreateLogger("Quota").LogWarning(
+                ex, "Quota: budget summarisation failed; returning budgetsError=true");
+            views = Array.Empty<AgentBudgetUsageView>();
+            budgetsError = true;
+        }
+        foreach (var v in views)
+        {
+            budgets.Add(new
+            {
+                agent = v.Agent,
+                model = v.Model,
+                windows = v.Windows.Select(w => new
+                {
+                    kind = w.Kind,
+                    hours = w.Hours,
+                    usedCents = w.UsedCents,
+                    limitCents = w.LimitCents,
+                    percentRemaining = Math.Round(w.PercentRemaining, 2),
+                    resetAt = w.ResetAt,
+                }).ToList(),
+            });
+        }
+    }
+
     return Results.Ok(new
     {
         generatedAt = now,
@@ -1739,6 +1811,8 @@ app.MapGet("/quota", async (
         unknownPolicy = options.UnknownPolicy.ToString(),
         observedFailureWindowMinutes = options.ObservedFailureWindow.TotalMinutes,
         probes = snapshots,
+        budgets,
+        budgetsError,
         observedFailuresLast60m = failures,
     });
 });
@@ -2024,6 +2098,9 @@ namespace CodeyBox.Api
 
         /// <summary>Per-agent burn-rate estimator config (rate-aware dispatch gate).</summary>
         public AgentBurnEstimatorOptions AgentBurnEstimator { get; set; } = new();
+
+        /// <summary>Per-agent/per-model multi-window spend budgets (synthetic quota for the router).</summary>
+        public AgentBudgetOptions AgentBudgets { get; set; } = new();
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();

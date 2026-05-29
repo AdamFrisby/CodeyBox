@@ -226,6 +226,169 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
+    // ── Local-budget MIN gate in EvaluateAuditCandidateQuotaAsync ────────────
+
+    [Fact]
+    public async Task PreferredBudgetExhausted_ProbeHealthy_AuditFallsThroughToClassMember()
+    {
+        // The preferred audit agent (gemini) has a healthy real probe (80%) but
+        // its operator spend budget is exhausted (1% < MinQuotaPct). MIN(probe,
+        // budget) must reject gemini — the early budget check fires before the
+        // probe round-trip — so the audit falls through to codex, whose budget is
+        // unconfigured (null → ignored) and whose probe is healthy.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(new() { [AgentKind.Gemini] = 1.0 }));
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredBudgetAndProbeHealthy_AuditRunsOnPreferredAgent()
+    {
+        // Both the real probe and the local budget for gemini are above the
+        // floor. MIN(80, 50) = 50 >= MinQuotaPct, so the preferred audit agent is
+        // accepted — confirming the budget gate does not spuriously reject a
+        // healthy budget (guards against an inverted MIN that would still allow
+        // here but reject in the exhausted-budget test above).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(new() { [AgentKind.Gemini] = 50.0 }));
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredProbeExhausted_BudgetHealthy_AuditFallsThroughToClassMember()
+    {
+        // Symmetric to PreferredBudgetExhausted_ProbeHealthy: the preferred audit
+        // agent (gemini) has a HEALTHY budget (80%, so the early budget-only check
+        // passes) but an EXHAUSTED real probe (1%). MIN(probe 1, budget 80) = 1 <
+        // MinQuotaPct must reject gemini. If the combination were MAX, or dropped
+        // the probe, gemini would be wrongly accepted. The audit therefore falls
+        // through to codex (healthy probe, unconfigured budget).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 1.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(new() { [AgentKind.Gemini] = 80.0 }));
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task BudgetProviderThrows_FailsClosed_AuditFallsThroughToClassMember()
+    {
+        // The budget provider throws for the preferred audit agent (gemini). We
+        // cannot verify the spend cap, so the gate must fail closed (reject
+        // gemini) rather than silently drop the budget constraint. The audit
+        // falls through to codex, whose budget lookup succeeds (null → ignored).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(new(), throwFor: [AgentKind.Gemini]));
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task PreferredProbeThrows_HealthyBudget_FailCautious_FallsBackToBudgetAndRunsPreferred()
+    {
+        // The preferred audit agent's real probe throws (transient error) but its
+        // operator budget is healthy (80%). The throw must be treated as unknown
+        // (-1) and fall through to MIN(probe, budget) = budget, NOT short-circuit on
+        // the FailCautious UnknownPolicy. So gemini runs despite FailCautious,
+        // because the configured budget vouches for it. Without the MIN fallthrough
+        // (the throw-path returning early) gemini would be rejected and the audit
+        // would fall through to codex — a fail-closed bypass of a healthy budget.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Codex] = 80.0 },
+            throwingProbes: [AgentKind.Gemini],
+            unknownPolicy: QuotaUnknownPolicy.FailCautious,
+            budgetProvider: new FakeBudgetProvider(new() { [AgentKind.Gemini] = 80.0 }));
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task NoAuditProbeButHealthyBudget_AuditRunsOnPreferredAgent()
+    {
+        // No real audit probes are registered, but the preferred audit agent has
+        // a healthy configured budget. The probe-less branch must treat the
+        // budget's concrete available percentage as "available" and run the
+        // preferred agent rather than reverting to a blanket probe-less allow that
+        // ignores the configured spend cap.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(new() { [AgentKind.Gemini] = 80.0 }),
+            registerAuditProbes: false);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
     // ── Harness ─────────────────────────────────────────────────────────────
 
     private RoutingFixture BuildFixture(
@@ -234,7 +397,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         IReadOnlyList<AgentKind> classMembers,
         Dictionary<AgentKind, double>? quotas = null,
         IReadOnlyList<AgentKind>? throwingProbes = null,
-        QuotaUnknownPolicy unknownPolicy = QuotaUnknownPolicy.UseObservedFailures)
+        QuotaUnknownPolicy unknownPolicy = QuotaUnknownPolicy.UseObservedFailures,
+        IAgentBudgetProvider? budgetProvider = null,
+        bool registerAuditProbes = true)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -319,7 +484,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: probes,
+            auditQuotaProbes: registerAuditProbes ? probes : null,
             auditQuotaOptions: new QuotaRouterOptions
             {
                 MinQuotaPct = 10.0,
@@ -332,7 +497,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
-            ]));
+            ]),
+            budgetProvider: budgetProvider);
 
         return new RoutingFixture(pipeline, store, webhooks, codex);
     }
@@ -387,6 +553,31 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             _pct = 0.0;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class FakeBudgetProvider : IAgentBudgetProvider
+    {
+        private readonly Dictionary<AgentKind, double> _pct;
+        private readonly HashSet<AgentKind> _throw;
+
+        public FakeBudgetProvider(Dictionary<AgentKind, double> pct, IEnumerable<AgentKind>? throwFor = null)
+        {
+            _pct = pct;
+            _throw = throwFor is null ? new() : new(throwFor);
+        }
+
+        public Task<AgentQuotaSnapshot?> GetBudgetSnapshotAsync(AgentKind agent, string? modelId, CancellationToken ct = default)
+        {
+            if (_throw.Contains(agent))
+                throw new InvalidOperationException("budget provider failure (test)");
+            // null = no budget configured for this agent → router ignores the gate.
+            return Task.FromResult(_pct.TryGetValue(agent, out var p)
+                ? new AgentQuotaSnapshot { AvailablePct = p }
+                : null);
+        }
+
+        public Task<IReadOnlyList<AgentBudgetUsageView>> SummariseAllAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AgentBudgetUsageView>>([]);
     }
 
     // Returns a non-null AgentCredential for every kind so the resolver's

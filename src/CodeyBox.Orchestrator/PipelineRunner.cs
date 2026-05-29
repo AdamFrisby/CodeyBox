@@ -53,6 +53,13 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAuditReportStore? _auditReports;
     private readonly ITimingStore? _timings;
     private readonly IWorkItemCostStore? _costStore;
+    private readonly IAgentUsageStore? _usageStore;
+    // Local operator-budget provider. The audit-phase quota gate
+    // (EvaluateAuditCandidateQuotaAsync) consults it and takes MIN with the real
+    // probe, mirroring AgentClassRouter.ApplyBudgetAsync so the work and audit
+    // phases gate on the same synthetic budget quota. Optional: when unwired the
+    // audit gate falls back to probe-only behaviour.
+    private readonly IAgentBudgetProvider? _budgetProvider;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? _costExtractors;
     private readonly IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? _toolCallCounters;
     private readonly AgentCostCalculator? _costCalculator;
@@ -167,7 +174,9 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentRunningCounters? agentRunningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
         IPreMergeVerifier? preMergeVerifier = null,
-        AgentConcurrencySnapshot? agentConcurrencySnapshot = null)
+        AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
+        IAgentUsageStore? usageStore = null,
+        IAgentBudgetProvider? budgetProvider = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -182,6 +191,8 @@ public sealed class PipelineRunner : IPipelineRunner
         _opts = opts;
         _timings = timingStore;
         _costStore = costStore;
+        _usageStore = usageStore;
+        _budgetProvider = budgetProvider;
         _costExtractors = costExtractors;
         _costCalculator = costCalculator;
         _stdoutBroadcaster = stdoutBroadcaster;
@@ -1322,6 +1333,20 @@ public sealed class PipelineRunner : IPipelineRunner
                     candidateReasons.Add($"{member.Agent.Value}: no runner registered");
                     continue;
                 }
+                // Apply the same local-budget MIN gate used at pickup: a member whose
+                // operator spend budget is already exhausted must not be chosen for
+                // conflict rework just because OrderedFallbackCandidates (score-only)
+                // surfaced it. Fail closed when the provider throws.
+                var (budgetPct, budgetFailedClosed) =
+                    await ReadCandidateBudgetAsync(member.Agent, member.ModelId, ct);
+                if (budgetFailedClosed
+                    || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
+                {
+                    candidateReasons.Add(
+                        $"{member.Agent.Value}: local budget exhausted " +
+                        (budgetFailedClosed ? "(provider error)" : $"({budgetPct:F1}%)"));
+                    continue;
+                }
 
                 await TryAddCandidateAsync(memberRunner, ct);
             }
@@ -1931,7 +1956,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (streamCapture is null)
             await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-            runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt);
+            runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
         agentSw.Stop();
         // Feed the availability registry so the fast-fail circuit breaker can
         // exclude an agent that exits non-zero in under FastFailThresholdSeconds
@@ -2876,9 +2901,18 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (needsCreds)
         {
+            // Record usage under the model the auditor actually dispatched on, so
+            // spend lands in the same bucket EvaluateAuditCandidateQuotaAsync gates
+            // on (see BuildUsageEvent). ExecAuditorAsync dispatches with
+            // ModelId = crossKind ? null : ctx.ModelId, so mirror that here:
+            // same-kind keeps the work item's model, cross-kind falls back to the
+            // runner default. Passing modelId:null unconditionally would bucket
+            // same-kind audit spend under the runner default instead of ctx.ModelId,
+            // understating the gated window and fail-opening the spend cap.
             await TryRecordCostAsync(run.Result.RawOutput, null,
                 run.Runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
-                run.StartedAt, run.StartedAt + run.Elapsed);
+                run.StartedAt, run.StartedAt + run.Elapsed,
+                ResolveAuditUsageModelId(run.Runner, workRunner.Kind, ctx.ModelId));
         }
         await EmitAuditorSubStepsAsync(run.Auditor.Name, run.Result.RawOutput,
             ctx.WorkItemId, ctx.Iteration, run.StartedAt);
@@ -3157,6 +3191,37 @@ public sealed class PipelineRunner : IPipelineRunner
     /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
     /// on what counts as "available".
     /// </summary>
+    /// <summary>
+    /// Reads the operator's local spend budget for (<paramref name="kind"/>,
+    /// <paramref name="modelId"/>) and classifies it for the mid-iteration fallback
+    /// gates. Returns the budget <c>AvailablePct</c> (or <c>-1</c> when no budget is
+    /// configured) and a <c>FailedClosed</c> flag set when the provider itself threw
+    /// — that means the operator's spend cap cannot be verified, so callers must gate
+    /// dispatch rather than silently drop the constraint. Shared by the audit-candidate
+    /// gate and the work-phase fallback so both honour MIN(probe, local budget).
+    /// <see cref="OperationCanceledException"/> propagates (shutdown/abort is not an
+    /// accounting outage).
+    /// </summary>
+    private async Task<(double Pct, bool FailedClosed)> ReadCandidateBudgetAsync(
+        AgentKind kind, string? modelId, CancellationToken ct)
+    {
+        if (_budgetProvider is null) return (-1, false);
+        try
+        {
+            var budget = await _budgetProvider.GetBudgetSnapshotAsync(kind, modelId, ct);
+            return (budget?.AvailablePct ?? -1, false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Provider failure (not a configured-but-degraded budget, which is
+            // already reported as 0%) means we cannot verify the spend cap.
+            _log.LogWarning(ex,
+                "Budget gate for {Agent}/{Model} threw; failing closed",
+                kind.Value, modelId ?? "(default)");
+            return (-1, true);
+        }
+    }
+
     private async Task<(bool Allowed, string Reason)> EvaluateAuditCandidateQuotaAsync(
         AgentKind kind, AgentMembership member, CancellationToken ct)
     {
@@ -3169,28 +3234,61 @@ public sealed class PipelineRunner : IPipelineRunner
             return (false, "recent observed quota failure");
         }
 
-        if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
-            return (true, "no probe registered");
+        // Local operator-budget snapshot. Acceptance criterion: quota routing
+        // takes MIN(real probe, local budget), so the audit fallthrough must not
+        // dispatch an agent whose operator spend budget is exhausted just because
+        // the subscription probe still has headroom. budgetPct < 0 means "no
+        // budget configured" (the budget gate is then absent).
+        var (budgetPct, budgetFailedClosed) = await ReadCandidateBudgetAsync(kind, member.ModelId, ct);
+        if (budgetFailedClosed)
+            return (false, "budget provider error (fail-closed)");
 
-        AgentQuotaSnapshot snapshot;
+        // A configured budget that is itself below the threshold gates regardless
+        // of the probe — MIN(probe, budget) would be below threshold anyway, and
+        // this avoids a probe round-trip we know cannot pass.
+        if (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct)
+            return (false, $"local budget exhausted ({budgetPct:F1}%)");
+
+        if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
+        {
+            // No real probe. A healthy configured budget supplies a concrete
+            // available percentage; otherwise preserve the prior probe-less
+            // "allow" semantics.
+            return budgetPct >= 0
+                ? (true, $"available (budget {budgetPct:F1}%)")
+                : (true, "no probe registered");
+        }
+
+        double probePct;
         try
         {
-            snapshot = await probe.GetAvailabilityAsync(member, ct);
+            var snapshot = await probe.GetAvailabilityAsync(member, ct);
+            probePct = AgentClassRouter.ResolveMemberQuota(snapshot, member).AvailablePct;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // Probe threw (transient API error). Treat it as unknown (-1) and fall
+            // through to the MIN(real probe, local budget) logic below rather than
+            // short-circuiting: a healthy configured budget must still gate, and an
+            // exhausted one was already rejected above. Bypassing the budget here
+            // would fail-open the operator spend cap on a probe blip.
             _log.LogDebug(ex, "Audit quota probe for {Agent} threw; treating as unknown", kind.Value);
-            return _auditQuotaOptions.UnknownPolicy == QuotaUnknownPolicy.FailCautious
-                ? (false, "probe failed (fail-cautious policy)")
-                : (true, "probe failed (fail-open policy)");
+            probePct = -1;
         }
 
-        var quota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
-        if (quota.AvailablePct >= _auditQuotaOptions.MinQuotaPct)
-            return (true, $"available ({quota.AvailablePct:F1}%)");
+        // MIN(real probe, local budget): the budget stands alone when the probe is
+        // unknown (-1), and the probe stands alone when no budget is configured.
+        var combinedPct = probePct < 0
+            ? budgetPct
+            : budgetPct < 0
+                ? probePct
+                : Math.Min(probePct, budgetPct);
 
-        if (quota.AvailablePct >= 0)
-            return (false, $"quota exhausted ({quota.AvailablePct:F1}%)");
+        if (combinedPct >= _auditQuotaOptions.MinQuotaPct)
+            return (true, $"available ({combinedPct:F1}%)");
+
+        if (combinedPct >= 0)
+            return (false, $"quota exhausted ({combinedPct:F1}%)");
 
         return _auditQuotaOptions.UnknownPolicy switch
         {
@@ -3416,6 +3514,23 @@ public sealed class PipelineRunner : IPipelineRunner
                         classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
                     continue;
                 }
+                // Local operator-budget gate. OrderedFallbackCandidates filters only
+                // score / in-process exhaustion / smoke / observed failures — it never
+                // consults IAgentBudgetProvider, so without this check the mid-iteration
+                // fallback could dispatch a member that ResolveAsync would have rejected
+                // for an exhausted spend cap (acceptance criterion 3: MIN(probe, budget)
+                // on routing paths). Fail closed when the provider throws.
+                var (budgetPct, budgetFailedClosed) =
+                    await ReadCandidateBudgetAsync(candidate.Agent, candidate.ModelId, ct);
+                if (budgetFailedClosed
+                    || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
+                {
+                    _log.LogInformation(
+                        "Class '{ClassId}' member {Agent}/{Model} local budget exhausted ({Pct}); skipping for fallback (work item {WorkItemId})",
+                        classId, candidate.Agent.Value, candidate.ModelId ?? "(default)",
+                        budgetFailedClosed ? "provider error" : $"{budgetPct:F1}%", item.Id);
+                    continue;
+                }
                 nextMember = candidate;
                 break;
             }
@@ -3594,6 +3709,24 @@ public sealed class PipelineRunner : IPipelineRunner
             return string.IsNullOrWhiteSpace(defaults.DefaultModelId) ? null : defaults.DefaultModelId;
 
         return null;
+    }
+
+    /// <summary>
+    /// Resolves the model id under which a completed auditor's spend is recorded
+    /// so audit usage lands in the same budget bucket the gate queries. Mirrors
+    /// the dispatch rule in <see cref="ExecAuditorAsync"/>: a same-kind auditor
+    /// keeps the work item's model (<paramref name="ctxModelId"/>); a cross-kind
+    /// auditor drops the (vendor-specific) work model and falls back to the audit
+    /// runner's DefaultModelId. Recording the work model unconditionally would
+    /// bucket cross-kind spend under a model the audit runner never dispatched on;
+    /// recording null unconditionally would understate the gated same-kind window
+    /// and fail-open its spend cap.
+    /// </summary>
+    internal static string? ResolveAuditUsageModelId(
+        IAgentRunner auditRunner, AgentKind workRunnerKind, string? ctxModelId)
+    {
+        var crossKind = auditRunner.Kind != workRunnerKind;
+        return ResolveObservedModelId(auditRunner, crossKind ? null : ctxModelId);
     }
 
     /// <summary>
@@ -3869,7 +4002,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!mergeStructuredStreamCaptured)
                 await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt);
+                runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
             mergeSw.Stop();
             if (_availability is { } regOnMergeFinish)
             {
@@ -5804,7 +5937,8 @@ public sealed class PipelineRunner : IPipelineRunner
             stopwatch.Stop();
             var endedAt = DateTimeOffset.UtcNow;
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                runner.Kind, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt);
+                runner.Kind, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt,
+                ResolveObservedModelId(runner, item.ModelId));
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
@@ -7405,7 +7539,8 @@ Original merge-phase failure (for context):
         string phase,
         int? iteration,
         DateTimeOffset startedAt,
-        DateTimeOffset endedAt)
+        DateTimeOffset endedAt,
+        string? dispatchModelId)
     {
         if (_costStore is null || _costExtractors is null || _costCalculator is null) return;
         if (!_costExtractors.TryGetValue(agentKind, out var extractor)) return;
@@ -7452,7 +7587,64 @@ Original merge-phase failure (for context):
             _log.LogWarning(ex, "Cost: failed to persist row for work item {Id} phase '{Phase}'",
                 workItemId, phase);
         }
+
+        if (_usageStore is not null)
+        {
+            try
+            {
+                await _usageStore.RecordAsync(
+                    BuildUsageEvent(agentKind, dispatchModelId, snapshot, usd, workItemId, endedAt),
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Usage: failed to persist event for work item {Id} phase '{Phase}'",
+                    workItemId, phase);
+            }
+        }
     }
+
+    /// <summary>
+    /// Builds the durable usage-accounting row for one agent invocation.
+    /// <para>
+    /// The row is keyed by the DISPATCHED model id, never the model id parsed from
+    /// agent output (<see cref="AgentCostSnapshot.ModelId"/>). The budget gate sums
+    /// spend filtered on the operator-configured <c>member.ModelId</c> — the same
+    /// value used to route/dispatch. Persisting under the parsed model id (which is
+    /// null on many human-readable footers and a provider-supplied string on JSON
+    /// paths) would store spend in a different or NULL bucket than the one being
+    /// gated, so the gate's SUM returns zero used and AvailablePct stays at 100%
+    /// while real cost accrues — a fail-open bypass of the operator spend cap.
+    /// <paramref name="dispatchModelId"/> == <c>member.ModelId</c> guarantees the
+    /// bucket the gate reads is the bucket spend lands in.
+    /// </para>
+    /// <para>
+    /// Token counts and cost come from parsing untrusted agent stdout/stderr. A
+    /// hostile or malformed CLI emission (e.g. <c>completion_tokens:-999999999</c>)
+    /// would otherwise persist negative microcents, deflate the budget window SUM,
+    /// and keep AvailablePct artificially high — fail-open on the spend cap. Every
+    /// persisted component is clamped non-negative so a bad emission can only ever
+    /// over-report spend, never deflate it.
+    /// </para>
+    /// </summary>
+    internal static AgentUsageEvent BuildUsageEvent(
+        AgentKind agentKind,
+        string? dispatchModelId,
+        AgentCostSnapshot snapshot,
+        decimal usd,
+        WorkItemId workItemId,
+        DateTimeOffset endedAt) => new()
+        {
+            Id = Guid.NewGuid().ToString(),
+            TimeUtc = endedAt,
+            AgentKind = agentKind.Value,
+            ModelId = dispatchModelId,
+            InputTokens = Math.Max(0, snapshot.InputTokens),
+            CachedInputTokens = Math.Max(0, snapshot.CachedInputTokens),
+            OutputTokens = Math.Max(0, snapshot.OutputTokens),
+            CostMicroCents = Math.Max(0L, AgentUsageEvent.UsdToMicroCents(usd)),
+            WorkItemId = workItemId.ToString(),
+        };
 
     // ── Question parsing + NeedsOperatorInput parking ───────────────────────
 
