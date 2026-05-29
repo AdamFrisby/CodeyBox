@@ -156,6 +156,14 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault).
             await ProbeAgentAsync(probe, ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Genuine dispatch/shutdown cancellation must propagate so the
+            // router aborts cleanly rather than continuing to route on a
+            // half-probed agent. Only step timeouts (ct NOT signalled) are
+            // handled as transient inside ProbeAgentAsync; those never reach here.
+            throw;
+        }
         catch (Exception ex)
         {
             // The gate runs on the router hot path and must never throw. The
