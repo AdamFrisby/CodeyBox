@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -183,6 +184,76 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         Assert.Null(snapshot.Notes);
     }
 
+    // ── Cursor ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Cursor_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
+    {
+        var body = """
+        {
+          "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
+          "autoBucketModels": ["composer-2"]
+        }
+        """;
+        var probe = BuildCursorProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Cursor,
+            Billing = AgentBilling.Subscription,
+            ModelId = "composer-99-unknown",
+            QualityScore = 98,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(-1, snapshot.AvailablePct);
+        Assert.Contains("composer-99-unknown", snapshot.Notes ?? "");
+        Assert.Contains("not in quota response", snapshot.Notes ?? "");
+    }
+
+    [Fact]
+    public async Task Cursor_ConfiguredModelPresentInPerModel_UsesParsedQuota()
+    {
+        var body = """
+        {
+          "planUsage": { "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
+          "autoBucketModels": ["composer-2.5"]
+        }
+        """;
+        var probe = BuildCursorProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Cursor,
+            Billing = AgentBilling.Subscription,
+            ModelId = CursorQuotaProbe.DefaultRoutedModelId,
+            QualityScore = 98,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.True(snapshot.AvailablePct >= 0);
+        Assert.True(snapshot.PerModel.ContainsKey(CursorQuotaProbe.DefaultRoutedModelId));
+        Assert.Null(snapshot.Notes);
+    }
+
+    [Fact]
+    public async Task Cursor_NoConfiguredModelId_PreservesOverallAvailability()
+    {
+        var body = """{"planUsage":{"totalPercentUsed":30}}""";
+        var probe = BuildCursorProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Cursor,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 98,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(70, snapshot.AvailablePct);
+        Assert.Null(snapshot.Notes);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static GeminiQuotaProbe BuildGeminiProbe(string body, TimeSpan? cacheTtl = null)
@@ -216,6 +287,17 @@ public sealed class QuotaProbeConfiguredModelMissingTests
             token: "test-token",
             cacheTtl: TimeSpan.FromMinutes(1),
             NullLogger<CodexQuotaProbe>.Instance);
+    }
+
+    private static CursorQuotaProbe BuildCursorProbe(string body)
+    {
+        var handler = new QuotaCapturingHandler(HttpStatusCode.OK, body, _ => { });
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        return new CursorQuotaProbe(
+            factory,
+            token: "test-token",
+            cacheTtl: TimeSpan.FromMinutes(1),
+            NullLogger<CursorQuotaProbe>.Instance);
     }
 
 }

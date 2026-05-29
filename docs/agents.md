@@ -372,12 +372,19 @@ agent-class member is accepted (so the schema stays uniform across agents)
 but is not threaded into argv. If a future Cursor release adds one, wire it
 in `CursorAgentRunner.BuildInvocation`.
 
-**Quota probe:** Cursor does not currently document a usage / rate-limit
-endpoint reachable from a subscription token. `CursorQuotaProbe` always
-reports `AvailablePct=-1` ("no probe endpoint"); the router's
-`UnknownPolicy=UseObservedFailures` applies observation-based back-pressure
-via `CursorQuotaFailureDetector` instead. Per the operator's stated
-preference for reactive over speculative coverage, this is intentional.
+**Quota probe:** `CursorQuotaProbe` POSTs to Cursor's Connect-RPC
+`DashboardService/GetCurrentPeriodUsage` on `api2.cursor.sh`, using the
+`accessToken` from `~/.config/cursor/auth.json` (same credential bundle as
+the runner). Overall availability is `100 - planUsage.totalPercentUsed`;
+`billingCycleEnd` becomes `ResetAt`. Per-model routing uses
+`autoBucketModels` plus `autoPercentUsed` (composer-* automatic models).
+When a member has `ModelId` set but that id is absent from the parsed
+buckets, the probe reports `AvailablePct=-1` so the router applies its
+unknown policy rather than falling open on the global percentage.
+Results are cached for `QuotaCacheTtlSeconds` (default 60s). Token refresh
+is file-driven (no OAuth refresh helper yet); transient HTTP failures can
+pin unknown until cache expiry or `TokenUpdated` invalidates the cache.
+`CursorQuotaFailureDetector` still classifies dispatch-time limit signals.
 
 **Smoke probe:** the Cursor smoke probe performs a credential-bundle
 presence check (it verifies that `CODEYBOX_CURSOR_AUTH_JSON` is set);

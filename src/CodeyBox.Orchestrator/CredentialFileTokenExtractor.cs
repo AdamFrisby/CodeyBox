@@ -81,6 +81,28 @@ public static class CredentialFileTokenExtractor
         return (accessToken, accountId);
     }
 
+    public static string? ExtractCursorAccessToken(string? rawContents)
+    {
+        if (string.IsNullOrWhiteSpace(rawContents))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawContents);
+            if (doc.RootElement.TryGetProperty("accessToken", out var token) &&
+                token.ValueKind == JsonValueKind.String)
+            {
+                var value = token.GetString();
+                return string.IsNullOrEmpty(value) ? null : value;
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return null;
+    }
+
     public static string? ExtractGeminiAccessToken(string? rawContents)
     {
         if (string.IsNullOrWhiteSpace(rawContents))

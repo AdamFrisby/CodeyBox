@@ -7,24 +7,18 @@ namespace CodeyBox.Agents.Cursor;
 /// <summary>
 /// Credential smoke test for Cursor.
 ///
-/// <para>Cursor does not currently document a usage / status HTTP endpoint
-/// reachable from a subscription token (the way Claude has
-/// <c>/v1/messages</c>, Codex has <c>/v1/chat/completions</c>, Gemini has
-/// <c>/v1beta/.../generateContent</c>). The probe therefore performs a cheap
-/// credential-presence check — it verifies that the credential bundle carries
-/// either <c>CODEYBOX_CURSOR_AUTH_JSON</c> (subscription flow) and surfaces a
-/// human-readable failure reason otherwise. This is intentionally lighter than
-/// the HTTP probes used by other agents: a real <c>agent --version</c>
-/// invocation requires a sandbox, which is too heavy for the startup-time
-/// smoke gate (and we'd be paying multipass cold-start at every restart).</para>
+/// <para>Subscription usage is probed separately by
+/// <see cref="CursorQuotaProbe"/> against
+/// <c>DashboardService/GetCurrentPeriodUsage</c>. This smoke probe performs a
+/// cheap credential-presence check — it verifies that the credential bundle
+/// carries <c>CODEYBOX_CURSOR_AUTH_JSON</c> and surfaces a human-readable
+/// failure reason otherwise. This is intentionally lighter than invoking the
+/// CLI: a real <c>agent --version</c> call requires a sandbox, which is too
+/// heavy for the startup-time smoke gate.</para>
 ///
-/// <para>The first real Cursor invocation in the pipeline is the authoritative
-/// credential check; <see cref="CursorQuotaFailureDetector"/> classifies any
-/// <c>401</c> response that surfaces there as
-/// <see cref="QuotaFailureKind.Unauthorized"/>, which the pipeline treats the
-/// same way it would a smoke-probe auth failure. Per the operator's stated
-/// preference (<c>feedback-vendor-api-drift</c>), this reactive surface is
-/// preferred over speculative HTTP coverage.</para>
+/// <para>The first real Cursor invocation in the pipeline remains an
+/// authoritative credential check; <see cref="CursorQuotaFailureDetector"/>
+/// classifies limit and auth failures from dispatch output.</para>
 ///
 /// <para>This probe deliberately does NOT verify that the <c>agent</c> binary
 /// is present in the sandbox image — see the comment above re. multipass

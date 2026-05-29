@@ -6,10 +6,11 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Tests for <see cref="CursorSmokeProbe"/>. Unlike Claude/Codex/Gemini's
-/// probes, this one performs no HTTP call — Cursor exposes no documented
-/// usage endpoint reachable from a subscription token — so the probe
-/// reduces to a credential-presence check on the bundle. These tests pin
-/// that contract so an editor rename or inverted check would fail loudly.
+/// smoke probes, this one performs no HTTP call — it only checks that the
+/// credential bundle carries <c>CODEYBOX_CURSOR_AUTH_JSON</c> (or a host
+/// auth file). Quota visibility is handled separately by
+/// <see cref="CursorQuotaProbe"/>. These tests pin that contract so an
+/// editor rename or inverted check would fail loudly.
 /// </summary>
 public sealed class CursorSmokeProbeTests
 {

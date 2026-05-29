@@ -666,7 +666,7 @@ builder.Services.AddHttpClient("github-upstream", client =>
 builder.Services.AddHttpClient("agent-quota", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(10);
-});
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
 
 // Named client for credential smoke probes. Authorization is added per-request
 // from the credential bundle; the header is never logged. Timeout is generous
@@ -792,12 +792,21 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     source.TokenUpdated += probe.InvalidateCache;
     return probe;
 });
-// Cursor has no programmatic usage endpoint reachable from a subscription
-// token; CursorQuotaProbe always reports Unknown and the router's
-// UnknownPolicy=UseObservedFailures applies observation-based back-pressure
-// via CursorQuotaFailureDetector. Per feedback-vendor-api-drift, reactive
-// is preferred over speculative coverage.
-builder.Services.AddSingleton<IAgentQuotaProbe, CursorQuotaProbe>();
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var source = sp.GetRequiredService<CursorCredentialFileSource>();
+    var probe = new CursorQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () => new AgentQuotaCredentials(
+            CredentialFileTokenExtractor.ExtractCursorAccessToken(source.GetRaw())
+                ?? CredentialFileTokenExtractor.ExtractCursorAccessToken(
+                    Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_JSON"))),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<CursorQuotaProbe>());
+    source.TokenUpdated += probe.InvalidateCache;
+    return probe;
+});
 
 // opencode: no verified usage endpoint at integration time. The probe ships
 // as Unknown-only so the router falls onto its QuotaUnknownPolicy

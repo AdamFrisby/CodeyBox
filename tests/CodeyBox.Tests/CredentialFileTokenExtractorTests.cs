@@ -79,6 +79,25 @@ public sealed class CredentialFileTokenExtractorTests
     }
 
     [Fact]
+    public void ExtractCursorAccessToken_ReadsAccessToken()
+    {
+        const string raw = """{"accessToken":"cursor-subscription-token","email":"redacted@example.com"}""";
+
+        var token = CredentialFileTokenExtractor.ExtractCursorAccessToken(raw);
+
+        Assert.Equal("cursor-subscription-token", token);
+    }
+
+    [Theory]
+    [InlineData("not-json")]
+    [InlineData("""{"accessToken":""}""")]
+    [InlineData("""{"token":"legacy-shape"}""")]
+    public void ExtractCursorAccessToken_ReturnsNullForMalformedOrMissingToken(string raw)
+    {
+        Assert.Null(CredentialFileTokenExtractor.ExtractCursorAccessToken(raw));
+    }
+
+    [Fact]
     public void ExtractGeminiAccessToken_ReadsAccessToken()
     {
         const string raw = """{"access_token":"gemini-token","refresh_token":"ignored"}""";
