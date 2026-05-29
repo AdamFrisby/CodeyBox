@@ -532,7 +532,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
                     try
                     {
-                        reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
+                        // Iteration 1 matches the Publish{Iteration}Started/Completed
+                        // calls bracketing this resume branch and the standard
+                        // post-audit rework path's per-iteration numbering, so a
+                        // resume-after-preempt rework row aligns with main-path rows.
+                        reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: 1,
                             async (runner, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkPhase, ct,
                                     phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
@@ -6448,6 +6452,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
                 throw phase.Wrap(oce);
             }
+            catch (Exception ex)
+            {
+                // A phase timeout (PhaseCancellationException) or any other
+                // unexpected failure from the agent run must still close the
+                // involvement row — otherwise it dangles in-progress forever,
+                // unlike InvokeAgentWithQuotaFallbackAsync / ExecAuditorAsync
+                // which both finalize on generic Exception. OutcomeForFailure
+                // maps cancellation/timeout to failure:cancelled and everything
+                // else to failure:agent.
+                await FinalizeInvolvementAsync(conflictInvolvementId, OutcomeForFailure(ex));
+                throw;
+            }
             stopwatch.Stop();
             var endedAt = DateTimeOffset.UtcNow;
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
@@ -6456,9 +6472,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
+            // A semantic-incompatible declaration is the disposition the pipeline
+            // acts on (it parks the item with that reason) even though the agent
+            // legitimately exits non-zero to signal it — so it must be checked
+            // before the generic !Success → failure:agent fallback, otherwise the
+            // involvement outcome would mislabel it as a plain agent failure.
             await FinalizeInvolvementAsync(conflictInvolvementId,
-                !agentResult.Success ? "failure:agent"
-                : semanticIncompatible is not null ? "failure:semantic-incompatible"
+                semanticIncompatible is not null ? "failure:semantic-incompatible"
+                : !agentResult.Success ? "failure:agent"
                 : "success");
             if (semanticIncompatible is not null)
             {

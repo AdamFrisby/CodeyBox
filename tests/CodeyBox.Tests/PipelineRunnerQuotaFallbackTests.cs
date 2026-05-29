@@ -169,6 +169,55 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task TwoAuditorProgression_RecordsExactlySevenRowInvolvementTrailThroughPipeline()
+    {
+        // Acceptance criterion #5, realised end-to-end through the REAL pipeline
+        // (not store seeding) and asserting an EXACT seven-row trail. The audit
+        // loop re-runs the full auditor list on every iteration, so the row count
+        // for a Work → Audit → Rework → Audit → Merge progression with N LLM
+        // auditors is 1 + N + 1 + N + 1 = 2N + 3. AC#5's "7 rows" therefore
+        // corresponds to N = 2 here; the three-auditor case genuinely produces
+        // nine rows (MultiAuditorProgression). A regression that dropped the
+        // single chokepoint, mislabeled a phase, or skipped the post-rework
+        // re-audit recording would change this count and fail here.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var alpha = new ScriptedLlmAuditor("review-alpha", failOnCall: 1);
+        var beta = new ScriptedLlmAuditor("review-beta");
+        using var fix = BuildPipeline(seed, [alpha, beta], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+
+        // 1 work + 2 audits(iter1) + 1 rework + 2 audits(iter2) + 1 merge = 7.
+        Assert.Equal(7, rows.Count);
+        Assert.All(rows, r => Assert.NotNull(r.EndedAt));
+        Assert.All(rows, r => Assert.Equal(AgentKind.Codex, r.AgentKind));
+
+        AssertInvolvement(rows[0], AgentKind.Codex, "work", null, "success");
+        AssertInvolvement(rows[3], AgentKind.Codex, "rework", 2, "success");
+        AssertInvolvement(rows[6], AgentKind.Codex, "merge", null, "success");
+
+        var auditPhases = new[] { "audit:review-alpha", "audit:review-beta" };
+
+        var iter1Audits = rows.Skip(1).Take(2).ToList();
+        Assert.All(iter1Audits, r => Assert.Equal(1, r.Iteration));
+        Assert.Equal(auditPhases, iter1Audits.Select(r => r.Phase).OrderBy(p => p));
+
+        var iter2Audits = rows.Skip(4).Take(2).ToList();
+        Assert.All(iter2Audits, r => Assert.Equal(2, r.Iteration));
+        Assert.Equal(auditPhases, iter2Audits.Select(r => r.Phase).OrderBy(p => p));
+    }
+
+    [Fact]
     public async Task WorkQuotaFallback_RecordsFailureThenSuccessInvolvementRows()
     {
         // The quota fallback path must close the exhausted attempt's row as
@@ -469,6 +518,15 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
         Assert.Equal(WorkItemState.Failed, finalItem!.State);
+
+        // The non-quota work failure throws out of the chokepoint, so the work
+        // involvement row must be finalized failure:agent (the OutcomeForFailure
+        // default). This is the only end-to-end assertion of that outcome string.
+        var workRows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase == "work").ToList();
+        var failedWork = Assert.Single(workRows);
+        AssertInvolvement(failedWork, AgentKind.Codex, "work", null, "failure:agent");
+        Assert.NotNull(failedWork.EndedAt);
     }
 
     [Fact]
@@ -511,6 +569,15 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
         Assert.Equal(AgentKind.Claude, fallback.ToAgent);
         Assert.Contains("per-attempt timeout", fallback.Reason);
+
+        // The per-attempt timeout must close codex's work row as failure:timeout
+        // and open a fresh success row for claude. This is the only end-to-end
+        // assertion of the failure:timeout involvement outcome.
+        var workRows = (await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase == "work").ToList();
+        Assert.Collection(workRows,
+            r => AssertInvolvement(r, AgentKind.Codex, "work", null, "failure:timeout"),
+            r => AssertInvolvement(r, AgentKind.Claude, "work", null, "success"));
 
         Assert.Empty(fix.CodexProbe.MarkedExhausted);
         Assert.Empty(fix.ClaudeProbe.MarkedExhausted);
@@ -556,6 +623,17 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(1, fix.Codex.CallCount);
         Assert.Equal(0, fix.Claude.CallCount);
         Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
+
+        // The per-attempt timeout (10s) elapses at the same tick the host
+        // shutdown fires; the timeout finalize wins the race, so codex's work row
+        // is stamped failure:timeout even though shutdown decides the final
+        // disposition (item stays Working, no fallback). Pins that attribution
+        // under the timeout-vs-shutdown race and that the row never dangles.
+        var workRow = Assert.Single(
+            await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "work");
+        AssertInvolvement(workRow, AgentKind.Codex, "work", null, "failure:timeout");
+        Assert.NotNull(workRow.EndedAt);
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);

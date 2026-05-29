@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Api;
@@ -519,7 +520,12 @@ internal static class WorkItemEndpoints
         IWorkItemCostStore? costs,
         ILoggerFactory loggerFactory,
         IAgentFallbackHistoryStore? fallbackHistory,
-        IAgentInvolvementStore? involvement,
+        // [FromServices] + nullable makes this a genuinely OPTIONAL dependency:
+        // when no involvement store is registered the framework binds null
+        // (rather than failing endpoint construction with inferred-body), so the
+        // "feature disabled → omit agentHistory/workAgent" branch below is real
+        // and testable, not dead code.
+        [FromServices] IAgentInvolvementStore? involvement,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -562,7 +568,7 @@ internal static class WorkItemEndpoints
             // Always emit a list (possibly empty) when the store is wired so
             // consumers distinguish "no agent ran yet / history started
             // post-migration" ([]) from "store unavailable" (omitted). WorkAgent
-            // is the original implementer, derived from the first Work entry.
+            // is the original implementer, derived from the successful Work entry.
             var involvementHistory = await involvement.ListByWorkItemAsync(item.Id, ct);
             dto = dto with
             {
@@ -582,7 +588,9 @@ internal static class WorkItemEndpoints
     private static async Task<IResult> GetAgentHistoryAsync(
         string id,
         IWorkItemStore store,
-        IAgentInvolvementStore? involvement,
+        // See GetAsync: [FromServices] + nullable = optional dependency, so the
+        // store-unwired branch binds null instead of breaking endpoint setup.
+        [FromServices] IAgentInvolvementStore? involvement,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -641,15 +649,31 @@ internal static class WorkItemEndpoints
             Outcome: r.Outcome);
 
     /// <summary>
-    /// The agent that ran the original implementation: the first
-    /// <c>Work</c>-phase involvement entry. Distinct from
+    /// The agent that ran the original implementation. Distinct from
     /// <see cref="WorkItem.Agent"/>, which reflects whichever phase is current.
     /// Phase match is case-insensitive ("work" vs "Work").
+    /// <para>
+    /// A work-phase quota/timeout fallback records the exhausted attempt first
+    /// (e.g. codex <c>failure:quota</c>) and then the successor that actually
+    /// produced the implementation (e.g. claude <c>success</c>). Returning the
+    /// first row would re-introduce the exact mis-attribution this feature
+    /// exists to fix, so prefer the work row that finished successfully. Fall
+    /// back to the first work attempt only while none has succeeded yet (still
+    /// in progress, or every attempt failed).
+    /// </para>
     /// </summary>
-    private static string? ResolveWorkAgent(IReadOnlyList<AgentInvolvement> history) =>
-        history
-            .FirstOrDefault(h => string.Equals(h.Phase, "work", StringComparison.OrdinalIgnoreCase))
-            ?.AgentKind.Value;
+    private static string? ResolveWorkAgent(IReadOnlyList<AgentInvolvement> history)
+    {
+        AgentInvolvement? firstWork = null;
+        foreach (var h in history)
+        {
+            if (!string.Equals(h.Phase, "work", StringComparison.OrdinalIgnoreCase)) continue;
+            firstWork ??= h;
+            if (string.Equals(h.Outcome, "success", StringComparison.Ordinal))
+                return h.AgentKind.Value;
+        }
+        return firstWork?.AgentKind.Value;
+    }
 
     private static AgentFallbackDto MapFallback(AgentFallbackRecord r) =>
         new(

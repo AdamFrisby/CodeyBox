@@ -141,19 +141,23 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkAuditReworkAuditMergeProgression_ProducesSevenRowHistory()
+    public async Task FullProgression_RoundTripsOrderingMultiRowPerIterationAndFinalize()
     {
-        // STORE-CONTRACT test only: pushes the seven-row Work → Audit (3 auditors)
-        // → Rework → Audit (re-check) → Merge shape directly at the SQLite store to
-        // pin ordering, multi-row-per-iteration, and one-time finalize. It does NOT
-        // exercise PipelineRunner; the end-to-end chokepoint wiring (acceptance #5/#6)
-        // is verified by
-        // PipelineRunnerQuotaFallbackTests.MultiAuditorProgression_RecordsPerAuditorInvolvementThroughPipeline,
-        // which drives the real pipeline with three distinct LLM auditors. Phase
-        // strings here use the production "audit:{auditor.Name}" format that
-        // ExecAuditorAsync emits, so this test also guards that label shape.
-        // Work-phase iteration is null here to match what
-        // InvokeAgentWithQuotaFallbackAsync passes in production.
+        // STORE-CONTRACT test only: pins SQLite ordering, multi-row-per-iteration,
+        // and one-time finalize for a full Work → Audit → Rework → Audit → Merge
+        // progression. It does NOT exercise PipelineRunner and is NOT the
+        // acceptance-#5 guard — that lives in the REAL-pipeline tests
+        // PipelineRunnerQuotaFallbackTests.TwoAuditorProgression_...SevenRow... (7
+        // rows, 2 auditors) and MultiAuditorProgression_... (9 rows, 3 auditors).
+        //
+        // The shape modelled here matches production: the audit loop re-runs the
+        // FULL auditor list on every iteration, so three LLM auditors produce
+        // three "audit:{name}" rows in BOTH audit iterations (1 + 3 + 1 + 3 + 1 =
+        // 9). Earlier this test seeded only a single audit row for iteration 2,
+        // which implied a single-auditor re-check that the orchestrator never
+        // performs; that fiction is removed here. Phase strings use the
+        // production "audit:{name}" format ExecAuditorAsync emits, and work/merge
+        // iteration is null to match InvokeAgentWithQuotaFallbackAsync.
         using var store = NewStore();
         var id = WorkItemId.New();
         var t = new DateTimeOffset(2026, 5, 1, 9, 0, 0, TimeSpan.Zero);
@@ -170,20 +174,22 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
 
         // 1: Work phase, run by Cursor (iteration null, as production records it).
         await RecordPhase(AgentKind.Cursor, "work", null, "success");
-        // 2-4: Audit iteration 1 — three LLM auditors, each recorded under its
-        // own "audit:{name}" phase (the label ExecAuditorAsync actually emits).
+        // 2-4: Audit iteration 1 — the full three-auditor list.
         await RecordPhase(AgentKind.Claude, "audit:security", 1, "success");
         await RecordPhase(AgentKind.Cursor, "audit:quality", 1, "success");
         await RecordPhase(AgentKind.Gemini, "audit:completeness", 1, "success");
         // 5: Rework, back to the original work agent.
         await RecordPhase(AgentKind.Cursor, "rework", 1, "success");
-        // 6: Audit iteration 2 — single re-check after the rework.
+        // 6-8: Audit iteration 2 — the SAME full auditor list re-runs (production
+        // re-runs all auditors every iteration; it is not a single re-check).
         await RecordPhase(AgentKind.Claude, "audit:security", 2, "success");
-        // 7: Merge phase.
+        await RecordPhase(AgentKind.Cursor, "audit:quality", 2, "success");
+        await RecordPhase(AgentKind.Gemini, "audit:completeness", 2, "success");
+        // 9: Merge phase.
         await RecordPhase(AgentKind.Cursor, "merge", null, "success");
 
         var rows = await store.ListByWorkItemAsync(id);
-        Assert.Equal(7, rows.Count);
+        Assert.Equal(9, rows.Count);
 
         // Phase/agent sequence maps 1:1 to the orchestrator's phase transitions.
         Assert.Collection(rows,
@@ -193,6 +199,8 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
             r => AssertRow(r, AgentKind.Gemini, "audit:completeness", 1),
             r => AssertRow(r, AgentKind.Cursor, "rework", 1),
             r => AssertRow(r, AgentKind.Claude, "audit:security", 2),
+            r => AssertRow(r, AgentKind.Cursor, "audit:quality", 2),
+            r => AssertRow(r, AgentKind.Gemini, "audit:completeness", 2),
             r => AssertRow(r, AgentKind.Cursor, "merge", null));
 
         // Every row is finalized; none is left dangling in-progress.
