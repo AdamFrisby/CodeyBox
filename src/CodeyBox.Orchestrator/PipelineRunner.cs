@@ -4396,73 +4396,105 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (_involvement is null) return null;
 
-        var id = Guid.NewGuid();
-        try
-        {
-            await _involvement.RecordStartAsync(new AgentInvolvement(
-                Id: id,
-                WorkItemId: workItemId,
-                AgentKind: agent,
-                ModelId: modelId,
-                Phase: phase,
-                StartedAt: DateTimeOffset.UtcNow,
-                EndedAt: null,
-                Iteration: iteration,
-                Outcome: null), CancellationToken.None);
-            return id;
-        }
-        catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
-        {
-            // Best-effort like fallback-history recording: a *transient* persistence
-            // fault (DB busy/locked/I-O hiccup, or a store disposed during host
-            // shutdown) must not break a work item that did real work. Logged at
-            // Warning (not Debug) so a dropped audit-trail row is operator-visible.
-            // Only this bounded set is swallowed — an unexpected exception (e.g. a
-            // wiring/programming bug in the recording path) propagates so it surfaces
-            // in CI rather than silently eroding the 1:1 phase→row guarantee.
-            // Cancellation is never swallowed — it propagates to abort the phase.
-            _log.LogWarning(ex, "agent involvement start record failed for phase '{Phase}'", phase);
-            return null;
-        }
+        var entry = new AgentInvolvement(
+            Id: Guid.NewGuid(),
+            WorkItemId: workItemId,
+            AgentKind: agent,
+            ModelId: modelId,
+            Phase: phase,
+            StartedAt: DateTimeOffset.UtcNow,
+            EndedAt: null,
+            Iteration: iteration,
+            Outcome: null);
+
+        var persisted = await PersistInvolvementWithRetryAsync(
+            ct => _involvement.RecordStartAsync(entry, ct),
+            op: "start record", phase: phase);
+        return persisted ? entry.Id : null;
     }
 
     /// <summary>
-    /// True for the bounded set of exceptions involvement persistence is allowed
-    /// to swallow: transient store faults (any <see cref="System.Data.Common.DbException"/>
-    /// such as SQLite busy/locked, an <see cref="IOException"/>, a
-    /// <see cref="TimeoutException"/>) and an <see cref="ObjectDisposedException"/>
-    /// from a store torn down during host shutdown. Cancellation is excluded so it
-    /// keeps propagating; anything else is an unexpected bug that must surface.
+    /// Persists one involvement mutation (start insert or finalize update) with a
+    /// bounded retry so a <em>transient</em> store fault (SQLite busy/locked, an
+    /// <see cref="IOException"/>, a <see cref="TimeoutException"/>) does not drop
+    /// an audit-trail row on the first blip — AC#1 requires a row on every phase
+    /// transition and AC#6 a 1:1 phase→row mapping, so a momentary lock must not
+    /// silently erode the trail. Retries share the DB with the work-item store, so
+    /// a fault that survives all attempts means the DB is genuinely unhealthy and
+    /// the next work-item write would fail the phase anyway; rather than abort a
+    /// work item that did real work for an audit-trail write, the exhausted fault
+    /// is logged at Warning and swallowed (returns false). An
+    /// <see cref="ObjectDisposedException"/> from a store torn down during host
+    /// shutdown is not retried (the host is going away) but is likewise tolerated.
+    /// Cancellation and any unexpected exception (a wiring/programming bug) always
+    /// propagate so they surface in CI instead of silently eroding the trail.
+    /// </summary>
+    private async Task<bool> PersistInvolvementWithRetryAsync(
+        Func<CancellationToken, Task> write, string op, string phase)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await write(CancellationToken.None);
+                return true;
+            }
+            catch (Exception ex)
+                when (IsTransientInvolvementPersistenceFault(ex) && attempt < InvolvementPersistenceMaxAttempts)
+            {
+                _log.LogDebug(ex,
+                    "agent involvement {Op} transient fault for phase '{Phase}' (attempt {Attempt}/{Max}); retrying",
+                    op, phase, attempt, InvolvementPersistenceMaxAttempts);
+                await Task.Delay(InvolvementPersistenceRetryDelay * attempt, CancellationToken.None);
+            }
+            catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
+            {
+                // Transient fault that survived every retry, or a store disposed
+                // during host shutdown. Logged at Warning (not Debug) so a dropped
+                // audit-trail row stays operator-visible.
+                _log.LogWarning(ex, "agent involvement {Op} failed for phase '{Phase}'", op, phase);
+                return false;
+            }
+        }
+    }
+
+    private const int InvolvementPersistenceMaxAttempts = 4;
+    private static readonly TimeSpan InvolvementPersistenceRetryDelay = TimeSpan.FromMilliseconds(25);
+
+    /// <summary>
+    /// Transient (retryable) involvement persistence faults: a contended store
+    /// (any <see cref="System.Data.Common.DbException"/> such as SQLite
+    /// busy/locked), an <see cref="IOException"/>, or a <see cref="TimeoutException"/>.
+    /// These typically clear on a short retry, so the audit-trail row is preserved
+    /// rather than dropped.
+    /// </summary>
+    private static bool IsTransientInvolvementPersistenceFault(Exception ex) =>
+        ex is System.Data.Common.DbException or IOException or TimeoutException;
+
+    /// <summary>
+    /// The bounded set of exceptions involvement persistence is allowed to swallow
+    /// after retries: the transient faults above plus an
+    /// <see cref="ObjectDisposedException"/> from a store torn down during host
+    /// shutdown. Cancellation is excluded so it keeps propagating; anything else is
+    /// an unexpected bug that must surface.
     /// </summary>
     private static bool IsTolerableInvolvementPersistenceFault(Exception ex) =>
         ex is not OperationCanceledException
-        && ex is System.Data.Common.DbException
-            or IOException
-            or TimeoutException
-            or ObjectDisposedException;
+        && (IsTransientInvolvementPersistenceFault(ex) || ex is ObjectDisposedException);
 
     /// <summary>
     /// Stamps the completion outcome on a previously-started involvement row.
-    /// No-op when no store is wired or no row was recorded. Best-effort; uses
+    /// No-op when no store is wired or no row was recorded. Uses
     /// <see cref="CancellationToken.None"/> so the audit stamp lands even when
-    /// the phase was cancelled.
+    /// the phase was cancelled, and retries transient faults so the closing stamp
+    /// survives a momentary store blip (see <see cref="PersistInvolvementWithRetryAsync"/>).
     /// </summary>
     private async Task FinalizeInvolvementAsync(Guid? involvementId, string outcome)
     {
         if (_involvement is null || involvementId is not { } id) return;
-        try
-        {
-            await _involvement.FinalizeAsync(id, DateTimeOffset.UtcNow, outcome, CancellationToken.None);
-        }
-        catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
-        {
-            // Best-effort; Warning (not Debug) so a missed completion stamp on the
-            // audit trail is visible to operators instead of silently swallowed.
-            // Only transient persistence faults are swallowed (see
-            // IsTolerableInvolvementPersistenceFault) — an unexpected bug propagates.
-            // Cancellation is never swallowed — it propagates to abort the phase.
-            _log.LogWarning(ex, "agent involvement finalize failed");
-        }
+        await PersistInvolvementWithRetryAsync(
+            ct => _involvement.FinalizeAsync(id, DateTimeOffset.UtcNow, outcome, ct),
+            op: "finalize", phase: outcome);
     }
 
     /// <summary>

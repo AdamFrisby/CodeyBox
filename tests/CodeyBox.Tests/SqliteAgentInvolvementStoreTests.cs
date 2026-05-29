@@ -147,8 +147,9 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
         // and one-time finalize for a full Work → Audit → Rework → Audit → Merge
         // progression. It does NOT exercise PipelineRunner and is NOT the
         // acceptance-#5 guard — that lives in the REAL-pipeline tests
-        // PipelineRunnerQuotaFallbackTests.TwoAuditorProgression_...SevenRow... (7
-        // rows, 2 auditors) and MultiAuditorProgression_... (9 rows, 3 auditors).
+        // PipelineRunnerQuotaFallbackTests.Ac5_WorkAuditReworkAuditMerge_RecordsExactlySevenRowAgentHistory
+        // (7 rows, 2 auditors) and
+        // ThreeAuditorProgression_…_RecordsNineRowPerAuditorTrail (9 rows, 3 auditors).
         //
         // The shape modelled here matches production: the audit loop re-runs the
         // FULL auditor list on every iteration, so three LLM auditors produce

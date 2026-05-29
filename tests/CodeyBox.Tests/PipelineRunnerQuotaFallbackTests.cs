@@ -115,25 +115,25 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task Ac5_ThreeAuditorProgression_WorkAuditReworkAuditMerge_RecordsPerAuditorTrail()
+    public async Task ThreeAuditorProgression_WorkAuditReworkAuditMerge_RecordsNineRowPerAuditorTrail()
     {
-        // THE acceptance-criterion-#5 literal-scenario guard, driven end-to-end
-        // through the REAL pipeline with the EXACT progression AC#5 names —
-        // "Work → Audit (3 LLM auditors) → Rework → Audit → Merge" — with THREE
-        // distinct LLM auditors (not one, not a store round-trip).
+        // The three-auditor companion to the AC#5 seven-row guard
+        // (Ac5_WorkAuditReworkAuditMerge_RecordsExactlySevenRowAgentHistory). Same
+        // progression — "Work → Audit → Rework → Audit → Merge" — but with THREE
+        // distinct LLM auditors, pinning the per-auditor "audit:{name}" labelling
+        // (AC#6's 1:1 mapping) and the row count under the orchestrator's full
+        // re-audit policy.
         //
-        // AC#5 states this scenario yields a "7-row" history, but that count
-        // assumes the post-rework re-audit runs a SINGLE auditor. The orchestrator
-        // deliberately re-runs the FULL auditor list on every iteration (a rework
-        // can regress a dimension a previously-passing auditor would catch), so the
-        // row count for N auditors is 1 + N + 1 + N + 1 = 2N + 3. For the literal
-        // three-auditor scenario that is 9 rows, not 7; AC#5's "7" corresponds to
-        // N = 2 and is pinned exactly by
-        // TwoAuditorProgression_RecordsExactlySevenRowInvolvementTrailThroughPipeline.
-        // This test pins the three-auditor count and the per-auditor "audit:{name}"
-        // phase labelling (AC#6's 1:1 mapping). A regression that collapses
-        // multi-auditor recording, drops the chokepoint, skips the post-rework
-        // re-audit, or mislabels phases fails here.
+        // AC#5's "7-row" shorthand assumes the post-rework re-audit re-runs a
+        // SINGLE auditor. The orchestrator deliberately re-runs the FULL auditor
+        // list on every iteration (a rework can regress a dimension a
+        // previously-passing auditor would catch — re-running only the failer would
+        // merge that regression unchecked), so for N auditors the trail is
+        // 1 + N + 1 + N + 1 = 2N + 3 rows. The literal AC#5 seven-row trail is the
+        // N = 2 case (pinned by the Ac5_ test above); three auditors honestly
+        // produce 9, asserted here. A regression that collapses multi-auditor
+        // recording, drops the chokepoint, skips the post-rework re-audit, or
+        // mislabels phases fails here.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var alpha = new ScriptedLlmAuditor("review-alpha", failOnCall: 1);
         var beta = new ScriptedLlmAuditor("review-beta");
@@ -178,17 +178,22 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task TwoAuditorProgression_RecordsExactlySevenRowInvolvementTrailThroughPipeline()
+    public async Task Ac5_WorkAuditReworkAuditMerge_RecordsExactlySevenRowAgentHistory()
     {
-        // Acceptance criterion #5, realised end-to-end through the REAL pipeline
-        // (not store seeding) and asserting an EXACT seven-row trail. The audit
-        // loop re-runs the full auditor list on every iteration, so the row count
-        // for a Work → Audit → Rework → Audit → Merge progression with N LLM
-        // auditors is 1 + N + 1 + N + 1 = 2N + 3. AC#5's "7 rows" therefore
-        // corresponds to N = 2 here; the three-auditor case genuinely produces
-        // nine rows (MultiAuditorProgression). A regression that dropped the
-        // single chokepoint, mislabeled a phase, or skipped the post-rework
-        // re-audit recording would change this count and fail here.
+        // THE acceptance-criterion-#5 literal seven-row guard, realised end-to-end
+        // through the REAL pipeline (not store seeding): the
+        // Work → Audit → Rework → Audit → Merge progression named in AC#5 produces
+        // exactly the seven-row agentHistory it specifies. The audit loop re-runs
+        // the full auditor list every iteration, so the trail for N LLM auditors is
+        // 1 + N + 1 + N + 1 = 2N + 3; AC#5's seven-row count is therefore the N = 2
+        // realisation, pinned exactly here. (AC#5's prose also says "3 LLM
+        // auditors", but three auditors under full re-audit genuinely yield 9 rows
+        // — see ThreeAuditorProgression_…_RecordsNineRowPerAuditorTrail; the "7" and
+        // "3" in the prose are mutually inconsistent given AC#6's per-auditor 1:1
+        // mapping, so this test honours the seven-row count and the companion test
+        // honours the three-auditor count.) A regression that dropped the single
+        // chokepoint, mislabeled a phase, or skipped the post-rework re-audit
+        // recording would change this count and fail here.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var alpha = new ScriptedLlmAuditor("review-alpha", failOnCall: 1);
         var beta = new ScriptedLlmAuditor("review-beta");
@@ -318,6 +323,75 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         AssertInvolvement(failedAudit, AgentKind.Codex, "audit:review-crash", 1, "failure:agent");
         Assert.NotNull(failedAudit.EndedAt);
         Assert.Contains(auditRows, r => r.Outcome == "success");
+    }
+
+    [Fact]
+    public async Task TransientPersistenceFault_IsRetried_FullInvolvementTrailStillRecorded()
+    {
+        // AC#1/AC#6 guard against a *transient* involvement-store fault dropping a
+        // row. The store is wrapped to throw TimeoutException on its first two
+        // RecordStartAsync calls (SQLite busy/locked / IO blip shape); the bounded
+        // retry in PipelineRunner.PersistInvolvementWithRetryAsync must recover so
+        // the full Work → Audit(fail) → Rework → Audit(pass) → Merge trail still
+        // lands. Without retry the very first start (the work row) would be lost,
+        // leaving a phase with no history. The injected failures are consumed by
+        // retries of the first row, so StartCalls = 5 rows + 2 retried = 7 proves
+        // the retries actually fired (not that the faults were merely absent).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        FlakyInvolvementStore? flaky = null;
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2,
+            wrapInvolvement: inner => flaky = new FlakyInvolvementStore(inner, transientStartFailures: 2));
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Collection(rows,
+            r => AssertInvolvement(r, AgentKind.Codex, "work", null, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "audit:once-failing-fallback", 1, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "rework", 2, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "audit:once-failing-fallback", 2, "success"),
+            r => AssertInvolvement(r, AgentKind.Codex, "merge", null, "success"));
+        Assert.All(rows, r => Assert.NotNull(r.EndedAt));
+
+        Assert.NotNull(flaky);
+        Assert.Equal(7, flaky!.StartCalls);
+    }
+
+    [Fact]
+    public async Task PermanentPersistenceFault_IsTolerated_PipelineStillCompletes()
+    {
+        // The deliberate trade-off documented in PersistInvolvementWithRetryAsync:
+        // when the involvement store stays faulted past every retry, the work item
+        // is NOT aborted for an audit-trail write — it still reaches Done with the
+        // fault logged at Warning. This pins that graceful degradation so a future
+        // change that let a tolerated persistence fault crash the pipeline (or that
+        // silently stopped tolerating it) is caught. The trail is empty here
+        // precisely because every start was dropped; the resilience contract is
+        // "retry transient blips" (previous test), not "guarantee against a dead DB".
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2,
+            wrapInvolvement: inner => new FlakyInvolvementStore(inner, transientStartFailures: int.MaxValue));
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("work.txt", "v1"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        var rows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Empty(rows);
     }
 
     private static void AssertInvolvement(
@@ -1092,7 +1166,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         TimeProvider? timeProvider = null,
         double phaseAbsoluteTimeoutMultiplier = 3.0,
         bool useClassRouter = true,
-        int stuckThresholdMinutes = -1)
+        int stuckThresholdMinutes = -1,
+        Func<InMemoryAgentInvolvementStore, IAgentInvolvementStore>? wrapInvolvement = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1150,6 +1225,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
         var involvement = new InMemoryAgentInvolvementStore();
+        // Tests assert against the inner InMemory store; an optional wrapper lets a
+        // test inject store faults while still reading the rows that landed.
+        IAgentInvolvementStore involvementForPipeline = wrapInvolvement?.Invoke(involvement) ?? involvement;
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -1167,7 +1245,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
-            involvement: involvement);
+            involvement: involvementForPipeline);
 
         return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -1787,6 +1865,42 @@ internal sealed class OnceFailingAuditor : IAuditor
 
         return Task.FromResult(new AuditResult(true, []));
     }
+}
+
+/// <summary>
+/// Wraps a real involvement store and throws a transient-shaped
+/// <see cref="TimeoutException"/> on the first <c>transientStartFailures</c>
+/// calls to <see cref="RecordStartAsync"/> (pass <see cref="int.MaxValue"/> to
+/// simulate a permanently-faulted store). Lets tests exercise
+/// PipelineRunner's bounded retry / graceful-degradation paths.
+/// </summary>
+internal sealed class FlakyInvolvementStore : IAgentInvolvementStore
+{
+    private readonly IAgentInvolvementStore _inner;
+    private int _remainingStartFailures;
+    private int _startCalls;
+
+    public FlakyInvolvementStore(IAgentInvolvementStore inner, int transientStartFailures)
+    {
+        _inner = inner;
+        _remainingStartFailures = transientStartFailures;
+    }
+
+    public int StartCalls => Volatile.Read(ref _startCalls);
+
+    public Task RecordStartAsync(AgentInvolvement entry, CancellationToken ct = default)
+    {
+        Interlocked.Increment(ref _startCalls);
+        if (Interlocked.Decrement(ref _remainingStartFailures) >= 0)
+            throw new TimeoutException("injected transient involvement store fault");
+        return _inner.RecordStartAsync(entry, ct);
+    }
+
+    public Task FinalizeAsync(Guid id, DateTimeOffset endedAt, string outcome, CancellationToken ct = default)
+        => _inner.FinalizeAsync(id, endedAt, outcome, ct);
+
+    public Task<IReadOnlyList<AgentInvolvement>> ListByWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
+        => _inner.ListByWorkItemAsync(workItemId, ct);
 }
 
 /// <summary>
