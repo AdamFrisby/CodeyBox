@@ -12,6 +12,8 @@
   <ItemGroup>
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g94r-2vxg-569j" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-9j88-vvj5-vhgr" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" />
   </ItemGroup>
 
   <ItemGroup>
@@ -70,6 +72,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Harness\CodeyBox.Harness.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Notifications\CodeyBox.Notifications.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Admin\src\CodeyBox.Admin.Web\CodeyBox.Admin.Web.csproj" Aliases="CodeyBoxAdminWeb" />
     <!--
       Build dependency only: the CLI UAT tests spawn the CLI as an out-of-process

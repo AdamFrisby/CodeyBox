@@ -38,6 +38,7 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly ILogger<SandboxLeakReaper> _log;
     private readonly IWorkItemStore? _store;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly LeakDetectionSink? _leakSink;
 
     // First time THIS reaper observed each VM in a suspend-lifecycle state with no
     // live mapping. The suspend-orphan grace is measured from this timestamp, NOT
@@ -81,7 +82,8 @@ public sealed class SandboxLeakReaper : BackgroundService
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log,
         IWorkItemStore? store,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        LeakDetectionSink? leakSink = null)
     {
         _provider = provider;
         _webhooks = webhooks;
@@ -89,6 +91,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         _log = log;
         _store = store;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _leakSink = leakSink;
     }
 
     /// <summary>
@@ -230,6 +233,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                         Reason = reason,
                     },
                 }, ct);
+                _leakSink?.Increment();
             }
 
             // Drop first-seen entries for VMs that are no longer suspend orphans

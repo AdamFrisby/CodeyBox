@@ -29,12 +29,18 @@ public sealed class IdempotencyKeyRetentionService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var timer = new PeriodicTimer(_interval);
-        do
+        while (!stoppingToken.IsCancellationRequested)
         {
             await RunSweepAsync(stoppingToken);
+            try
+            {
+                await Task.Delay(_interval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
-        while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 
     private async Task RunSweepAsync(CancellationToken ct)

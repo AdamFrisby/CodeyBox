@@ -24,6 +24,7 @@ using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using CodeyBox.Notifications;
 using Serilog;
 using Serilog.Events;
 using Serilog.Filters;
@@ -145,6 +146,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 }
 
 builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
+builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -1138,6 +1140,52 @@ builder.Services.AddSingleton<IWebhookDispatcher>(sp =>
     return new BroadcastingWebhookDispatcher(broadcaster, http);
 });
 
+// --- Notifications ------------------------------------------------------------
+// Human/systems notification pipeline: conditions evaluate system state,
+// rules route matching notifications to providers (email, etc.).
+// Safe no-op when unconfigured — no startup failure without SMTP config.
+builder.Services.AddSingleton<OrchestratorProgressClock>();
+builder.Services.AddSingleton<LeakDetectionSink>();
+
+builder.Services.AddSingleton<INotificationProvider>(sp =>
+{
+    var logger = sp.GetRequiredService<ILogger<EmailNotificationProvider>>();
+    var isDev = sp.GetRequiredService<IHostEnvironment>().IsDevelopment();
+    Func<EmailProviderOptions> optsAccessor = () =>
+        sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>().CurrentValue.Email;
+    var opts = optsAccessor();
+    if (opts.Enabled)
+        return new EmailNotificationProvider(optsAccessor, logger, isDevelopment: isDev);
+    return new NullNotificationProvider("email");
+});
+
+// ICondition registrations — one per supported condition.
+builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
+builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
+    sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct,
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
+builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
+builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
+    sp.GetRequiredService<OrchestratorProgressClock>(),
+    sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
+builder.Services.AddSingleton<ICondition, SandboxLeakReapedCondition>();
+
+// INotificationBuilder registrations — one per condition.
+builder.Services.AddSingleton<INotificationBuilder, QueueEmptyNotificationBuilder>();
+builder.Services.AddSingleton<INotificationBuilder>(sp => new AllQuotasExhaustedNotificationBuilder(
+    sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct));
+builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNotificationBuilder>();
+builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
+    sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
+builder.Services.AddSingleton<INotificationBuilder, SandboxLeakReapedNotificationBuilder>();
+
+// Rules engine — BackgroundService that evaluates conditions and dispatches.
+builder.Services.AddSingleton<NotificationRulesEngine>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NotificationRulesEngine>());
+
 // --- Changelog automation ----------------------------------------------------
 // Named HTTP client for direct Anthropic Messages API calls (changelog generation).
 // Reuses api.anthropic.com which is already in AgentAllowedHosts; this client is
@@ -1562,7 +1610,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
-    sp.GetRequiredService<IBaselineImageResolver>()));
+    sp.GetRequiredService<IBaselineImageResolver>(),
+    sp.GetRequiredService<OrchestratorProgressClock>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -1686,7 +1735,8 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         sp.GetRequiredService<IWebhookDispatcher>(),
         () => monitor.CurrentValue.SandboxLeak,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),
-        sp.GetRequiredService<IWorkItemStore>());
+        sp.GetRequiredService<IWorkItemStore>(),
+        leakSink: sp.GetRequiredService<LeakDetectionSink>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
 
@@ -2374,6 +2424,14 @@ namespace CodeyBox.Api
 
         /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
+
+        /// <summary>
+        /// Human/systems notification rules and provider configuration.
+        /// Edits hot-reload via IOptionsMonitor — conditions, cooldowns,
+        /// and provider routing take effect on the next sweep without restart.
+        /// Empty Rules list = notifications disabled.
+        /// </summary>
+        public NotificationsOptions Notifications { get; set; } = new();
 
         /// <summary>
         /// Sandbox leak reaper configuration. The reaper periodically scans for

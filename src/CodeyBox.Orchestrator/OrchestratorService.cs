@@ -81,6 +81,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // the DI factory hands in NullBaselineImageResolver which returns null
     // for every resolve — pickup proceeds without a stamp.
     private readonly IBaselineImageResolver _baselineResolver;
+    private readonly OrchestratorProgressClock _progressClock;
     // Shared swappable holder. Both this service AND PipelineRunner (the
     // pickup-time rebase-resolver's cap-aware router) read through the same
     // AgentConcurrencySnapshot, so ApplyAgentConcurrencyReload's swap is
@@ -152,7 +153,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         ReleaseService? releaseService = null,
         AgentConcurrencyOptions? agentConcurrency = null,
         AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
-        IBaselineImageResolver? baselineResolver = null)
+        IBaselineImageResolver? baselineResolver = null,
+        OrchestratorProgressClock? progressClock = null)
     {
         _queue = queue;
         _store = store;
@@ -169,6 +171,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _reaper = reaper;
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
+        _progressClock = progressClock ?? new OrchestratorProgressClock();
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -403,6 +406,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             await _reaper.RunOnceAsync(stoppingToken);
             await _reaper.SweepStrandedItemsAsync(stoppingToken);
+            _progressClock.Stamp(DateTimeOffset.UtcNow);
         }
 
         await ReplayPendingAsync(stoppingToken);
@@ -1225,6 +1229,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         finally
         {
             _activeItems.TryRemove(id, out _);
+            _progressClock.Stamp(DateTimeOffset.UtcNow);
 
             // Release the per-agent slot if we reserved one (the only state in
             // which it was incremented). Doing this here — rather than at the
