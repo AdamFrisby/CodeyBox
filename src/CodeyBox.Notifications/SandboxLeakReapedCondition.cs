@@ -22,13 +22,14 @@ public sealed class SandboxLeakReapedCondition : ICondition, IDisposable
     public Task<bool> EvaluateAsync(CancellationToken ct)
     {
         var current = _sink.DetectionCount;
-        if (current > _lastKnownCount)
+        var last = Interlocked.Read(ref _lastKnownCount);
+        if (current > last)
         {
-            _lastKnownCount = current;
+            Interlocked.Exchange(ref _lastKnownCount, current);
             return Task.FromResult(true);
         }
 
-        _lastKnownCount = current;
+        Interlocked.Exchange(ref _lastKnownCount, current);
         return Task.FromResult(false);
     }
 

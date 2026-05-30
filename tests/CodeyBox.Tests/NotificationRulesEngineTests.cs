@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
 using CodeyBox.Notifications;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -250,6 +251,102 @@ public sealed class NotificationRulesEngineTests
 
         Assert.Equal(1, provider.CallCount);
         Assert.Equal(NotificationSeverity.Critical, provider.Notifications.First().Severity);
+    }
+
+    // ── Recipients propagation ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task Recipients_PropagatedToNotification()
+    {
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Recipients test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["counting"], Recipients = ["alice@test", "bob@test"] },
+        };
+        var (provider, engine) = BuildEngineWithCounter(condition, builder, rules);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CallCount);
+        Assert.NotNull(provider.Notifications.First().Recipients);
+        Assert.Equal(2, provider.Notifications.First().Recipients!.Count);
+        Assert.Contains("alice@test", provider.Notifications.First().Recipients!);
+        Assert.Contains("bob@test", provider.Notifications.First().Recipients!);
+    }
+
+    // ── Disabled / zero-rules short-circuit ─────────────────────────────────
+
+    [Fact]
+    public async Task Disabled_ShortCircuitsWithoutEvaluating()
+    {
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Disabled test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["counting"] },
+        };
+        var opts = new NotificationsOptions { Enabled = false, Rules = rules };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        var provider = new CountingProvider();
+        var engine = new NotificationRulesEngine(
+            monitor, [condition], [builder], [provider],
+            NullLogger<NotificationRulesEngine>.Instance);
+
+        condition.Set(true);
+        // No prime — go straight to sweep so we don't prime an inactive engine.
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CallCount);
+    }
+
+    [Fact]
+    public async Task ZeroRules_ShortCircuitsWithoutEvaluating()
+    {
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Zero rules test");
+        var opts = new NotificationsOptions { Enabled = true, Rules = [] };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        var provider = new CountingProvider();
+        var engine = new NotificationRulesEngine(
+            monitor, [condition], [builder], [provider],
+            NullLogger<NotificationRulesEngine>.Instance);
+
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CallCount);
+    }
+
+    // ── Unknown-provider branch ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task UnknownProvider_LogsWarningAndContinues()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Unknown provider test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["nonexistent"] },
+        };
+        var provider = new CountingProvider("counting");
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition], [builder], [provider],
+            log);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CallCount);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("provider")
+            && e.Message.Contains("not registered"));
     }
 }
 

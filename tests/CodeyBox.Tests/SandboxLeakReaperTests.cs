@@ -34,6 +34,30 @@ public sealed class SandboxLeakReaperTests
         return new SandboxLeakReaper(provider, webhooks ?? new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
     }
 
+    private static SandboxLeakReaper BuildReaperWithSink(
+        FakeSandboxProvider provider,
+        LeakDetectionSink sink,
+        SandboxLeakOptions? opts = null,
+        IWebhookDispatcher? webhooks = null)
+    {
+        var sandboxOpts = opts ?? new SandboxLeakOptions
+        {
+            Enabled = true,
+            CheckInterval = TimeSpan.FromHours(1),
+            LeakAgeThreshold = TimeSpan.FromMinutes(30),
+            PreemptRetention = TimeSpan.FromHours(24),
+            AutoDispose = false,
+        };
+        return new SandboxLeakReaper(
+            provider,
+            webhooks ?? new NullWebhookDispatcher(),
+            () => sandboxOpts,
+            NullLogger<SandboxLeakReaper>.Instance,
+            store: null,
+            clock: null,
+            leakSink: sink);
+    }
+
     private static DateTimeOffset OldEnough(TimeSpan threshold) =>
         DateTimeOffset.UtcNow - threshold - TimeSpan.FromMinutes(1);
 
@@ -60,6 +84,32 @@ public sealed class SandboxLeakReaperTests
         await reaper.RunSweepAsync(CancellationToken.None);
 
         Assert.Empty(reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task LeakDetected_IncrementsLeakDetectionSink()
+    {
+        var sink = new LeakDetectionSink();
+        var provider = new FakeSandboxProvider();
+        var oldTimestamp = DateTimeOffset.UtcNow - TimeSpan.FromHours(2);
+        provider.AddSandbox(new ManagedSandboxInfo(
+            "codeybox-leaked-vm-00112233",
+            oldTimestamp,
+            DiskBytes: null,
+            IsTrackedActive: false));
+
+        var reaper = BuildReaperWithSink(provider, sink,
+            new SandboxLeakOptions
+            {
+                Enabled = true,
+                CheckInterval = TimeSpan.FromHours(1),
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                AutoDispose = false,
+            });
+
+        Assert.Equal(0, sink.DetectionCount);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        Assert.Equal(1, sink.DetectionCount);
     }
 
     [Fact]

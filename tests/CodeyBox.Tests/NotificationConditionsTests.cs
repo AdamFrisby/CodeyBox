@@ -44,6 +44,26 @@ public sealed class NotificationConditionsTests
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
 
+    [Fact]
+    public void OrchestratorProgressClock_IsMonotonic()
+    {
+        var clock = new OrchestratorProgressClock();
+        var t1 = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+        var t2 = new DateTimeOffset(2026, 1, 1, 11, 0, 0, TimeSpan.Zero); // earlier
+
+        clock.Stamp(t1);
+        Assert.Equal(t1, clock.LastTransition);
+
+        // Stamp an earlier timestamp — monotonic guard should keep t1.
+        clock.Stamp(t2);
+        Assert.Equal(t1, clock.LastTransition);
+
+        // Stamp a later timestamp — should advance.
+        var t3 = new DateTimeOffset(2026, 1, 1, 13, 0, 0, TimeSpan.Zero);
+        clock.Stamp(t3);
+        Assert.Equal(t3, clock.LastTransition);
+    }
+
     // ── SandboxLeakReapedCondition ─────────────────────────────────────────
 
     [Fact]

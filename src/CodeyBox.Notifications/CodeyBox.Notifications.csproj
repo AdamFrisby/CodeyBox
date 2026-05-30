@@ -21,7 +21,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- GHSA-9j88-vvj5-vhgr (moderate): affects BouncyCastle (transitive via MailKit/MimeKit 4.13.0).
+         CodeyBox.Notifications does not use BouncyCastle cryptographic primitives directly nor is
+         there a datagram/DTLS code path; the advisory concerns BC's TLS implementation which MailKit
+         does not route through. No patched MailKit version exists in the NuGet cache; revisit when
+         4.14+ ships with updated dependencies. -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-9j88-vvj5-vhgr" />
+    <!-- GHSA-g7hc-96xr-gvvx (moderate): same BouncyCastle transitive chain; see above. -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" />
   </ItemGroup>
 

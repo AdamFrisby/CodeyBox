@@ -145,6 +145,7 @@ public sealed class NotificationRulesEngine : BackgroundService
                 catch (Exception ex)
                 {
                     _log.LogError(ex, "Notifications: dispatch failed for condition {Condition}", rule.Condition);
+                    _state[rule.Condition] = (true, now);
                 }
             }
             else if (!currentlyActive && state.Active)
@@ -174,9 +175,19 @@ public sealed class NotificationRulesEngine : BackgroundService
 
         var opts = _optsMonitor.CurrentValue;
         IReadOnlyList<string>? recipients = null;
+        var matched = 0;
         foreach (var rule in opts.Rules)
         {
             if (!string.Equals(rule.Condition, conditionId, StringComparison.Ordinal)) continue;
+            matched++;
+            if (matched > 1)
+            {
+                _log.LogWarning(
+                    "Notifications: multiple rules map to condition '{Condition}' — " +
+                    "severity/recipients use last-match-wins, cooldown uses first-match. " +
+                    "Use exactly one rule per condition to avoid inconsistent behaviour.",
+                    conditionId);
+            }
             if (rule.Severity is not null
                 && Enum.TryParse<NotificationSeverity>(rule.Severity, ignoreCase: true, out var sev))
             {
@@ -216,7 +227,13 @@ public sealed class NotificationRulesEngine : BackgroundService
         var rule = _optsMonitor.CurrentValue.Rules
             .FirstOrDefault(r => string.Equals(r.Condition, conditionId, StringComparison.Ordinal));
         if (rule is null) return TimeSpan.Zero;
-        return TimeSpan.TryParse(rule.Cooldown, out var cd) ? cd : TimeSpan.Zero;
+        if (!TimeSpan.TryParse(rule.Cooldown, out var cd))
+        {
+            _log.LogWarning("Notifications: invalid Cooldown '{Cooldown}' for condition {Condition}; treating as zero",
+                rule.Cooldown, conditionId);
+            return TimeSpan.Zero;
+        }
+        return cd;
     }
 
     private IReadOnlyList<string> GetProviderNames(string conditionId)
@@ -230,9 +247,6 @@ public sealed class NotificationRulesEngine : BackgroundService
 
     private static string InferConditionId(INotificationBuilder builder)
     {
-        if (builder is IConditionAwareBuilder aware)
-            return aware.ConditionId;
-
         var name = builder.GetType().Name;
         if (name.EndsWith("NotificationBuilder", StringComparison.Ordinal))
             name = name[..^"NotificationBuilder".Length];

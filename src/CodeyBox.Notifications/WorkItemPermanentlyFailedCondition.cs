@@ -26,19 +26,20 @@ public sealed class WorkItemPermanentlyFailedCondition : ICondition, IDisposable
         var abandonedCount = await _store.CountByStateAsync(WorkItemState.AbandonedAfterRecoveryAttempts, ct);
         var total = failedCount + abandonedCount;
 
-        if (_lastKnownFailedCount < 0)
+        var last = Volatile.Read(ref _lastKnownFailedCount);
+        if (last < 0)
         {
-            _lastKnownFailedCount = total;
+            Volatile.Write(ref _lastKnownFailedCount, total);
             return false;
         }
 
-        if (total > _lastKnownFailedCount)
+        if (total > last)
         {
-            _lastKnownFailedCount = total;
+            Volatile.Write(ref _lastKnownFailedCount, total);
             return true;
         }
 
-        _lastKnownFailedCount = total;
+        Volatile.Write(ref _lastKnownFailedCount, total);
         return false;
     }
 

@@ -5,6 +5,8 @@ using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.Extensions.Logging;
 using MimeKit;
+using System.Net;
+using System.Text;
 
 namespace CodeyBox.Tests;
 
@@ -288,6 +290,131 @@ public sealed class EmailNotificationProviderTests
         Assert.True(result.IsCompletedSuccessfully);
         Assert.Equal("test", np.Name);
     }
+
+    [Fact]
+    public async Task IgnoreCertificateErrors_Development_LogsWarning()
+    {
+        var logger = new CapturingLogger<EmailNotificationProvider>();
+
+        var provider = new EmailNotificationProvider(
+            () => new EmailProviderOptions
+            {
+                Enabled = true,
+                Host = "smtp.test",
+                Port = 587,
+                From = "bot@test.local",
+                IgnoreCertificateErrors = true,
+            },
+            logger,
+            () => new CaptureSmtpClient(),
+            isDevelopment: true);
+
+        await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("IgnoreCertificateErrors")
+            && e.Message.Contains("disabled"));
+    }
+
+    [Fact]
+    public async Task IgnoreCertificateErrors_NotDevelopment_LogsErrorAndRefuses()
+    {
+        var logger = new CapturingLogger<EmailNotificationProvider>();
+
+        var provider = new EmailNotificationProvider(
+            () => new EmailProviderOptions
+            {
+                Enabled = true,
+                Host = "smtp.test",
+                Port = 587,
+                From = "bot@test.local",
+                IgnoreCertificateErrors = true,
+            },
+            logger,
+            () => new CaptureSmtpClient(),
+            isDevelopment: false);
+
+        await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error
+            && e.Message.Contains("IgnoreCertificateErrors")
+            && e.Message.Contains("non-Development"));
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_CalledWithCorrectCredentials()
+    {
+        var logger = new CapturingLogger<EmailNotificationProvider>();
+        string? capturedUser = null;
+        string? capturedPassword = null;
+
+        var client = new CaptureSmtpClient(authCaptor: (user, pwd) =>
+        {
+            capturedUser = user;
+            capturedPassword = pwd;
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_SMTP_TEST_PWD", "test-password");
+        try
+        {
+            var provider = new EmailNotificationProvider(
+                new EmailProviderOptions
+                {
+                    Enabled = true,
+                    Host = "smtp.test",
+                    Port = 587,
+                    From = "bot@test.local",
+                    User = "smtp-user",
+                    PasswordEnvVar = "CODEYBOX_SMTP_TEST_PWD",
+                },
+                logger,
+                () => client);
+
+            await provider.SendAsync(MakeNotification(), CancellationToken.None);
+
+            Assert.Equal("smtp-user", capturedUser);
+            Assert.Equal("test-password", capturedPassword);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_SMTP_TEST_PWD", null);
+        }
+    }
+
+    [Fact]
+    public async Task HeaderValues_StripControlCharacters()
+    {
+        var logger = new CapturingLogger<EmailNotificationProvider>();
+        var client = new CaptureSmtpClient();
+
+        var provider = new EmailNotificationProvider(
+            new EmailProviderOptions
+            {
+                Enabled = true,
+                Host = "smtp.test",
+                Port = 587,
+                From = "bot@test.local",
+            },
+            logger,
+            () => client);
+
+        var notification = new Notification
+        {
+            ConditionId = "test",
+            Title = "Test",
+            Severity = NotificationSeverity.Information,
+            Fields = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["field_with_crlf"] = "value\r\nwith\r\ncontrol\rchars",
+            },
+        };
+
+        await provider.SendAsync(notification, CancellationToken.None);
+
+        var snap = client.Snapshot;
+        Assert.NotNull(snap);
+        Assert.Equal("valuewithcontrolchars", snap!.Headers["X-CodeyBox-field_with_crlf"]);
+    }
 }
 
 /// <summary>
@@ -300,6 +427,7 @@ internal sealed class CaptureSmtpClient : SmtpClient
 {
     private readonly Action<MimeMessage>? _sendCaptor;
     private readonly Action<string, int, SecureSocketOptions>? _connectCaptor;
+    private readonly Action<string, string>? _authCaptor;
 
     public sealed record CapturedSnapshot(
         string Subject,
@@ -312,15 +440,31 @@ internal sealed class CaptureSmtpClient : SmtpClient
 
     public CaptureSmtpClient(
         Action<MimeMessage>? sendCaptor = null,
-        Action<string, int, SecureSocketOptions>? connectCaptor = null)
+        Action<string, int, SecureSocketOptions>? connectCaptor = null,
+        Action<string, string>? authCaptor = null)
     {
         _sendCaptor = sendCaptor;
         _connectCaptor = connectCaptor;
+        _authCaptor = authCaptor;
     }
 
     public override Task ConnectAsync(string host, int port, SecureSocketOptions options, CancellationToken cancellationToken = default)
     {
         _connectCaptor?.Invoke(host, port, options);
+        return Task.CompletedTask;
+    }
+
+    public override Task AuthenticateAsync(Encoding encoding, ICredentials credentials, CancellationToken cancellationToken = default)
+    {
+        if (credentials is NetworkCredential nc)
+            _authCaptor?.Invoke(nc.UserName, nc.Password);
+        return Task.CompletedTask;
+    }
+
+    public override Task? AuthenticateAsync(SaslMechanism mechanism, CancellationToken cancellationToken = default)
+    {
+        if (mechanism is SaslMechanismPlain plain)
+            _authCaptor?.Invoke(plain.Credentials.UserName, plain.Credentials.Password);
         return Task.CompletedTask;
     }
 

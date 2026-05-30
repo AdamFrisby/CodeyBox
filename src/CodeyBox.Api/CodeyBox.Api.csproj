@@ -39,6 +39,8 @@
   <ItemGroup>
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g94r-2vxg-569j" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
+    <!-- GHSA-9j88-vvj5-vhgr / GHSA-g7hc-96xr-gvvx: BouncyCastle transitive via MailKit/MimeKit (Notifications project ref).
+         See CodeyBox.Notifications.csproj for rationale. -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-9j88-vvj5-vhgr" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" />
   </ItemGroup>

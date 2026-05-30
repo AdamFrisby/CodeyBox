@@ -13,32 +13,55 @@ namespace CodeyBox.Notifications;
 /// Unconfigured providers are safe no-ops: if <c>Enabled</c> is false,
 /// <see cref="SendAsync"/> returns immediately.
 /// </summary>
-public sealed class EmailNotificationProvider : INotificationProvider, IDisposable
+public sealed class EmailNotificationProvider : INotificationProvider
 {
     private const int SmtpsPort = 465;
 
-    private readonly EmailProviderOptions _opts;
+    private readonly Func<EmailProviderOptions> _optsAccessor;
     private readonly ILogger<EmailNotificationProvider> _log;
     private readonly Func<SmtpClient> _smtpClientFactory;
+    private readonly bool _isDevelopment;
 
     public string Name => "email";
 
     public EmailNotificationProvider(
         EmailProviderOptions opts,
         ILogger<EmailNotificationProvider> log,
-        Func<SmtpClient>? smtpClientFactory = null)
+        Func<SmtpClient>? smtpClientFactory = null,
+        bool isDevelopment = false)
     {
-        _opts = opts;
+        _optsAccessor = () => opts;
         _log = log;
         _smtpClientFactory = smtpClientFactory ?? (() => new SmtpClient());
+        _isDevelopment = isDevelopment;
+    }
+
+    public EmailNotificationProvider(
+        Func<EmailProviderOptions> optsAccessor,
+        ILogger<EmailNotificationProvider> log,
+        Func<SmtpClient>? smtpClientFactory = null,
+        bool isDevelopment = false)
+    {
+        _optsAccessor = optsAccessor;
+        _log = log;
+        _smtpClientFactory = smtpClientFactory ?? (() => new SmtpClient());
+        _isDevelopment = isDevelopment;
+    }
+
+    private static string SanitizeHeaderValue(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value ?? string.Empty;
+        return value.Replace("\r", "").Replace("\n", "").Replace("\0", "");
     }
 
     public async Task SendAsync(Notification notification, CancellationToken ct)
     {
-        if (!_opts.Enabled)
+        var opts = _optsAccessor();
+        if (!opts.Enabled)
             return;
 
-        if (string.IsNullOrWhiteSpace(_opts.Host))
+        if (string.IsNullOrWhiteSpace(opts.Host))
         {
             _log.LogWarning("EmailNotificationProvider: Host is not configured; skipping notification {Condition}",
                 notification.ConditionId);
@@ -46,17 +69,17 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
         }
 
         string? password = null;
-        if (!string.IsNullOrEmpty(_opts.PasswordEnvVar))
+        if (!string.IsNullOrEmpty(opts.PasswordEnvVar))
         {
-            password = Environment.GetEnvironmentVariable(_opts.PasswordEnvVar);
+            password = Environment.GetEnvironmentVariable(opts.PasswordEnvVar);
             if (password is null)
                 _log.LogWarning(
                     "EmailNotificationProvider: PasswordEnvVar '{EnvVar}' is configured but not set in environment",
-                    _opts.PasswordEnvVar);
+                    opts.PasswordEnvVar);
         }
 
         using var message = new MimeMessage();
-        message.From.Add(new MailboxAddress("CodeyBox", _opts.From));
+        message.From.Add(new MailboxAddress("CodeyBox", opts.From));
 
         var recipients = notification.Recipients;
         if (recipients is { Count: > 0 })
@@ -66,7 +89,7 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
         }
         else
         {
-            message.To.Add(new MailboxAddress("Operator", _opts.From));
+            message.To.Add(new MailboxAddress("Operator", opts.From));
         }
         message.Subject = $"[CodeyBox/{notification.Severity}] {notification.Title}";
 
@@ -78,30 +101,45 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
         };
         message.Body = body;
 
-        // Add structured fields as X- headers for threading/filtering.
         message.Headers.Add("X-CodeyBox-Condition", notification.ConditionId);
         message.Headers.Add("X-CodeyBox-Severity", notification.Severity.ToString());
         if (notification.Fields is not null)
         {
             foreach (var (key, value) in notification.Fields)
-                message.Headers.Add($"X-CodeyBox-{key.Replace(' ', '-')}", value);
+            {
+                var safeKey = SanitizeHeaderValue(key).Replace(' ', '-');
+                var safeValue = SanitizeHeaderValue(value);
+                message.Headers.Add($"X-CodeyBox-{safeKey}", safeValue);
+            }
         }
 
         using var client = _smtpClientFactory();
 
         try
         {
-            if (_opts.IgnoreCertificateErrors)
-                client.ServerCertificateValidationCallback = (_, _, _, _) => true;
+            if (opts.IgnoreCertificateErrors)
+            {
+                if (!_isDevelopment)
+                {
+                    _log.LogError(
+                        "EmailNotificationProvider: IgnoreCertificateErrors is enabled in a non-Development environment. " +
+                        "Refusing to disable TLS certificate validation. The notification will be sent with normal TLS verification.");
+                }
+                else
+                {
+                    _log.LogWarning("EmailNotificationProvider: IgnoreCertificateErrors is enabled — TLS certificate validation is disabled");
+                    client.ServerCertificateValidationCallback = (_, _, _, _) => true;
+                }
+            }
 
-            var secureOption = _opts.Port == SmtpsPort
+            var secureOption = opts.Port == SmtpsPort
                 ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
 
-            await client.ConnectAsync(_opts.Host, _opts.Port, secureOption, ct);
+            await client.ConnectAsync(opts.Host, opts.Port, secureOption, ct);
 
-            if (!string.IsNullOrEmpty(_opts.User) && password is not null)
-                await client.AuthenticateAsync(_opts.User, password, ct);
+            if (!string.IsNullOrEmpty(opts.User) && password is not null)
+                await client.AuthenticateAsync(opts.User, password, ct);
 
             await client.SendAsync(message, ct);
             await client.DisconnectAsync(true, ct);
@@ -118,9 +156,5 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
             _log.LogError(ex, "EmailNotificationProvider: failed to send notification {Condition}",
                 notification.ConditionId);
         }
-    }
-
-    public void Dispose()
-    {
     }
 }
