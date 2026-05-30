@@ -55,6 +55,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentBurnEstimator _burnEstimator;
     private readonly IAgentBudgetConfigReloadable? _budgetReloader;
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
@@ -71,6 +72,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastBudgets = "";
     private string _lastDefaults = "";
     private string _lastIncrementalRebase = "";
+    private string _lastSanitizer = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -81,6 +83,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentBurnEstimator burnEstimator,
         ILogger<AgentConfigHotReload> log,
         AgentDefaultsSnapshot? defaults = null,
+        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null,
         AgentCostCalculator? costCalculator = null,
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null,
@@ -99,6 +102,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _burnEstimator = burnEstimator;
         _budgetReloader = budgetReloader;
         _defaults = defaults;
+        _sanitizerConfig = sanitizerConfig;
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
@@ -118,11 +122,12 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastBudgets = SerializeBudgets(initial.AgentBudgets);
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
         _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
+        _lastSanitizer = SerializeSanitizer(initial.ClaudeThinkingBlockSanitizer);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
-            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen}",
-            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length);
+            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen}",
+            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length, _lastSanitizer.Length);
         return Task.CompletedTask;
     }
 
@@ -149,6 +154,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyBudgetsIfChanged(opts);
             ApplyDefaultsIfChanged(opts);
             ApplyIncrementalRebaseIfChanged(opts);
+            ApplySanitizerIfChanged(opts);
         }
     }
 
@@ -332,6 +338,31 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    private void ApplySanitizerIfChanged(CodeyBoxOptions opts)
+    {
+        if (_sanitizerConfig is null) return;
+
+        var next = SerializeSanitizer(opts.ClaudeThinkingBlockSanitizer);
+        if (string.Equals(_lastSanitizer, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastSanitizer;
+        try
+        {
+            _sanitizerConfig.Enabled = opts.ClaudeThinkingBlockSanitizer.Enabled;
+            _lastSanitizer = next;
+            AuditLog.ConfigReloaded("ClaudeThinkingBlockSanitizer", prev, next);
+            _log.LogInformation("Hot-reloaded ClaudeThinkingBlockSanitizer: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of ClaudeThinkingBlockSanitizer rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private static string SerializeConcurrency(AgentConcurrencyOptions opts) =>
         JsonSerializer.Serialize(
             new
@@ -439,5 +470,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             JsonOpts);
 
     private static string SerializeIncrementalRebase(IncrementalRebaseOptions opts) =>
+        JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
+
+    private static string SerializeSanitizer(ClaudeThinkingBlockSanitizerOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
 }
