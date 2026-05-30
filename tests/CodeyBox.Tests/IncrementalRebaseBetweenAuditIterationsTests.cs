@@ -202,9 +202,12 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         // Initial work call: do nothing (incremental rebase hasn't run yet —
         // we need the plan EMPTY when it runs).
         // Rework call: by now the incremental rebase has failed-and-been-
-        // swallowed; enqueue the resolver entry the merge-time pickup-rebase
-        // will need. Also capture the rework dispatch's HEAD ancestry to
-        // confirm the un-rebased branch reached the rework agent.
+        // swallowed; enqueue the resolver entries the merge-time pickup-rebase
+        // will need. Two entries because the work branch has two commits
+        // (initial work + rework), each touching a.txt — git rebase replays
+        // them in order and each commit's conflict triggers a fresh agentic
+        // resolver invocation. Also capture the rework dispatch's HEAD
+        // ancestry to confirm the un-rebased branch reached the rework agent.
         tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
         {
             if (!reworkObservation.InitialWorkSeen)
@@ -215,6 +218,11 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
             if (reworkObservation.SnapshotTaken) return;
             reworkObservation.SnapshotTaken = true;
             await reworkObservation.CaptureAsync(sandbox, workingDirectory, ct);
+            tp.Agent.ConflictResolutionPlan.Enqueue(_ =>
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["a.txt"] = "merged\n",
+                });
             tp.Agent.ConflictResolutionPlan.Enqueue(_ =>
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {

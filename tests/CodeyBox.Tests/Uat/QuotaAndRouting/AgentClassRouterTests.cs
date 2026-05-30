@@ -172,7 +172,7 @@ public sealed class AgentClassRouterTests : IDisposable
 
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
-        Assert.Contains("below 10", decision.Reason);
+        Assert.Contains("below the effective quota floor", decision.Reason);
     }
 
     [Fact]

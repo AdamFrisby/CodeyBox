@@ -405,7 +405,7 @@ public sealed class AgentClassRouter
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, ct);
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, nowUtc, ct);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -494,7 +494,8 @@ public sealed class AgentClassRouter
             }
             else
             {
-                reason = $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold";
+                reason = $"all members of class '{classId}' are below the effective quota floor " +
+                         $"(ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%)";
                 suggested = _opts.QuotaRecheckInterval;
             }
             AuditLog.QuotaRouterWaiting(classId, item.Id, suggested);
@@ -773,7 +774,10 @@ public sealed class AgentClassRouter
             quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
             // Skip unknown (probe failed / no data) and members above the
             // threshold (would have been chosen by the router and so don't
-            // need to gate park-time).
+            // need to gate park-time). Uses the fixed MinQuotaPct fallback
+            // here — this path computes retry-scheduling park time, not the
+            // dispatch gate, and a stable threshold keeps the retry hint
+            // independent of where in the ramp the member happens to be.
             if (quota.AvailablePct < 0) continue;
             if (quota.AvailablePct >= _opts.MinQuotaPct) continue;
             if (quota.ResetAt is not { } resetAt) continue;
@@ -784,16 +788,33 @@ public sealed class AgentClassRouter
         return earliest;
     }
 
-    private async Task<QuotaGateDecision> EvaluateGateAsync(AgentMembership member, ProjectId projectId, double availablePct, CancellationToken ct)
+    private async Task<QuotaGateDecision> EvaluateGateAsync(
+        AgentMembership member,
+        ProjectId projectId,
+        double availablePct,
+        DateTimeOffset? resetAt,
+        DateTimeOffset nowUtc,
+        CancellationToken ct)
     {
-        if (availablePct >= _opts.MinQuotaPct)
+        // The time-based ramp is only meaningful for Subscription members:
+        // their AvailablePct is driven by the agent's quota window, and
+        // <paramref name="resetAt"/> is that window's reset. PayPerApi has
+        // no agent quota window — its AvailablePct is either 100% (probe)
+        // or the operator's local-budget MIN, and the budget defines its
+        // own reset cycle. Falling back to the fixed MinQuotaPct keeps the
+        // operator's spend cap honest regardless of where in the agent
+        // window we happen to be.
+        var floor = member.Billing == AgentBilling.Subscription
+            ? ComputeEffectiveFloorPct(member.Agent, resetAt, nowUtc)
+            : _opts.MinQuotaPct;
+        if (availablePct >= floor)
         {
             var rateAware = await EvaluateRateAwareGateAsync(member, availablePct, ct);
             return rateAware ?? new QuotaGateDecision(true, "quota available");
         }
 
         if (availablePct >= 0)
-            return new QuotaGateDecision(false, "quota exhausted");
+            return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)");
 
         return _opts.UnknownPolicy switch
         {
@@ -801,6 +822,54 @@ public sealed class AgentClassRouter
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    /// <summary>
+    /// Returns the effective quota floor for <paramref name="agent"/> at
+    /// <paramref name="nowUtc"/> given the soonest known reset
+    /// <paramref name="resetAt"/>. Replaces the fixed
+    /// <see cref="QuotaRouterOptions.MinQuotaPct"/> with a ramp from
+    /// <see cref="QuotaRouterOptions.StartFloorPct"/> (just after reset) down to
+    /// <see cref="QuotaRouterOptions.EndFloorPct"/> (as reset approaches), so
+    /// the gate preserves headroom for the operator's interactive session
+    /// early in the window and drains the surplus before the weekly reset
+    /// at the end. Falls back to <see cref="QuotaRouterOptions.MinQuotaPct"/>
+    /// when no <paramref name="resetAt"/> or no ramp window is known for
+    /// the agent — the original fixed-floor behaviour.
+    /// <para>
+    /// <paramref name="resetAt"/> is the binding-window reset surfaced by
+    /// the probe (i.e. the same one the gate already keys on); the helper
+    /// trusts the probe to have aggregated multi-window snapshots before
+    /// handing one up. <c>fractionElapsed</c> is clamped to [0, 1] so a
+    /// stale reset in the past or a reset further in the future than the
+    /// configured window cannot push the floor past the endpoints.
+    /// </para>
+    /// </summary>
+    internal double ComputeEffectiveFloorPct(AgentKind agent, DateTimeOffset? resetAt, DateTimeOffset nowUtc)
+    {
+        if (resetAt is not { } reset) return _opts.MinQuotaPct;
+        var rampWindow = GetRampWindow(agent);
+        if (rampWindow <= TimeSpan.Zero) return _opts.MinQuotaPct;
+
+        var untilReset = reset - nowUtc;
+        var fractionElapsed = 1.0 - untilReset.TotalSeconds / rampWindow.TotalSeconds;
+        if (double.IsNaN(fractionElapsed) || double.IsInfinity(fractionElapsed))
+            return _opts.MinQuotaPct;
+        fractionElapsed = Math.Clamp(fractionElapsed, 0.0, 1.0);
+
+        var floor = _opts.StartFloorPct + (_opts.EndFloorPct - _opts.StartFloorPct) * fractionElapsed;
+        var lo = Math.Min(_opts.StartFloorPct, _opts.EndFloorPct);
+        var hi = Math.Max(_opts.StartFloorPct, _opts.EndFloorPct);
+        return Math.Clamp(floor, lo, hi);
+    }
+
+    private TimeSpan GetRampWindow(AgentKind agent)
+    {
+        if (_opts.RampWindowByAgent is { } overrides
+            && overrides.TryGetValue(agent.Value, out var perAgent)
+            && perAgent > TimeSpan.Zero)
+            return perAgent;
+        return _opts.RampWindow;
     }
 
     /// <summary>
@@ -1196,11 +1265,52 @@ public sealed record AgentRoutingDecision
 public sealed class QuotaRouterOptions
 {
     /// <summary>
-    /// Minimum percentage of quota remaining for a member to be considered
-    /// available. Members below this threshold are skipped in favour of the
-    /// next class member. Default 10.
+    /// Fallback floor used when the time-based ramp can't be computed — the
+    /// probe didn't surface a <c>ResetAt</c>, or no <see cref="RampWindow"/>
+    /// is configured for the member's agent. Members below this threshold
+    /// are skipped in favour of the next class member. Default 10.
+    /// <para>
+    /// When the ramp IS computable, <see cref="StartFloorPct"/> /
+    /// <see cref="EndFloorPct"/> drive the effective floor instead — see
+    /// <see cref="AgentClassRouter.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>.
+    /// </para>
     /// </summary>
     public double MinQuotaPct { get; set; } = 10.0;
+
+    /// <summary>
+    /// Early-window floor for the time-based ramp: the effective minimum
+    /// available-quota percentage just after the quota window resets. Higher
+    /// than <see cref="EndFloorPct"/> so the operator's own interactive
+    /// session and monitoring keep headroom on a freshly-reset week. Default 25.
+    /// </summary>
+    public double StartFloorPct { get; set; } = 25.0;
+
+    /// <summary>
+    /// Late-window floor for the time-based ramp: the effective minimum
+    /// available-quota percentage as the quota window approaches reset. Low
+    /// enough to drain otherwise-stranded quota right before the use-it-or-
+    /// lose-it reset. Default 3.
+    /// </summary>
+    public double EndFloorPct { get; set; } = 3.0;
+
+    /// <summary>
+    /// Default length of the quota window used to compute the time-based
+    /// floor ramp when the probe surfaces a <c>ResetAt</c>. The fraction-
+    /// elapsed is <c>1 - timeUntilReset / RampWindow</c>. Default 7 days
+    /// (claude/codex weekly cap). Override per agent via
+    /// <see cref="RampWindowByAgent"/> when an agent's binding window differs.
+    /// </summary>
+    public TimeSpan RampWindow { get; set; } = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Per-agent override for the ramp window length, keyed by
+    /// <see cref="AgentKind.Value"/>. When an agent is not present here the
+    /// global <see cref="RampWindow"/> is used. Lets the operator wire a
+    /// 7-day window for one agent and a 24h window for another without
+    /// touching code.
+    /// </summary>
+    public Dictionary<string, TimeSpan> RampWindowByAgent { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// How long to wait before re-probing when all subscription-billed members

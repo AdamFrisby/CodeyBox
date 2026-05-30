@@ -10,6 +10,29 @@ The router checks all three before dispatching a subscription-billed class
 member, taking `MIN(real probe AvailablePct, local budget AvailablePct)`.
 Pay-per-API members are not quota-gated.
 
+## Time-Based Floor Ramp
+
+The gate's minimum-available-quota floor is a linear ramp from
+`StartFloorPct` (just after a window reset) down to `EndFloorPct` (as the
+window approaches reset), keyed off the probe's `ResetAt` and the
+configured `RampWindow`. Early in a weekly cycle the floor is high (default
+25%) so CodeyBox doesn't burn the shared subscription down to a sliver and
+starve the operator's own Claude Code session or monitoring. Late in the
+cycle the floor drops (default 3%) so otherwise-stranded quota gets drained
+before the use-it-or-lose-it reset rather than sitting unused.
+
+`fractionElapsed = 1 - timeUntilReset / RampWindow`, clamped to `[0, 1]`, and
+`effectiveFloorPct = lerp(StartFloorPct, EndFloorPct, fractionElapsed)`.
+Per-agent overrides go in `RampWindowByAgentSeconds`; agents missing from
+that map use the default `RampWindowSeconds`. The ramp applies to
+Subscription members only — PayPerApi members fall back to the fixed
+`MinQuotaPct` because their `AvailablePct` is driven by the operator's
+local budget, not an agent quota window. Unknown windows (no `ResetAt`)
+also fall back to `MinQuotaPct`.
+
+All knobs are hot-reloadable via the `CodeyBox:QuotaRouter` config block —
+edits to `~/codeybox-extra.json` take effect on the next gate decision.
+
 ## Probe Model
 
 `AgentQuotaSnapshot.AvailablePct` is the overall account quota. `PerModel`
