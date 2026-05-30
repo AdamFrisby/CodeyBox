@@ -59,6 +59,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
+    private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -73,6 +74,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastDefaults = "";
     private string _lastIncrementalRebase = "";
     private string _lastSanitizer = "";
+    private string _lastQuotaRouter = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -87,7 +89,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentCostCalculator? costCalculator = null,
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null,
-        IncrementalRebaseSnapshot? incrementalRebase = null)
+        IncrementalRebaseSnapshot? incrementalRebase = null,
+        QuotaRouterOptions? quotaRouterOptions = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -106,6 +109,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
+        _quotaRouterOptions = quotaRouterOptions;
         _log = log;
     }
 
@@ -123,6 +127,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
         _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
         _lastSanitizer = SerializeSanitizer(initial.ClaudeThinkingBlockSanitizer);
+        _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
@@ -155,6 +160,56 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyDefaultsIfChanged(opts);
             ApplyIncrementalRebaseIfChanged(opts);
             ApplySanitizerIfChanged(opts);
+            ApplyQuotaRouterIfChanged(opts);
+        }
+    }
+
+    private void ApplyQuotaRouterIfChanged(CodeyBoxOptions opts)
+    {
+        if (_quotaRouterOptions is null) return;
+
+        var next = SerializeQuotaRouter(opts.QuotaRouter);
+        if (string.Equals(_lastQuotaRouter, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastQuotaRouter;
+        try
+        {
+            // Mutate the shared singleton in place. The router holds the same
+            // QuotaRouterOptions reference and reads its properties on every
+            // gate decision, so the new values take effect on the next pickup
+            // attempt without a process restart. Probe-side knobs (cache TTL
+            // bound at construction) are NOT reloaded here — they have their
+            // own IOptionsMonitor-driven resilience-provider delegate.
+            var src = opts.QuotaRouter;
+            _quotaRouterOptions.MinQuotaPct = src.MinQuotaPct;
+            _quotaRouterOptions.StartFloorPct = src.StartFloorPct;
+            _quotaRouterOptions.EndFloorPct = src.EndFloorPct;
+            if (src.RampWindowSeconds > 0)
+                _quotaRouterOptions.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
+            var overrides = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in src.RampWindowByAgentSeconds)
+            {
+                if (kv.Value <= 0) continue;
+                overrides[kv.Key] = TimeSpan.FromSeconds(kv.Value);
+            }
+            _quotaRouterOptions.RampWindowByAgent = overrides;
+            _quotaRouterOptions.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
+            _quotaRouterOptions.UnknownPolicy = src.UnknownPolicy;
+            _quotaRouterOptions.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
+            _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
+            _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
+
+            _lastQuotaRouter = next;
+            AuditLog.ConfigReloaded("QuotaRouter", prev, next);
+            _log.LogInformation("Hot-reloaded QuotaRouter: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of QuotaRouter rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
         }
     }
 
@@ -474,4 +529,23 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private static string SerializeSanitizer(ClaudeThinkingBlockSanitizerOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
+
+    private static string SerializeQuotaRouter(QuotaRouterConfig opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.MinQuotaPct,
+                opts.StartFloorPct,
+                opts.EndFloorPct,
+                opts.RampWindowSeconds,
+                RampWindowByAgentSeconds = opts.RampWindowByAgentSeconds
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value),
+                opts.QuotaRecheckIntervalSeconds,
+                UnknownPolicy = opts.UnknownPolicy.ToString(),
+                opts.ObservedFailureWindowMinutes,
+                opts.ObservedFailureRetentionMinutes,
+                opts.CapRetryIntervalSeconds,
+            },
+            JsonOpts);
 }

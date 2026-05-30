@@ -699,6 +699,10 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
     return new QuotaRouterOptions
     {
         MinQuotaPct = qr.MinQuotaPct,
+        StartFloorPct = qr.StartFloorPct,
+        EndFloorPct = qr.EndFloorPct,
+        RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
+        RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
         QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
         QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
         UnknownPolicy = qr.UnknownPolicy,
@@ -706,6 +710,18 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
     };
+
+    static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)
+    {
+        var dst = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (kv.Value <= 0) continue;
+            dst[kv.Key] = TimeSpan.FromSeconds(kv.Value);
+        }
+        return dst;
+    }
 });
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
@@ -1699,7 +1715,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
-        incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>());
+        incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+        quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2780,8 +2797,40 @@ namespace CodeyBox.Api
     /// <summary>Quota router tuning. Bound from CodeyBox:QuotaRouter.</summary>
     public sealed class QuotaRouterConfig
     {
-        /// <summary>Minimum available-quota percentage to consider a member viable. Default 10.</summary>
+        /// <summary>
+        /// Fallback floor used when the ramp can't be computed (probe didn't
+        /// surface a ResetAt, or no ramp window is configured for the agent).
+        /// Default 10. See <see cref="StartFloorPct"/> /
+        /// <see cref="EndFloorPct"/> / <see cref="RampWindowSeconds"/> for the
+        /// ramped floor that supersedes this when the window IS known.
+        /// </summary>
         public double MinQuotaPct { get; set; } = 10.0;
+        /// <summary>
+        /// Early-window quota floor — the effective minimum just after the
+        /// quota window resets. Reserves headroom for the operator's
+        /// interactive session and monitoring on a freshly-reset week.
+        /// Default 25.
+        /// </summary>
+        public double StartFloorPct { get; set; } = 25.0;
+        /// <summary>
+        /// Late-window quota floor — the effective minimum as the quota
+        /// window approaches reset. Drains otherwise-stranded quota right
+        /// before the use-it-or-lose-it reset. Default 3.
+        /// </summary>
+        public double EndFloorPct { get; set; } = 3.0;
+        /// <summary>
+        /// Length of the binding quota window the ramp is computed against,
+        /// in seconds. Default 604800 (7 days, claude/codex weekly cap).
+        /// </summary>
+        public int RampWindowSeconds { get; set; } = 7 * 24 * 60 * 60;
+        /// <summary>
+        /// Optional per-agent ramp window length, keyed by agent kind value.
+        /// Lets the operator pin a 24h window for one agent and a 7-day
+        /// window for another without touching code. Entries with
+        /// non-positive seconds are ignored.
+        /// </summary>
+        public Dictionary<string, int> RampWindowByAgentSeconds { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
