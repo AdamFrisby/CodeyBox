@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -9,8 +8,16 @@ namespace CodeyBox.Agents.Claude;
 /// Fetches the list of model identifiers available to a Claude credential by
 /// calling <c>GET https://api.anthropic.com/v1/models</c>.
 ///
-/// <para>Supports both OAuth tokens (sent as <c>Authorization: Bearer</c>)
-/// and raw API keys (sent as <c>x-api-key</c>), matching <see cref="ClaudeSmokeProbe"/>.</para>
+/// <para>Only the raw-API path (<c>x-api-key</c> with <c>ANTHROPIC_API_KEY</c>)
+/// is supported. A subscription OAuth token (<c>CLAUDE_CODE_OAUTH_TOKEN</c>)
+/// is <em>not</em> usable here: the official Claude Code client does not call
+/// <c>/v1/models</c>, so an OAuth Bearer against that endpoint is raw-API
+/// access outside the legitimate client shape — the same account-termination
+/// risk that motivated <see cref="ClaudeSmokeProbe"/>'s OAuth-path rework
+/// (commit 8abd0d9). When only OAuth is configured, the probe returns a
+/// failure result and the
+/// <see cref="CodeyBox.Api.AgentClassConfigValidator"/> logs once and
+/// skips ModelId validation for the Claude agent.</para>
 ///
 /// <para>Never logs the Authorization header or credential values.</para>
 /// </summary>
@@ -18,6 +25,7 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
 {
     internal const string ModelsEndpoint = "https://api.anthropic.com/v1/models";
     internal const string AnthropicVersion = "2023-06-01";
+    internal const string OAuthDeclinedReason = "subscription OAuth not supported for /v1/models (account-safety); configure ANTHROPIC_API_KEY to enable ModelId validation";
     private const int MaxResponseChars = 256 * 1024;
 
     private readonly IHttpClientFactory _httpClientFactory;
@@ -39,17 +47,18 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
     public async Task<AgentModelListResult> GetModelListAsync(CancellationToken ct)
     {
         var (oauth, apiKey) = _credentialsProvider();
-        if (string.IsNullOrEmpty(oauth) && string.IsNullOrEmpty(apiKey))
-            return AgentModelListResult.Failed("no credential configured");
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            return string.IsNullOrEmpty(oauth)
+                ? AgentModelListResult.Failed("no credential configured")
+                : AgentModelListResult.Failed(OAuthDeclinedReason);
+        }
 
         try
         {
             var client = _httpClientFactory.CreateClient("agent-modellist");
             using var request = new HttpRequestMessage(HttpMethod.Get, ModelsEndpoint);
-            if (!string.IsNullOrEmpty(oauth))
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", oauth);
-            else
-                request.Headers.Add("x-api-key", apiKey!);
+            request.Headers.Add("x-api-key", apiKey);
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
             using var response = await client.SendAsync(request, ct);

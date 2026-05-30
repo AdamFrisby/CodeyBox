@@ -74,6 +74,48 @@ public sealed class ClaudeSmokeProbeTests
     }
 
     [Fact]
+    public async Task GuardAgainstRawMessagesWithOAuthBearer_OverAllOAuthShapes()
+    {
+        // Account-safety regression guard: under no OAuth credential shape may the
+        // smoke probe ever construct a POST https://api.anthropic.com/v1/messages
+        // request with an Authorization: Bearer header — that pattern is what risks
+        // Anthropic terminating the subscription account. The fix routes OAuth via
+        // /api/oauth/usage instead; this test re-runs every OAuth-bearing shape we
+        // recognise so a future refactor that re-introduces the misuse fails here.
+        var oauthOnly = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-only" },
+            new Dictionary<string, string>());
+        var oauthPlusApiKey = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-pref",
+                ["ANTHROPIC_API_KEY"] = "fallback-key",
+            },
+            new Dictionary<string, string>());
+
+        foreach (var cred in new[] { oauthOnly, oauthPlusApiKey })
+        {
+            HttpRequestMessage? captured = null;
+            var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req);
+            await BuildProbe(handler).SmokeTestAsync(cred, CancellationToken.None);
+
+            Assert.NotNull(captured);
+            var isMessagesEndpoint = string.Equals(
+                captured!.RequestUri?.AbsoluteUri,
+                ClaudeSmokeProbe.MessagesEndpoint,
+                StringComparison.Ordinal);
+            var isBearer = string.Equals(
+                captured.Headers.Authorization?.Scheme,
+                "Bearer",
+                StringComparison.OrdinalIgnoreCase);
+
+            // The forbidden combination is BOTH at once.
+            Assert.False(isMessagesEndpoint && isBearer,
+                $"Smoke probe constructed POST {ClaudeSmokeProbe.MessagesEndpoint} with a Bearer Authorization header — this is exactly the subscription-OAuth misuse that risks Anthropic terminating the account. See ClaudeSmokeProbe.cs.");
+        }
+    }
+
+    [Fact]
     public async Task OAuthPresent_UsesUsageEndpoint_NotRawMessages_EvenWithApiKey()
     {
         // When an OAuth subscription token is present it takes precedence: validate

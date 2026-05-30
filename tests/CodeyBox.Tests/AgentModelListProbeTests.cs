@@ -17,13 +17,17 @@ public sealed class AgentModelListProbeTests
     // ── Claude ───────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Claude_CallsModelsEndpoint_WithBearer_WhenOAuth()
+    public async Task Claude_OAuthOnly_DeclinesWithoutHttpCall()
     {
-        Uri? capturedUri = null;
-        string? capturedAuth = null;
+        // A subscription OAuth token must NOT be used for a raw /v1/models call:
+        // the official Claude Code client does not hit that endpoint, so an
+        // OAuth Bearer there is raw-API access outside the legitimate client
+        // shape (same account-termination risk as /v1/messages). The probe
+        // returns a failure result and makes no HTTP call.
+        int calls = 0;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK,
-            """{"data":[{"id":"claude-opus-4-7"},{"id":"claude-haiku-4-5"}]}""",
-            req => { capturedUri = req.RequestUri; capturedAuth = req.Headers.Authorization?.ToString(); });
+            """{"data":[{"id":"claude-opus-4-7"}]}""",
+            _ => calls++);
 
         var probe = new ClaudeModelListProbe(
             new SmokeFakeHttpClientFactory("agent-modellist", handler),
@@ -31,8 +35,38 @@ public sealed class AgentModelListProbeTests
             NullLogger<ClaudeModelListProbe>.Instance);
 
         var result = await probe.GetModelListAsync(CancellationToken.None);
+        Assert.Equal(ClaudeModelListProbe.OAuthDeclinedReason, result.FailureReason);
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
+    public async Task Claude_OAuthAndApiKey_UsesApiKeyPath_NotOAuth()
+    {
+        // When both are present the API-key path wins — never an OAuth Bearer
+        // against /v1/models. Also asserts end-to-end parsing of the /v1/models
+        // happy-path response into ModelIds (covers ParseResponse's data[].id
+        // extraction loop alongside the credential-selection invariant).
+        Uri? capturedUri = null;
+        string? capturedAuth = null;
+        string? xApiKey = null;
+        var handler = new SmokeCapturingHandler(HttpStatusCode.OK,
+            """{"data":[{"id":"claude-opus-4-7"},{"id":"claude-haiku-4-5"}]}""",
+            req =>
+            {
+                capturedUri = req.RequestUri;
+                capturedAuth = req.Headers.Authorization?.ToString();
+                xApiKey = req.Headers.TryGetValues("x-api-key", out var v) ? string.Join("", v) : null;
+            });
+
+        var probe = new ClaudeModelListProbe(
+            new SmokeFakeHttpClientFactory("agent-modellist", handler),
+            () => ("oauth-tok", "ak-456"),
+            NullLogger<ClaudeModelListProbe>.Instance);
+
+        var result = await probe.GetModelListAsync(CancellationToken.None);
         Assert.Equal(new Uri(ClaudeModelListProbe.ModelsEndpoint), capturedUri);
-        Assert.Equal("Bearer oauth-tok", capturedAuth);
+        Assert.Null(capturedAuth);
+        Assert.Equal("ak-456", xApiKey);
         Assert.Null(result.FailureReason);
         Assert.Equal(new[] { "claude-opus-4-7", "claude-haiku-4-5" }, result.ModelIds);
     }
@@ -59,7 +93,7 @@ public sealed class AgentModelListProbeTests
         var handler = new SmokeCapturingHandler(HttpStatusCode.Unauthorized, "", _ => { });
         var probe = new ClaudeModelListProbe(
             new SmokeFakeHttpClientFactory("agent-modellist", handler),
-            () => ("oauth-tok", null),
+            () => (null, "ak-401"),
             NullLogger<ClaudeModelListProbe>.Instance);
 
         var result = await probe.GetModelListAsync(CancellationToken.None);
@@ -73,11 +107,55 @@ public sealed class AgentModelListProbeTests
         var handler = new SmokeThrowingHandler(new HttpRequestException("connection refused"));
         var probe = new ClaudeModelListProbe(
             new SmokeFakeHttpClientFactory("agent-modellist", handler),
-            () => ("oauth-tok", null),
+            () => (null, "ak-net"),
             NullLogger<ClaudeModelListProbe>.Instance);
 
         var result = await probe.GetModelListAsync(CancellationToken.None);
         Assert.NotNull(result.FailureReason);
+    }
+
+    [Fact]
+    public async Task Claude_GuardAgainstRawV1ModelsWithOAuthBearer_OverAllOAuthShapes()
+    {
+        // Account-safety regression guard: a subscription OAuth token must never
+        // be sent as an Authorization: Bearer to https://api.anthropic.com/v1/models
+        // either — the official Claude Code client doesn't call that endpoint, so
+        // the misuse pattern is identical to /v1/messages and carries the same
+        // account-termination risk. Cover every OAuth-bearing credential shape
+        // so a future refactor re-enabling the OAuth path fails here.
+        foreach (var creds in new (string? OAuth, string? ApiKey)[]
+        {
+            ("oauth-only", null),
+            ("oauth-pref", "ak-fallback"),
+        })
+        {
+            HttpRequestMessage? captured = null;
+            var handler = new SmokeCapturingHandler(HttpStatusCode.OK,
+                """{"data":[]}""",
+                req => captured = req);
+
+            var probe = new ClaudeModelListProbe(
+                new SmokeFakeHttpClientFactory("agent-modellist", handler),
+                () => creds,
+                NullLogger<ClaudeModelListProbe>.Instance);
+
+            await probe.GetModelListAsync(CancellationToken.None);
+
+            // The forbidden combination is /v1/models AND a Bearer Authorization.
+            // Either: no HTTP call at all (preferred — OAuth-only is declined),
+            // or, when an API key is also present, the request uses x-api-key.
+            if (captured is null) continue;
+            var isModelsEndpoint = string.Equals(
+                captured.RequestUri?.AbsoluteUri,
+                ClaudeModelListProbe.ModelsEndpoint,
+                StringComparison.Ordinal);
+            var isBearer = string.Equals(
+                captured.Headers.Authorization?.Scheme,
+                "Bearer",
+                StringComparison.OrdinalIgnoreCase);
+            Assert.False(isModelsEndpoint && isBearer,
+                $"ClaudeModelListProbe constructed GET {ClaudeModelListProbe.ModelsEndpoint} with a Bearer Authorization header — this is the same subscription-OAuth raw-API misuse pattern as /v1/messages. See ClaudeModelListProbe.cs.");
+        }
     }
 
     [Fact]

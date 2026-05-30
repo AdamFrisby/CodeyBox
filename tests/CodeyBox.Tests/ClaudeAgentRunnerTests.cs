@@ -446,6 +446,28 @@ public sealed class ClaudeAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunTextOnlyAsync_OAuthOnly_DeclinesWithoutHttpCall_AccountSafety()
+    {
+        // Account-safety regression guard: a subscription OAuth token must NEVER
+        // be sent to https://api.anthropic.com/v1/messages with Authorization:
+        // Bearer (raw-API misuse outside the Claude-Code client shape) — Anthropic
+        // can flag and terminate the account. The text-only path declines OAuth
+        // outright; the rebase/merge resolver cascade parks the conflict instead.
+        // A real ANTHROPIC_API_KEY (x-api-key) is the only legitimate raw-API path.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-only" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        // No HTTP error string — the path returns before any network call.
+        Assert.Null(result.Error);
+        Assert.Contains("OAuth", result.Summary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_MissingDefault_ReturnsError()
     {
         // When no default is configured and no modelId is passed, the new
