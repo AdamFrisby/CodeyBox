@@ -501,8 +501,8 @@ public sealed class GeminiOauthCredentialFileRefresher
                     FileName = cliPath,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
+                    RedirectStandardOutput = false,
+                    RedirectStandardError = false,
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
@@ -554,7 +554,11 @@ public sealed class GeminiOauthCredentialFileRefresher
                 CreateNoWindow = true,
             });
             if (proc is null) return null;
-            proc.WaitForExit(WhichTimeoutMilliseconds);
+            if (!proc.WaitForExit(WhichTimeoutMilliseconds))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
+                return null;
+            }
             if (proc.ExitCode == 0)
             {
                 var path = proc.StandardOutput.ReadLine()?.Trim();

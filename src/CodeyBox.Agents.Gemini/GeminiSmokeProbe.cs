@@ -15,10 +15,10 @@ namespace CodeyBox.Agents.Gemini;
 /// <para>Authentication priority:</para>
 /// <list type="number">
 ///   <item><c>GEMINI_API_KEY</c> — sent as <c>x-goog-api-key</c> header (API-key auth).</item>
-    ///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
-    ///   contents (env-var name must stay in sync with
-    ///   <c>GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar</c> in
-    ///   CodeyBox.Orchestrator); the <c>access_token</c> field is extracted and sent as
+///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
+///   contents (env-var name must stay in sync with
+///   <c>GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar</c> in
+///   CodeyBox.Orchestrator); the <c>access_token</c> field is extracted and sent as
 ///   <c>Authorization: Bearer &lt;token&gt;</c> (OAuth auth).</item>
 /// </list>
 ///
