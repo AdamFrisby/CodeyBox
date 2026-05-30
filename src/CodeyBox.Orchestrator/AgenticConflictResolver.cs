@@ -96,7 +96,9 @@ public sealed record AgenticConflictResolverResult(
     IAgentRunner? ChosenRunner,
     AgentCredential? ChosenCredential,
     IReadOnlyList<string> ConflictFiles,
-    int IterationsUsed);
+    int IterationsUsed,
+    string? Stdout,
+    string? Stderr);
 
 /// <summary>
 /// A single agent candidate the resolver may invoke. The orchestrator builds
@@ -172,7 +174,9 @@ public sealed class AgenticConflictResolver
                 ChosenRunner: null,
                 ChosenCredential: null,
                 ConflictFiles: [],
-                IterationsUsed: 0);
+                IterationsUsed: 0,
+                Stdout: null,
+                Stderr: null);
         }
 
         foreach (var file in conflictFiles)
@@ -245,7 +249,9 @@ public sealed class AgenticConflictResolver
                         ChosenRunner: runner,
                         ChosenCredential: candidate.Credential,
                         ConflictFiles: conflictFiles,
-                        IterationsUsed: totalIterations);
+                        IterationsUsed: totalIterations,
+                        Stdout: agentResult.Stdout,
+                        Stderr: agentResult.Stderr);
                 }
 
                 lastVerificationError = verification.Reason;
@@ -266,7 +272,9 @@ public sealed class AgenticConflictResolver
             ChosenRunner: null,
             ChosenCredential: null,
             ConflictFiles: conflictFiles,
-            IterationsUsed: totalIterations);
+            IterationsUsed: totalIterations,
+            Stdout: lastAgentResult?.Stdout,
+            Stderr: lastAgentResult?.Stderr);
     }
 
     internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(

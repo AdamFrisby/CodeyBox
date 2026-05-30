@@ -3877,7 +3877,11 @@ public sealed class PipelineRunner : IPipelineRunner
                         new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge),
                         candidates,
                         ct);
-                    agentResult = new AgentResult(resolverResult.Success, resolverResult.Summary, null, null);
+                    agentResult = new AgentResult(
+                        resolverResult.Success,
+                        resolverResult.Summary,
+                        resolverResult.Stdout,
+                        resolverResult.Stderr);
                     if (resolverResult.Success && resolverResult.ChosenRunner is not null)
                     {
                         chosenMergeRunner = resolverResult.ChosenRunner;
@@ -3933,19 +3937,24 @@ public sealed class PipelineRunner : IPipelineRunner
                 mergeEndedAt = DateTimeOffset.UtcNow;
             }
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
-                new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
                 new KeyValuePair<string, object?>("phase", "merge"));
 
-            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+            // When the cascade swapped to a cross-kind fallback, item.ModelId
+            // belongs to the primary (e.g. "claude-opus-4-7") and is not valid
+            // for the winner — fall back to the winner runner's default model.
+            var observedModelId = ResolveObservedModelId(
+                chosenMergeRunner,
+                chosenMergeRunner.Kind == runner.Kind ? item.ModelId : null);
             var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
             if (!mergeStructuredStreamCaptured)
-                await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
+                await EmitToolCallCountsAsync(chosenMergeRunner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
+                chosenMergeRunner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
             mergeSw.Stop();
             if (_availability is { } regOnMergeFinish)
             {
-                var transition = regOnMergeFinish.RecordRunOutcome(runner.Kind, agentResult.Success, mergeSw.Elapsed);
+                var transition = regOnMergeFinish.RecordRunOutcome(chosenMergeRunner.Kind, agentResult.Success, mergeSw.Elapsed);
                 if (!transition.PreviouslyExcluded && transition.NowExcluded)
                 {
                     await _webhooks.PublishAsync(new WebhookEvent
@@ -3955,25 +3964,25 @@ public sealed class PipelineRunner : IPipelineRunner
                         Project = project,
                         Details = new AgentSmokeFailedDetails
                         {
-                            AgentKind = runner.Kind.Value,
+                            AgentKind = chosenMergeRunner.Kind.Value,
                             Reason = transition.Reason,
                         },
                     }, CancellationToken.None);
                 }
             }
-            AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
+            AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
-            LogAgentOutput(_log, runner.Kind, agentResult);
+            LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
             if (!agentResult.Success)
             {
                 _quotaClassifier.EmitAdvisoryAuditEvents(
-                    runner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                    chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
+                var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
                 if (detection is not null)
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,
-                        runner.Kind,
+                        chosenMergeRunner.Kind,
                         observedModelId,
                         agentResult.Summary,
                         agentResult.Stderr,
@@ -3982,12 +3991,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         ct,
                         projectId: item.ProjectId,
                         stdout: agentResult.Stdout);
-                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
                 }
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
-                    runner.Kind,
+                    chosenMergeRunner.Kind,
                     observedModelId,
                     agentResult.Summary,
                     agentResult.Stderr,
@@ -3999,7 +4008,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+                throw new InvalidOperationException($"Merge agent {chosenMergeRunner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
             }
 
             // Read suggestions.json before cleaning the working tree, then remove it
