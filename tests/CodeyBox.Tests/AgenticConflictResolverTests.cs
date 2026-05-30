@@ -160,13 +160,15 @@ public sealed class AgenticConflictResolverTests
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
 
         var first = new FakeAgentResolverRunner(_ =>
-            new AgentResult(false, "rate limited", null, "429")) { Kind = new AgentKind("first") };
+            new AgentResult(false, "rate limited", null, "429"))
+        { Kind = new AgentKind("first") };
         var second = new FakeAgentResolverRunner(sb =>
         {
             sb.WriteFile("src/a.txt", "m + w\n");
             sb.GitAdd("src/a.txt");
             return new AgentResult(true, "ok", null, null);
-        }) { Kind = new AgentKind("second") };
+        })
+        { Kind = new AgentKind("second") };
 
         var result = await resolver.ResolveAsync(
             sandbox,
@@ -300,6 +302,211 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_HotReloadedOptions_AreObservedOnNextCall()
+    {
+        // Knob #4 is documented as hot-reloadable: a snapshot.Apply between
+        // two ResolveAsync calls must reach the next call. Construct with
+        // MaxIterations=1, run once (agent lies → markers remain → 1 attempt
+        // total, failure). Apply MaxIterations=3, run again (same scenario →
+        // 3 attempts, still failure but trail proves the new cap was honoured).
+        var snapshot = new AgenticConflictResolverOptionsSnapshot(
+            new AgenticConflictResolverOptions { MaxIterations = 1 });
+        var resolver = new AgenticConflictResolver(snapshot);
+
+        var sandbox1 = new ConflictSandbox();
+        sandbox1.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var runner1 = new FakeAgentResolverRunner(sb =>
+        {
+            // Agent lies about resolution — markers remain so verification fails
+            // and the resolver burns one attempt per iteration.
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "lied", null, null);
+        });
+        var firstRun = await resolver.ResolveAsync(
+            sandbox1,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner1, Credential: null)],
+            CancellationToken.None);
+        Assert.False(firstRun.Success);
+        Assert.Equal(1, firstRun.IterationsUsed);
+        Assert.Equal(1, runner1.InvocationCount);
+
+        snapshot.Apply(new AgenticConflictResolverOptions { MaxIterations = 3 });
+        Assert.Equal(3, snapshot.Current.MaxIterations);
+
+        var sandbox2 = new ConflictSandbox();
+        sandbox2.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var runner2 = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "still lying", null, null);
+        });
+        var secondRun = await resolver.ResolveAsync(
+            sandbox2,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner2, Credential: null)],
+            CancellationToken.None);
+        Assert.False(secondRun.Success);
+        Assert.Equal(3, secondRun.IterationsUsed);
+        Assert.Equal(3, runner2.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ListUnmergedPathsAsyncFails_ThrowsMergeConflictResolutionFailed()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        // First (and only) diff call must fail so ListUnmergedPathsAsync throws
+        // before any agent invocation happens.
+        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: not a git repository"));
+
+        var resolver = new AgenticConflictResolver();
+        var runner = new FakeAgentResolverRunner(_ => throw new InvalidOperationException("agent should never run"));
+
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+            resolver.ResolveAsync(
+                sandbox,
+                "/work",
+                WorkItemId.New(),
+                new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+                [new AgenticConflictResolverCandidate(runner, Credential: null)],
+                CancellationToken.None));
+        Assert.Contains("failed to inspect unmerged paths", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("fatal: not a git repository", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, runner.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AgentThrows_AdvancesToNextCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 3 }));
+
+        var first = new FakeAgentResolverRunner(_ =>
+            throw new InvalidOperationException("agent CLI exploded"))
+        { Kind = new AgentKind("first") };
+        var second = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "recovered", null, null);
+        })
+        { Kind = new AgentKind("second") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [
+                new AgenticConflictResolverCandidate(first, Credential: null),
+                new AgenticConflictResolverCandidate(second, Credential: null),
+            ],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal("second", result.ChosenRunner?.Kind.Value);
+        // First candidate threw on attempt 1 → resolver broke out of the inner
+        // loop (no retry of the same candidate on a thrown exception) and moved
+        // to the second candidate, which resolved on its first attempt.
+        Assert.Equal(1, first.InvocationCount);
+        Assert.Equal(1, second.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_GrepReturnsUnexpectedExitCode_ReportsScanFailure()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        // grep exit codes: 0 = matched (markers), 1 = no match (clean),
+        // anything else = grep itself failed. Force a real-grep-error exit so
+        // the "scan failed" branch fires.
+        sandbox.GrepResponseQueue.Enqueue(new SandboxExecResult(2, "", "grep: I/O error"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("failed to scan for conflict markers", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("grep: I/O error", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_VerifyDiffFails_ReportsDiffFailure()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        // First diff call (in ListUnmergedPathsAsync) returns default success +
+        // the conflict file; second diff call (in VerifyResolutionAsync) fails.
+        sandbox.DiffResponseQueue.Enqueue(null);
+        sandbox.DiffResponseQueue.Enqueue(new SandboxExecResult(128, "", "fatal: index corrupted"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("git diff failed", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("fatal: index corrupted", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PromptShape_MergeOperationUsesMergeTokens()
+    {
+        var prompt = AgenticConflictResolver.BuildAgenticConflictResolverPrompt(
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            ["a.txt"],
+            attempt: 1,
+            maxAttempts: 3,
+            priorVerificationError: null);
+
+        // The Rebase/Merge ternary at the top of the builder picks the noun for
+        // both the situation sentence ("mid-{op}") and the "git {op} --continue"
+        // constraint line. Both must use "merge" when Operation = Merge.
+        Assert.Contains("mid-merge", prompt, StringComparison.Ordinal);
+        Assert.Contains("git merge --continue", prompt, StringComparison.Ordinal);
+        Assert.Contains("git merge --abort", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("mid-rebase", prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("git rebase --continue", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateRelativeWorkPath_RejectsTraversal()
     {
         Assert.Throws<MergeConflictResolutionFailedException>(() =>
@@ -388,6 +595,11 @@ public sealed class AgenticConflictResolverTests
         public string Id => "agentic-resolver-fake";
         public List<string> AddedFiles { get; } = new();
 
+        // Per-call response overrides. Null entry = use default behaviour for
+        // that call; concrete entry overrides it. Empty queue = always default.
+        public Queue<SandboxExecResult?> DiffResponseQueue { get; } = new();
+        public Queue<SandboxExecResult?> GrepResponseQueue { get; } = new();
+
         public void AddConflictedFile(string relativePath, string content)
         {
             _files[relativePath] = content;
@@ -424,6 +636,8 @@ public sealed class AgenticConflictResolverTests
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "diff"
                 && argv.Contains("--diff-filter=U"))
             {
+                if (DiffResponseQueue.TryDequeue(out var queued) && queued is not null)
+                    return Task.FromResult(queued);
                 var listed = string.Join('\n', _unmerged.Order(StringComparer.Ordinal));
                 return Task.FromResult(new SandboxExecResult(0, listed, ""));
             }
@@ -431,6 +645,8 @@ public sealed class AgenticConflictResolverTests
             if (argv.Count >= 4
                 && argv[0] == "git" && argv[1] == "-C" && argv[3] == "grep")
             {
+                if (GrepResponseQueue.TryDequeue(out var queued) && queued is not null)
+                    return Task.FromResult(queued);
                 var sepIdx = -1;
                 for (var i = 4; i < argv.Count; i++)
                 {
