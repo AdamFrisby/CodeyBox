@@ -10,16 +10,26 @@ namespace CodeyBox.Agents.Gemini;
 
 /// <summary>
 /// Smoke-tests Gemini (Google AI) credentials by issuing a minimal
-/// generateContent request directly to the Generative Language API.
+/// generateContent request.
 ///
-/// <para>Authentication priority:</para>
+/// <para>Authentication priority and endpoint:</para>
 /// <list type="number">
-///   <item><c>GEMINI_API_KEY</c> — sent as <c>x-goog-api-key</c> header (API-key auth).</item>
+///   <item><c>GEMINI_API_KEY</c> — sent as <c>x-goog-api-key</c> header against
+///   the public Generative Language endpoint
+///   (<see cref="ApiKeyGenerateContentEndpoint"/>).</item>
 ///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
 ///   contents (env-var name sourced from
 ///   <c>CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar</c>);
 ///   the <c>access_token</c> field is extracted and sent as
-///   <c>Authorization: Bearer &lt;token&gt;</c> (OAuth auth).</item>
+///   <c>Authorization: Bearer &lt;token&gt;</c> against the Code Assist OAuth
+///   endpoint (<see cref="OAuthGenerateContentEndpoint"/>). The public
+///   Generative Language endpoint does <i>not</i> authenticate OAuth bearer
+///   tokens — sending one returns 401/403 and an OAuth-only setup would always
+///   fail the smoke gate. The Code Assist v1internal surface is the same
+///   endpoint <c>GeminiAgentRunner.SendOAuthAsync</c>,
+///   <c>GeminiQuotaProbe</c>, and <c>GeminiModelListProbe</c> already use for
+///   the OAuth subscription path; the request body is wrapped in
+///   <c>{model, request}</c> to match Code Assist's shape.</item>
 /// </list>
 ///
 /// <para>Uses the <c>agent-smoke</c> named HTTP client. Never logs the API key,
@@ -31,8 +41,17 @@ namespace CodeyBox.Agents.Gemini;
 /// </summary>
 public sealed class GeminiSmokeProbe : IAgentSmokeProbe
 {
-    internal const string GenerateContentEndpoint =
+    // API-key path: the public Generative Language endpoint. Does NOT
+    // authenticate OAuth bearer tokens — keep this for x-goog-api-key only.
+    internal const string ApiKeyGenerateContentEndpoint =
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+    // OAuth subscription path: the Code Assist v1internal surface, the same
+    // endpoint family GeminiQuotaProbe / GeminiModelListProbe / GeminiAgentRunner
+    // already use for OAuth-personal. Code Assist wraps the GenerateContent
+    // body in {model, request} (see SmokeRequestBodyOAuthJson below).
+    internal const string OAuthGenerateContentEndpoint =
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GeminiSmokeProbe> _log;
@@ -79,9 +98,9 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         string apiKey, CancellationToken ct, Stopwatch sw)
     {
         var client = _httpClientFactory.CreateClient("agent-smoke");
-        using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
+        using var request = new HttpRequestMessage(HttpMethod.Post, ApiKeyGenerateContentEndpoint);
         request.Headers.Add("x-goog-api-key", apiKey);
-        request.Content = CreateSmokeRequestBody();
+        request.Content = CreateApiKeySmokeRequestBody();
         return await SendAndInterpretAsync(client, request, ct, sw);
     }
 
@@ -89,9 +108,9 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         string accessToken, CancellationToken ct, Stopwatch sw)
     {
         var client = _httpClientFactory.CreateClient("agent-smoke");
-        using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
+        using var request = new HttpRequestMessage(HttpMethod.Post, OAuthGenerateContentEndpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        request.Content = CreateSmokeRequestBody();
+        request.Content = CreateOAuthSmokeRequestBody();
         return await SendAndInterpretAsync(client, request, ct, sw);
     }
 
@@ -137,9 +156,21 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         return new AgentSmokeResult(false, reason, sw.Elapsed);
     }
 
-    private const string SmokeRequestBodyJson =
+    // Public v1beta endpoint shape: GenerateContentRequest at the top level.
+    private const string SmokeRequestBodyApiKeyJson =
         """{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}""";
 
-    private static StringContent CreateSmokeRequestBody() =>
-        new(SmokeRequestBodyJson, Encoding.UTF8, "application/json");
+    // Code Assist v1internal shape: {model, request} envelope around the
+    // GenerateContentRequest. Mirrors GeminiQuotaProbe.ProbeOneAsync /
+    // GeminiAgentRunner.SendOAuthAsync. The model id matches the API-key probe
+    // (gemini-2.0-flash) so OAuth and API-key gates exercise the same cheapest
+    // model bucket.
+    private const string SmokeRequestBodyOAuthJson =
+        """{"model":"models/gemini-2.0-flash","request":{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}}""";
+
+    private static StringContent CreateApiKeySmokeRequestBody() =>
+        new(SmokeRequestBodyApiKeyJson, Encoding.UTF8, "application/json");
+
+    private static StringContent CreateOAuthSmokeRequestBody() =>
+        new(SmokeRequestBodyOAuthJson, Encoding.UTF8, "application/json");
 }

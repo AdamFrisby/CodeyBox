@@ -44,12 +44,73 @@ public sealed class GeminiSmokeProbeTests
             NullLogger<GeminiSmokeProbe>.Instance);
 
     [Fact]
-    public async Task Probe_PostsToGenerateContentEndpoint()
+    public async Task ApiKeyProbe_PostsToApiKeyEndpoint()
     {
         Uri? captured = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req.RequestUri);
         await BuildProbe(handler).SmokeTestAsync(ValidCred(), CancellationToken.None);
-        Assert.Equal(new Uri(GeminiSmokeProbe.GenerateContentEndpoint), captured);
+        Assert.Equal(new Uri(GeminiSmokeProbe.ApiKeyGenerateContentEndpoint), captured);
+    }
+
+    /// <summary>
+    /// OAuth bearer tokens must hit the Code Assist v1internal endpoint
+    /// (cloudcode-pa.googleapis.com), NOT the public Generative Language
+    /// endpoint. The public endpoint does not authenticate OAuth tokens and
+    /// would return 401/403, falsely failing the smoke gate for OAuth-only
+    /// (subscription) setups. This test guards the regression that landed in
+    /// #163, where the OAuth path inherited the API-key endpoint.
+    /// </summary>
+    [Fact]
+    public async Task OAuthProbe_PostsToCloudCodeOAuthEndpoint()
+    {
+        Uri? captured = null;
+        var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req => captured = req.RequestUri);
+        await BuildProbe(handler).SmokeTestAsync(OAuthCred("oauth-token"), CancellationToken.None);
+
+        Assert.NotNull(captured);
+        Assert.Equal(new Uri(GeminiSmokeProbe.OAuthGenerateContentEndpoint), captured);
+        Assert.Equal("cloudcode-pa.googleapis.com", captured!.Host);
+        Assert.NotEqual("generativelanguage.googleapis.com", captured.Host);
+    }
+
+    /// <summary>
+    /// The Code Assist v1internal:generateContent shape wraps the
+    /// GenerateContentRequest in <c>{model, request}</c>; without the envelope
+    /// the API responds 400. Mirrors GeminiQuotaProbe.ProbeOneAsync /
+    /// GeminiAgentRunner.SendOAuthAsync.
+    /// </summary>
+    [Fact]
+    public async Task OAuthProbe_UsesCodeAssistWrappedBody()
+    {
+        string? body = null;
+        var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
+            body = req.Content?.ReadAsStringAsync().GetAwaiter().GetResult());
+        await BuildProbe(handler).SmokeTestAsync(OAuthCred("oauth-token"), CancellationToken.None);
+
+        Assert.NotNull(body);
+        using var doc = System.Text.Json.JsonDocument.Parse(body!);
+        Assert.True(doc.RootElement.TryGetProperty("model", out var modelEl));
+        Assert.Equal("models/gemini-2.0-flash", modelEl.GetString());
+        Assert.True(doc.RootElement.TryGetProperty("request", out var reqEl));
+        Assert.True(reqEl.TryGetProperty("contents", out _));
+    }
+
+    /// <summary>
+    /// The API-key body must NOT be wrapped — the public v1beta endpoint
+    /// expects the GenerateContentRequest at the top level.
+    /// </summary>
+    [Fact]
+    public async Task ApiKeyProbe_UsesFlatBody()
+    {
+        string? body = null;
+        var handler = new SmokeCapturingHandler(HttpStatusCode.OK, "{}", req =>
+            body = req.Content?.ReadAsStringAsync().GetAwaiter().GetResult());
+        await BuildProbe(handler).SmokeTestAsync(ValidCred(), CancellationToken.None);
+
+        Assert.NotNull(body);
+        using var doc = System.Text.Json.JsonDocument.Parse(body!);
+        Assert.True(doc.RootElement.TryGetProperty("contents", out _));
+        Assert.False(doc.RootElement.TryGetProperty("request", out _));
     }
 
     [Fact]

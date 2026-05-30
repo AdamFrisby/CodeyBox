@@ -132,4 +132,41 @@ public sealed class GeminiOAuthFileCredentialProviderTests : IDisposable
 
         Assert.Null(await provider.GetAsync(AgentKind.Claude));
     }
+
+    /// <summary>
+    /// Locks down the contract underpinning the smoke gate post-rotation
+    /// behavior: when oauth_creds.json is rewritten out-of-band (host operator
+    /// running gemini, the orchestrator's own refresher, or a child sandbox
+    /// writeback), the very next <c>GetAsync</c> call must surface the new
+    /// token. The credential bundle does <i>not</i> cache across calls — the
+    /// shared <see cref="CredentialFileSource"/> stat-checks and re-reads.
+    /// Regression guard for the operator-reported "dispatch bundle caches
+    /// stale token" symptom referenced in #163's secondary issue.
+    /// </summary>
+    [Fact]
+    public async Task GetAsync_ReReadsOAuthFileAfterOutOfBandRotation()
+    {
+        var paths = WriteGeminiFiles();
+        using var provider = new GeminiOAuthFileCredentialProvider(
+            paths.OAuth,
+            paths.Settings,
+            watch: false);
+
+        var initial = await provider.GetAsync(AgentKind.Gemini);
+        Assert.NotNull(initial);
+        Assert.Equal(
+            """{"access_token":"gemini-token"}""",
+            initial!.EnvironmentVariables[GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar]);
+
+        File.WriteAllText(paths.OAuth, """{"access_token":"refreshed-token"}""");
+        // Bump mtime explicitly: write-then-write within a coarse-mtime
+        // filesystem could otherwise keep the cached stat fingerprint.
+        File.SetLastWriteTimeUtc(paths.OAuth, DateTime.UtcNow.AddSeconds(1));
+
+        var refreshed = await provider.GetAsync(AgentKind.Gemini);
+        Assert.NotNull(refreshed);
+        Assert.Equal(
+            """{"access_token":"refreshed-token"}""",
+            refreshed!.EnvironmentVariables[GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar]);
+    }
 }
