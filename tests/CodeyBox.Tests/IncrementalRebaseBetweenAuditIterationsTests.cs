@@ -10,7 +10,7 @@ namespace CodeyBox.Tests;
 /// the merge-time rebase has smaller and rarer conflicts.
 ///
 /// <para>
-/// All four cases are spec-required (see work item rework prompt):
+/// Spec-required cases (see work item rework prompt):
 /// <list type="bullet">
 ///   <item>Disabled flag is a no-op (default behaviour preserved).</item>
 ///   <item>Skipped for branches outside the pickup-rebase-owned prefix.</item>
@@ -38,6 +38,7 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var advancingAuditor = new MainAdvancingAuditor(seed, blockingFirstThenPass: true);
+        var reworkObservation = new ReworkObservationProbe();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
@@ -46,23 +47,43 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2"));
 
+        // Capture HEAD's ancestry at the rework dispatch (the SECOND work
+        // call). The initial work call fires BEFORE main is advanced and
+        // would trivially report origin/main in ancestry; it must be
+        // skipped. The rework call fires AFTER iter 1 + (a no-op
+        // MaybeIncrementalRebaseAsync, because the flag is off), so the
+        // rebase-vs-no-rebase divergence is observable.
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            if (!reworkObservation.InitialWorkSeen)
+            {
+                reworkObservation.InitialWorkSeen = true;
+                return;
+            }
+            if (reworkObservation.SnapshotTaken) return;
+            reworkObservation.SnapshotTaken = true;
+            await reworkObservation.CaptureAsync(sandbox, workingDirectory, ct);
+        };
+
         var item = NewItem();
+        advancingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        // The work item still completes — the merge-time rebase at pickup
-        // consolidates the advanced base. The pickup rebase's parent walk
-        // proves the work branch was NOT rebased earlier (otherwise the
-        // pickup rebase would observe an already-on-base tip).
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         // The advancing auditor must have fired during iter 1.
         Assert.True(advancingAuditor.AdvancedMain);
-        // The between-iteration rebase did not run (flag off), so the audit
-        // iteration 2 ran on a work branch whose ancestry still pointed at
-        // the pre-advance base. We verify the pre-advance commit appears in
-        // the final history (it is the merge-base contribution after the
-        // pickup-time rebase).
+        // Probe ran on rework dispatch (proves the dispatch happened post
+        // the disabled-flag no-op).
+        Assert.True(reworkObservation.SnapshotTaken);
+        // CRITICAL: with the flag off, the incremental rebase must NOT have
+        // run between iter 1 and rework — so the rework agent observes an
+        // un-rebased branch whose ancestry does NOT yet contain the
+        // advanced origin/main. A regression that ran the rebase despite
+        // Enabled=false would advance the branch and flip this assertion.
+        Assert.False(reworkObservation.AdvancedMainInAncestry,
+            "with Enabled=false, the rework agent must see the un-rebased work branch");
     }
 
     [Fact]
@@ -83,6 +104,7 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         // non-owned branch is force-pushed, so a successful run proves the
         // gate fired BEFORE the rebase core was entered.
         var item = NewItem("feature/not-pickup-owned");
+        advancingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -113,10 +135,18 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         // Snapshot what the rework agent sees the moment it dispatches —
-        // before writing the rework file. If the incremental rebase ran,
-        // origin/{baseBranch} appears in HEAD's ancestry already.
+        // before writing the rework file. The initial work call (first
+        // BeforeWorkAsync) fires BEFORE the auditor advances main, so
+        // origin/main and HEAD trivially share ancestry; we must skip it
+        // and capture on the rework dispatch (second call) where the
+        // rebase-vs-no-rebase divergence is observable.
         tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
         {
+            if (!reworkObservation.InitialWorkSeen)
+            {
+                reworkObservation.InitialWorkSeen = true;
+                return;
+            }
             if (reworkObservation.SnapshotTaken) return;
             reworkObservation.SnapshotTaken = true;
             await reworkObservation.CaptureAsync(sandbox, workingDirectory, ct);
@@ -124,6 +154,7 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-after-rework"));
 
         var item = NewItem();
+        advancingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
@@ -147,13 +178,18 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
     public async Task ReBaseFailure_IsSwallowedWorkItemProceeds()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        // Configure the auditor to advance main with a conflicting change AND
-        // to have NO conflict resolution plan enqueued. The rebase will hit a
-        // conflict, the resolver will fail (no plan entries), and
-        // MaybeIncrementalRebaseAsync MUST swallow the failure — the work
-        // item proceeds to the merge phase where the pickup-time rebase
-        // (which DOES have a conflict plan) does the heavy lifting.
+        // Configure the auditor to advance main with a conflicting change.
+        // ConflictResolutionPlan starts EMPTY, so when MaybeIncrementalRebaseAsync
+        // (running between iter 1 and the rework dispatch) hits the conflict
+        // on a.txt, the resolver cascade exhausts (ScriptedAgent returns
+        // failure when its plan queue is empty), the rebase core throws
+        // MergeConflictResolutionFailedException, and the catch in
+        // MaybeIncrementalRebaseAsync MUST swallow it so the work item
+        // proceeds. A single plan entry is enqueued LATER (via BeforeWorkAsync
+        // on the rework dispatch, AFTER the incremental rebase has already
+        // failed) so the merge-time pickup-rebase has a viable resolver.
         var advancingAuditor = new MainAdvancingAuditor(seed, blockingFirstThenPass: true, conflictingFile: "a.txt");
+        var reworkObservation = new ReworkObservationProbe();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -163,30 +199,48 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "work-v1\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "work-v2-after-rework\n"));
 
-        // Conflict-resolution plan for the merge-time (pickup-time) rebase.
-        // The between-iteration rebase finds a conflict too but its first
-        // dequeue will succeed — that is fine. We only assert that the work
-        // item still proceeds even if the incremental rebase had failed.
-        tp.Agent.ConflictResolutionPlan.Enqueue(_ =>
-            new Dictionary<string, string>(StringComparer.Ordinal)
+        // Initial work call: do nothing (incremental rebase hasn't run yet —
+        // we need the plan EMPTY when it runs).
+        // Rework call: by now the incremental rebase has failed-and-been-
+        // swallowed; enqueue the resolver entry the merge-time pickup-rebase
+        // will need. Also capture the rework dispatch's HEAD ancestry to
+        // confirm the un-rebased branch reached the rework agent.
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            if (!reworkObservation.InitialWorkSeen)
             {
-                ["a.txt"] = "merged\n",
-            });
-        // A second resolution for the pickup-time rebase that runs at merge.
-        tp.Agent.ConflictResolutionPlan.Enqueue(_ =>
-            new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["a.txt"] = "merged\n",
-            });
+                reworkObservation.InitialWorkSeen = true;
+                return;
+            }
+            if (reworkObservation.SnapshotTaken) return;
+            reworkObservation.SnapshotTaken = true;
+            await reworkObservation.CaptureAsync(sandbox, workingDirectory, ct);
+            tp.Agent.ConflictResolutionPlan.Enqueue(_ =>
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["a.txt"] = "merged\n",
+                });
+        };
 
         var item = NewItem();
+        advancingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
         // The work item must complete — the audit/rework loop is not
-        // sensitive to incremental rebase failures.
+        // sensitive to incremental rebase failures. If the catch in
+        // MaybeIncrementalRebaseAsync were removed, the
+        // MergeConflictResolutionFailedException raised by the empty
+        // cascade would propagate up and tear the work item to Failed.
         Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(reworkObservation.SnapshotTaken);
+        // The incremental rebase FAILED (didn't advance the branch), so the
+        // rework agent saw the un-rebased branch. If the rebase had
+        // succeeded (e.g. the plan had been seeded too early), this would
+        // flip to true and the test would catch the mis-setup.
+        Assert.False(reworkObservation.AdvancedMainInAncestry,
+            "incremental rebase should have failed-and-been-swallowed, leaving the rework branch un-rebased");
     }
 
     [Fact]
@@ -207,6 +261,7 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("never-consumed.txt", "should-not-run"));
 
         var item = NewItem();
+        cancellingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
         await tp.Store.CreateAsync(item);
 
         // Cancellation propagates as OperationCanceledException at the
@@ -245,6 +300,16 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
     /// (before returning a blocking finding). Iteration 2 returns clean so
     /// the work item reaches Done. Optionally writes a conflicting change to
     /// <paramref name="conflictingFile"/> to exercise the failure path.
+    ///
+    /// <para>
+    /// Set <see cref="BarePath"/> after the pipeline has constructed its
+    /// LocalGitHost so iter-1's seed-advance is also fetched into the bare
+    /// repo. Without this, sandboxes clone an unrefreshed bare in which
+    /// origin/main is still pre-advance — making the incremental rebase a
+    /// silent no-op (baseAlreadyAncestor returns true and the rebase early
+    /// returns) and erasing every observable difference between "rebase ran"
+    /// and "rebase was skipped".
+    /// </para>
     /// </summary>
     private sealed class MainAdvancingAuditor : IAuditor
     {
@@ -274,6 +339,7 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         public AuditCapabilities Required => AuditCapabilities.None;
         public bool AdvancedMain { get; private set; }
         public string AdvancedMainSha { get; private set; } = string.Empty;
+        public string? BarePath { get; set; }
 
         public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
         {
@@ -296,6 +362,19 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
                 AdvancedMainSha = advancedSha.Trim();
                 AdvancedMain = true;
 
+                if (BarePath is not null)
+                {
+                    // Propagate the seed's main advance into the bare repo
+                    // — mirrors what FetchUpstreamAsync does during a fresh
+                    // EnsureRepositoryAsync call. The pipeline only does this
+                    // ONCE at start, so without an explicit fetch here the
+                    // bare repo holds a pre-advance origin/main for the rest
+                    // of the run.
+                    await TestSupport.RunGit(
+                        BarePath, "fetch", "--no-tags", "--prune",
+                        _seedRepoPath, "+refs/heads/main:refs/heads/main");
+                }
+
                 _cancelAfterFirstIteration?.Cancel();
 
                 return _blockingFirstThenPass
@@ -308,13 +387,16 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
     }
 
     /// <summary>
-    /// Captures the work-branch ancestry as seen by the rework agent on its
-    /// first invocation. Used to assert that the between-iteration
-    /// incremental rebase has already advanced the work branch by the time
-    /// the rework agent gets dispatched.
+    /// Captures the work-branch ancestry as seen by the rework agent.
+    /// Callers gate <see cref="CaptureAsync"/> on
+    /// <see cref="InitialWorkSeen"/> so the FIRST work-agent dispatch
+    /// (which runs before main advances and would trivially report origin/main
+    /// in ancestry) is skipped; the SECOND dispatch — the rework after iter
+    /// 1 advanced main — is what carries signal.
     /// </summary>
     private sealed class ReworkObservationProbe
     {
+        public bool InitialWorkSeen { get; set; }
         public bool SnapshotTaken { get; set; }
         public bool AdvancedMainInAncestry { get; set; }
 
