@@ -143,7 +143,7 @@ public sealed class NotificationRulesEngineTests
         var builder = new StaticBuilder("test_cond", "Cooldown elapsed");
         var rules = new List<NotificationRuleOptions>
         {
-            new() { Condition = "test_cond", Providers = ["counting"], Cooldown = "00:00:00" },
+            new() { Condition = "test_cond", Providers = ["counting"], Cooldown = "00:00:00.050" },
         };
         var (provider, engine) = BuildEngineWithCounter(condition, builder, rules);
 
@@ -155,6 +155,9 @@ public sealed class NotificationRulesEngineTests
 
         condition.Set(false);
         await engine.RunSweepAsync(CancellationToken.None);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(150));
+
         condition.Set(true);
         await engine.RunSweepAsync(CancellationToken.None);
         Assert.Equal(2, provider.CallCount);
