@@ -43,12 +43,14 @@ public sealed class AgentModelListProbeTests
     public async Task Claude_OAuthAndApiKey_UsesApiKeyPath_NotOAuth()
     {
         // When both are present the API-key path wins — never an OAuth Bearer
-        // against /v1/models.
+        // against /v1/models. Also asserts end-to-end parsing of the /v1/models
+        // happy-path response into ModelIds (covers ParseResponse's data[].id
+        // extraction loop alongside the credential-selection invariant).
         Uri? capturedUri = null;
         string? capturedAuth = null;
         string? xApiKey = null;
         var handler = new SmokeCapturingHandler(HttpStatusCode.OK,
-            """{"data":[{"id":"claude-opus-4-7"}]}""",
+            """{"data":[{"id":"claude-opus-4-7"},{"id":"claude-haiku-4-5"}]}""",
             req =>
             {
                 capturedUri = req.RequestUri;
@@ -66,6 +68,7 @@ public sealed class AgentModelListProbeTests
         Assert.Null(capturedAuth);
         Assert.Equal("ak-456", xApiKey);
         Assert.Null(result.FailureReason);
+        Assert.Equal(new[] { "claude-opus-4-7", "claude-haiku-4-5" }, result.ModelIds);
     }
 
     [Fact]
