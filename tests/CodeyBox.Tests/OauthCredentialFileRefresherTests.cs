@@ -393,6 +393,25 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.True(log.WarningCount >= 1);
     }
 
+    [Fact]
+    public async Task Gemini_Refresh_WhenResponseBodyExceedsMax_ReturnsNull()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old-access", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var oversizedBody = "{\"access_token\":\"tok\",\"expires_in\":3600" + new string(' ', 8192) + "}";
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, oversizedBody);
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance);
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Null(token);
+        Assert.Single(handler.Requests);
+    }
+
     // ── CLI refresh handler (TryCreateCliRefreshHandler / ResolveGeminiCliPath) ─
 
     [Fact]
@@ -439,10 +458,36 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
     }
 
     [Fact]
+    public async Task TryCreateCliRefreshHandler_ForwardsHomeEnvVarToSubprocess()
+    {
+        var sentinel = Path.Combine(_dir, $"sentinel-{Guid.NewGuid():N}.txt");
+        var isWin = OperatingSystem.IsWindows();
+        var body = isWin
+            ? $"echo %HOME% > \"{sentinel}\""
+            : $"echo \"$HOME\" > \"{sentinel}\"";
+        var scriptPath = WriteExecutableScript(body, exitCode: 0);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.True(await handler(CancellationToken.None));
+        Assert.True(File.Exists(sentinel));
+        var captured = File.ReadAllText(sentinel).Trim();
+        Assert.Equal(Environment.GetEnvironmentVariable("HOME") ?? "", captured);
+    }
+
+    [Fact]
     public void ResolveExecutablePath_WhenResolverFails_ReturnsNull()
     {
         var result = GeminiOauthCredentialFileRefresher.ResolveExecutablePath(
             "no-such-resolver-command-hopefully-not-on-path", "gemini");
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ResolveExecutablePath_WhenResolverTimesOut_ReturnsNull()
+    {
+        var scriptPath = WriteExecutableScript("sleep 10", exitCode: 0);
+        var result = GeminiOauthCredentialFileRefresher.ResolveExecutablePath(scriptPath, "gemini");
         Assert.Null(result);
     }
 

@@ -503,13 +503,12 @@ public sealed class GeminiOauthCredentialFileRefresher
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
-                var environment = new Dictionary<string, string?>();
+                psi.Environment.Clear();
                 foreach (var key in new[] { "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL" })
                 {
                     var val = Environment.GetEnvironmentVariable(key);
-                    if (val is not null) environment[key] = val;
+                    if (val is not null) psi.Environment[key] = val;
                 }
-                foreach (var kv in environment) psi.Environment[kv.Key] = kv.Value;
                 proc = Process.Start(psi);
                 if (proc is null) return false;
                 _ = proc.StandardOutput.ReadToEndAsync(CancellationToken.None);
