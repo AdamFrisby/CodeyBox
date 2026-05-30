@@ -984,29 +984,18 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
+    private async Task RebaseWorkBranchInSandboxCoreAsync(
         WorkItem item,
         IAgentRunner runner,
         string repoId,
         string baseBranch,
         string workBranch,
         Project project,
-        CancellationToken ct,
-        string timingPhase = "pickup")
+        string timingPhase,
+        string? baselineImageRef,
+        bool swallowReviewFailures,
+        CancellationToken ct)
     {
-        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
-        Validation.ValidateBranchName(workBranch, nameof(workBranch));
-
-        if (!IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
-        {
-            _log.LogInformation(
-                "Skipping pickup-time rebase for work item {WorkItemId} branch {WorkBranch}; only {OwnedWorkBranch} is eligible for sandbox force-push",
-                item.Id,
-                workBranch,
-                DefaultWorkBranchFor(item.Id));
-            return;
-        }
-
         var lockKey = $"{repoId}:{workBranch}";
         var gate = RetainPickupRebaseLock(lockKey);
         var lockEntered = false;
@@ -1047,7 +1036,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
-                baselineImageRef: item.BaselineImageRef);
+                baselineImageRef: baselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             if (credential is not null && credential.Files.Count > 0)
@@ -1125,17 +1114,44 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 // Reuse the cascade member that actually resolved conflicts so
                 // the advisory review never routes back to a failed first choice.
-                await RecordMergeSecurityReviewAsync(
-                    item.Id,
-                    repoId,
-                    oldTip,
-                    newTip,
-                    rebaseConflictFiles,
-                    project,
-                    rebaseReviewRunner,
-                    rebaseReviewCredential,
-                    sandbox,
-                    ct);
+                if (swallowReviewFailures)
+                {
+                    try
+                    {
+                        await RecordMergeSecurityReviewAsync(
+                            item.Id,
+                            repoId,
+                            oldTip,
+                            newTip,
+                            rebaseConflictFiles,
+                            project,
+                            rebaseReviewRunner,
+                            rebaseReviewCredential,
+                            sandbox,
+                            ct);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _log.LogWarning(ex,
+                            "{Phase} rebase security review failed for work item {WorkItemId}; continuing",
+                            timingPhase,
+                            item.Id);
+                    }
+                }
+                else
+                {
+                    await RecordMergeSecurityReviewAsync(
+                        item.Id,
+                        repoId,
+                        oldTip,
+                        newTip,
+                        rebaseConflictFiles,
+                        project,
+                        rebaseReviewRunner,
+                        rebaseReviewCredential,
+                        sandbox,
+                        ct);
+                }
             }
 
             _log.LogInformation(
@@ -1151,6 +1167,36 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             ReleasePickupRebaseLock(lockKey, gate, lockEntered);
         }
+    }
+
+    private async Task RebaseExistingWorkBranchOntoFreshBaseAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        Project project,
+        CancellationToken ct)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        Validation.ValidateBranchName(workBranch, nameof(workBranch));
+
+        if (!IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+        {
+            _log.LogInformation(
+                "Skipping pickup-time rebase for work item {WorkItemId} branch {WorkBranch}; only {OwnedWorkBranch} is eligible for sandbox force-push",
+                item.Id,
+                workBranch,
+                DefaultWorkBranchFor(item.Id));
+            return;
+        }
+
+        await RebaseWorkBranchInSandboxCoreAsync(
+            item, runner, repoId, baseBranch, workBranch, project,
+            timingPhase: "pickup",
+            baselineImageRef: item.BaselineImageRef,
+            swallowReviewFailures: false,
+            ct);
     }
 
     /// <summary>
@@ -1215,9 +1261,12 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
-            await RebaseExistingWorkBranchOntoFreshBaseAsync(
-                item, runner, repoId, baseBranch, workBranch, project, ct,
-                timingPhase: "incremental-rebase");
+            await RebaseWorkBranchInSandboxCoreAsync(
+                item, runner, repoId, baseBranch, workBranch, project,
+                timingPhase: "incremental-rebase",
+                baselineImageRef: item.BaselineImageRef,
+                swallowReviewFailures: true,
+                ct);
         }
         catch (OperationCanceledException)
         {
@@ -2356,6 +2405,9 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
+
+            if (iteration > 1)
+                await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
 
             await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
