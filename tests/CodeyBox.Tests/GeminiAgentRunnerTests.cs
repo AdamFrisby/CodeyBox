@@ -415,12 +415,21 @@ public sealed class GeminiAgentRunnerTests
     // (e.g. "GEMINI_KEY" instead of "GEMINI_API_KEY") would silently
     // misclassify every OAuth-only operator setup — which is exactly the
     // configuration the routing fix exists to handle.
+    //
+    // Two credential shapes are viable for the text-only path:
+    //   1. GEMINI_API_KEY  → pay-per-use generativelanguage.googleapis.com
+    //   2. CODEYBOX_GEMINI_OAUTH_CREDS_JSON containing a non-empty
+    //      access_token → Code Assist cloudcode-pa.googleapis.com (Authorized
+    //      for Gemini specifically; the conflict-resolver cascade relies on
+    //      this when API-key auth is not configured).
+
+    private const string ExpectedMissingReason = "GEMINI_API_KEY or Gemini OAuth credentials are required";
 
     [Fact]
     public void GetTextOnlyUnavailabilityReason_NullCredential_ReturnsReason()
     {
         var runner = new GeminiAgentRunner();
-        Assert.Equal("GEMINI_API_KEY is required",
+        Assert.Equal(ExpectedMissingReason,
             runner.GetTextOnlyUnavailabilityReason(credential: null));
     }
 
@@ -432,17 +441,16 @@ public sealed class GeminiAgentRunnerTests
             new Dictionary<string, string>(),
             new Dictionary<string, string>());
 
-        Assert.Equal("GEMINI_API_KEY is required",
+        Assert.Equal(ExpectedMissingReason,
             runner.GetTextOnlyUnavailabilityReason(cred));
     }
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_OAuthOnlyCredentials_ReturnsReason()
+    public void GetTextOnlyUnavailabilityReason_PlaceholderEnvOnly_StillReturnsReason()
     {
-        // The bug shape this fix exists to fix: operator has OAuth-only
-        // (CODEYBOX_GEMINI_OAUTH_FILE → mounted into sandbox) but no API key.
-        // The probe must mark Gemini as unavailable so the router walks past
-        // it to Claude/Codex.
+        // A leftover unused env-var (no API key, no real OAuth bundle) must
+        // not silently mark Gemini as viable — only the canonical bundle env
+        // CODEYBOX_GEMINI_OAUTH_CREDS_JSON counts.
         var runner = new GeminiAgentRunner();
         var cred = new AgentCredential(AgentKind.Gemini,
             new Dictionary<string, string>
@@ -451,7 +459,71 @@ public sealed class GeminiAgentRunnerTests
             },
             new Dictionary<string, string>());
 
-        Assert.Equal("GEMINI_API_KEY is required",
+        Assert.Equal(ExpectedMissingReason,
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthBundlePresent_ReturnsNull()
+    {
+        // Operator has subscription-OAuth creds (no API key). The conflict
+        // resolver cascade needs Gemini to be considered viable for its
+        // text-only path so it can be routed when claude/codex/etc. decline.
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = """{"access_token":"ya29.placeholder"}""",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthBundleMalformed_ReturnsReason()
+    {
+        // A malformed bundle has no extractable access_token; the runner
+        // cannot send Authorization: Bearer, so it must report unavailable.
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = "not json",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal(ExpectedMissingReason,
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthBundleMissingAccessToken_ReturnsReason()
+    {
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = """{"refresh_token":"r","expiry":123}""",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal(ExpectedMissingReason,
+            runner.GetTextOnlyUnavailabilityReason(cred));
+    }
+
+    [Fact]
+    public void GetTextOnlyUnavailabilityReason_OAuthBundleEmptyAccessToken_ReturnsReason()
+    {
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = """{"access_token":""}""",
+            },
+            new Dictionary<string, string>());
+
+        Assert.Equal(ExpectedMissingReason,
             runner.GetTextOnlyUnavailabilityReason(cred));
     }
 
@@ -476,7 +548,7 @@ public sealed class GeminiAgentRunnerTests
             new Dictionary<string, string> { ["GEMINI_API_KEY"] = "" },
             new Dictionary<string, string>());
 
-        Assert.Equal("GEMINI_API_KEY is required",
+        Assert.Equal(ExpectedMissingReason,
             runner.GetTextOnlyUnavailabilityReason(cred));
     }
 
@@ -492,6 +564,62 @@ public sealed class GeminiAgentRunnerTests
         var result = await runner.RunTextOnlyAsync("hello", cred);
         Assert.False(result.Success);
         Assert.Contains("GEMINI_API_KEY", result.Error);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_OAuthOnlyBundle_DoesNotShortCircuitAsMissingCredential()
+    {
+        // With a valid OAuth-only bundle (no GEMINI_API_KEY), RunTextOnlyAsync
+        // must not return the "missing credential" failure — it must instead
+        // proceed to the Code Assist HTTP call. The call itself will fail
+        // (the placeholder token is rejected upstream / no network reachable
+        // from the unit test), but the failure shape must be the HTTP path,
+        // not the early-return guard. This is what makes the conflict
+        // resolver cascade routable to gemini under subscription OAuth.
+        var runner = new GeminiAgentRunner();
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = """{"access_token":"ya29.placeholder"}""",
+            },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        // The early-return guard would have produced this exact summary;
+        // assert we got past it.
+        Assert.NotEqual("missing Gemini text-only credential", result.Summary);
+    }
+
+    // ── ExtractResponseText shape handling ────────────────────────────────────
+
+    [Fact]
+    public void ExtractResponseText_PublicShape_ReturnsConcatenatedParts()
+    {
+        // generativelanguage.googleapis.com :generateContent — flat shape.
+        const string json = """
+            {"candidates":[{"content":{"parts":[{"text":"hello "},{"text":"world"}]}}]}
+            """;
+        Assert.Equal("hello world", GeminiAgentRunner.ExtractResponseText(json));
+    }
+
+    [Fact]
+    public void ExtractResponseText_CodeAssistWrappedShape_ReturnsConcatenatedParts()
+    {
+        // cloudcode-pa.googleapis.com v1internal:generateContent wraps the
+        // payload in {"response": {...}} — the OAuth path used by the
+        // subscription-OAuth fallback. Without this unwrap, callers would
+        // silently get empty text and the resolver would commit nothing.
+        const string json = """
+            {"response":{"candidates":[{"content":{"parts":[{"text":"resolved"}]}}]}}
+            """;
+        Assert.Equal("resolved", GeminiAgentRunner.ExtractResponseText(json));
+    }
+
+    [Fact]
+    public void ExtractResponseText_UnknownShape_ReturnsEmpty()
+    {
+        Assert.Equal(string.Empty, GeminiAgentRunner.ExtractResponseText("""{"foo":"bar"}"""));
     }
 
     // ── Credential provider ───────────────────────────────────────────────────
