@@ -363,6 +363,9 @@ public sealed class GeminiOauthCredentialFileRefresher
     /// <summary>Fallback token lifetime used when the CLI-refreshed file carries no expiry.</summary>
     internal static readonly TimeSpan FallbackTokenLifetime = TimeSpan.FromHours(1);
 
+    /// <summary>Maximum response body size in bytes accepted from the OAuth refresh endpoint.</summary>
+    internal const int MaxRefreshBodyBytes = 8192;
+
     private readonly string _refreshEndpoint;
     private readonly string? _fallbackClientId;
     private readonly string? _fallbackClientSecret;
@@ -425,7 +428,7 @@ public sealed class GeminiOauthCredentialFileRefresher
                 var reparsed = ParseCreds(raw);
                 if (!string.IsNullOrEmpty(reparsed.AccessToken))
                 {
-                    var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow() + FallbackTokenLifetime;
+                    var expiresAt = reparsed.ExpiresAt ?? (TimeProvider.GetUtcNow() + FallbackTokenLifetime);
                     var expiresIn = expiresAt - TimeProvider.GetUtcNow();
                     if (expiresIn <= TimeSpan.Zero) expiresIn = FallbackTokenLifetime;
                     return new RefreshResult(reparsed.AccessToken, reparsed.RefreshToken, expiresIn);
@@ -452,7 +455,10 @@ public sealed class GeminiOauthCredentialFileRefresher
         if (resp.StatusCode != HttpStatusCode.OK)
             return new RefreshResult(null, null, TimeSpan.Zero);
 
-        var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var bodyBytes = await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+        if (bodyBytes.Length > MaxRefreshBodyBytes)
+            return new RefreshResult(null, null, TimeSpan.Zero);
+        var body = System.Text.Encoding.UTF8.GetString(bodyBytes);
         using var doc = JsonDocument.Parse(body);
         var newAccess = TryString(doc.RootElement, "access_token");
         var newRefresh = TryString(doc.RootElement, "refresh_token");
@@ -492,19 +498,29 @@ public sealed class GeminiOauthCredentialFileRefresher
                     FileName = cliPath,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                    RedirectStandardOutput = false,
-                    RedirectStandardError = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
-                proc = Process.Start(psi)!;
+                var environment = new Dictionary<string, string?>();
+                foreach (var key in new[] { "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL" })
+                {
+                    var val = Environment.GetEnvironmentVariable(key);
+                    if (val is not null) environment[key] = val;
+                }
+                foreach (var kv in environment) psi.Environment[kv.Key] = kv.Value;
+                proc = Process.Start(psi);
+                if (proc is null) return false;
+                _ = proc.StandardOutput.ReadToEndAsync(CancellationToken.None);
+                _ = proc.StandardError.ReadToEndAsync(CancellationToken.None);
                 await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
                 return proc.ExitCode == 0;
             }
             catch (Exception ex) when (ex is OperationCanceledException or IOException
                 or InvalidOperationException or System.ComponentModel.Win32Exception)
             {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
+                try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
                 return false;
             }
             finally
@@ -542,7 +558,7 @@ public sealed class GeminiOauthCredentialFileRefresher
             if (proc is null) return null;
             if (!proc.WaitForExit(WhichTimeout))
             {
-                try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
+                try { proc.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
                 return null;
             }
             if (proc.ExitCode == 0)
@@ -552,7 +568,8 @@ public sealed class GeminiOauthCredentialFileRefresher
             }
         }
         catch (Exception ex) when (ex is IOException or InvalidOperationException
-            or System.ComponentModel.Win32Exception) { }
+            or System.ComponentModel.Win32Exception)
+        { }
         return null;
     }
 

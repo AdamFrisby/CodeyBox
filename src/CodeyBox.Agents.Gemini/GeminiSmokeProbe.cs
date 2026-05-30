@@ -16,9 +16,9 @@ namespace CodeyBox.Agents.Gemini;
 /// <list type="number">
 ///   <item><c>GEMINI_API_KEY</c> — sent as <c>x-goog-api-key</c> header (API-key auth).</item>
 ///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
-///   contents (env-var name must stay in sync with
-///   <c>GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar</c> in
-///   CodeyBox.Orchestrator); the <c>access_token</c> field is extracted and sent as
+///   contents (env-var name sourced from
+///   <c>CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar</c>);
+///   the <c>access_token</c> field is extracted and sent as
 ///   <c>Authorization: Bearer &lt;token&gt;</c> (OAuth auth).</item>
 /// </list>
 ///
@@ -54,7 +54,7 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
             if (!string.IsNullOrEmpty(apiKey))
                 return await ProbeWithApiKeyAsync(apiKey!, ct, sw);
 
-            if (credential.EnvironmentVariables.TryGetValue("CODEYBOX_GEMINI_OAUTH_CREDS_JSON", out var oauthJson)
+            if (credential.EnvironmentVariables.TryGetValue(CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar, out var oauthJson)
                 && !string.IsNullOrEmpty(oauthJson))
             {
                 var accessToken = ExtractAccessToken(oauthJson!, _log);

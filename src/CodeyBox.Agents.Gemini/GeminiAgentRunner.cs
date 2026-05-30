@@ -62,7 +62,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // operators using GEMINI_API_KEY); the CLI will fall back to whichever
         // env-var auth path the credential pipeline plugged in.
         if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey("CODEYBOX_GEMINI_OAUTH_CREDS_JSON"))
+            || !credential.EnvironmentVariables.ContainsKey(CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar))
             return null;
 
         var script =

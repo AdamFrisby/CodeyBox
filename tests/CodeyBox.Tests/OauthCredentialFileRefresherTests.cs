@@ -293,20 +293,28 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         var path = WriteCreds("oauth_creds.json", staleJson);
         using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
         var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+        var cliCalled = 0;
         using var refresher = new GeminiOauthCredentialFileRefresher(
             source,
             new RefresherFakeHttpClientFactory("agent-quota", handler),
             NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
             cliTokenRefresher: _ =>
             {
+                cliCalled++;
                 File.WriteAllText(path, """{"access_token":"cli-fresh-token","refresh_token":"rt-2"}""");
                 return Task.FromResult(true);
             });
 
         var token = await refresher.GetAccessTokenAsync();
-
         Assert.Equal("cli-fresh-token", token);
+        Assert.Equal(1, cliCalled);
         Assert.Empty(handler.Requests);
+
+        // Second call must serve from the in-process cache (FallbackTokenLifetime)
+        // without re-invoking the CLI.
+        var token2 = await refresher.GetAccessTokenAsync();
+        Assert.Equal("cli-fresh-token", token2);
+        Assert.Equal(1, cliCalled);
     }
 
     [Fact]
@@ -355,6 +363,34 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Equal("cli-refreshed", token);
         Assert.Equal(1, cliCalled);
         Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_WhenHttpFails_DoesNotFallBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old-access", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        // HTTP returns 401 — credentials were revoked or misconfigured.
+        var handler = new RefresherCapturingHandler(HttpStatusCode.Unauthorized, "{}");
+        var cliCalled = 0;
+        var log = new CountingLogger<GeminiOauthCredentialFileRefresher>();
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            log,
+            cliTokenRefresher: _ =>
+            {
+                cliCalled++;
+                File.WriteAllText(path, """{"access_token":"cli-fresh","expiry_date":9999999999999}""");
+                return Task.FromResult(true);
+            });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Null(token);
+        Assert.Equal(0, cliCalled);
+        Assert.True(log.WarningCount >= 1);
     }
 
     // ── CLI refresh handler (TryCreateCliRefreshHandler / ResolveGeminiCliPath) ─
