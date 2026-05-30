@@ -6,6 +6,7 @@ using CodeyBox.Agents.Opencode;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 

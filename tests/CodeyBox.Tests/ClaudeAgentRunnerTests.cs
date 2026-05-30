@@ -330,6 +330,49 @@ public sealed class ClaudeAgentRunnerTests
         var interfaces = typeof(ClaudeAgentRunner).GetInterfaces();
         Assert.DoesNotContain(typeof(ITextOnlyAgentRunner), interfaces);
     }
+
+    // ── Text-only model plumbing ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task RunTextOnlyAsync_ConfiguredDefault_SetsModelInRequestBody()
+    {
+        // When a default is configured, the text-only call proceeds past the
+        // model-resolve guard (though the sandbox-less HTTP call will fail
+        // against a bogus endpoint — we pin that the failure is NOT the new
+        // "no default configured" guard).
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = "claude-haiku-4-5",
+            });
+        var runner = new ClaudeAgentRunner(defaults);
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        Assert.DoesNotContain("no default configured", result.Summary);
+        Assert.DoesNotContain("no default configured", result.Error);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_MissingDefault_ReturnsError()
+    {
+        // When no default is configured and no modelId is passed, the new
+        // guard must return a meaningful error instead of sending model=null
+        // to the Anthropic API.
+        var runner = new ClaudeAgentRunner();
+        var cred = new AgentCredential(AgentKind.Claude,
+            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred);
+
+        Assert.False(result.Success);
+        Assert.Contains("no default configured", result.Error);
+    }
 }
 
 internal sealed class RecordingRotationPusher : IClaudeTokenRotationPusher
