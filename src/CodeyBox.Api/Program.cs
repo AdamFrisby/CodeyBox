@@ -855,6 +855,16 @@ builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
 builder.Services.AddSingleton<AgentConcurrencySnapshot>(sp =>
     new AgentConcurrencySnapshot(sp.GetRequiredService<AgentConcurrencyOptions>()));
 
+// IncrementalRebaseSnapshot — hot-reloadable feature flag for the
+// between-iteration incremental rebase. Same swappable-singleton pattern as
+// AgentConcurrencySnapshot: PipelineRunner reads through it, and the
+// hot-reload coordinator publishes new values on Replace so an edit to
+// CodeyBox:IncrementalRebase takes effect on the next audit iteration
+// without a process restart.
+builder.Services.AddSingleton<IncrementalRebaseSnapshot>(sp =>
+    new IncrementalRebaseSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.IncrementalRebase));
+
 // AgentDefaultsSnapshot — per-agent default model ids, swappable by the
 // hot-reload coordinator. Every runner reads through this same instance so
 // an operator edit to CodeyBox:AgentDefaults takes effect on the next
@@ -1468,7 +1478,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IPreMergeVerifier>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetService<IAgentUsageStore>(),
-    sp.GetService<IAgentBudgetProvider>()));
+    sp.GetService<IAgentBudgetProvider>(),
+    sp.GetRequiredService<IncrementalRebaseSnapshot>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1599,7 +1610,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         defaults: sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
         costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
         pricingState: pricingState,
-        budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>());
+        budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
+        incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2381,6 +2393,15 @@ namespace CodeyBox.Api
         /// values are cross-checked against the provider's live model list.
         /// </summary>
         public ConfigValidationOptions ConfigValidation { get; set; } = new();
+
+        /// <summary>
+        /// Between-iteration incremental rebase toggle. When enabled,
+        /// <see cref="CodeyBox.Orchestrator.PipelineRunner"/> runs the
+        /// pickup-time rebase flow as best-effort between audit iterations
+        /// so the work branch stays close to base BETWEEN reworks (smaller
+        /// and rarer merge-time conflicts). Off by default. Hot-reloadable.
+        /// </summary>
+        public IncrementalRebaseOptions IncrementalRebase { get; set; } = new();
     }
 
     /// <summary>

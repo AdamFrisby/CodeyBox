@@ -70,6 +70,11 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly AgentAvailabilityRegistry? _availability;
     private readonly IPreMergeVerifier? _preMergeVerifier;
+    // Hot-reloadable feature flag for the between-iteration incremental
+    // rebase. Optional: when null the feature is disabled regardless of
+    // config — tests and embeddings that don't wire the snapshot keep the
+    // pre-feature behaviour.
+    private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverCascadeAsync to
     // route the pickup-time rebase resolver away from agents whose
     // operator-configured cap is at ceiling. The cap is shorthand for "this
@@ -176,7 +181,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IPreMergeVerifier? preMergeVerifier = null,
         AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
         IAgentUsageStore? usageStore = null,
-        IAgentBudgetProvider? budgetProvider = null)
+        IAgentBudgetProvider? budgetProvider = null,
+        IncrementalRebaseSnapshot? incrementalRebase = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -242,6 +248,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
+        _incrementalRebase = incrementalRebase;
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -968,7 +975,8 @@ public sealed class PipelineRunner : IPipelineRunner
         string baseBranch,
         string workBranch,
         Project project,
-        CancellationToken ct)
+        CancellationToken ct,
+        string timingPhase = "pickup")
     {
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         Validation.ValidateBranchName(workBranch, nameof(workBranch));
@@ -1010,12 +1018,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 allowAgentNetwork: false,
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
-                timingPhase: "pickup",
+                timingPhase: timingPhase,
                 baselineImageRef: item.BaselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.clone_into_sandbox",
+                _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
@@ -1047,7 +1055,7 @@ public sealed class PipelineRunner : IPipelineRunner
             IAgentRunner? rebaseReviewRunner = null;
             AgentCredential? rebaseReviewCredential = null;
             await using (var rebaseScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.rebase_work_branch_onto_base",
+                _timings, item.Id, timingPhase, "git.rebase_work_branch_onto_base",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 var rebaseResult = await RebaseCheckedOutBranchWithScopeFenceAsync(
@@ -1071,7 +1079,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 return;
 
             await using (var pushScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.force_push_rebased_work_branch",
+                _timings, item.Id, timingPhase, "git.force_push_rebased_work_branch",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(
@@ -1112,6 +1120,86 @@ public sealed class PipelineRunner : IPipelineRunner
         finally
         {
             ReleasePickupRebaseLock(lockKey, gate, lockEntered);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort incremental rebase invoked between audit iterations to
+    /// keep the work branch close to <paramref name="baseBranch"/> so the
+    /// pickup-time rebase at merge has less to consolidate (smaller and
+    /// rarer conflicts).
+    ///
+    /// <para>
+    /// Reuses the pickup-time rebase end-to-end — including the per-repo
+    /// lock, the text-only resolver cascade, the scope-fence verification,
+    /// and the merge-security-review routing through the resolver that
+    /// actually resolved any conflicts. The single rebase core
+    /// (<see cref="RebaseCheckedOutBranchWithScopeFenceAsync"/>) stays
+    /// authoritative; this entry point is a gate + try/catch around the
+    /// existing flow, not a parallel implementation. The timing-phase tag is
+    /// passed through as <c>"incremental-rebase"</c> so the between-iteration
+    /// flow is distinguishable from the merge-time pickup flow in
+    /// observability (without it both flows would appear as <c>"pickup"</c>).
+    /// </para>
+    ///
+    /// <para>
+    /// Gates: a) hot-reloadable config flag — when
+    /// <see cref="IncrementalRebaseOptions.Enabled"/> is <c>false</c> or
+    /// the snapshot is unwired, returns immediately; b) only the
+    /// pickup-rebase-owned (server-owned) work branch is eligible for
+    /// sandbox force-push — non-owned branches return immediately.
+    /// </para>
+    ///
+    /// <para>
+    /// Failure mode: any non-cancellation failure (clone error, resolver
+    /// unavailable, conflict that the cascade could not resolve, security
+    /// review failure, push failure) logs a warning and returns normally.
+    /// The work item proceeds with the un-rebased branch; the merge-time
+    /// rebase at pickup is the authoritative retry. Cancellation
+    /// propagates so the surrounding audit/rework loop tears down cleanly
+    /// on shutdown or operator cancel.
+    /// </para>
+    /// </summary>
+    private async Task MaybeIncrementalRebaseAsync(
+        WorkItem item,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        Project project,
+        CancellationToken ct)
+    {
+        var snapshot = _incrementalRebase?.Current;
+        if (snapshot is null || !snapshot.Enabled)
+            return;
+
+        if (!IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+        {
+            _log.LogDebug(
+                "Skipping incremental rebase for work item {WorkItemId} branch {WorkBranch}; only {OwnedWorkBranch} is eligible",
+                item.Id,
+                workBranch,
+                DefaultWorkBranchFor(item.Id));
+            return;
+        }
+
+        try
+        {
+            await RebaseExistingWorkBranchOntoFreshBaseAsync(
+                item, runner, repoId, baseBranch, workBranch, project, ct,
+                timingPhase: "incremental-rebase");
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Incremental rebase between audit iterations failed for work item {WorkItemId} branch {WorkBranch}; continuing with un-rebased branch (the pickup-time rebase will retry at merge)",
+                item.Id,
+                workBranch);
         }
     }
 
@@ -2521,6 +2609,19 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
+
+            // Keep the work branch close to base BETWEEN audit/rework
+            // iterations so the merge-time rebase has less to consolidate
+            // (smaller and rarer conflicts). Best-effort: any failure logs a
+            // warning and the rework dispatch proceeds against the
+            // un-rebased branch. Hot-reloadable; off by default. Must run
+            // BEFORE the rework dispatch — once the agent has cloned, it is
+            // operating on a snapshot of origin and any subsequent
+            // force-push to the work branch would race the agent's working
+            // tree. Cancellation propagates so a shutdown mid-rebase tears
+            // down cleanly instead of being swallowed.
+            await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
+
             // Rework following audit iteration N is the input that will be
             // evaluated by audit iteration N+1, so emit it as iteration N+1.
             var reworkIterationNumber = iteration + 1;

@@ -1102,6 +1102,62 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_IncrementalRebasePushesToSnapshot()
+    {
+        // End-to-end: an edit to CodeyBox:IncrementalRebase must reach the
+        // live IncrementalRebaseSnapshot without a restart, so PipelineRunner
+        // — which reads through the same snapshot reference — observes the
+        // new Enabled value on the next between-iteration check. Catches
+        // plausible coordinator bugs:
+        //   - snapshot parameter not threaded through DI / ctor (silently no-ops)
+        //   - SerializeIncrementalRebase emitting a constant (no change ever detected)
+        //   - _lastIncrementalRebase not advanced (second valid edit silently skipped)
+        var initial = new CodeyBoxOptions
+        {
+            IncrementalRebase = new IncrementalRebaseOptions { Enabled = false },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new IncrementalRebaseSnapshot(
+            new IncrementalRebaseOptions { Enabled = initial.IncrementalRebase.Enabled });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            incrementalRebase: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.False(snapshot.Current.Enabled);
+
+        // Flip the flag on via hot-reload.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            IncrementalRebase = new IncrementalRebaseOptions { Enabled = true },
+        });
+        Assert.True(snapshot.Current.Enabled);
+
+        // Flip it back off — confirms _lastIncrementalRebase was advanced
+        // after the first apply, so the second edit is detected as a change
+        // rather than as a redundant repeat of the prior payload.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            IncrementalRebase = new IncrementalRebaseOptions { Enabled = false },
+        });
+        Assert.False(snapshot.Current.Enabled);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()
