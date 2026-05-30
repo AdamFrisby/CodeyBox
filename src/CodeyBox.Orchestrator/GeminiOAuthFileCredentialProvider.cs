@@ -24,8 +24,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class GeminiOAuthFileCredentialProvider : ICredentialProvider, IDisposable
 {
-    public const string OAuthCredsEnvVar = "CODEYBOX_GEMINI_OAUTH_CREDS_JSON";
-    public const string SettingsEnvVar = "CODEYBOX_GEMINI_SETTINGS_JSON";
+    public const string OAuthCredsEnvVar = CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar;
+    public const string SettingsEnvVar = CodeyBox.Core.GeminiConstants.SettingsEnvVar;
 
     private readonly CredentialFileSource _oauthSource;
     private readonly CredentialFileSource _settingsSource;

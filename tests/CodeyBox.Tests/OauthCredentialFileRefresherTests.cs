@@ -139,6 +139,375 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Single(handler.Requests);
     }
 
+    [Fact]
+    public async Task Gemini_Refresh_ConfigProvidedClientCredentials_FallbackWhenFileLacksThem()
+    {
+        // Real gemini CLI output omits client_id and client_secret.
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"new-access","expires_in":3600}""");
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: "config-secret");
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("new-access", token);
+        Assert.Single(handler.Requests);
+        var form = handler.Requests[0];
+        Assert.Contains("client_id=config-client", form);
+        Assert.Contains("client_secret=config-secret", form);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_InvokedWhenNoClientCredentialsAvailable()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed-token","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"unused","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-refreshed-token", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_ExtractsTokenFromRefreshedFile()
+    {
+        // The file on disk is stale (no client_id/client_secret). The CLI
+        // refresh rewrites the file with a fresh token. The refresher must
+        // re-read and return it.
+        var staleJson = $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""";
+        var path = WriteCreds("oauth_creds.json", staleJson);
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+
+        var freshMs = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds();
+        var freshJson = $$"""{"access_token":"cli-fresh-token","refresh_token":"rt-2","expiry_date":{{freshMs}}}""";
+
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            cliTokenRefresher: _ =>
+            {
+                // Simulate the CLI rewriting the file.
+                File.WriteAllText(path, freshJson);
+                return Task.FromResult(true);
+            });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-fresh-token", token);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_Failure_ReturnsNullAndLogsOnce()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+        var log = new CountingLogger<GeminiOauthCredentialFileRefresher>();
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            log,
+            cliTokenRefresher: _ => Task.FromResult(false));
+
+        for (int i = 0; i < 3; i++)
+            Assert.Null(await refresher.GetAccessTokenAsync());
+
+        Assert.Empty(handler.Requests);
+        Assert.Equal(1, log.WarningCount);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_ConfigCredentialsBeatCliFallback()
+    {
+        // When both config client creds and CLI refresh are available, config
+        // creds are preferred (HTTP refresh is faster and more reliable).
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"http-new-access","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: "config-secret",
+            cliTokenRefresher: _ => { cliCalled++; return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("http-new-access", token);
+        Assert.Single(handler.Requests);
+        Assert.Equal(0, cliCalled);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_ReturnsNullWhenRefreshedFileLacksAccessToken()
+    {
+        var staleJson = $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""";
+        var path = WriteCreds("oauth_creds.json", staleJson);
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+        var log = new CountingLogger<GeminiOauthCredentialFileRefresher>();
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            log,
+            cliTokenRefresher: _ =>
+            {
+                File.WriteAllText(path, """{"access_token":"","refresh_token":"rt-1","expiry_date":0}""");
+                return Task.FromResult(true);
+            });
+
+        Assert.Null(await refresher.GetAccessTokenAsync());
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_UsesFallbackLifetimeWhenExpiryMissing()
+    {
+        var staleJson = $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""";
+        var path = WriteCreds("oauth_creds.json", staleJson);
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            cliTokenRefresher: _ =>
+            {
+                cliCalled++;
+                File.WriteAllText(path, """{"access_token":"cli-fresh-token","refresh_token":"rt-2"}""");
+                return Task.FromResult(true);
+            });
+
+        var token = await refresher.GetAccessTokenAsync();
+        Assert.Equal("cli-fresh-token", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+
+        // Second call must serve from the in-process cache (FallbackTokenLifetime)
+        // without re-invoking the CLI.
+        var token2 = await refresher.GetAccessTokenAsync();
+        Assert.Equal("cli-fresh-token", token2);
+        Assert.Equal(1, cliCalled);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_OnlyClientIdProvided_WithoutFileClientId_FallsBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"http-new","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: null,
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-refreshed", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_OnlyClientSecretProvided_WithoutFileClientSecret_FallsBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"http-new","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: null,
+            geminiOauthClientSecret: "config-secret",
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-refreshed", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_WhenHttpFails_DoesNotFallBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old-access", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        // HTTP returns 401 — credentials were revoked or misconfigured.
+        var handler = new RefresherCapturingHandler(HttpStatusCode.Unauthorized, "{}");
+        var cliCalled = 0;
+        var log = new CountingLogger<GeminiOauthCredentialFileRefresher>();
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            log,
+            cliTokenRefresher: _ =>
+            {
+                cliCalled++;
+                File.WriteAllText(path, """{"access_token":"cli-fresh","expiry_date":9999999999999}""");
+                return Task.FromResult(true);
+            });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Null(token);
+        Assert.Equal(0, cliCalled);
+        Assert.True(log.WarningCount >= 1);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_WhenResponseBodyExceedsMax_ReturnsNull()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            GeminiCreds("old-access", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()));
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var oversizedBody = "{\"access_token\":\"tok\",\"expires_in\":3600" + new string(' ', 8192) + "}";
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, oversizedBody);
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance);
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Null(token);
+        Assert.Single(handler.Requests);
+    }
+
+    // ── CLI refresh handler (TryCreateCliRefreshHandler / ResolveGeminiCliPath) ─
+
+    [Fact]
+    public async Task TryCreateCliRefreshHandler_WhenScriptExitsZero_ReturnsTrue()
+    {
+        var scriptPath = WriteExecutableScript("echo done", exitCode: 0);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.True(await handler(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TryCreateCliRefreshHandler_WhenScriptExitsNonZero_ReturnsFalse()
+    {
+        var scriptPath = WriteExecutableScript("echo fail", exitCode: 1);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.False(await handler(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TryCreateCliRefreshHandler_WhenPathIsNull_ReturnsNull()
+    {
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => null!);
+        Assert.Null(handler);
+    }
+
+    [Fact]
+    public async Task TryCreateCliRefreshHandler_WhenCancellationTokenCanceled_ReturnsFalse()
+    {
+        // Use a script that sleeps so the CT fires before exit.
+        var scriptPath = WriteExecutableScript("sleep 60", exitCode: 0);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        // The external CT fires after 100 ms, well before the 30 s linked CTS timeout.
+        var result = await handler(cts.Token);
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryCreateCliRefreshHandler_ForwardsHomeEnvVarToSubprocess()
+    {
+        var sentinel = Path.Combine(_dir, $"sentinel-{Guid.NewGuid():N}.txt");
+        var isWin = OperatingSystem.IsWindows();
+        var body = isWin
+            ? $"echo %HOME% > \"{sentinel}\""
+            : $"echo \"$HOME\" > \"{sentinel}\"";
+        var scriptPath = WriteExecutableScript(body, exitCode: 0);
+        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.True(await handler(CancellationToken.None));
+        Assert.True(File.Exists(sentinel));
+        var captured = File.ReadAllText(sentinel).Trim();
+        Assert.Equal(Environment.GetEnvironmentVariable("HOME") ?? "", captured);
+    }
+
+    [Fact]
+    public void ResolveExecutablePath_WhenResolverFails_ReturnsNull()
+    {
+        var result = GeminiOauthCredentialFileRefresher.ResolveExecutablePath(
+            "no-such-resolver-command-hopefully-not-on-path", "gemini");
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ResolveExecutablePath_WhenResolverTimesOut_ReturnsNull()
+    {
+        var scriptPath = WriteExecutableScript("sleep 10", exitCode: 0);
+        var result = GeminiOauthCredentialFileRefresher.ResolveExecutablePath(scriptPath, "gemini");
+        Assert.Null(result);
+    }
+
+    private string WriteExecutableScript(string body, int exitCode)
+    {
+        var ext = OperatingSystem.IsWindows() ? ".cmd" : ".sh";
+        var scriptPath = Path.Combine(_dir, $"fake-gemini-{Guid.NewGuid():N}{ext}");
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllText(scriptPath, $"@echo off\r\n{body}\r\nexit /b {exitCode}\r\n");
+        }
+        else
+        {
+            File.WriteAllText(scriptPath, $"#!/bin/sh\n{body}\nexit {exitCode}\n");
+            File.SetUnixFileMode(scriptPath,
+                UnixFileMode.UserRead | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+        }
+        return scriptPath;
+    }
+
     // ── Claude ───────────────────────────────────────────────────────────────
 
     private static string ClaudeCreds(string access, string refresh, long expiresAtMs)

@@ -730,10 +730,19 @@ builder.Services.AddSingleton<ICodexQuotaTokenSource>(sp => new CodexOauthCreden
     sp.GetRequiredService<CodexCredentialFileSource>(),
     sp.GetRequiredService<IHttpClientFactory>(),
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexOauthCredentialFileRefresher>()));
-builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp => new GeminiOauthCredentialFileRefresher(
-    sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),
-    sp.GetRequiredService<IHttpClientFactory>(),
-    sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiOauthCredentialFileRefresher>()));
+builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    return new GeminiOauthCredentialFileRefresher(
+        sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiOauthCredentialFileRefresher>(),
+        geminiOauthClientId: Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_CLIENT_ID")
+            ?? config["CodeyBox:GeminiOauthClientId"],
+        geminiOauthClientSecret: Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_CLIENT_SECRET")
+            ?? config["CodeyBox:GeminiOauthClientSecret"],
+        cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
+});
 
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
