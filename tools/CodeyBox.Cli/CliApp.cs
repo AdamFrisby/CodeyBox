@@ -12,15 +12,19 @@ internal static class CliApp
 
     internal static Task<int> InvokeAsync(
         string[] args,
-        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null)
+        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
+        CancellationToken cancellationToken = default)
     {
-        var parser = new CommandLineBuilder(BuildRootCommand(clientFactory))
+        var parser = new CommandLineBuilder(BuildRootCommand(clientFactory, cancellationToken))
             .UseDefaults()
             .Build();
+
         return parser.InvokeAsync(args);
     }
 
-    internal static RootCommand BuildRootCommand(Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null)
+    internal static RootCommand BuildRootCommand(
+        Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
+        CancellationToken externalCancellation = default)
     {
         clientFactory ??= CodeyBoxClient.Create;
 
@@ -38,7 +42,7 @@ internal static class CliApp
         queueCmd.AddCommand(QueueShow.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueCancel.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueRetry.Build(apiUrlOpt, apiKeyOpt, clientFactory));
-        queueCmd.AddCommand(QueueWatch.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueWatch.Build(apiUrlOpt, apiKeyOpt, clientFactory, externalCancellation));
 
         root.AddCommand(queueCmd);
         root.AddCommand(ConfigureCommand.Build());

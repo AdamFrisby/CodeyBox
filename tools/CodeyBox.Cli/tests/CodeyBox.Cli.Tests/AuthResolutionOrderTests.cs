@@ -130,7 +130,7 @@ public sealed class AuthResolutionOrderTests
         {
             await CliApp.InvokeAsync(["queue", "ls"], MakeCapturingFactory());
 
-            Assert.Equal("http://localhost:5050", _capturedUrl);
+            Assert.Equal("http://localhost:5036", _capturedUrl);
         }
         finally
         {

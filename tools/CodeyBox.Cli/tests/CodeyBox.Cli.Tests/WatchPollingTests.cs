@@ -27,7 +27,7 @@ public sealed class WatchPollingTests
         try
         {
             var code = await CliApp.InvokeAsync(
-                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
                 factory);
 
             Assert.Equal(0, code);
@@ -63,10 +63,79 @@ public sealed class WatchPollingTests
         try
         {
             await CliApp.InvokeAsync(
-                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
                 factory);
 
             Assert.Equal(1, callCount);
+        }
+        finally
+        {
+            QueueWatch.PollingInterval = TimeSpan.FromSeconds(2);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Theory]
+    [InlineData("Failed")]
+    [InlineData("Cancelled")]
+    [InlineData("AuditFailed")]
+    public async Task Watch_Poll_StopsAtEachTerminalState(string terminalState)
+    {
+        var callCount = 0;
+        Func<ResolvedConfig, CodeyBoxClient> factory = config =>
+            new CodeyBoxClient(
+                new HttpClient(new FakeHttpMessageHandler(_ =>
+                {
+                    callCount++;
+                    return SampleData.WorkItemResponse(SampleData.WorkItem(terminalState));
+                }))
+                { BaseAddress = new Uri(config.ApiBaseUrl) });
+
+        QueueWatch.PollingInterval = TimeSpan.Zero;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        try
+        {
+            await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
+                factory);
+
+            Assert.Equal(1, callCount);
+        }
+        finally
+        {
+            QueueWatch.PollingInterval = TimeSpan.FromSeconds(2);
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Watch_Poll_SanitizesControlCharactersInStateOutput()
+    {
+        const string dirtyState = "Working\u0007Injected";
+        var callIndex = 0;
+        Func<ResolvedConfig, CodeyBoxClient> factory = config =>
+            new CodeyBoxClient(
+                new HttpClient(new FakeHttpMessageHandler(_ =>
+                {
+                    var state = callIndex++ == 0 ? dirtyState : "Done";
+                    return SampleData.WorkItemResponse(SampleData.WorkItem(state));
+                }))
+                { BaseAddress = new Uri(config.ApiBaseUrl) });
+
+        QueueWatch.PollingInterval = TimeSpan.Zero;
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            await CliApp.InvokeAsync(
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
+                factory);
+
+            var stdout = output.Out.ToString();
+            Assert.Contains("WorkingInjected", stdout);
+            Assert.DoesNotContain('\u0007', stdout);
+            foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                Assert.DoesNotContain('\u0007', line);
         }
         finally
         {
@@ -95,7 +164,7 @@ public sealed class WatchPollingTests
         try
         {
             await CliApp.InvokeAsync(
-                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000"],
+                ["queue", "watch", "aabbccdd-0000-0000-0000-000000000000", "--poll"],
                 factory);
 
             var workingLines = output.Out.ToString()
