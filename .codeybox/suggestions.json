@@ -1,0 +1,26 @@
+{
+  "suggestions": [
+    {
+      "title": "Cross-kind resolver fallback can't get its own env-var credentials",
+      "rationale": "AgenticConflictResolver now invokes a per-candidate credential-file materialiser before each candidate runs, so fallback CLIs that read file-based auth (e.g. ~/.claude/.credentials.json) work even when a different primary provisioned the sandbox. However, env-var credentials are baked at SandboxSpec construction time (CliAgentRunnerBase.RunAsync intentionally does NOT merge credential.EnvironmentVariables into per-exec ExtraEnvironment) and remain pinned to the primary's runner. If a class fallback requires a specific env var (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) that the primary's credential bundle didn't supply, the fallback CLI will exit on missing auth even with the materialiser hook. Real fix needs either: (a) a per-exec env-var injection path in CliAgentRunnerBase, (b) merging all-candidates env vars at sandbox-create time, or (c) recreating the sandbox when switching candidate kinds.",
+      "category": "refactor",
+      "severity": "notable",
+      "estimatedEffort": "medium",
+      "filesReferenced": [
+        "src/CodeyBox.Orchestrator/AgenticConflictResolver.cs",
+        "src/CodeyBox.Orchestrator/PipelineRunner.cs",
+        "src/CodeyBox.Agents/CliAgentRunnerBase.cs"
+      ]
+    },
+    {
+      "title": "Pickup-rebase sandbox always allocates agent credentials even on clean rebases",
+      "rationale": "The pickup-rebase sandbox now pre-resolves the primary runner's credential and bakes it into spec.Environment so the agentic conflict resolver can authenticate when (and only when) a conflict actually happens. The vast majority of pickup-rebases are conflict-free, so the credentials sit unused. Possible optimisation: resolve credentials lazily and re-create the sandbox if and only if `git rebase` exits non-zero. Tradeoff is wall-clock + a second sandbox create vs. a small steady-state cost of unused creds-on-disk; current shape is simpler and matches the work-phase pattern, but worth revisiting if pickup-rebase wall-clock becomes a perf concern.",
+      "category": "refactor",
+      "severity": "minor",
+      "estimatedEffort": "small",
+      "filesReferenced": [
+        "src/CodeyBox.Orchestrator/PipelineRunner.cs"
+      ]
+    }
+  ]
+}

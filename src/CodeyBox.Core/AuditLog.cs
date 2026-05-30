@@ -203,6 +203,33 @@ public static class AuditLog
         Audit("agent.killed_by_stuck_probe")
             .Warning("Agent {Agent} killed by stuck probe in phase {Phase}", agent.Value, phase);
 
+    /// <summary>
+    /// Per-attempt failure of the in-VM agentic conflict resolver. Carries the
+    /// full stdout/stderr tail (truncated to <see cref="TruncateAuditTail"/>'s
+    /// 2 KiB window) plus the runner kind, sandbox id, working directory, and
+    /// attempt counter so operators can diagnose without trawling logs. Emitted
+    /// at <c>Warning</c> because every emission represents an iteration that
+    /// either burned a retry slot or ended a candidate.
+    /// </summary>
+    public static void AgenticConflictResolverAttemptFailed(
+        WorkItemId workItemId,
+        AgentKind agent,
+        string sandboxId,
+        string workingDirectory,
+        int attempt,
+        int maxAttempts,
+        string reason,
+        string? stdoutTail = null,
+        string? stderrTail = null)
+    {
+        var log = Audit("agentic_conflict_resolver.attempt_failed");
+        if (stdoutTail is not null) log = log.ForContext("StdoutTail", TruncateAuditTail(stdoutTail));
+        if (stderrTail is not null) log = log.ForContext("StderrTail", TruncateAuditTail(stderrTail));
+        log.Warning(
+            "Agentic conflict resolver attempt {Attempt}/{Max} failed for work item {WorkItemId} (agent={Agent} sandbox={Sandbox} workdir={WorkDir}): {Reason}",
+            attempt, maxAttempts, workItemId.ToString(), agent.Value, sandboxId, workingDirectory, reason);
+    }
+
     // ── Sandbox lifecycle ────────────────────────────────────────────────────
 
     public static void SandboxCreated(string vmName, string? networkProfile) =>

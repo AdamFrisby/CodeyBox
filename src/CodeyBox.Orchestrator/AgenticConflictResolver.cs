@@ -135,13 +135,23 @@ public sealed class AgenticConflictResolver
 {
     private readonly AgenticConflictResolverOptionsSnapshot _options;
     private readonly ILogger _log;
+    private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
 
     public AgenticConflictResolver(
         AgenticConflictResolverOptionsSnapshot? options = null,
-        ILogger<AgenticConflictResolver>? log = null)
+        ILogger<AgenticConflictResolver>? log = null,
+        Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
+        // Optional hook the orchestrator wires in so a cross-kind candidate's
+        // file-based credentials (e.g. ~/.claude/.credentials.json) land in the
+        // sandbox before the candidate's CLI runs. The sandbox's env-var
+        // credentials are baked at create time (CliAgentRunnerBase.RunAsync
+        // documents this) and remain pinned to whichever runner the sandbox
+        // was originally provisioned for; this hook covers file-based auth
+        // which most agent CLIs also accept.
+        _credentialFileMaterialiser = credentialFileMaterialiser;
     }
 
     /// <summary>
@@ -192,6 +202,32 @@ public sealed class AgenticConflictResolver
         foreach (var candidate in candidates)
         {
             var runner = candidate.Runner;
+
+            // Cross-kind fallback: the sandbox was provisioned for whichever
+            // runner the orchestrator pre-baked at create time. Writing this
+            // candidate's file-based credentials (e.g. ~/.claude/.credentials.json)
+            // before invoking it lets a fallback CLI authenticate even when the
+            // sandbox env vars are still pinned to the primary. No-op when the
+            // candidate has no file creds or the host did not wire the hook.
+            if (_credentialFileMaterialiser is not null
+                && candidate.Credential is { Files.Count: > 0 })
+            {
+                try
+                {
+                    await _credentialFileMaterialiser(sandbox, candidate.Credential, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Agentic conflict resolver: failed to materialise file credentials for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox}); will still attempt the runner",
+                        runner.Kind.Value, workItemId, sandbox.Id);
+                }
+            }
+
             for (var attempt = 1; attempt <= maxIterations; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -223,8 +259,14 @@ public sealed class AgenticConflictResolver
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex,
-                        "Agentic conflict resolver: agent '{Agent}' threw on attempt {Attempt}/{Max} for {WorkItemId}",
-                        runner.Kind.Value, attempt, maxIterations, workItemId);
+                        "Agentic conflict resolver: agent '{Agent}' threw on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir})",
+                        runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                    AuditLog.AgenticConflictResolverAttemptFailed(
+                        workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                        attempt, maxIterations,
+                        $"threw {ex.GetType().Name}: {ex.Message}",
+                        stdoutTail: null,
+                        stderrTail: Truncate(ex.ToString(), 4096));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {ex.Message})");
                     break;
                 }
@@ -232,10 +274,27 @@ public sealed class AgenticConflictResolver
                 lastAgentResult = agentResult;
                 if (!agentResult.Success)
                 {
-                    _log.LogInformation(
-                        "Agentic conflict resolver: agent '{Agent}' reported failure on attempt {Attempt}/{Max} for {WorkItemId}: {Summary}",
-                        runner.Kind.Value, attempt, maxIterations, workItemId, agentResult.Summary);
-                    attemptTrail.Add($"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)})");
+                    // Bumped to Warning + full stdout/stderr capture: the prior
+                    // Information log + Summary-only trail made
+                    // "agent exited 1" failures impossible to diagnose without
+                    // a sandbox re-run. Operators need the runner's own output
+                    // here to see auth/network/CLI startup errors.
+                    _log.LogWarning(
+                        "Agentic conflict resolver: agent '{Agent}' reported failure on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}, model {Model}, reasoning {Reasoning}): {Summary}\n--- stdout (tail) ---\n{StdoutTail}\n--- stderr (tail) ---\n{StderrTail}",
+                        runner.Kind.Value, attempt, maxIterations, workItemId,
+                        sandbox.Id, workingDirectory,
+                        candidate.ModelId ?? "(default)", candidate.ReasoningMode ?? "(default)",
+                        agentResult.Summary,
+                        Truncate(agentResult.Stdout, 4096),
+                        Truncate(agentResult.Stderr, 4096));
+                    AuditLog.AgenticConflictResolverAttemptFailed(
+                        workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                        attempt, maxIterations,
+                        agentResult.Summary,
+                        stdoutTail: agentResult.Stdout,
+                        stderrTail: agentResult.Stderr);
+                    attemptTrail.Add(
+                        $"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)}; stderr: {Truncate(agentResult.Stderr, 200)})");
                     break;
                 }
 
@@ -256,9 +315,15 @@ public sealed class AgenticConflictResolver
 
                 lastVerificationError = verification.Reason;
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(verification.Reason, 200)})");
+                AuditLog.AgenticConflictResolverAttemptFailed(
+                    workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                    attempt, maxIterations,
+                    $"verification: {verification.Reason}",
+                    stdoutTail: agentResult.Stdout,
+                    stderrTail: agentResult.Stderr);
                 _log.LogInformation(
-                    "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId}: {Reason}",
-                    runner.Kind.Value, attempt, maxIterations, workItemId, verification.Reason);
+                    "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
+                    runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, verification.Reason);
             }
         }
 
