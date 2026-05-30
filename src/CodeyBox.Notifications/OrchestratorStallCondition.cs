@@ -36,8 +36,10 @@ public sealed class OrchestratorStallCondition : ICondition, IDisposable
 /// <summary>
 /// Notification builder for the orchestrator_stall condition.
 /// </summary>
-public sealed class OrchestratorStallNotificationBuilder : INotificationBuilder
+public sealed class OrchestratorStallNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
+    public string ConditionId => "orchestrator_stall";
+
     private readonly TimeSpan _stallThreshold;
 
     public OrchestratorStallNotificationBuilder(TimeSpan stallThreshold)

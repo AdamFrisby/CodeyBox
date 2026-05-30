@@ -29,8 +29,10 @@ public sealed class QueueEmptyCondition : ICondition, IDisposable
 /// <summary>
 /// Notification builder for the queue_empty condition.
 /// </summary>
-public sealed class QueueEmptyNotificationBuilder : INotificationBuilder
+public sealed class QueueEmptyNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
+    public string ConditionId => "queue_empty";
+
     public Notification Build(DateTimeOffset evaluatedAt) => new()
     {
         ConditionId = "queue_empty",

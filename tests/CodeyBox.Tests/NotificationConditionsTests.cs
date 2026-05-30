@@ -187,7 +187,7 @@ public sealed class NotificationConditionsTests
     }
 
     [Fact]
-    public async Task AllQuotasExhausted_ProbeThrows_ReturnsFalse()
+    public async Task AllQuotasExhausted_ProbeThrows_TreatedAsBelowThreshold()
     {
         var probes = new IAgentQuotaProbe[]
         {
@@ -199,10 +199,7 @@ public sealed class NotificationConditionsTests
             probes, 10,
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
-        // codex probe throws — treated as below threshold, but claude is below too.
-        // Wait — the exception returns false for the whole thing.
-        // Actually looking at the code: catch returns false.
-        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
 
     [Fact]

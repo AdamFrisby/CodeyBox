@@ -38,8 +38,10 @@ public sealed class SandboxLeakReapedCondition : ICondition, IDisposable
 /// <summary>
 /// Notification builder for the sandbox_leak_reaped condition.
 /// </summary>
-public sealed class SandboxLeakReapedNotificationBuilder : INotificationBuilder
+public sealed class SandboxLeakReapedNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
+    public string ConditionId => "sandbox_leak_reaped";
+
     public Notification Build(DateTimeOffset evaluatedAt) => new()
     {
         ConditionId = "sandbox_leak_reaped",

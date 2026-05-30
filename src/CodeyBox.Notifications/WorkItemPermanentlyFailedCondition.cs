@@ -48,8 +48,10 @@ public sealed class WorkItemPermanentlyFailedCondition : ICondition, IDisposable
 /// <summary>
 /// Notification builder for the work_item_permanently_failed condition.
 /// </summary>
-public sealed class WorkItemPermanentlyFailedNotificationBuilder : INotificationBuilder
+public sealed class WorkItemPermanentlyFailedNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
+    public string ConditionId => "work_item_permanently_failed";
+
     public Notification Build(DateTimeOffset evaluatedAt) => new()
     {
         ConditionId = "work_item_permanently_failed",

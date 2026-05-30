@@ -56,7 +56,7 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "AllQuotasExhaustedCondition: probe {AgentKind} failed; treating as below threshold", probe.Kind);
-                return false;
+                continue;
             }
         }
 
@@ -69,8 +69,10 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 /// <summary>
 /// Notification builder for the all_quotas_exhausted condition.
 /// </summary>
-public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder
+public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder, IConditionAwareBuilder
 {
+    public string ConditionId => "all_quotas_exhausted";
+
     private readonly IEnumerable<IAgentQuotaProbe> _probes;
     private readonly double _minQuotaPct;
 
