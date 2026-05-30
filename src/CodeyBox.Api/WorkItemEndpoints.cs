@@ -2220,10 +2220,11 @@ public sealed record CreateWorkItemRequest(
     /// field is <b>not consulted</b> during class routing: members are chosen purely by
     /// quality score, quota availability, smoke gates, and related routing rules. At pickup
     /// the orchestrator <b>rewrites</b> the persisted work item's <c>agent</c> field to
-    /// whichever class member the router actually chose. Per-agent concurrency caps apply
-    /// after routing to the chosen member and may defer the work item without picking
-    /// another class member. There is no mechanism today to hard-pin a work item to a
-    /// specific agent inside a class.
+    /// whichever class member the router actually chose. Per-agent concurrency caps
+    /// participate in routing as an additional gate: when the top-ranked eligible member
+    /// is at its cap, the router spills to the next eligible-and-free member. Only when
+    /// every eligible member is at its cap does the item defer. There is no mechanism
+    /// today to hard-pin a work item to a specific agent inside a class.
     /// </summary>
     string? Agent,
     string? AuditorProfile,

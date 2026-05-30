@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IShutdownDispatchGate
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate
 {
     // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -91,12 +91,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // dispatch time.
     private readonly AgentConcurrencySnapshot _concurrencySnapshot;
 
-    // Live in-flight count keyed by routed agent kind. Incremented after the
-    // router pins an item to a member, decremented when the worker exits.
-    // Surfaced via /concurrency and consumed by the rate-aware gate.
+    // Live in-flight count keyed by routed agent kind. For class-routed items
+    // the count is incremented atomically inside AgentClassRouter via the
+    // IAgentSlotGate (this service); for direct-agent items the orchestrator
+    // reserves the slot itself after routing. In both cases the outer finally
+    // block releases the slot. Surfaced via /concurrency and consumed by the
+    // rate-aware gate.
     private readonly ConcurrentDictionary<AgentKind, int> _runningPerAgent = new();
 
-    // Re-pickup delay applied when a routed agent's per-agent cap is at ceiling.
+    // Re-pickup delay applied when a direct-agent item hits its per-agent
+    // cap. Class-routed items use QuotaRouterOptions.CapRetryRecheckInterval
+    // (the router surfaces it via AgentRoutingDecision.SuggestedRecheckIn).
     // Short enough that the deferred item is reconsidered as soon as another
     // worker on the same agent finishes; long enough not to busy-loop.
     private static readonly TimeSpan _agentCapRetryDelay = TimeSpan.FromSeconds(15);
@@ -286,6 +291,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <summary>
+    /// <see cref="IAgentSlotGate.TryReserve"/> implementation.
     /// Atomically tries to reserve a per-agent slot for <paramref name="agent"/>.
     /// Returns true and increments the count when the routed agent has no cap
     /// or running &lt; cap; returns false when the cap is at ceiling.
@@ -297,7 +303,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// race without exceeding the cap.
     /// </para>
     /// </summary>
-    private bool TryReserveAgentSlot(AgentKind agent)
+    public bool TryReserve(AgentKind agent)
     {
         var cap = GetAgentCap(agent);
         if (cap <= 0)
@@ -325,7 +331,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private void ReleaseAgentSlot(AgentKind agent)
+    /// <summary>
+    /// <see cref="IAgentSlotGate.Release"/> implementation. Decrements the
+    /// in-flight count for <paramref name="agent"/>.
+    /// </summary>
+    public void Release(AgentKind agent)
     {
         // Decrement-or-remove: drop the key when it hits 0 so the next
         // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
@@ -666,8 +676,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // The hot-spin bug in the first revision of this code (TryAdd against an
     // existing key) is only visible across a Release-then-Reserve cycle, which
     // PinnedPipelineRunner-based integration tests do not produce.
-    internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserveAgentSlot(agent);
-    internal void ReleaseAgentSlotForTest(AgentKind agent) => ReleaseAgentSlot(agent);
+    internal bool TryReserveAgentSlotForTest(AgentKind agent) => TryReserve(agent);
+    internal void ReleaseAgentSlotForTest(AgentKind agent) => Release(agent);
 
     /// <summary>
     /// On startup, re-enqueue work items that were mid-flight when we last
@@ -1040,17 +1050,48 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             // Quota routing: resolve which agent to use, or decide to wait.
             // Skipped entirely (no probe, no wait) when no agent class is configured.
+            //
+            // We pass `this` (IAgentSlotGate) as the router's per-agent cap
+            // gate so that when the top-ranked eligible member is at its cap,
+            // routing spills to the next eligible member atomically inside
+            // the candidate walk instead of pinning the item to a saturated
+            // agent and deferring. When ResolveAsync returns Chosen != null
+            // it has already test-and-reserved the chosen member's slot via
+            // the gate; the outer finally releases on every exit path.
             if (_router is not null)
             {
-                var decision = await _router.ResolveAsync(item, project, ct);
+                var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
                 {
-                    AuditLog.QuotaRouterDeferred(item.Id, decision.SuggestedRecheckIn);
-                    ScheduleDeferredRequeue(item.Id, decision.SuggestedRecheckIn, ct);
+                    // Honour the router's suggested delay verbatim — when a
+                    // quota-passing member was at cap, the router has already
+                    // picked the short cap-retry interval; pure quota stalls
+                    // use the longer QuotaRecheckInterval. AnyMemberAtCap only
+                    // drives the per-agent ConcurrencyGated audit emission.
+                    var deferDelay = decision.SuggestedRecheckIn;
+                    if (decision.AnyMemberAtCap)
+                    {
+                        foreach (var atCapAgent in decision.AtCapAgents)
+                        {
+                            AuditLog.ConcurrencyGated(item.Id, atCapAgent,
+                                GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                        }
+                    }
+                    AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
+                    ScheduleDeferredRequeue(item.Id, deferDelay, ct);
                     return;
                 }
                 if (decision.Chosen is { } chosen)
+                {
                     item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
+                    if (decision.SlotReserved)
+                    {
+                        // Router already reserved the slot through our gate —
+                        // outer finally releases on every exit path.
+                        agentForRelease = chosen.Agent;
+                        agentSlotReserved = true;
+                    }
+                }
                 else if (decision.NoEligibleMembers)
                 {
                     _log.LogError("Work item {Id}: {Reason}", item.Id, decision.Reason);
@@ -1060,28 +1101,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
 
-            // Per-agent concurrency cap: applied after routing has settled the agent
-            // so a class-routed item is gated by the cap of the *chosen* member, not
-            // by whatever override the operator put on the work item. When the cap
-            // is hit, defer-requeue with a short delay so the next pickup (after
-            // some agent slot frees up) finds it again. Reservation is held for the
-            // life of the worker and released in the outer finally.
-            agentForRelease = item.Agent;
-            if (item.Agent is { } routedAgent)
+            // Per-agent concurrency cap reservation for items that did NOT go
+            // through class routing (no AgentClassRouter, or no class configured
+            // for this item). Class-routed items already had their slot
+            // reserved atomically inside ResolveAsync via the IAgentSlotGate;
+            // re-reserving here would double-count. When the cap is hit on a
+            // direct-agent item, defer-requeue with the short cap-retry delay
+            // so the next pickup (after some agent slot frees up) finds it
+            // again. Reservation is held for the life of the worker and
+            // released in the outer finally.
+            if (!agentSlotReserved)
             {
-                if (!TryReserveAgentSlot(routedAgent))
+                agentForRelease = item.Agent;
+                if (item.Agent is { } routedAgent)
                 {
-                    var cap = GetAgentCap(routedAgent);
-                    var running = GetRunning(routedAgent);
-                    _log.LogInformation(
-                        "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
-                        workerIndex, id, routedAgent.Value, running, cap);
-                    AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
-                    ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
-                    return;
+                    if (!TryReserve(routedAgent))
+                    {
+                        var cap = GetAgentCap(routedAgent);
+                        var running = GetRunning(routedAgent);
+                        _log.LogInformation(
+                            "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
+                            workerIndex, id, routedAgent.Value, running, cap);
+                        AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
+                        ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
+                        return;
+                    }
+                    // Reservation successful — outer finally releases on exit.
+                    agentSlotReserved = true;
                 }
-                // Reservation successful — outer finally releases on exit.
-                agentSlotReserved = true;
             }
 
             // Per-project pause gate: check before the budget lock so paused projects
@@ -1237,7 +1284,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // budget-deferred / pipeline-exception code paths.
             if (agentSlotReserved && agentForRelease is { } releaseAgent)
             {
-                ReleaseAgentSlot(releaseAgent);
+                Release(releaseAgent);
             }
 
             // Stop the heartbeat and remove the registry row on any exit path

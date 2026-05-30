@@ -318,6 +318,303 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
         Assert.Empty(state.CurrentlyRunningPerAgent);
     }
 
+    [Fact]
+    public async Task PerAgentCap_SpillsToNextEligibleMember_WhenTopIsSaturated()
+    {
+        // Acceptance scenario from the spill spec: class with A(QS95, cap=1)
+        // and B(QS90, cap=2) and 3 ready items — item1 routes to A, items 2&3
+        // SPILL to B instead of deferring on A. Pre-spill behavior deferred
+        // items 2&3 until A's slot freed up; we assert at least two distinct
+        // agents are seen running at the same time, which proves spill.
+        var cls = new AgentClass
+        {
+            Id = "spill",
+            DisplayName = "Spill",
+            Members =
+            [
+                new AgentMembership { Agent = Codex,  Billing = AgentBilling.Subscription, QualityScore = 95 },
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+        };
+
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                ["codex"]  = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+                ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 2 },
+            }
+        };
+
+        var probes = new IAgentQuotaProbe[]
+        {
+            new FakeProbe(Codex, 90.0),
+            new FakeProbe(Claude, 90.0),
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            probes,
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var pipeline = new PinnedPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var orchestrator = new OrchestratorService(
+            queue, _store, pipeline, reg,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            agentConcurrency: concurrency);
+
+        // 3 items into the same class. Without spill, only one would run
+        // (the others queue on Codex's cap=1); with spill, all three run
+        // concurrently (1 Codex + 2 Claude).
+        var i1 = Item("a") with { AgentClassId = "spill" };
+        var i2 = Item("b") with { AgentClassId = "spill" };
+        var i3 = Item("c") with { AgentClassId = "spill" };
+        foreach (var it in new[] { i1, i2, i3 })
+        {
+            await _store.CreateAsync(it);
+            await queue.EnqueueAsync(it.Id);
+        }
+
+        await orchestrator.StartAsync(CancellationToken.None);
+
+        // Wait until all three items are in-flight simultaneously.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        int observedCodex = 0, observedClaude = 0, observedTotal = 0;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var snap = orchestrator.Snapshot();
+            observedCodex = Math.Max(observedCodex, snap.GetValueOrDefault(Codex));
+            observedClaude = Math.Max(observedClaude, snap.GetValueOrDefault(Claude));
+            observedTotal = Math.Max(observedTotal, snap.Values.Sum());
+            if (observedTotal >= 3) break;
+            await Task.Delay(25);
+        }
+
+        try
+        {
+            // Spill working: Codex hit its cap=1 AND Claude has 2 items running.
+            Assert.Equal(1, observedCodex);
+            Assert.Equal(2, observedClaude);
+            Assert.Equal(3, observedTotal);
+
+            // Per-item agent assignment: exactly one item routed to Codex
+            // (the top-scoring member, picked first) and the other two
+            // spilled to Claude. Without spill, items 2&3 would have stayed
+            // Queued and their Agent field would be null.
+            var snap1 = await _store.GetAsync(i1.Id);
+            var snap2 = await _store.GetAsync(i2.Id);
+            var snap3 = await _store.GetAsync(i3.Id);
+            var agents = new[] { snap1?.Agent, snap2?.Agent, snap3?.Agent };
+            Assert.Equal(1, agents.Count(a => a == Codex));
+            Assert.Equal(2, agents.Count(a => a == Claude));
+        }
+        finally
+        {
+            pipeline.Release();
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task PerAgentCap_AllMembersAtCap_DefersWithoutChoosingASaturatedMember()
+    {
+        // When every class member is at its cap, the item defers — the router
+        // returns ShouldWait+AnyMemberAtCap=true. We assert that the work
+        // item stays Queued (does not transition to Working) while every
+        // member is saturated.
+        var cls = new AgentClass
+        {
+            Id = "saturated",
+            DisplayName = "Saturated",
+            Members =
+            [
+                new AgentMembership { Agent = Codex,  Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                ["codex"]  = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+                ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+            }
+        };
+
+        var probes = new IAgentQuotaProbe[]
+        {
+            new FakeProbe(Codex, 90.0),
+            new FakeProbe(Claude, 90.0),
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            probes,
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var pipeline = new PinnedPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var orchestrator = new OrchestratorService(
+            queue, _store, pipeline, reg,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            agentConcurrency: concurrency);
+
+        // Pre-saturate both agents' caps via the test reservation API.
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Claude));
+
+        // Enqueue one item; with both caps saturated, it should defer rather
+        // than be picked up.
+        var deferred = Item("d") with { AgentClassId = "saturated" };
+        await _store.CreateAsync(deferred);
+        await queue.EnqueueAsync(deferred.Id);
+
+        await orchestrator.StartAsync(CancellationToken.None);
+
+        try
+        {
+            // Give the dispatcher a moment to attempt and defer.
+            await Task.Delay(300);
+
+            // Item must still be Queued (deferred) — never assigned to either
+            // already-at-cap agent, and never transitioned to Working.
+            var snap = await _store.GetAsync(deferred.Id);
+            Assert.NotNull(snap);
+            Assert.Equal(WorkItemState.Queued, snap!.State);
+
+            // Total in-flight count from this test's pre-reservations is 2;
+            // the dispatcher did not increment it for the deferred item.
+            var state = orchestrator.GetConcurrencyState();
+            Assert.Equal(1, state.CurrentlyRunningPerAgent["codex"]);
+            Assert.Equal(1, state.CurrentlyRunningPerAgent["claude"]);
+        }
+        finally
+        {
+            orchestrator.ReleaseAgentSlotForTest(Codex);
+            orchestrator.ReleaseAgentSlotForTest(Claude);
+            pipeline.Release();
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task PerAgentCap_AllAtCap_UsesShortCapRetryDelay_NotQuotaRecheckInterval()
+    {
+        // Behaviour guard for the router→orchestrator cap-retry plumbing.
+        // The router signals AnyMemberAtCap with SuggestedRecheckIn=CapRetryRecheckInterval
+        // (we configure 200ms) instead of the QuotaRecheckInterval (60s). If the
+        // orchestrator ignored the suggestion and waited the longer quota interval,
+        // the item would still be Queued at our 1.5s deadline — the test would fail.
+        var cls = new AgentClass
+        {
+            Id = "cap-retry",
+            DisplayName = "CapRetry",
+            Members =
+            [
+                new AgentMembership { Agent = Codex,  Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                ["codex"]  = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+                ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+            }
+        };
+        var probes = new IAgentQuotaProbe[]
+        {
+            new FakeProbe(Codex, 90.0),
+            new FakeProbe(Claude, 90.0),
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            probes,
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 5.0,
+                QuotaRecheckInterval = TimeSpan.FromSeconds(60),
+                CapRetryRecheckInterval = TimeSpan.FromMilliseconds(200),
+            },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var pipeline = new PinnedPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var orchestrator = new OrchestratorService(
+            queue, _store, pipeline, reg,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            agentConcurrency: concurrency);
+
+        // Saturate both members.
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Claude));
+
+        var item = Item("d") with { AgentClassId = "cap-retry" };
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await orchestrator.StartAsync(CancellationToken.None);
+
+        try
+        {
+            // The item must defer on first attempt (everything at cap). We
+            // detect successful re-pickup by polling the per-agent running
+            // counter: PinnedPipelineRunner blocks until Release, so the
+            // work item's State stays Queued throughout, but the orchestrator
+            // increments the running count the moment the router reserves a
+            // slot during pickup.
+            await Task.Delay(100);
+            // Pre-release sanity: only the two test pre-reservations are visible.
+            var pre = orchestrator.Snapshot();
+            Assert.Equal(1, pre.GetValueOrDefault(Codex));
+            Assert.Equal(1, pre.GetValueOrDefault(Claude));
+
+            // Now free Codex so the cap-retry re-pickup can route there.
+            orchestrator.ReleaseAgentSlotForTest(Codex);
+
+            // Within the cap-retry window (200ms) + a small scheduling jitter
+            // budget, the deferred item must re-attempt pickup and reserve
+            // Codex's slot. If the orchestrator had used the 60s quota
+            // interval, Codex's in-flight count would still be 0 at the
+            // deadline. We wait up to 2s — well under the 60s quota window
+            // but well over the 200ms cap-retry interval.
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+            int observedCodex = 0;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                observedCodex = orchestrator.Snapshot().GetValueOrDefault(Codex);
+                if (observedCodex >= 1) break;
+                await Task.Delay(25);
+            }
+            Assert.Equal(1, observedCodex);
+
+            // Cross-check: the work item's stamped Agent field reflects the
+            // chosen-and-reserved member from the re-pickup (router writes
+            // it via UpdateAsync alongside StartedAt).
+            var snap = await _store.GetAsync(item.Id);
+            Assert.Equal(Codex, snap!.Agent);
+        }
+        finally
+        {
+            // Pipeline released so the in-flight worker drains; both agent
+            // slots are released by the orchestrator's outer finally.
+            pipeline.Release();
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+    }
+
     private static AgentClass SingleAgentClass(string classId, AgentKind agent) => new()
     {
         Id = classId,

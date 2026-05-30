@@ -72,7 +72,7 @@ public sealed class AgentClassRouterCapSpillTests
         {
             MinQuotaPct = 10.0,
             QuotaRecheckInterval = TimeSpan.FromMinutes(5),
-            CapRetryInterval = TimeSpan.FromSeconds(15),
+            CapRetryRecheckInterval = TimeSpan.FromSeconds(15),
         };
         return new AgentClassRouter(
             catalog, probes, opts,
@@ -155,7 +155,7 @@ public sealed class AgentClassRouterCapSpillTests
             {
                 MinQuotaPct = 10.0,
                 QuotaRecheckInterval = quotaRecheck,
-                CapRetryInterval = capRetry,
+                CapRetryRecheckInterval = capRetry,
             });
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
@@ -190,7 +190,7 @@ public sealed class AgentClassRouterCapSpillTests
             {
                 MinQuotaPct = 10.0,
                 QuotaRecheckInterval = quotaRecheck,
-                CapRetryInterval = capRetry,
+                CapRetryRecheckInterval = capRetry,
             });
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
@@ -227,7 +227,7 @@ public sealed class AgentClassRouterCapSpillTests
             {
                 MinQuotaPct = 10.0,
                 QuotaRecheckInterval = quotaRecheck,
-                CapRetryInterval = capRetry,
+                CapRetryRecheckInterval = capRetry,
             },
             budgetProvider: budgetProvider);
 
@@ -351,7 +351,7 @@ public sealed class AgentClassRouterCapSpillTests
             MinQuotaPct = 10.0,
             QuotaRecheckInterval = TimeSpan.FromMinutes(5),
             ObservedFailureWindow = TimeSpan.FromMinutes(10),
-            CapRetryInterval = TimeSpan.FromSeconds(15),
+            CapRetryRecheckInterval = TimeSpan.FromSeconds(15),
         };
         var router = new AgentClassRouter(
             [cls],
@@ -397,7 +397,7 @@ public sealed class AgentClassRouterCapSpillTests
             MinQuotaPct = 10.0,
             QuotaRecheckInterval = TimeSpan.FromMinutes(5),
             ObservedFailureWindow = TimeSpan.FromMinutes(10),
-            CapRetryInterval = TimeSpan.FromSeconds(15),
+            CapRetryRecheckInterval = TimeSpan.FromSeconds(15),
         };
         var router = new AgentClassRouter(
             [cls],
@@ -491,7 +491,7 @@ public sealed class AgentClassRouterCapSpillTests
             {
                 MinQuotaPct = 10.0,
                 QuotaRecheckInterval = quotaRecheck,
-                CapRetryInterval = capRetry,
+                CapRetryRecheckInterval = capRetry,
             });
 
         var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
