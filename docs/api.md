@@ -767,7 +767,7 @@ Returns `202 Accepted` on success, `400 Bad Request` for malformed
 
 ### `PATCH /workitems/{id}`
 
-Partially update a **Queued** work item's editable fields. Only fields
+Partially update a work item's editable fields. Only fields
 provided (non-null) in the body are updated.
 
 ```json
@@ -778,15 +778,17 @@ provided (non-null) in the body are updated.
   "workTimeoutMinutes": 240,
   "mergeTimeoutMinutes": 60,
   "minModelScore": 70,
-  "requiredCapabilities": ["sensitive"]
+  "requiredCapabilities": ["sensitive"],
+  "dependsOn": ["<id-or-externalId>", "..."]
 }
 ```
 
 * Returns `200 OK` with the updated work item record.
-* Returns `409 Conflict` when the item is not in `Queued` state (in-flight items are read-only).
+* Returns `409 Conflict` for non-`dependsOn` fields when the item is not in `Queued` state (in-flight items are read-only). `dependsOn` is allowed on any **non-terminal** state and returns `409` only on terminal items.
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
 * `workTimeoutMinutes` is clamped to `[1, 480]`, `mergeTimeoutMinutes` to `[1, 240]`, `minModelScore` to `[0, 200]` — out-of-range values pin to the boundary rather than 400, matching the creation surface. This lets an operator bulk-PATCH the queue after a defaults bump without special-casing stray inputs.
 * `requiredCapabilities` is the explicit clearance/trust gate (see [agent-classes.md](agent-classes.md#capability-gate)). Tags are trimmed, de-duplicated case-insensitively, and validated for length (≤64 chars) and count (≤16 entries). Sending the field replaces the existing list; omit it to leave the list unchanged.
+* `dependsOn` is replace-set semantics: the array overwrites the item's full dependency list. Each entry is a GUID, a namespaced `ns:value` externalId, or a bare externalId (must be unambiguous within the project). Capped at 100 entries; the create-time validation (existence, self-loop, cycle) re-runs against the proposed graph and `400`s on rejection. Pass `[]` to clear all deps. Persisted via a partial UPDATE that does not stomp `state` / `startedAt`, and a `work_item.dependencies_changed` audit-log entry records the pre/post sets.
 * Priority is not editable here — use `PATCH /workitems/{id}/priority` (works on any non-terminal state, uses a TOCTOU-safe partial UPDATE).
 
 ### `PATCH /workitems/{id}/priority`

@@ -189,6 +189,8 @@ public sealed class AgentLogPathHelpersTests : IDisposable
         public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => Task.FromResult(true);
         public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default)
             => Task.FromResult(new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null));
+        public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default)
+            => Task.FromResult(new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null));
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Empty();
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Empty();
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => Task.FromResult(0);
