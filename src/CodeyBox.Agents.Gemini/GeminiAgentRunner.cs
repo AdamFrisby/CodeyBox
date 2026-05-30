@@ -1,3 +1,4 @@
+using System.Net.Http.Headers;
 using System.Text.RegularExpressions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -148,11 +149,18 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return new AgentInvocation(argv, Stdin: prompt);
     }
 
+    // Code Assist generateContent endpoint used by the OAuth subscription path
+    // (the same v1internal family GeminiQuotaProbe / GeminiModelListProbe hit).
+    // The API-key path stays on the public generativelanguage.googleapis.com
+    // surface because that endpoint does not authenticate OAuth bearer tokens.
+    internal const string OAuthGenerateContentEndpoint =
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
     {
-        string? apiKey = null;
-        credential?.EnvironmentVariables.TryGetValue("GEMINI_API_KEY", out apiKey);
-        return string.IsNullOrEmpty(apiKey) ? "GEMINI_API_KEY is required" : null;
+        if (TryGetApiKey(credential, out _)) return null;
+        if (TryGetOAuthAccessToken(credential, out _)) return null;
+        return "GEMINI_API_KEY or Gemini OAuth credentials are required";
     }
 
     public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
@@ -167,11 +175,29 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         _ = sandbox;
         _ = workingDirectory;
         _ = reasoningMode;
-        string? apiKey = null;
-        credential?.EnvironmentVariables.TryGetValue("GEMINI_API_KEY", out apiKey);
-        if (string.IsNullOrEmpty(apiKey))
-            return new TextOnlyAgentResult(false, "missing Gemini text-only credential", null, "GEMINI_API_KEY is required");
 
+        // API-key first preference: pay-per-use callers explicitly configured
+        // GEMINI_API_KEY and expect that quota to be spent, not the OAuth one.
+        if (TryGetApiKey(credential, out var apiKey))
+            return await SendApiKeyAsync(prompt, apiKey, modelId, ct).ConfigureAwait(false);
+
+        // OAuth subscription fallback: authorized for Gemini specifically (the
+        // operator note explicitly permits subscription-OAuth usage against
+        // Gemini's API directly; this is the resolver-cascade workaround until
+        // the agentic in-VM resolver lands).
+        if (TryGetOAuthAccessToken(credential, out var oauthToken))
+            return await SendOAuthAsync(prompt, oauthToken, modelId, ct).ConfigureAwait(false);
+
+        return new TextOnlyAgentResult(
+            false,
+            "missing Gemini text-only credential",
+            null,
+            "GEMINI_API_KEY or Gemini OAuth credentials are required");
+    }
+
+    private static async Task<TextOnlyAgentResult> SendApiKeyAsync(
+        string prompt, string apiKey, string? modelId, CancellationToken ct)
+    {
         try
         {
             var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
@@ -205,6 +231,72 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             return new TextOnlyAgentResult(false, "Gemini text-only call failed", null, ex.Message);
         }
+    }
+
+    private static async Task<TextOnlyAgentResult> SendOAuthAsync(
+        string prompt, string accessToken, string? modelId, CancellationToken ct)
+    {
+        try
+        {
+            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
+            // Code Assist wraps the GenerateContent body in {model, request}
+            // (see GeminiQuotaProbe.ProbeOneAsync for the canonical shape).
+            var body = JsonSerializer.Serialize(new
+            {
+                model = $"models/{effectiveModel}",
+                request = new
+                {
+                    contents = new[]
+                    {
+                        new
+                        {
+                            role = "user",
+                            parts = new[] { new { text = prompt } },
+                        },
+                    },
+                    generationConfig = new { maxOutputTokens = 8192 },
+                },
+            });
+            using var request = new HttpRequestMessage(HttpMethod.Post, OAuthGenerateContentEndpoint)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return new TextOnlyAgentResult(false, $"Gemini text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
+
+            return new TextOnlyAgentResult(true, "ok", ExtractResponseText(responseText), null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new TextOnlyAgentResult(false, "Gemini text-only call failed", null, ex.Message);
+        }
+    }
+
+    private static bool TryGetApiKey(AgentCredential? credential, out string apiKey)
+    {
+        apiKey = "";
+        if (credential is null) return false;
+        if (!credential.EnvironmentVariables.TryGetValue("GEMINI_API_KEY", out var v) || string.IsNullOrEmpty(v))
+            return false;
+        apiKey = v;
+        return true;
+    }
+
+    private static bool TryGetOAuthAccessToken(AgentCredential? credential, out string accessToken)
+    {
+        accessToken = "";
+        if (credential is null) return false;
+        if (!credential.EnvironmentVariables.TryGetValue(CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar, out var bundle)
+            || string.IsNullOrEmpty(bundle))
+            return false;
+        var token = GeminiSmokeProbe.ExtractAccessToken(bundle);
+        if (string.IsNullOrEmpty(token)) return false;
+        accessToken = token!;
+        return true;
     }
 
     public override async Task<AgentResult> RunAsync(
@@ -320,11 +412,21 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             : "…" + collapsed[^(FailureSummaryTailMaxChars - 1)..];
     }
 
-    private static string ExtractResponseText(string responseText)
+    internal static string ExtractResponseText(string responseText)
     {
         using var doc = JsonDocument.Parse(responseText);
         var parts = new List<string>();
-        if (!doc.RootElement.TryGetProperty("candidates", out var candidates)
+        // Code Assist's v1internal:generateContent wraps its payload in
+        // {"response": {"candidates": [...]}}; the public v1beta endpoint
+        // returns {"candidates": [...]} directly. Accept either.
+        var root = doc.RootElement;
+        if (root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("response", out var wrapped)
+            && wrapped.ValueKind == JsonValueKind.Object)
+        {
+            root = wrapped;
+        }
+        if (!root.TryGetProperty("candidates", out var candidates)
             || candidates.ValueKind != JsonValueKind.Array)
             return string.Empty;
 
