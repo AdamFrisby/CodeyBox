@@ -1,0 +1,63 @@
+# R8-resilience: per-agent-CLI suspend survival matrix against real multipass +
+# provider credentials. Slow and cost-bearing — run on schedule or manual dispatch.
+#
+# Required repository secrets (or vars) on the runner:
+#   CODEYBOX_CLAUDE_API_KEY, CODEYBOX_CODEX_API_KEY, CODEYBOX_GEMINI_API_KEY
+#   CODEYBOX_CURSOR_AUTH_JSON or CODEYBOX_CURSOR_AUTH_FILE on the runner
+#   CODEYBOX_OPENCODE_AUTH_FILE (or OPENCODE_AUTH_JSON)
+#
+# The job host must have multipass installed and passwordless access to launch VMs.
+
+name: agent suspend resilience
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly Sunday 03:00 UTC — adjust if your fleet uses a different maintenance window.
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-suspend-resilience
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: agent × suspend duration smoke
+    # GitHub-hosted ubuntu-latest does not ship multipass/KVM; register a
+    # self-hosted runner with the `multipass` label (see docs/agent-suspend-resilience.md).
+    runs-on: [self-hosted, multipass]
+    timeout-minutes: 360
+    env:
+      CODEYBOX_RUN_AGENT_SUSPEND_SMOKE: "1"
+      CODEYBOX_CLAUDE_API_KEY: ${{ secrets.CODEYBOX_CLAUDE_API_KEY }}
+      CODEYBOX_CODEX_API_KEY: ${{ secrets.CODEYBOX_CODEX_API_KEY }}
+      CODEYBOX_GEMINI_API_KEY: ${{ secrets.CODEYBOX_GEMINI_API_KEY }}
+      CODEYBOX_CURSOR_AUTH_JSON: ${{ secrets.CODEYBOX_CURSOR_AUTH_JSON }}
+      CODEYBOX_OPENCODE_AUTH_FILE: ${{ secrets.CODEYBOX_OPENCODE_AUTH_FILE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: multipass version
+        run: multipass version
+
+      - name: build
+        run: dotnet build tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release
+
+      - name: run suspend resilience matrix
+        run: |
+          dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj \
+            --configuration Release \
+            --no-build \
+            --filter "Category=AgentSuspendResilience" \
+            --logger "trx;LogFileName=agent-suspend-resilience.trx"
+
+      - name: upload trx
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-suspend-resilience-trx
+          path: "**/agent-suspend-resilience.trx"
+          retention-days: 14

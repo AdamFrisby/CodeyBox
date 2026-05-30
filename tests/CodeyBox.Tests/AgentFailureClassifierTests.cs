@@ -53,6 +53,8 @@ public sealed class AgentFailureClassifierTests
     [InlineData("ECONNRESET while contacting api.anthropic.com")]
     [InlineData("Temporary failure in name resolution")]
     [InlineData("503 Service Unavailable")]
+    [InlineData("socket hang up")]
+    [InlineData("fetch failed")]
     public void NetworkPatterns_Classified_AsTransient(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);

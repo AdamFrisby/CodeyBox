@@ -84,6 +84,66 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return preparation;
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
+        return await ExecuteWithSuspendResilienceAsync(
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+    }
+
+    public virtual async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
+
+        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
+        if (preparation is not null)
+            return preparation;
+
+        var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
+        return await ExecuteWithSuspendResilienceAsync(
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+    }
+
+    private async Task<AgentResult> ExecuteWithSuspendResilienceAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentInvocation invocation,
+        Action<string>? stdoutChunkCallback,
+        CancellationToken ct)
+    {
+        var attempt = 0;
+        AgentResult? last = null;
+        while (attempt <= AgentSuspendResilience.MaxRetries)
+        {
+            last = await ExecuteInvocationOnceAsync(
+                sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+            if (last.Success || attempt >= AgentSuspendResilience.MaxRetries)
+                return last;
+
+            var classification = ((IAgentRunner)this).ClassifyFailure(last);
+            var exitCode = ParseExitCodeFromSummary(last.Summary);
+            if (!AgentSuspendResilience.ShouldRetry(Kind, classification, exitCode))
+                return last;
+
+            attempt++;
+        }
+
+        return last!;
+    }
+
+    private async Task<AgentResult> ExecuteInvocationOnceAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentInvocation invocation,
+        Action<string>? stdoutChunkCallback,
+        CancellationToken ct)
+    {
         var runKey = AgentRunKey(sandbox, workingDirectory);
         var runId = Guid.NewGuid().ToString("N");
         ActiveAgentRunIds[runKey] = runId;
@@ -221,51 +281,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return new TextOnlyAgentResult(true, "ok", output.Trim(), null);
     }
 
-    public virtual async Task<AgentResult> RunResumedAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string prompt,
-        AgentCredential? credential,
-        AgentResumeContext resume,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default,
-        Action<string>? stdoutChunkCallback = null)
+    private static int ParseExitCodeFromSummary(string summary)
     {
-        await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
-
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
-        if (preparation is not null)
-            return preparation;
-
-        var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
-        var runKey = AgentRunKey(sandbox, workingDirectory);
-        var runId = Guid.NewGuid().ToString("N");
-        ActiveAgentRunIds[runKey] = runId;
-        var exec = new SandboxExec
-        {
-            Argv = invocation.Argv,
-            WorkingDirectory = workingDirectory,
-            ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
-            Stdin = invocation.Stdin,
-            StdoutChunkCallback = stdoutChunkCallback,
-        };
-
-        SandboxExecResult result;
-        try
-        {
-            result = await sandbox.ExecAsync(exec, ct);
-        }
-        finally
-        {
-            RemoveActiveAgentRunId(runKey, runId);
-        }
-
-        return new AgentResult(
-            Success: result.Success,
-            Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
-            Stdout: result.Stdout,
-            Stderr: result.Stderr);
+        const string prefix = "agent exited ";
+        if (!summary.StartsWith(prefix, StringComparison.Ordinal))
+            return -1;
+        var tail = summary[prefix.Length..];
+        return int.TryParse(tail, out var code) ? code : -1;
     }
 
     public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
