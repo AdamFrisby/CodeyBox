@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -336,8 +337,18 @@ public abstract class OauthCredentialFileRefresher : IDisposable
 /// { "access_token": "...", "refresh_token": "...", "client_id": "...",
 ///   "client_secret": "...", "expiry_date": &lt;ms-since-epoch&gt; }
 /// </code>
-/// Refreshes via <c>POST https://oauth2.googleapis.com/token</c> with
-/// <c>grant_type=refresh_token</c>.
+///
+/// <para>Refresh strategy (tried in order):</para>
+/// <list type="number">
+///   <item>HTTP refresh using client_id + client_secret from the creds file
+///   (only when <c>@google/gemini-cli</c> happened to persist them).</item>
+///   <item>HTTP refresh using client_id + client_secret from config (operator
+///   supplies them via env var or <c>codeybox-extra.json</c> — never embedded
+///   in source).</item>
+///   <item>CLI-based refresh: invoke the host <c>gemini</c> CLI, which
+///   self-refreshes using its own embedded OAuth client, then re-read
+///   <c>~/.gemini/oauth_creds.json</c> for the new access_token/expiry.</item>
+/// </list>
 /// </summary>
 public sealed class GeminiOauthCredentialFileRefresher
     : OauthCredentialFileRefresher, IGeminiQuotaTokenSource
@@ -346,16 +357,25 @@ public sealed class GeminiOauthCredentialFileRefresher
     internal const string HttpClientName = "agent-quota";
 
     private readonly string _refreshEndpoint;
+    private readonly string? _fallbackClientId;
+    private readonly string? _fallbackClientSecret;
+    private readonly Func<CancellationToken, Task<bool>>? _cliTokenRefresher;
 
     public GeminiOauthCredentialFileRefresher(
         GeminiOAuthCredentialFileSource source,
         IHttpClientFactory httpClientFactory,
         ILogger<GeminiOauthCredentialFileRefresher> log,
         TimeProvider? timeProvider = null,
-        string? refreshEndpoint = null)
+        string? refreshEndpoint = null,
+        string? geminiOauthClientId = null,
+        string? geminiOauthClientSecret = null,
+        Func<CancellationToken, Task<bool>>? cliTokenRefresher = null)
         : base(source, httpClientFactory, timeProvider ?? TimeProvider.System, log)
     {
         _refreshEndpoint = refreshEndpoint ?? DefaultRefreshEndpoint;
+        _fallbackClientId = geminiOauthClientId;
+        _fallbackClientSecret = geminiOauthClientSecret;
+        _cliTokenRefresher = cliTokenRefresher;
     }
 
     public Task<string?> GetAccessTokenAsync(CancellationToken ct = default) => GetOrRefreshAsync(ct);
@@ -372,7 +392,6 @@ public sealed class GeminiOauthCredentialFileRefresher
         if (root.TryGetProperty("expiry_date", out var exp) && exp.ValueKind == JsonValueKind.Number
             && exp.TryGetInt64(out var ms))
         {
-            // Google's `expiry_date` is milliseconds since epoch.
             expires = DateTimeOffset.FromUnixTimeMilliseconds(ms);
         }
         return new ParsedCreds(access, refresh, expires, clientId, clientSecret, AccountId: null);
@@ -380,20 +399,52 @@ public sealed class GeminiOauthCredentialFileRefresher
 
     protected override async Task<RefreshResult> PerformRefreshAsync(ParsedCreds creds, CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(creds.RefreshToken)
-            || string.IsNullOrEmpty(creds.ClientId)
-            || string.IsNullOrEmpty(creds.ClientSecret))
+        var clientId = creds.ClientId ?? _fallbackClientId;
+        var clientSecret = creds.ClientSecret ?? _fallbackClientSecret;
+
+        if (!string.IsNullOrEmpty(creds.RefreshToken)
+            && !string.IsNullOrEmpty(clientId)
+            && !string.IsNullOrEmpty(clientSecret))
         {
-            return new RefreshResult(null, null, TimeSpan.Zero);
+            return await HttpRefreshAsync(creds.RefreshToken!, clientId!, clientSecret!, ct)
+                .ConfigureAwait(false);
         }
 
+        if (_cliTokenRefresher is not null && await _cliTokenRefresher(ct).ConfigureAwait(false))
+        {
+            var raw = Source.GetRaw();
+            if (!string.IsNullOrEmpty(raw))
+            {
+                try
+                {
+                    var reparsed = ParseCreds(raw);
+                    if (!string.IsNullOrEmpty(reparsed.AccessToken))
+                    {
+                        var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow().AddHours(1);
+                        var expiresIn = expiresAt - TimeProvider.GetUtcNow();
+                        if (expiresIn <= TimeSpan.Zero) expiresIn = TimeSpan.FromHours(1);
+                        return new RefreshResult(reparsed.AccessToken, reparsed.RefreshToken, expiresIn);
+                    }
+                }
+                catch (JsonException)
+                {
+                }
+            }
+        }
+
+        return new RefreshResult(null, null, TimeSpan.Zero);
+    }
+
+    private async Task<RefreshResult> HttpRefreshAsync(
+        string refreshToken, string clientId, string clientSecret, CancellationToken ct)
+    {
         var http = HttpClientFactory.CreateClient(HttpClientName);
         var form = new FormUrlEncodedContent(new[]
         {
             new KeyValuePair<string, string>("grant_type", "refresh_token"),
-            new KeyValuePair<string, string>("refresh_token", creds.RefreshToken!),
-            new KeyValuePair<string, string>("client_id", creds.ClientId!),
-            new KeyValuePair<string, string>("client_secret", creds.ClientSecret!),
+            new KeyValuePair<string, string>("refresh_token", refreshToken),
+            new KeyValuePair<string, string>("client_id", clientId),
+            new KeyValuePair<string, string>("client_secret", clientSecret),
         });
         using var req = new HttpRequestMessage(HttpMethod.Post, _refreshEndpoint) { Content = form };
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
@@ -407,6 +458,107 @@ public sealed class GeminiOauthCredentialFileRefresher
         var seconds = doc.RootElement.TryGetProperty("expires_in", out var ex) && ex.ValueKind == JsonValueKind.Number
             && ex.TryGetInt32(out var s) ? s : 3600;
         return new RefreshResult(newAccess, newRefresh, TimeSpan.FromSeconds(seconds));
+    }
+
+    /// <summary>
+    /// Returns a delegate that invokes the host <c>gemini</c> CLI to force an
+    /// OAuth token refresh, or null if the CLI cannot be found.
+    /// The delegate launches <c>gemini -p "."</c> with a 30 s timeout and
+    /// returns <c>true</c> when the process exits successfully (exit code 0),
+    /// which indicates the CLI refreshed and rewrote <c>~/.gemini/oauth_creds.json</c>.
+    /// </summary>
+    internal static Func<CancellationToken, Task<bool>>? TryCreateCliRefreshHandler()
+    {
+        var cliPath = ResolveGeminiCliPath();
+        if (cliPath is null) return null;
+
+        return async ct =>
+        {
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(TimeSpan.FromSeconds(30));
+                var psi = new ProcessStartInfo
+                {
+                    FileName = cliPath,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                psi.ArgumentList.Add("-p");
+                psi.ArgumentList.Add(".");
+                using var proc = Process.Start(psi);
+                if (proc is null) return false;
+                await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                return proc.ExitCode == 0;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        };
+    }
+
+    private static string? ResolveGeminiCliPath()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var proc = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "which",
+                    ArgumentList = { "gemini" },
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                if (proc is not null)
+                {
+                    proc.WaitForExit(5000);
+                    if (proc.ExitCode == 0)
+                    {
+                        var path = proc.StandardOutput.ReadLine()?.Trim();
+                        if (!string.IsNullOrEmpty(path)) return path;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+        else
+        {
+            try
+            {
+                using var proc = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "where",
+                    ArgumentList = { "gemini" },
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                if (proc is not null)
+                {
+                    proc.WaitForExit(5000);
+                    if (proc.ExitCode == 0)
+                    {
+                        var path = proc.StandardOutput.ReadLine()?.Trim();
+                        if (!string.IsNullOrEmpty(path)) return path;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+        return null;
     }
 
     protected override string BuildPersistedJson(string existingRaw, RefreshResult result, DateTimeOffset newExpiresAt)
@@ -435,7 +587,6 @@ public sealed class GeminiOauthCredentialFileRefresher
                     prop.WriteTo(writer);
                 }
             }
-            // Ensure the three updated keys are present even if they were absent originally.
             if (!doc.RootElement.TryGetProperty("access_token", out _))
                 writer.WriteString("access_token", result.AccessToken);
             if (!doc.RootElement.TryGetProperty("expiry_date", out _))

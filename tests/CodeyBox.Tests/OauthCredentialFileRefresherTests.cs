@@ -139,6 +139,129 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Single(handler.Requests);
     }
 
+    [Fact]
+    public async Task Gemini_Refresh_ConfigProvidedClientCredentials_FallbackWhenFileLacksThem()
+    {
+        // Real gemini CLI output omits client_id and client_secret.
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"new-access","expires_in":3600}""");
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: "config-secret");
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("new-access", token);
+        Assert.Single(handler.Requests);
+        var form = handler.Requests[0];
+        Assert.Contains("client_id=config-client", form);
+        Assert.Contains("client_secret=config-secret", form);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_InvokedWhenNoClientCredentialsAvailable()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"unused","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            cliTokenRefresher: _ => { cliCalled++; return Task.FromResult(true); });
+
+        await refresher.GetAccessTokenAsync();
+
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_ExtractsTokenFromRefreshedFile()
+    {
+        // The file on disk is stale (no client_id/client_secret). The CLI
+        // refresh rewrites the file with a fresh token. The refresher must
+        // re-read and return it.
+        var staleJson = $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""";
+        var path = WriteCreds("oauth_creds.json", staleJson);
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+
+        var freshMs = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds();
+        var freshJson = $$"""{"access_token":"cli-fresh-token","refresh_token":"rt-2","expiry_date":{{freshMs}}}""";
+
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            cliTokenRefresher: _ =>
+            {
+                // Simulate the CLI rewriting the file.
+                File.WriteAllText(path, freshJson);
+                return Task.FromResult(true);
+            });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-fresh-token", token);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_Failure_ReturnsNullAndLogsOnce()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, "{}");
+        var log = new CountingLogger<GeminiOauthCredentialFileRefresher>();
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            log,
+            cliTokenRefresher: _ => Task.FromResult(false));
+
+        for (int i = 0; i < 3; i++)
+            Assert.Null(await refresher.GetAccessTokenAsync());
+
+        Assert.Empty(handler.Requests);
+        Assert.Equal(1, log.WarningCount);
+    }
+
+    [Fact]
+    public async Task Gemini_CliRefresh_ConfigCredentialsBeatCliFallback()
+    {
+        // When both config client creds and CLI refresh are available, config
+        // creds are preferred (HTTP refresh is faster and more reliable).
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK,
+            """{"access_token":"http-new-access","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: "config-secret",
+            cliTokenRefresher: _ => { cliCalled++; return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("http-new-access", token);
+        Assert.Single(handler.Requests);
+        Assert.Equal(0, cliCalled);
+    }
+
     // ── Claude ───────────────────────────────────────────────────────────────
 
     private static string ClaudeCreds(string access, string refresh, long expiresAtMs)
