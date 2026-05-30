@@ -382,6 +382,28 @@ public sealed class EmailNotificationProviderTests
     }
 
     [Fact]
+    public async Task OperationCanceledException_Rethrows()
+    {
+        var logger = new CapturingLogger<EmailNotificationProvider>();
+        var oce = new OperationCanceledException("shutdown");
+
+        var provider = new EmailNotificationProvider(
+            new EmailProviderOptions
+            {
+                Enabled = true,
+                Host = "smtp.test",
+                Port = 587,
+                From = "bot@test.local",
+            },
+            logger,
+            () => new CaptureSmtpClient(sendCaptor: _ => throw oce));
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => provider.SendAsync(MakeNotification(), CancellationToken.None));
+        Assert.Same(oce, ex);
+    }
+
+    [Fact]
     public async Task HeaderValues_StripControlCharacters()
     {
         var logger = new CapturingLogger<EmailNotificationProvider>();

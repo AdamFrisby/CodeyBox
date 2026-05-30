@@ -323,6 +323,159 @@ public sealed class NotificationRulesEngineTests
         Assert.Equal(0, provider.CallCount);
     }
 
+    // ── Invalid cooldown format ────────────────────────────────────────────
+
+    [Fact]
+    public async Task InvalidCooldown_LogsWarningAndTreatsAsZero()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Invalid cooldown test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["counting"], Cooldown = "banana" },
+        };
+        var provider = new CountingProvider();
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition], [builder], [provider],
+            log);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        // Notification fires because Cooldown "banana" is treated as zero.
+        Assert.Equal(1, provider.CallCount);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("invalid Cooldown"));
+    }
+
+    // ── Throwing condition inside sweep ────────────────────────────────────
+
+    [Fact]
+    public async Task ConditionThrows_SkippedAndSweepContinues()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var throwing = new ThrowingCondition("thrower", new InvalidOperationException("bang"));
+        var healthy = new ToggleCondition("healthy", initial: false);
+        var throwingBuilder = new StaticBuilder("thrower", "Should not fire");
+        var healthyBuilder = new StaticBuilder("healthy", "Should fire");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "thrower", Providers = ["counting"] },
+            new() { Condition = "healthy", Providers = ["counting"] },
+        };
+        var provider = new CountingProvider();
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [throwing, healthy], [throwingBuilder, healthyBuilder], [provider],
+            log);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        healthy.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        // The healthy condition still fires; the throwing condition is skipped.
+        Assert.Equal(1, provider.CallCount);
+        Assert.Equal("Should fire", provider.Notifications.First().Title);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("failed to evaluate condition"));
+    }
+
+    // ── Provider throws, isolation on failure ──────────────────────────────
+
+    [Fact]
+    public async Task ProviderThrows_OtherProvidersStillNotified()
+    {
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Isolation test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["throwing", "counting"] },
+        };
+
+        var throwingProvider = new ThrowingProvider("throwing", new IOException("smtp timeout"));
+        var countingProvider = new CountingProvider("counting");
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition],
+            [builder],
+            [throwingProvider, countingProvider],
+            NullLogger<NotificationRulesEngine>.Instance);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        // Counting provider still received the notification despite the throwing provider.
+        Assert.Equal(1, countingProvider.CallCount);
+    }
+
+    // ── Missing builder ────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task MissingBuilder_LogsWarningAndSkips()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var condition = new ToggleCondition("orphan_cond", initial: false);
+        var provider = new CountingProvider();
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "orphan_cond", Providers = ["counting"] },
+        };
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition],
+            [], // no builders registered
+            [provider],
+            log);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CallCount);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("no builder registered"));
+    }
+
+    // ── PrimeInitialStateAsync: throwing condition ─────────────────────────
+
+    [Fact]
+    public async Task PrimeInitialState_ThrowingCondition_SetToFalse()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var throwing = new ThrowingCondition("thrower", new InvalidOperationException("prime failed"));
+        var healthy = new ToggleCondition("healthy", initial: true);
+        var throwingBuilder = new StaticBuilder("thrower", "Throwing");
+        var healthyBuilder = new StaticBuilder("healthy", "Healthy");
+        var provider = new CountingProvider();
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "thrower", Providers = ["counting"] },
+            new() { Condition = "healthy", Providers = ["counting"] },
+        };
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [throwing, healthy], [throwingBuilder, healthyBuilder], [provider],
+            log);
+
+        // Prime: throwing condition caught, initial state set to false.
+        // Healthy condition starts true → no edge on first sweep.
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CallCount);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("failed to evaluate initial state"));
+    }
+
     // ── Unknown-provider branch ─────────────────────────────────────────────
 
     [Fact]
@@ -417,6 +570,37 @@ public sealed class CountingProvider : INotificationProvider
         _notifications.Add(notification);
         return Task.CompletedTask;
     }
+}
+
+public sealed class ThrowingCondition : ICondition
+{
+    private readonly Exception _exception;
+
+    public string Id { get; }
+
+    public ThrowingCondition(string id, Exception exception)
+    {
+        Id = id;
+        _exception = exception;
+    }
+
+    public Task<bool> EvaluateAsync(CancellationToken ct) => throw _exception;
+}
+
+public sealed class ThrowingProvider : INotificationProvider
+{
+    private readonly string _name;
+    private readonly Exception _exception;
+
+    public string Name => _name;
+
+    public ThrowingProvider(string name, Exception exception)
+    {
+        _name = name;
+        _exception = exception;
+    }
+
+    public Task SendAsync(Notification notification, CancellationToken ct) => throw _exception;
 }
 
 public sealed class StaticOptionsMonitor<T> : IOptionsMonitor<T> where T : class, new()
