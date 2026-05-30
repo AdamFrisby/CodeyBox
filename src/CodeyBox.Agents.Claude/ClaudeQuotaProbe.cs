@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -9,9 +10,14 @@ namespace CodeyBox.Agents.Claude;
 /// Probes the Anthropic OAuth usage endpoint to estimate available Claude
 /// subscription quota. Uses the <c>agent-quota</c> named HTTP client.
 ///
-/// Any network error, unexpected status code, or unrecognised response shape
-/// returns <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1; the router's
-/// unknown policy decides whether that blocks pickup.
+/// Transient probe failures (network errors, timeouts, 5xx, 408, 429) retry
+/// with backoff before being recorded as a failure. On continued failure the
+/// last-known-good snapshot is RETAINED (with a staleness note carrying the
+/// age) until either <c>MaxConsecutiveFailures</c> end-to-end probes have
+/// failed or the retained snapshot age exceeds <c>MaxStaleness</c>; only then
+/// does the snapshot fall to <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1
+/// so the router's unknown policy decides what to do. This means a one-off
+/// network blip cannot silently disable the <c>MinQuotaPct</c> floor.
 ///
 /// Thread-safe; results are cached for <c>cacheTtl</c> to avoid hammering
 /// the endpoint when several work items pick up close together.
@@ -23,10 +29,16 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
+    private readonly Func<ClaudeQuotaProbeResilienceOptions> _resilienceProvider;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger<ClaudeQuotaProbe> _log;
 
     // Single-entry cache: (token, snapshot, expiry). Protected by _lock.
     private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Last successful fetch's underlying snapshot + when it was captured.
+    // Surfaced as a stale-but-retained reading on transient failures.
+    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset CapturedAt)? _lastKnownGood;
+    private int _consecutiveFailures;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     // Dedupes the Information log line that fires when a configured model is
@@ -50,10 +62,24 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         Func<AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<ClaudeQuotaProbe> log)
+        : this(httpClientFactory, credentialsProvider, cacheTtl, log,
+               resilienceProvider: null, timeProvider: null)
+    {
+    }
+
+    public ClaudeQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<ClaudeQuotaProbe> log,
+        Func<ClaudeQuotaProbeResilienceOptions>? resilienceProvider,
+        TimeProvider? timeProvider)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
+        _resilienceProvider = resilienceProvider ?? (static () => new ClaudeQuotaProbeResilienceOptions());
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _log = log;
     }
 
@@ -68,16 +94,17 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         await _lock.WaitAsync(ct);
         try
         {
+            var now = _timeProvider.GetUtcNow();
             if (_cache is { } entry
                 && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
-                && DateTimeOffset.UtcNow < entry.ExpiresAt)
+                && now < entry.ExpiresAt)
             {
                 snapshot = entry.Snapshot;
             }
             else
             {
-                snapshot = await FetchAsync(token, ct);
-                _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+                snapshot = await FetchWithResilienceAsync(token, ct);
+                _cache = (token, snapshot, _timeProvider.GetUtcNow() + _cacheTtl);
             }
         }
         finally
@@ -137,13 +164,72 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     public void InvalidateCache()
     {
         _lock.Wait();
-        try { _cache = null; }
+        try
+        {
+            _cache = null;
+            // Drop the last-known-good as well: a token rotation typically means
+            // the previous token's account view should not bleed into the new
+            // token's snapshot (different sub, different cap).
+            _lastKnownGood = null;
+            _consecutiveFailures = 0;
+        }
         finally { _lock.Release(); }
     }
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
 
-    private async Task<AgentQuotaSnapshot> FetchAsync(string token, CancellationToken ct)
+    /// <summary>
+    /// Single end-to-end probe attempt: retries transient failures with
+    /// exponential backoff. On terminal failure, retains a stale last-known-good
+    /// snapshot until either too many consecutive failures or staleness expiry.
+    /// </summary>
+    private async Task<AgentQuotaSnapshot> FetchWithResilienceAsync(string token, CancellationToken ct)
+    {
+        var opts = _resilienceProvider();
+        var totalAttempts = Math.Max(1, opts.MaxRetries + 1);
+        ProbeAttemptResult last = default;
+
+        for (int attempt = 0; attempt < totalAttempts; attempt++)
+        {
+            if (attempt > 0)
+            {
+                var backoff = TimeSpan.FromTicks(
+                    opts.RetryInitialDelay.Ticks * (long)Math.Pow(2, attempt - 1));
+                await Task.Delay(backoff, _timeProvider, ct);
+            }
+
+            last = await ProbeOnceAsync(token, ct);
+            if (last.Outcome == ProbeOutcome.Success)
+            {
+                _consecutiveFailures = 0;
+                // Only record real readings as last-known-good. A 200 carrying an
+                // unparseable body is a Success at the HTTP layer but yields
+                // AvailablePct=-1, and retaining that as "last-known-good" would
+                // disable the staleness floor itself.
+                if (last.Snapshot!.AvailablePct >= 0)
+                    _lastKnownGood = (token, last.Snapshot!, _timeProvider.GetUtcNow());
+                return last.Snapshot!;
+            }
+            if (last.Outcome == ProbeOutcome.PermanentFailure)
+            {
+                // 4xx (other than 408/429) or unparseable body: no retry, no
+                // retain — those are configuration/contract failures, not
+                // transient blips. Drop the last-known-good so a later 200 can
+                // re-establish it cleanly.
+                _consecutiveFailures = 0;
+                _lastKnownGood = null;
+                return last.Snapshot!;
+            }
+        }
+
+        // All attempts in this probe end-to-end failed transiently. Count this
+        // as ONE consecutive failure (the inner retries already burned).
+        _consecutiveFailures++;
+
+        return BuildStaleOrUnknown(token, last.Reason ?? "network error", opts);
+    }
+
+    private async Task<ProbeAttemptResult> ProbeOnceAsync(string token, CancellationToken ct)
     {
         try
         {
@@ -155,15 +241,20 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             using var response = await client.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)
             {
+                var status = (int)response.StatusCode;
                 _log.LogDebug("Claude quota endpoint returned {StatusCode}; treating quota as unknown",
-                    (int)response.StatusCode);
-                return Unknown($"HTTP {(int)response.StatusCode}");
+                    status);
+                var reason = $"HTTP {status}";
+                return IsTransientStatus(response.StatusCode)
+                    ? ProbeAttemptResult.Transient(reason)
+                    : ProbeAttemptResult.Permanent(Unknown(reason), reason);
             }
 
             // Do NOT log the response body — it may contain account identifiers.
             var body = await ReadCappedAsync(response.Content, ct);
-            if (body is null) return Unknown("response too large");
-            return ParseResponse(body);
+            if (body is null)
+                return ProbeAttemptResult.Permanent(Unknown("response too large"), "response too large");
+            return ProbeAttemptResult.Success(ParseResponse(body));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -171,9 +262,62 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "Claude quota probe failed; treating quota as unknown");
-            return Unknown("network error");
+            _log.LogDebug(ex, "Claude quota probe failed; treating as transient");
+            return ProbeAttemptResult.Transient("network error");
         }
+    }
+
+    private AgentQuotaSnapshot BuildStaleOrUnknown(
+        string token,
+        string reason,
+        ClaudeQuotaProbeResilienceOptions opts)
+    {
+        if (_lastKnownGood is { } lkg && string.Equals(lkg.AccessToken, token, StringComparison.Ordinal))
+        {
+            var age = _timeProvider.GetUtcNow() - lkg.CapturedAt;
+            if (_consecutiveFailures <= opts.MaxConsecutiveFailures && age <= opts.MaxStaleness)
+            {
+                var ageSeconds = (long)Math.Round(age.TotalSeconds);
+                var notes = $"stale (age {ageSeconds}s, {reason}, consecutiveFailures={_consecutiveFailures})";
+                _log.LogInformation(
+                    "Claude quota probe: transient failure {Reason}; retaining last-known-good (age {AgeSeconds}s, consecutiveFailures={ConsecutiveFailures})",
+                    reason, ageSeconds, _consecutiveFailures);
+                return lkg.Snapshot with
+                {
+                    Notes = notes,
+                };
+            }
+
+            _log.LogWarning(
+                "Claude quota probe: dropping retained last-known-good (age {AgeSeconds}s, consecutiveFailures={ConsecutiveFailures}); falling to unknown",
+                (long)Math.Round(age.TotalSeconds), _consecutiveFailures);
+        }
+        return Unknown(reason);
+    }
+
+    private static bool IsTransientStatus(HttpStatusCode status)
+    {
+        var code = (int)status;
+        if (code >= 500 && code <= 599) return true;
+        return status == HttpStatusCode.RequestTimeout
+            || status == HttpStatusCode.TooManyRequests;
+    }
+
+    private enum ProbeOutcome { Success, TransientFailure, PermanentFailure }
+
+    private readonly record struct ProbeAttemptResult(
+        ProbeOutcome Outcome,
+        AgentQuotaSnapshot? Snapshot,
+        string? Reason)
+    {
+        public static ProbeAttemptResult Success(AgentQuotaSnapshot snapshot)
+            => new(ProbeOutcome.Success, snapshot, null);
+
+        public static ProbeAttemptResult Transient(string reason)
+            => new(ProbeOutcome.TransientFailure, null, reason);
+
+        public static ProbeAttemptResult Permanent(AgentQuotaSnapshot snapshot, string reason)
+            => new(ProbeOutcome.PermanentFailure, snapshot, reason);
     }
 
     private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)

@@ -751,6 +751,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<ClaudeCredentialFileSource>();
     var tokenSource = sp.GetRequiredService<IClaudeQuotaTokenSource>();
+    var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var probe = new ClaudeQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         // Sync-over-async is intentional and safe here: ASP.NET Core has no
@@ -762,7 +763,22 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
                 ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<ClaudeQuotaProbe>());
+        loggerFactory.CreateLogger<ClaudeQuotaProbe>(),
+        // Resilience knobs are read on every probe call so values bound from
+        // CodeyBox:QuotaRouter hot-reload through IOptionsMonitor without
+        // restarting the process.
+        resilienceProvider: () =>
+        {
+            var qr = optionsMonitor.CurrentValue.QuotaRouter;
+            return new ClaudeQuotaProbeResilienceOptions
+            {
+                MaxRetries = qr.ProbeMaxRetries,
+                RetryInitialDelay = TimeSpan.FromMilliseconds(qr.ProbeRetryInitialDelayMs),
+                MaxConsecutiveFailures = qr.ProbeMaxConsecutiveFailures,
+                MaxStaleness = TimeSpan.FromSeconds(qr.ProbeMaxStalenessSeconds),
+            };
+        },
+        timeProvider: null);
     source.TokenUpdated += probe.InvalidateCache;
     return probe;
 });
@@ -2748,6 +2764,28 @@ namespace CodeyBox.Api
         /// 15s cadence, so leave defaults aligned unless you have a reason.
         /// </summary>
         public int CapRetryIntervalSeconds { get; set; } = 15;
+        /// <summary>
+        /// Additional retries on a transient probe failure (network error / timeout / 5xx)
+        /// before recording the failure. Total attempts = 1 + this value. Default 2.
+        /// Hot-reloadable.
+        /// </summary>
+        public int ProbeMaxRetries { get; set; } = 2;
+        /// <summary>
+        /// Base retry backoff in milliseconds; doubles each attempt. Default 250 ms.
+        /// Hot-reloadable.
+        /// </summary>
+        public int ProbeRetryInitialDelayMs { get; set; } = 250;
+        /// <summary>
+        /// Consecutive probe failures tolerated before the probe stops returning
+        /// the retained last-known-good snapshot. Default 3. Hot-reloadable.
+        /// </summary>
+        public int ProbeMaxConsecutiveFailures { get; set; } = 3;
+        /// <summary>
+        /// Maximum age in seconds of a retained last-known-good snapshot before
+        /// it is dropped in favour of <c>AvailablePct=-1</c>. Default 300 (5 min).
+        /// Hot-reloadable.
+        /// </summary>
+        public int ProbeMaxStalenessSeconds { get; set; } = 300;
     }
 
     /// <summary>
