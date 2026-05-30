@@ -257,7 +257,14 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _incrementalRebase = incrementalRebase;
-        _agenticConflictResolver = agenticConflictResolver ?? new AgenticConflictResolver();
+        // Wire the credential-file materialiser into the default resolver so
+        // a cross-kind fallback candidate (whose file-based creds aren't yet on
+        // disk in the sandbox the primary provisioned) can authenticate before
+        // its CLI runs. Custom-injected resolvers are passed through as-is for
+        // tests and for callers that wire their own hook.
+        _agenticConflictResolver = agenticConflictResolver
+            ?? new AgenticConflictResolver(
+                credentialFileMaterialiser: MaterialiseCredentialFilesAsync);
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -1009,28 +1016,42 @@ public sealed class PipelineRunner : IPipelineRunner
             lockEntered = true;
 
             var access = _gitHost.GetSandboxAccess(repoId);
-            // Reuse one of the project's configured network profiles so the
-            // sandbox provider can take the fast baseline-clone path. Egress is
-            // still blocked by allowAgentNetwork:false → AllowedHosts:[], so the
-            // host-bridge attachment is just for boot, not for traffic; the
-            // rebase reads from the file:// mount, not the network. Without a
-            // profile, providers that use per-profile baselines (Multipass) fall
-            // through to full cloud-init from scratch, which routinely exceeds
-            // the launch timeout because MultipassExtraRuncmd re-runs all the
-            // agent-CLI installs the rebase doesn't need.
-            var rebaseProfile = project.NetworkProfiles.AuditTool
+            // Pre-resolve the primary runner's credential and bake it into the
+            // sandbox. The vast majority of pickup-rebases are conflict-free
+            // and will not invoke the agent CLI at all, so these creds sit
+            // unused — but when a conflict triggers AgenticConflictResolver,
+            // the agent runs in THIS sandbox via IAgentRunner.RunAsync, and
+            // env-based credentials are baked at sandbox-create time only
+            // (CliAgentRunnerBase.RunAsync documents this; file-based creds
+            // are materialised post-create). Building the sandbox with no
+            // credential + no network — the pre-#168 shape, when conflict
+            // resolution ran from the host via text-only HTTP — leaves the
+            // in-VM CLI starving for both auth and egress and was the cause
+            // of every "agent exited 1" we saw on MergeConflictResolutionFailed
+            // items after PR #168.
+            //
+            // Network profile prefers the agent profile (Work) so AllowedHosts
+            // includes the agent's API endpoints. We fall back through the
+            // audit profiles for the baseline-clone fast path when Work is
+            // unconfigured.
+            var credential = _credentials is IProjectAwareCredentialProvider pacRebase
+                ? await pacRebase.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
+                : await _credentials.GetAsync(runner.Kind, ct);
+            var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
-                ?? project.NetworkProfiles.Work;
+                ?? project.NetworkProfiles.AuditTool;
             var spec = BuildSandboxSpec(
                 access,
-                includeAgentCredential: null,
-                allowAgentNetwork: false,
+                includeAgentCredential: credential,
+                allowAgentNetwork: true,
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
                 baselineImageRef: item.BaselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
                 _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
@@ -3786,7 +3807,15 @@ public sealed class PipelineRunner : IPipelineRunner
         var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
         var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
         var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
-        var mergeCredential = hostMerge.HasConflicts ? null : credential;
+        // Both the clean-merge branch (BuildMergePrompt + runner.RunAsync) and
+        // the conflict branch (AgenticConflictResolver.ResolveAsync → the agent
+        // CLI inside this same sandbox) invoke an in-VM agent. The pre-#168
+        // conditional that nulled the credential and disabled network when
+        // hostMerge.HasConflicts assumed the conflict path resolved text-only
+        // from the host, which is no longer true: the resolver runs the CLI
+        // in-VM and needs both auth and egress. Always bake creds + open
+        // network for the merge sandbox.
+        var mergeCredential = credential;
         var isolatedMergeRepoPath = hostMerge.HasConflicts
             ? await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct)
             : null;
@@ -3795,7 +3824,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var access = isolatedMergeRepoPath is null
                 ? _gitHost.GetSandboxAccess(repoId)
                 : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: !hostMerge.HasConflicts,
+            var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: true,
                 hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
                 baselineImageRef: item.BaselineImageRef);
             var mergeSandboxStartSw = Stopwatch.StartNew();
