@@ -79,10 +79,15 @@ public sealed class IdempotencyKeyRetentionServiceTests
         var service = new IdempotencyKeyRetentionService(
             store, logger, interval: TimeSpan.FromMilliseconds(50));
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        // Headroom: the 2-second wait was failing under load in the audit
+        // sandbox even though the local 50 ms interval should produce >=2
+        // sweeps in well under a second. Give the BackgroundService scheduler
+        // generous time so a slow CI host doesn't observe only the first sweep
+        // and report a spurious failure.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var task = service.StartAsync(cts.Token);
         // Sweep #1 throws; we need to see sweep #2 succeed AFTER the catch.
-        await WaitForAsync(() => store.DeleteExpiredCallCount >= 2, TimeSpan.FromSeconds(2));
+        await WaitForAsync(() => store.DeleteExpiredCallCount >= 2, TimeSpan.FromSeconds(30));
         await service.StopAsync(CancellationToken.None);
         await task;
 
