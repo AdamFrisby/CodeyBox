@@ -121,14 +121,12 @@ public sealed record AgenticConflictResolverCandidate(
 /// build) and iterates per agent attempt up to a configurable cap.
 ///
 /// <para>
-/// This supersedes the old text-only resolver path (
-/// <c>PipelineRunner.RunConstrainedConflictResolverAsync</c> +
-/// <c>InvokeTextOnlyAsync</c> + <c>ClaudeAgentRunner.RunTextOnlyAsync</c>),
-/// which had three structural defects: a 128 KB per-file byte cap, no
-/// multi-file iterative resolution, and a raw <c>api.anthropic.com</c> call
-/// that risked subscription-account termination. None of those apply here:
-/// the agent runs in-VM through its normal CLI shape (ToS-compliant) and reads
-/// files directly without orchestrator-side base64 transport.
+/// This supersedes the prior text-only resolver path, which had three
+/// structural defects: a 128 KB per-file byte cap, no multi-file iterative
+/// resolution, and a raw <c>api.anthropic.com</c> call that risked
+/// subscription-account termination. None of those apply here: the agent runs
+/// in-VM through its normal CLI shape (ToS-compliant) and reads files directly
+/// without orchestrator-side base64 transport.
 /// </para>
 /// </summary>
 public sealed class AgenticConflictResolver

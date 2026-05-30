@@ -140,8 +140,6 @@ public sealed class ProjectAuditConfig
     public bool? AutoRetryOnStuck { get; set; }
     public int? MaxStuckRetries { get; set; }
     public int? MergeScopeBufferLines { get; set; }
-    public int? MergeScopeResolverMaxBytes { get; set; }
-    public int? MergeScopeResolverContextLines { get; set; }
 
     public List<string>? Languages { get; set; }
     public Dictionary<string, ProjectLanguagePresetOverrideConfig>? LanguageOverrides { get; set; }

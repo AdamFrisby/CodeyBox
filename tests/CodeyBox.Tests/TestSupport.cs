@@ -303,6 +303,22 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
 
     /// <summary>
+    /// Captured prompts the agentic (in-sandbox) conflict resolver sent to this
+    /// agent via <see cref="RunAsync"/>. One entry per resolver attempt. The
+    /// prompt starts with "# Conflict-resolution mode (in-sandbox agentic resolver)".
+    /// </summary>
+    public List<string> AgenticConflictInvocations { get; } = new();
+
+    /// <summary>
+    /// When non-empty, each agentic conflict-resolution invocation dequeues a
+    /// scripted <see cref="AgentResult"/> instead of running the default
+    /// <see cref="ConflictResolutionPlan"/> handler. Used to simulate
+    /// transient agentic-resolver failures so the resolver falls through to
+    /// the next candidate.
+    /// </summary>
+    public Queue<AgentResult> AgenticConflictResults { get; } = new();
+
+    /// <summary>
     /// Hunk-scoped resolution handler queue. Each handler receives the
     /// parsed hunk slices the resolver sent and returns a per-hunk replacement
     /// (index → resolved-region content). Used when the conflict resolver
@@ -444,7 +460,85 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             var handler = ConflictReworkPlan.Dequeue();
             return await handler(sandbox, workingDirectory, ct);
         }
+        if (prompt.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", StringComparison.Ordinal))
+        {
+            return await HandleAgenticConflictAsync(sandbox, workingDirectory, prompt, ct);
+        }
         return await HandleWorkAsync(sandbox, workingDirectory, ct);
+    }
+
+    private async Task<AgentResult> HandleAgenticConflictAsync(
+        ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
+    {
+        AgenticConflictInvocations.Add(prompt);
+        if (AgenticConflictResults.Count > 0)
+            return AgenticConflictResults.Dequeue();
+
+        // Parse the bulleted file list from the prompt — mirrors the shape
+        // emitted by AgenticConflictResolver.BuildAgenticConflictResolverPrompt.
+        var files = ParseAgenticConflictFiles(prompt);
+        if (files.Count == 0)
+            return new AgentResult(false, "ScriptedAgent: agentic conflict prompt listed no files", null, null);
+        if (ConflictResolutionPlan.Count == 0)
+            return new AgentResult(false, "ScriptedAgent: ran out of conflict-resolution plan entries", null, null);
+
+        // Read each conflicted file from the sandbox so the existing plan
+        // handler (which takes ConflictResolverFile inputs) keeps working.
+        var resolverInputs = new List<ConflictResolverFile>(files.Count);
+        foreach (var file in files)
+        {
+            var read = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/{file}"],
+            }, ct);
+            if (!read.Success)
+                return new AgentResult(false, $"ScriptedAgent: failed to read '{file}': {read.Stderr}", null, null);
+            resolverInputs.Add(new ConflictResolverFile(file, read.Stdout));
+        }
+
+        var resolvedFiles = ConflictResolutionPlan.Dequeue()(resolverInputs);
+        foreach (var (path, content) in resolvedFiles)
+        {
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/{path}"],
+                Stdin = content,
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, $"ScriptedAgent: failed to write '{path}': {write.Stderr}", null, null);
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", path],
+            }, ct);
+            if (!add.Success)
+                return new AgentResult(false, $"ScriptedAgent: failed to git add '{path}': {add.Stderr}", null, null);
+        }
+
+        return new AgentResult(true, "agentic resolved", null, null);
+    }
+
+    private static IReadOnlyList<string> ParseAgenticConflictFiles(string prompt)
+    {
+        // The prompt lists conflicted files as bullet entries of the form
+        // "  - `path/to/file`" between the "Conflicted files" header and the
+        // next blank-line-terminated section. Match those exactly.
+        var marker = "Conflicted files (relative to the working tree):\n";
+        var start = prompt.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0) return [];
+        start += marker.Length;
+        var end = prompt.IndexOf("\n\n", start, StringComparison.Ordinal);
+        if (end < 0) end = prompt.Length;
+        var block = prompt[start..end];
+        var files = new List<string>();
+        foreach (var rawLine in block.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (!line.StartsWith("- `", StringComparison.Ordinal)) continue;
+            var open = line.IndexOf('`');
+            var close = line.LastIndexOf('`');
+            if (close > open) files.Add(line[(open + 1)..close]);
+        }
+        return files;
     }
 
     private static IReadOnlyList<ConflictResolverFile> ParseConflictResolverFiles(string prompt)
