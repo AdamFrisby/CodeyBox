@@ -119,7 +119,16 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
-    private const int MaxConflictResolverFileBytes = 128 * 1024;
+    /// <summary>
+    /// Upper bound on bytes read from a single conflicted file by the
+    /// resolver's safe-read path. This is a sanity gate, not a tunable knob:
+    /// the operator-visible cap is <see cref="ProjectAudit.MergeScopeResolverMaxBytes"/>,
+    /// which limits the LLM payload per file (whole-file mode) or per hunk
+    /// (hunk-scoped mode). The safe-read ceiling is kept well above the
+    /// payload cap so the orchestrator can ingest large conflicted files (e.g.
+    /// PipelineRunner.cs at ~200 KB) and slice them per-hunk before sending.
+    /// </summary>
+    private const int MaxConflictResolverSafeReadBytes = 4 * 1024 * 1024;
     // CancellationTokenSource timers use a uint millisecond due-time internally;
     // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
@@ -1343,6 +1352,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     item.Agent ?? runner.Kind,
                     item.ModelId,
                     item.ReasoningMode,
+                    project.Audit.MergeScopeResolverMaxBytes,
+                    project.Audit.MergeScopeResolverContextLines,
                     ct);
                 if (!agentResult.Success || iterationResolver is null)
                     throw new MergeConflictResolutionFailedException(
@@ -1525,6 +1536,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentKind workAgentKind,
         string? modelId,
         string? reasoningMode,
+        int resolverMaxBytes,
+        int resolverContextLines,
         CancellationToken ct)
     {
         var attemptTrail = new List<string>();
@@ -1541,7 +1554,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 resolverCredential,
                 crossKind ? null : modelId,
                 crossKind ? null : reasoningMode,
-                ct);
+                ct,
+                resolverMaxBytes,
+                resolverContextLines);
             lastResult = agentResult;
             if (agentResult.Success)
             {
@@ -4053,7 +4068,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         credential,
                         item.ModelId,
                         item.ReasoningMode,
-                        ct);
+                        ct,
+                        project.Audit.MergeScopeResolverMaxBytes,
+                        project.Audit.MergeScopeResolverContextLines);
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
                 mergeEndedAt = DateTimeOffset.UtcNow;
@@ -4330,7 +4347,9 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentCredential? credential,
         string? modelId,
         string? reasoningMode,
-        CancellationToken ct)
+        CancellationToken ct,
+        int resolverMaxBytes,
+        int resolverContextLines)
     {
         if (runner is not ITextOnlyAgentRunner)
         {
@@ -4349,7 +4368,7 @@ public sealed class PipelineRunner : IPipelineRunner
         foreach (var file in files)
             ValidateConflictResolverPath(file);
 
-        var resolverFiles = new List<ConflictResolverFile>(files.Length);
+        var fileContents = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var file in files)
         {
             string content;
@@ -4362,9 +4381,36 @@ public sealed class PipelineRunner : IPipelineRunner
                 return new AgentResult(false, $"failed to read conflicted file '{file}': {ex.Message}", null, null);
             }
 
-            resolverFiles.Add(new ConflictResolverFile(file, content));
+            fileContents[file] = content;
         }
 
+        // Whole-file mode preserves the original protocol when every file fits
+        // under the operator-tunable resolver payload cap. Past the cap we fall
+        // through to hunk-scoped mode so a small conflict inside a large file
+        // (e.g. a 5600-line file with a 30-line hunk) doesn't wedge the item.
+        var anyFileOverCap = fileContents.Values
+            .Any(c => Encoding.UTF8.GetByteCount(c) > resolverMaxBytes);
+        return anyFileOverCap
+            ? await RunHunkScopedResolverAsync(
+                runner, sandbox, prompt, conflictHunks, fileContents,
+                credential, modelId, reasoningMode,
+                resolverMaxBytes, resolverContextLines, ct)
+            : await RunWholeFileResolverAsync(
+                runner, sandbox, prompt,
+                files.Select(f => new ConflictResolverFile(f, fileContents[f])).ToList(),
+                credential, modelId, reasoningMode, ct);
+    }
+
+    private async Task<AgentResult> RunWholeFileResolverAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string prompt,
+        IReadOnlyList<ConflictResolverFile> resolverFiles,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct)
+    {
         var resolverPrompt = BuildConflictResolverTextOnlyPrompt(prompt, resolverFiles);
         var textResult = await InvokeTextOnlyAsync(
             runner,
@@ -4397,7 +4443,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 StringComparer.Ordinal)
             ?? new Dictionary<string, string>(StringComparer.Ordinal);
 
-        var expected = files.ToHashSet(StringComparer.Ordinal);
+        var expected = resolverFiles.Select(f => f.Path).ToHashSet(StringComparer.Ordinal);
         var actual = resolvedFiles.Keys.ToHashSet(StringComparer.Ordinal);
         var missing = expected.Except(actual, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         var extra = actual.Except(expected, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
@@ -4423,6 +4469,171 @@ public sealed class PipelineRunner : IPipelineRunner
         return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
     }
 
+    private async Task<AgentResult> RunHunkScopedResolverAsync(
+        IAgentRunner runner,
+        ISandbox sandbox,
+        string prompt,
+        IReadOnlyList<ConflictHunk> conflictHunks,
+        IReadOnlyDictionary<string, string> fileContents,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        int resolverMaxBytes,
+        int resolverContextLines,
+        CancellationToken ct)
+    {
+        // Each hunk becomes its own payload, capped at resolverMaxBytes. The
+        // conflict region itself is sent verbatim; only the orientation context
+        // shrinks if needed. A hunk whose verbatim conflict region alone
+        // exceeds the cap is reported as a precise per-hunk failure so the
+        // operator sees which file:line range is the genuine blocker —
+        // documented fallback that replaces the previous file-level wedge.
+        var hunkSlices = new List<ResolverHunkPayload>(conflictHunks.Count);
+        for (var i = 0; i < conflictHunks.Count; i++)
+        {
+            var hunk = conflictHunks[i];
+            if (!fileContents.TryGetValue(hunk.Path, out var content))
+                return new AgentResult(
+                    false,
+                    $"internal: no file contents loaded for '{hunk.Path}'",
+                    null, null);
+
+            var slice = BuildResolverHunkPayload(i, hunk, content, resolverContextLines, resolverMaxBytes);
+            if (slice.OversizedReason is not null)
+                return new AgentResult(false, slice.OversizedReason, null, null);
+            hunkSlices.Add(slice);
+        }
+
+        var resolverPrompt = BuildConflictResolverHunkScopedPrompt(prompt, hunkSlices);
+        var textResult = await InvokeTextOnlyAsync(
+            runner,
+            sandbox,
+            SandboxConventions.WorkDir,
+            resolverPrompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct);
+        if (!textResult.Success)
+            return new AgentResult(false, textResult.Summary, textResult.Output, textResult.Error);
+
+        ConflictResolutionHunksJson parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<ConflictResolutionHunksJson>(ExtractJsonObject(textResult.Output), JsonOpts)
+                ?? new ConflictResolutionHunksJson(null);
+        }
+        catch (JsonException ex)
+        {
+            return new AgentResult(false, $"conflict resolver produced invalid JSON: {ex.Message}", textResult.Output, textResult.Error);
+        }
+
+        var resolvedHunks = parsed.Hunks?
+            .Where(static h => h.Index is not null)
+            .ToDictionary(static h => h.Index!.Value, static h => h.Content ?? string.Empty)
+            ?? new Dictionary<int, string>();
+
+        var expected = Enumerable.Range(0, hunkSlices.Count).ToHashSet();
+        var actual = resolvedHunks.Keys.ToHashSet();
+        var missing = expected.Except(actual).Order().ToArray();
+        var extra = actual.Except(expected).Order().ToArray();
+        if (missing.Length > 0 || extra.Length > 0)
+        {
+            var message = $"conflict resolver returned an invalid hunk set; missing=[{string.Join(", ", missing)}], extra=[{string.Join(", ", extra)}]";
+            return new AgentResult(false, message, textResult.Output, textResult.Error);
+        }
+
+        // Splice each resolved region back into its file. Descending order by
+        // start line within a file keeps earlier hunks' coordinates stable
+        // while later hunks are replaced first.
+        var resolvedFileContents = new Dictionary<string, string>(fileContents, StringComparer.Ordinal);
+        var hunksByFile = hunkSlices
+            .GroupBy(h => h.Hunk.Path, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(h => h.Hunk.StartLine).ToList(), StringComparer.Ordinal);
+
+        foreach (var (path, fileHunks) in hunksByFile)
+        {
+            var lines = SplitLinesPreservingTrailingEmpty(resolvedFileContents[path]);
+            foreach (var fh in fileHunks)
+            {
+                var replacement = SplitLinesPreservingTrailingEmpty(resolvedHunks[fh.Index]);
+                var before = lines.Take(fh.Hunk.StartLine - 1);
+                var after = lines.Skip(fh.Hunk.EndLine);
+                lines = before.Concat(replacement).Concat(after).ToArray();
+            }
+            resolvedFileContents[path] = string.Join('\n', lines);
+        }
+
+        foreach (var (path, content) in resolvedFileContents)
+        {
+            ValidateConflictResolverPath(path);
+            try
+            {
+                await WriteSandboxConflictFileAsync(sandbox, path, content, ct);
+            }
+            catch (MergeConflictResolutionFailedException ex)
+            {
+                return new AgentResult(false, $"failed to write resolved file '{path}': {ex.Message}", null, null);
+            }
+        }
+
+        return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
+    }
+
+    private sealed record ResolverHunkPayload(
+        int Index,
+        ConflictHunk Hunk,
+        int ContextStartLine,
+        int ContextEndLine,
+        string Content,
+        string? OversizedReason);
+
+    /// <summary>
+    /// Builds the per-hunk payload sent to the resolver. The conflict region is
+    /// included verbatim; the orientation context starts at
+    /// <paramref name="requestedContextLines"/> and is halved (then dropped to
+    /// zero) until the payload fits within <paramref name="maxBytes"/>. If even
+    /// the zero-context payload exceeds the cap, the returned record carries an
+    /// <c>OversizedReason</c> naming the exact file:line range — the caller
+    /// surfaces this as the documented fallback for genuinely oversized hunks.
+    /// </summary>
+    private static ResolverHunkPayload BuildResolverHunkPayload(
+        int index,
+        ConflictHunk hunk,
+        string fileContent,
+        int requestedContextLines,
+        int maxBytes)
+    {
+        var lines = SplitLinesPreservingTrailingEmpty(fileContent);
+        var lineCount = lines.Length;
+        var clampedRequest = Math.Max(0, requestedContextLines);
+
+        // Try progressively smaller context windows until the payload fits.
+        // Skipping straight to 0 on the second pass keeps the loop bounded and
+        // surfaces oversized-hunk failures fast.
+        foreach (var ctx in new[] { clampedRequest, clampedRequest / 2, 0 }.Distinct())
+        {
+            var contextStart = Math.Max(1, hunk.StartLine - ctx);
+            var contextEnd = Math.Min(lineCount, hunk.EndLine + ctx);
+            var slice = string.Join('\n', lines.Skip(contextStart - 1).Take(contextEnd - contextStart + 1));
+            if (Encoding.UTF8.GetByteCount(slice) <= maxBytes)
+            {
+                return new ResolverHunkPayload(index, hunk, contextStart, contextEnd, slice, OversizedReason: null);
+            }
+        }
+
+        var conflictSize = Encoding.UTF8.GetByteCount(
+            string.Join('\n', lines.Skip(hunk.StartLine - 1).Take(hunk.EndLine - hunk.StartLine + 1)));
+        var reason =
+            $"conflict hunk at '{hunk.Path}':{hunk.StartLine}-{hunk.EndLine} ({conflictSize} bytes) " +
+            $"exceeds the {maxBytes}-byte resolver payload cap even with zero context lines; " +
+            "split the change into a smaller conflict or raise CodeyBox:Projects:Defaults:Audit:MergeScopeResolverMaxBytes";
+        return new ResolverHunkPayload(index, hunk, hunk.StartLine, hunk.EndLine, string.Empty, OversizedReason: reason);
+    }
+
+    private static string[] SplitLinesPreservingTrailingEmpty(string content)
+        => content.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+
     private static async Task<string> ReadSandboxConflictFileAsync(
         ISandbox sandbox,
         string path,
@@ -4437,7 +4648,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 "sh", "-c", SafeReadSandboxFileScript, "codeybox-safe-read-conflict-file",
                 SandboxConventions.WorkDir,
                 path,
-                (MaxConflictResolverFileBytes + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                (MaxConflictResolverSafeReadBytes + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
             ],
         }, ct);
         if (!read.Success)
@@ -4455,9 +4666,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 $"failed to decode {description} '{path}'", ex);
         }
 
-        if (bytes.Length > MaxConflictResolverFileBytes)
+        if (bytes.Length > MaxConflictResolverSafeReadBytes)
             throw new MergeConflictResolutionFailedException(
-                $"{description} '{path}' exceeds the {MaxConflictResolverFileBytes} byte resolver input limit");
+                $"{description} '{path}' exceeds the {MaxConflictResolverSafeReadBytes} byte safe-read sanity limit");
 
         return Encoding.UTF8.GetString(bytes);
     }
@@ -5027,6 +5238,62 @@ public sealed class PipelineRunner : IPipelineRunner
             """;
     }
 
+    private static string BuildConflictResolverHunkScopedPrompt(
+        string contractPrompt,
+        IReadOnlyList<ResolverHunkPayload> hunks)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            hunks = hunks.Select(static h => new
+            {
+                index = h.Index,
+                path = h.Hunk.Path,
+                conflictStartLine = h.Hunk.StartLine,
+                conflictEndLine = h.Hunk.EndLine,
+                contextStartLine = h.ContextStartLine,
+                contextEndLine = h.ContextEndLine,
+                content = h.Content,
+            }),
+        }, JsonOpts);
+
+        return $$"""
+            # Merge conflict resolver
+
+            You are resolving merge conflicts from text only. You have no shell,
+            filesystem, repository checkout, agent tools, or model-controlled network
+            access. The orchestrator has sliced each conflict into its own payload
+            so a large file with small conflicts stays under the LLM input limit.
+
+            Scope contract:
+            {{contractPrompt}}
+
+            Each input hunk lists its conflict region (1-indexed line numbers
+            conflictStartLine..conflictEndLine, inclusive) within the file at
+            `path`. The `content` field is a slice of the file from
+            `contextStartLine` to `contextEndLine` (inclusive) that contains
+            the conflict region plus surrounding orientation context.
+
+            Hunk inputs are provided as JSON:
+            {{payload}}
+
+            For each input hunk, produce the replacement text for ONLY the
+            conflict region (lines conflictStartLine..conflictEndLine,
+            inclusive). Do NOT include the surrounding context lines in your
+            output — the orchestrator splices your replacement back into the
+            file exactly at those coordinates. Your replacement must contain no
+            `<<<<<<<`, `|||||||`, `=======`, or `>>>>>>>` conflict markers.
+
+            Return a single JSON object with this exact shape:
+            {
+              "hunks": [
+                { "index": 0, "path": "relative/path", "content": "resolved replacement for the conflict region" }
+              ]
+            }
+
+            Do not include markdown fences or commentary. Return only the JSON object.
+            """;
+    }
+
     private static string ExtractJsonObject(string? output)
     {
         if (string.IsNullOrWhiteSpace(output))
@@ -5046,6 +5313,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private sealed record ConflictResolutionJson(List<ConflictResolutionFileJson>? Files);
     private sealed record ConflictResolutionFileJson(string? Path, string? Content);
+    private sealed record ConflictResolutionHunksJson(List<ConflictResolutionHunkJson>? Hunks);
+    private sealed record ConflictResolutionHunkJson(int? Index, string? Path, string? Content);
     private sealed record MergeSecurityReviewJson(List<MergeSecurityReviewFindingJson>? Findings);
     private sealed record MergeSecurityReviewFindingJson(string? Title, string? Description, string? Location);
 

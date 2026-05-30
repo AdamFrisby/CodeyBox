@@ -390,6 +390,26 @@ public sealed record ProjectAudit
     /// </summary>
     public int MergeScopeBufferLines { get; init; } = 5;
 
+    /// <summary>
+    /// Maximum UTF-8 byte size of a single payload sent to the text-only
+    /// conflict resolver. In whole-file mode (small files) this caps the file
+    /// content; in hunk-scoped mode (large files) it caps each per-hunk slice
+    /// before the file is split into hunks. Defaults to 128 KiB. Tune up when
+    /// the resolver model's context window is larger; tune down to force
+    /// hunk-scoped slicing on smaller files for tighter prompts.
+    /// </summary>
+    public int MergeScopeResolverMaxBytes { get; init; } = 128 * 1024;
+
+    /// <summary>
+    /// Number of file lines included on either side of each conflict hunk
+    /// when the resolver runs in hunk-scoped mode. The conflict region itself
+    /// is always sent verbatim; this controls only the orientation context
+    /// around it. Defaults to 50. When a hunk's slice still exceeds
+    /// <see cref="MergeScopeResolverMaxBytes"/> with this context, the
+    /// resolver shrinks the context progressively before falling back.
+    /// </summary>
+    public int MergeScopeResolverContextLines { get; init; } = 50;
+
     public IReadOnlyList<string> Languages { get; init; } = [];
     public bool LanguagesConfigured { get; init; }
     public IReadOnlyDictionary<string, ProjectLanguagePresetOverride> LanguageOverrides { get; init; }

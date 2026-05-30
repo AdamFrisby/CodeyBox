@@ -302,8 +302,27 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// </summary>
     public Queue<TextOnlyAgentResult> TextOnlyResults { get; } = new();
 
+    /// <summary>
+    /// Hunk-scoped resolution handler queue. Each handler receives the
+    /// parsed hunk slices the resolver sent and returns a per-hunk replacement
+    /// (index → resolved-region content). Used when the conflict resolver
+    /// switches to hunk-scoped mode (any file exceeds the configured payload
+    /// cap). For whole-file mode tests, keep using
+    /// <see cref="ConflictResolutionPlan"/>.
+    /// </summary>
+    public Queue<Func<IReadOnlyList<ConflictResolverHunkInput>, IReadOnlyDictionary<int, string>>> ConflictResolutionHunkPlan { get; } = new();
+
     private sealed record ConflictResolverInputJson(List<ConflictResolverInputFileJson>? Files);
     private sealed record ConflictResolverInputFileJson(string? Path, string? Content);
+    private sealed record ConflictResolverHunkInputJson(List<ConflictResolverHunkInputItemJson>? Hunks);
+    private sealed record ConflictResolverHunkInputItemJson(
+        int? Index,
+        string? Path,
+        int? ConflictStartLine,
+        int? ConflictEndLine,
+        int? ContextStartLine,
+        int? ContextEndLine,
+        string? Content);
 
     public ScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
     {
@@ -341,16 +360,40 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             return Task.FromResult(TextOnlyResults.Dequeue());
         if (prompt.StartsWith("# Merge conflict resolver", StringComparison.Ordinal))
         {
+            // The hunk-scoped prompt format includes the "Hunk inputs are
+            // provided as JSON:" marker; whole-file uses "Conflicted file
+            // inputs are provided as JSON:". Route by marker so existing
+            // tests keep working unchanged and new hunk-mode tests can opt
+            // into ConflictResolutionHunkPlan.
+            if (prompt.Contains("Hunk inputs are provided as JSON:", StringComparison.Ordinal))
+            {
+                if (ConflictResolutionHunkPlan.Count == 0)
+                    return Task.FromResult(new TextOnlyAgentResult(false, "ScriptedAgent: ran out of hunk-scoped conflict-resolution plan entries", null, null));
+
+                var hunks = ParseConflictResolverHunks(prompt);
+                var resolved = ConflictResolutionHunkPlan.Dequeue()(hunks);
+                var output = JsonSerializer.Serialize(new
+                {
+                    hunks = resolved.Select(kvp => new
+                    {
+                        index = kvp.Key,
+                        path = hunks.First(h => h.Index == kvp.Key).Path,
+                        content = kvp.Value,
+                    }),
+                });
+                return Task.FromResult(new TextOnlyAgentResult(true, "resolved", output, null));
+            }
+
             if (ConflictResolutionPlan.Count == 0)
                 return Task.FromResult(new TextOnlyAgentResult(false, "ScriptedAgent: ran out of conflict-resolution plan entries", null, null));
 
             var files = ParseConflictResolverFiles(prompt);
-            var resolved = ConflictResolutionPlan.Dequeue()(files);
-            var output = JsonSerializer.Serialize(new
+            var resolvedFiles = ConflictResolutionPlan.Dequeue()(files);
+            var fileOutput = JsonSerializer.Serialize(new
             {
-                files = resolved.Select(static f => new { path = f.Key, content = f.Value }),
+                files = resolvedFiles.Select(static f => new { path = f.Key, content = f.Value }),
             });
-            return Task.FromResult(new TextOnlyAgentResult(true, "resolved", output, null));
+            return Task.FromResult(new TextOnlyAgentResult(true, "resolved", fileOutput, null));
         }
 
         if (prompt.StartsWith("# Advisory merge security review", StringComparison.Ordinal))
@@ -423,6 +466,32 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             ?? [];
     }
 
+    private static IReadOnlyList<ConflictResolverHunkInput> ParseConflictResolverHunks(string prompt)
+    {
+        const string marker = "Hunk inputs are provided as JSON:";
+        var start = prompt.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return [];
+        start += marker.Length;
+        var end = prompt.IndexOf("\n\nFor each input hunk", start, StringComparison.Ordinal);
+        if (end < 0)
+            return [];
+        var json = prompt[start..end].Trim();
+        var parsed = JsonSerializer.Deserialize<ConflictResolverHunkInputJson>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        return parsed?.Hunks?
+            .Where(static h => h.Index is not null && !string.IsNullOrWhiteSpace(h.Path))
+            .Select(static h => new ConflictResolverHunkInput(
+                h.Index!.Value,
+                h.Path!,
+                h.ConflictStartLine ?? 0,
+                h.ConflictEndLine ?? 0,
+                h.ContextStartLine ?? 0,
+                h.ContextEndLine ?? 0,
+                h.Content ?? string.Empty))
+            .ToList()
+            ?? [];
+    }
+
     private async Task<AgentResult> HandleWorkAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct)
     {
         if (BeforeWorkAsync is not null)
@@ -490,6 +559,23 @@ internal sealed class SandboxTextOnlyScriptedAgent : ScriptedAgent
 }
 
 internal sealed record FileWrite(string FileName, string Contents);
+
+/// <summary>
+/// One per-hunk payload as the conflict resolver sees it in hunk-scoped mode:
+/// the file path, the conflict region's 1-indexed line range, the slice's
+/// surrounding context range, and the file slice itself (with conflict markers
+/// still present). The resolver's job is to produce replacement text for ONLY
+/// the conflict region — the orchestrator splices it back at the conflict
+/// coordinates.
+/// </summary>
+internal sealed record ConflictResolverHunkInput(
+    int Index,
+    string Path,
+    int ConflictStartLine,
+    int ConflictEndLine,
+    int ContextStartLine,
+    int ContextEndLine,
+    string Content);
 
 /// <summary>
 /// Webhook dispatcher that captures all published events in memory.
