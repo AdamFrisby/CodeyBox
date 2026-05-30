@@ -516,7 +516,17 @@ public sealed class GeminiOauthCredentialFileRefresher
                 try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
                 return false;
             }
-            catch (Exception)
+            catch (IOException)
+            {
+                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
+                return false;
+            }
+            catch (InvalidOperationException)
+            {
+                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
+                return false;
+            }
+            catch (System.ComponentModel.Win32Exception)
             {
                 try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
                 return false;
@@ -565,9 +575,9 @@ public sealed class GeminiOauthCredentialFileRefresher
                 if (!string.IsNullOrEmpty(path)) return path;
             }
         }
-        catch (Exception)
-        {
-        }
+        catch (IOException) { }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
         return null;
     }
 
