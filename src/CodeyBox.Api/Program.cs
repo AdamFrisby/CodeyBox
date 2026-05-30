@@ -1150,7 +1150,8 @@ builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct,
-    sp.GetRequiredService<IAgentRegistry>()));
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
     sp.GetRequiredService<OrchestratorProgressClock>(),

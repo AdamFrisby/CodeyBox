@@ -1,6 +1,3 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -34,6 +31,11 @@ public sealed record Notification
     /// should be stable across evaluations of the same condition so email
     /// clients can thread correctly.</summary>
     public IReadOnlyDictionary<string, string>? Fields { get; init; }
+
+    /// <summary>Recipient addresses or channel identifiers from the matching
+    /// rule. When non-empty providers SHOULD deliver to these recipients;
+    /// when null or empty the provider's default applies.</summary>
+    public IReadOnlyList<string>? Recipients { get; init; }
 }
 
 public enum NotificationSeverity

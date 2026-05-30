@@ -15,6 +15,8 @@ namespace CodeyBox.Notifications;
 /// </summary>
 public sealed class EmailNotificationProvider : INotificationProvider, IDisposable
 {
+    private const int SmtpsPort = 465;
+
     private readonly EmailProviderOptions _opts;
     private readonly ILogger<EmailNotificationProvider> _log;
     private readonly Func<SmtpClient> _smtpClientFactory;
@@ -55,7 +57,17 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
 
         using var message = new MimeMessage();
         message.From.Add(new MailboxAddress("CodeyBox", _opts.From));
-        message.To.Add(new MailboxAddress("Operator", _opts.From));
+
+        var recipients = notification.Recipients;
+        if (recipients is { Count: > 0 })
+        {
+            foreach (var recipient in recipients)
+                message.To.Add(MailboxAddress.Parse(recipient));
+        }
+        else
+        {
+            message.To.Add(new MailboxAddress("Operator", _opts.From));
+        }
         message.Subject = $"[CodeyBox/{notification.Severity}] {notification.Title}";
 
         var body = new TextPart("plain")
@@ -82,7 +94,7 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
             if (_opts.IgnoreCertificateErrors)
                 client.ServerCertificateValidationCallback = (_, _, _, _) => true;
 
-            var secureOption = _opts.Port == 465
+            var secureOption = _opts.Port == SmtpsPort
                 ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
 
@@ -96,6 +108,10 @@ public sealed class EmailNotificationProvider : INotificationProvider, IDisposab
 
             _log.LogInformation("EmailNotificationProvider: sent notification {Condition} ({Severity})",
                 notification.ConditionId, notification.Severity);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

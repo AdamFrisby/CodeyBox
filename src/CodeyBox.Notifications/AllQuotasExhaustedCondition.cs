@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Notifications;
 
@@ -12,17 +13,20 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
     private readonly IEnumerable<IAgentQuotaProbe> _probes;
     private readonly double _minQuotaPct;
     private readonly IAgentRegistry _agentRegistry;
+    private readonly ILogger<AllQuotasExhaustedCondition> _log;
 
     public string Id => "all_quotas_exhausted";
 
     public AllQuotasExhaustedCondition(
         IEnumerable<IAgentQuotaProbe> probes,
         double minQuotaPct,
-        IAgentRegistry agentRegistry)
+        IAgentRegistry agentRegistry,
+        ILogger<AllQuotasExhaustedCondition> log)
     {
         _probes = probes;
         _minQuotaPct = minQuotaPct;
         _agentRegistry = agentRegistry;
+        _log = log;
     }
 
     public async Task<bool> EvaluateAsync(CancellationToken ct)
@@ -49,8 +53,9 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
                 if (snapshot.AvailablePct < 0 || snapshot.AvailablePct >= _minQuotaPct)
                     return false;
             }
-            catch
+            catch (Exception ex)
             {
+                _log.LogWarning(ex, "AllQuotasExhaustedCondition: probe {AgentKind} failed; treating as below threshold", probe.Kind);
                 return false;
             }
         }

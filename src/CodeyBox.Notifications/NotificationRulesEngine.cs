@@ -28,7 +28,6 @@ public sealed class NotificationRulesEngine : BackgroundService
     // conditionId -> (isCurrentlyActive, lastFireTime)
     private readonly ConcurrentDictionary<string, (bool Active, DateTimeOffset LastFired)> _state = new(StringComparer.Ordinal);
     private readonly TimeSpan _sweepInterval;
-    internal bool _primed;
 
     public NotificationRulesEngine(
         IOptionsMonitor<NotificationsOptions> optsMonitor,
@@ -93,7 +92,6 @@ public sealed class NotificationRulesEngine : BackgroundService
                 }
             }
         }
-        _primed = true;
     }
 
     /// <summary>
@@ -175,6 +173,7 @@ public sealed class NotificationRulesEngine : BackgroundService
         var notification = builder.Build(now);
 
         var opts = _optsMonitor.CurrentValue;
+        IReadOnlyList<string>? recipients = null;
         foreach (var rule in opts.Rules)
         {
             if (!string.Equals(rule.Condition, conditionId, StringComparison.Ordinal)) continue;
@@ -183,7 +182,10 @@ public sealed class NotificationRulesEngine : BackgroundService
             {
                 notification = notification with { Severity = sev };
             }
+            if (rule.Recipients is { Count: > 0 })
+                recipients = rule.Recipients;
         }
+        notification = notification with { Recipients = recipients };
 
         _log.LogInformation("Notifications: firing condition {Condition} ({Severity})",
             conditionId, notification.Severity);

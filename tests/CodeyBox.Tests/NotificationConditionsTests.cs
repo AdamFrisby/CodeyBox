@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Notifications;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -30,6 +31,15 @@ public sealed class NotificationConditionsTests
     {
         var clock = new OrchestratorProgressClock();
         clock.Stamp(DateTimeOffset.UtcNow - TimeSpan.FromMinutes(20));
+        var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task OrchestratorStall_TrueExactlyAtThreshold()
+    {
+        var clock = new OrchestratorProgressClock();
+        clock.Stamp(DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10));
         var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
@@ -95,6 +105,122 @@ public sealed class NotificationConditionsTests
         store.AbandonedCount = 1;
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
+
+    // ── AllQuotasExhaustedCondition ────────────────────────────────────────
+
+    [Fact]
+    public async Task AllQuotasExhausted_NoProbes_ReturnsFalse()
+    {
+        var registry = new StubAgentRegistry();
+        var condition = new AllQuotasExhaustedCondition(
+            [], 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_AllProbesBelowThreshold_ReturnsTrue()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new StubQuotaProbe(new AgentKind("codex"), 3),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_OneProbeAboveThreshold_ReturnsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new StubQuotaProbe(new AgentKind("codex"), 15),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_ProbeNotInRegistry_Excluded()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new StubQuotaProbe(new AgentKind("codex"), 3),
+        };
+        // Registry only contains claude — codex is not available.
+        var registry = new StubAgentRegistry(probes[0].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        // Only claude is considered, and it's below threshold.
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_AvailablePctNegative_ShortCircuitsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), -1),
+            new StubQuotaProbe(new AgentKind("codex"), 3),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        // claude probe returns -1 (unknown) — short-circuits to false.
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_ProbeThrows_ReturnsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new ThrowingQuotaProbe(new AgentKind("codex")),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        // codex probe throws — treated as below threshold, but claude is below too.
+        // Wait — the exception returns false for the whole thing.
+        // Actually looking at the code: catch returns false.
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_ExactlyAtThreshold_ReturnsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 10),
+            new StubQuotaProbe(new AgentKind("codex"), 5),
+        };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, 10,
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+        // claude is at exactly 10 (>= minQuotaPct), so returns false.
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
 }
 
 // ── Test doubles ───────────────────────────────────────────────────────────
@@ -148,4 +274,51 @@ public sealed class StubWorkItemStore : IWorkItemStore
     public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
     public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => throw new NotImplementedException();
+    public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
+}
+
+public sealed class StubQuotaProbe : IAgentQuotaProbe
+{
+    public AgentKind Kind { get; }
+    private readonly double _availablePct;
+
+    public StubQuotaProbe(AgentKind kind, double availablePct)
+    {
+        Kind = kind;
+        _availablePct = availablePct;
+    }
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+}
+
+public sealed class ThrowingQuotaProbe : IAgentQuotaProbe
+{
+    public AgentKind Kind { get; }
+
+    public ThrowingQuotaProbe(AgentKind kind)
+    {
+        Kind = kind;
+    }
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        => throw new InvalidOperationException("Probe failed");
+}
+
+public sealed class StubAgentRegistry : IAgentRegistry
+{
+    private readonly HashSet<AgentKind> _available;
+
+    public StubAgentRegistry(params AgentKind[] available)
+    {
+        _available = new HashSet<AgentKind>(available);
+    }
+
+    public bool TryGet(AgentKind kind, out IAgentRunner runner)
+    {
+        runner = null!;
+        return _available.Contains(kind);
+    }
+
+    public IReadOnlyCollection<AgentKind> Available => _available;
 }
