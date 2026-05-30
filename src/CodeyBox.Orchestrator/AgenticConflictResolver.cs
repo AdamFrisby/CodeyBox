@@ -96,7 +96,9 @@ public sealed record AgenticConflictResolverResult(
     IAgentRunner? ChosenRunner,
     AgentCredential? ChosenCredential,
     IReadOnlyList<string> ConflictFiles,
-    int IterationsUsed);
+    int IterationsUsed,
+    string? Stdout,
+    string? Stderr);
 
 /// <summary>
 /// A single agent candidate the resolver may invoke. The orchestrator builds
@@ -121,14 +123,12 @@ public sealed record AgenticConflictResolverCandidate(
 /// build) and iterates per agent attempt up to a configurable cap.
 ///
 /// <para>
-/// This supersedes the old text-only resolver path (
-/// <c>PipelineRunner.RunConstrainedConflictResolverAsync</c> +
-/// <c>InvokeTextOnlyAsync</c> + <c>ClaudeAgentRunner.RunTextOnlyAsync</c>),
-/// which had three structural defects: a 128 KB per-file byte cap, no
-/// multi-file iterative resolution, and a raw <c>api.anthropic.com</c> call
-/// that risked subscription-account termination. None of those apply here:
-/// the agent runs in-VM through its normal CLI shape (ToS-compliant) and reads
-/// files directly without orchestrator-side base64 transport.
+/// This supersedes the prior text-only resolver path, which had three
+/// structural defects: a 128 KB per-file byte cap, no multi-file iterative
+/// resolution, and a raw <c>api.anthropic.com</c> call that risked
+/// subscription-account termination. None of those apply here: the agent runs
+/// in-VM through its normal CLI shape (ToS-compliant) and reads files directly
+/// without orchestrator-side base64 transport.
 /// </para>
 /// </summary>
 public sealed class AgenticConflictResolver
@@ -174,7 +174,9 @@ public sealed class AgenticConflictResolver
                 ChosenRunner: null,
                 ChosenCredential: null,
                 ConflictFiles: [],
-                IterationsUsed: 0);
+                IterationsUsed: 0,
+                Stdout: null,
+                Stderr: null);
         }
 
         foreach (var file in conflictFiles)
@@ -247,7 +249,9 @@ public sealed class AgenticConflictResolver
                         ChosenRunner: runner,
                         ChosenCredential: candidate.Credential,
                         ConflictFiles: conflictFiles,
-                        IterationsUsed: totalIterations);
+                        IterationsUsed: totalIterations,
+                        Stdout: agentResult.Stdout,
+                        Stderr: agentResult.Stderr);
                 }
 
                 lastVerificationError = verification.Reason;
@@ -268,7 +272,9 @@ public sealed class AgenticConflictResolver
             ChosenRunner: null,
             ChosenCredential: null,
             ConflictFiles: conflictFiles,
-            IterationsUsed: totalIterations);
+            IterationsUsed: totalIterations,
+            Stdout: lastAgentResult?.Stdout,
+            Stderr: lastAgentResult?.Stderr);
     }
 
     internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(

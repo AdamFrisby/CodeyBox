@@ -313,175 +313,22 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal(1, pusher.DisposedCount);
     }
 
-    // ── GetTextOnlyUnavailabilityReason ───────────────────────────────────────
+    // ── No text-only path: account-safety contract ────────────────────────────
     //
-    // The rebase-resolver router calls this BEFORE invoking RunTextOnlyAsync, so
-    // a divergence between the two (e.g. `&&` flipped to `||`, or one path
-    // checking a renamed env var) would silently route past Claude even when
-    // its credential is valid, OR pick Claude with no credential and fail at
-    // call-time with the misleading-error shape the routing fix was supposed
-    // to eliminate. These tests pin the credential-check contract.
+    // ClaudeAgentRunner deliberately does NOT implement ITextOnlyAgentRunner.
+    // The pre-agentic resolver had a text-only Claude path that POSTed directly
+    // to https://api.anthropic.com/v1/messages — a usage shape outside the
+    // Claude-Code client that Anthropic can flag and terminate the subscription
+    // for. The pickup-time rebase + merge conflict resolvers now run through
+    // the normal CLI shape inside the sandbox via the agentic resolver, so the
+    // text-only path is gone. This test pins the contract: the type itself
+    // does not advertise ITextOnlyAgentRunner.
 
     [Fact]
-    public void GetTextOnlyUnavailabilityReason_NullCredential_ReturnsReason()
+    public void ClaudeAgentRunner_DoesNotImplementITextOnlyAgentRunner()
     {
-        var runner = new ClaudeAgentRunner();
-        var reason = runner.GetTextOnlyUnavailabilityReason(credential: null);
-        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required", reason);
-    }
-
-    [Fact]
-    public void GetTextOnlyUnavailabilityReason_EmptyEnvironment_ReturnsReason()
-    {
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string>(),
-            new Dictionary<string, string>());
-
-        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
-            runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public void GetTextOnlyUnavailabilityReason_OAuthTokenPresent_ReturnsNull()
-    {
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-oauth" },
-            new Dictionary<string, string>());
-
-        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public void GetTextOnlyUnavailabilityReason_ApiKeyPresent_ReturnsNull()
-    {
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-api" },
-            new Dictionary<string, string>());
-
-        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public void GetTextOnlyUnavailabilityReason_BothCredentialsPresent_ReturnsNull()
-    {
-        // Guards against an accidental `&&` → `||` flip: with both set, the
-        // OR-shape contract says viable. With AND, both-present would also be
-        // viable, so this case alone doesn't catch the flip — paired with the
-        // single-credential tests above it does.
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string>
-            {
-                ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-oauth",
-                ["ANTHROPIC_API_KEY"] = "sk-api",
-            },
-            new Dictionary<string, string>());
-
-        Assert.Null(runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public void GetTextOnlyUnavailabilityReason_EmptyStringValues_TreatedAsAbsent()
-    {
-        // Operators sometimes export `FOO=` to clear an inherited env var;
-        // the probe must treat empty strings as absent, not as present-and-blank.
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string>
-            {
-                ["CLAUDE_CODE_OAUTH_TOKEN"] = "",
-                ["ANTHROPIC_API_KEY"] = "",
-            },
-            new Dictionary<string, string>());
-
-        Assert.Equal("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required",
-            runner.GetTextOnlyUnavailabilityReason(cred));
-    }
-
-    [Fact]
-    public async Task GetTextOnlyUnavailabilityReason_AgreesWithRunTextOnlyAsync_OnMissingCredentials()
-    {
-        // The probe (used by the router) and RunTextOnlyAsync (used at call
-        // time) must agree on what 'viable' means — otherwise the router can
-        // pick Claude as viable and then RunTextOnlyAsync rejects the same
-        // credential, reproducing the original misleading-error bug shape.
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string>(),
-            new Dictionary<string, string>());
-
-        Assert.NotNull(runner.GetTextOnlyUnavailabilityReason(cred));
-        var result = await runner.RunTextOnlyAsync("hello", cred);
-        Assert.False(result.Success);
-        Assert.Contains("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY", result.Error);
-    }
-
-    // ── Text-only model plumbing ──────────────────────────────────────────────
-
-    [Fact]
-    public async Task RunTextOnlyAsync_ConfiguredDefault_SetsModelInRequestBody()
-    {
-        // When a default is configured, the text-only call proceeds past the
-        // model-resolve guard (though the sandbox-less HTTP call will fail
-        // against a bogus endpoint — we pin that the failure is NOT the new
-        // "no default configured" guard).
-        var defaults = new AgentDefaultsSnapshot(
-            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["claude"] = "claude-haiku-4-5",
-            });
-        var runner = new ClaudeAgentRunner(defaults);
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
-            new Dictionary<string, string>());
-
-        var result = await runner.RunTextOnlyAsync("hello", cred);
-
-        Assert.False(result.Success);
-        Assert.DoesNotContain("no default configured", result.Summary);
-        Assert.DoesNotContain("no default configured", result.Error);
-    }
-
-    [Fact]
-    public async Task RunTextOnlyAsync_OAuthOnly_DeclinesWithoutHttpCall_AccountSafety()
-    {
-        // Account-safety regression guard: a subscription OAuth token must NEVER
-        // be sent to https://api.anthropic.com/v1/messages with Authorization:
-        // Bearer (raw-API misuse outside the Claude-Code client shape) — Anthropic
-        // can flag and terminate the account. The text-only path declines OAuth
-        // outright; the rebase/merge resolver cascade parks the conflict instead.
-        // A real ANTHROPIC_API_KEY (x-api-key) is the only legitimate raw-API path.
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-only" },
-            new Dictionary<string, string>());
-
-        var result = await runner.RunTextOnlyAsync("hello", cred);
-
-        Assert.False(result.Success);
-        // No HTTP error string — the path returns before any network call.
-        Assert.Null(result.Error);
-        Assert.Contains("OAuth", result.Summary, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public async Task RunTextOnlyAsync_MissingDefault_ReturnsError()
-    {
-        // When no default is configured and no modelId is passed, the new
-        // guard must return a meaningful error instead of sending model=null
-        // to the Anthropic API.
-        var runner = new ClaudeAgentRunner();
-        var cred = new AgentCredential(AgentKind.Claude,
-            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test" },
-            new Dictionary<string, string>());
-
-        var result = await runner.RunTextOnlyAsync("hello", cred);
-
-        Assert.False(result.Success);
-        Assert.Contains("no default configured", result.Error);
+        var interfaces = typeof(ClaudeAgentRunner).GetInterfaces();
+        Assert.DoesNotContain(typeof(ITextOnlyAgentRunner), interfaces);
     }
 }
 

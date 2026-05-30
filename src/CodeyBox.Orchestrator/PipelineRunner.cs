@@ -75,13 +75,13 @@ public sealed class PipelineRunner : IPipelineRunner
     // config — tests and embeddings that don't wire the snapshot keep the
     // pre-feature behaviour.
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
-    // Per-agent concurrency view used by ResolveTextOnlyRebaseResolverCascadeAsync to
-    // route the pickup-time rebase resolver away from agents whose
-    // operator-configured cap is at ceiling. The cap is shorthand for "this
-    // agent's API account budget is currently saturated"; a second concurrent
-    // call from the resolver against the same account is what produces the
-    // HTTP 429 reported in c9fd5b75. Both are optional so tests/embeddings
-    // that don't wire concurrency can keep their previous "always-route-to-
+    // Per-agent concurrency view used by BuildAgenticConflictCandidatesAsync to
+    // deprioritize agents whose operator-configured cap is at ceiling. The cap
+    // is shorthand for "this agent's API account budget is currently
+    // saturated"; a second concurrent call from the resolver against the same
+    // account is what produces the HTTP 429 reported in c9fd5b75. Both are
+    // optional so tests/embeddings that don't wire concurrency can keep their
+    // previous "always-route-to-
     // primary" semantics.
     private readonly IAgentRunningCounters? _agentRunningCounters;
     // Shared swappable holder for per-agent caps. Same instance is held by
@@ -89,6 +89,14 @@ public sealed class PipelineRunner : IPipelineRunner
     // OrchestratorService.ApplyAgentConcurrencyReload (which writes through
     // the shared snapshot) is observable here on the next GetCapSafe read.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
+    // In-VM agentic conflict resolver. Mid-rebase / mid-merge conflicts are
+    // resolved by invoking the configured agent's normal CLI inside the same
+    // sandbox via IAgentRunner.RunAsync — supersedes the old text-only LLM
+    // call that used to POST raw /v1/messages with subscription OAuth tokens
+    // (ToS-unsafe) and was limited to a 128 KiB per-file payload (couldn't
+    // resolve large conflict files). Hot-reloadable through the options
+    // snapshot the resolver holds; the same instance is reused across phases.
+    private readonly AgenticConflictResolver _agenticConflictResolver;
     // Last-resort pause for quota-shaped terminal failures when neither the
     // agent output nor quota probes expose a reset window.
     internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
@@ -119,16 +127,6 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
-    /// <summary>
-    /// Upper bound on bytes read from a single conflicted file by the
-    /// resolver's safe-read path. This is a sanity gate, not a tunable knob:
-    /// the operator-visible cap is <see cref="ProjectAudit.MergeScopeResolverMaxBytes"/>,
-    /// which limits the LLM payload per file (whole-file mode) or per hunk
-    /// (hunk-scoped mode). The safe-read ceiling is kept well above the
-    /// payload cap so the orchestrator can ingest large conflicted files (e.g.
-    /// PipelineRunner.cs at ~200 KB) and slice them per-hunk before sending.
-    /// </summary>
-    private const int MaxConflictResolverSafeReadBytes = 4 * 1024 * 1024;
     // CancellationTokenSource timers use a uint millisecond due-time internally;
     // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
@@ -191,7 +189,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
         IAgentUsageStore? usageStore = null,
         IAgentBudgetProvider? budgetProvider = null,
-        IncrementalRebaseSnapshot? incrementalRebase = null)
+        IncrementalRebaseSnapshot? incrementalRebase = null,
+        AgenticConflictResolver? agenticConflictResolver = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -258,6 +257,7 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _incrementalRebase = incrementalRebase;
+        _agenticConflictResolver = agenticConflictResolver ?? new AgenticConflictResolver();
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
     }
@@ -1140,9 +1140,9 @@ public sealed class PipelineRunner : IPipelineRunner
     ///
     /// <para>
     /// Reuses the pickup-time rebase end-to-end — including the per-repo
-    /// lock, the text-only resolver cascade, the scope-fence verification,
-    /// and the merge-security-review routing through the resolver that
-    /// actually resolved any conflicts. The single rebase core
+    /// lock, the in-VM agentic conflict resolver, the scope-fence
+    /// verification, and the merge-security-review routing through the
+    /// resolver that actually resolved any conflicts. The single rebase core
     /// (<see cref="RebaseCheckedOutBranchWithScopeFenceAsync"/>) stays
     /// authoritative; this entry point is a gate + try/catch around the
     /// existing flow, not a parallel implementation. The timing-phase tag is
@@ -1308,11 +1308,11 @@ public sealed class PipelineRunner : IPipelineRunner
         var resolvedAnyConflict = false;
         IAgentRunner? chosenResolver = null;
         AgentCredential? chosenCredential = null;
-        // Resolver cascade is resolved lazily on first conflict so a clean
-        // rebase (no conflicts) is never blocked when no class member has
-        // viable text-only credentials. The same cascade is reused for every
-        // conflict iteration within this rebase.
-        TextOnlyRebaseResolverCascade? resolverCascade = null;
+        // Candidate list is built lazily on first conflict so a clean rebase
+        // (no conflicts) never has to resolve credentials for fallback agents.
+        // The same list is reused for every conflict iteration within this
+        // rebase.
+        IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -1331,44 +1331,25 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                var hunks = await ExtractSandboxConflictHunksAsync(sandbox, ct);
-                if (hunks.Count == 0)
-                    throw new MergeConflictResolutionFailedException(
-                        $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed without inspectable conflict hunks; work branch left at original tip {oldTip}");
+                candidates ??= await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
 
-                foreach (var path in hunks.Select(static h => h.Path))
+                var resolveResult = await _agenticConflictResolver.ResolveAsync(
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    item.Id,
+                    new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Rebase),
+                    candidates,
+                    ct);
+
+                foreach (var path in resolveResult.ConflictFiles)
                     conflictFiles.Add(path);
 
-                resolverCascade ??= await ResolveTextOnlyRebaseResolverCascadeAsync(item, project, runner, ct);
-
-                var baselines = await ReadConflictFilesAsync(sandbox, hunks, ct);
-                var prompt = BuildRebaseConflictResolverPrompt(baseBranch, workBranch, hunks, project.Audit.MergeScopeBufferLines);
-                var (agentResult, iterationResolver, iterationCredential) = await RunRebaseConflictResolverCascadeAsync(
-                    item.Id,
-                    resolverCascade,
-                    sandbox,
-                    prompt,
-                    hunks,
-                    item.Agent ?? runner.Kind,
-                    item.ModelId,
-                    item.ReasoningMode,
-                    project.Audit.MergeScopeResolverMaxBytes,
-                    project.Audit.MergeScopeResolverContextLines,
-                    ct);
-                if (!agentResult.Success || iterationResolver is null)
+                if (!resolveResult.Success || resolveResult.ChosenRunner is null)
                     throw new MergeConflictResolutionFailedException(
-                        $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {agentResult.Summary}");
+                        $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
 
-                chosenResolver = iterationResolver;
-                chosenCredential = iterationCredential;
-
-                await VerifySandboxConflictResolutionScopeAsync(
-                    sandbox,
-                    baselines,
-                    hunks,
-                    project.Audit.MergeScopeBufferLines,
-                    ct);
-                await FinalizeRebaseConflictResolutionAsync(sandbox, hunks, ct);
+                chosenResolver = resolveResult.ChosenRunner;
+                chosenCredential = resolveResult.ChosenCredential;
                 resolvedAnyConflict = true;
 
                 rebase = await sandbox.ExecAsync(new SandboxExec
@@ -1407,18 +1388,44 @@ public sealed class PipelineRunner : IPipelineRunner
             resolvedAnyConflict ? chosenCredential : null);
     }
 
-    private sealed record TextOnlyRebaseResolverCascade(
-        IReadOnlyList<(IAgentRunner Runner, AgentCredential? Credential)> Candidates,
-        string SkippedReasons);
-
-    private async Task<TextOnlyRebaseResolverCascade> ResolveTextOnlyRebaseResolverCascadeAsync(
+    /// <summary>
+    /// Builds the ordered candidate list the agentic conflict resolver walks
+    /// for a single rebase or merge. Order: primary runner first, then class
+    /// chain fallbacks (ranked by the router), with at-cap candidates pushed
+    /// to the back so a saturated subscription budget yields to a member with
+    /// headroom before being used as a last-resort. Throws
+    /// <see cref="AgentUnavailableException"/> if no candidate has resolvable
+    /// credentials so the work item parks as failureKind=agent_unavailable
+    /// instead of MergeConflictResolutionFailed.
+    /// </summary>
+    internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
         WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
     {
-        var candidateReasons = new List<string>();
         var seenKinds = new HashSet<AgentKind>();
-        var viable = new List<(IAgentRunner Runner, AgentCredential? Credential)>();
+        var skipReasons = new List<string>();
+        var collected = new List<AgenticConflictResolverCandidate>();
 
-        await TryAddCandidateAsync(primaryRunner, ct);
+        // Apply the local-budget MIN gate to the primary too: an exhausted
+        // primary should NOT be tried just because it was the work item's
+        // originally-routed agent. The work-phase vetted the primary at
+        // pickup, but between pickup and merge the spend budget can drift
+        // past MinQuotaPct. Without this gate the throw at collected.Count==0
+        // below is unreachable (the primary would always be added), so
+        // 'no viable agent' would silently route to the exhausted primary.
+        seenKinds.Add(primaryRunner.Kind);
+        var (primaryBudgetPct, primaryBudgetFailedClosed) =
+            await ReadCandidateBudgetAsync(primaryRunner.Kind, item.ModelId, ct);
+        if (primaryBudgetFailedClosed
+            || (primaryBudgetPct >= 0 && primaryBudgetPct < _auditQuotaOptions.MinQuotaPct))
+        {
+            skipReasons.Add(
+                $"{primaryRunner.Kind.Value}: local budget exhausted " +
+                (primaryBudgetFailedClosed ? "(provider error)" : $"({primaryBudgetPct:F1}%)"));
+        }
+        else
+        {
+            await TryAddAsync(primaryRunner, item.ModelId, item.ReasoningMode, ct);
+        }
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
@@ -1429,178 +1436,59 @@ public sealed class PipelineRunner : IPipelineRunner
                     continue;
                 if (!_agents.TryGet(member.Agent, out var memberRunner))
                 {
-                    candidateReasons.Add($"{member.Agent.Value}: no runner registered");
+                    skipReasons.Add($"{member.Agent.Value}: no runner registered");
                     continue;
                 }
-                // Apply the same local-budget MIN gate used at pickup: a member whose
-                // operator spend budget is already exhausted must not be chosen for
-                // conflict rework just because OrderedFallbackCandidates (score-only)
-                // surfaced it. Fail closed when the provider throws.
+                // Apply the same local-budget MIN gate used at pickup: a member
+                // whose operator spend budget is already exhausted must not be
+                // chosen for conflict rework just because OrderedFallbackCandidates
+                // (score-only) surfaced it. Fail closed when the provider throws.
                 var (budgetPct, budgetFailedClosed) =
                     await ReadCandidateBudgetAsync(member.Agent, member.ModelId, ct);
                 if (budgetFailedClosed
                     || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
                 {
-                    candidateReasons.Add(
+                    skipReasons.Add(
                         $"{member.Agent.Value}: local budget exhausted " +
                         (budgetFailedClosed ? "(provider error)" : $"({budgetPct:F1}%)"));
                     continue;
                 }
-
-                await TryAddCandidateAsync(memberRunner, ct);
+                // Cross-kind candidates clear ModelId / ReasoningMode — those
+                // strings are agent-specific (e.g. "claude-opus-4-7" is not a
+                // valid Codex model). The candidate's own default kicks in.
+                await TryAddAsync(memberRunner, modelId: null, reasoningMode: null, ct);
             }
         }
 
-        if (viable.Count == 0)
+        if (collected.Count == 0)
         {
-            var reasons = candidateReasons.Count == 0
-                ? "no text-only-capable agent registered"
-                : string.Join("; ", candidateReasons);
-            AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
+            var reasons = skipReasons.Count == 0
+                ? "no candidate runner registered"
+                : string.Join("; ", skipReasons);
             throw new AgentUnavailableException(
-                $"pickup-time rebase resolver could not run: no text-only-capable agent has viable credentials ({reasons})",
+                $"pickup-time rebase resolver could not run: no agent has viable credentials ({reasons})",
                 reasons);
         }
 
+        // Deprioritize at-cap candidates while preserving primary > class-chain
+        // ordering within each cap bucket. A cap of 0 (unconfigured) is treated
+        // as "not at cap" so wiring agentRunningCounters without an explicit
+        // cap config keeps the previous "always prefer primary" behaviour.
         const int capSortPreferred = 0;
         const int capSortDeprioritized = 1;
-        var ordered = viable
-            .OrderBy(c => IsAtAgentCap(c.Runner.Kind) ? capSortDeprioritized : capSortPreferred)
+        return collected
+            .Select((c, idx) => (Candidate: c, Index: idx, AtCap: IsAtAgentCap(c.Runner.Kind)))
+            .OrderBy(t => t.AtCap ? capSortDeprioritized : capSortPreferred)
+            .ThenBy(t => t.Index)
+            .Select(t => t.Candidate)
             .ToList();
 
-        var skipped = candidateReasons.Count == 0 ? "(none)" : string.Join("; ", candidateReasons);
-        var orderLabel = string.Join(">", ordered.Select(static c => c.Runner.Kind.Value));
-        AuditLog.RebaseResolverCascadePlanned(item.Id, orderLabel, skipped);
-
-        var primaryAtCap = IsAtAgentCap(primaryRunner.Kind);
-        var first = ordered[0];
-        if (!ReferenceEquals(first.Runner, primaryRunner))
-        {
-            if (primaryAtCap)
-            {
-                AuditLog.RebaseResolverAgentCapReroute(
-                    primaryRunner.Kind, first.Runner.Kind,
-                    GetRunningSafe(primaryRunner.Kind), GetCapSafe(primaryRunner.Kind));
-            }
-            else
-            {
-                var primarySkip = candidateReasons
-                    .FirstOrDefault(r => r.StartsWith($"{primaryRunner.Kind.Value}:", StringComparison.Ordinal));
-                var skipDetail = primarySkip is not null
-                    ? primarySkip[(primaryRunner.Kind.Value.Length + 2)..]
-                    : "text-only not available";
-                AuditLog.RebaseResolverAgentRerouted(primaryRunner.Kind, first.Runner.Kind,
-                    $"{primaryRunner.Kind.Value} skipped ({skipDetail}); using class member");
-            }
-        }
-        else if (primaryAtCap && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
-        {
-            AuditLog.RebaseResolverAllAtCap(
-                first.Runner.Kind,
-                GetRunningSafe(first.Runner.Kind),
-                GetCapSafe(first.Runner.Kind));
-        }
-
-        return new TextOnlyRebaseResolverCascade(ordered, skipped);
-
-        async Task TryAddCandidateAsync(IAgentRunner candidate, CancellationToken token)
+        async Task TryAddAsync(IAgentRunner candidate, string? modelId, string? reasoningMode, CancellationToken token)
         {
             seenKinds.Add(candidate.Kind);
-            if (candidate is not ITextOnlyAgentRunner)
-            {
-                candidateReasons.Add($"{candidate.Kind.Value}: runner does not implement text-only mode");
-                return;
-            }
-
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
-            var reason = ((ITextOnlyAgentRunner)candidate).GetTextOnlyUnavailabilityReason(credential);
-            if (reason is not null)
-            {
-                candidateReasons.Add($"{candidate.Kind.Value}: {reason}");
-                return;
-            }
-
-            if (viable.Any(v => v.Runner.Kind == candidate.Kind))
-                return;
-
-            viable.Add((candidate, credential));
+            collected.Add(new AgenticConflictResolverCandidate(candidate, credential, modelId, reasoningMode));
         }
-    }
-
-    private async Task<(AgentResult Result, IAgentRunner? ChosenRunner, AgentCredential? ChosenCredential)> RunRebaseConflictResolverCascadeAsync(
-        WorkItemId workItemId,
-        TextOnlyRebaseResolverCascade cascade,
-        ISandbox sandbox,
-        string prompt,
-        IReadOnlyList<ConflictHunk> conflictHunks,
-        AgentKind workAgentKind,
-        string? modelId,
-        string? reasoningMode,
-        int resolverMaxBytes,
-        int resolverContextLines,
-        CancellationToken ct)
-    {
-        var attemptTrail = new List<string>();
-        AgentResult? lastResult = null;
-
-        foreach (var (resolverRunner, resolverCredential) in cascade.Candidates)
-        {
-            var crossKind = resolverRunner.Kind != workAgentKind;
-            var agentResult = await RunConstrainedConflictResolverAsync(
-                resolverRunner,
-                sandbox,
-                prompt,
-                conflictHunks,
-                resolverCredential,
-                crossKind ? null : modelId,
-                crossKind ? null : reasoningMode,
-                ct,
-                resolverMaxBytes,
-                resolverContextLines);
-            lastResult = agentResult;
-            if (agentResult.Success)
-            {
-                var attempted = attemptTrail.Count == 0
-                    ? "(none)"
-                    : string.Join("; ", attemptTrail);
-                AuditLog.RebaseResolverSucceeded(workItemId, resolverRunner.Kind, attempted, cascade.SkippedReasons);
-                return (agentResult, resolverRunner, resolverCredential);
-            }
-
-            attemptTrail.Add($"{resolverRunner.Kind.Value}({agentResult.Summary})");
-            AuditLog.RebaseResolverTextOnlyAttemptFailed(workItemId, resolverRunner.Kind, agentResult.Summary);
-        }
-
-        return (lastResult ?? new AgentResult(false, "no text-only resolver candidates", null, null), null, null);
-    }
-
-    internal static async Task<TextOnlyAgentResult> InvokeTextOnlyAsync(
-        IAgentRunner runner,
-        ISandbox? sandbox,
-        string? workingDirectory,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId,
-        string? reasoningMode,
-        CancellationToken ct)
-    {
-        if (runner is ITextOnlyAgentRunner textOnlyRunner)
-        {
-            return await textOnlyRunner.RunTextOnlyAsync(
-                prompt,
-                credential,
-                modelId,
-                reasoningMode,
-                ct,
-                sandbox,
-                workingDirectory);
-        }
-
-        return new TextOnlyAgentResult(
-            false,
-            $"agent {runner.Kind.Value} does not support text-only calls",
-            null,
-            null);
     }
 
     /// <summary>
@@ -1631,93 +1519,6 @@ public sealed class PipelineRunner : IPipelineRunner
             && entry is { MaxConcurrent: > 0 }
             ? entry.MaxConcurrent
             : 0;
-    }
-
-    private int GetRunningSafe(AgentKind agent) =>
-        _agentRunningCounters?.GetRunning(agent) ?? 0;
-
-    private static async Task<IReadOnlyList<ConflictHunk>> ExtractSandboxConflictHunksAsync(ISandbox sandbox, CancellationToken ct)
-    {
-        var unmerged = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
-        }, ct);
-        if (!unmerged.Success)
-            throw new MergeConflictResolutionFailedException($"failed to inspect pickup-time rebase conflicts: {unmerged.Stderr}");
-
-        var hunks = new List<ConflictHunk>();
-        foreach (var file in unmerged.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            ValidateConflictResolverPath(file);
-            var content = await ReadSandboxConflictFileAsync(sandbox, file, "pickup-time rebase conflict file", ct);
-            hunks.AddRange(MergeScopeFence.ExtractConflictHunks(file, content));
-        }
-
-        return hunks;
-    }
-
-    private static async Task<IReadOnlyDictionary<string, string>> ReadConflictFilesAsync(
-        ISandbox sandbox,
-        IReadOnlyList<ConflictHunk> hunks,
-        CancellationToken ct)
-    {
-        var files = hunks.Select(static h => h.Path).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        var contents = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var file in files)
-            contents[file] = await ReadSandboxConflictFileAsync(sandbox, file, "pickup-time rebase conflict baseline", ct);
-
-        return contents;
-    }
-
-    private static async Task VerifySandboxConflictResolutionScopeAsync(
-        ISandbox sandbox,
-        IReadOnlyDictionary<string, string> baselines,
-        IReadOnlyList<ConflictHunk> hunks,
-        int bufferLines,
-        CancellationToken ct)
-    {
-        var resolved = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var path in baselines.Keys)
-            resolved[path] = await ReadSandboxConflictFileAsync(sandbox, path, "pickup-time rebase resolution", ct);
-
-        MergeScopeFence.VerifyResolvedContents(baselines, resolved, hunks, bufferLines);
-    }
-
-    private static async Task FinalizeRebaseConflictResolutionAsync(
-        ISandbox sandbox,
-        IReadOnlyList<ConflictHunk> conflictHunks,
-        CancellationToken ct)
-    {
-        var files = conflictHunks.Select(h => h.Path).Distinct(StringComparer.Ordinal).ToArray();
-        if (files.Length > 0)
-        {
-            var addArgv = new List<string> { "git", "-C", SandboxConventions.WorkDir, "add", "--" };
-            addArgv.AddRange(files);
-            await RunWithCancellation(sandbox, ct, addArgv.ToArray());
-        }
-
-        var unmerged = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "diff", "--name-only", "--diff-filter=U"],
-        }, ct);
-        if (!unmerged.Success)
-            throw new InvalidOperationException($"failed to inspect unmerged paths: {unmerged.Stderr}");
-        if (!string.IsNullOrWhiteSpace(unmerged.Stdout))
-            throw new InvalidOperationException($"pickup-time rebase resolver left unmerged paths:\n{unmerged.Stdout}");
-
-        if (files.Length > 0)
-        {
-            var grepArgv = new List<string>
-            {
-                "git", "-C", SandboxConventions.WorkDir, "grep", "-n", "-E", "^(<<<<<<<|=======|>>>>>>>)", "--",
-            };
-            grepArgv.AddRange(files);
-            var markers = await sandbox.ExecAsync(new SandboxExec { Argv = grepArgv }, ct);
-            if (markers.ExitCode == 0)
-                throw new InvalidOperationException($"pickup-time rebase resolver left conflict markers:\n{markers.Stdout}");
-            if (markers.ExitCode != 1)
-                throw new InvalidOperationException($"failed to scan for conflict markers: {markers.Stderr}");
-        }
     }
 
     private static async Task<bool> FetchOriginBranchAsync(ISandbox sandbox, string branch, bool required, CancellationToken ct)
@@ -4042,35 +3843,50 @@ public sealed class PipelineRunner : IPipelineRunner
                         "host git reported conflicts but sandbox git merged the same commits cleanly");
             }
 
-            var prompt = hostMerge.HasConflicts
-                ? BuildConflictResolverPrompt(baseBranch, workBranch, conflictHunks, project.Audit.MergeScopeBufferLines)
-                : BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
+            // Clean-merge prompt is only meaningful when there are no conflicts.
+            // The conflict path runs the agentic resolver, which builds its own
+            // per-attempt prompt inside AgenticConflictResolver.
             var mergeSw = Stopwatch.StartNew();
             AgentResult agentResult;
             long mergeExecElapsedMs;
             DateTimeOffset mergeEndedAt;
             var mergeStructuredStreamCaptured = false;
+            // When the merge phase resolves conflicts via the agentic resolver,
+            // the chosen candidate (possibly a class fallback) replaces the
+            // pipeline's primary runner from this point onward — so post-resolution
+            // verification, cost recording, suggestion pickup, and the merge
+            // commit's trailer attribute the work to the agent that actually did
+            // it. Mirrors the pickup-rebase pattern where chosenResolver swaps in.
+            var chosenMergeRunner = runner;
+            var chosenMergeCredential = credential;
             if (hostMerge.HasConflicts)
             {
                 var mergeExecScope = await TimingScope.BeginAsync(
                     _timings, item.Id, "merge", "agent.exec",
-                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "conflict-text-only" },
+                    metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value, ["capability"] = "agentic-in-vm" },
                     log: _log,
                     activitySource: CodeyBoxActivities.Pipeline);
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                    agentResult = await RunConstrainedConflictResolverAsync(
-                        runner,
+                    var candidates = await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                    var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
-                        prompt,
-                        conflictHunks,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        ct,
-                        project.Audit.MergeScopeResolverMaxBytes,
-                        project.Audit.MergeScopeResolverContextLines);
+                        SandboxConventions.WorkDir,
+                        item.Id,
+                        new AgenticConflictResolverContext(baseBranch, workBranch, AgenticConflictResolverOperation.Merge),
+                        candidates,
+                        ct);
+                    agentResult = new AgentResult(
+                        resolverResult.Success,
+                        resolverResult.Summary,
+                        resolverResult.Stdout,
+                        resolverResult.Stderr);
+                    if (resolverResult.Success && resolverResult.ChosenRunner is not null)
+                    {
+                        chosenMergeRunner = resolverResult.ChosenRunner;
+                        chosenMergeCredential = resolverResult.ChosenCredential;
+                    }
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
                 mergeEndedAt = DateTimeOffset.UtcNow;
@@ -4078,6 +3894,7 @@ public sealed class PipelineRunner : IPipelineRunner
             else
             {
                 AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                var mergePrompt = BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
                 var mergeExecScope = await TimingScope.BeginAsync(
                     _timings, item.Id, "merge", "agent.exec",
                     metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
@@ -4094,7 +3911,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     await using (mergeExecScope)
                     {
-                        var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                        var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                             stdoutChunkCallback: mergeStdoutCallback,
                             captureStructuredStream: mergeStreamCapture is not null);
                         var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
@@ -4120,19 +3937,24 @@ public sealed class PipelineRunner : IPipelineRunner
                 mergeEndedAt = DateTimeOffset.UtcNow;
             }
             CodeyBoxMeters.AgentDuration.Record(mergeExecElapsedMs,
-                new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                new KeyValuePair<string, object?>("agent.kind", chosenMergeRunner.Kind.Value),
                 new KeyValuePair<string, object?>("phase", "merge"));
 
-            var observedModelId = ResolveObservedModelId(runner, item.ModelId);
+            // When the cascade swapped to a cross-kind fallback, item.ModelId
+            // belongs to the primary (e.g. "claude-opus-4-7") and is not valid
+            // for the winner — fall back to the winner runner's default model.
+            var observedModelId = ResolveObservedModelId(
+                chosenMergeRunner,
+                chosenMergeRunner.Kind == runner.Kind ? item.ModelId : null);
             var mergeStartedAt = mergeEndedAt.AddMilliseconds(-mergeExecElapsedMs);
             if (!mergeStructuredStreamCaptured)
-                await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
+                await EmitToolCallCountsAsync(chosenMergeRunner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                runner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
+                chosenMergeRunner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
             mergeSw.Stop();
             if (_availability is { } regOnMergeFinish)
             {
-                var transition = regOnMergeFinish.RecordRunOutcome(runner.Kind, agentResult.Success, mergeSw.Elapsed);
+                var transition = regOnMergeFinish.RecordRunOutcome(chosenMergeRunner.Kind, agentResult.Success, mergeSw.Elapsed);
                 if (!transition.PreviouslyExcluded && transition.NowExcluded)
                 {
                     await _webhooks.PublishAsync(new WebhookEvent
@@ -4142,25 +3964,25 @@ public sealed class PipelineRunner : IPipelineRunner
                         Project = project,
                         Details = new AgentSmokeFailedDetails
                         {
-                            AgentKind = runner.Kind.Value,
+                            AgentKind = chosenMergeRunner.Kind.Value,
                             Reason = transition.Reason,
                         },
                     }, CancellationToken.None);
                 }
             }
-            AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
+            AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
-            LogAgentOutput(_log, runner.Kind, agentResult);
+            LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
             if (!agentResult.Success)
             {
                 _quotaClassifier.EmitAdvisoryAuditEvents(
-                    runner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+                    chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
+                var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
                 if (detection is not null)
                 {
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,
-                        runner.Kind,
+                        chosenMergeRunner.Kind,
                         observedModelId,
                         agentResult.Summary,
                         agentResult.Stderr,
@@ -4169,12 +3991,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         ct,
                         projectId: item.ProjectId,
                         stdout: agentResult.Stdout);
-                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {runner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
+                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
                 }
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
-                    runner.Kind,
+                    chosenMergeRunner.Kind,
                     observedModelId,
                     agentResult.Summary,
                     agentResult.Stderr,
@@ -4186,7 +4008,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                throw new InvalidOperationException($"Merge agent {runner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+                throw new InvalidOperationException($"Merge agent {chosenMergeRunner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
             }
 
             // Read suggestions.json before cleaning the working tree, then remove it
@@ -4210,7 +4032,7 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 try
                 {
-                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct);
+                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct);
                     await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
                     mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                     await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
@@ -4228,8 +4050,8 @@ public sealed class PipelineRunner : IPipelineRunner
                             project.Audit.MergeScopeBufferLines,
                             ct,
                             project,
-                            runner,
-                            credential,
+                            chosenMergeRunner,
+                            chosenMergeCredential,
                             sandbox,
                             conflictsResolvedByConstrainedResolver: true);
                         await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
@@ -4338,422 +4160,6 @@ public sealed class PipelineRunner : IPipelineRunner
 
         return headSha;
     }
-
-    private async Task<AgentResult> RunConstrainedConflictResolverAsync(
-        IAgentRunner runner,
-        ISandbox sandbox,
-        string prompt,
-        IReadOnlyList<ConflictHunk> conflictHunks,
-        AgentCredential? credential,
-        string? modelId,
-        string? reasoningMode,
-        CancellationToken ct,
-        int resolverMaxBytes,
-        int resolverContextLines)
-    {
-        if (runner is not ITextOnlyAgentRunner)
-        {
-            return new AgentResult(
-                false,
-                $"agent {runner.Kind} does not implement text-only merge conflict resolution",
-                null,
-                "conflicted merges require a text-only-capable agent runner");
-        }
-
-        var files = conflictHunks
-            .Select(h => h.Path)
-            .Distinct(StringComparer.Ordinal)
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-        foreach (var file in files)
-            ValidateConflictResolverPath(file);
-
-        var fileContents = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var file in files)
-        {
-            string content;
-            try
-            {
-                content = await ReadSandboxConflictFileAsync(sandbox, file, "conflicted file", ct);
-            }
-            catch (MergeConflictResolutionFailedException ex)
-            {
-                return new AgentResult(false, $"failed to read conflicted file '{file}': {ex.Message}", null, null);
-            }
-
-            fileContents[file] = content;
-        }
-
-        // Whole-file mode preserves the original protocol when every file fits
-        // under the operator-tunable resolver payload cap. Past the cap we fall
-        // through to hunk-scoped mode so a small conflict inside a large file
-        // (e.g. a 5600-line file with a 30-line hunk) doesn't wedge the item.
-        var anyFileOverCap = fileContents.Values
-            .Any(c => Encoding.UTF8.GetByteCount(c) > resolverMaxBytes);
-        return anyFileOverCap
-            ? await RunHunkScopedResolverAsync(
-                runner, sandbox, prompt, conflictHunks, fileContents,
-                credential, modelId, reasoningMode,
-                resolverMaxBytes, resolverContextLines, ct)
-            : await RunWholeFileResolverAsync(
-                runner, sandbox, prompt,
-                files.Select(f => new ConflictResolverFile(f, fileContents[f])).ToList(),
-                credential, modelId, reasoningMode, ct);
-    }
-
-    private async Task<AgentResult> RunWholeFileResolverAsync(
-        IAgentRunner runner,
-        ISandbox sandbox,
-        string prompt,
-        IReadOnlyList<ConflictResolverFile> resolverFiles,
-        AgentCredential? credential,
-        string? modelId,
-        string? reasoningMode,
-        CancellationToken ct)
-    {
-        var resolverPrompt = BuildConflictResolverTextOnlyPrompt(prompt, resolverFiles);
-        var textResult = await InvokeTextOnlyAsync(
-            runner,
-            sandbox,
-            SandboxConventions.WorkDir,
-            resolverPrompt,
-            credential,
-            modelId,
-            reasoningMode,
-            ct);
-        if (!textResult.Success)
-            return new AgentResult(false, textResult.Summary, textResult.Output, textResult.Error);
-
-        ConflictResolutionJson parsed;
-        try
-        {
-            parsed = JsonSerializer.Deserialize<ConflictResolutionJson>(ExtractJsonObject(textResult.Output), JsonOpts)
-                ?? new ConflictResolutionJson(null);
-        }
-        catch (JsonException ex)
-        {
-            return new AgentResult(false, $"conflict resolver produced invalid JSON: {ex.Message}", textResult.Output, textResult.Error);
-        }
-
-        var resolvedFiles = parsed.Files?
-            .Where(static f => !string.IsNullOrWhiteSpace(f.Path))
-            .ToDictionary(
-                static f => f.Path!,
-                static f => f.Content ?? string.Empty,
-                StringComparer.Ordinal)
-            ?? new Dictionary<string, string>(StringComparer.Ordinal);
-
-        var expected = resolverFiles.Select(f => f.Path).ToHashSet(StringComparer.Ordinal);
-        var actual = resolvedFiles.Keys.ToHashSet(StringComparer.Ordinal);
-        var missing = expected.Except(actual, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        var extra = actual.Except(expected, StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        if (missing.Length > 0 || extra.Length > 0)
-        {
-            var message = $"conflict resolver returned an invalid file set; missing=[{string.Join(", ", missing)}], extra=[{string.Join(", ", extra)}]";
-            return new AgentResult(false, message, textResult.Output, textResult.Error);
-        }
-
-        foreach (var (path, content) in resolvedFiles)
-        {
-            ValidateConflictResolverPath(path);
-            try
-            {
-                await WriteSandboxConflictFileAsync(sandbox, path, content, ct);
-            }
-            catch (MergeConflictResolutionFailedException ex)
-            {
-                return new AgentResult(false, $"failed to write resolved file '{path}': {ex.Message}", null, null);
-            }
-        }
-
-        return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
-    }
-
-    private async Task<AgentResult> RunHunkScopedResolverAsync(
-        IAgentRunner runner,
-        ISandbox sandbox,
-        string prompt,
-        IReadOnlyList<ConflictHunk> conflictHunks,
-        IReadOnlyDictionary<string, string> fileContents,
-        AgentCredential? credential,
-        string? modelId,
-        string? reasoningMode,
-        int resolverMaxBytes,
-        int resolverContextLines,
-        CancellationToken ct)
-    {
-        // Each hunk becomes its own payload, capped at resolverMaxBytes. The
-        // conflict region itself is sent verbatim; only the orientation context
-        // shrinks if needed. A hunk whose verbatim conflict region alone
-        // exceeds the cap is reported as a precise per-hunk failure so the
-        // operator sees which file:line range is the genuine blocker —
-        // documented fallback that replaces the previous file-level wedge.
-        var hunkSlices = new List<ResolverHunkPayload>(conflictHunks.Count);
-        for (var i = 0; i < conflictHunks.Count; i++)
-        {
-            var hunk = conflictHunks[i];
-            if (!fileContents.TryGetValue(hunk.Path, out var content))
-                return new AgentResult(
-                    false,
-                    $"internal: no file contents loaded for '{hunk.Path}'",
-                    null, null);
-
-            var slice = BuildResolverHunkPayload(i, hunk, content, resolverContextLines, resolverMaxBytes);
-            if (slice.OversizedReason is not null)
-                return new AgentResult(false, slice.OversizedReason, null, null);
-            hunkSlices.Add(slice);
-        }
-
-        var resolverPrompt = BuildConflictResolverHunkScopedPrompt(prompt, hunkSlices);
-        var textResult = await InvokeTextOnlyAsync(
-            runner,
-            sandbox,
-            SandboxConventions.WorkDir,
-            resolverPrompt,
-            credential,
-            modelId,
-            reasoningMode,
-            ct);
-        if (!textResult.Success)
-            return new AgentResult(false, textResult.Summary, textResult.Output, textResult.Error);
-
-        ConflictResolutionHunksJson parsed;
-        try
-        {
-            parsed = JsonSerializer.Deserialize<ConflictResolutionHunksJson>(ExtractJsonObject(textResult.Output), JsonOpts)
-                ?? new ConflictResolutionHunksJson(null);
-        }
-        catch (JsonException ex)
-        {
-            return new AgentResult(false, $"conflict resolver produced invalid JSON: {ex.Message}", textResult.Output, textResult.Error);
-        }
-
-        var resolvedHunks = parsed.Hunks?
-            .Where(static h => h.Index is not null)
-            .ToDictionary(static h => h.Index!.Value, static h => h.Content ?? string.Empty)
-            ?? new Dictionary<int, string>();
-
-        var expected = Enumerable.Range(0, hunkSlices.Count).ToHashSet();
-        var actual = resolvedHunks.Keys.ToHashSet();
-        var missing = expected.Except(actual).Order().ToArray();
-        var extra = actual.Except(expected).Order().ToArray();
-        if (missing.Length > 0 || extra.Length > 0)
-        {
-            var message = $"conflict resolver returned an invalid hunk set; missing=[{string.Join(", ", missing)}], extra=[{string.Join(", ", extra)}]";
-            return new AgentResult(false, message, textResult.Output, textResult.Error);
-        }
-
-        // Splice each resolved region back into its file. Descending order by
-        // start line within a file keeps earlier hunks' coordinates stable
-        // while later hunks are replaced first.
-        var resolvedFileContents = new Dictionary<string, string>(fileContents, StringComparer.Ordinal);
-        var hunksByFile = hunkSlices
-            .GroupBy(h => h.Hunk.Path, StringComparer.Ordinal)
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(h => h.Hunk.StartLine).ToList(), StringComparer.Ordinal);
-
-        foreach (var (path, fileHunks) in hunksByFile)
-        {
-            var lines = SplitLinesPreservingTrailingEmpty(resolvedFileContents[path]);
-            foreach (var fh in fileHunks)
-            {
-                var replacement = SplitLinesPreservingTrailingEmpty(resolvedHunks[fh.Index]);
-                var before = lines.Take(fh.Hunk.StartLine - 1);
-                var after = lines.Skip(fh.Hunk.EndLine);
-                lines = before.Concat(replacement).Concat(after).ToArray();
-            }
-            resolvedFileContents[path] = string.Join('\n', lines);
-        }
-
-        foreach (var (path, content) in resolvedFileContents)
-        {
-            ValidateConflictResolverPath(path);
-            try
-            {
-                await WriteSandboxConflictFileAsync(sandbox, path, content, ct);
-            }
-            catch (MergeConflictResolutionFailedException ex)
-            {
-                return new AgentResult(false, $"failed to write resolved file '{path}': {ex.Message}", null, null);
-            }
-        }
-
-        return new AgentResult(true, textResult.Summary, textResult.Output, textResult.Error);
-    }
-
-    private sealed record ResolverHunkPayload(
-        int Index,
-        ConflictHunk Hunk,
-        int ContextStartLine,
-        int ContextEndLine,
-        string Content,
-        string? OversizedReason);
-
-    /// <summary>
-    /// Builds the per-hunk payload sent to the resolver. The conflict region is
-    /// included verbatim; the orientation context starts at
-    /// <paramref name="requestedContextLines"/> and is halved (then dropped to
-    /// zero) until the payload fits within <paramref name="maxBytes"/>. If even
-    /// the zero-context payload exceeds the cap, the returned record carries an
-    /// <c>OversizedReason</c> naming the exact file:line range — the caller
-    /// surfaces this as the documented fallback for genuinely oversized hunks.
-    /// </summary>
-    private static ResolverHunkPayload BuildResolverHunkPayload(
-        int index,
-        ConflictHunk hunk,
-        string fileContent,
-        int requestedContextLines,
-        int maxBytes)
-    {
-        var lines = SplitLinesPreservingTrailingEmpty(fileContent);
-        var lineCount = lines.Length;
-        var clampedRequest = Math.Max(0, requestedContextLines);
-
-        // Try progressively smaller context windows until the payload fits.
-        // Skipping straight to 0 on the second pass keeps the loop bounded and
-        // surfaces oversized-hunk failures fast.
-        foreach (var ctx in new[] { clampedRequest, clampedRequest / 2, 0 }.Distinct())
-        {
-            var contextStart = Math.Max(1, hunk.StartLine - ctx);
-            var contextEnd = Math.Min(lineCount, hunk.EndLine + ctx);
-            var slice = string.Join('\n', lines.Skip(contextStart - 1).Take(contextEnd - contextStart + 1));
-            if (Encoding.UTF8.GetByteCount(slice) <= maxBytes)
-            {
-                return new ResolverHunkPayload(index, hunk, contextStart, contextEnd, slice, OversizedReason: null);
-            }
-        }
-
-        var conflictSize = Encoding.UTF8.GetByteCount(
-            string.Join('\n', lines.Skip(hunk.StartLine - 1).Take(hunk.EndLine - hunk.StartLine + 1)));
-        var reason =
-            $"conflict hunk at '{hunk.Path}':{hunk.StartLine}-{hunk.EndLine} ({conflictSize} bytes) " +
-            $"exceeds the {maxBytes}-byte resolver payload cap even with zero context lines; " +
-            "split the change into a smaller conflict or raise CodeyBox:Projects:Defaults:Audit:MergeScopeResolverMaxBytes";
-        return new ResolverHunkPayload(index, hunk, hunk.StartLine, hunk.EndLine, string.Empty, OversizedReason: reason);
-    }
-
-    private static string[] SplitLinesPreservingTrailingEmpty(string content)
-        => content.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
-
-    private static async Task<string> ReadSandboxConflictFileAsync(
-        ISandbox sandbox,
-        string path,
-        string description,
-        CancellationToken ct)
-    {
-        ValidateConflictResolverPath(path);
-        var read = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv =
-            [
-                "sh", "-c", SafeReadSandboxFileScript, "codeybox-safe-read-conflict-file",
-                SandboxConventions.WorkDir,
-                path,
-                (MaxConflictResolverSafeReadBytes + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
-            ],
-        }, ct);
-        if (!read.Success)
-            throw new MergeConflictResolutionFailedException(
-                $"failed to read {description} '{path}' safely: {read.Stderr.Trim()}");
-
-        byte[] bytes;
-        try
-        {
-            bytes = Convert.FromBase64String(read.Stdout);
-        }
-        catch (FormatException ex)
-        {
-            throw new MergeConflictResolutionFailedException(
-                $"failed to decode {description} '{path}'", ex);
-        }
-
-        if (bytes.Length > MaxConflictResolverSafeReadBytes)
-            throw new MergeConflictResolutionFailedException(
-                $"{description} '{path}' exceeds the {MaxConflictResolverSafeReadBytes} byte safe-read sanity limit");
-
-        return Encoding.UTF8.GetString(bytes);
-    }
-
-    private static async Task WriteSandboxConflictFileAsync(
-        ISandbox sandbox,
-        string path,
-        string content,
-        CancellationToken ct)
-    {
-        ValidateConflictResolverPath(path);
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv =
-            [
-                "sh", "-c", SafeWriteSandboxFileScript, "codeybox-safe-write-conflict-file",
-                SandboxConventions.WorkDir,
-                path,
-            ],
-            Stdin = content,
-        }, ct);
-        if (!write.Success)
-            throw new MergeConflictResolutionFailedException(
-                $"safe write rejected '{path}': {write.Stderr.Trim()}");
-    }
-
-    private static void ValidateConflictResolverPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path)
-            || Path.IsPathRooted(path)
-            || path.Contains('\\', StringComparison.Ordinal)
-            || path.Split('/', StringSplitOptions.None).Any(static part => part is "" or "." or ".."))
-        {
-            throw new MergeConflictResolutionFailedException($"unsafe conflict file path '{path}'");
-        }
-    }
-
-    private const string SafeReadSandboxFileScript = """
-        set -eu
-        root=$1
-        rel=$2
-        limit=$3
-        case "$limit" in ''|*[!0-9]*) echo "invalid byte limit" >&2; exit 64;; esac
-        root_real=$(cd "$root" 2>/dev/null && pwd -P) || { echo "worktree root not found" >&2; exit 65; }
-        case "$rel" in /*|*\\*|''|.|..|./*|../*|*/./*|*/../*|*/.|*/..) echo "unsafe relative path" >&2; exit 66;; esac
-        parent_rel=${rel%/*}
-        base=${rel##*/}
-        if [ "$parent_rel" = "$rel" ]; then
-            parent_path=$root_real
-        else
-            parent_path=$root_real/$parent_rel
-        fi
-        parent_real=$(cd "$parent_path" 2>/dev/null && pwd -P) || { echo "parent path not found" >&2; exit 67; }
-        case "$parent_real/" in "$root_real/"|"$root_real"/*) ;; *) echo "path escapes worktree" >&2; exit 68;; esac
-        target=$parent_real/$base
-        if [ -L "$target" ]; then echo "refusing symlink" >&2; exit 69; fi
-        if [ ! -f "$target" ]; then echo "not a regular file" >&2; exit 70; fi
-        dd if="$target" bs="$limit" count=1 iflag=nofollow status=none | base64
-        """;
-
-    private const string SafeWriteSandboxFileScript = """
-        set -eu
-        root=$1
-        rel=$2
-        root_real=$(cd "$root" 2>/dev/null && pwd -P) || { echo "worktree root not found" >&2; exit 65; }
-        case "$rel" in /*|*\\*|''|.|..|./*|../*|*/./*|*/../*|*/.|*/..) echo "unsafe relative path" >&2; exit 66;; esac
-        parent_rel=${rel%/*}
-        base=${rel##*/}
-        if [ "$parent_rel" = "$rel" ]; then
-            parent_path=$root_real
-        else
-            parent_path=$root_real/$parent_rel
-        fi
-        parent_real=$(cd "$parent_path" 2>/dev/null && pwd -P) || { echo "parent path not found" >&2; exit 67; }
-        case "$parent_real/" in "$root_real/"|"$root_real"/*) ;; *) echo "path escapes worktree" >&2; exit 68;; esac
-        target=$parent_real/$base
-        if [ -L "$target" ]; then echo "refusing symlink" >&2; exit 69; fi
-        if [ ! -f "$target" ]; then echo "not a regular file" >&2; exit 70; fi
-        tmp=$(mktemp "$parent_real/.codeybox-resolve.XXXXXX") || exit 71
-        trap 'rm -f "$tmp"' EXIT
-        cat > "$tmp"
-        if mode=$(stat -c '%a' -- "$target" 2>/dev/null); then chmod "$mode" "$tmp"; fi
-        mv -f -T "$tmp" "$target"
-        trap - EXIT
-        """;
 
     private async Task<IReadOnlyList<ConflictHunk>> ExtractHostConflictHunksAsync(
         string repoId,
@@ -5132,15 +4538,15 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
-        var result = await InvokeTextOnlyAsync(
-            runner,
-            sandbox,
-            sandbox is null ? null : SandboxConventions.WorkDir,
+        var textOnlyRunner = (ITextOnlyAgentRunner)runner;
+        var result = await textOnlyRunner.RunTextOnlyAsync(
             prompt,
             credential,
             modelId: null,
             reasoningMode: null,
-            ct);
+            ct,
+            sandbox,
+            sandbox is null ? null : SandboxConventions.WorkDir);
         if (!result.Success)
         {
             _log.LogWarning(
@@ -5205,95 +4611,6 @@ public sealed class PipelineRunner : IPipelineRunner
             the JSON object, with no markdown or commentary.
             """;
 
-    private static string BuildConflictResolverTextOnlyPrompt(
-        string contractPrompt,
-        IReadOnlyList<ConflictResolverFile> files)
-    {
-        var payload = JsonSerializer.Serialize(new
-        {
-            files = files.Select(static f => new { path = f.Path, content = f.Content }),
-        }, JsonOpts);
-
-        return $$"""
-            # Merge conflict resolver
-
-            You are resolving merge conflicts from text only. You have no shell,
-            filesystem, repository checkout, agent tools, or model-controlled network
-            access. Return complete resolved contents for exactly the provided paths.
-
-            Scope contract:
-            {{contractPrompt}}
-
-            Conflicted file inputs are provided as JSON:
-            {{payload}}
-
-            Return a single JSON object with this exact shape:
-            {
-              "files": [
-                { "path": "relative/path", "content": "complete resolved file contents" }
-              ]
-            }
-
-            Do not include markdown fences or commentary. Return only the JSON object.
-            """;
-    }
-
-    private static string BuildConflictResolverHunkScopedPrompt(
-        string contractPrompt,
-        IReadOnlyList<ResolverHunkPayload> hunks)
-    {
-        var payload = JsonSerializer.Serialize(new
-        {
-            hunks = hunks.Select(static h => new
-            {
-                index = h.Index,
-                path = h.Hunk.Path,
-                conflictStartLine = h.Hunk.StartLine,
-                conflictEndLine = h.Hunk.EndLine,
-                contextStartLine = h.ContextStartLine,
-                contextEndLine = h.ContextEndLine,
-                content = h.Content,
-            }),
-        }, JsonOpts);
-
-        return $$"""
-            # Merge conflict resolver
-
-            You are resolving merge conflicts from text only. You have no shell,
-            filesystem, repository checkout, agent tools, or model-controlled network
-            access. The orchestrator has sliced each conflict into its own payload
-            so a large file with small conflicts stays under the LLM input limit.
-
-            Scope contract:
-            {{contractPrompt}}
-
-            Each input hunk lists its conflict region (1-indexed line numbers
-            conflictStartLine..conflictEndLine, inclusive) within the file at
-            `path`. The `content` field is a slice of the file from
-            `contextStartLine` to `contextEndLine` (inclusive) that contains
-            the conflict region plus surrounding orientation context.
-
-            Hunk inputs are provided as JSON:
-            {{payload}}
-
-            For each input hunk, produce the replacement text for ONLY the
-            conflict region (lines conflictStartLine..conflictEndLine,
-            inclusive). Do NOT include the surrounding context lines in your
-            output — the orchestrator splices your replacement back into the
-            file exactly at those coordinates. Your replacement must contain no
-            `<<<<<<<`, `|||||||`, `=======`, or `>>>>>>>` conflict markers.
-
-            Return a single JSON object with this exact shape:
-            {
-              "hunks": [
-                { "index": 0, "path": "relative/path", "content": "resolved replacement for the conflict region" }
-              ]
-            }
-
-            Do not include markdown fences or commentary. Return only the JSON object.
-            """;
-    }
-
     private static string ExtractJsonObject(string? output)
     {
         if (string.IsNullOrWhiteSpace(output))
@@ -5311,10 +4628,6 @@ public sealed class PipelineRunner : IPipelineRunner
         PropertyNameCaseInsensitive = true,
     };
 
-    private sealed record ConflictResolutionJson(List<ConflictResolutionFileJson>? Files);
-    private sealed record ConflictResolutionFileJson(string? Path, string? Content);
-    private sealed record ConflictResolutionHunksJson(List<ConflictResolutionHunkJson>? Hunks);
-    private sealed record ConflictResolutionHunkJson(int? Index, string? Path, string? Content);
     private sealed record MergeSecurityReviewJson(List<MergeSecurityReviewFindingJson>? Findings);
     private sealed record MergeSecurityReviewFindingJson(string? Title, string? Description, string? Location);
 
@@ -5395,62 +4708,6 @@ public sealed class PipelineRunner : IPipelineRunner
           - confirm HEAD is on `{{baseBranch}}`
           - confirm `{{workBranch}}` is reachable from HEAD
           - push `{{baseBranch}}` back to the host bare repo
-        """;
-    }
-
-    private static string BuildConflictResolverPrompt(
-        string baseBranch,
-        string workBranch,
-        IReadOnlyList<ConflictHunk> hunks,
-        int bufferLines)
-    {
-        var hunkList = string.Join('\n', hunks.Select(h => $"          - {h.Path}:{h.StartLine}-{h.EndLine}"));
-        return $$"""
-        # Conflict resolution task
-
-        You will receive the conflicted file contents for `{{workBranch}}`
-        merged into `{{baseBranch}}`. Return complete resolved contents for
-        exactly those same files. You do not have shell, network, or repository
-        filesystem access.
-
-        Conflict scope contract:
-        {{hunkList}}
-
-        Constraints:
-          - You may modify ONLY the lines in those hunks.
-          - A buffer of +/-{{bufferLines}} lines around each hunk is permitted only for mechanical adjustments.
-          - You MAY NOT add, delete, or rename files.
-          - You MAY NOT modify any file outside the conflict list.
-          - Out-of-scope changes will be rejected by deterministic host verification.
-          - Preserve the intent of both sides; do not take one side blindly.
-        """;
-    }
-
-    private static string BuildRebaseConflictResolverPrompt(
-        string baseBranch,
-        string workBranch,
-        IReadOnlyList<ConflictHunk> hunks,
-        int bufferLines)
-    {
-        var hunkList = string.Join('\n', hunks.Select(h => $"          - {h.Path}:{h.StartLine}-{h.EndLine}"));
-        return $$"""
-        # Conflict resolution task
-
-        You will receive conflicted file contents from rebasing `{{workBranch}}`
-        onto `{{baseBranch}}`. Return complete resolved contents for exactly
-        those same files. You do not have shell, network, or repository
-        filesystem access.
-
-        Conflict scope contract:
-        {{hunkList}}
-
-        Constraints:
-          - You may modify ONLY the lines in those hunks.
-          - A buffer of +/-{{bufferLines}} lines around each hunk is permitted only for mechanical adjustments.
-          - You MAY NOT add, delete, or rename files.
-          - You MAY NOT modify any file outside the conflict list.
-          - Out-of-scope changes will be rejected by deterministic host verification.
-          - Preserve the intent of both sides; do not take one side blindly.
         """;
     }
 

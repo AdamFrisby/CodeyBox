@@ -74,7 +74,7 @@ cycles tend to plateau quickly.
 | Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
 | Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
 | Audit-LLM / clean-merge sandbox | VM (Multipass/KVM) | Nothing         | No                    | Yes (only its own)    |
-| Conflict resolver            | Text-only VM sandbox | Conflict text only | No                 | Yes (resolver only) |
+| Conflict resolver            | Work-item sandbox    | In-sandbox repo CLI | Yes (resolver only) | Yes (resolver only) |
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
@@ -84,22 +84,21 @@ against the pre-merge main commit and the work tip.
 
 For clean merges, the agent commit tree must exactly match the host
 `merge-tree` result, and the accepted commit must keep both the pre-merge main
-commit and the work tip in its ancestry. For conflicted merges, the normal
-repository-mounted merge agent runner is not invoked. The host first creates the
-conflicted working tree, reads only the conflicted file contents, records each
-`<<<<<<<` ... `>>>>>>>` hunk as the marker span in the conflicted merge-tree
-file, and sends that text through <see cref="ITextOnlyAgentRunner"/>.
-Host HTTP runners (Claude, Codex, Gemini) answer on the orchestrator host;
-subscription CLIs (Cursor, Opencode) run a tool-less print-mode invocation
-inside the work-item sandbox when <c>sandbox</c> and <c>workingDirectory</c>
-are supplied to <see cref="ITextOnlyAgentRunner.RunTextOnlyAsync"/>. That call is pure text-in/text-out:
-no repository checkout, shell, filesystem, agent tools, writable result file, or
-model-controlled network is exposed to the untrusted conflict text. The resolver
-can only return complete replacement contents for exactly the conflicted paths;
-the host applies those contents to the merge worktree.
+commit and the work tip in its ancestry. For conflicted merges, the orchestrator
+runs the configured agent's normal CLI shape inside the work-item sandbox via
+<see cref="IAgentRunner.RunAsync"/> with a conflict-resolution prompt. The agent
+reads conflicted files directly off the sandbox working tree, writes resolutions,
+and `git add`'s them; the orchestrator then verifies (no unmerged paths, no
+conflict markers in any of the originally-conflicted files) and commits. This
+is the same CLI shape the agent uses for any normal pickup, so subscription
+credentials (Claude OAuth, Cursor session) are exercised through the supported
+client surface and there is no raw-HTTP-to-the-provider path on the orchestrator
+host. The resolver iterates through a candidate chain (the work item's primary
+runner plus its class fallback chain, with at-cap agents deprioritised) until
+one candidate produces a clean working tree.
 
-After the host writes those returned contents and creates the merge commit, it
-applies a deterministic scope fence before updating main. The final
+After the in-VM resolver commits the merge, the orchestrator applies a
+deterministic scope fence before updating main. The final
 conflict-baseline-to-resolved changed-file set must exactly equal the
 conflicted file set, and each conflict-baseline-to-resolved changed line in
 those files is checked in conflicted-baseline coordinates. Every changed old-side
@@ -109,25 +108,11 @@ deletes, renames, edits to non-conflicted files, missing conflicted-file edits,
 and whitespace-only edits outside the allowed ranges are rejected and the work
 item enters `MergeConflictResolutionFailed`.
 
-The resolver has two payload modes, switched per iteration on file size:
-
-* **Whole-file** (default for files under `Audit.MergeScopeResolverMaxBytes`,
-  128 KiB by default): each conflicted file is sent in full; the resolver
-  returns full resolved contents.
-* **Hunk-scoped** (used when any file exceeds the cap): each conflict region
-  is sent as its own payload — the marker span plus
-  `Audit.MergeScopeResolverContextLines` lines of orientation context on each
-  side (default 50). The resolver returns only the replacement for the
-  conflict region; the host splices it back at the conflict coordinates. This
-  keeps a small conflict inside a large file (e.g. a 30-line hunk inside a
-  5600-line file) well under the payload cap.
-
-When a single hunk's marker span alone still exceeds the cap with zero
-context, the work item enters `MergeConflictResolutionFailed` with an error
-naming the exact `path:start-end` range — the documented fallback for
-genuinely oversized hunks. Operators can either raise
-`Audit.MergeScopeResolverMaxBytes` for that project or split the change into
-a smaller conflict before retrying.
+Because the agent reads files directly off the working tree inside the sandbox,
+there is no per-file or per-hunk payload cap — large conflicted files (hundreds
+of KiB or more) are handled the same way as small ones. The previous text-only
+resolver had a 128 KiB resolver-payload cap and a hunk-scoped fallback for files
+exceeding it; both have been removed.
 
 This deterministic scope fence is the security boundary. The optional merge
 security review is an LLM text review over the resolved conflict diff in a

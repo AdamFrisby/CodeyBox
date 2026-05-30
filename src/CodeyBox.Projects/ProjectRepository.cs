@@ -383,12 +383,6 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var mergedAutoRetry = project?.AutoRetryOnStuck ?? defaults?.AutoRetryOnStuck ?? false;
         var mergedMaxRetries = project?.MaxStuckRetries ?? defaults?.MaxStuckRetries ?? 2;
         var mergedMergeScopeBufferLines = Math.Max(0, project?.MergeScopeBufferLines ?? defaults?.MergeScopeBufferLines ?? 5);
-        var mergedMergeScopeResolverMaxBytes = Math.Max(
-            1024,
-            project?.MergeScopeResolverMaxBytes ?? defaults?.MergeScopeResolverMaxBytes ?? 128 * 1024);
-        var mergedMergeScopeResolverContextLines = Math.Max(
-            0,
-            project?.MergeScopeResolverContextLines ?? defaults?.MergeScopeResolverContextLines ?? 50);
 
         var rawAuditAgent = project?.AuditAgent ?? defaults?.AuditAgent;
         var mergedAuditAgent = string.IsNullOrWhiteSpace(rawAuditAgent)
@@ -415,8 +409,6 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             AutoRetryOnStuck = mergedAutoRetry,
             MaxStuckRetries = mergedMaxRetries,
             MergeScopeBufferLines = mergedMergeScopeBufferLines,
-            MergeScopeResolverMaxBytes = mergedMergeScopeResolverMaxBytes,
-            MergeScopeResolverContextLines = mergedMergeScopeResolverContextLines,
             Languages = mergedLanguages,
             LanguagesConfigured = languagesConfigured,
             LanguageOverrides = mergedLanguageOverrides,
@@ -479,8 +471,6 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             AutoRetryOnStuck = audit.AutoRetryOnStuck,
             MaxStuckRetries = audit.MaxStuckRetries,
             MergeScopeBufferLines = audit.MergeScopeBufferLines,
-            MergeScopeResolverMaxBytes = audit.MergeScopeResolverMaxBytes,
-            MergeScopeResolverContextLines = audit.MergeScopeResolverContextLines,
             Languages = [.. audit.Languages],
             LanguageOverrides = audit.LanguageOverrides.ToDictionary(
                 kvp => kvp.Key,

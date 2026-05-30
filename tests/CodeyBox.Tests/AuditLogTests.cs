@@ -515,53 +515,6 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal("attempt timed out after 240m", GetScalar<string>(evt, "Reason"));
     }
 
-    [Fact]
-    public void RebaseResolverCascadePlanned_emits_cascade_planned_event()
-    {
-        var id = WorkItemId.New();
-
-        AuditLog.RebaseResolverCascadePlanned(id, "cursor>codex", "claude: no runner");
-
-        var evt = Assert.Single(_sink.Events);
-        Assert.True(GetScalar<bool>(evt, "Audit"));
-        Assert.Equal("rebase_resolver.cascade_planned", GetScalar<string>(evt, "EventName"));
-        Assert.Equal(LogEventLevel.Information, evt.Level);
-        Assert.Equal(id.ToString(), GetScalar<string>(evt, "WorkItemId"));
-        Assert.Equal("cursor>codex", GetScalar<string>(evt, "CandidateOrder"));
-        Assert.Equal("claude: no runner", GetScalar<string>(evt, "SkippedReasons"));
-    }
-
-    [Fact]
-    public void RebaseResolverTextOnlyAttemptFailed_emits_attempt_failed_event()
-    {
-        var id = WorkItemId.New();
-
-        AuditLog.RebaseResolverTextOnlyAttemptFailed(id, AgentKind.Claude, "HTTP 404");
-
-        var evt = Assert.Single(_sink.Events);
-        Assert.True(GetScalar<bool>(evt, "Audit"));
-        Assert.Equal("rebase_resolver.text_only_attempt_failed", GetScalar<string>(evt, "EventName"));
-        Assert.Equal(LogEventLevel.Warning, evt.Level);
-        Assert.Equal("claude", GetScalar<string>(evt, "Agent"));
-        Assert.Equal("HTTP 404", GetScalar<string>(evt, "Summary"));
-    }
-
-    [Fact]
-    public void RebaseResolverSucceeded_emits_succeeded_event_with_attempt_trail()
-    {
-        var id = WorkItemId.New();
-
-        AuditLog.RebaseResolverSucceeded(id, AgentKind.Cursor, "claude(HTTP 404)", "gemini: missing key");
-
-        var evt = Assert.Single(_sink.Events);
-        Assert.True(GetScalar<bool>(evt, "Audit"));
-        Assert.Equal("rebase_resolver.succeeded", GetScalar<string>(evt, "EventName"));
-        Assert.Equal(LogEventLevel.Information, evt.Level);
-        Assert.Equal("cursor", GetScalar<string>(evt, "ChosenAgent"));
-        Assert.Equal("claude(HTTP 404)", GetScalar<string>(evt, "AttemptedAgents"));
-        Assert.Equal("gemini: missing key", GetScalar<string>(evt, "SkippedReasons"));
-    }
-
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)

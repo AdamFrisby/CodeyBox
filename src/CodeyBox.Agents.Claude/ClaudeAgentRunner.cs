@@ -1,9 +1,6 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
 
 namespace CodeyBox.Agents.Claude;
 
@@ -11,10 +8,20 @@ namespace CodeyBox.Agents.Claude;
 /// Drives the Claude Code CLI ("claude") in non-interactive mode. The agent
 /// is expected to be installed in the sandbox image; the host injects only
 /// the API token via tmpfs/env.
+///
+/// <para>This runner deliberately does NOT implement
+/// <see cref="ITextOnlyAgentRunner"/>. The previous text-only path POSTed
+/// directly to <c>https://api.anthropic.com/v1/messages</c> with the
+/// subscription OAuth token, which Anthropic can flag as a wrong-client-shape
+/// usage of the credential and terminate the account. The pickup-time rebase
+/// and merge-phase conflict resolvers now run inside the same sandbox via
+/// <see cref="IAgentRunner.RunAsync"/> (the normal CLI shape), so no
+/// text-only Claude path is needed. The advisory merge security review
+/// gracefully skips when the chosen agent does not implement text-only
+/// review.</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
 {
-    private static readonly HttpClient TextOnlyHttp = new();
     private readonly IClaudeTokenRotationPusher? _rotationPusher;
     private readonly AgentDefaultsSnapshot? _defaults;
 
@@ -211,89 +218,6 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null)
         => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
-
-    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
-    {
-        string? oauthToken = null;
-        string? apiKey = null;
-        credential?.EnvironmentVariables.TryGetValue("CLAUDE_CODE_OAUTH_TOKEN", out oauthToken);
-        credential?.EnvironmentVariables.TryGetValue("ANTHROPIC_API_KEY", out apiKey);
-        return string.IsNullOrEmpty(oauthToken) && string.IsNullOrEmpty(apiKey)
-            ? "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required"
-            : null;
-    }
-
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default,
-        ISandbox? sandbox = null,
-        string? workingDirectory = null)
-    {
-        _ = sandbox;
-        _ = workingDirectory;
-        _ = reasoningMode;
-        string? oauthToken = null;
-        string? apiKey = null;
-        credential?.EnvironmentVariables.TryGetValue("CLAUDE_CODE_OAUTH_TOKEN", out oauthToken);
-        credential?.EnvironmentVariables.TryGetValue("ANTHROPIC_API_KEY", out apiKey);
-        if (string.IsNullOrEmpty(oauthToken) && string.IsNullOrEmpty(apiKey))
-            return new TextOnlyAgentResult(false, "missing Claude text-only credential", null, "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required");
-
-        // A subscription OAuth token must NOT be used for a raw /v1/messages call:
-        // Anthropic can flag subscription credentials used outside the Claude-Code
-        // client shape and terminate the account (it also 404/429s). Decline the
-        // text-only path for OAuth — the rebase/merge resolver cascade then parks
-        // the conflict as MergeConflictResolutionFailed instead of making a raw
-        // call. A real ANTHROPIC_API_KEY (x-api-key) is a legitimate raw-API
-        // credential and is still used below. The proper fix is the agentic in-VM
-        // resolver (work items 4f435279/8ec0d914), which never needs this path.
-        if (!string.IsNullOrEmpty(oauthToken))
-            return new TextOnlyAgentResult(false, "Claude text-only via subscription OAuth disabled (account-termination risk; agentic in-VM resolver pending)", null, null);
-
-        try
-        {
-            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultModelId : modelId;
-            if (string.IsNullOrWhiteSpace(effectiveModel))
-                return new TextOnlyAgentResult(false, "missing model id for Claude text-only call", null, "No model id available (no default configured); set a default in CodeyBox:AgentDefaults or supply an explicit modelId.");
-
-            var body = JsonSerializer.Serialize(new
-            {
-                model = effectiveModel,
-                max_tokens = 8192,
-                messages = new[] { new { role = "user", content = prompt } },
-            });
-
-            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
-            if (!string.IsNullOrEmpty(oauthToken))
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", oauthToken);
-            else
-                request.Headers.Add("x-api-key", apiKey!);
-            request.Headers.Add("anthropic-version", "2023-06-01");
-            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
-
-            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-                return new TextOnlyAgentResult(false, $"Claude text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
-
-            using var doc = JsonDocument.Parse(responseText);
-            var output = string.Concat(doc.RootElement
-                .GetProperty("content")
-                .EnumerateArray()
-                .Where(static c => c.TryGetProperty("type", out var type)
-                    && string.Equals(type.GetString(), "text", StringComparison.Ordinal)
-                    && c.TryGetProperty("text", out _))
-                .Select(static c => c.GetProperty("text").GetString()));
-            return new TextOnlyAgentResult(true, "ok", output, null);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return new TextOnlyAgentResult(false, "Claude text-only call failed", null, ex.Message);
-        }
-    }
 
     private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
     {
