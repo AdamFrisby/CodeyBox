@@ -227,7 +227,7 @@ public sealed class CursorQuotaProbeTests
     [Fact]
     public async Task ResponseTooLarge_ReturnsUnknown()
     {
-        var oversized = "{\"planUsage\":{\"totalPercentUsed\":0}}" + new string(' ', 70 * 1024);
+        var oversized = "{\"planUsage\":{\"remaining\":0,\"limit\":100}}" + new string(' ', 70 * 1024);
         var probe = BuildProbe(UsageHandler(oversized));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
         Assert.True(snap.AvailablePct < 0);
@@ -292,6 +292,23 @@ public sealed class CursorQuotaProbeTests
         Assert.Equal(70, snap.PerModel["composer-2.5"].AvailablePct, precision: 5);
         Assert.False(snap.PerModel.ContainsKey("cursor-auto"));
         Assert.False(snap.PerModel.ContainsKey("cursor-api"));
+    }
+
+    [Fact]
+    public void ParseResponse_UsesFallbackAutoBucketModels_WhenArrayMissing()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "remaining": 50,
+            "limit": 100,
+            "autoPercentUsed": 20
+          }
+        }
+        """);
+        Assert.Equal(50, snap.AvailablePct, precision: 5);
+        Assert.True(snap.PerModel.ContainsKey(CursorQuotaProbe.DefaultRoutedModelId));
+        Assert.Equal(50, snap.PerModel[CursorQuotaProbe.DefaultRoutedModelId].AvailablePct, precision: 5);
     }
 
     [Fact]
