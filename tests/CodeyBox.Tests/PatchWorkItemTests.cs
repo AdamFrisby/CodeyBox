@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using Microsoft.Extensions.DependencyInjection;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -565,19 +566,26 @@ public sealed class PatchWorkItemHttpTests : IDisposable
     // and avoids the cancel-and-recreate workaround.
 
     [Fact]
-    public async Task PatchDependsOn_OnQueuedItem_AddDep_BlocksDispatchUntilDepCompletes()
+    public async Task PatchDependsOn_OnQueuedItem_AddDep_DoesNotKickQueueAndGateBlocksDispatch()
     {
-        // Dep A is still Working; B's dependsOn gate stays unsatisfied. Once A
-        // reaches Done, the gate opens — same semantics as create-time deps.
+        // Dep A is still Working; B's dependsOn gate stays unsatisfied. The
+        // endpoint must NOT issue an EnqueueAsync kick (that would race a
+        // dispatch tick where the gate predicate is the only guard).
         var depA = QueuedItem() with { State = WorkItemState.Working, Title = "A" };
         var itemB = QueuedItem() with { Title = "B" };
         await _factory.Store.CreateAsync(depA);
         await _factory.Store.CreateAsync(itemB);
 
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(0, queue.Count);
+
         var response = await _client.PatchAsJsonAsync(
             $"/workitems/{itemB.Id}",
             new { dependsOn = new[] { depA.Id.ToString() } });
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Unsatisfied dep → no kick.
+        Assert.Equal(0, queue.Count);
 
         var storedB = await _factory.Store.GetAsync(itemB.Id);
         Assert.Single(storedB!.DependsOn);
@@ -596,6 +604,30 @@ public sealed class PatchWorkItemHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task PatchDependsOn_DepAlreadyDone_KicksDispatcherQueue()
+    {
+        // PATCH lands a dep that's already Done — the gate is already
+        // satisfied so the endpoint must enqueue a kick instead of leaving
+        // the item to wait for the next scan tick.
+        var depDone = QueuedItem() with { State = WorkItemState.Done, Title = "done-dep" };
+        var itemB = QueuedItem() with { Title = "B" };
+        await _factory.Store.CreateAsync(depDone);
+        await _factory.Store.CreateAsync(itemB);
+
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(0, queue.Count);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{itemB.Id}",
+            new { dependsOn = new[] { depDone.Id.ToString() } });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(1, queue.Count);
+        var kicked = await queue.DequeueAsync();
+        Assert.Equal(itemB.Id, kicked);
+    }
+
+    [Fact]
     public async Task PatchDependsOn_SelfDependency_Returns400()
     {
         var item = QueuedItem();
@@ -606,6 +638,11 @@ public sealed class PatchWorkItemHttpTests : IDisposable
             new { dependsOn = new[] { item.Id.ToString() } });
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        // Lock the operator-visible error message: a refactor that swallows
+        // the specific self-loop string into a generic 400 must be caught.
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("a work item cannot depend on itself", body);
     }
 
     [Fact]
@@ -624,9 +661,110 @@ public sealed class PatchWorkItemHttpTests : IDisposable
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
+        // Lock the operator-visible message — the cycle-path projection is
+        // the only signal an operator has to diagnose which edge to break.
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("circular dependency detected", body);
+
         // Confirm A's deps did NOT get written by the rejected request.
         var storedA = await _factory.Store.GetAsync(itemA.Id);
         Assert.Empty(storedA!.DependsOn);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_NamespacedExternalId_ResolvesAndPersists()
+    {
+        // PATCH-side analogue of NamespacedExternalIdsTests: a 'ns:value'
+        // entry must resolve via the same byNamespacedExternalId lookup that
+        // CreateAsync uses. Without this test a typo in the PATCH branch
+        // (swapped tuple order, missing project filter, wrong dictionary
+        // key) goes unnoticed because every other test uses bare GUIDs.
+        var dep = QueuedItem() with
+        {
+            Title = "dep",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["github"] = "issue-42",
+            },
+        };
+        var target = QueuedItem() with { Title = "target" };
+        await _factory.Store.CreateAsync(dep);
+        await _factory.Store.CreateAsync(target);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{target.Id}",
+            new { dependsOn = new[] { "github:issue-42" } });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var stored = await _factory.Store.GetAsync(target.Id);
+        Assert.Single(stored!.DependsOn);
+        Assert.Equal(dep.Id, stored.DependsOn[0]);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_BareUnambiguousExternalId_Resolves()
+    {
+        // Bare externalId path: the value appears under exactly one namespace
+        // in the project, so it resolves without a 'ns:' qualifier.
+        var dep = QueuedItem() with
+        {
+            Title = "dep",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["linear"] = "LIN-7",
+            },
+        };
+        var target = QueuedItem() with { Title = "target" };
+        await _factory.Store.CreateAsync(dep);
+        await _factory.Store.CreateAsync(target);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{target.Id}",
+            new { dependsOn = new[] { "LIN-7" } });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var stored = await _factory.Store.GetAsync(target.Id);
+        Assert.Single(stored!.DependsOn);
+        Assert.Equal(dep.Id, stored.DependsOn[0]);
+    }
+
+    [Fact]
+    public async Task PatchDependsOn_AmbiguousBareExternalId_Returns400()
+    {
+        // Same bare value lives under two different namespaces — the bare
+        // form is ambiguous and must 400 with a 'qualify as namespace:value'
+        // hint. Mirrors the create-handler contract.
+        var depA = QueuedItem() with
+        {
+            Title = "depA",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["github"] = "DUP",
+            },
+        };
+        var depB = QueuedItem() with
+        {
+            Title = "depB",
+            ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["linear"] = "DUP",
+            },
+        };
+        var target = QueuedItem() with { Title = "target" };
+        await _factory.Store.CreateAsync(depA);
+        await _factory.Store.CreateAsync(depB);
+        await _factory.Store.CreateAsync(target);
+
+        var response = await _client.PatchAsJsonAsync(
+            $"/workitems/{target.Id}",
+            new { dependsOn = new[] { "DUP" } });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("ambiguous", body);
+
+        var stored = await _factory.Store.GetAsync(target.Id);
+        Assert.Empty(stored!.DependsOn);
     }
 
     [Fact]
@@ -711,7 +849,7 @@ public sealed class PatchWorkItemHttpTests : IDisposable
     }
 
     [Fact]
-    public async Task PatchDependsOn_EmptyArray_ClearsDependencies_OnQueuedItem()
+    public async Task PatchDependsOn_EmptyArray_ClearsDependencies_AndKicksQueue()
     {
         var depA = QueuedItem() with { State = WorkItemState.Working, Title = "A" };
         var itemB = QueuedItem() with
@@ -722,6 +860,9 @@ public sealed class PatchWorkItemHttpTests : IDisposable
         await _factory.Store.CreateAsync(depA);
         await _factory.Store.CreateAsync(itemB);
 
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        Assert.Equal(0, queue.Count);
+
         var response = await _client.PatchAsJsonAsync(
             $"/workitems/{itemB.Id}",
             new { dependsOn = Array.Empty<string>() });
@@ -730,6 +871,12 @@ public sealed class PatchWorkItemHttpTests : IDisposable
 
         var storedB = await _factory.Store.GetAsync(itemB.Id);
         Assert.Empty(storedB!.DependsOn);
+
+        // Clearing deps on a Queued item leaves the gate satisfied — the
+        // endpoint must enqueue a dispatch kick.
+        Assert.Equal(1, queue.Count);
+        var kicked = await queue.DequeueAsync();
+        Assert.Equal(itemB.Id, kicked);
     }
 
     [Fact]
