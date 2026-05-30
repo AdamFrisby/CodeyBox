@@ -356,6 +356,12 @@ public sealed class GeminiOauthCredentialFileRefresher
     internal const string DefaultRefreshEndpoint = "https://oauth2.googleapis.com/token";
     internal const string HttpClientName = "agent-quota";
 
+    /// <summary>Timeout for the gemini CLI refresh sub-process.</summary>
+    internal static readonly TimeSpan GeminiCliRefreshTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>Fallback token lifetime used when the CLI-refreshed file carries no expiry.</summary>
+    internal static readonly TimeSpan FallbackTokenLifetime = TimeSpan.FromHours(1);
+
     private readonly string _refreshEndpoint;
     private readonly string? _fallbackClientId;
     private readonly string? _fallbackClientSecret;
@@ -420,14 +426,18 @@ public sealed class GeminiOauthCredentialFileRefresher
                     var reparsed = ParseCreds(raw);
                     if (!string.IsNullOrEmpty(reparsed.AccessToken))
                     {
-                        var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow().AddHours(1);
+                        var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow() + FallbackTokenLifetime;
                         var expiresIn = expiresAt - TimeProvider.GetUtcNow();
-                        if (expiresIn <= TimeSpan.Zero) expiresIn = TimeSpan.FromHours(1);
+                        if (expiresIn <= TimeSpan.Zero) expiresIn = FallbackTokenLifetime;
                         return new RefreshResult(reparsed.AccessToken, reparsed.RefreshToken, expiresIn);
                     }
                 }
-                catch (JsonException)
+                catch (JsonException ex)
                 {
+                    Log.LogDebug(
+                        ex,
+                        "CLI refresh rewrote {Path} but the result is unparseable JSON; treating as no-token",
+                        Source.FilePath);
                 }
             }
         }
@@ -467,17 +477,25 @@ public sealed class GeminiOauthCredentialFileRefresher
     /// returns <c>true</c> when the process exits successfully (exit code 0),
     /// which indicates the CLI refreshed and rewrote <c>~/.gemini/oauth_creds.json</c>.
     /// </summary>
-    internal static Func<CancellationToken, Task<bool>>? TryCreateCliRefreshHandler()
+    /// <param name="resolvePath">Optional test seam. When non-null, used instead
+    /// of <see cref="ResolveGeminiCliPath"/> to resolve the gemini binary path.</param>
+    internal static Func<CancellationToken, Task<bool>>? TryCreateCliRefreshHandler(
+        Func<string?>? resolvePath = null)
     {
-        var cliPath = ResolveGeminiCliPath();
+        var cliPath = (resolvePath ?? ResolveGeminiCliPath)();
         if (cliPath is null) return null;
+        return BuildCliRefreshDelegate(cliPath);
+    }
 
+    private static Func<CancellationToken, Task<bool>> BuildCliRefreshDelegate(string cliPath)
+    {
         return async ct =>
         {
+            Process? proc = null;
             try
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                cts.CancelAfter(TimeSpan.FromSeconds(30));
+                cts.CancelAfter(GeminiCliRefreshTimeout);
                 var psi = new ProcessStartInfo
                 {
                     FileName = cliPath,
@@ -488,75 +506,63 @@ public sealed class GeminiOauthCredentialFileRefresher
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
-                using var proc = Process.Start(psi);
+                proc = Process.Start(psi);
                 if (proc is null) return false;
                 await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
                 return proc.ExitCode == 0;
             }
             catch (OperationCanceledException)
             {
+                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
                 return false;
             }
-            catch
+            catch (Exception)
             {
+                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
                 return false;
+            }
+            finally
+            {
+                proc?.Dispose();
             }
         };
     }
 
-    private static string? ResolveGeminiCliPath()
+    private const int WhichTimeoutMilliseconds = 5000;
+
+    /// <summary>
+    /// Resolves the absolute path to the host <c>gemini</c> binary using
+    /// <c>which</c> (POSIX) or <c>where</c> (Windows). Returns <c>null</c>
+    /// when the binary is not found or any OS error occurs.
+    /// </summary>
+    internal static string? ResolveGeminiCliPath()
     {
-        if (!OperatingSystem.IsWindows())
+        return ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "gemini");
+    }
+
+    /// <summary>Resolves an executable path using the platform-specific resolver command.</summary>
+    internal static string? ResolveExecutablePath(string resolverCommand, string targetBinary)
+    {
+        try
         {
-            try
+            using var proc = Process.Start(new ProcessStartInfo
             {
-                using var proc = Process.Start(new ProcessStartInfo
-                {
-                    FileName = "which",
-                    ArgumentList = { "gemini" },
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                });
-                if (proc is not null)
-                {
-                    proc.WaitForExit(5000);
-                    if (proc.ExitCode == 0)
-                    {
-                        var path = proc.StandardOutput.ReadLine()?.Trim();
-                        if (!string.IsNullOrEmpty(path)) return path;
-                    }
-                }
-            }
-            catch
+                FileName = resolverCommand,
+                ArgumentList = { targetBinary },
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            if (proc is null) return null;
+            proc.WaitForExit(WhichTimeoutMilliseconds);
+            if (proc.ExitCode == 0)
             {
+                var path = proc.StandardOutput.ReadLine()?.Trim();
+                if (!string.IsNullOrEmpty(path)) return path;
             }
         }
-        else
+        catch (Exception)
         {
-            try
-            {
-                using var proc = Process.Start(new ProcessStartInfo
-                {
-                    FileName = "where",
-                    ArgumentList = { "gemini" },
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                });
-                if (proc is not null)
-                {
-                    proc.WaitForExit(5000);
-                    if (proc.ExitCode == 0)
-                    {
-                        var path = proc.StandardOutput.ReadLine()?.Trim();
-                        if (!string.IsNullOrEmpty(path)) return path;
-                    }
-                }
-            }
-            catch
-            {
-            }
         }
         return null;
     }

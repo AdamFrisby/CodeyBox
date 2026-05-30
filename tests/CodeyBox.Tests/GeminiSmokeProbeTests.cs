@@ -199,4 +199,28 @@ public sealed class GeminiSmokeProbeTests
         Assert.False(result.Ok);
         Assert.Equal("timeout", result.FailureReason);
     }
+
+    // ── ExtractAccessToken edge cases ──────────────────────────────────────
+
+    [Fact]
+    public void ExtractAccessToken_MalformedJson_ReturnsNull()
+    {
+        var result = GeminiSmokeProbe.ExtractAccessToken("not valid json at all");
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ExtractAccessToken_AccessTokenIsNonString_ReturnsNull()
+    {
+        var json = """{"access_token":12345,"refresh_token":"rt"}""";
+        var result = GeminiSmokeProbe.ExtractAccessToken(json);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ExtractAccessToken_EmptyString_ReturnsNull()
+    {
+        var result = GeminiSmokeProbe.ExtractAccessToken("");
+        Assert.Null(result);
+    }
 }

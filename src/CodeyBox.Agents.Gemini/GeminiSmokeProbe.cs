@@ -15,8 +15,10 @@ namespace CodeyBox.Agents.Gemini;
 /// <para>Authentication priority:</para>
 /// <list type="number">
 ///   <item><c>GEMINI_API_KEY</c> — sent as <c>x-goog-api-key</c> header (API-key auth).</item>
-///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
-///   contents; the <c>access_token</c> field is extracted and sent as
+    ///   <item><c>CODEYBOX_GEMINI_OAUTH_CREDS_JSON</c> — the raw <c>~/.gemini/oauth_creds.json</c>
+    ///   contents (env-var name must stay in sync with
+    ///   <c>GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar</c> in
+    ///   CodeyBox.Orchestrator); the <c>access_token</c> field is extracted and sent as
 ///   <c>Authorization: Bearer &lt;token&gt;</c> (OAuth auth).</item>
 /// </list>
 ///
@@ -79,7 +81,7 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         var client = _httpClientFactory.CreateClient("agent-smoke");
         using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
         request.Headers.Add("x-goog-api-key", apiKey);
-        request.Content = SmokeRequestBody;
+        request.Content = CreateSmokeRequestBody();
         return await SendAndInterpretAsync(client, request, ct, sw);
     }
 
@@ -89,7 +91,7 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         var client = _httpClientFactory.CreateClient("agent-smoke");
         using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-        request.Content = SmokeRequestBody;
+        request.Content = CreateSmokeRequestBody();
         return await SendAndInterpretAsync(client, request, ct, sw);
     }
 
@@ -134,7 +136,9 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         return new AgentSmokeResult(false, reason, sw.Elapsed);
     }
 
-    private static readonly StringContent SmokeRequestBody = new(
-        """{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}""",
-        Encoding.UTF8, "application/json");
+    private const string SmokeRequestBodyJson =
+        """{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":1}}""";
+
+    private static StringContent CreateSmokeRequestBody() =>
+        new(SmokeRequestBodyJson, Encoding.UTF8, "application/json");
 }
