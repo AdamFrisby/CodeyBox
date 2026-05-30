@@ -1398,14 +1398,34 @@ public sealed class PipelineRunner : IPipelineRunner
     /// credentials so the work item parks as failureKind=agent_unavailable
     /// instead of MergeConflictResolutionFailed.
     /// </summary>
-    private async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
+    internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
         WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
     {
         var seenKinds = new HashSet<AgentKind>();
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
 
-        await TryAddAsync(primaryRunner, item.ModelId, item.ReasoningMode, ct);
+        // Apply the local-budget MIN gate to the primary too: an exhausted
+        // primary should NOT be tried just because it was the work item's
+        // originally-routed agent. The work-phase vetted the primary at
+        // pickup, but between pickup and merge the spend budget can drift
+        // past MinQuotaPct. Without this gate the throw at collected.Count==0
+        // below is unreachable (the primary would always be added), so
+        // 'no viable agent' would silently route to the exhausted primary.
+        seenKinds.Add(primaryRunner.Kind);
+        var (primaryBudgetPct, primaryBudgetFailedClosed) =
+            await ReadCandidateBudgetAsync(primaryRunner.Kind, item.ModelId, ct);
+        if (primaryBudgetFailedClosed
+            || (primaryBudgetPct >= 0 && primaryBudgetPct < _auditQuotaOptions.MinQuotaPct))
+        {
+            skipReasons.Add(
+                $"{primaryRunner.Kind.Value}: local budget exhausted " +
+                (primaryBudgetFailedClosed ? "(provider error)" : $"({primaryBudgetPct:F1}%)"));
+        }
+        else
+        {
+            await TryAddAsync(primaryRunner, item.ModelId, item.ReasoningMode, ct);
+        }
 
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
