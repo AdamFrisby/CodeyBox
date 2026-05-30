@@ -1156,14 +1156,9 @@ builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
-var stallThresholdMinutes = TimeSpan.FromMinutes(builder.Configuration
-    .GetSection("CodeyBox:Notifications:Rules")
-    .Get<List<NotificationRuleOptions>>()
-    ?.FirstOrDefault(r => r.Condition == "orchestrator_stall")
-    ?.StallThresholdMinutes ?? 15);
 builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
     sp.GetRequiredService<OrchestratorProgressClock>(),
-    stallThresholdMinutes));
+    sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
 builder.Services.AddSingleton<ICondition, SandboxLeakReapedCondition>();
 
 // INotificationBuilder registrations — one per condition.
@@ -1173,7 +1168,7 @@ builder.Services.AddSingleton<INotificationBuilder>(sp => new AllQuotasExhausted
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct));
 builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNotificationBuilder>();
 builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
-    stallThresholdMinutes));
+    sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
 builder.Services.AddSingleton<INotificationBuilder, SandboxLeakReapedNotificationBuilder>();
 
 // Rules engine — BackgroundService that evaluates conditions and dispatches.

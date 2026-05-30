@@ -1,23 +1,26 @@
 using CodeyBox.Core;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Notifications;
 
 /// <summary>
 /// Evaluates true when the orchestrator has made no state transitions for
 /// a configurable number of minutes. Reads the shared
-/// <see cref="OrchestratorProgressClock"/> singleton.
+/// <see cref="OrchestratorProgressClock"/> singleton and obtains the
+/// stall threshold from the current <see cref="NotificationRuleOptions"/>
+/// via <c>IOptionsMonitor</c> so operators can adjust it without restart.
 /// </summary>
 public sealed class OrchestratorStallCondition : ICondition, IDisposable
 {
     private readonly OrchestratorProgressClock _clock;
-    private readonly TimeSpan _stallThreshold;
+    private readonly IOptionsMonitor<NotificationsOptions> _optsMonitor;
 
     public string Id => "orchestrator_stall";
 
-    public OrchestratorStallCondition(OrchestratorProgressClock clock, TimeSpan stallThreshold)
+    public OrchestratorStallCondition(OrchestratorProgressClock clock, IOptionsMonitor<NotificationsOptions> optsMonitor)
     {
         _clock = clock;
-        _stallThreshold = stallThreshold;
+        _optsMonitor = optsMonitor;
     }
 
     public Task<bool> EvaluateAsync(CancellationToken ct)
@@ -26,8 +29,16 @@ public sealed class OrchestratorStallCondition : ICondition, IDisposable
         if (lastTransition == DateTimeOffset.MinValue)
             return Task.FromResult(false);
 
+        var threshold = GetStallThreshold();
         var elapsed = DateTimeOffset.UtcNow - lastTransition;
-        return Task.FromResult(elapsed >= _stallThreshold);
+        return Task.FromResult(elapsed >= threshold);
+    }
+
+    private TimeSpan GetStallThreshold()
+    {
+        var rule = _optsMonitor.CurrentValue.Rules
+            .FirstOrDefault(r => string.Equals(r.Condition, Id, StringComparison.Ordinal));
+        return TimeSpan.FromMinutes(rule?.StallThresholdMinutes ?? 15);
     }
 
     public void Dispose() { }
@@ -40,27 +51,39 @@ public sealed class OrchestratorStallNotificationBuilder : INotificationBuilder,
 {
     public string ConditionId => "orchestrator_stall";
 
-    private readonly TimeSpan _stallThreshold;
+    private readonly IOptionsMonitor<NotificationsOptions> _optsMonitor;
 
-    public OrchestratorStallNotificationBuilder(TimeSpan stallThreshold)
+    public OrchestratorStallNotificationBuilder(IOptionsMonitor<NotificationsOptions> optsMonitor)
     {
-        _stallThreshold = stallThreshold;
+        _optsMonitor = optsMonitor;
     }
 
-    public Notification Build(DateTimeOffset evaluatedAt) => new()
+    public Notification Build(DateTimeOffset evaluatedAt)
     {
-        ConditionId = "orchestrator_stall",
-        Title = $"Orchestrator stalled — no progress for {_stallThreshold.TotalMinutes:F0} min",
-        Summary = "The orchestrator has not made any state transitions within the configured stall threshold.",
-        Body = $"At {evaluatedAt:R}, the orchestrator had made no state transitions for " +
-               $"{_stallThreshold.TotalMinutes:F0} minutes (configured threshold). " +
-               "This may indicate a deadlock, resource exhaustion, or host issue. " +
-               "Check the admin dashboard and host metrics.",
-        Severity = NotificationSeverity.Critical,
-        Timestamp = evaluatedAt,
-        Fields = new Dictionary<string, string>(StringComparer.Ordinal)
+        var threshold = GetStallThreshold();
+        var minutes = threshold.TotalMinutes.ToString("F0");
+        return new Notification
         {
-            ["stallThresholdMinutes"] = _stallThreshold.TotalMinutes.ToString("F0"),
-        },
-    };
+            ConditionId = "orchestrator_stall",
+            Title = $"Orchestrator stalled — no progress for {minutes} min",
+            Summary = "The orchestrator has not made any state transitions within the configured stall threshold.",
+            Body = $"At {evaluatedAt:R}, the orchestrator had made no state transitions for " +
+                   $"{minutes} minutes (configured threshold). " +
+                   "This may indicate a deadlock, resource exhaustion, or host issue. " +
+                   "Check the admin dashboard and host metrics.",
+            Severity = NotificationSeverity.Critical,
+            Timestamp = evaluatedAt,
+            Fields = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["stallThresholdMinutes"] = minutes,
+            },
+        };
+    }
+
+    private TimeSpan GetStallThreshold()
+    {
+        var rule = _optsMonitor.CurrentValue.Rules
+            .FirstOrDefault(r => string.Equals(r.Condition, ConditionId, StringComparison.Ordinal));
+        return TimeSpan.FromMinutes(rule?.StallThresholdMinutes ?? 15);
+    }
 }

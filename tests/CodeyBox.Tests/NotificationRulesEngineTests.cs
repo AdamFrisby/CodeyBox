@@ -504,6 +504,76 @@ public sealed class NotificationRulesEngineTests
             && e.Message.Contains("provider")
             && e.Message.Contains("not registered"));
     }
+
+    // ── Multiple rules per condition ────────────────────────────────────────
+
+    [Fact]
+    public async Task MultipleRulesPerCondition_LogsWarningAndFiresOnce()
+    {
+        var log = new CapturingLogger<NotificationRulesEngine>();
+        var condition = new ToggleCondition("test_cond", initial: false);
+        var builder = new StaticBuilder("test_cond", "Multi-rule test");
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "test_cond", Providers = ["counting"], Severity = "Warning" },
+            new() { Condition = "test_cond", Providers = ["counting"], Severity = "Critical" },
+        };
+        var provider = new CountingProvider();
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition],
+            [builder],
+            [provider],
+            log);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CallCount);
+        Assert.Contains(log.Entries, e => e.Level == LogLevel.Warning
+            && e.Message.Contains("multiple rules map to condition"));
+
+        // Clear and re-trigger → state was not prematurely cleared.
+        condition.Set(false);
+        await engine.RunSweepAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(2, provider.CallCount);
+    }
+
+    // ── InferConditionId fallback ───────────────────────────────────────────
+
+    [Fact]
+    public async Task InferConditionId_UsedWhenBuilderLacksIConditionAwareBuilder()
+    {
+        // FooBarNotificationBuilder → InferConditionId strips "NotificationBuilder"
+        // then CamelToSnake → "foo_bar"
+        var condition = new ToggleCondition("foo_bar", initial: false);
+        var builder = new FooBarNotificationBuilder();
+        var rules = new List<NotificationRuleOptions>
+        {
+            new() { Condition = "foo_bar", Providers = ["counting"] },
+        };
+        var provider = new CountingProvider();
+        var opts = new NotificationsOptions { Enabled = true, Rules = rules };
+        var engine = new NotificationRulesEngine(
+            new StaticOptionsMonitor<NotificationsOptions>(opts),
+            [condition],
+            [builder],
+            [provider],
+            NullLogger<NotificationRulesEngine>.Instance);
+
+        await engine.PrimeInitialStateAsync(CancellationToken.None);
+        condition.Set(true);
+        await engine.RunSweepAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CallCount);
+        Assert.Equal("foo_bar", provider.Notifications.First().ConditionId);
+        Assert.Equal("Fallback title", provider.Notifications.First().Title);
+    }
 }
 
 // ── Test doubles ───────────────────────────────────────────────────────────
@@ -614,4 +684,18 @@ public sealed class StaticOptionsMonitor<T> : IOptionsMonitor<T> where T : class
     public T Get(string? name) => CurrentValue;
     public IDisposable? OnChange(Action<T, string> listener) => null;
     public IDisposable? OnChange(Action<T> listener) => null;
+}
+
+public sealed class FooBarNotificationBuilder : INotificationBuilder
+{
+    // Does NOT implement IConditionAwareBuilder — exercises the
+    // InferConditionId / CamelToSnake fallback path.
+
+    public Notification Build(DateTimeOffset evaluatedAt) => new()
+    {
+        ConditionId = "foo_bar",
+        Title = "Fallback title",
+        Severity = NotificationSeverity.Information,
+        Timestamp = evaluatedAt,
+    };
 }

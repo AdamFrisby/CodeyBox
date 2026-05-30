@@ -1,19 +1,36 @@
 using CodeyBox.Core;
 using CodeyBox.Notifications;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
 public sealed class NotificationConditionsTests
 {
+    private static OrchestratorStallCondition CreateStallCondition(OrchestratorProgressClock clock, int thresholdMinutes)
+    {
+        var opts = new NotificationsOptions
+        {
+            Rules =
+            [
+                new NotificationRuleOptions
+                {
+                    Condition = "orchestrator_stall",
+                    StallThresholdMinutes = thresholdMinutes,
+                },
+            ],
+        };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        return new OrchestratorStallCondition(clock, monitor);
+    }
+
     // ── OrchestratorStallCondition ─────────────────────────────────────────
 
     [Fact]
     public async Task OrchestratorStall_NotStalledWhenNoTransitions()
     {
         var clock = new OrchestratorProgressClock();
-        // clock has never been stamped — not stalled.
-        var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
+        var condition = CreateStallCondition(clock, 10);
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
     }
 
@@ -22,7 +39,7 @@ public sealed class NotificationConditionsTests
     {
         var clock = new OrchestratorProgressClock();
         clock.Stamp(DateTimeOffset.UtcNow);
-        var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
+        var condition = CreateStallCondition(clock, 10);
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
     }
 
@@ -31,7 +48,7 @@ public sealed class NotificationConditionsTests
     {
         var clock = new OrchestratorProgressClock();
         clock.Stamp(DateTimeOffset.UtcNow - TimeSpan.FromMinutes(20));
-        var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
+        var condition = CreateStallCondition(clock, 10);
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
 
@@ -40,7 +57,7 @@ public sealed class NotificationConditionsTests
     {
         var clock = new OrchestratorProgressClock();
         clock.Stamp(DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10));
-        var condition = new OrchestratorStallCondition(clock, TimeSpan.FromMinutes(10));
+        var condition = CreateStallCondition(clock, 10);
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
     }
 
@@ -237,6 +254,182 @@ public sealed class NotificationConditionsTests
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         // claude is at exactly 10 (>= minQuotaPct), so returns false.
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    // ── OrchestratorStallCondition hot-reload ───────────────────────────────
+
+    [Fact]
+    public async Task OrchestratorStall_UsesCurrentThresholdFromMonitor()
+    {
+        var clock = new OrchestratorProgressClock();
+        clock.Stamp(DateTimeOffset.UtcNow - TimeSpan.FromMinutes(10));
+        var opts = new NotificationsOptions
+        {
+            Rules =
+            [
+                new NotificationRuleOptions
+                {
+                    Condition = "orchestrator_stall",
+                    StallThresholdMinutes = 20,
+                },
+            ],
+        };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        var condition = new OrchestratorStallCondition(clock, monitor);
+
+        // 10 min elapsed < 20 min threshold → not stalled.
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+
+        // Hot-reload: change threshold to 5 minutes.
+        opts.Rules[0].StallThresholdMinutes = 5;
+        monitor.Set(opts);
+
+        // 10 min elapsed >= 5 min threshold → stalled.
+        Assert.True(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    // ── Builder tests ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void QueueEmptyNotificationBuilder_Build_ReturnsCorrectNotification()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var builder = new QueueEmptyNotificationBuilder();
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("queue_empty", notification.ConditionId);
+        Assert.Equal("Queue is empty", notification.Title);
+        Assert.Contains("No active work items", notification.Summary);
+        Assert.Contains("orchestrator is idle", notification.Body);
+        Assert.Equal(NotificationSeverity.Information, notification.Severity);
+        Assert.Equal(timestamp, notification.Timestamp);
+    }
+
+    [Fact]
+    public void WorkItemPermanentlyFailedNotificationBuilder_Build_ReturnsCorrectNotification()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var builder = new WorkItemPermanentlyFailedNotificationBuilder();
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("work_item_permanently_failed", notification.ConditionId);
+        Assert.Contains("permanently failed", notification.Title, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("terminal failure", notification.Summary);
+        Assert.Contains("not be retried", notification.Body);
+        Assert.Equal(NotificationSeverity.Warning, notification.Severity);
+        Assert.Equal(timestamp, notification.Timestamp);
+    }
+
+    [Fact]
+    public void SandboxLeakReapedNotificationBuilder_Build_ReturnsCorrectNotification()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var builder = new SandboxLeakReapedNotificationBuilder();
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("sandbox_leak_reaped", notification.ConditionId);
+        Assert.Contains("leak", notification.Title, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("leaked", notification.Summary);
+        Assert.Contains("orphaned", notification.Body);
+        Assert.Contains("GET /sandboxes/leaked", notification.Body);
+        Assert.Equal(NotificationSeverity.Warning, notification.Severity);
+        Assert.Equal(timestamp, notification.Timestamp);
+    }
+
+    [Fact]
+    public void OrchestratorStallNotificationBuilder_Build_ReturnsCorrectNotification()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var opts = new NotificationsOptions
+        {
+            Rules =
+            [
+                new NotificationRuleOptions
+                {
+                    Condition = "orchestrator_stall",
+                    StallThresholdMinutes = 30,
+                },
+            ],
+        };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        var builder = new OrchestratorStallNotificationBuilder(monitor);
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("orchestrator_stall", notification.ConditionId);
+        Assert.Contains("stalled", notification.Title, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("30", notification.Title);
+        Assert.Contains("not made any state transitions", notification.Summary);
+        Assert.Contains("30", notification.Body);
+        Assert.Equal(NotificationSeverity.Critical, notification.Severity);
+        Assert.Equal(timestamp, notification.Timestamp);
+        Assert.True(notification.Fields!.ContainsKey("stallThresholdMinutes"));
+        Assert.Equal("30", notification.Fields!["stallThresholdMinutes"]);
+    }
+
+    [Fact]
+    public void OrchestratorStallNotificationBuilder_HotReloadPicksUpNewThreshold()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var opts = new NotificationsOptions
+        {
+            Rules =
+            [
+                new NotificationRuleOptions
+                {
+                    Condition = "orchestrator_stall",
+                    StallThresholdMinutes = 10,
+                },
+            ],
+        };
+        var monitor = new StaticOptionsMonitor<NotificationsOptions>(opts);
+        var builder = new OrchestratorStallNotificationBuilder(monitor);
+
+        var n1 = builder.Build(timestamp);
+        Assert.Contains("10", n1.Title);
+
+        opts.Rules[0].StallThresholdMinutes = 45;
+        monitor.Set(opts);
+
+        var n2 = builder.Build(timestamp);
+        Assert.Contains("45", n2.Title);
+    }
+
+    [Fact]
+    public void AllQuotasExhaustedNotificationBuilder_Build_ReturnsCorrectNotification()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new StubQuotaProbe(new AgentKind("codex"), 3),
+        };
+        var builder = new AllQuotasExhaustedNotificationBuilder(probes, 10);
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("all_quotas_exhausted", notification.ConditionId);
+        Assert.Contains("10%", notification.Title);
+        Assert.Contains("threshold: 10", notification.Title);
+        Assert.Contains("claude", notification.Summary);
+        Assert.Contains("codex", notification.Summary);
+        Assert.Contains("10%", notification.Body);
+        Assert.Equal(NotificationSeverity.Critical, notification.Severity);
+        Assert.Equal(timestamp, notification.Timestamp);
+        Assert.True(notification.Fields!.ContainsKey("minQuotaPct"));
+        Assert.Equal("10", notification.Fields!["minQuotaPct"]);
+        Assert.True(notification.Fields!.ContainsKey("agents"));
+        Assert.Contains("claude", notification.Fields!["agents"]);
+        Assert.Contains("codex", notification.Fields!["agents"]);
+    }
+
+    [Fact]
+    public void AllQuotasExhaustedNotificationBuilder_EmptyProbes_DoesNotThrow()
+    {
+        var timestamp = new DateTimeOffset(2026, 5, 30, 12, 0, 0, TimeSpan.Zero);
+        var builder = new AllQuotasExhaustedNotificationBuilder([], 10);
+        var notification = builder.Build(timestamp);
+
+        Assert.Equal("all_quotas_exhausted", notification.ConditionId);
+        Assert.Equal(string.Empty, notification.Fields!["agents"]);
     }
 }
 

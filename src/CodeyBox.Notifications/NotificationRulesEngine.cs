@@ -95,7 +95,7 @@ public sealed class NotificationRulesEngine : BackgroundService
     }
 
     /// <summary>
-    /// Runs one evaluation sweep: evaluates every condition, applies
+    /// Runs one evaluation sweep: evaluates every condition once, applies
     /// edge-trigger + cooldown logic, and fires matching notifications.
     /// </summary>
     internal async Task RunSweepAsync(CancellationToken ct)
@@ -104,24 +104,32 @@ public sealed class NotificationRulesEngine : BackgroundService
         if (!currentOpts.Enabled || currentOpts.Rules.Count == 0)
             return;
 
+        var conditionResults = new Dictionary<string, bool?>(StringComparer.Ordinal);
+
         foreach (var rule in currentOpts.Rules)
         {
             if (string.IsNullOrEmpty(rule.Condition)) continue;
             if (!_conditions.TryGetValue(rule.Condition, out var condition))
                 continue;
 
-            var state = _state.GetOrAdd(rule.Condition, _ => (false, DateTimeOffset.MinValue));
-            bool currentlyActive;
-            try
+            if (!conditionResults.TryGetValue(rule.Condition, out var cachedResult))
             {
-                currentlyActive = await condition.EvaluateAsync(ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Notifications: failed to evaluate condition {Condition}", rule.Condition);
-                continue;
+                try
+                {
+                    cachedResult = await condition.EvaluateAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Notifications: failed to evaluate condition {Condition}", rule.Condition);
+                    cachedResult = null;
+                }
+                conditionResults[rule.Condition] = cachedResult;
             }
 
+            if (cachedResult is not bool currentlyActive)
+                continue;
+
+            var state = _state.GetOrAdd(rule.Condition, _ => (false, DateTimeOffset.MinValue));
             var now = DateTimeOffset.UtcNow;
             var cooldown = GetCooldown(rule.Condition);
 

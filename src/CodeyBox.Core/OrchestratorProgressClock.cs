@@ -2,9 +2,9 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// Shared singleton that tracks the time of the most recent orchestrator
-/// state transition. Stamped by <c>OrchestratorService</c> after each
-/// work-item state change; read by stall-detection consumers.
-/// Thread-safe via Interlocked.
+/// state transition. Stamped by <c>OrchestratorService</c> after the
+/// dead-worker reaper init sweep and when a work item completes;
+/// read by stall-detection consumers. Thread-safe via Interlocked.
 /// </summary>
 public sealed class OrchestratorProgressClock
 {
