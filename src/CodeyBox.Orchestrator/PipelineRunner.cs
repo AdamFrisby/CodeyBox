@@ -975,7 +975,8 @@ public sealed class PipelineRunner : IPipelineRunner
         string baseBranch,
         string workBranch,
         Project project,
-        CancellationToken ct)
+        CancellationToken ct,
+        string timingPhase = "pickup")
     {
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         Validation.ValidateBranchName(workBranch, nameof(workBranch));
@@ -1017,12 +1018,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 allowAgentNetwork: false,
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
-                timingPhase: "pickup",
+                timingPhase: timingPhase,
                 baselineImageRef: item.BaselineImageRef);
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.clone_into_sandbox",
+                _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
@@ -1054,7 +1055,7 @@ public sealed class PipelineRunner : IPipelineRunner
             IAgentRunner? rebaseReviewRunner = null;
             AgentCredential? rebaseReviewCredential = null;
             await using (var rebaseScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.rebase_work_branch_onto_base",
+                _timings, item.Id, timingPhase, "git.rebase_work_branch_onto_base",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 var rebaseResult = await RebaseCheckedOutBranchWithScopeFenceAsync(
@@ -1078,7 +1079,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 return;
 
             await using (var pushScope = await TimingScope.BeginAsync(
-                _timings, item.Id, "pickup", "git.force_push_rebased_work_branch",
+                _timings, item.Id, timingPhase, "git.force_push_rebased_work_branch",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
             {
                 await Run(
@@ -1135,7 +1136,10 @@ public sealed class PipelineRunner : IPipelineRunner
     /// actually resolved any conflicts. The single rebase core
     /// (<see cref="RebaseCheckedOutBranchWithScopeFenceAsync"/>) stays
     /// authoritative; this entry point is a gate + try/catch around the
-    /// existing flow, not a parallel implementation.
+    /// existing flow, not a parallel implementation. The timing-phase tag is
+    /// passed through as <c>"incremental-rebase"</c> so the between-iteration
+    /// flow is distinguishable from the merge-time pickup flow in
+    /// observability (without it both flows would appear as <c>"pickup"</c>).
     /// </para>
     ///
     /// <para>
@@ -1182,7 +1186,8 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             await RebaseExistingWorkBranchOntoFreshBaseAsync(
-                item, runner, repoId, baseBranch, workBranch, project, ct);
+                item, runner, repoId, baseBranch, workBranch, project, ct,
+                timingPhase: "incremental-rebase");
         }
         catch (OperationCanceledException)
         {
