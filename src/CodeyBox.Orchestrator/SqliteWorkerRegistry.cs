@@ -125,13 +125,27 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     public async Task<IReadOnlyList<WorkerRegistration>> ListAsync(CancellationToken ct = default)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT * FROM worker_registry ORDER BY started_at;";
-        using var reader = await cmd.ExecuteReaderAsync(ct);
-        var results = new List<WorkerRegistration>();
-        while (await reader.ReadAsync(ct))
-            results.Add(Read(reader));
-        return results;
+        // Microsoft.Data.Sqlite serializes commands per-connection: if another
+        // caller (e.g. ClaimDeadWorkersAsync) is mid-BeginTransaction on _conn,
+        // an unscoped ExecuteReaderAsync here throws "pending local transaction".
+        // _writeLock is the single-writer guard that protects every mutation
+        // and the only transactional read path; taking it for reads too closes
+        // the race without forcing callers to coordinate externally.
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM worker_registry ORDER BY started_at;";
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            var results = new List<WorkerRegistration>();
+            while (await reader.ReadAsync(ct))
+                results.Add(Read(reader));
+            return results;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     /// <summary>
