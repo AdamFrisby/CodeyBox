@@ -45,6 +45,12 @@ public sealed class AgentClassRouter
     private readonly IAgentRunningCounters? _runningCounters;
     private readonly AgentAvailabilityRegistry? _availability;
     private readonly IAgentBudgetProvider? _budgetProvider;
+    // Shared swappable holder for per-agent operator caps. Same instance is
+    // held by OrchestratorService and PipelineRunner so hot-reload writes
+    // propagate through one snapshot. Null when no concurrency state is wired
+    // (legacy test fixtures) — the cap-spill check falls back to "no cap" and
+    // the router behaves as before this feature.
+    private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -67,7 +73,8 @@ public sealed class AgentClassRouter
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
         AgentAvailabilityRegistry? availability = null,
-        IAgentBudgetProvider? budgetProvider = null)
+        IAgentBudgetProvider? budgetProvider = null,
+        AgentConcurrencySnapshot? concurrencySnapshot = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -88,6 +95,7 @@ public sealed class AgentClassRouter
         _runningCounters = runningCounters;
         _availability = availability;
         _budgetProvider = budgetProvider;
+        _concurrencySnapshot = concurrencySnapshot;
     }
 
     /// <summary>
@@ -261,6 +269,15 @@ public sealed class AgentClassRouter
         var budgetExhaustedMembers = new HashSet<AgentMembership>();
         DateTimeOffset? earliestBudgetReset = null;
 
+        // Members the operator's per-agent concurrency cap pushed past in this
+        // pass: the cap was at its ceiling so we spilled to a lower-ranked
+        // member rather than DEFERring the work item. Recorded so the PayPerApi
+        // fire-anyway fallthrough doesn't pick a cap-saturated member (the
+        // orchestrator's TryReserveAgentSlot would just fail on it) and so the
+        // post-loop wait interval shrinks to the cap-retry window when cap was
+        // the only blocker — a slot opens far sooner than a quota window resets.
+        var capSaturatedMembers = new HashSet<AgentMembership>();
+
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in sorted)
         {
@@ -298,6 +315,27 @@ public sealed class AgentClassRouter
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
                     continue;
                 }
+            }
+
+            // Per-agent operator concurrency cap: skip if the routed agent has
+            // no free slot. This is the SPILL step — when the highest-quality
+            // member is at cap, continue to the next eligible member rather than
+            // returning a defer. Checked BEFORE the quota probe so we don't burn
+            // a probe round-trip on a member we can't dispatch to anyway.
+            // The orchestrator's TryReserveAgentSlot remains authoritative for
+            // the actual reservation; a race where slots fill between this read
+            // and that reservation still falls through to the orchestrator's
+            // existing cap-defer (rare, and correctly bounded).
+            if (IsAtAgentCap(member))
+            {
+                var cap = GetAgentCap(member.Agent);
+                var running = _runningCounters?.GetRunning(member.Agent) ?? 0;
+                var capReason = $"per-agent cap: running={running} cap={cap}";
+                _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
+                capSaturatedMembers.Add(member);
+                AuditLog.ConcurrencyGated(item.Id, member.Agent, running, cap);
+                continue;
             }
 
             AgentQuotaSnapshot snapshot;
@@ -370,22 +408,40 @@ public sealed class AgentClassRouter
         // No member is above the threshold.
         if (hasSubscription)
         {
-            AuditLog.QuotaRouterWaiting(classId, item.Id, _opts.QuotaRecheckInterval);
+            // When a Subscription member was blocked only by per-agent cap (not
+            // quota), a slot will free up far sooner than a quota window resets.
+            // Wake on whichever comes first so spill-saturated classes don't sit
+            // idle on the longer quota interval.
+            var recheck = _opts.QuotaRecheckInterval;
+            string waitReason;
+            if (capSaturatedMembers.Count > 0)
+            {
+                if (recheck > _opts.CapRetryInterval)
+                    recheck = _opts.CapRetryInterval;
+                waitReason = $"all eligible members of class '{classId}' are below the {_opts.MinQuotaPct}% threshold or at their per-agent concurrency cap";
+            }
+            else
+            {
+                waitReason = $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold";
+            }
+            AuditLog.QuotaRouterWaiting(classId, item.Id, recheck);
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
-                SuggestedRecheckIn = _opts.QuotaRecheckInterval,
-                Reason = $"all members of class '{classId}' are below {_opts.MinQuotaPct}% threshold",
+                SuggestedRecheckIn = recheck,
+                Reason = waitReason,
             };
         }
 
         // Only PayPerApi members reached here. PayPerApi probes normally report 100%,
         // so a below-threshold member is usually an unusual custom probe — fire anyway.
-        // EXCEPTION: a member pushed below threshold by a configured operator budget is
-        // hitting a real spend cap. Fire the first member NOT budget-exhausted; if every
-        // member is budget-exhausted, park until the soonest budget window resets rather
-        // than fail-open on the cap.
-        var fireable = sorted.FirstOrDefault(x => !budgetExhaustedMembers.Contains(x.Member));
+        // EXCEPTIONS that must NOT be fired:
+        //  - budget-exhausted: a configured operator spend cap (fail-open would burn money).
+        //  - cap-saturated: the orchestrator's TryReserveAgentSlot would refuse the dispatch.
+        // Fire the first member that is neither budget-exhausted nor cap-saturated.
+        var fireable = sorted.FirstOrDefault(x =>
+            !budgetExhaustedMembers.Contains(x.Member)
+            && !capSaturatedMembers.Contains(x.Member));
         if (fireable is not null)
         {
             var fallback = fireable.Member;
@@ -399,6 +455,10 @@ public sealed class AgentClassRouter
             };
         }
 
+        // Build the park interval from whichever blocker is the soonest to clear.
+        // budget-reset is typically minutes-to-hours; cap-retry is seconds. Both
+        // can be active simultaneously (some PayPerApi members budget-exhausted,
+        // others cap-saturated) so we take the soonest.
         var budgetRecheck = _opts.QuotaRecheckInterval;
         if (earliestBudgetReset is { } budgetReset)
         {
@@ -406,16 +466,58 @@ public sealed class AgentClassRouter
             if (untilReset > TimeSpan.Zero && untilReset < budgetRecheck)
                 budgetRecheck = untilReset;
         }
+        if (capSaturatedMembers.Count > 0 && budgetRecheck > _opts.CapRetryInterval)
+            budgetRecheck = _opts.CapRetryInterval;
+        string parkReason;
+        if (budgetExhaustedMembers.Count > 0 && capSaturatedMembers.Count > 0)
+            parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted or at their per-agent concurrency cap";
+        else if (capSaturatedMembers.Count > 0)
+            parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
+        else
+            parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted";
         _log.LogInformation(
-            "Work item {Id}: class '{ClassId}' has only PayPerApi members and all are budget-exhausted; parking until budget reset",
-            item.Id, classId);
+            "Work item {Id}: class '{ClassId}' parking — {Reason}",
+            item.Id, classId, parkReason);
         AuditLog.QuotaRouterWaiting(classId, item.Id, budgetRecheck);
         return new AgentRoutingDecision
         {
             ShouldWait = true,
             SuggestedRecheckIn = budgetRecheck,
-            Reason = $"all PayPerApi members of class '{classId}' are budget-exhausted",
+            Reason = parkReason,
         };
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="member"/>'s agent has an operator-
+    /// configured per-agent cap and the live in-flight count is at or above
+    /// that cap. Always false when either the cap config or the running
+    /// counters are not wired — keeping router behaviour stable for fixtures
+    /// that don't register concurrency.
+    /// </summary>
+    private bool IsAtAgentCap(AgentMembership member)
+    {
+        if (_runningCounters is null) return false;
+        var cap = GetAgentCap(member.Agent);
+        if (cap <= 0) return false;
+        return _runningCounters.GetRunning(member.Agent) >= cap;
+    }
+
+    /// <summary>
+    /// Reads the per-agent cap from the swappable snapshot. Returns 0 when no
+    /// snapshot is wired or the agent has no entry (= unlimited within the
+    /// global worker-pool ceiling). Defence-in-depth: rejects stored
+    /// <c>MaxConcurrent &lt;= 0</c> values even though
+    /// <see cref="AgentConcurrencyOptions.ValidateAndThrow"/> rejects them at
+    /// load — test fixtures can build options directly without the validator.
+    /// </summary>
+    private int GetAgentCap(AgentKind agent)
+    {
+        var opts = _concurrencySnapshot?.Current;
+        return opts is not null
+            && opts.Members.TryGetValue(agent.Value, out var entry)
+            && entry is { MaxConcurrent: > 0 }
+            ? entry.MaxConcurrent
+            : 0;
     }
 
     /// <summary>
@@ -997,6 +1099,17 @@ public sealed class QuotaRouterOptions
     public TimeSpan ObservedFailureWindow { get; set; } = TimeSpan.FromMinutes(10);
 
     public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Re-pickup delay applied when the router spilled past every eligible
+    /// member because each was at its per-agent concurrency cap. Short enough
+    /// that the deferred item is reconsidered as soon as another worker on any
+    /// of those agents finishes; long enough not to busy-loop. Default 15s,
+    /// matching <c>OrchestratorService._agentCapRetryDelay</c> (the fallback
+    /// the orchestrator applies if its own atomic slot reservation races and
+    /// fails after the router's pre-check).
+    /// </summary>
+    public TimeSpan CapRetryInterval { get; set; } = TimeSpan.FromSeconds(15);
 }
 
 public enum QuotaUnknownPolicy
