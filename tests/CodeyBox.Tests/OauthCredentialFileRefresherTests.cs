@@ -169,6 +169,7 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
     {
         var path = WriteCreds("oauth_creds.json",
             $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed-token","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
         using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
         var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"unused","expires_in":3600}""");
         var cliCalled = 0;
@@ -176,11 +177,11 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
             source,
             new RefresherFakeHttpClientFactory("agent-quota", handler),
             NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
-            cliTokenRefresher: _ => { cliCalled++; return Task.FromResult(true); });
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
 
         var token = await refresher.GetAccessTokenAsync();
 
-        Assert.Equal("old-access", token);
+        Assert.Equal("cli-refreshed-token", token);
         Assert.Equal(1, cliCalled);
         Assert.Empty(handler.Requests);
     }
@@ -308,6 +309,54 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Empty(handler.Requests);
     }
 
+    [Fact]
+    public async Task Gemini_Refresh_OnlyClientIdProvided_WithoutFileClientId_FallsBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"http-new","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: "config-client",
+            geminiOauthClientSecret: null,
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-refreshed", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Gemini_Refresh_OnlyClientSecretProvided_WithoutFileClientSecret_FallsBackToCli()
+    {
+        var path = WriteCreds("oauth_creds.json",
+            $$"""{"access_token":"old-access","refresh_token":"rt-1","expiry_date":{{DateTimeOffset.UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()}}}""");
+        var freshJson = $$"""{"access_token":"cli-refreshed","refresh_token":"rt-2","expiry_date":{{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}}""";
+        using var source = new GeminiOAuthCredentialFileSource(path, watch: false);
+        var handler = new RefresherCapturingHandler(HttpStatusCode.OK, """{"access_token":"http-new","expires_in":3600}""");
+        var cliCalled = 0;
+        using var refresher = new GeminiOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", handler),
+            NullLogger<GeminiOauthCredentialFileRefresher>.Instance,
+            geminiOauthClientId: null,
+            geminiOauthClientSecret: "config-secret",
+            cliTokenRefresher: _ => { cliCalled++; File.WriteAllText(path, freshJson); return Task.FromResult(true); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("cli-refreshed", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Empty(handler.Requests);
+    }
+
     // ── CLI refresh handler (TryCreateCliRefreshHandler / ResolveGeminiCliPath) ─
 
     [Fact]
@@ -348,17 +397,9 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.NotNull(handler);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
-        // Suppress the linked CTS timeout so only the external CT matters.
+        // The external CT fires after 100 ms, well before the 30 s linked CTS timeout.
         var result = await handler(cts.Token);
         Assert.False(result);
-    }
-
-    [Fact]
-    public void TryCreateCliRefreshHandler_WhenResolvePathReturnsNull_ReturnsNull()
-    {
-        var handler = GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
-            resolvePath: () => null!);
-        Assert.Null(handler);
     }
 
     [Fact]

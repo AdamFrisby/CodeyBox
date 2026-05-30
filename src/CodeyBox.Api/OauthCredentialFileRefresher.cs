@@ -338,15 +338,16 @@ public abstract class OauthCredentialFileRefresher : IDisposable
 ///   "client_secret": "...", "expiry_date": &lt;ms-since-epoch&gt; }
 /// </code>
 ///
-/// <para>Refresh strategy (tried in order):</para>
+/// <para>Refresh strategy:</para>
 /// <list type="number">
-///   <item>HTTP refresh using client_id + client_secret from the creds file
-///   (only when <c>@google/gemini-cli</c> happened to persist them).</item>
-///   <item>HTTP refresh using client_id + client_secret from config (operator
-///   supplies them via env var or <c>codeybox-extra.json</c> — never embedded
-///   in source).</item>
-///   <item>CLI-based refresh: invoke the host <c>gemini</c> CLI, which
-///   self-refreshes using its own embedded OAuth client, then re-read
+///   <item>HTTP refresh using client_id + client_secret pooled from whichever
+///   source is available (file creds take precedence; config fallback from
+///   env var or <c>codeybox-extra.json</c> fills in missing values). This is
+///   a single attempt — if HTTP creds exist but the call fails, CLI is not
+///   attempted.</item>
+///   <item>CLI-based refresh (only when no client credentials are available
+///   for HTTP): invoke the host <c>gemini</c> CLI, which self-refreshes
+///   using its own embedded OAuth client, then re-read
 ///   <c>~/.gemini/oauth_creds.json</c> for the new access_token/expiry.</item>
 /// </list>
 /// </summary>
@@ -421,23 +422,13 @@ public sealed class GeminiOauthCredentialFileRefresher
             var raw = Source.GetRaw();
             if (!string.IsNullOrEmpty(raw))
             {
-                try
+                var reparsed = ParseCreds(raw);
+                if (!string.IsNullOrEmpty(reparsed.AccessToken))
                 {
-                    var reparsed = ParseCreds(raw);
-                    if (!string.IsNullOrEmpty(reparsed.AccessToken))
-                    {
-                        var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow() + FallbackTokenLifetime;
-                        var expiresIn = expiresAt - TimeProvider.GetUtcNow();
-                        if (expiresIn <= TimeSpan.Zero) expiresIn = FallbackTokenLifetime;
-                        return new RefreshResult(reparsed.AccessToken, reparsed.RefreshToken, expiresIn);
-                    }
-                }
-                catch (JsonException ex)
-                {
-                    Log.LogDebug(
-                        ex,
-                        "CLI refresh rewrote {Path} but the result is unparseable JSON; treating as no-token",
-                        Source.FilePath);
+                    var expiresAt = reparsed.ExpiresAt ?? TimeProvider.GetUtcNow() + FallbackTokenLifetime;
+                    var expiresIn = expiresAt - TimeProvider.GetUtcNow();
+                    if (expiresIn <= TimeSpan.Zero) expiresIn = FallbackTokenLifetime;
+                    return new RefreshResult(reparsed.AccessToken, reparsed.RefreshToken, expiresIn);
                 }
             }
         }
@@ -466,7 +457,7 @@ public sealed class GeminiOauthCredentialFileRefresher
         var newAccess = TryString(doc.RootElement, "access_token");
         var newRefresh = TryString(doc.RootElement, "refresh_token");
         var seconds = doc.RootElement.TryGetProperty("expires_in", out var ex) && ex.ValueKind == JsonValueKind.Number
-            && ex.TryGetInt32(out var s) ? s : 3600;
+            && ex.TryGetInt32(out var s) ? s : (int)FallbackTokenLifetime.TotalSeconds;
         return new RefreshResult(newAccess, newRefresh, TimeSpan.FromSeconds(seconds));
     }
 
@@ -506,27 +497,12 @@ public sealed class GeminiOauthCredentialFileRefresher
                 };
                 psi.ArgumentList.Add("-p");
                 psi.ArgumentList.Add(".");
-                proc = Process.Start(psi);
-                if (proc is null) return false;
+                proc = Process.Start(psi)!;
                 await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
                 return proc.ExitCode == 0;
             }
-            catch (OperationCanceledException)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
-                return false;
-            }
-            catch (IOException)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
-                return false;
-            }
-            catch (InvalidOperationException)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
-                return false;
-            }
-            catch (System.ComponentModel.Win32Exception)
+            catch (Exception ex) when (ex is OperationCanceledException or IOException
+                or InvalidOperationException or System.ComponentModel.Win32Exception)
             {
                 try { proc?.Kill(entireProcessTree: true); } catch (Exception) { }
                 return false;
@@ -538,7 +514,7 @@ public sealed class GeminiOauthCredentialFileRefresher
         };
     }
 
-    private const int WhichTimeoutMilliseconds = 5000;
+    internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Resolves the absolute path to the host <c>gemini</c> binary using
@@ -564,7 +540,7 @@ public sealed class GeminiOauthCredentialFileRefresher
                 CreateNoWindow = true,
             });
             if (proc is null) return null;
-            if (!proc.WaitForExit(WhichTimeoutMilliseconds))
+            if (!proc.WaitForExit(WhichTimeout))
             {
                 try { proc.Kill(entireProcessTree: true); } catch (Exception) { }
                 return null;
@@ -575,9 +551,8 @@ public sealed class GeminiOauthCredentialFileRefresher
                 if (!string.IsNullOrEmpty(path)) return path;
             }
         }
-        catch (IOException) { }
-        catch (InvalidOperationException) { }
-        catch (System.ComponentModel.Win32Exception) { }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException
+            or System.ComponentModel.Win32Exception) { }
         return null;
     }
 

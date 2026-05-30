@@ -57,7 +57,7 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
             if (credential.EnvironmentVariables.TryGetValue("CODEYBOX_GEMINI_OAUTH_CREDS_JSON", out var oauthJson)
                 && !string.IsNullOrEmpty(oauthJson))
             {
-                var accessToken = ExtractAccessToken(oauthJson!);
+                var accessToken = ExtractAccessToken(oauthJson!, _log);
                 if (!string.IsNullOrEmpty(accessToken))
                     return await ProbeWithOAuthAsync(accessToken!, ct, sw);
             }
@@ -113,7 +113,7 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
         return new AgentSmokeResult(false, $"HTTP {(int)response.StatusCode}", sw.Elapsed);
     }
 
-    internal static string? ExtractAccessToken(string oauthCredsJson)
+    internal static string? ExtractAccessToken(string oauthCredsJson, ILogger? log = null)
     {
         try
         {
@@ -124,8 +124,9 @@ public sealed class GeminiSmokeProbe : IAgentSmokeProbe
                 return token.GetString();
             }
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
+            log?.LogDebug(ex, "Gemini OAuth creds JSON is malformed; treating as no token");
         }
         return null;
     }
