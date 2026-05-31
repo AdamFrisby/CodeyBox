@@ -351,6 +351,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 AuditLog.AgentSmokeSucceeded(agentKind, smokeResult.Duration);
         }
 
+        // ── check-and-act branch ─────────────────────────────────────────────
+        // A CheckAndAct item runs a single agent invocation in a sandbox that
+        // evaluates a yes/no question against the project repo and returns a
+        // structured JSON verdict on stdout. It never opens a PR, never merges,
+        // never pushes upstream. On a matching verdict it enqueues a Normal
+        // follow-up item; on a non-matching verdict it finishes Done with the
+        // verdict recorded.
+        if (item.JobType == JobType.CheckAndAct)
+        {
+            await RunCheckAndActAsync(item, project, agentRunner, ct);
+            return;
+        }
+
         try
         {
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
@@ -2160,6 +2173,274 @@ public sealed class PipelineRunner : IPipelineRunner
 
             Continue the interrupted rework from the restored files and any CLI session state that was recovered by the runner. Make a commit for the resumed rework before exiting.
             """, checkpointRef);
+    }
+
+    /// <summary>
+    /// Executes a <see cref="JobType.CheckAndAct"/> work item end-to-end: spins
+    /// up a sandbox with a read-only clone of the project repo at the base
+    /// branch, runs a SINGLE agent invocation with the verdict-protocol prompt,
+    /// parses the structured JSON verdict from agent stdout, persists it on
+    /// the work item, and — when the verdict matches
+    /// <see cref="CheckAndActSpec.ActionableAnswer"/> — enqueues a Normal
+    /// follow-up item built from <see cref="CheckAndActSpec.OnYes"/>. Finishes
+    /// the work item Done on a parsable verdict (regardless of yes/no);
+    /// transitions to Failed with <c>failureKind=other</c> on a missing /
+    /// malformed verdict so the operator can surface the misbehaviour. Never
+    /// commits, pushes, opens a PR, or otherwise mutates the project repo.
+    /// </summary>
+    private async Task RunCheckAndActAsync(
+        WorkItem item, Project project, IAgentRunner agentRunner, CancellationToken ct)
+    {
+        if (item.Check is null || item.Check.OnYes is null)
+        {
+            await TransitionFailed(item,
+                "check-and-act item is missing a check spec (or its on-yes action) — refusing to dispatch",
+                CancellationToken.None, project, failureKind: "other");
+            return;
+        }
+        var checkSpec = item.Check;
+
+        try
+        {
+            var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
+            var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
+            var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+
+            await Transition(item, WorkItemState.Working, ct, project);
+
+            var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
+            var stdout = await RunCheckAndActAgentAsync(item, project, agentRunner, repoId, baseBranch, prompt, ct);
+
+            if (!CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var parseError))
+            {
+                AuditLog.WorkItemFailed(item.Id, $"check-and-act: {parseError}");
+                await TransitionFailed(item,
+                    $"check-and-act verdict parse failure: {parseError}",
+                    CancellationToken.None, project, failureKind: "other");
+                return;
+            }
+
+            // Persist the verdict. We re-read the item to avoid clobbering any
+            // concurrent partial-update (priority / prompt) that may have
+            // landed mid-flight.
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            var withVerdict = current with { Verdict = verdict };
+            await _store.UpdateAsync(withVerdict, ct);
+            item = withVerdict;
+
+            _log.LogInformation(
+                "Work item {Id} check verdict: answer={Answer} confidence={Confidence}",
+                item.Id, verdict!.Answer, verdict.Confidence ?? "(unspecified)");
+
+            // Only enqueue the on-yes follow-up when the verdict matches the
+            // actionable condition. A non-matching verdict still completes Done
+            // — the recorded verdict is the deliverable.
+            if (verdict.Answer == checkSpec.ActionableAnswer)
+            {
+                await EnqueueOnYesFollowupAsync(item, project, checkSpec.OnYes, ct);
+            }
+
+            await Transition(item, WorkItemState.Done, ct, project);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "other");
+        }
+    }
+
+    /// <summary>
+    /// Runs the agent inside a project sandbox for the check phase. Mirrors
+    /// the work-phase sandbox / clone scaffolding but never commits, never
+    /// pushes, never opens a PR — the agent's only deliverable is the
+    /// structured verdict on stdout. Returns the aggregated stdout chunks
+    /// (via callback) and final <see cref="AgentResult.Stdout"/> concatenated
+    /// so the verdict parser sees both streamed deltas and any one-shot final
+    /// payload. Throws on agent failure so the outer catch in
+    /// <see cref="RunCheckAndActAsync"/> records it as Failed.
+    /// </summary>
+    private async Task<string> RunCheckAndActAgentAsync(
+        WorkItem item, Project project, IAgentRunner agentRunner,
+        string repoId, string baseBranch, string prompt, CancellationToken ct)
+    {
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(agentRunner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(agentRunner.Kind, ct);
+        var access = _gitHost.GetSandboxAccess(repoId);
+
+        var spec = BuildSandboxSpec(
+            access,
+            includeAgentCredential: credential,
+            allowAgentNetwork: true,
+            hostNetworkProfile: project.NetworkProfiles.Work,
+            timingWorkItemId: item.Id,
+            timingPhase: "check",
+            flavor: SandboxProfileFlavor.Headless,
+            extraEnvironment: null,
+            baselineImageRef: item.BaselineImageRef);
+
+        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        if (credential is not null && credential.Files.Count > 0)
+            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+
+        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
+
+        var aggregator = new System.Text.StringBuilder();
+        var chunkCallback = (Action<string>)(chunk =>
+        {
+            aggregator.Append(chunk);
+            _stdoutBroadcaster?.BroadcastChunk(item.Id, "check", chunk);
+        });
+
+        AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "check");
+        var result = await agentRunner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, prompt, credential,
+            item.ModelId, item.ReasoningMode, ct,
+            stdoutChunkCallback: chunkCallback,
+            captureStructuredStream: false);
+
+        if (!result.Success)
+        {
+            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
+            throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
+        }
+
+        // If the runner returned a final stdout payload that wasn't streamed
+        // through the callback, append it so the verdict parser sees the full
+        // tail. Double-counting a chunk that was both streamed AND echoed in
+        // the final payload only hurts the parser if the final payload omits
+        // the sentinels — which would itself be a malformed-verdict failure.
+        if (!string.IsNullOrEmpty(result.Stdout) && !aggregator.ToString().EndsWith(result.Stdout, StringComparison.Ordinal))
+            aggregator.Append(result.Stdout);
+
+        return aggregator.ToString();
+    }
+
+    /// <summary>
+    /// Builds and persists the on-yes follow-up Normal work item triggered by
+    /// a matching check verdict. The follow-up inherits the parent's
+    /// <see cref="WorkItem.ProjectId"/> and base branch, uses the spec's
+    /// title / prompt verbatim, and back-links to the check via
+    /// <see cref="WorkItem.OriginCheckWorkItemId"/>. Optional spec fields
+    /// (agent kind, agent class, dependsOn, priority, min-model-score) flow
+    /// through verbatim — no defaulting here so the operator's intent is
+    /// preserved end-to-end. Dependency resolution mirrors
+    /// <c>POST /workitems</c>: UUIDs and bare/namespaced externalIds within
+    /// the same project.
+    /// </summary>
+    private async Task EnqueueOnYesFollowupAsync(
+        WorkItem checkItem, Project project, OnYesActionSpec onYes, CancellationToken ct)
+    {
+        var newId = WorkItemId.New();
+        var dependsOn = await ResolveOnYesDependsOnAsync(checkItem.ProjectId, onYes.DependsOn ?? [], ct);
+        AgentKind? agentOverride = string.IsNullOrWhiteSpace(onYes.Agent) ? null : new AgentKind(onYes.Agent.Trim());
+        var classId = string.IsNullOrWhiteSpace(onYes.AgentClassId) ? null : onYes.AgentClassId.Trim();
+        var priority = onYes.Priority is { } p ? Math.Clamp(p, -1000, 1000) : 0;
+        var minScore = onYes.MinModelScore is { } s ? Math.Clamp(s, 0, 200) : 0;
+
+        var followup = new WorkItem
+        {
+            Id = newId,
+            ProjectId = checkItem.ProjectId,
+            Title = onYes.Title,
+            Prompt = onYes.Prompt,
+            BaseBranch = checkItem.BaseBranch,
+            Agent = agentOverride,
+            AgentClassId = classId,
+            PushUpstream = checkItem.PushUpstream,
+            DependsOn = dependsOn,
+            QueuePosition = DateTimeOffset.UtcNow.Ticks,
+            Priority = priority,
+            MinModelScore = minScore,
+            OriginCheckWorkItemId = checkItem.Id,
+            JobType = JobType.Normal,
+        };
+
+        await _store.CreateAsync(followup, ct);
+        AuditLog.WorkItemCreated(followup.Id, followup.ProjectId, followup.Title);
+
+        // Enqueue iff all (zero-or-more) dependencies are already satisfied.
+        // Same posture as POST /workitems: unsatisfied deps mean we persist
+        // Queued but defer enqueue until they reach Done.
+        var depStates = new Dictionary<WorkItemId, WorkItemState>();
+        foreach (var depId in followup.DependsOn)
+        {
+            var dep = await _store.GetAsync(depId, ct);
+            if (dep is not null) depStates[depId] = dep.State;
+        }
+        if (_taskQueue is not null && WorkItemDependencies.AreSatisfied(followup.DependsOn, depStates))
+            await _taskQueue.EnqueueAsync(followup.Id, ct);
+
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.check_followup_enqueued",
+            WorkItem = followup,
+            Project = project,
+            Details = new
+            {
+                originCheckWorkItemId = checkItem.Id.ToString(),
+                followupWorkItemId = followup.Id.ToString(),
+            },
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Resolves the dependency strings supplied on an <see cref="OnYesActionSpec"/>
+    /// to <see cref="WorkItemId"/>s. Mirrors the create-time resolver in
+    /// <c>WorkItemEndpoints.CreateAsync</c> at the orchestrator layer: GUIDs
+    /// pass through, namespaced <c>"ns:value"</c> externalIds use the indexed
+    /// lookup, bare externalIds are unambiguous-or-skipped within the same
+    /// project. Unknown entries are silently dropped here rather than failing
+    /// the check item — the check has already run successfully and recording
+    /// the verdict is the priority. The follow-up's dependency gate will then
+    /// see an empty dependsOn (vs a stale GUID that would never satisfy).
+    /// </summary>
+    private async Task<IReadOnlyList<WorkItemId>> ResolveOnYesDependsOnAsync(
+        ProjectId projectId, IReadOnlyList<string> rawDeps, CancellationToken ct)
+    {
+        if (rawDeps.Count == 0) return [];
+
+        var ids = new List<WorkItemId>(rawDeps.Count);
+        List<WorkItem>? cachedProjectItems = null;
+        foreach (var rawId in rawDeps)
+        {
+            if (string.IsNullOrWhiteSpace(rawId)) continue;
+            if (Guid.TryParse(rawId, out var g))
+            {
+                ids.Add(new WorkItemId(g));
+                continue;
+            }
+
+            if (cachedProjectItems is null)
+            {
+                cachedProjectItems = new List<WorkItem>();
+                await foreach (var existing in _store.ListAsync(ct))
+                    if (existing.ProjectId == projectId) cachedProjectItems.Add(existing);
+            }
+
+            if (Validation.TryParseNamespacedExternalId(rawId, out var ns, out var value) && ns is not null)
+            {
+                var hit = cachedProjectItems.FirstOrDefault(i =>
+                    i.ExternalIds.TryGetValue(ns, out var v) && string.Equals(v, value, StringComparison.Ordinal));
+                if (hit is not null) ids.Add(hit.Id);
+                continue;
+            }
+
+            var matches = cachedProjectItems
+                .Where(i => i.ExternalIds.Values.Any(v => string.Equals(v, rawId, StringComparison.Ordinal)))
+                .Select(i => i.Id)
+                .Distinct()
+                .ToList();
+            if (matches.Count == 1) ids.Add(matches[0]);
+            // Ambiguous bare externalId (>1 match) and unknown (0 matches) both
+            // silently drop — see method docstring for rationale.
+        }
+        return ids;
     }
 
     private async Task ClearPreemptAsync(WorkItem item, CancellationToken ct)

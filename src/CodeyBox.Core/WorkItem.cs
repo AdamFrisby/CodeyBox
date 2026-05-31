@@ -344,6 +344,43 @@ public sealed record WorkItem
     public ReleaseId? ReleaseId { get; init; }
 
     /// <summary>
+    /// Kind of work this item represents. <see cref="JobType.Normal"/> runs the
+    /// full work → audit → merge → upstream pipeline. <see cref="JobType.CheckAndAct"/>
+    /// runs a single agent invocation in a sandbox that evaluates a yes/no
+    /// question against the project repo, persists a structured verdict, and
+    /// optionally enqueues a follow-up <see cref="JobType.Normal"/> item.
+    /// </summary>
+    public JobType JobType { get; init; } = JobType.Normal;
+
+    /// <summary>
+    /// Configuration for a <see cref="JobType.CheckAndAct"/> item: the yes/no
+    /// question to ask, the actionable condition, and the spec for the
+    /// follow-up work item enqueued when the verdict matches. Required when
+    /// <see cref="JobType"/> is <see cref="JobType.CheckAndAct"/>; null otherwise.
+    /// </summary>
+    public CheckAndActSpec? Check { get; init; }
+
+    /// <summary>
+    /// Verdict the agent returned for a <see cref="JobType.CheckAndAct"/> item.
+    /// Persisted on the work item once the check phase completes successfully;
+    /// null while the item is in flight or for non-check items. The verdict is
+    /// authoritative — the orchestrator does not re-ask if the operator
+    /// retries the check.
+    /// </summary>
+    public CheckVerdict? Verdict { get; init; }
+
+    /// <summary>
+    /// When this item was enqueued as the on-yes follow-up of a
+    /// <see cref="JobType.CheckAndAct"/> check, this points back at the check
+    /// item that triggered it. Provides traceability ("why was this item
+    /// queued?") without conflating with <see cref="ReplayOfWorkItemId"/>
+    /// (which has distinct replay-history semantics) or
+    /// <see cref="DependsOn"/> (which gates pickup). Null for items not
+    /// produced by a check.
+    /// </summary>
+    public WorkItemId? OriginCheckWorkItemId { get; init; }
+
+    /// <summary>
     /// Content-hashed identifier of the sandbox baseline image this work item is
     /// pinned to. Stamped at pickup time from the sandbox provider's live config
     /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved

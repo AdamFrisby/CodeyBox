@@ -189,6 +189,19 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // to any member of the routed class.
         RunMigration("ALTER TABLE work_items ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]';");
 
+        // check-and-act job-type fields. New work-item kind that runs a single
+        // agent invocation against the project repo, parses a structured
+        // verdict, and optionally enqueues a follow-up Normal item. Default
+        // job_type 'Normal' preserves the prior shape for every legacy row.
+        RunMigration("ALTER TABLE work_items ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Normal';");
+        // CheckAndActSpec (question + actionable condition + on-yes action). JSON.
+        RunMigration("ALTER TABLE work_items ADD COLUMN check_spec_json TEXT;");
+        // CheckVerdict (answer + evidence + confidence). JSON; populated after check completes.
+        RunMigration("ALTER TABLE work_items ADD COLUMN check_verdict_json TEXT;");
+        // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
+        RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
+        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+
         // Per-iteration dispatch record. One row per (work_item_id, iteration);
         // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
         // restart-recovery for the same iteration) overwrites the row via
@@ -288,14 +301,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
-                        required_capabilities_json)
+                        required_capabilities_json,
+                        job_type, check_spec_json, check_verdict_json, origin_check_work_item_id)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
-                        $required_capabilities);
+                        $required_capabilities,
+                        $job_type, $check_spec, $check_verdict, $origin_check);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -396,7 +411,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
                     baseline_image_ref = $baseline_image_ref,
-                    required_capabilities_json = $required_capabilities
+                    required_capabilities_json = $required_capabilities,
+                    job_type = $job_type,
+                    check_spec_json = $check_spec,
+                    check_verdict_json = $check_verdict,
+                    origin_check_work_item_id = $origin_check
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -449,7 +468,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
                     baseline_image_ref = $baseline_image_ref,
-                    required_capabilities_json = $required_capabilities
+                    required_capabilities_json = $required_capabilities,
+                    job_type = $job_type,
+                    check_spec_json = $check_spec,
+                    check_verdict_json = $check_verdict,
+                    origin_check_work_item_id = $origin_check
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -1292,6 +1315,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$required_capabilities",
             JsonSerializer.Serialize(item.RequiredCapabilities));
+        cmd.Parameters.AddWithValue("$job_type", item.JobType.ToString());
+        cmd.Parameters.AddWithValue("$check_spec",
+            item.Check is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Check));
+        cmd.Parameters.AddWithValue("$check_verdict",
+            item.Verdict is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Verdict));
+        cmd.Parameters.AddWithValue("$origin_check",
+            (object?)item.OriginCheckWorkItemId?.ToString() ?? DBNull.Value);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1345,7 +1375,39 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         ConflictReworkAttempts = ReadInt32OrDefault(r, "conflict_rework_attempts", defaultValue: 0),
         BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
         RequiredCapabilities = ReadRequiredCapabilities(r),
+        JobType = ReadJobType(r),
+        Check = ReadCheckSpec(r),
+        Verdict = ReadCheckVerdict(r),
+        OriginCheckWorkItemId = ReadNullableWorkItemId(r, "origin_check_work_item_id"),
     };
+
+    private static JobType ReadJobType(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("job_type");
+        if (r.IsDBNull(ord)) return JobType.Normal;
+        var raw = r.GetString(ord);
+        return Enum.TryParse<JobType>(raw, ignoreCase: true, out var value) ? value : JobType.Normal;
+    }
+
+    private static CheckAndActSpec? ReadCheckSpec(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("check_spec_json");
+        if (r.IsDBNull(ord)) return null;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<CheckAndActSpec>(json); }
+        catch (JsonException) { return null; }
+    }
+
+    private static CheckVerdict? ReadCheckVerdict(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("check_verdict_json");
+        if (r.IsDBNull(ord)) return null;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<CheckVerdict>(json); }
+        catch (JsonException) { return null; }
+    }
 
     private static IReadOnlyList<string> ReadRequiredCapabilities(SqliteDataReader r)
     {

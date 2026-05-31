@@ -350,6 +350,103 @@ across `/replay`.
 
 ---
 
+## Check-and-act work items
+
+A *check-and-act* work item is a special `JobType` that runs ONE agent
+invocation in the project sandbox — exactly the same in-VM execution path
+normal items use, no raw provider HTTP — to answer a yes/no question against
+the project repository. The agent is required to return a structured JSON
+verdict; on a matching verdict the orchestrator enqueues a follow-up Normal
+work item back into the same project, parented to the check.
+
+The check item itself never opens a PR, never commits, never pushes upstream.
+Its only deliverable is the verdict (persisted on the row, queryable via
+`GET /workitems/{id}`, and surfaced in the timeline).
+
+### Creating a check-and-act item
+
+Add an optional `check` block to the `POST /workitems` payload:
+
+```json
+POST /workitems
+{
+  "projectId": "my-app",
+  "title":     "Check for SQL injection",
+  "prompt":    "evaluate the repo",
+  "check": {
+    "question": "Is any user-facing SQL built via string concatenation / interpolation (SQL-injection risk)?",
+    "actionableAnswer": true,
+    "onYes": {
+      "title":         "Fix all SQL injection vulnerabilities and verify none remain",
+      "prompt":        "Replace every string-interpolated SQL with parameterised queries. Add tests.",
+      "minModelScore": 50,
+      "priority":      100
+    }
+  }
+}
+```
+
+The `check` block is data, not policy — the question text, the actionable
+condition, and the on-yes follow-up's title/prompt/agent/priority are all
+supplied by the caller. The orchestrator never hardcodes a question.
+
+| `check` field | Required | Default | Notes |
+|---|---|---|---|
+| `question` | yes | — | The yes/no question. ≤ 64 KB. |
+| `actionableAnswer` | no | `true` | Which boolean answer triggers `onYes`. Set to `false` for inverse-shape checks (e.g. "if no tests cover X, write some"). |
+| `onYes.title` | yes | — | Follow-up work item title (≤ 200 chars, no leading dash, no control chars). |
+| `onYes.prompt` | yes | — | Follow-up prompt (≤ 64 KB). |
+| `onYes.agent` | no | inherit | Override agent kind for the follow-up. |
+| `onYes.agentClassId` | no | inherit | Override agent class for the follow-up. |
+| `onYes.minModelScore` | no | `0` | Min quality score floor. Clamped to `[0, 200]`. |
+| `onYes.priority` | no | `0` | Dispatch priority. Clamped to `[-1000, 1000]`. |
+| `onYes.dependsOn` | no | `[]` | Dependency list (UUIDs / externalIds). Resolution mirrors the regular create path. |
+
+### Verdict protocol
+
+The orchestrator builds the agent prompt by wrapping `check.question` with a
+strict response protocol. The agent MUST emit exactly one JSON object between
+the sentinels `<<<CODEYBOX_VERDICT>>>` and `<<<END_VERDICT>>>`:
+
+```
+<<<CODEYBOX_VERDICT>>>
+{"answer": true, "evidence": "src/Foo.cs L42 builds SQL via interpolation", "confidence": "high"}
+<<<END_VERDICT>>>
+```
+
+The parser is strict — missing sentinels, missing required fields (`answer`,
+`evidence`), or unparseable JSON all transition the check to `Failed` with
+`failureKind="other"`. The orchestrator never guesses a yes/no from free text.
+
+When multiple verdict blocks appear (e.g. the agent revised mid-run), the
+LAST block wins.
+
+### Outcomes
+
+| Verdict | Check state | Follow-up |
+|---|---|---|
+| `answer == actionableAnswer` | `Done` (verdict persisted) | New `Normal` work item Queued + kicked on the dispatch queue, parented to the check via `originCheckWorkItemId`. |
+| `answer != actionableAnswer` | `Done` (verdict persisted) | None. |
+| Malformed / missing verdict | `Failed` (`failureKind="other"`) | None. |
+| Agent error / sandbox failure | `Failed` (`failureKind="other"`) | None. |
+
+The verdict and the back-pointer are exposed in the work-item DTO:
+
+```jsonc
+{
+  "id": "…",
+  "jobType": "CheckAndAct",
+  "check": { "question": "…", "actionableAnswer": true, "onYes": { … } },
+  "verdict": { "answer": true, "evidence": "…", "confidence": "high" },
+  "originCheckWorkItemId": null            // set ONLY on follow-ups; null on the check itself
+}
+```
+
+A successful enqueue also publishes a `work_item.check_followup_enqueued`
+webhook event carrying the parent check ID and the new follow-up's ID.
+
+---
+
 ## Editing dependencies post-hoc
 
 `dependsOn` is editable via `PATCH /workitems/{id}` with replace-set

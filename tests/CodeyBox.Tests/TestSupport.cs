@@ -101,13 +101,14 @@ internal static class TestSupport
         AgentCostCalculator? costCalculator = null,
         string? stateDbPathOverride = null,
         IPreMergeVerifier? preMergeVerifier = null,
-        IncrementalRebaseSnapshot? incrementalRebase = null)
+        IncrementalRebaseSnapshot? incrementalRebase = null,
+        ITaskQueue? taskQueue = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
-        var queue = new InMemoryTaskQueue();
+        var queue = taskQueue ?? new InMemoryTaskQueue();
         var realGitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         // Tests that need to inject failures (e.g. SetBranchToCommitAsync throw)
         // wrap the real host. PipelineRunner sees the decorator; tests still
@@ -176,9 +177,10 @@ internal static class TestSupport
                 new GeminiQuotaFailureDetector(),
             }),
             preMergeVerifier: preMergeVerifier,
-            incrementalRebase: incrementalRebase);
+            incrementalRebase: incrementalRebase,
+            taskQueue: queue);
 
-        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot);
+        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue);
     }
 }
 
@@ -190,14 +192,16 @@ internal sealed class TestPipeline : IDisposable
     public ScriptedAgent Agent { get; }
     public LocalGitHost GitHost { get; }
     public string GitRoot { get; }
+    public ITaskQueue Queue { get; }
 
-    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot)
+    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot, ITaskQueue? queue = null)
     {
         Pipeline = pipeline;
         Store = store;
         Agent = agent;
         GitHost = gitHost;
         GitRoot = gitRoot;
+        Queue = queue ?? new InMemoryTaskQueue();
     }
 
     public void Dispose() => Store.Dispose();
@@ -281,6 +285,20 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     public List<string> ConflictReworkPrompts { get; } = new();
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
+    /// <summary>
+    /// Captured prompts the check-and-act path sent to this agent. One entry
+    /// per <see cref="CheckPlan"/> invocation. Tests use this to assert the
+    /// prompt scaffolding (sentinels, question, read-only rules) without
+    /// re-implementing the prompt builder.
+    /// </summary>
+    public List<string> CheckInvocations { get; } = new();
+    /// <summary>
+    /// Scripted check-and-act verdicts. Each entry is the raw stdout the
+    /// agent emits when the orchestrator dispatches a check prompt — should
+    /// contain the verdict sentinels + JSON between them. Dequeued in order;
+    /// running out throws.
+    /// </summary>
+    public Queue<string> CheckPlan { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
     public Func<ISandbox, string, CancellationToken, Task>? BeforeWorkAsync { get; set; }
     public int StructuredStreamSupportProbeCount { get; private set; }
@@ -464,7 +482,23 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         {
             return await HandleAgenticConflictAsync(sandbox, workingDirectory, prompt, ct);
         }
+        if (prompt.StartsWith("# Check-and-Act task", StringComparison.Ordinal))
+        {
+            return await HandleCheckAsync(prompt, stdoutChunkCallback, ct);
+        }
         return await HandleWorkAsync(sandbox, workingDirectory, ct);
+    }
+
+    private Task<AgentResult> HandleCheckAsync(
+        string prompt, Action<string>? stdoutChunkCallback, CancellationToken ct)
+    {
+        _ = ct;
+        CheckInvocations.Add(prompt);
+        if (CheckPlan.Count == 0)
+            return Task.FromResult(new AgentResult(false, "ScriptedAgent: ran out of check-plan entries", null, null));
+        var verdictStdout = CheckPlan.Dequeue();
+        stdoutChunkCallback?.Invoke(verdictStdout);
+        return Task.FromResult(new AgentResult(true, "ok", verdictStdout, null));
     }
 
     private async Task<AgentResult> HandleAgenticConflictAsync(
