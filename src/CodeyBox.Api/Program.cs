@@ -1202,6 +1202,23 @@ builder.Services.AddSingleton<INotificationProvider>(sp =>
     return new NullNotificationProvider("email");
 });
 
+// Chat provider (Slack / Discord incoming webhooks). Safe no-op when disabled
+// or when no webhooks are configured; URLs are read from env vars at send time.
+builder.Services.AddHttpClient("notifications-chat");
+builder.Services.AddSingleton<INotificationProvider>(sp =>
+{
+    var logger = sp.GetRequiredService<ILogger<ChatNotificationProvider>>();
+    Func<ChatProviderOptions> optsAccessor = () =>
+        sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>().CurrentValue.Chat;
+    var opts = optsAccessor();
+    if (opts.Enabled)
+    {
+        var httpClient = sp.GetRequiredService<IHttpClientFactory>().CreateClient("notifications-chat");
+        return new ChatNotificationProvider(optsAccessor, httpClient, logger);
+    }
+    return new NullNotificationProvider("chat");
+});
+
 // ICondition registrations — one per supported condition.
 builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
