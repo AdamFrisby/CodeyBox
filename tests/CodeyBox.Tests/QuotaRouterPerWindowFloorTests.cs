@@ -33,16 +33,16 @@ public sealed class QuotaRouterPerWindowFloorTests
     private static QuotaRouterOptions Opts(
         Dictionary<string, double>? windowFloors = null,
         double minQuotaPct = 10.0) => new()
-    {
-        MinQuotaPct = minQuotaPct,
-        MinQuotaPctByWindow = windowFloors ?? new(StringComparer.OrdinalIgnoreCase),
-        // Pin the ramp endpoints to the same value as MinQuotaPct so the
-        // ramp doesn't interfere — these tests only assert the per-window
-        // floor path; QuotaRouterRampedFloorTests covers the ramp itself.
-        StartFloorPct = minQuotaPct,
-        EndFloorPct = minQuotaPct,
-        RampWindow = TimeSpan.FromDays(7),
-    };
+        {
+            MinQuotaPct = minQuotaPct,
+            MinQuotaPctByWindow = windowFloors ?? new(StringComparer.OrdinalIgnoreCase),
+            // Pin the ramp endpoints to the same value as MinQuotaPct so the
+            // ramp doesn't interfere — these tests only assert the per-window
+            // floor path; QuotaRouterRampedFloorTests covers the ramp itself.
+            StartFloorPct = minQuotaPct,
+            EndFloorPct = minQuotaPct,
+            RampWindow = TimeSpan.FromDays(7),
+        };
 
     private static AgentClass ClaudeOnlyClass(string? modelId = null) => new()
     {
