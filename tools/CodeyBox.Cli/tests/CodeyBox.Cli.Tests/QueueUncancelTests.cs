@@ -50,4 +50,31 @@ public sealed class QueueUncancelTests
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
         }
     }
+
+    [Fact]
+    public async Task Uncancel_Quiet_PrintsOnlyState()
+    {
+        var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                "{\"id\":\"some-id\",\"state\":\"Queued\"}",
+                System.Text.Encoding.UTF8,
+                "application/json"),
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["queue", "uncancel", "some-id", "--quiet"], factory);
+
+            Assert.Equal(0, code);
+            Assert.Equal("Queued", output.Out.ToString().Trim());
+            Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
 }
