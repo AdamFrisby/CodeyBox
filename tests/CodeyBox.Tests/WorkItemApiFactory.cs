@@ -23,6 +23,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 
     public SqliteWorkItemStore Store { get; }
     public string? TemplateDirectory { get; set; }
+    public int? MaxTemplateChecks { get; set; }
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
@@ -55,7 +56,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             var tmp = Path.GetTempPath();
-            cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            var values = new Dictionary<string, string?>
             {
                 // Disable bearer-token auth so tests don't need to supply a key.
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -66,7 +67,10 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
                 ["CodeyBox:TemplateDirectory"] = TemplateDirectory,
-            });
+            };
+            if (MaxTemplateChecks is { } maxTemplateChecks)
+                values["CodeyBox:MaxTemplateChecks"] = maxTemplateChecks.ToString();
+            cfg.AddInMemoryCollection(values);
         });
         builder.ConfigureTestServices(services =>
         {

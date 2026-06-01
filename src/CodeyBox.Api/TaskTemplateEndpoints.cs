@@ -155,6 +155,15 @@ internal static class TaskTemplateEndpoints
                         available = agents.Available.Select(a => a.Value),
                     });
             }
+
+            if (entry.OnYes.Priority is { } onYesPriority)
+            {
+                var priorityError = ValidatePriority(
+                    onYesPriority,
+                    project,
+                    $"template '{template.Name}' checks[{i}].onYes.priority");
+                if (priorityError is not null) return priorityError;
+            }
         }
 
         var items = new List<WorkItem>(template.Checks.Count);
@@ -252,17 +261,17 @@ internal static class TaskTemplateEndpoints
     private const int MaxRequiredCapabilities = 16;
     private const int MaxCapabilityLength = 64;
 
-    private static IResult? ValidatePriority(int priority, Project project)
+    private static IResult? ValidatePriority(int priority, Project project, string field = "priority")
     {
         if (priority is < GlobalMinPriority or > GlobalMaxPriority)
             return Results.BadRequest(new
             {
-                error = $"priority must be between {GlobalMinPriority} and {GlobalMaxPriority}"
+                error = $"{field} must be between {GlobalMinPriority} and {GlobalMaxPriority}"
             });
         if (project.MaxPriority is { } max && priority > max)
             return Results.BadRequest(new
             {
-                error = $"priority {priority} exceeds project maxPriority {max}"
+                error = $"{field} {priority} exceeds project maxPriority {max}"
             });
         return null;
     }

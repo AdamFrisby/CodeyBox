@@ -34,10 +34,15 @@ public sealed class TaskTemplateApiTests : IDisposable
               "checks": [
                 {
                   "question": "Is user input interpolated into SQL?",
+                  "prompt": "Inspect SQL construction only.",
                   "onYes": {
                     "title": "Fix SQL injection",
                     "prompt": "Replace unsafe SQL construction with parameters.",
-                    "priority": 100
+                    "minModelScore": 70,
+                    "priority": 100,
+                    "agent": "codex",
+                    "agentClassId": "secure-class",
+                    "dependsOn": [ "ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000" ]
                   }
                 },
                 {
@@ -88,11 +93,19 @@ public sealed class TaskTemplateApiTests : IDisposable
         var byIndex = stored.ToDictionary(item => item.TemplateEntryIndex!.Value);
         Assert.Equal(0, byIndex[0].TemplateEntryIndex);
         Assert.Equal(1, byIndex[1].TemplateEntryIndex);
+        Assert.Equal("Inspect SQL construction only.", byIndex[0].Prompt);
         Assert.Equal("Is user input interpolated into SQL?", byIndex[0].Check!.Question);
         Assert.StartsWith("Check template entry 1:", byIndex[0].Title);
         Assert.True(byIndex[0].Check!.ActionableAnswer);
         Assert.Equal("Fix SQL injection", byIndex[0].Check!.OnYes.Title);
+        Assert.Equal("Replace unsafe SQL construction with parameters.", byIndex[0].Check!.OnYes.Prompt);
+        Assert.Equal(70, byIndex[0].Check!.OnYes.MinModelScore);
         Assert.Equal(100, byIndex[0].Check!.OnYes.Priority);
+        Assert.Equal("codex", byIndex[0].Check!.OnYes.Agent);
+        Assert.Equal("secure-class", byIndex[0].Check!.OnYes.AgentClassId);
+        Assert.Equal(
+            ["ticket:SEC-1", "550e8400-e29b-41d4-a716-446655440000"],
+            byIndex[0].Check!.OnYes.DependsOn);
         Assert.Equal("Check cookie attributes", byIndex[1].Title);
         Assert.False(byIndex[1].Check!.ActionableAnswer);
         Assert.NotEqual(byIndex[0].Id, byIndex[1].Id);
@@ -389,11 +402,59 @@ public sealed class TaskTemplateApiTests : IDisposable
     }
 
     [Fact]
+    public async Task QueueTemplate_OnYesPriorityAboveProjectMax_Returns400WithoutPartialEnqueue()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-followup-priority.json"), """
+            {
+              "checks": [
+                {
+                  "question": "Is the risky pattern present?",
+                  "onYes": {
+                    "title": "Fix risky pattern",
+                    "prompt": "Remove the risky pattern.",
+                    "priority": 11
+                  }
+                }
+              ]
+            }
+            """);
+        var project = new Project
+        {
+            Id = new ProjectId("limited"),
+            DisplayName = "Limited",
+            RepositoryUrl = "https://github.com/test/limited",
+            MaxPriority = 10,
+        };
+
+        using var factory = new WorkItemApiFactory(null, project) { TemplateDirectory = _templateDir };
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "bad-followup-priority",
+            projectId = "limited",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("checks[0].onYes.priority", err.GetProperty("error").GetString());
+        Assert.Contains("maxPriority", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync(factory);
+    }
+
+    [Fact]
     public async Task QueueTemplate_UnknownOnYesAgent_Returns400WithoutPartialEnqueue()
     {
         await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-agent.json"), """
             {
               "checks": [
+                {
+                  "question": "Is the first risky pattern present?",
+                  "onYes": {
+                    "title": "Fix first risky pattern",
+                    "prompt": "Remove the first risky pattern."
+                  }
+                },
                 {
                   "question": "Is the risky pattern present?",
                   "onYes": {
@@ -416,8 +477,47 @@ public sealed class TaskTemplateApiTests : IDisposable
         var err = await response.Content.ReadFromJsonAsync<JsonElement>();
         var message = err.GetProperty("error").GetString();
         Assert.Contains("unknown agent", message);
-        Assert.Contains("checks[0].onYes", message);
+        Assert.Contains("checks[1].onYes", message);
         await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_TooManyTemplateChecks_Returns400WithoutPartialEnqueue()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "too-big.json"), """
+            {
+              "checks": [
+                {
+                  "question": "Is the first risky pattern present?",
+                  "onYes": {
+                    "title": "Fix first risky pattern",
+                    "prompt": "Remove the first risky pattern."
+                  }
+                },
+                {
+                  "question": "Is the second risky pattern present?",
+                  "onYes": {
+                    "title": "Fix second risky pattern",
+                    "prompt": "Remove the second risky pattern."
+                  }
+                }
+              ]
+            }
+            """);
+
+        using var factory = new WorkItemApiFactory { TemplateDirectory = _templateDir, MaxTemplateChecks = 1 };
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "too-big",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("at most 1", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync(factory);
     }
 
     [Fact]

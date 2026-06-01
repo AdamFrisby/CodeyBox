@@ -135,6 +135,40 @@ public sealed class TaskTemplateRegistryTests : IDisposable
     }
 
     [Theory]
+    [MemberData(nameof(InvalidTemplateRefCases))]
+    public async Task LoadAsync_InvalidTemplateReferences_AreRejected(string templateRef, string expectedMessage)
+    {
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var ex = await Assert.ThrowsAsync<TaskTemplateLoadException>(() => registry.LoadAsync(templateRef));
+
+        Assert.Contains(expectedMessage, ex.Message);
+    }
+
+    [Fact]
+    public async Task LoadAsync_TooManyChecks_ThrowsClearError()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "large.json"), """
+            {
+              "checks": [
+                {
+                  "question": "Is logging missing?",
+                  "onYes": { "title": "Add logging", "prompt": "Add useful logs." }
+                },
+                {
+                  "question": "Is tracing missing?",
+                  "onYes": { "title": "Add tracing", "prompt": "Add useful traces." }
+                }
+              ]
+            }
+            """);
+
+        var registry = new FileTaskTemplateRegistry(_templateDir, maxCheckCount: 1);
+        var ex = await Assert.ThrowsAsync<TaskTemplateLoadException>(() => registry.LoadAsync("large"));
+
+        Assert.Contains("at most 1", ex.Message);
+    }
+
+    [Theory]
     [MemberData(nameof(InvalidTemplateCases))]
     public async Task LoadAsync_InvalidTemplateBranches_ThrowClearErrors(string json, string expectedMessage)
     {
@@ -198,6 +232,18 @@ public sealed class TaskTemplateRegistryTests : IDisposable
             "{\"question\":\"q\",\"prompt\":" + JsonString(new string('p', 64 * 1024 + 1)) +
             ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
             ".prompt must be <= 64KB");
+    }
+
+    public static IEnumerable<object[]> InvalidTemplateRefCases()
+    {
+        var root = Path.GetPathRoot(Environment.CurrentDirectory) ?? Path.DirectorySeparatorChar.ToString();
+        yield return new object[] { "", "template name is required" };
+        yield return new object[] { "   ", "template name is required" };
+        yield return new object[] { Path.Combine(root, "outside-template"), "relative to the templates directory" };
+        yield return new object[] { "templates/", "template name is required" };
+        yield return new object[] { "templates/.json", "template name is required" };
+        yield return new object[] { "security//extra", "empty, '.', or '..' path segments" };
+        yield return new object[] { "security/./extra", "empty, '.', or '..' path segments" };
     }
 
     private static object[] Case(string json, string expectedMessage) => [json, expectedMessage];

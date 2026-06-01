@@ -56,21 +56,28 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
     };
 
     private readonly Func<string> _rootFactory;
+    private readonly Func<int> _maxCheckCountFactory;
 
     public FileTaskTemplateRegistry(IOptionsMonitor<CodeyBoxOptions> options, IHostEnvironment env)
-        : this(() => ResolveRoot(options.CurrentValue.TemplateDirectory, env.ContentRootPath)) { }
+        : this(
+            () => ResolveRoot(options.CurrentValue.TemplateDirectory, env.ContentRootPath),
+            () => options.CurrentValue.MaxTemplateChecks) { }
 
-    internal FileTaskTemplateRegistry(string templateDirectory)
-        : this(() => Path.GetFullPath(templateDirectory)) { }
+    internal FileTaskTemplateRegistry(
+        string templateDirectory,
+        int maxCheckCount = CodeyBoxOptions.DefaultMaxTemplateChecks)
+        : this(() => Path.GetFullPath(templateDirectory), () => maxCheckCount) { }
 
-    private FileTaskTemplateRegistry(Func<string> rootFactory)
+    private FileTaskTemplateRegistry(Func<string> rootFactory, Func<int> maxCheckCountFactory)
     {
         _rootFactory = rootFactory;
+        _maxCheckCountFactory = maxCheckCountFactory;
     }
 
     public async Task<IReadOnlyList<TaskTemplateSummary>> ListAsync(CancellationToken ct = default)
     {
         var root = _rootFactory();
+        var maxCheckCount = _maxCheckCountFactory();
         if (!Directory.Exists(root))
             return [];
 
@@ -81,7 +88,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
             var name = Path.GetFileNameWithoutExtension(path);
             try
             {
-                var template = await LoadFromPathAsync(name, path, ct);
+                var template = await LoadFromPathAsync(name, path, maxCheckCount, ct);
                 summaries.Add(new TaskTemplateSummary(name, RelativeDisplayPath(root, path), template.Checks.Count));
             }
             catch (TaskTemplateLoadException ex)
@@ -96,12 +103,13 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
     public async Task<TaskTemplateDefinition> LoadAsync(string templateRef, CancellationToken ct = default)
     {
         var root = _rootFactory();
+        var maxCheckCount = _maxCheckCountFactory();
         var (name, path) = ResolveTemplatePath(root, templateRef);
         if (!File.Exists(path))
             throw new TaskTemplateNotFoundException(
                 $"template '{templateRef}' was not found under '{root}'");
 
-        return await LoadFromPathAsync(name, path, ct);
+        return await LoadFromPathAsync(name, path, maxCheckCount, ct);
     }
 
     private static string ResolveRoot(string? configured, string contentRootPath)
@@ -144,6 +152,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
     private static async Task<TaskTemplateDefinition> LoadFromPathAsync(
         string name,
         string path,
+        int maxCheckCount,
         CancellationToken ct)
     {
         JsonDocument doc;
@@ -182,6 +191,10 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
             var index = 0;
             foreach (var element in checksElement.EnumerateArray())
             {
+                if (checks.Count >= maxCheckCount)
+                    throw new TaskTemplateLoadException(
+                        $"template '{name}' checks must contain at most {maxCheckCount} entries");
+
                 TaskTemplateCheck? check;
                 try
                 {

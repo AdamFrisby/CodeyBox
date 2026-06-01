@@ -2572,7 +2572,7 @@ namespace CodeyBox.Api
     /// <item><b>Hot-reloadable</b> fields are read fresh from
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
-    ///   <c>TemplateDirectory</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
+    ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
     ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>SandboxLeak</c> (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
@@ -2599,6 +2599,9 @@ namespace CodeyBox.Api
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string TemplateDirectory { get; set; } = "templates";
+        public const int DefaultMaxTemplateChecks = 100;
+        public const int MaximumMaxTemplateChecks = 1000;
+        public int MaxTemplateChecks { get; set; } = DefaultMaxTemplateChecks;
         public string SandboxImageReference { get; set; } = "";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
         public string[] AuditToolAllowedHosts { get; set; } =

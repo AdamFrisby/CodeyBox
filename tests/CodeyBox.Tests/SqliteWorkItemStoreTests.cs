@@ -209,6 +209,36 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task TemplateProvenance_SurvivesStateUpdates()
+    {
+        var item = Sample() with
+        {
+            TemplateName = "security",
+            TemplateEntryIndex = 2,
+        };
+        await _store.CreateAsync(item);
+
+        await _store.UpdateAsync(item.With(WorkItemState.Working));
+
+        var afterUpdate = await _store.GetAsync(item.Id);
+        Assert.NotNull(afterUpdate);
+        Assert.Equal(WorkItemState.Working, afterUpdate!.State);
+        Assert.Equal("security", afterUpdate.TemplateName);
+        Assert.Equal(2, afterUpdate.TemplateEntryIndex);
+
+        var updated = await _store.TryUpdateIfStateAsync(
+            afterUpdate.With(WorkItemState.Done),
+            WorkItemState.Working);
+        Assert.True(updated);
+
+        var afterConditionalUpdate = await _store.GetAsync(item.Id);
+        Assert.NotNull(afterConditionalUpdate);
+        Assert.Equal(WorkItemState.Done, afterConditionalUpdate!.State);
+        Assert.Equal("security", afterConditionalUpdate.TemplateName);
+        Assert.Equal(2, afterConditionalUpdate.TemplateEntryIndex);
+    }
+
+    [Fact]
     public async Task RoundTrip_NormalItem_DefaultsToJobTypeNormal_NoCheckOrVerdict()
     {
         // The migration defaults legacy / new-row job_type to 'Normal' and the
