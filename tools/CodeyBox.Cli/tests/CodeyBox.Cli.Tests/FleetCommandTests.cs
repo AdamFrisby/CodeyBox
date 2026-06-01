@@ -58,6 +58,12 @@ public sealed class FleetCommandTests
             Assert.Contains("proj-alpha", stdout);
             Assert.Contains("Alpha Project", stdout);
             Assert.Contains("Working", stdout);
+            Assert.Contains("false", stdout);
+            Assert.Contains("true", stdout);
+            Assert.Contains("12.34", stdout);
+            Assert.Contains("BUDGET_STATE", stdout);
+            Assert.Contains("ok", stdout);
+            Assert.Contains("Done,Failed", stdout);
             Assert.Empty(output.Error.ToString());
         }
         finally
@@ -70,7 +76,12 @@ public sealed class FleetCommandTests
     public async Task Fleet_Json_PrintsRawResponse()
     {
         const string responseBody = """[{"projectId":"proj-alpha"}]""";
-        var factory = MakeFactory(_ => JsonResponse(responseBody));
+        HttpRequestMessage? captured = null;
+        var factory = MakeFactory(req =>
+        {
+            captured = req;
+            return JsonResponse(responseBody);
+        });
 
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
         using var output = new TestOutput();
@@ -79,8 +90,33 @@ public sealed class FleetCommandTests
             var code = await CliApp.InvokeAsync(["fleet", "--json"], factory);
 
             Assert.Equal(0, code);
+            Assert.NotNull(captured);
+            Assert.Equal(HttpMethod.Get, captured.Method);
+            Assert.EndsWith("/fleet/summary", captured.RequestUri!.ToString());
             Assert.Equal(responseBody, output.Out.ToString().Trim());
             Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Fleet_HumanReadable_NonArrayResponse_WritesParsingError()
+    {
+        var factory = MakeFactory(_ => JsonResponse("""{"projectId":"proj-alpha"}"""));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["fleet"], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Error parsing response", output.Error.ToString());
+            Assert.Contains("Expected top-level JSON array", output.Error.ToString());
         }
         finally
         {

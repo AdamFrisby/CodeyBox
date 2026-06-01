@@ -63,7 +63,12 @@ public sealed class WorkersCommandTests
     public async Task Workers_Json_PrintsRawResponse()
     {
         const string responseBody = """[{"workerId":"worker-0001"}]""";
-        var factory = MakeFactory(_ => JsonResponse(responseBody));
+        HttpRequestMessage? captured = null;
+        var factory = MakeFactory(req =>
+        {
+            captured = req;
+            return JsonResponse(responseBody);
+        });
 
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
         using var output = new TestOutput();
@@ -72,8 +77,33 @@ public sealed class WorkersCommandTests
             var code = await CliApp.InvokeAsync(["workers", "--json"], factory);
 
             Assert.Equal(0, code);
+            Assert.NotNull(captured);
+            Assert.Equal(HttpMethod.Get, captured.Method);
+            Assert.EndsWith("/workers", captured.RequestUri!.ToString());
             Assert.Equal(responseBody, output.Out.ToString().Trim());
             Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Workers_HumanReadable_NonArrayResponse_WritesParsingError()
+    {
+        var factory = MakeFactory(_ => JsonResponse("""{"workerId":"worker-0001"}"""));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["workers"], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Error parsing response", output.Error.ToString());
+            Assert.Contains("Expected top-level JSON array", output.Error.ToString());
         }
         finally
         {
@@ -126,7 +156,12 @@ public sealed class WorkersCommandTests
     public async Task WorkersStatus_Json_PrintsRawResponse()
     {
         const string responseBody = """{"maxConcurrent":4,"currentlyRunning":2}""";
-        var factory = MakeFactory(_ => JsonResponse(responseBody));
+        HttpRequestMessage? captured = null;
+        var factory = MakeFactory(req =>
+        {
+            captured = req;
+            return JsonResponse(responseBody);
+        });
 
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
         using var output = new TestOutput();
@@ -135,8 +170,33 @@ public sealed class WorkersCommandTests
             var code = await CliApp.InvokeAsync(["workers", "status", "--json"], factory);
 
             Assert.Equal(0, code);
+            Assert.NotNull(captured);
+            Assert.Equal(HttpMethod.Get, captured.Method);
+            Assert.EndsWith("/workers/status", captured.RequestUri!.ToString());
             Assert.Equal(responseBody, output.Out.ToString().Trim());
             Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task WorkersStatus_HumanReadable_NonObjectResponse_WritesParsingError()
+    {
+        var factory = MakeFactory(_ => JsonResponse("""[{"maxConcurrent":4}]"""));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["workers", "status"], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Error parsing response", output.Error.ToString());
+            Assert.Contains("Expected top-level JSON object", output.Error.ToString());
         }
         finally
         {

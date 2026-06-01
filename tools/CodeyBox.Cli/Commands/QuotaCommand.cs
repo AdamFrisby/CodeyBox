@@ -33,6 +33,8 @@ internal static class QuotaCommand
         if (root.ValueKind != JsonValueKind.Object)
             throw new JsonException("Expected top-level JSON object.");
 
+        var observedWindow = DisplayHelpers.Field(root, "observedFailureWindowMinutes");
+
         DisplayHelpers.PrintTable(
             [
                 new("METRIC", 30),
@@ -42,7 +44,7 @@ internal static class QuotaCommand
                 ["Generated", DisplayHelpers.Field(root, "generatedAt")],
                 ["Min quota", DisplayHelpers.Percent(root, "minQuotaPct")],
                 ["Unknown policy", DisplayHelpers.Field(root, "unknownPolicy")],
-                ["Observed failure window", DisplayHelpers.Field(root, "observedFailureWindowMinutes") + "m"],
+                ["Observed failure window", string.IsNullOrEmpty(observedWindow) ? "" : observedWindow + "m"],
                 ["Budgets error", DisplayHelpers.Field(root, "budgetsError")],
             ]);
 

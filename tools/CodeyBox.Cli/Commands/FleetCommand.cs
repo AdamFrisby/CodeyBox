@@ -43,7 +43,7 @@ internal static class FleetCommand
                 new("PAUSED", 6),
                 new("FAILURES", 8),
                 new("SPEND", 10),
-                new("BUDGET", 10),
+                new("BUDGET_STATE", 12),
                 new("RECENT", 24),
             ],
             root.EnumerateArray().Select<JsonElement, IReadOnlyList<string?>>(project =>
@@ -55,7 +55,7 @@ internal static class FleetCommand
                 DisplayHelpers.Field(project, "currentPhase"),
                 DisplayHelpers.Field(project, "isPaused"),
                 DisplayHelpers.Field(project, "hasRecentFailures"),
-                DisplayHelpers.Field(project, "monthlySpendUsd"),
+                DisplayHelpers.Decimal(project, "monthlySpendUsd"),
                 DisplayHelpers.Field(project, "budgetThresholdState"),
                 DisplayHelpers.JoinArray(project, "recentOutcomes"),
             ]));

@@ -98,28 +98,14 @@ internal static class QueueList
 
         foreach (var item in items)
         {
-            var id = Truncate(Sanitize(item.ShortId) + "...", idW);
-            var state = Truncate(Sanitize(item.State), stateW);
-            var agent = Truncate(Sanitize(item.Agent), agentW);
-            var proj = Truncate(Sanitize(item.ProjectId), projW);
-            var title = Truncate(Sanitize(item.Title), titleW);
-            var upd = Truncate(Sanitize(item.RelativeAge), updW);
+            var id = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.ShortId) + "...", idW);
+            var state = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.State), stateW);
+            var agent = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.Agent), agentW);
+            var proj = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.ProjectId), projW);
+            var title = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.Title), titleW);
+            var upd = DisplayHelpers.Truncate(DisplayHelpers.Sanitize(item.RelativeAge), updW);
 
             Console.WriteLine($"{id,-idW}  {state,-stateW}  {agent,-agentW}  {proj,-projW}  {title,-titleW}  {upd,-updW}");
         }
-    }
-
-    private static string Truncate(string s, int maxLen) =>
-        s.Length <= maxLen ? s : s[..(maxLen - 1)] + "…";
-
-    // Strip control characters to prevent ANSI injection from server-returned strings.
-    private static string Sanitize(string? s)
-    {
-        if (string.IsNullOrEmpty(s)) return s ?? "";
-        Span<char> buf = stackalloc char[s.Length];
-        int pos = 0;
-        foreach (var c in s)
-            if (c >= ' ') buf[pos++] = c;
-        return new string(buf[..pos]);
     }
 }

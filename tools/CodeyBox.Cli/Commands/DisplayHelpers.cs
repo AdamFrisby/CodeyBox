@@ -55,6 +55,7 @@ internal static class DisplayHelpers
 
     internal static string Percent(double value)
     {
+        // Backend uses -1 to signal unknown availability.
         if (value < 0)
             return "unknown";
 
@@ -136,7 +137,10 @@ internal static class DisplayHelpers
         if (string.IsNullOrEmpty(s))
             return s ?? "";
 
-        Span<char> buf = stackalloc char[s.Length];
+        const int MaxStackallocChars = 1024;
+        Span<char> buf = s.Length <= MaxStackallocChars
+            ? stackalloc char[s.Length]
+            : new char[s.Length];
         int pos = 0;
         foreach (var c in s)
         {

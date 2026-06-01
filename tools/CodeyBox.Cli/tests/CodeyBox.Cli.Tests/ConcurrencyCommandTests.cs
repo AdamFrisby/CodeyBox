@@ -68,7 +68,11 @@ public sealed class ConcurrencyCommandTests
             var stdout = output.Out.ToString();
             Assert.Contains("Global max concurrent", stdout);
             Assert.Contains("codex", stdout);
+            Assert.Matches(@"(?m)^codex\s+1\s+1\s+", stdout);
+            Assert.Matches(@"(?m)^claude\s+2\s+0\s+true\s+smoke failed", stdout);
             Assert.Contains("default", stdout);
+            Assert.Contains("90%", stdout);
+            Assert.Matches(@"(?m)^default\s+codex\s+gpt-5\s+80%\s+10%\s+8\s+1", stdout);
             Assert.Contains("smoke failed", stdout);
             Assert.Empty(output.Error.ToString());
         }
@@ -82,7 +86,12 @@ public sealed class ConcurrencyCommandTests
     public async Task Concurrency_Json_PrintsRawResponse()
     {
         const string responseBody = """{"globalMaxConcurrent":4,"currentlyRunningTotal":1}""";
-        var factory = MakeFactory(_ => JsonResponse(responseBody));
+        HttpRequestMessage? captured = null;
+        var factory = MakeFactory(req =>
+        {
+            captured = req;
+            return JsonResponse(responseBody);
+        });
 
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
         using var output = new TestOutput();
@@ -91,8 +100,33 @@ public sealed class ConcurrencyCommandTests
             var code = await CliApp.InvokeAsync(["concurrency", "--json"], factory);
 
             Assert.Equal(0, code);
+            Assert.NotNull(captured);
+            Assert.Equal(HttpMethod.Get, captured.Method);
+            Assert.EndsWith("/concurrency", captured.RequestUri!.ToString());
             Assert.Equal(responseBody, output.Out.ToString().Trim());
             Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Concurrency_HumanReadable_NonObjectResponse_WritesParsingError()
+    {
+        var factory = MakeFactory(_ => JsonResponse("""[]"""));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["concurrency"], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Error parsing response", output.Error.ToString());
+            Assert.Contains("Expected top-level JSON object", output.Error.ToString());
         }
         finally
         {
