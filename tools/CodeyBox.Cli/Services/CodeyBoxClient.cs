@@ -122,9 +122,32 @@ internal sealed class CodeyBoxClient
 
     internal async Task<string> GetQueueStatusAsync(CancellationToken ct = default)
     {
-        var resp = await _http.GetAsync("/queue/status", ct);
-        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
-        return await resp.Content.ReadAsStringAsync(ct);
+        return await GetRawAsync("/queue/status", ct);
+    }
+
+    internal async Task<string> GetWorkersAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/workers", ct);
+    }
+
+    internal async Task<string> GetWorkerStatusAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/workers/status", ct);
+    }
+
+    internal async Task<string> GetQuotaAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/quota", ct);
+    }
+
+    internal async Task<string> GetConcurrencyAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/concurrency", ct);
+    }
+
+    internal async Task<string> GetFleetSummaryAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/fleet/summary", ct);
     }
 
     internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
@@ -135,5 +158,12 @@ internal sealed class CodeyBoxClient
             CliJsonContext.Default.ReorderRequest,
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    private async Task<string> GetRawAsync(string path, CancellationToken ct)
+    {
+        var resp = await _http.GetAsync(path, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
     }
 }
