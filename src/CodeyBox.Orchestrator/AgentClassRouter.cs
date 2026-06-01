@@ -405,7 +405,7 @@ public sealed class AgentClassRouter
 
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var gate = await EvaluateGateAsync(member, item.ProjectId, quota.AvailablePct, quota.ResetAt, nowUtc, ct);
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -792,11 +792,13 @@ public sealed class AgentClassRouter
     private async Task<QuotaGateDecision> EvaluateGateAsync(
         AgentMembership member,
         ProjectId projectId,
-        double availablePct,
-        DateTimeOffset? resetAt,
+        EffectiveQuota quota,
         DateTimeOffset nowUtc,
         CancellationToken ct)
     {
+        var availablePct = quota.AvailablePct;
+        var resetAt = quota.ResetAt;
+
         // The time-based ramp is only meaningful for Subscription members:
         // their AvailablePct is driven by the agent's quota window, and
         // <paramref name="resetAt"/> is that window's reset. PayPerApi has
@@ -810,6 +812,28 @@ public sealed class AgentClassRouter
             : _opts.MinQuotaPct;
         if (availablePct >= floor)
         {
+            // Per-window floor check sits alongside the aggregated/time-ramp
+            // floor: a small window (e.g. claude five_hour) can be the binding
+            // constraint during a burst even when the aggregated reading is
+            // healthy, because 10 % of a 5 h window is thin headroom relative
+            // to MaxConcurrent + cache-staleness overshoot. Only applies to
+            // Subscription members — PayPerApi has no provider window concept.
+            if (member.Billing == AgentBilling.Subscription
+                && quota.Windows is { Count: > 0 } windows)
+            {
+                foreach (var w in windows)
+                {
+                    if (w.AvailablePct < 0) continue; // unknown — gated by aggregated check above
+                    var windowFloor = ResolveWindowFloorPct(w.Name);
+                    if (w.AvailablePct < windowFloor)
+                    {
+                        return new QuotaGateDecision(
+                            false,
+                            $"quota below window floor ({w.Name}: {w.AvailablePct:F1}% < {windowFloor:F1}%)");
+                    }
+                }
+            }
+
             var rateAware = await EvaluateRateAwareGateAsync(member, availablePct, ct);
             return rateAware ?? new QuotaGateDecision(true, "quota available");
         }
@@ -823,6 +847,22 @@ public sealed class AgentClassRouter
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    /// <summary>
+    /// Returns the absolute floor for one provider window name (e.g. <c>five_hour</c>).
+    /// Looks up <see cref="QuotaRouterOptions.MinQuotaPctByWindow"/>; falls
+    /// back to <see cref="QuotaRouterOptions.MinQuotaPct"/> when the window is
+    /// not listed. Case-insensitive match because providers vary on snake_case
+    /// vs <c>5h-rolling</c> style names.
+    /// </summary>
+    internal double ResolveWindowFloorPct(string windowName)
+    {
+        if (string.IsNullOrEmpty(windowName)) return _opts.MinQuotaPct;
+        if (_opts.MinQuotaPctByWindow is { } overrides
+            && overrides.TryGetValue(windowName, out var perWindow))
+            return perWindow;
+        return _opts.MinQuotaPct;
     }
 
     /// <summary>
@@ -1013,10 +1053,12 @@ public sealed class AgentClassRouter
     internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
     {
         if (string.IsNullOrWhiteSpace(member.ModelId))
-            return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);
+            return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows);
 
         if (snapshot.PerModel.TryGetValue(member.ModelId, out var modelQuota))
-            return new EffectiveQuota(modelQuota.AvailablePct, modelQuota.ResetAt, modelQuota.Window);
+            return new EffectiveQuota(
+                modelQuota.AvailablePct, modelQuota.ResetAt, modelQuota.Window,
+                modelQuota.Windows.Count > 0 ? modelQuota.Windows : snapshot.Windows);
 
         // ModelId is set but not in PerModel.
         //
@@ -1040,7 +1082,7 @@ public sealed class AgentClassRouter
                 if (q.ResetAt is { } r && (earliestReset is null || r < earliestReset))
                     earliestReset = r;
             }
-            return new EffectiveQuota(best!.AvailablePct, earliestReset, best.Window);
+            return new EffectiveQuota(best!.AvailablePct, earliestReset, best.Window, snapshot.Windows);
         }
 
         // Unknown model id on a probe that DOES provide per-model data — the operator
@@ -1052,7 +1094,7 @@ public sealed class AgentClassRouter
 
         // Probe returned no per-model breakdown at all (e.g. NullQuotaProbe, or a
         // provider whose API has no per-model dimension). Fall back to overall.
-        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null);
+        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows);
     }
 
     /// <summary>
@@ -1154,7 +1196,11 @@ public sealed class AgentClassRouter
         EffectiveQuota Quota, bool BudgetExhausted, DateTimeOffset? BudgetReset);
 }
 
-public sealed record EffectiveQuota(double AvailablePct, DateTimeOffset? ResetAt, string? Window);
+public sealed record EffectiveQuota(
+    double AvailablePct,
+    DateTimeOffset? ResetAt,
+    string? Window,
+    IReadOnlyList<WindowQuota>? Windows = null);
 
 /// <summary>
 /// Snapshot of the router's rate-aware view for one class member, surfaced via
@@ -1277,6 +1323,27 @@ public sealed class QuotaRouterOptions
     /// </para>
     /// </summary>
     public double MinQuotaPct { get; set; } = 10.0;
+
+    /// <summary>
+    /// Per-window absolute floors, keyed by <see cref="WindowQuota.Name"/>
+    /// (e.g. <c>five_hour</c>, <c>seven_day</c>). When a snapshot surfaces
+    /// per-window readings, dispatch requires EVERY window's
+    /// <see cref="WindowQuota.AvailablePct"/> to be at or above its window's
+    /// floor; an unlisted window falls back to <see cref="MinQuotaPct"/>.
+    /// Sits alongside (not under) the time-ramped floor computed in
+    /// <see cref="AgentClassRouter.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>:
+    /// the ramp governs the aggregated min-across-windows reading, while this
+    /// map governs each window independently so a small window like
+    /// <c>five_hour</c> can hold more headroom than its share of the aggregate
+    /// would imply. The 5h window has a far smaller absolute budget than 7d,
+    /// so 10% of 5h is thin headroom under bursty dispatch (MaxConcurrent + the
+    /// 60 s cache TTL of in-flight overshoot) where 10% of 7d is large; the
+    /// 5h floor should cover that overshoot — default ~25% for MaxConcurrent=4
+    /// (see <c>QuotaRouterConfig.MinQuotaPctByWindow</c> for the bound defaults).
+    /// Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, double> MinQuotaPctByWindow { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Early-window floor for the time-based ramp: the effective minimum

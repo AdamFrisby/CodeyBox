@@ -10,6 +10,31 @@ The router checks all three before dispatching a subscription-billed class
 member, taking `MIN(real probe AvailablePct, local budget AvailablePct)`.
 Pay-per-API members are not quota-gated.
 
+## Per-Window Floors
+
+`AvailablePct` is the MIN across the provider's windows (e.g. claude's
+`five_hour` + `seven_day`). A single overall `MinQuotaPct` applied to the
+min treats 10% of the much smaller `five_hour` window the same as 10% of
+the `seven_day` window — but a 5-hour budget has far less absolute headroom
+for in-flight + cache-staleness overshoot during a burst (up to
+`MaxConcurrent` dispatched runs already burning + new dispatches inside
+`QuotaCacheTtlSeconds`). To stop that overshoot from blowing through the
+small window, the gate also enforces a per-window floor: dispatch requires
+EVERY window's `AvailablePct` to be at or above its own configured floor,
+using the per-window readings the probe surfaces in
+`AgentQuotaSnapshot.Windows` / `PerModel[].Windows`. Any window below its
+floor blocks dispatch; an unlisted window falls back to `MinQuotaPct`.
+
+Floors are configured via `CodeyBox:QuotaRouter:MinQuotaPctByWindow`,
+keyed by provider window name (e.g. `five_hour`, `seven_day`). Default
+`{"five_hour": 25}` for `MaxConcurrent=4` — tune up for higher fleet
+concurrency. Hot-reloadable.
+
+Per-window floors and the time-based ramp are orthogonal: the ramp
+controls the aggregated min-across-windows reading over time, while the
+per-window map gates each window independently regardless of where in the
+ramp the window happens to be.
+
 ## Time-Based Floor Ramp
 
 The gate's minimum-available-quota floor is a linear ramp from
