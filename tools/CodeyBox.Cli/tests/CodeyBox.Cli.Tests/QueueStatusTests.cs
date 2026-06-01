@@ -140,6 +140,30 @@ public sealed class QueueStatusTests
     }
 
     [Fact]
+    public async Task Status_NonJsonResponse_WritesErrorToStderrNonZeroExit()
+    {
+        var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("not valid json"),
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["queue", "status"], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Error parsing response", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
     public async Task Status_NetworkFailure_WritesToStderrNonZeroExit()
     {
         Func<ResolvedConfig, CodeyBoxClient> factory = config => new CodeyBoxClient(

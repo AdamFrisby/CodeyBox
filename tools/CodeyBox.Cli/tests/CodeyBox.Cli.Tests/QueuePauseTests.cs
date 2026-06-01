@@ -35,7 +35,10 @@ public sealed class QueuePauseTests
                 factory);
 
             Assert.Equal(0, code);
-            Assert.NotNull(captured!.Content);
+            Assert.NotNull(captured);
+            Assert.Equal(HttpMethod.Post, captured.Method);
+            Assert.Contains("/queue/pause", captured.RequestUri!.ToString());
+            Assert.NotNull(captured.Content);
             var body = await captured.Content.ReadFromJsonAsync(CliJsonContext.Default.PauseQueueRequest);
             Assert.Equal("maintenance window", body!.Reason);
             Assert.Contains("Queue paused", output.Out.ToString());
