@@ -311,6 +311,80 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RoundTrip_ReCheckVerdicts_OrderedHistoryPreserved()
+    {
+        // The post-act re-validation loop appends one CheckVerdict per
+        // iteration to ReCheckVerdicts. Pin: ordering is preserved (the
+        // first entry is the initial post-act re-check, subsequent entries
+        // are after each rework), AND each verdict's fields round-trip
+        // intact (Answer + Evidence + optional Confidence).
+        var history = new List<CheckVerdict>
+        {
+            new() { Answer = true,  Evidence = "iter1 still vulnerable", Confidence = "high" },
+            new() { Answer = true,  Evidence = "iter2 still vulnerable", Confidence = "medium" },
+            new() { Answer = false, Evidence = "iter3 clean", Confidence = "high" },
+        };
+        var item = Sample() with
+        {
+            OriginCheckWorkItemId = WorkItemId.New(),
+            ReCheckVerdicts = history,
+        };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(3, read!.ReCheckVerdicts.Count);
+        Assert.True(read.ReCheckVerdicts[0].Answer);
+        Assert.True(read.ReCheckVerdicts[1].Answer);
+        Assert.False(read.ReCheckVerdicts[2].Answer);
+        Assert.Equal("iter1 still vulnerable", read.ReCheckVerdicts[0].Evidence);
+        Assert.Equal("iter2 still vulnerable", read.ReCheckVerdicts[1].Evidence);
+        Assert.Equal("iter3 clean", read.ReCheckVerdicts[2].Evidence);
+        Assert.Equal("high", read.ReCheckVerdicts[0].Confidence);
+        Assert.Equal("medium", read.ReCheckVerdicts[1].Confidence);
+    }
+
+    [Fact]
+    public async Task RoundTrip_NoReCheckVerdicts_ReadsAsEmpty()
+    {
+        // Default for new rows: empty history (never re-validated). Stored
+        // as '[]' per the migration default; reads must surface as an
+        // empty IReadOnlyList<CheckVerdict>, never as null.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.NotNull(read!.ReCheckVerdicts);
+        Assert.Empty(read.ReCheckVerdicts);
+    }
+
+    [Fact]
+    public async Task ReadRow_CorruptReCheckVerdictsJson_ReadsAsEmpty()
+    {
+        // Corruption-tolerant: a poisoned re-check history shouldn't
+        // strand the work item. Reads return empty (the next re-validation
+        // iteration appends a fresh entry), matching the documented
+        // behaviour of ReadReCheckVerdicts.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET re_check_verdicts_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "not-json");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Empty(read!.ReCheckVerdicts);
+    }
+
+    [Fact]
     public async Task ReadRow_CorruptRequiredCapabilitiesJson_FailsClosed()
     {
         // Persist normally, then poison the column directly via raw SQLite.

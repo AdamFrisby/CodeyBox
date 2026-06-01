@@ -580,6 +580,25 @@ public sealed class PipelineRunner : IPipelineRunner
                 item = item with { PreemptedAt = null, PreemptCheckpoint = null };
             }
 
+            // -------- Phase 1.6: Post-act re-validation (check-and-act follow-ups) --------
+            // For items that were enqueued as the on-yes follow-up of a CheckAndAct
+            // (OriginCheckWorkItemId set), re-run the originating check's question
+            // against the now-modified repo BEFORE the merge phase. If the re-check
+            // still returns the actionable answer the remediation did not satisfy
+            // the check — the agent gets sent back to rework with the failing
+            // verdict as feedback, bounded by the existing rework/iteration cap.
+            // Skipped when resuming past merge (re-validation already happened on
+            // the first pass) and for items not produced by a check.
+            if (!skipMerge && item.OriginCheckWorkItemId is not null)
+            {
+                await RunPostActRevalidationLoopAsync(
+                    item, project, agentRunner, repoId, baseBranch, workBranch, ct, hostShutdownToken);
+                // RunPostActRevalidationLoopAsync mutates the item via the store on each
+                // verdict. Refresh the in-memory snapshot so the downstream merge / PR
+                // open phases see the updated ReCheckVerdicts list.
+                item = await _store.GetAsync(item.Id, ct) ?? item;
+            }
+
             // Open PR record (local metadata) AFTER the audit converges.
             // Skip if we're resuming past merge — merge is the only consumer.
             PullRequest? pr = null;
@@ -2483,6 +2502,269 @@ public sealed class PipelineRunner : IPipelineRunner
             // silently drop — see method docstring for rationale.
         }
         return ids;
+    }
+
+    /// <summary>
+    /// Post-act re-validation gate for items that were enqueued as the on-yes
+    /// follow-up of a CheckAndAct (see <see cref="WorkItem.OriginCheckWorkItemId"/>).
+    /// Re-runs the originating check's yes/no question against the modified repo
+    /// after the act has been applied, using the same in-VM execution path as
+    /// the original check (sandbox clone + <see cref="CheckAndActPipeline.BuildPrompt"/>
+    /// + <see cref="CheckAndActPipeline.TryParseVerdict"/>). Each iteration's
+    /// verdict is appended to <see cref="WorkItem.ReCheckVerdicts"/> for the
+    /// timeline; non-actionable result accepts the remediation and returns,
+    /// actionable result reworks the agent with the failing verdict as
+    /// feedback and re-validates again. Bounded by
+    /// <see cref="ProjectAudit.MaxIterations"/> — the same cap that bounds the
+    /// audit/rework loop, reused per the CONFIG-OVER-HARDCODING posture so the
+    /// re-check question/condition are read from the originating check item's
+    /// stored <see cref="CheckAndActSpec"/> rather than baked into a new path.
+    /// Throws when the cap is exhausted while the re-check still reports the
+    /// actionable condition; the outer pipeline catch transitions the item to
+    /// Failed with a "remediation did not satisfy the check after N attempts"
+    /// reason so the operator can re-scope.
+    /// </summary>
+    private async Task RunPostActRevalidationLoopAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner agentRunner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        if (item.OriginCheckWorkItemId is null) return;
+        var originCheckId = item.OriginCheckWorkItemId.Value;
+
+        // CONFIG-OVER-HARDCODING: the re-check question / actionable answer
+        // come from the originating check item, not a new hardcoded copy.
+        var originCheck = await _store.GetAsync(originCheckId, ct);
+        if (originCheck is null || originCheck.Check is null)
+        {
+            _log.LogWarning(
+                "Work item {Id} originating check {OriginId} missing or has no spec; skipping post-act re-validation",
+                item.Id, originCheckId);
+            return;
+        }
+        var checkSpec = originCheck.Check;
+        var maxIterations = Math.Max(1, project.Audit.MaxIterations);
+
+        for (var iteration = 1; iteration <= maxIterations; iteration++)
+        {
+            if (hostShutdownToken.IsCancellationRequested)
+                throw new OperationCanceledException(hostShutdownToken);
+
+            var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
+            var stdout = await RunPostActReCheckAgentAsync(
+                item, project, agentRunner, repoId, workBranch, prompt, ct);
+
+            if (!CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var parseError))
+            {
+                throw new InvalidOperationException(
+                    $"post-act re-check verdict parse failure on iteration {iteration}/{maxIterations}: {parseError}");
+            }
+
+            // Persist the verdict to the act item's history. Re-read first so a
+            // concurrent partial update (priority / prompt) is not clobbered.
+            var current = await _store.GetAsync(item.Id, ct) ?? item;
+            var newHistory = current.ReCheckVerdicts.Count == 0
+                ? new List<CheckVerdict> { verdict! }
+                : new List<CheckVerdict>(current.ReCheckVerdicts) { verdict! };
+            var withHistory = current with { ReCheckVerdicts = newHistory };
+            await _store.UpdateAsync(withHistory, ct);
+            item = withHistory;
+
+            _log.LogInformation(
+                "Work item {Id} post-act re-check iteration {Iter}/{Max}: answer={Answer} confidence={Conf}",
+                item.Id, iteration, maxIterations, verdict!.Answer,
+                verdict.Confidence ?? "(unspecified)");
+
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.post_act_recheck_completed",
+                WorkItem = item,
+                Project = project,
+                Details = new
+                {
+                    iteration,
+                    maxIterations,
+                    answer = verdict.Answer,
+                    actionableAnswer = checkSpec.ActionableAnswer,
+                    actionable = verdict.Answer == checkSpec.ActionableAnswer,
+                    originCheckWorkItemId = originCheckId.ToString(),
+                },
+            }, CancellationToken.None);
+
+            // Non-actionable answer → remediation accepted; proceed to merge.
+            if (verdict.Answer != checkSpec.ActionableAnswer)
+                return;
+
+            // Still actionable after the last allowed iteration → fail with a
+            // clear reason so the operator can re-scope.
+            if (iteration >= maxIterations)
+            {
+                throw new InvalidOperationException(
+                    $"remediation did not satisfy the check after {maxIterations} attempt(s) " +
+                    $"(originating check {originCheckId}); last evidence: {verdict.Evidence}");
+            }
+
+            // Re-engage the original work agent with the failing verdict as
+            // feedback, then loop and re-validate again. Mirrors the
+            // audit/rework loop's wiring (PhaseCancellation, quota fallback,
+            // stuck probe, RunAgentPhaseAsync) so the post-act rework
+            // participates in the same routing/observability machinery as
+            // the audit-driven rework.
+            var reworkPrompt = BuildPostActReworkPrompt(item.Prompt, checkSpec, verdict, iteration, maxIterations);
+            await Transition(item, WorkItemState.Reworking, ct, project);
+            using var reworkPhase = new PhaseCancellation("post-act-rework", ct, _opts.TimeProvider);
+            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+            reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
+            try
+            {
+                await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
+                    async (workerRunner, trialItem, attemptCt) =>
+                        await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
+                            phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
+                                reworkPrompt, isInitial: false,
+                                networkProfile: sandboxTarget.NetworkProfile,
+                                sandboxFlavor: sandboxTarget.Flavor,
+                                project: project,
+                                phaseCt,
+                                hostShutdownToken,
+                                iteration: null),
+                            workToken: attemptCt),
+                    ct,
+                    phaseCancellation: reworkPhase,
+                    attemptTimeout: item.WorkTimeout);
+            }
+            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+            {
+                throw reworkPhase.Wrap(oce);
+            }
+
+            // The rework agent committed; the next loop iteration will
+            // re-check against the new work-branch tip. Refresh so the next
+            // re-check sees any state mutations made by the rework path
+            // (e.g. concurrent prompt edit captured by RunAgentPhaseAsync).
+            item = await _store.GetAsync(item.Id, ct) ?? item;
+        }
+    }
+
+    /// <summary>
+    /// Runs a single post-act re-check agent invocation in a fresh sandbox,
+    /// cloning the per-work-item repo and checking out the work branch (so the
+    /// agent's committed remediation is visible). Mirrors
+    /// <see cref="RunCheckAndActAgentAsync"/> — single invocation, no commit,
+    /// no merge, no push — but evaluates the modified repo instead of the
+    /// pristine base. Returns the aggregated stdout (streamed chunks +
+    /// terminal payload) so the verdict parser sees the full tail.
+    /// </summary>
+    private async Task<string> RunPostActReCheckAgentAsync(
+        WorkItem item, Project project, IAgentRunner agentRunner,
+        string repoId, string workBranch, string prompt, CancellationToken ct)
+    {
+        var credential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(agentRunner.Kind, project.CredentialProviderPriority, ct)
+            : await _credentials.GetAsync(agentRunner.Kind, ct);
+        var access = _gitHost.GetSandboxAccess(repoId);
+
+        var spec = BuildSandboxSpec(
+            access,
+            includeAgentCredential: credential,
+            allowAgentNetwork: true,
+            hostNetworkProfile: project.NetworkProfiles.Work,
+            timingWorkItemId: item.Id,
+            timingPhase: "post-act-recheck",
+            flavor: SandboxProfileFlavor.Headless,
+            extraEnvironment: null,
+            baselineImageRef: item.BaselineImageRef);
+
+        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        if (credential is not null && credential.Files.Count > 0)
+            await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
+
+        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+
+        var aggregator = new System.Text.StringBuilder();
+        var chunkCallback = (Action<string>)(chunk =>
+        {
+            aggregator.Append(chunk);
+            _stdoutBroadcaster?.BroadcastChunk(item.Id, "post-act-recheck", chunk);
+        });
+
+        AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "post-act-recheck");
+        var result = await agentRunner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, prompt, credential,
+            item.ModelId, item.ReasoningMode, ct,
+            stdoutChunkCallback: chunkCallback,
+            captureStructuredStream: false);
+
+        if (!result.Success)
+        {
+            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
+            throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
+        }
+
+        if (!string.IsNullOrEmpty(result.Stdout) && !aggregator.ToString().EndsWith(result.Stdout, StringComparison.Ordinal))
+            aggregator.Append(result.Stdout);
+
+        return aggregator.ToString();
+    }
+
+    /// <summary>
+    /// Builds the rework prompt for a post-act re-check that still reports the
+    /// actionable condition. Surfaces the failing verdict's evidence as
+    /// feedback so the agent can target the remaining issue, references the
+    /// originating check's question verbatim, and frames the iteration count
+    /// against the configured cap so the agent knows how many attempts remain.
+    /// Kept distinct from <see cref="ReworkPromptBuilder"/> because the latter
+    /// is shaped around auditor findings; here the "finding" is a single
+    /// yes/no verdict with a free-form evidence string.
+    /// </summary>
+    private static string BuildPostActReworkPrompt(
+        string originalPrompt,
+        CheckAndActSpec checkSpec,
+        CheckVerdict failingVerdict,
+        int iteration,
+        int maxIterations)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("## Rework requested — post-act re-validation failed");
+        sb.AppendLine();
+        sb.Append("Iteration ").Append(iteration).Append(" of ").Append(maxIterations)
+          .AppendLine(" of post-act re-validation: the originating check's question still reports the actionable condition against the current work branch. Your previous remediation did not fully satisfy the check.");
+        sb.AppendLine();
+        sb.AppendLine("Make new commits — do not amend — that close the gap. The orchestrator will RE-RUN the same check after your commit; if the answer flips to the non-actionable result, the work is accepted and merged. If it still reports the actionable answer, you'll get another chance up to the iteration cap.");
+        sb.AppendLine();
+        sb.AppendLine("### Originating check");
+        sb.AppendLine();
+        sb.AppendLine("Question:");
+        sb.AppendLine("```");
+        sb.AppendLine(checkSpec.Question);
+        sb.AppendLine("```");
+        sb.Append("Actionable answer (the one that means \"problem still present\"): `")
+          .Append(checkSpec.ActionableAnswer ? "true" : "false")
+          .AppendLine("`.");
+        sb.AppendLine();
+        sb.AppendLine("### Failing re-check verdict");
+        sb.AppendLine();
+        sb.Append("- Answer: `").Append(failingVerdict.Answer ? "true" : "false").AppendLine("` (matches the actionable condition)");
+        if (!string.IsNullOrWhiteSpace(failingVerdict.Confidence))
+            sb.Append("- Confidence: ").AppendLine(failingVerdict.Confidence);
+        sb.AppendLine("- Evidence:");
+        sb.AppendLine("```");
+        sb.AppendLine(failingVerdict.Evidence);
+        sb.AppendLine("```");
+        sb.AppendLine();
+        sb.AppendLine("Address the specific evidence cited above, then commit. Do not echo this prompt back.");
+        sb.AppendLine();
+        sb.AppendLine("## Original task");
+        sb.AppendLine();
+        sb.AppendLine(originalPrompt);
+        return sb.ToString();
     }
 
     private async Task ClearPreemptAsync(WorkItem item, CancellationToken ct)

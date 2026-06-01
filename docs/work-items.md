@@ -445,6 +445,55 @@ The verdict and the back-pointer are exposed in the work-item DTO:
 A successful enqueue also publishes a `work_item.check_followup_enqueued`
 webhook event carrying the parent check ID and the new follow-up's ID.
 
+### Post-act re-validation
+
+The check-and-act loop closes itself: when a follow-up work item (the *act*)
+completes its normal pipeline phase — work → audit/rework → just-before-merge —
+the orchestrator RE-RUNS the originating check's question against the modified
+repo as a final validation before accepting the act as `Done`. The re-check
+uses the same in-VM execution path as the initial check (sandbox clone +
+`<<<CODEYBOX_VERDICT>>>` sentinels + structured verdict). The question and
+the actionable answer are read from the originating check item's stored
+`CheckAndActSpec` — no new hardcoded question.
+
+| Re-check verdict | Follow-up outcome |
+|---|---|
+| `answer != actionableAnswer` (e.g. "no" = vulnerability no longer present) | Merge phase proceeds; the act reaches `Done`. |
+| `answer == actionableAnswer` (problem persists) | The act is sent back to rework with the failing verdict as feedback; the orchestrator re-validates again after each rework. |
+| Cap exhausted while still actionable | The act transitions to `Failed` with `failureKind="other"` and `LastError = "remediation did not satisfy the check after N attempt(s) …"`. The item needs a human / re-scoping. |
+
+The cap is the project's existing `audit.maxIterations` — the same setting
+that bounds the audit/rework loop, reused here so there's no parallel
+configuration path to manage.
+
+Every re-check verdict (initial post-act check + each rework re-check) is
+appended to the follow-up's `reCheckVerdicts` history in order; the
+originating check's initial verdict remains on the check item itself.
+The two together form the full re-validation timeline:
+
+```jsonc
+{
+  "id": "…",                                  // the act item
+  "originCheckWorkItemId": "…",               // back-pointer to the check
+  "reCheckVerdicts": [
+    {"answer": true,  "evidence": "iter1 still present", "confidence": "high"},
+    {"answer": true,  "evidence": "iter2 still present", "confidence": "medium"},
+    {"answer": false, "evidence": "iter3 now clean",     "confidence": "high"}
+  ]
+}
+```
+
+Each iteration also publishes a `work_item.post_act_recheck_completed`
+webhook event with the iteration number, the verdict's answer, and the
+originating check id — operators can stream this to build a per-item
+re-validation timeline without re-reading the DTO.
+
+The gate fires only for items whose `originCheckWorkItemId` is set;
+plain work items go straight from audit-pass to merge with no re-check
+invocation. Orphaned follow-ups (whose originating check has been
+deleted) skip the gate and proceed normally — losing the check item
+must not strand the follow-up.
+
 ---
 
 ## Editing dependencies post-hoc
