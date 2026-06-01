@@ -302,7 +302,7 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            ConcurrentLimitRecheck = TimeSpan.FromMilliseconds(100),
+            ConcurrentLimitRecheck = TimeSpan.FromSeconds(30),
         });
 
         var svc = new OrchestratorService(
