@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Hosting;
@@ -221,6 +222,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _quotaRouterOptions.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
             _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
             _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
+            _quotaRouterOptions.ColdStartFitInWindow = src.ColdStartFitInWindow;
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -593,6 +595,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.ObservedFailureWindowMinutes,
                 opts.ObservedFailureRetentionMinutes,
                 opts.CapRetryIntervalSeconds,
+                opts.ColdStartFitInWindow,
             },
             JsonOpts);
 
@@ -608,6 +611,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         try
         {
             _pipelineTuning.Replace(opts.PipelineTuning);
+            AgentSuspendResilience.SetMaxRetries(opts.PipelineTuning.AgentSuspendMaxRetries);
             _lastPipelineTuning = next;
             AuditLog.ConfigReloaded("PipelineTuning", prev, next);
             _log.LogInformation("Hot-reloaded PipelineTuning: {OldValue} → {NewValue}", prev, next);
@@ -654,6 +658,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 QuotaExhaustionFallbackTtlSeconds = opts.QuotaExhaustionFallbackTtl.TotalSeconds,
                 MaxParsedQuotaResetWindowSeconds = opts.MaxParsedQuotaResetWindow.TotalSeconds,
                 opts.MergeSandboxStagingRestoreAttempts,
+                opts.MaxQuestionsPerWorkItem,
+                opts.AgentSuspendMaxRetries,
             },
             JsonOpts);
 

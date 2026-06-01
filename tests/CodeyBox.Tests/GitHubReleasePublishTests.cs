@@ -180,7 +180,9 @@ public sealed class GitHubReleasePublishTests : IDisposable
             new PipelineOptions { SandboxImageReference = "none", AgentAllowedHosts = [] },
             new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
-            NullLogger<ReleaseService>.Instance);
+            NullLogger<ReleaseService>.Instance,
+            () => 4,
+            () => TimeSpan.FromMinutes(30));
 
     private async Task WaitForStateAsync(ReleaseId id, params ReleaseState[] terminal)
     {

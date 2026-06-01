@@ -38,6 +38,19 @@ public sealed class PipelineTuningOptions
     /// falls through to rethrow rather than spinning indefinitely.
     /// </summary>
     public int MergeSandboxStagingRestoreAttempts { get; set; } = 2;
+
+    /// <summary>
+    /// Maximum number of operator questions an agent can emit per work item
+    /// before the pipeline ignores further questions and continues processing.
+    /// Default 10.
+    /// </summary>
+    public int MaxQuestionsPerWorkItem { get; set; } = 10;
+
+    /// <summary>
+    /// Maximum automatic re-invocations after a failed agent exec, applied by
+    /// <see cref="Agents.AgentSuspendResilience"/>. Default 1.
+    /// </summary>
+    public int AgentSuspendMaxRetries { get; set; } = 1;
 }
 
 /// <summary>

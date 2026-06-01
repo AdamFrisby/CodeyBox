@@ -8020,8 +8020,6 @@ Original merge-phase failure (for context):
 
     // ── Question parsing + NeedsOperatorInput parking ───────────────────────
 
-    private const int MaxQuestionsPerWorkItem = 10;
-
     /// <summary>
     /// Parses agent stdout for question blocks, persists new ones, and transitions
     /// the work item to NeedsOperatorInput if at least one new question was created.
@@ -8040,11 +8038,11 @@ Original merge-phase failure (for context):
         var newQuestions = new List<WorkItemQuestion>();
         foreach (var p in parsed)
         {
-            if (existingCount + newQuestions.Count >= MaxQuestionsPerWorkItem)
+            if (existingCount + newQuestions.Count >= _pipelineTuning.Current.MaxQuestionsPerWorkItem)
             {
                 _log.LogWarning(
                     "Work item {Id}: question cap ({Max}) reached; ignoring additional <codeybox-question> blocks",
-                    item.Id, MaxQuestionsPerWorkItem);
+                    item.Id, _pipelineTuning.Current.MaxQuestionsPerWorkItem);
                 break;
             }
 

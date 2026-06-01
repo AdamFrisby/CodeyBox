@@ -41,12 +41,11 @@ public sealed class ReleaseService
     private readonly ILogger<ReleaseService> _log;
     private readonly IAgentStreamStore? _agentStreams;
 
-    // Caps concurrent deep-audit phases across all releases to bound LLM/sandbox resource usage.
-    private const int MaxConcurrentDeepAudits = 4;
-    private readonly SemaphoreSlim _deepAuditGate = new(MaxConcurrentDeepAudits, MaxConcurrentDeepAudits);
-
-    // Maximum time to wait for a single remediation work item before failing the deep audit.
-    private static readonly TimeSpan RemediationItemTimeout = TimeSpan.FromMinutes(30);
+    // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
+    // acquire/remediate call so config edits take effect without restart.
+    private readonly Func<int> _deepAuditMaxConcurrency;
+    private readonly Func<TimeSpan> _deepAuditRemediationItemTimeout;
+    private int _deepAuditsRunning;
 
     public ReleaseService(
         IReleaseStore releases,
@@ -64,6 +63,8 @@ public sealed class ReleaseService
         ITaskQueue queue,
         IHostApplicationLifetime lifetime,
         ILogger<ReleaseService> log,
+        Func<int> deepAuditMaxConcurrency,
+        Func<TimeSpan> deepAuditRemediationItemTimeout,
         IAgentStreamStore? agentStreams = null)
     {
         _releases = releases;
@@ -81,7 +82,30 @@ public sealed class ReleaseService
         _queue = queue;
         _lifetime = lifetime;
         _log = log;
+        _deepAuditMaxConcurrency = deepAuditMaxConcurrency;
+        _deepAuditRemediationItemTimeout = deepAuditRemediationItemTimeout;
         _agentStreams = agentStreams;
+    }
+
+    private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var running = Volatile.Read(ref _deepAuditsRunning);
+            if (running >= _deepAuditMaxConcurrency())
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), ct);
+                continue;
+            }
+            if (Interlocked.CompareExchange(ref _deepAuditsRunning, running + 1, running) == running)
+                return;
+        }
+    }
+
+    private void ReleaseDeepAuditSlot()
+    {
+        Interlocked.Decrement(ref _deepAuditsRunning);
     }
 
     // ── Branch creation ──────────────���─────────────────────────────────���──────
@@ -307,9 +331,9 @@ public sealed class ReleaseService
         var project = await _projects.GetAsync(inReview.ProjectId, ct);
         await PublishAsync("release.in_review", inReview, project, ct);
 
-        // Acquire the concurrency gate before starting. If MaxConcurrentDeepAudits are already
+        // Acquire the concurrency gate before starting. If _deepAuditMaxConcurrency() are already
         // running, wait here (the release is already InReview in the DB, so this is safe).
-        await _deepAuditGate.WaitAsync(_lifetime.ApplicationStopping);
+        await AcquireDeepAuditSlotAsync(_lifetime.ApplicationStopping);
 
         // Run deep audit in background. Link the application stopping token so graceful shutdown
         // can cancel in-progress audits and clean up sandbox resources.
@@ -327,7 +351,7 @@ public sealed class ReleaseService
             }
             finally
             {
-                _deepAuditGate.Release();
+                ReleaseDeepAuditSlot();
             }
         }, auditCt);
     }
@@ -460,11 +484,12 @@ public sealed class ReleaseService
             await _queue.EnqueueAsync(remediationItem.Id, ct);
 
             // Wait for the remediation item to complete before looping; fail the release on timeout.
-            var completed = await WaitForWorkItemTerminalAsync(remediationItem.Id, RemediationItemTimeout, ct);
+            var timeout = _deepAuditRemediationItemTimeout();
+            var completed = await WaitForWorkItemTerminalAsync(remediationItem.Id, timeout, ct);
             if (!completed)
             {
                 var timeoutReason = $"deep audit remediation work item did not reach terminal state within " +
-                                    $"{RemediationItemTimeout.TotalMinutes:F0} minutes at iteration {iteration}";
+                                    $"{timeout.TotalMinutes:F0} minutes at iteration {iteration}";
                 await FailReleaseAsync(current, timeoutReason, ct);
                 return;
             }

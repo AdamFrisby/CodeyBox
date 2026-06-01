@@ -1778,7 +1778,9 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<ReleaseService>>(),
-    sp.GetService<IAgentStreamStore>()));
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
+    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
+    agentStreams: sp.GetService<IAgentStreamStore>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -2504,6 +2506,20 @@ namespace CodeyBox.Api
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
 
+        /// <summary>
+        /// Maximum concurrent release deep-audit phases across all releases.
+        /// Bounds LLM/sandbox resource usage. Default 4.
+        /// Hot-reloadable: read on each deep-audit start attempt.
+        /// </summary>
+        public int DeepAuditMaxConcurrency { get; set; } = 4;
+
+        /// <summary>
+        /// Maximum seconds to wait for a single remediation work item to reach a
+        /// terminal state before failing the deep audit. Default 1800 (30 min).
+        /// Hot-reloadable: read on each remediation dispatch.
+        /// </summary>
+        public int DeepAuditRemediationItemTimeoutSeconds { get; set; } = 1800;
+
         /// <summary>Pipeline-runner quota-fallback and retry tuning. Hot-reloadable.</summary>
         public PipelineTuningOptions PipelineTuning { get; set; } = new();
 
@@ -3122,6 +3138,12 @@ namespace CodeyBox.Api
         /// 15s cadence, so leave defaults aligned unless you have a reason.
         /// </summary>
         public int CapRetryIntervalSeconds { get; set; } = 15;
+        /// <summary>
+        /// Default "how many concurrent burns fit in the remaining quota window"
+        /// used when the estimator has no historical samples yet. Keeps the
+        /// dispatch queue from stalling on cold start. Default 2.0.
+        /// </summary>
+        public double ColdStartFitInWindow { get; set; } = 2.0;
         /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.

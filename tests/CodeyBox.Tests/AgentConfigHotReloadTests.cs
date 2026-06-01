@@ -1665,6 +1665,120 @@ public sealed class AgentConfigHotReloadTests
             Task.FromResult(0m);
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterColdStartFitInWindowPropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                ColdStartFitInWindow = 2.0,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = new QuotaRouterOptions
+        {
+            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
+            ColdStartFitInWindow = initial.QuotaRouter.ColdStartFitInWindow,
+        };
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(2.0, qro.ColdStartFitInWindow);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 5.0 },
+        });
+        Assert.Equal(5.0, qro.ColdStartFitInWindow);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 1.5 },
+        });
+        Assert.Equal(1.5, qro.ColdStartFitInWindow);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningPushesNewFieldsToSnapshot()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                MaxQuestionsPerWorkItem = 10,
+                AgentSuspendMaxRetries = 1,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+            MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
+            AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
+        });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // Capture the static default before the coordinator sets it.
+        var originalMaxRetries = AgentSuspendResilience.MaxRetries;
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pipelineTuning: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
+        Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
+
+        // SetMaxRetries is called on start; verify the static was initialised.
+        Assert.Equal(1, AgentSuspendResilience.MaxRetries);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MaxQuestionsPerWorkItem = 20,
+                AgentSuspendMaxRetries = 3,
+            },
+        });
+        Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
+        Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
+        Assert.Equal(3, AgentSuspendResilience.MaxRetries);
+
+        // Restore original (shared static).
+        AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>
     {
         private T _value;

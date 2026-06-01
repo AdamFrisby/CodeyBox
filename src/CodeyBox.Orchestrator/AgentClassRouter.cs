@@ -1037,7 +1037,7 @@ public sealed class AgentClassRouter
         double fit;
         if (estimate.SampleCount <= 0 || estimate.AvgBurnPctPerItem <= 0)
         {
-            fit = DefaultColdStartFitInWindow;
+            fit = _opts.ColdStartFitInWindow;
         }
         else
         {
@@ -1082,7 +1082,7 @@ public sealed class AgentClassRouter
             catch { est = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 }; }
 
             double fit;
-            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = DefaultColdStartFitInWindow;
+            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = _opts.ColdStartFitInWindow;
             else if (quota.AvailablePct < 0) fit = double.NaN;
             else fit = quota.AvailablePct / est.AvgBurnPctPerItem;
 
@@ -1495,6 +1495,13 @@ public sealed class QuotaRouterOptions
     /// long enough not to busy-loop. Default 15s.
     /// </summary>
     public TimeSpan CapRetryRecheckInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Default "how many concurrent burns fit in the remaining quota window"
+    /// used when the estimator has no historical samples yet. Keeps the
+    /// dispatch queue from stalling on cold start. Default 2.0.
+    /// </summary>
+    public double ColdStartFitInWindow { get; set; } = 2.0;
 }
 
 public enum QuotaUnknownPolicy
