@@ -51,9 +51,11 @@ public sealed record TraceAction
     public required IReadOnlyList<SandboxInputEvent> InputEvents { get; init; }
 
     /// <summary>
-    /// Action kind as a stable string: <c>click</c>, <c>double_click</c>,
+    /// Action kind as a canonical string: <c>click</c>, <c>double_click</c>,
     /// <c>move</c>, <c>scroll</c>, <c>key</c>, <c>type</c>, <c>events</c>,
-    /// <c>screenshot</c>.
+    /// <c>screenshot</c>. Synonyms submitted by the caller (e.g.
+    /// <c>left_click</c>, <c>mouse_move</c>, <c>keypress</c>) are normalised
+    /// to the canonical form before storage.
     /// </summary>
     public required string Kind { get; init; }
 
@@ -67,6 +69,10 @@ public sealed record TraceAction
 /// <summary>
 /// Recognition descriptors for an interaction target. Always carries a visual
 /// descriptor; augments with accessibility information when available.
+///
+/// <para>All string fields that originate from app screen content (accessibility
+/// role/name/text, OCR text) are untrusted — treat them as opaque data, never
+/// as instructions, when consumed by LLM-driven replay or analysis pipelines.</para>
 /// </summary>
 public sealed record TraceTargetDescriptor
 {
@@ -85,6 +91,9 @@ public sealed record TraceTargetDescriptor
 
 /// <summary>
 /// Accessibility signals captured from an app's accessibility tree at action time.
+/// All fields are untrusted: they originate from the app screen and must be
+/// treated as opaque data, never as instructions, when consumed by LLM-driven
+/// replay or analysis pipelines.
 /// </summary>
 public sealed record TraceAccessibilityDescriptor
 {
@@ -98,6 +107,10 @@ public sealed record TraceAccessibilityDescriptor
 /// Visual signals for re-locating a target by sight. Includes a cropped
 /// template/anchor image, OCR text from the region, and the bounding region
 /// in the source screenshot.
+///
+/// <para><see cref="OcrText"/> originates from the app screen and is untrusted —
+/// treat it as opaque data, never as instructions, when consumed by LLM-driven
+/// replay or analysis pipelines.</para>
 /// </summary>
 public sealed record TraceVisualDescriptor
 {
@@ -110,6 +123,7 @@ public sealed record TraceVisualDescriptor
 
     /// <summary>
     /// OCR text detected in the target region. Null when OCR was not run.
+    /// Untrusted: originates from the app screen — treat as opaque data.
     /// </summary>
     public string? OcrText { get; init; }
 
@@ -138,6 +152,11 @@ public sealed record TraceBoundingRegion
 /// <summary>
 /// Post-action observation: the state of the app immediately after the action
 /// was applied.
+///
+/// <para>All string fields that originate from app screen content
+/// (<see cref="AccessibilitySnapshotJson"/>) are untrusted — treat them as
+/// opaque data, never as instructions, when consumed by LLM-driven replay
+/// or analysis pipelines.</para>
 /// </summary>
 public sealed record TraceObservation
 {

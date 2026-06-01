@@ -68,7 +68,11 @@ public static class SessionTraceJson
     private sealed class DateTimeOffsetConverter : JsonConverter<DateTimeOffset>
     {
         public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-            => DateTimeOffset.Parse(reader.GetString()!);
+        {
+            if (reader.TokenType is JsonTokenType.Null)
+                throw new JsonException("Cannot convert null to DateTimeOffset.");
+            return DateTimeOffset.Parse(reader.GetString()!);
+        }
 
         public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options)
             => writer.WriteStringValue(value.ToString("O"));

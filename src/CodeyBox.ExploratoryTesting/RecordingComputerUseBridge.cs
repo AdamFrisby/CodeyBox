@@ -14,6 +14,12 @@ public sealed record RecordingComputerUseBridgeOptions
     /// in each dimension, clamped to non-negative screen coordinates.
     /// </summary>
     public int TargetCropRadius { get; init; } = 50;
+
+    /// <summary>
+    /// Modality label recorded in the trace. Defaults to <c>"web-graphical"</c>
+    /// for the web pilot; CLI/API recorders should override.
+    /// </summary>
+    public string Modality { get; init; } = "web-graphical";
 }
 
 /// <summary>
@@ -23,6 +29,14 @@ public sealed record RecordingComputerUseBridgeOptions
 /// target descriptors; after the action a post-action screenshot is captured
 /// as the observation. The trace is available via <see cref="Trace"/> and can
 /// be serialised at any point.
+///
+/// <para>Threading: this class is designed for a single producer (one driver
+/// per session). <see cref="ExecuteAsync"/>, <see cref="SetMetadata"/>, and
+/// <see cref="EndTrace"/> must not be called concurrently. The
+/// <see cref="Trace"/> property returns a live view whose
+/// <see cref="SessionTrace.Entries"/> may be read after <see cref="EndTrace"/>
+/// without external synchronisation; concurrent reading during
+/// <see cref="ExecuteAsync"/> requires caller-supplied serialisation.</para>
 /// </summary>
 public sealed class RecordingComputerUseBridge
 {
@@ -44,7 +58,7 @@ public sealed class RecordingComputerUseBridge
         _trace = new SessionTrace
         {
             TraceFormatVersion = SessionTrace.CurrentVersion,
-            Modality = "web-graphical",
+            Modality = _options.Modality,
             StartedAt = _timeProvider.GetUtcNow(),
             Entries = _entries,
             TargetName = null,
@@ -53,39 +67,52 @@ public sealed class RecordingComputerUseBridge
 
     /// <summary>
     /// The trace built so far. Entries are appended as actions execute;
-    /// the returned instance is a live view so callers can observe progress
-    /// or serialise at any time.
+    /// the returned instance is a live view. Callers should read
+    /// <see cref="SessionTrace.Entries"/> only after <see cref="EndTrace"/>
+    /// unless they supply their own synchronisation.
     /// </summary>
     public SessionTrace Trace => _trace;
 
     /// <summary>
     /// Sets trace-level metadata after construction (e.g. from the harness
-    /// that launched the session).
+    /// that launched the session). Each non-null value overwrites the
+    /// corresponding field; passing null for a field leaves the prior value
+    /// in place.
     /// </summary>
     public void SetMetadata(
         string? targetName = null,
         string? entryUrl = null,
         byte[]? readinessScreenshotPng = null)
     {
-        _trace = _trace with
+        lock (_entries)
         {
-            TargetName = targetName ?? _trace.TargetName,
-            EntryUrl = entryUrl ?? _trace.EntryUrl,
-            ReadinessScreenshotPng = readinessScreenshotPng ?? _trace.ReadinessScreenshotPng,
-        };
+            _trace = _trace with
+            {
+                TargetName = targetName ?? _trace.TargetName,
+                EntryUrl = entryUrl ?? _trace.EntryUrl,
+                ReadinessScreenshotPng = readinessScreenshotPng ?? _trace.ReadinessScreenshotPng,
+            };
+        }
     }
 
     /// <summary>
     /// Marks the trace as ended. Call once the session is done.
+    /// Preserves all recorded entries.
     /// </summary>
     public void EndTrace()
     {
-        _trace = _trace with { EndedAt = _timeProvider.GetUtcNow() };
+        lock (_entries)
+        {
+            _trace = _trace with { EndedAt = _timeProvider.GetUtcNow() };
+        }
     }
 
     /// <summary>
     /// Executes <paramref name="request"/> through the inner bridge, capturing
     /// pre/post screenshots and journaling a <see cref="TraceEntry"/>.
+    /// Action kind and events are resolved through
+    /// <see cref="ComputerUseBridge.ResolveInputEvents"/> so the trace records
+    /// the same events the inner bridge dispatches.
     /// </summary>
     public async Task<ComputerUseResult> ExecuteAsync(
         ISandbox sandbox,
@@ -95,28 +122,48 @@ public sealed class RecordingComputerUseBridge
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(request);
 
-        var action = (request.Action ?? "").Trim().ToLowerInvariant();
+        var (events, canonicalAction) = ComputerUseBridge.ResolveInputEvents(request);
+        var isScreenshot = canonicalAction is "screenshot";
         var timestamp = _timeProvider.GetUtcNow();
 
         byte[]? preScreenshot = null;
-        if (action is not "screenshot")
+        if (!isScreenshot)
         {
-            preScreenshot = await CaptureScreenshotBestEffortAsync(sandbox, ct);
+            preScreenshot = await CaptureScreenshotBestEffortAsync(sandbox, ct).ConfigureAwait(false);
         }
 
-        var result = await _inner.ExecuteAsync(sandbox, request, ct);
+        (int? cx, int? cy) = ResolveActionCentre(canonicalAction, events);
+        TraceAccessibilityDescriptor? preAccessibility = null;
+        if (cx.HasValue && cy.HasValue)
+        {
+            var snap = await CaptureAccessibilityBestEffortAsync(sandbox, cx.Value, cy.Value, ct).ConfigureAwait(false);
+            if (snap != null)
+            {
+                preAccessibility = new TraceAccessibilityDescriptor
+                {
+                    Role = snap.Role,
+                    Name = snap.Name,
+                    Text = snap.Text,
+                    ElementType = snap.ElementType,
+                };
+            }
+        }
+
+        var result = await _inner.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
 
         byte[]? postScreenshot;
-        if (action is "screenshot")
+        if (isScreenshot)
         {
             postScreenshot = result.ScreenshotPng;
         }
         else
         {
-            postScreenshot = await CaptureScreenshotBestEffortAsync(sandbox, ct);
+            postScreenshot = await CaptureScreenshotBestEffortAsync(sandbox, ct).ConfigureAwait(false);
         }
 
-        var targetDescriptor = BuildTargetDescriptor(action, request, preScreenshot);
+        string? postAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
+
+        var targetDescriptor = BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
 
         var entry = new TraceEntry
         {
@@ -124,14 +171,14 @@ public sealed class RecordingComputerUseBridge
             Timestamp = timestamp,
             Action = new TraceAction
             {
-                InputEvents = MapToInputEvents(action, request),
-                Kind = action,
+                InputEvents = events,
+                Kind = canonicalAction,
                 TargetDescriptor = targetDescriptor,
             },
             Observation = new TraceObservation
             {
                 ScreenshotPng = postScreenshot,
-                AccessibilitySnapshotJson = null,
+                AccessibilitySnapshotJson = postAccessibilityJson,
                 CapturedAt = _timeProvider.GetUtcNow(),
             },
         };
@@ -148,9 +195,42 @@ public sealed class RecordingComputerUseBridge
     {
         try
         {
-            return await sandbox.GetScreenshotAsync(ct);
+            return await sandbox.GetScreenshotAsync(ct).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static async Task<TraceAccessibilityDescriptor?> CaptureAccessibilityBestEffortAsync(
+        ISandbox sandbox, int x, int y, CancellationToken ct)
+    {
+        try
+        {
+            var snap = await sandbox.GetAccessibilityAtPointAsync(x, y, ct).ConfigureAwait(false);
+            if (snap is null) return null;
+            return new TraceAccessibilityDescriptor
+            {
+                Role = snap.Role,
+                Name = snap.Name,
+                Text = snap.Text,
+                ElementType = snap.ElementType,
+            };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string?> CaptureAccessibilityTreeBestEffortAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        try
+        {
+            return await sandbox.GetAccessibilityTreeJsonAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return null;
         }
@@ -158,19 +238,22 @@ public sealed class RecordingComputerUseBridge
 
     private TraceTargetDescriptor BuildTargetDescriptor(
         string action,
-        ComputerUseRequest request,
-        byte[]? preScreenshot)
+        SandboxInputEvent[] events,
+        byte[]? preScreenshot,
+        TraceAccessibilityDescriptor? preAccessibility)
     {
-        var (cx, cy) = ResolveActionCentre(action, request);
+        var (cx, cy) = ResolveActionCentre(action, events);
 
         TraceBoundingRegion region;
         if (cx.HasValue && cy.HasValue)
         {
             var r = _options.TargetCropRadius;
+            var clampedX = Math.Max(0, cx.Value - r);
+            var clampedY = Math.Max(0, cy.Value - r);
             region = new TraceBoundingRegion
             {
-                X = Math.Max(0, cx.Value - r),
-                Y = Math.Max(0, cy.Value - r),
+                X = clampedX,
+                Y = clampedY,
                 Width = 2 * r + 1,
                 Height = 2 * r + 1,
             };
@@ -182,6 +265,7 @@ public sealed class RecordingComputerUseBridge
 
         return new TraceTargetDescriptor
         {
+            Accessibility = preAccessibility,
             Visual = new TraceVisualDescriptor
             {
                 Region = region,
@@ -190,60 +274,13 @@ public sealed class RecordingComputerUseBridge
         };
     }
 
-    private static (int? X, int? Y) ResolveActionCentre(string action, ComputerUseRequest request)
+    private static (int? X, int? Y) ResolveActionCentre(string action, SandboxInputEvent[] events)
     {
-        switch (action)
+        if (events.Length > 0 && action is "click" or "double_click" or "move" or "scroll")
         {
-            case "click":
-            case "left_click":
-            case "double_click":
-            case "move":
-            case "mouse_move":
-                return (request.X, request.Y);
-            case "scroll":
-                return (request.ScrollX ?? request.X, request.ScrollY ?? request.Y);
-            default:
-                return (null, null);
+            var first = events[0];
+            return (first.X, first.Y);
         }
-    }
-
-    private static IReadOnlyList<SandboxInputEvent> MapToInputEvents(string action, ComputerUseRequest request)
-    {
-        switch (action)
-        {
-            case "screenshot":
-                return [];
-
-            case "click":
-            case "left_click":
-                return [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y }];
-
-            case "double_click":
-                return
-                [
-                    new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
-                    new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
-                ];
-
-            case "move":
-            case "mouse_move":
-                return [new SandboxInputEvent { Type = SandboxInputEventType.Move, X = request.X, Y = request.Y }];
-
-            case "scroll":
-                return [new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = request.ScrollX ?? request.X, Y = request.ScrollY ?? request.Y }];
-
-            case "key":
-            case "keypress":
-                return [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = request.Key ?? request.Text }];
-
-            case "type":
-                return [new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = request.Text }];
-
-            case "events":
-                return request.Events ?? [];
-
-            default:
-                return [];
-        }
+        return (null, null);
     }
 }
