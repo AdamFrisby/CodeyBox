@@ -102,7 +102,8 @@ internal static class TestSupport
         string? stateDbPathOverride = null,
         IPreMergeVerifier? preMergeVerifier = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
-        ITaskQueue? taskQueue = null)
+        ITaskQueue? taskQueue = null,
+        IAgentInvolvementStore? involvement = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -178,9 +179,10 @@ internal static class TestSupport
             }),
             preMergeVerifier: preMergeVerifier,
             incrementalRebase: incrementalRebase,
-            taskQueue: queue);
+            taskQueue: queue,
+            involvement: involvement);
 
-        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue);
+        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }
 }
 
@@ -193,8 +195,11 @@ internal sealed class TestPipeline : IDisposable
     public LocalGitHost GitHost { get; }
     public string GitRoot { get; }
     public ITaskQueue Queue { get; }
+    public IAgentInvolvementStore? Involvement { get; }
 
-    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot, ITaskQueue? queue = null)
+    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot,
+        ITaskQueue? queue = null,
+        IAgentInvolvementStore? involvement = null)
     {
         Pipeline = pipeline;
         Store = store;
@@ -202,6 +207,7 @@ internal sealed class TestPipeline : IDisposable
         GitHost = gitHost;
         GitRoot = gitRoot;
         Queue = queue ?? new InMemoryTaskQueue();
+        Involvement = involvement;
     }
 
     public void Dispose() => Store.Dispose();

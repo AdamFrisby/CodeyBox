@@ -218,7 +218,8 @@ public sealed class MergeConflictReworkTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], involvement: involvement);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -249,6 +250,16 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Contains("SEMANTIC_INCOMPATIBLE", final.LastError);
         Assert.Contains("events have diverged", final.LastError);
 
+        // The conflict-rework row must be finalized failure:semantic-incompatible
+        // — the only end-to-end assertion of that outcome string. A regression in
+        // ReworkConflictAsync's finalize branch (e.g. stamping success or agent)
+        // would slip through without this.
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:semantic-incompatible", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
+
         // The work branch in the bare repo must still hold the work agent's
         // commits so the operator can inspect.
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
@@ -256,6 +267,98 @@ public sealed class MergeConflictReworkTests : IDisposable
             barePath, "rev-parse", "--verify", $"refs/heads/{workBranch}");
         Assert.Equal(0, exitCode);
         Assert.False(string.IsNullOrWhiteSpace(branchRef));
+    }
+
+    /// <summary>
+    /// Cancellation mid-conflict-rework: when the agent run is cancelled, the
+    /// involvement row must be finalized <c>failure:cancelled</c> (not left
+    /// dangling in-progress). This is the only end-to-end assertion of the
+    /// failure:cancelled outcome, exercising the dedicated cancel branch in
+    /// <c>RunConflictReworkAgentAsync</c>.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_AgentCancelled_FinalizesInvolvementFailureCancelled()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], involvement: involvement);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        // Simulate the agent run being cancelled mid-rework. A plain
+        // OperationCanceledException (not a PhaseCancellationException) hits the
+        // dedicated cancel branch, which stamps failure:cancelled before
+        // rethrowing.
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+            throw new OperationCanceledException("simulated mid-rework cancellation"));
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        // The wrapped PhaseCancellationException propagates out of RunAsync (the
+        // conflict-rework caller rethrows OperationCanceledException); the row is
+        // finalized before it does. Tolerate both throw and graceful return.
+        try { await tp.Pipeline.RunAsync(item, CancellationToken.None); }
+        catch (OperationCanceledException) { /* expected: simulated cancellation */ }
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:cancelled", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
+    }
+
+    /// <summary>
+    /// Plain (non-semantic, non-cancelled) conflict-rework agent failure: the
+    /// agent exits unsuccessfully without declaring SEMANTIC_INCOMPATIBLE, so
+    /// <c>RunConflictReworkAgentAsync</c> must finalize the involvement row
+    /// <c>failure:agent</c> — the generic <c>!Success</c> branch that sits AFTER
+    /// the semantic-incompatible check. This is the only end-to-end assertion of
+    /// that outcome; a regression that stamped <c>success</c> on a failed rework
+    /// run, or that mis-ordered the semantic check ahead of the generic failure,
+    /// would otherwise go uncaught.
+    /// </summary>
+    [Fact]
+    public async Task ConflictRework_AgentPlainFailure_FinalizesInvolvementFailureAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], involvement: involvement);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        // Agent fails to resolve the conflict and returns unsuccessfully WITHOUT a
+        // SEMANTIC_INCOMPATIBLE marker — a generic agent failure, not a deliberate
+        // bail-out. Must NOT be classified as semantic-incompatible.
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "could not resolve conflict",
+                Stdout: "tried to merge but gave up",
+                Stderr: "fatal: rebase failed"));
+        });
+
+        var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(1, final.ConflictReworkAttempts);
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:agent", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
     }
 
     /// <summary>
@@ -335,6 +438,7 @@ public sealed class MergeConflictReworkTests : IDisposable
             [AgentKind.Claude] = extractor,
         };
         var calculator = new AgentCostCalculator(new AgentPricingOptions());
+        var involvement = new InMemoryAgentInvolvementStore();
 
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
@@ -342,7 +446,8 @@ public sealed class MergeConflictReworkTests : IDisposable
             costStore: costStore,
             costExtractors: extractors,
             costCalculator: calculator,
-            stateDbPathOverride: sharedDb);
+            stateDbPathOverride: sharedDb,
+            involvement: involvement);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 
@@ -372,6 +477,19 @@ public sealed class MergeConflictReworkTests : IDisposable
         var reworkRow = rows.First(r => r.Phase == "conflict_rework");
         Assert.Equal(1234, reworkRow.InputTokens);
         Assert.Equal(567, reworkRow.OutputTokens);
+
+        // The conflict-rework agent run is recorded outside the
+        // InvokeAgentWithQuotaFallbackAsync chokepoint, so assert its involvement
+        // row directly: exactly one closed conflict_rework entry, finalized
+        // success, for the work agent. A regression that drops the direct
+        // RecordInvolvementStartAsync/FinalizeInvolvementAsync calls in
+        // ReworkConflictAsync leaves the audit trail blind to this phase.
+        var inv = await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var conflictRow = Assert.Single(inv, r => r.Phase == "conflict_rework");
+        Assert.Equal(AgentKind.Claude, conflictRow.AgentKind);
+        Assert.Null(conflictRow.Iteration);
+        Assert.NotNull(conflictRow.EndedAt);
+        Assert.Equal("success", conflictRow.Outcome);
     }
 
     /// <summary>

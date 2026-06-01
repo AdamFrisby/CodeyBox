@@ -68,6 +68,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
+    private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
@@ -192,7 +193,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IAgentInvolvementStore? involvement = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -233,6 +235,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
         _fallbackHistory = fallbackHistory;
+        _involvement = involvement;
         _log = log;
         _smokeGate = smokeGate;
         _suggestions = suggestions;
@@ -529,7 +532,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
                     try
                     {
-                        reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: null,
+                        // Iteration 1 matches the Publish{Iteration}Started/Completed
+                        // calls bracketing this resume branch and the standard
+                        // post-audit rework path's per-iteration numbering, so a
+                        // resume-after-preempt rework row aligns with main-path rows.
+                        reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: 1,
                             async (runner, trialItem, attemptCt) =>
                                 await RunWithStuckProbeAsync(trialItem, project, runner.Kind, "rework", reworkPhase, ct,
                                     phaseCt => RunAgentPhaseAsync(trialItem, runner, repoId, baseBranch, workBranch,
@@ -3375,7 +3382,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         initialMemberOverride: _classRouter?.FindMember(
                             item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
                             pair.Runner.Kind,
-                            modelId: null));
+                            modelId: null),
+                        // ExecAuditorAsync records one involvement row per auditor
+                        // sandbox run (incl. the transient retry), so the wrapper
+                        // must not also record one per attempt — that would
+                        // double-count and collapse the retry into a single row.
+                        recordInvolvement: false);
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -3470,6 +3482,13 @@ public sealed class PipelineRunner : IPipelineRunner
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
             log: _log);
+        // Record one involvement row per auditor sandbox run. ExecAuditorAsync is
+        // the single chokepoint for every auditor (tool + LLM, including the LLM
+        // transient retry), so recording here gives a 1:1 mapping between the
+        // "Running auditor" log line above and a history row — and an
+        // auditor-identifying phase the plain "audit" label could not provide.
+        var involvementId = await RecordInvolvementStartAsync(
+            ctx.WorkItemId, runner.Kind, auditorCtx.ModelId, $"audit:{auditor.Name}", ctx.Iteration);
         AuditResult result;
         try
         {
@@ -3478,12 +3497,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 result = await auditor.RunAsync(sandbox, SandboxConventions.WorkDir, auditorCtx, ct);
             }
         }
+        catch (Exception ex)
+        {
+            await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+            throw;
+        }
         finally
         {
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
         }
         sw.Stop();
+        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
         return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
     }
 
@@ -3989,7 +4014,8 @@ public sealed class PipelineRunner : IPipelineRunner
         PhaseCancellation? phaseCancellation = null,
         TimeSpan? attemptTimeout = null,
         IAgentRunner? initialRunnerOverride = null,
-        AgentMembership? initialMemberOverride = null)
+        AgentMembership? initialMemberOverride = null,
+        bool recordInvolvement = true)
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
@@ -4004,19 +4030,36 @@ public sealed class PipelineRunner : IPipelineRunner
 
         async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
         {
+            // Append a per-phase involvement row for the agent about to run, so the
+            // full who-did-what trail captures every agent that touched the item —
+            // not just the one currently stamped on WorkItem.Agent. Finalized with
+            // an outcome below; on a quota/timeout fallback the next attempt records
+            // its own row and this one is closed as a failure.
+            //
+            // recordInvolvement is false only for the LLM quota-fallback wrapper
+            // around auditors: ExecAuditorAsync records one row per auditor sandbox
+            // run (the single chokepoint for tool and LLM auditors alike), so
+            // recording here as well would double-count.
+            var involvementId = recordInvolvement
+                ? await RecordInvolvementStartAsync(
+                    item.Id, runner.Kind, trialItem.ModelId, phase, iteration)
+                : null;
             using var attempt = phaseCancellation is not null && attemptTimeout is { } perAttempt
                 ? phaseCancellation.BeginAttemptTimeout(perAttempt)
                 : null;
             var attemptCt = attempt?.Token ?? phaseCancellation?.Token ?? ct;
             try
             {
-                return await invoker(runner, trialItem, attemptCt);
+                var result = await invoker(runner, trialItem, attemptCt);
+                await FinalizeInvolvementAsync(involvementId, "success");
+                return result;
             }
             catch (OperationCanceledException oce) when (
                 attempt is { TimeoutElapsed: true }
                 && phaseCancellation is not null
                 && oce is not PhaseCancellationException)
             {
+                await FinalizeInvolvementAsync(involvementId, "failure:timeout");
                 if (phaseCancellation.Token.IsCancellationRequested
                     || phaseCancellation.Source is not null)
                     throw phaseCancellation.Wrap(oce);
@@ -4026,6 +4069,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     runner.Kind,
                     attemptTimeout!.Value,
                     oce);
+            }
+            catch (Exception ex)
+            {
+                await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+                throw;
             }
         }
 
@@ -4332,6 +4380,150 @@ public sealed class PipelineRunner : IPipelineRunner
                     terminalException: timeoutEx);
             }
         }
+    }
+
+    /// <summary>
+    /// Appends an in-progress <see cref="AgentInvolvement"/> row for the agent
+    /// about to run a phase and returns its id (or null when no involvement store
+    /// is wired). PipelineRunner is the single writer of involvement rows (the
+    /// router selects but never persists), so every phase attempt that actually
+    /// runs opens exactly one row here — no cross-component adoption handshake.
+    /// Best-effort: a failure to persist never breaks the pipeline, mirroring the
+    /// fallback-history recording.
+    /// </summary>
+    private async Task<Guid?> RecordInvolvementStartAsync(
+        WorkItemId workItemId, AgentKind agent, string? modelId, string phase, int? iteration)
+    {
+        if (_involvement is null) return null;
+
+        var entry = new AgentInvolvement(
+            Id: Guid.NewGuid(),
+            WorkItemId: workItemId,
+            AgentKind: agent,
+            ModelId: modelId,
+            Phase: phase,
+            StartedAt: DateTimeOffset.UtcNow,
+            EndedAt: null,
+            Iteration: iteration,
+            Outcome: null);
+
+        var persisted = await PersistInvolvementWithRetryAsync(
+            ct => _involvement.RecordStartAsync(entry, ct),
+            op: "start record", phase: phase);
+        return persisted ? entry.Id : null;
+    }
+
+    /// <summary>
+    /// Persists one involvement mutation (start insert or finalize update) with a
+    /// bounded retry so a <em>transient</em> store fault (SQLite busy/locked, an
+    /// <see cref="IOException"/>, a <see cref="TimeoutException"/>) does not drop
+    /// an audit-trail row on the first blip — AC#1 requires a row on every phase
+    /// transition and AC#6 a 1:1 phase→row mapping, so a momentary lock must not
+    /// silently erode the trail. Retries share the DB with the work-item store, so
+    /// a fault that survives all attempts means the DB is genuinely unhealthy and
+    /// the next work-item write would fail the phase anyway; rather than abort a
+    /// work item that did real work for an audit-trail write, the exhausted fault
+    /// is logged at Warning and swallowed (returns false). An
+    /// <see cref="ObjectDisposedException"/> from a store torn down during host
+    /// shutdown is not retried (the host is going away) but is likewise tolerated.
+    /// Cancellation and any unexpected exception (a wiring/programming bug) always
+    /// propagate so they surface in CI instead of silently eroding the trail.
+    /// </summary>
+    private async Task<bool> PersistInvolvementWithRetryAsync(
+        Func<CancellationToken, Task> write, string op, string phase)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await write(CancellationToken.None);
+                return true;
+            }
+            catch (Exception ex)
+                when (IsTransientInvolvementPersistenceFault(ex) && attempt < InvolvementPersistenceMaxAttempts)
+            {
+                _log.LogDebug(ex,
+                    "agent involvement {Op} transient fault for phase '{Phase}' (attempt {Attempt}/{Max}); retrying",
+                    op, phase, attempt, InvolvementPersistenceMaxAttempts);
+                await Task.Delay(InvolvementPersistenceRetryDelay * attempt, CancellationToken.None);
+            }
+            catch (Exception ex) when (IsTolerableInvolvementPersistenceFault(ex))
+            {
+                // Transient fault that survived every retry, or a store disposed
+                // during host shutdown. Logged at Warning (not Debug) so a dropped
+                // audit-trail row stays operator-visible.
+                _log.LogWarning(ex, "agent involvement {Op} failed for phase '{Phase}'", op, phase);
+                return false;
+            }
+        }
+    }
+
+    private const int InvolvementPersistenceMaxAttempts = 4;
+    private static readonly TimeSpan InvolvementPersistenceRetryDelay = TimeSpan.FromMilliseconds(25);
+
+    /// <summary>
+    /// Transient (retryable) involvement persistence faults: a contended store
+    /// (any <see cref="System.Data.Common.DbException"/> such as SQLite
+    /// busy/locked), an <see cref="IOException"/>, or a <see cref="TimeoutException"/>.
+    /// These typically clear on a short retry, so the audit-trail row is preserved
+    /// rather than dropped.
+    /// </summary>
+    private static bool IsTransientInvolvementPersistenceFault(Exception ex) =>
+        ex is System.Data.Common.DbException or IOException or TimeoutException;
+
+    /// <summary>
+    /// The bounded set of exceptions involvement persistence is allowed to swallow
+    /// after retries: the transient faults above plus an
+    /// <see cref="ObjectDisposedException"/> from a store torn down during host
+    /// shutdown. Cancellation is excluded so it keeps propagating; anything else is
+    /// an unexpected bug that must surface.
+    /// </summary>
+    private static bool IsTolerableInvolvementPersistenceFault(Exception ex) =>
+        ex is not OperationCanceledException
+        && (IsTransientInvolvementPersistenceFault(ex) || ex is ObjectDisposedException);
+
+    /// <summary>
+    /// Stamps the completion outcome on a previously-started involvement row.
+    /// No-op when no store is wired or no row was recorded. Uses
+    /// <see cref="CancellationToken.None"/> so the audit stamp lands even when
+    /// the phase was cancelled, and retries transient faults so the closing stamp
+    /// survives a momentary store blip (see <see cref="PersistInvolvementWithRetryAsync"/>).
+    /// </summary>
+    private async Task FinalizeInvolvementAsync(Guid? involvementId, string outcome)
+    {
+        if (_involvement is null || involvementId is not { } id) return;
+        await PersistInvolvementWithRetryAsync(
+            ct => _involvement.FinalizeAsync(id, DateTimeOffset.UtcNow, outcome, ct),
+            op: "finalize", phase: outcome);
+    }
+
+    /// <summary>
+    /// Maps an attempt-terminating exception to a compact involvement outcome
+    /// label ("failure:&lt;reason&gt;") for operator-facing attribution.
+    /// </summary>
+    private static string OutcomeForFailure(Exception ex) => ex switch
+    {
+        TerminalQuotaError => "failure:quota",
+        AgentAttemptTimeoutException => "failure:timeout",
+        OperationCanceledException => "failure:cancelled",
+        _ => "failure:agent",
+    };
+
+    /// <summary>
+    /// Maps a completed auditor run to an involvement outcome. A quota-shaped
+    /// agent failure is surfaced as <c>failure:quota</c> (the same signal that
+    /// later triggers fallback), a non-quota review-agent crash as
+    /// <c>failure:agent</c>; everything else — including a clean pass and a pass
+    /// that merely reported findings — is <c>success</c> (the agent ran fine; the
+    /// findings are the work product, not a run failure).
+    /// </summary>
+    private string AuditorRunOutcome(AgentKind kind, AuditResult result)
+    {
+        if (_quotaClassifier.Detect(kind, result.AgentStderr, result.AgentStdout) is not null)
+            return "failure:quota";
+        if (IsLlmAgentExecutionFailure(result))
+            return "failure:agent";
+        return "success";
     }
 
     private sealed class AgentAttemptTimeoutException : OperationCanceledException
@@ -6296,6 +6488,12 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentResult agentResult;
             var startedAt = DateTimeOffset.UtcNow;
             var stopwatch = Stopwatch.StartNew();
+            // Merge-conflict rework is a distinct agent phase that runs outside the
+            // InvokeAgentWithQuotaFallbackAsync chokepoint, so record its
+            // involvement row directly — otherwise this real sandbox run would
+            // leave no audit-trail entry and break operator attribution.
+            var conflictInvolvementId = await RecordInvolvementStartAsync(
+                item.Id, runner.Kind, item.ModelId, ConflictReworkPhaseKey, iteration: null);
             try
             {
                 agentResult = await runner.RunAsync(
@@ -6304,7 +6502,20 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
+                await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
                 throw phase.Wrap(oce);
+            }
+            catch (Exception ex)
+            {
+                // A phase timeout (PhaseCancellationException) or any other
+                // unexpected failure from the agent run must still close the
+                // involvement row — otherwise it dangles in-progress forever,
+                // unlike InvokeAgentWithQuotaFallbackAsync / ExecAuditorAsync
+                // which both finalize on generic Exception. OutcomeForFailure
+                // maps cancellation/timeout to failure:cancelled and everything
+                // else to failure:agent.
+                await FinalizeInvolvementAsync(conflictInvolvementId, OutcomeForFailure(ex));
+                throw;
             }
             stopwatch.Stop();
             var endedAt = DateTimeOffset.UtcNow;
@@ -6314,6 +6525,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
+            // A semantic-incompatible declaration is the disposition the pipeline
+            // acts on (it parks the item with that reason) even though the agent
+            // legitimately exits non-zero to signal it — so it must be checked
+            // before the generic !Success → failure:agent fallback, otherwise the
+            // involvement outcome would mislabel it as a plain agent failure.
+            await FinalizeInvolvementAsync(conflictInvolvementId,
+                semanticIncompatible is not null ? "failure:semantic-incompatible"
+                : !agentResult.Success ? "failure:agent"
+                : "success");
             if (semanticIncompatible is not null)
             {
                 return new ConflictReworkAgentOutcome(
