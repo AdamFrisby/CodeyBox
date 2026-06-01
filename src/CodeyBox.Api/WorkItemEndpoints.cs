@@ -308,6 +308,71 @@ internal static class WorkItemEndpoints
             requiredCapabilities = normalised!;
         }
 
+        // ── check-and-act validation ──────────────────────────────────────────
+        // When the caller supplies `check`, the resulting work item is a
+        // CheckAndAct job: a single agent invocation that answers Question
+        // and returns a structured verdict; on yes (or the configured
+        // ActionableAnswer) the orchestrator enqueues OnYes as a normal item.
+        // Validate the same shape rules as the top-level item — title/prompt
+        // lengths, branch/control characters — so the follow-up cannot be
+        // rejected at enqueue time after the check has already run.
+        var jobType = JobType.Normal;
+        CheckAndActSpec? checkSpec = null;
+        if (req.Check is not null)
+        {
+            var check = req.Check;
+            if (string.IsNullOrWhiteSpace(check.Question))
+                return Results.BadRequest(new { error = "check.question is required" });
+            if (check.Question.Length > 64 * 1024)
+                return Results.BadRequest(new { error = "check.question must be <= 64KB" });
+            if (check.OnYes is null)
+                return Results.BadRequest(new { error = "check.onYes is required when check is provided" });
+            var onYes = check.OnYes;
+            if (string.IsNullOrWhiteSpace(onYes.Title))
+                return Results.BadRequest(new { error = "check.onYes.title is required" });
+            try { Validation.ValidateNoOptionLikeOrControl(onYes.Title, "check.onYes.title"); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            if (onYes.Title.Length > 200)
+                return Results.BadRequest(new { error = "check.onYes.title must be <= 200 chars" });
+            if (string.IsNullOrWhiteSpace(onYes.Prompt))
+                return Results.BadRequest(new { error = "check.onYes.prompt is required" });
+            if (onYes.Prompt.Length > 64 * 1024)
+                return Results.BadRequest(new { error = "check.onYes.prompt must be <= 64KB" });
+            if (!string.IsNullOrWhiteSpace(onYes.Agent))
+            {
+                var kind = new AgentKind(onYes.Agent);
+                if (!agents.TryGet(kind, out _))
+                    return Results.BadRequest(new
+                    {
+                        error = $"unknown agent '{onYes.Agent}' on check.onYes",
+                        available = agents.Available.Select(a => a.Value),
+                    });
+            }
+            if (onYes.AgentClassId is { Length: > 200 })
+                return Results.BadRequest(new { error = "check.onYes.agentClassId must be <= 200 chars" });
+            if (onYes.DependsOn is { Length: > 100 })
+                return Results.BadRequest(new { error = "check.onYes.dependsOn must contain at most 100 entries" });
+
+            checkSpec = new CheckAndActSpec
+            {
+                Question = check.Question,
+                ActionableAnswer = check.ActionableAnswer ?? true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = onYes.Title,
+                    Prompt = onYes.Prompt,
+                    MinModelScore = onYes.MinModelScore,
+                    Priority = onYes.Priority,
+                    Agent = string.IsNullOrWhiteSpace(onYes.Agent) ? null : onYes.Agent.Trim(),
+                    AgentClassId = string.IsNullOrWhiteSpace(onYes.AgentClassId) ? null : onYes.AgentClassId.Trim(),
+                    DependsOn = onYes.DependsOn is null
+                        ? null
+                        : onYes.DependsOn.Where(d => !string.IsNullOrWhiteSpace(d)).Select(d => d.Trim()).ToList(),
+                },
+            };
+            jobType = JobType.CheckAndAct;
+        }
+
         // Use creation timestamp as default queue position so new items sort after
         // any explicitly reordered items (which get small integers 1, 2, 3 …).
         var item = new WorkItem
@@ -328,6 +393,8 @@ internal static class WorkItemEndpoints
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,
+            JobType = jobType,
+            Check = checkSpec,
         };
         if (req.WorkTimeoutMinutes is { } w)
             item = item with { WorkTimeout = TimeSpan.FromMinutes(Math.Clamp(w, 1, 480)) };
@@ -2037,7 +2104,11 @@ internal static class WorkItemEndpoints
                 .ToList(),
             RequiredCapabilities: item.RequiredCapabilities.Count == 0
                 ? Array.Empty<string>()
-                : item.RequiredCapabilities.ToList());
+                : item.RequiredCapabilities.ToList(),
+            JobType: item.JobType.ToString(),
+            Check: item.Check,
+            Verdict: item.Verdict,
+            OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString());
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -2245,7 +2316,38 @@ public sealed record CreateWorkItemRequest(
     IReadOnlyDictionary<string, string>? ExternalIds = null,
     // Clearance tags the agent member must declare. Empty (default) ⇒ any
     // member of the resolved AgentClass is eligible.
-    IReadOnlyList<string>? RequiredCapabilities = null);
+    IReadOnlyList<string>? RequiredCapabilities = null,
+    // When present, creates a JobType.CheckAndAct item: the agent evaluates
+    // the supplied yes/no question against the project repo and returns a
+    // structured verdict. On a matching verdict, the orchestrator enqueues
+    // the OnYes follow-up as a normal work item parented to the check.
+    CheckAndActRequest? Check = null);
+
+/// <summary>
+/// Request payload for the optional <c>check</c> block on
+/// <c>POST /workitems</c>. When supplied, the resulting work item is created
+/// with <see cref="JobType.CheckAndAct"/>; the orchestrator runs a single
+/// agent invocation in a sandbox that answers <see cref="Question"/> against
+/// the project repo and returns a structured verdict.
+/// </summary>
+public sealed record CheckAndActRequest(
+    string Question,
+    OnYesActionRequest OnYes,
+    bool? ActionableAnswer = null);
+
+/// <summary>
+/// Request payload for the follow-up work item the orchestrator should
+/// enqueue when a check verdict matches the actionable condition. Mirrors
+/// the relevant subset of <see cref="CreateWorkItemRequest"/>.
+/// </summary>
+public sealed record OnYesActionRequest(
+    string Title,
+    string Prompt,
+    int? MinModelScore = null,
+    int? Priority = null,
+    string? Agent = null,
+    string? AgentClassId = null,
+    string[]? DependsOn = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -2333,7 +2435,13 @@ public sealed record WorkItemDto(
     int TransientCancelRetries = 0,
     int PromptRevision = 1,
     IReadOnlyList<WorkItemIterationDto>? Iterations = null,
-    IReadOnlyList<string>? RequiredCapabilities = null);
+    IReadOnlyList<string>? RequiredCapabilities = null,
+    string JobType = "Normal",
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    CheckAndActSpec? Check = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    CheckVerdict? Verdict = null,
+    string? OriginCheckWorkItemId = null);
 
 public sealed record AgentFallbackDto(
     string Id,
