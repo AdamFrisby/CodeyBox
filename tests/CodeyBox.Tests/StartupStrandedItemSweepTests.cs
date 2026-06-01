@@ -132,6 +132,8 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     [InlineData(WorkItemState.Reworking, WorkItemState.Queued)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Merged)]
     public async Task Sweep_ResumableState_NoWorker_RecoversToMappedState(
         WorkItemState fromState, WorkItemState expectedTo)
     {
@@ -193,21 +195,49 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_OnlyTouchesWorkerOwnedStates()
+    public async Task Sweep_PhaseBoundaryStates_NoWorker_RedispatchesWithoutRecoveryAttempt()
     {
-        // Queued, WorkComplete, AuditPassed, Merged, Done, etc. are not
-        // worker-owned mid-flight states; the sweep must leave them alone.
         var states = new[]
         {
-            WorkItemState.Queued,
             WorkItemState.WorkComplete,
             WorkItemState.AuditPassed,
             WorkItemState.Merged,
+        };
+        var ids = new List<WorkItemId>();
+        foreach (var state in states)
+        {
+            var item = MakeItem(state) with { LastError = "diagnostic" };
+            await _store.CreateAsync(item);
+            ids.Add(item.Id);
+        }
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        for (int i = 0; i < states.Length; i++)
+        {
+            var after = await _store.GetAsync(ids[i]);
+            Assert.Equal(states[i], after!.State);
+            Assert.Equal(0, after.RecoveryAttempts);
+            Assert.Equal("diagnostic", after.LastError);
+        }
+        Assert.Equal(states.Length, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task Sweep_OnlySkipsNonReaperOwnedStates()
+    {
+        // Queued, terminal, and parked states are not owned by dead-worker
+        // recovery; the sweep must leave them alone.
+        var states = new[]
+        {
+            WorkItemState.Queued,
             WorkItemState.Done,
             WorkItemState.Failed,
             WorkItemState.Cancelled,
-            WorkItemState.UpstreamPushing,
-            WorkItemState.ReworkingForConflict,
+            WorkItemState.AuditFailed,
+            WorkItemState.NeedsOperatorInput,
+            WorkItemState.WaitingForQuotaReset,
         };
         var ids = new List<WorkItemId>();
         foreach (var s in states)

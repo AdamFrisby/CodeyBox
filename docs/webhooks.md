@@ -35,7 +35,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.budget_recovered` | Project's 30-day spend dropped back below the warning threshold (see [Details](#projectbudget_warning-details)) |
 | `project.queue_paused` | Per-project queue was paused (manual or auto) |
 | `project.queue_resumed` | Per-project queue was resumed |
-| `work_item.recovered` | Dead-worker reaper recovered a work item that was mid-flight when its worker crashed (see [Details](#recovered-details)) |
+| `work_item.recovered` | Dead-worker reaper recovered a work item with a state-changing crash recovery transition (see [Details](#recovered-details)) |
 | `work_item.auto_retry` | Quota auto-retry scheduler re-queued a Failed work item once its quota window reopened (see [Details](#auto_retry-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
@@ -423,7 +423,7 @@ See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger se
 | `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
 | `maxRecoveryAttempts` | int | The configured cap before the item is failed permanently |
 
-`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
+`work_item.recovered` fires even when `toState` is `"Failed"` (i.e. the cap was exceeded). Phase-boundary re-dispatches such as `AuditPassed` → `AuditPassed` do not emit this webhook because no recovery transition occurred. Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
 
 ### `agent_smoke_failed` details
 

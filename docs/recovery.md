@@ -6,7 +6,7 @@ CodeyBox detects worker crashes via a heartbeat registry and automatically re-qu
 
 ## Problem
 
-If the orchestrator process is killed mid-flight (OOM, host shutdown, `SIGKILL`), any work items in a non-terminal worker-owned state (`Working`, `Auditing`, `Reworking`, `Merging`, `UpstreamPushing`) are left orphaned. On restart, `ReplayPendingAsync` re-queues them, but items that crashed _during_ a phase rather than _between_ restarts require the operator to manually `force-fail` and retry today.
+If the orchestrator process is killed mid-flight (OOM, host shutdown, `SIGKILL`), any work items in a non-terminal worker-owned state (`Working`, `Auditing`, `Reworking`, `Merging`, `UpstreamPushing`) or a durable phase-boundary state (`WorkComplete`, `AuditPassed`, `Merged`) may be left orphaned. On restart, recovery re-queues them at the correct resume point.
 
 The dead-worker reaper fixes this: workers prove they are alive every N seconds; items whose worker hasn't heartbeated in M seconds are presumed dead and transitioned back to a safe pick-up point.
 
@@ -42,8 +42,9 @@ Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now
 3. For each deleted row whose `current_work_item_id IS NOT NULL`:
    - Look up the work item.
    - If it is in a recoverable worker-owned state (see table below), increment `RecoveryAttempts` and transition it.
+   - If it is in a durable phase-boundary state, re-dispatch it without changing state or consuming a recovery attempt.
    - If `RecoveryAttempts` exceeds `MaxRecoveryAttempts` (default **2**): transition to `Failed` with `LastError = "exceeded MaxRecoveryAttempts"`.
-   - Fire a `work_item.recovered` webhook event.
+   - Fire a `work_item.recovered` webhook event for state-changing recovery transitions.
    - Re-enqueue the item for immediate pick-up.
 
 The reaper also runs **once synchronously at orchestrator startup** (before the worker pool begins pulling from the queue), ensuring that items orphaned by the _previous_ process crash are recovered before any new work starts.
@@ -52,13 +53,16 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
-| `Working` | `Queued` | Re-run the work phase from scratch |
+| `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
 | `Reworking` | `Queued` | Re-run the work phase from scratch |
+| `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary without consuming a recovery attempt |
 | `Auditing` | `WorkComplete` | Re-audit the same commit |
+| `AuditPassed` | `AuditPassed` | Re-dispatch merge from the phase boundary without consuming a recovery attempt |
 | `Merging` | `AuditPassed` | Re-attempt the merge |
+| `Merged` | `Merged` | Re-dispatch upstream push/finalization from the phase boundary without consuming a recovery attempt |
 | `UpstreamPushing` | `Merged` | Re-attempt the upstream push |
 | Any terminal state | — (no action) | Already finished |
-| `Queued`, `WorkComplete`, `AuditPassed`, `Merged` | — (no action) | Not worker-owned; safe without intervention |
+| `Queued` | — (no action) | Not worker-owned; safe without intervention |
 
 ---
 

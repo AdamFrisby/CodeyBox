@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser
 {
     // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -113,6 +113,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // dispatched but whose persisted state has not yet flipped out of Queued.
     private readonly ConcurrentDictionary<WorkItemId, byte> _activeItems = new();
 
+    // One idempotent lease per spawned worker-pool slot. The worker task's
+    // finally block normally releases the lease; the dead-worker reaper can
+    // release the same lease early by registry worker id if it claims a stale
+    // row for this process and decides not to re-dispatch the item. The lease's
+    // single-shot release prevents a later task exit from double-decrementing
+    // _currentlyRunning or over-releasing the semaphore.
+    private readonly ConcurrentDictionary<string, WorkerSlotLease> _workerSlotsByRegistryId = new(StringComparer.Ordinal);
+
     // Tracks work item IDs that are currently sleeping in a deferred-requeue
     // delay (budget / quota / project-pause defer). They remain Queued in the
     // store; the pickup query skips them until the delay fires and removes them.
@@ -177,6 +185,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
+        _reaper?.AttachWorkerPoolSlotReleaser(this);
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -393,6 +402,52 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         catch (ObjectDisposedException) { /* shutdown teardown race; gate already disposed */ }
     }
 
+    public bool TryReleaseRecoveredWorkerSlot(string workerId, WorkItemId? workItemId, string reason)
+    {
+        if (!_workerSlotsByRegistryId.TryGetValue(workerId, out var lease))
+            return false;
+
+        if (workItemId is not null && lease.WorkItemId != workItemId.Value)
+        {
+            _log.LogWarning(
+                "Recovery ({WorkerId}): stale worker row referenced item {RecoveredItemId}, but active pool lease is for {ActiveItemId}; slot release skipped",
+                workerId, workItemId.Value, lease.WorkItemId);
+            return false;
+        }
+
+        if (!ReleaseWorkerSlotLease(lease))
+            return false;
+
+        _log.LogWarning(
+            "Worker pool: worker {WorkerIndex} slot for work item {WorkItemId} released by recovery ({WorkerId}): {Reason}",
+            lease.WorkerIndex, lease.WorkItemId, workerId, reason);
+        return true;
+    }
+
+    private void AttachRegistryWorkerId(WorkerSlotLease lease, string workerId)
+    {
+        if (!lease.TryAttachRegistryWorkerId(workerId))
+            return;
+
+        _workerSlotsByRegistryId[workerId] = lease;
+        if (lease.IsReleased)
+            _workerSlotsByRegistryId.TryRemove(workerId, out _);
+    }
+
+    private bool ReleaseWorkerSlotLease(WorkerSlotLease lease)
+    {
+        if (!lease.TryMarkReleased())
+            return false;
+
+        _activeItems.TryRemove(lease.WorkItemId, out _);
+        if (lease.RegistryWorkerId is { } workerId)
+            _workerSlotsByRegistryId.TryRemove(workerId, out _);
+        Interlocked.Decrement(ref _currentlyRunning);
+        AuditLog.WorkerPoolWorkerFinished(lease.WorkerIndex, lease.WorkItemId);
+        TryReleaseConcurrencyGate();
+        return true;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // R8-core suspend/resume: SandboxResumeOnStartupService.StartingAsync
@@ -562,18 +617,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // Increment before Task.Run so the counter is never transiently negative
             // if the task's finally block executes before we reach the increment.
             Interlocked.Increment(ref _currentlyRunning);
+            var slotLease = new WorkerSlotLease(workerIndex, capturedId);
             var task = Task.Run(async () =>
             {
                 AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
                 try
                 {
-                    await RunItemAsync(workerIndex, capturedId, stoppingToken);
+                    await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref _currentlyRunning);
-                    AuditLog.WorkerPoolWorkerFinished(workerIndex, capturedId);
-                    TryReleaseConcurrencyGate();
+                    ReleaseWorkerSlotLease(slotLease);
                 }
             });
 
@@ -696,9 +750,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     ///                                  all false, triggering a full pipeline replay from scratch)
     ///   WorkComplete / AuditPassed / Merged → (re-enqueued as-is; pipeline resumes at correct phase)
     ///
-    /// Each recovery increments <see cref="WorkItem.RecoveryAttempts"/>. Items that
-    /// exceed <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned
-    /// to <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
+    /// State-changing interrupted recovery increments
+    /// <see cref="WorkItem.RecoveryAttempts"/>. Items that exceed
+    /// <see cref="OrchestratorOptions.MaxRecoveryAttempts"/> are transitioned to
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/> instead.
+    /// Durable phase-boundary pass-throughs are re-enqueued without consuming a
+    /// recovery attempt.
     /// </summary>
     private async Task ReplayPendingAsync(CancellationToken ct)
     {
@@ -727,6 +784,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         foreach (var item in allItems)
         {
+            if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
+                continue;
+
             var recovered = TryBuildRecoveredState(item);
             if (recovered is not null)
             {
@@ -790,10 +850,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// if the item does not need recovery (terminal or Queued).
     ///
     /// <para>
-    /// When a <see cref="DeadWorkerReaper"/> is wired, items in
-    /// <see cref="WorkItemState.Working"/>, <see cref="WorkItemState.Reworking"/>,
-    /// <see cref="WorkItemState.Auditing"/>, and <see cref="WorkItemState.Merging"/>
-    /// are handled earlier by <see cref="DeadWorkerReaper.SweepStrandedItemsAsync"/>
+    /// When a <see cref="DeadWorkerReaper"/> is wired, states handled by
+    /// <see cref="DeadWorkerReaper.HandlesRecoveryState"/> are handled earlier by
+    /// <see cref="DeadWorkerReaper.RunOnceAsync"/> or
+    /// <see cref="DeadWorkerReaper.SweepStrandedItemsAsync"/>
     /// — that path consults the worker registry to skip items owned by a live
     /// worker, which this unconditional replay cannot do. Returning null here
     /// for those states prevents double-recovery (duplicate <c>RecoveryAttempts</c>
@@ -804,13 +864,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     private WorkItem? TryBuildRecoveredState(WorkItem item)
     {
-        // Worker-owned mid-flight states are handled by the registry-aware
-        // startup sweep when a reaper is wired. Skip them here to avoid
-        // clobbering items held by a live peer and to avoid double-recovery.
-        if (_reaper is not null && item.State is WorkItemState.Working
-            or WorkItemState.Reworking
-            or WorkItemState.Auditing
-            or WorkItemState.Merging)
+        // Reaper-owned states are handled by the registry-aware startup sweep
+        // when a reaper is wired. Skip them here to avoid clobbering items held
+        // by a live peer and to avoid duplicate recovery / queue kicks.
+        if (_reaper is not null && DeadWorkerReaper.HandlesRecoveryState(item.State))
         {
             return null;
         }
@@ -893,7 +950,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return item.With(targetState.Value) with { RecoveryAttempts = newAttempts };
     }
 
-    private async Task RunItemAsync(int workerIndex, WorkItemId id, CancellationToken ct)
+    private async Task RunItemAsync(int workerIndex, WorkItemId id, WorkerSlotLease slotLease, CancellationToken ct)
     {
         var item = await _store.GetAsync(id, ct);
         if (item is null)
@@ -955,6 +1012,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try
             {
                 await _workerRegistry.RegisterAsync(reg, ct);
+                AttachRegistryWorkerId(slotLease, registeredWorkerId);
                 AuditLog.WorkerRegistered(registeredWorkerId, reg.HostName, reg.ProcessId);
             }
             catch (Exception ex)
@@ -1339,6 +1397,33 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 catch (Exception ex) { _log.LogError(ex, "OnWorkItemTerminalAsync threw for release {Id}", completedReleaseId); }
             });
         }
+    }
+
+    private sealed class WorkerSlotLease
+    {
+        private int _released;
+
+        public WorkerSlotLease(int workerIndex, WorkItemId workItemId)
+        {
+            WorkerIndex = workerIndex;
+            WorkItemId = workItemId;
+        }
+
+        public int WorkerIndex { get; }
+        public WorkItemId WorkItemId { get; }
+        public string? RegistryWorkerId { get; private set; }
+        public bool IsReleased => Volatile.Read(ref _released) != 0;
+
+        public bool TryAttachRegistryWorkerId(string workerId)
+        {
+            if (IsReleased)
+                return false;
+            RegistryWorkerId = workerId;
+            return true;
+        }
+
+        public bool TryMarkReleased()
+            => Interlocked.Exchange(ref _released, 1) == 0;
     }
 
     private sealed record BudgetDeferral(string Reason, TimeSpan RecheckIn);
