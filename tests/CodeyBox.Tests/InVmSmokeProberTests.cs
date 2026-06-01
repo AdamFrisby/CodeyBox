@@ -1027,6 +1027,172 @@ public sealed class InVmSmokeProberTests
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_DefaultFailClosed_BenchesWithinProvisionTimeout()
+    {
+        // Production hang observed 2026-06-01: ISandboxProvider.CreateAsync (VM
+        // clone + "Launching multipass VM") never returns; per-step exec timeouts
+        // can't fire because no sandbox exists to exec into. Without a hard
+        // provisioning timeout the entire dispatch gate hangs and the worker pool
+        // wedges. ProvisionTimeoutSeconds=1 makes the prober bench-and-continue
+        // rather than wait forever for the inner CreateAsync.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                ProvisionTimeoutSeconds = 1,
+                // Gate deadline higher than provisioning timeout so we exercise
+                // the provisioning catch, not the outer deadline net.
+                GateDeadlineSeconds = 30,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // Provisioning timeout (1s) fires; the gate returns well under the gate
+        // deadline (30s) and well before any wall-clock deadlock would mature.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A")); // fault never cached → self-heals
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_ProvisioningHang_FailsOpen_DoesNotBench_DoesNotHang()
+    {
+        // Companion to the dispatch-gate case: the background sweep always fails
+        // open, so a stuck CreateAsync must NOT bench a possibly-working agent —
+        // but it also must NOT wedge the sweep loop forever. The provisioning
+        // timeout still fires (transient fault); ProbeAllAsync swallows it
+        // without mutating availability.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                ProvisionTimeoutSeconds = 1,
+                GateDeadlineSeconds = 30,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.ProbeAllAsync(CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"sweep took {sw.Elapsed}; provisioning timeout did not fire");
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available); // sweep fails open
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_FailOpenOptOut_DoesNotBench_DoesNotHang()
+    {
+        // Even on the gate path under fail-open, a stuck CreateAsync must not
+        // wedge the worker — the provisioning timeout fires, the agent stays
+        // available (fail-open), and the gate returns.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                ProvisionTimeoutSeconds = 1,
+                GateDeadlineSeconds = 30,
+                FailClosedOnProbeFault = false,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_GateDeadline_BenchesWithinBound_EvenIfInnerNeverReturns()
+    {
+        // Defect-in-depth: an inner step that ignores the per-operation timeouts
+        // (here the sandbox dispose hangs and CreateAsync also hangs without
+        // honouring ProvisionTimeout) must still not wedge the worker forever.
+        // GateDeadlineSeconds=1 with the provisioning timeout disabled and the
+        // provider's CreateAsync hanging forces the outer deadline to be the only
+        // thing that can unwedge the gate.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                ProvisionTimeoutSeconds = 0, // disable inner provisioning timeout
+                GateDeadlineSeconds = 1,     // only the outer deadline can fire
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; deadline did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe deadline exceeded", av.Reason);
+    }
+
     private static bool IsAgent(SandboxExec exec, string sub) =>
         exec.Argv.Count >= 2 && exec.Argv[0] == CursorAgentRunner.DefaultBinary && exec.Argv[1] == sub;
 
@@ -1136,6 +1302,29 @@ public sealed class InVmSmokeProberTests
 
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         }
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync hangs forever (until cancelled). Pins
+    /// the production hang observed 2026-06-01: VM provisioning (clone + launch)
+    /// never returns, so per-step exec timeouts never get a chance to fire
+    /// because no sandbox exists to exec into. Drives the provisioning timeout
+    /// and the gate deadline tests.
+    /// </summary>
+    private sealed class HangingCreateSandboxProvider : ISandboxProvider
+    {
+        public string Name => "hanging-create";
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct); // completes only on cancellation
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class MutableClock : TimeProvider

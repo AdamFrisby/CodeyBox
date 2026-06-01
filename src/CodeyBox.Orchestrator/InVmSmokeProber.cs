@@ -200,7 +200,48 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault). Probe
             // the pinned baseline when supplied so the verdict matches the image
             // the dispatch will clone; otherwise fall back to the active baseline.
-            await ProbeAgentAsync(probe, baselineRef ?? ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
+            var probeTask = ProbeAgentAsync(
+                probe, baselineRef ?? ResolveBaselineRef(), ct,
+                benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
+
+            // The provisioning/exec/step timeouts inside ProbeAgentAsync cover the
+            // expected hangs, but a defect-in-depth deadline guarantees the gate
+            // returns a verdict (or fail-closed bench) within a bounded wall-clock
+            // even if some inner step those timeouts don't cover (a stuck sandbox
+            // DisposeAsync, an unanticipated synchronous hang in a custom probe)
+            // would otherwise leave the worker waiting forever. Non-positive
+            // disables it (tests with synthetic clocks).
+            if (_opts.GateDeadlineSeconds <= 0)
+            {
+                await probeTask;
+                return;
+            }
+
+            var gateDeadline = TimeSpan.FromSeconds(_opts.GateDeadlineSeconds);
+            var winner = await Task.WhenAny(probeTask, Task.Delay(gateDeadline, ct));
+            ct.ThrowIfCancellationRequested();
+
+            if (winner != probeTask)
+            {
+                // Gate deadline elapsed before the probe produced a verdict. Bench
+                // under fail-closed and return so the worker can continue; the
+                // in-flight probeTask is left running and observed for its eventual
+                // exception via ContinueWith — its later verdict reconciles via the
+                // registry/cache on the next gate call. NEVER block the worker
+                // longer than the deadline, even if the inner probe never returns.
+                ObserveOrphanedProbe(kind, probeTask);
+                _log.LogWarning(
+                    "In-VM smoke gate: probe for {Agent} exceeded deadline {Deadline}s; benching",
+                    kind.Value, _opts.GateDeadlineSeconds);
+                BenchTransientFaultIfRequested(
+                    kind, $"probe deadline exceeded ({_opts.GateDeadlineSeconds}s)",
+                    _opts.FailClosedOnProbeFault);
+                return;
+            }
+
+            // Probe finished within the deadline; surface its outcome / exception
+            // via the existing catches.
+            await probeTask;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -224,6 +265,29 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             _log.LogWarning(ex, "In-VM smoke gate: probe for {Agent} threw unexpectedly", kind.Value);
             BenchTransientFaultIfRequested(kind, "probe threw unexpectedly", _opts.FailClosedOnProbeFault);
         }
+    }
+
+    /// <summary>
+    /// Attaches a continuation so a probe task we walked away from (gate deadline
+    /// exceeded) doesn't surface as an UnobservedTaskException if it later faults,
+    /// and so its eventual verdict is visible in logs for post-hoc diagnosis. The
+    /// task itself may still mutate the availability registry on completion;
+    /// that's the desired reconciliation path.
+    /// </summary>
+    private void ObserveOrphanedProbe(AgentKind kind, Task probeTask)
+    {
+        _ = probeTask.ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                _log.LogDebug(
+                    t.Exception,
+                    "In-VM smoke gate: orphaned probe for {Agent} faulted after deadline",
+                    kind.Value);
+            else
+                _log.LogDebug(
+                    "In-VM smoke gate: orphaned probe for {Agent} eventually completed after deadline",
+                    kind.Value);
+        }, TaskScheduler.Default);
     }
 
     /// <summary>
@@ -283,6 +347,16 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         try
         {
             result = await RunStepsInSandboxAsync(credential, baselineRef, steps, sw, ct);
+        }
+        catch (TimeoutException ex)
+        {
+            // Provisioning ran past ProvisionTimeoutSeconds — typed exception so
+            // the operator signal in audit/logs distinguishes a stuck VM clone
+            // from a per-step exec timeout (both are transient infra, but the
+            // root cause and remediation differ — clone hangs point at the
+            // sandbox host / multipass daemon; per-step hangs point at the CLI).
+            _log.LogWarning(ex, "In-VM smoke for {Agent}: provisioning timed out; treating as transient", probe.Kind.Value);
+            return BenchTransientFaultIfRequested(probe.Kind, "probe provisioning timed out", benchOnTransientFault);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -351,7 +425,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         CancellationToken ct)
     {
         var spec = BuildSpec(credential, baselineRef);
-        await using var sandbox = await _provider.CreateAsync(spec, ct);
+        await using var sandbox = await CreateSandboxWithProvisionTimeoutAsync(spec, ct);
 
         foreach (var step in steps)
         {
@@ -379,6 +453,37 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         sw.Stop();
         return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
+    }
+
+    /// <summary>
+    /// Provisions a sandbox under a hard provisioning timeout
+    /// (<see cref="InVmSmokeOptions.ProvisionTimeoutSeconds"/>). The per-step
+    /// exec timeout cannot bound this — provisioning has to produce a sandbox
+    /// before any step runs — so a wedged baseline clone / "multipass launch"
+    /// (observed 2026-06-01) would otherwise hang the gate forever. On overrun
+    /// we surface a <see cref="TimeoutException"/> rather than the raw OCE so
+    /// the caller's transient-fault catch can tag it with a clear reason
+    /// ("probe provisioning timed out") distinct from per-step exec timeouts.
+    /// Non-positive disables the timeout (tests with synthetic clocks).
+    /// </summary>
+    private async Task<ISandbox> CreateSandboxWithProvisionTimeoutAsync(
+        SandboxSpec spec, CancellationToken ct)
+    {
+        if (_opts.ProvisionTimeoutSeconds <= 0)
+            return await _provider.CreateAsync(spec, ct);
+
+        var provisionTimeout = TimeSpan.FromSeconds(_opts.ProvisionTimeoutSeconds);
+        using var provisionCts = new CancellationTokenSource(provisionTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, provisionCts.Token);
+        try
+        {
+            return await _provider.CreateAsync(spec, linked.Token);
+        }
+        catch (OperationCanceledException) when (provisionCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
+        }
     }
 
     private SandboxSpec BuildSpec(AgentCredential? credential, string baselineRef)

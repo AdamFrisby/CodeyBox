@@ -36,6 +36,46 @@ public sealed record InVmSmokeOptions
     public int StepTimeoutSeconds { get; init; } = 30;
 
     /// <summary>
+    /// Hard timeout on the VM provisioning step (<see cref="ISandboxProvider.CreateAsync"/>):
+    /// baseline clone, "multipass launch" / "multipass start", and any wait for
+    /// the sandbox to reach Running. Default 120s.
+    ///
+    /// <para>The per-step exec timeout (<see cref="StepTimeoutSeconds"/>) only
+    /// bounds <em>each in-sandbox command</em>; it cannot fire until provisioning
+    /// has produced a sandbox to exec into. A wedged or pathologically slow clone
+    /// (observed 2026-06-01: multipass logs "Launching multipass VM ... (10-30s)"
+    /// and never returns, while /repo is never mounted) would otherwise hang the
+    /// dispatch gate forever — pre-step timeouts never fire, the gate never reaches
+    /// a verdict, <see cref="FailClosedOnProbeFault"/> only triggers on a verdict
+    /// fault (not a hang), so every worker wedges before mounting /repo and the
+    /// queue stalls. This timeout is the hard floor under that failure mode: an
+    /// overrun throws a transient fault that benches the agent under the
+    /// configured policy (fail-closed on the gate, fail-open on the sweep), the
+    /// worker pool slot is released by the existing finally block, and dispatch
+    /// continues.</para>
+    /// </summary>
+    public int ProvisionTimeoutSeconds { get; init; } = 120;
+
+    /// <summary>
+    /// Top-level deadline on the dispatch gate call
+    /// (<see cref="InVmSmokeProber.EnsureProbedAsync"/>) — a safety net that
+    /// guarantees the gate returns a verdict (or a fail-closed bench) within a
+    /// bounded wall-clock time, even if some inner step the per-operation timeouts
+    /// don't cover (a stuck sandbox dispose, an unanticipated hang in a custom
+    /// probe) would otherwise leave the worker waiting forever. Default 180s.
+    ///
+    /// <para>When the deadline fires the gate benches the agent under the
+    /// <see cref="FailClosedOnProbeFault"/> policy and returns; the in-flight
+    /// probe task is left to finish in the background and reconciles on the next
+    /// gate call. Non-positive disables the deadline (the gate then relies on
+    /// inner timeouts only — appropriate for tests with synthetic clocks). The
+    /// background sweep (<see cref="InVmSmokeProber.ProbeAllAsync"/>) is not
+    /// bound by this deadline since it performs no dispatch and cannot wedge a
+    /// worker; the per-operation timeouts apply there.</para>
+    /// </summary>
+    public int GateDeadlineSeconds { get; init; } = 180;
+
+    /// <summary>
     /// How the <em>dispatch gate</em> (<see cref="InVmSmokeProber.EnsureProbedAsync"/>)
     /// reacts when an in-VM probe cannot run to a verdict — provisioning fault,
     /// exec error, step timeout, or credential-store fault.
