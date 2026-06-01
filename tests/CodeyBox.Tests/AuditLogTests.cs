@@ -515,6 +515,20 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal("attempt timed out after 240m", GetScalar<string>(evt, "Reason"));
     }
 
+    [Fact]
+    public void RebaseResolverAgentSelected_emits_event_naming_chosen_agent()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.RebaseResolverAgentSelected(workItemId, AgentKind.Cursor);
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("rebase_resolver.agent_selected", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("cursor", GetScalar<string>(evt, "ChosenAgent"));
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)

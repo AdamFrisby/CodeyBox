@@ -860,9 +860,11 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (AgentUnavailableException ex)
         {
             // Distinct from MergeConflictResolutionFailed: the resolver never
-            // ran because no text-only-capable agent had viable credentials.
-            // Failure is structured so operators can grep failureKind=agent_unavailable
-            // and fix the credential gap rather than chasing a phantom merge bug.
+            // ran because no candidate passed the pre-dispatch resolver gates
+            // (for example quota/budget exhaustion or missing routing support).
+            // Failure is structured so operators can grep
+            // failureKind=agent_unavailable and fix the routing, quota, or
+            // credential gap rather than chasing a phantom merge bug.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
         }
@@ -1194,8 +1196,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (rebaseConflictFiles.Count > 0 && rebaseReviewRunner is not null)
             {
-                // Reuse the cascade member that actually resolved conflicts so
-                // the advisory review never routes back to a failed first choice.
+                // Reuse the exact runner/credential the resolver already chose
+                // for conflict resolution. A non-empty conflict-file set means a
+                // conflict was resolved, so the pair is materialised; reusing it
+                // keeps the advisory review on the same agent and avoids
+                // emitting a second rebase_resolver.agent_selected line for one
+                // work item even if cap/quota state shifts between resolution
+                // and review.
                 if (swallowReviewFailures)
                 {
                     try
@@ -1458,6 +1465,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
         var resolvedAnyConflict = false;
+        var selectedResolverLogged = false;
         IAgentRunner? chosenResolver = null;
         AgentCredential? chosenCredential = null;
         // Candidate list is built lazily on first conflict so a clean rebase
@@ -1502,6 +1510,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 chosenResolver = resolveResult.ChosenRunner;
                 chosenCredential = resolveResult.ChosenCredential;
+                if (!selectedResolverLogged)
+                {
+                    AuditLog.RebaseResolverAgentSelected(item.Id, chosenResolver.Kind);
+                    selectedResolverLogged = true;
+                }
                 resolvedAnyConflict = true;
 
                 rebase = await sandbox.ExecAsync(new SandboxExec
@@ -1534,6 +1547,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
         _ = repoId;
         _ = oldTip;
+        // The chosen runner/credential are non-null whenever a conflict was
+        // actually resolved. Returning them lets the caller reuse the chosen
+        // pair for the advisory merge security review instead of re-running
+        // resolver selection.
         return new PickupRebaseResolutionResult(
             resolvedAnyConflict ? conflictFiles.ToArray() : [],
             resolvedAnyConflict ? chosenResolver : null,
@@ -1542,73 +1559,74 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Builds the ordered candidate list the agentic conflict resolver walks
-    /// for a single rebase or merge. Order: primary runner first, then class
-    /// chain fallbacks (ranked by the router), with at-cap candidates pushed
-    /// to the back so a saturated subscription budget yields to a member with
-    /// headroom before being used as a last-resort. Throws
-    /// <see cref="AgentUnavailableException"/> if no candidate has resolvable
-    /// credentials so the work item parks as failureKind=agent_unavailable
-    /// instead of MergeConflictResolutionFailed.
+    /// for a single rebase or merge. The configured
+    /// <see cref="ProjectAudit.AuditAgent"/> is the primary when it is set and
+    /// registered, falling back to the work runner otherwise. Candidates are
+    /// quota-gated with the same audit quota router path, then at-cap agents are
+    /// pushed to the back while retaining them as last-resort candidates.
+    /// Gate rejection reasons are preserved so reroute and unavailable events
+    /// report the real cause, such as quota exhaustion, rather than a generic
+    /// credential failure.
     /// </summary>
     internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
-        WorkItem item, Project project, IAgentRunner primaryRunner, CancellationToken ct)
+        WorkItem item,
+        Project project,
+        IAgentRunner primaryRunner,
+        CancellationToken ct,
+        AgenticConflictResolverOperation operation = AgenticConflictResolverOperation.Rebase)
     {
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
         var seenKinds = new HashSet<AgentKind>();
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
 
-        // Apply the local-budget MIN gate to the primary too: an exhausted
-        // primary should NOT be tried just because it was the work item's
-        // originally-routed agent. The work-phase vetted the primary at
-        // pickup, but between pickup and merge the spend budget can drift
-        // past MinQuotaPct. Without this gate the throw at collected.Count==0
-        // below is unreachable (the primary would always be added), so
-        // 'no viable agent' would silently route to the exhausted primary.
-        seenKinds.Add(primaryRunner.Kind);
-        var (primaryBudgetPct, primaryBudgetFailedClosed) =
-            await ReadCandidateBudgetAsync(primaryRunner.Kind, item.ModelId, ct);
-        if (primaryBudgetFailedClosed
-            || (primaryBudgetPct >= 0 && primaryBudgetPct < _auditQuotaOptions.MinQuotaPct))
+        var resolverPrimary = primaryRunner;
+        var resolverPrimaryModelId = item.ModelId;
+        var resolverPrimaryReasoningMode = item.ReasoningMode;
+        var resolverPrimaryMember = FindCandidateMember(primaryRunner.Kind, item.ModelId);
+
+        if (project.Audit.AuditAgent is { } auditKind && auditKind != primaryRunner.Kind)
         {
-            skipReasons.Add(
-                $"{primaryRunner.Kind.Value}: local budget exhausted " +
-                (primaryBudgetFailedClosed ? "(provider error)" : $"({primaryBudgetPct:F1}%)"));
-        }
-        else
-        {
-            await TryAddAsync(primaryRunner, item.ModelId, item.ReasoningMode, ct);
+            if (_agents.TryGet(auditKind, out var auditRunner))
+            {
+                resolverPrimary = auditRunner;
+                resolverPrimaryModelId = null;
+                resolverPrimaryReasoningMode = null;
+                resolverPrimaryMember = FindCandidateMember(auditKind, modelId: null);
+            }
+            else
+            {
+                _log.LogWarning(
+                    "Pickup-time rebase resolver: configured audit agent '{AuditKind}' is not registered; using work agent '{WorkKind}'",
+                    auditKind.Value, primaryRunner.Kind.Value);
+            }
         }
 
-        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        var resolverPrimaryRejectedReason = await TryAddAsync(
+            resolverPrimary,
+            resolverPrimaryModelId,
+            resolverPrimaryReasoningMode,
+            resolverPrimaryMember,
+            ct);
+
         if (_classRouter is not null && classId is not null)
         {
             foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
             {
-                if (!seenKinds.Add(member.Agent))
+                if (seenKinds.Contains(member.Agent))
                     continue;
                 if (!_agents.TryGet(member.Agent, out var memberRunner))
                 {
+                    seenKinds.Add(member.Agent);
                     skipReasons.Add($"{member.Agent.Value}: no runner registered");
                     continue;
                 }
-                // Apply the same local-budget MIN gate used at pickup: a member
-                // whose operator spend budget is already exhausted must not be
-                // chosen for conflict rework just because OrderedFallbackCandidates
-                // (score-only) surfaced it. Fail closed when the provider throws.
-                var (budgetPct, budgetFailedClosed) =
-                    await ReadCandidateBudgetAsync(member.Agent, member.ModelId, ct);
-                if (budgetFailedClosed
-                    || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
-                {
-                    skipReasons.Add(
-                        $"{member.Agent.Value}: local budget exhausted " +
-                        (budgetFailedClosed ? "(provider error)" : $"({budgetPct:F1}%)"));
-                    continue;
-                }
-                // Cross-kind candidates clear ModelId / ReasoningMode — those
-                // strings are agent-specific (e.g. "claude-opus-4-7" is not a
-                // valid Codex model). The candidate's own default kicks in.
-                await TryAddAsync(memberRunner, modelId: null, reasoningMode: null, ct);
+
+                // Cross-kind candidates clear ModelId / ReasoningMode; those
+                // strings are agent-specific. The class member's quota metadata
+                // still gates the candidate, but the runner dispatch uses its
+                // own default model unless it is the primary work runner above.
+                await TryAddAsync(memberRunner, modelId: null, reasoningMode: null, member, ct);
             }
         }
 
@@ -1617,8 +1635,9 @@ public sealed class PipelineRunner : IPipelineRunner
             var reasons = skipReasons.Count == 0
                 ? "no candidate runner registered"
                 : string.Join("; ", skipReasons);
+            AuditLog.RebaseResolverAgentUnavailable(item.Id, reasons);
             throw new AgentUnavailableException(
-                $"pickup-time rebase resolver could not run: no agent has viable credentials ({reasons})",
+                $"pickup-time rebase resolver could not run: no agent has viable credentials or quota ({reasons})",
                 reasons);
         }
 
@@ -1628,18 +1647,100 @@ public sealed class PipelineRunner : IPipelineRunner
         // cap config keeps the previous "always prefer primary" behaviour.
         const int capSortPreferred = 0;
         const int capSortDeprioritized = 1;
-        return collected
+        var ordered = collected
             .Select((c, idx) => (Candidate: c, Index: idx, AtCap: IsAtAgentCap(c.Runner.Kind)))
             .OrderBy(t => t.AtCap ? capSortDeprioritized : capSortPreferred)
             .ThenBy(t => t.Index)
             .Select(t => t.Candidate)
             .ToList();
 
-        async Task TryAddAsync(IAgentRunner candidate, string? modelId, string? reasoningMode, CancellationToken token)
+        var first = ordered[0];
+        var auditRebaseRouting = operation == AgenticConflictResolverOperation.Rebase;
+        if (auditRebaseRouting && first.Runner.Kind != resolverPrimary.Kind)
         {
-            seenKinds.Add(candidate.Kind);
+            var resolverPrimaryAtCap = collected.Any(c => c.Runner.Kind == resolverPrimary.Kind)
+                && IsAtAgentCap(resolverPrimary.Kind);
+            if (resolverPrimaryAtCap && !IsAtAgentCap(first.Runner.Kind))
+            {
+                AuditLog.RebaseResolverAgentCapReroute(
+                    resolverPrimary.Kind, first.Runner.Kind,
+                    GetRunningSafe(resolverPrimary.Kind), GetCapSafe(resolverPrimary.Kind));
+            }
+            else if (resolverPrimaryRejectedReason is not null)
+            {
+                AuditLog.RebaseResolverAgentRerouted(
+                    resolverPrimary.Kind, first.Runner.Kind, $"{resolverPrimaryRejectedReason}; using class member");
+            }
+        }
+        if (auditRebaseRouting && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
+        {
+            AuditLog.RebaseResolverAllAtCap(
+                first.Runner.Kind, GetRunningSafe(first.Runner.Kind), GetCapSafe(first.Runner.Kind));
+        }
+        return ordered;
+
+        async Task<string?> TryAddAsync(
+            IAgentRunner candidate,
+            string? modelId,
+            string? reasoningMode,
+            AgentMembership? configuredMember,
+            CancellationToken token)
+        {
+            if (!seenKinds.Add(candidate.Kind))
+                return null;
+
+            var quotaMember = BuildQuotaMember(candidate, configuredMember, modelId, reasoningMode);
+            var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(candidate.Kind, quotaMember, token);
+            if (!quotaOk)
+            {
+                var reason = $"{candidate.Kind.Value}: {quotaReason}";
+                skipReasons.Add(reason);
+                return reason;
+            }
+
             var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
             collected.Add(new AgenticConflictResolverCandidate(candidate, credential, modelId, reasoningMode));
+            return null;
+        }
+
+        AgentMembership? FindCandidateMember(AgentKind kind, string? modelId)
+        {
+            if (_classRouter is null || classId is null)
+                return null;
+            if (!string.IsNullOrWhiteSpace(modelId))
+            {
+                return _classRouter.FindMember(classId, kind, modelId)
+                    ?? _classRouter.FindMember(classId, kind, modelId: null);
+            }
+            return _classRouter.FindMember(classId, kind, modelId: null);
+        }
+
+        AgentMembership BuildQuotaMember(
+            IAgentRunner candidate,
+            AgentMembership? configuredMember,
+            string? modelId,
+            string? reasoningMode)
+        {
+            var observedModelId = ResolveObservedModelId(candidate, modelId);
+            if (configuredMember is not null)
+            {
+                return modelId is null
+                    ? configuredMember
+                    : configuredMember with
+                    {
+                        ModelId = observedModelId,
+                        ReasoningMode = reasoningMode ?? configuredMember.ReasoningMode,
+                    };
+            }
+
+            return new AgentMembership
+            {
+                Agent = candidate.Kind,
+                Billing = AgentBilling.Subscription,
+                ModelId = observedModelId,
+                ReasoningMode = reasoningMode,
+                QualityScore = 100,
+            };
         }
     }
 
@@ -1672,6 +1773,9 @@ public sealed class PipelineRunner : IPipelineRunner
             ? entry.MaxConcurrent
             : 0;
     }
+
+    private int GetRunningSafe(AgentKind agent) =>
+        _agentRunningCounters?.GetRunning(agent) ?? 0;
 
     private static async Task<bool> FetchOriginBranchAsync(ISandbox sandbox, string branch, bool required, CancellationToken ct)
     {
@@ -4793,7 +4897,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                    var candidates = await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                    var candidates = await BuildAgenticConflictCandidatesAsync(
+                        item, project, runner, ct, AgenticConflictResolverOperation.Merge);
                     var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
                         SandboxConventions.WorkDir,

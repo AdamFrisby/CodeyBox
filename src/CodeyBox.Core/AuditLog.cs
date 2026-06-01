@@ -463,6 +463,89 @@ public static class AuditLog
                 "LLM auditor '{AuditorName}' skipped for {WorkItemId}: all {CandidateCount} candidate agent(s) quota-exhausted",
                 auditorName, workItemId.ToString(), candidateCount);
 
+    /// <summary>
+    /// Emitted when the pickup-time rebase resolver routed past a candidate
+    /// whose non-cap pre-dispatch gate rejected it. <paramref name="rejectedAgent"/>
+    /// is the resolver's primary candidate: the configured
+    /// <c>Project.Audit.AuditAgent</c> when set and registered, otherwise the
+    /// work-phase runner. <paramref name="chosenAgent"/> is the class-chain
+    /// member that took over. <paramref name="reason"/>
+    /// carries the actual gate reason (for example
+    /// <c>quota exhausted (6.0%)</c>) so operators are not misled into reading
+    /// a quota steer as a credential problem. Cap-driven reroutes use
+    /// <see cref="RebaseResolverAgentCapReroute"/> instead.
+    /// </summary>
+    public static void RebaseResolverAgentRerouted(
+        AgentKind rejectedAgent, AgentKind chosenAgent, string reason) =>
+        Audit("rebase_resolver.rerouted")
+            .Information(
+                "Pickup-time rebase resolver rerouted from '{RejectedAgent}' to class member '{ChosenAgent}' ({Reason})",
+                rejectedAgent.Value, chosenAgent.Value, reason);
+
+    /// <summary>
+    /// Emitted when every candidate (configured primary + class chain) failed
+    /// the resolver's pre-dispatch gates, so the pickup-time rebase resolver
+    /// could not run at all. The work item is failed with
+    /// <c>failureKind=agent_unavailable</c>; distinct from resolver failures
+    /// where an agent ran but produced an unmergeable answer.
+    /// <paramref name="candidateReasons"/> carries the per-agent gate reasons
+    /// so operators can tell a credential gap from a quota steer.
+    /// </summary>
+    public static void RebaseResolverAgentUnavailable(
+        WorkItemId workItemId, string candidateReasons) =>
+        Audit("rebase_resolver.agent_unavailable")
+            .Warning(
+                "Pickup-time rebase resolver could not run for {WorkItemId}: no candidate agent passed the resolver gates ({CandidateReasons})",
+                workItemId.ToString(), candidateReasons);
+
+    /// <summary>
+    /// Emitted when the pickup-time rebase resolver routed past an agent
+    /// whose creds are viable but whose per-agent concurrency cap is at
+    /// ceiling, picking a class member that is below its own cap instead.
+    /// Distinct from <c>rebase_resolver.rerouted</c> (which fires only when
+    /// the primary's creds are missing): here the primary could have run,
+    /// but the operator-configured cap signals that adding a second
+    /// in-flight call against this agent's account would compete with
+    /// already-running work and risk a 429.
+    /// </summary>
+    public static void RebaseResolverAgentCapReroute(
+        AgentKind rejectedAgent, AgentKind chosenAgent, int rejectedRunning, int rejectedCap) =>
+        Audit("rebase_resolver.cap_rerouted")
+            .Information(
+                "Pickup-time rebase resolver rerouted from '{RejectedAgent}' (running={Running} cap={Cap}) to class member '{ChosenAgent}' — primary at per-agent cap",
+                rejectedAgent.Value, rejectedRunning, rejectedCap, chosenAgent.Value);
+
+    /// <summary>
+    /// Emitted when every candidate the pickup-time rebase resolver
+    /// considered was at its per-agent concurrency cap, so the resolver
+    /// fell back to the highest-ranked viable candidate (typically the
+    /// primary itself) and ran the call despite the cap. This is the
+    /// "reserve pool" escape hatch: better to attempt the call and possibly
+    /// 429 than to fail the work item outright when every alternative is
+    /// equally saturated. Distinct from <c>rebase_resolver.cap_rerouted</c>
+    /// (which fires when a non-saturated alternative exists).
+    /// </summary>
+    public static void RebaseResolverAllAtCap(
+        AgentKind chosenAgent, int chosenRunning, int chosenCap) =>
+        Audit("rebase_resolver.all_at_cap")
+            .Warning(
+                "Pickup-time rebase resolver: every viable agent at per-agent cap; running on '{ChosenAgent}' (running={Running} cap={Cap}) anyway",
+                chosenAgent.Value, chosenRunning, chosenCap);
+
+    /// <summary>
+    /// Emitted when the pickup-time rebase resolver has finalised which agent
+    /// it will actually invoke for conflict resolution (after honouring
+    /// <c>Project.Audit.AuditAgent</c>, the credential/quota/cap gates, and any
+    /// class-chain reroute). Gives operators a single diagnostic line for "who
+    /// ran the resolver" without correlating the reroute/cap/all-at-cap events.
+    /// </summary>
+    public static void RebaseResolverAgentSelected(
+        WorkItemId workItemId, AgentKind chosenAgent) =>
+        Audit("rebase_resolver.agent_selected")
+            .Information(
+                "Pickup-time rebase resolver selected agent '{ChosenAgent}' for {WorkItemId}",
+                chosenAgent.Value, workItemId.ToString());
+
     public static void AuditIterationComplete(int iteration, int maxIterations, int blockingCount, int nonBlockingCount) =>
         Audit("audit.iteration_complete")
             .Information("Audit iteration {Iteration}/{MaxIterations}: blocking={BlockingCount} non-blocking={NonBlockingCount}",
