@@ -145,6 +145,12 @@ Returns `201 Created`:
 Bad or missing templates fail before any work item is created. Each created
 work item records `templateName` and zero-based `templateEntryIndex`.
 
+### `POST /templates/{name}/queue`
+
+Equivalent to `POST /templates/queue`, but the template name comes from the
+route. The request body may omit `template`; if it supplies `template`, it must
+refer to the same template as `{name}`.
+
 ### `GET /workitems`
 
 List all work items, newest first.

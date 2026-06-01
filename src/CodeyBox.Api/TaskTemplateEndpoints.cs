@@ -30,14 +30,30 @@ internal static class TaskTemplateEndpoints
         IAgentRegistry agents,
         CancellationToken ct)
     {
+        if (!string.IsNullOrWhiteSpace(req.Template) && !TemplateRefsMatch(req.Template, name))
+            return Results.BadRequest(new { error = "body template must match route template name" });
+
         return await QueueCoreAsync(
-            req with { Template = string.IsNullOrWhiteSpace(req.Template) ? name : req.Template },
+            req with { Template = name },
             registry,
             store,
             queue,
             projects,
             agents,
             ct);
+    }
+
+    private static bool TemplateRefsMatch(string left, string right) =>
+        string.Equals(NormaliseTemplateRef(left), NormaliseTemplateRef(right), StringComparison.OrdinalIgnoreCase);
+
+    private static string NormaliseTemplateRef(string templateRef)
+    {
+        var normalised = templateRef.Trim().Replace('\\', '/');
+        if (normalised.StartsWith("templates/", StringComparison.OrdinalIgnoreCase))
+            normalised = normalised["templates/".Length..];
+        if (normalised.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            normalised = normalised[..^".json".Length];
+        return normalised.Trim('/');
     }
 
     private static async Task<IResult> QueueAsync(

@@ -86,7 +86,10 @@ public sealed class TaskTemplateApiTests : IDisposable
         });
 
         var byIndex = stored.ToDictionary(item => item.TemplateEntryIndex!.Value);
+        Assert.Equal(0, byIndex[0].TemplateEntryIndex);
+        Assert.Equal(1, byIndex[1].TemplateEntryIndex);
         Assert.Equal("Is user input interpolated into SQL?", byIndex[0].Check!.Question);
+        Assert.StartsWith("Check template entry 1:", byIndex[0].Title);
         Assert.True(byIndex[0].Check!.ActionableAnswer);
         Assert.Equal("Fix SQL injection", byIndex[0].Check!.OnYes.Title);
         Assert.Equal(100, byIndex[0].Check!.OnYes.Priority);
@@ -97,6 +100,67 @@ public sealed class TaskTemplateApiTests : IDisposable
         var firstDto = doc.GetProperty("workItems")[0];
         Assert.Equal("security", firstDto.GetProperty("templateName").GetString());
         Assert.Equal(0, firstDto.GetProperty("templateEntryIndex").GetInt32());
+    }
+
+    [Fact]
+    public async Task ListTemplates_ReturnsDiscoveredTemplateSummariesAndErrors()
+    {
+        await WriteValidTemplateAsync("security");
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "broken.json"), """{"checks":[]}""");
+
+        var response = await _client.GetAsync("/templates/");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var doc = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var byName = doc.EnumerateArray().ToDictionary(t => t.GetProperty("name").GetString()!);
+
+        var good = byName["security"];
+        Assert.Equal("templates/security.json", good.GetProperty("path").GetString());
+        Assert.Equal(1, good.GetProperty("checkCount").GetInt32());
+        Assert.Equal(JsonValueKind.Null, good.GetProperty("error").ValueKind);
+
+        var broken = byName["broken"];
+        Assert.Equal(JsonValueKind.Null, broken.GetProperty("checkCount").ValueKind);
+        Assert.Contains("at least one", broken.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task QueueTemplate_ByNameRoute_UsesRouteNameWhenBodyTemplateIsOmitted()
+    {
+        await WriteValidTemplateAsync("path-route");
+
+        var response = await _client.PostAsJsonAsync("/templates/path-route/queue", new
+        {
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var doc = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("path-route", doc.GetProperty("template").GetString());
+        Assert.Equal(1, doc.GetProperty("enqueued").GetInt32());
+
+        var item = Assert.Single(await ReadAllItemsAsync());
+        Assert.Equal("path-route", item.TemplateName);
+        Assert.Equal(0, item.TemplateEntryIndex);
+        Assert.Equal(new ProjectId("test-project"), item.ProjectId);
+    }
+
+    [Fact]
+    public async Task QueueTemplate_ByNameRoute_RejectsConflictingBodyTemplate()
+    {
+        await WriteValidTemplateAsync("security");
+        await WriteValidTemplateAsync("other");
+
+        var response = await _client.PostAsJsonAsync("/templates/security/queue", new
+        {
+            template = "templates/other",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("must match", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
     }
 
     [Fact]
@@ -129,6 +193,92 @@ public sealed class TaskTemplateApiTests : IDisposable
     }
 
     [Fact]
+    public async Task QueueTemplate_UnknownProjectId_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "missing-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("unknown project", err.GetProperty("error").GetString());
+        Assert.Contains("test-project", err.GetProperty("available").EnumerateArray().Select(v => v.GetString()));
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_UnknownTopLevelAgent_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            agent = "definitely-not-an-agent",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("unknown agent", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_TopLevelAgentClassIdTooLong_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            agentClassId = new string('c', 201),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("agentClassId", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_UnknownOnYesAgent_Returns400WithoutPartialEnqueue()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-agent.json"), """
+            {
+              "checks": [
+                {
+                  "question": "Is the risky pattern present?",
+                  "onYes": {
+                    "title": "Fix risky pattern",
+                    "prompt": "Remove the risky pattern.",
+                    "agent": "ghostagent"
+                  }
+                }
+              ]
+            }
+            """);
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "bad-agent",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var message = err.GetProperty("error").GetString();
+        Assert.Contains("unknown agent", message);
+        Assert.Contains("checks[0].onYes", message);
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
     public async Task QueueTemplate_MissingTemplate_Returns404WithoutPartialEnqueue()
     {
         var response = await _client.PostAsJsonAsync("/templates/queue", new
@@ -139,6 +289,28 @@ public sealed class TaskTemplateApiTests : IDisposable
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
         Assert.Empty(await ReadAllItemsAsync());
+    }
+
+    private Task WriteValidTemplateAsync(string name) =>
+        File.WriteAllTextAsync(Path.Combine(_templateDir, $"{name}.json"), """
+            {
+              "checks": [
+                {
+                  "question": "Is logging missing?",
+                  "onYes": {
+                    "title": "Add logging",
+                    "prompt": "Add useful logs."
+                  }
+                }
+              ]
+            }
+            """);
+
+    private async Task AssertNoItemsQueuedAsync()
+    {
+        Assert.Empty(await ReadAllItemsAsync());
+        var queue = _factory.Services.GetRequiredService<InMemoryTaskQueue>();
+        Assert.Equal(0, queue.Count);
     }
 
     private async Task<List<WorkItem>> ReadAllItemsAsync()
