@@ -37,14 +37,14 @@ public sealed class QueueReorderTests
             Assert.Equal(0, code);
             Assert.NotNull(captured);
             Assert.Equal(HttpMethod.Post, captured.Method);
-            Assert.Contains("/reorder", captured.RequestUri!.ToString());
+            Assert.Contains("/workitems/reorder", captured.RequestUri!.ToString());
             Assert.NotNull(captured.Content);
             var body = await captured.Content.ReadFromJsonAsync(CliJsonContext.Default.ReorderRequest);
             Assert.NotNull(body);
             Assert.Single(body.Ids);
             Assert.Equal("abc-123", body.Ids[0]);
             Assert.Contains("Queue reordered", output.Out.ToString());
-            Assert.Contains("1", output.Out.ToString());
+            Assert.Contains("(1 item)", output.Out.ToString());
             Assert.Empty(output.Error.ToString());
         }
         finally
@@ -79,7 +79,7 @@ public sealed class QueueReorderTests
             Assert.Equal("id-b", body.Ids[1]);
             Assert.Equal("id-c", body.Ids[2]);
             Assert.Contains("Queue reordered", output.Out.ToString());
-            Assert.Contains("3", output.Out.ToString());
+            Assert.Contains("(3 items)", output.Out.ToString());
             Assert.Empty(output.Error.ToString());
         }
         finally

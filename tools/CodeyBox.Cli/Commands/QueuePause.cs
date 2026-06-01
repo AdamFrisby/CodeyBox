@@ -11,9 +11,12 @@ internal static class QueuePause
         Option<string?> apiKeyOpt,
         Func<ResolvedConfig, CodeyBoxClient> clientFactory)
     {
-        var cmd = new Command("pause", "Pause the queue, optionally with a reason");
+        var cmd = new Command("pause", "Pause the queue");
 
-        var reasonOpt = new Option<string?>("--reason", "Reason for pausing the queue");
+        var reasonOpt = new Option<string>("--reason", "Reason for pausing the queue")
+        {
+            IsRequired = true,
+        };
 
         cmd.AddOption(reasonOpt);
 
@@ -38,9 +41,8 @@ internal static class QueuePause
 
             try
             {
-                await client.PauseQueueAsync(reason, ct);
-                var suffix = reason is not null ? $" (reason: {reason})" : "";
-                Console.WriteLine($"Queue paused{suffix}");
+                await client.PauseQueueAsync(reason!, ct);
+                Console.WriteLine($"Queue paused (reason: {reason})");
             }
             catch (CodeyBoxApiException ex)
             {

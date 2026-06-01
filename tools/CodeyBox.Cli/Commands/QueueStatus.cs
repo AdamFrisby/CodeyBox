@@ -50,14 +50,17 @@ internal static class QueueStatus
                 using var doc = JsonDocument.Parse(raw);
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("paused", out var paused))
-                    Console.WriteLine($"Paused:    {paused}");
+                if (root.TryGetProperty("state", out var state))
+                    Console.WriteLine($"State:    {state}");
+                if (root.TryGetProperty("pausedAt", out var pausedAt) && pausedAt.ValueKind != JsonValueKind.Null)
+                    Console.WriteLine($"Paused:   {pausedAt}");
                 if (root.TryGetProperty("pausedReason", out var reason) && reason.ValueKind != JsonValueKind.Null)
-                    Console.WriteLine($"Reason:    {reason}");
-                if (root.TryGetProperty("itemCount", out var count))
-                    Console.WriteLine($"Items:     {count}");
-                if (root.TryGetProperty("nextItemId", out var nextId) && nextId.ValueKind != JsonValueKind.Null)
-                    Console.WriteLine($"Next:      {nextId}");
+                    Console.WriteLine($"Reason:   {reason}");
+            }
+            catch (JsonException ex)
+            {
+                await Console.Error.WriteLineAsync($"Error parsing response: {ex.Message}");
+                ctx.ExitCode = 1;
             }
             catch (CodeyBoxApiException ex)
             {

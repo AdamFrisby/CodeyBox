@@ -42,7 +42,8 @@ internal static class QueueReorder
             try
             {
                 await client.ReorderQueueAsync(ids, ct);
-                Console.WriteLine($"Queue reordered ({ids.Length} items)");
+                var countLabel = ids.Length == 1 ? "1 item" : $"{ids.Length} items";
+                Console.WriteLine($"Queue reordered ({countLabel})");
             }
             catch (CodeyBoxApiException ex)
             {

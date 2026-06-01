@@ -19,10 +19,9 @@ public sealed class QueueStatusTests
     public async Task Status_HumanReadable_ParsesAndPrintsFields()
     {
         const string responseBody = @"{
-  ""paused"": true,
-  ""pausedReason"": ""maintenance"",
-  ""itemCount"": 42,
-  ""nextItemId"": ""abc-123""
+  ""state"": ""Paused"",
+  ""pausedAt"": ""2024-12-01T10:30:00Z"",
+  ""pausedReason"": ""maintenance""
 }";
 
         HttpRequestMessage? captured = null;
@@ -46,13 +45,12 @@ public sealed class QueueStatusTests
             Assert.Equal(HttpMethod.Get, captured.Method);
             Assert.Contains("/queue/status", captured.RequestUri!.ToString());
             var stdout = output.Out.ToString();
+            Assert.Contains("State:", stdout);
+            Assert.Contains("Paused", stdout);
             Assert.Contains("Paused:", stdout);
-            Assert.Contains("True", stdout);
+            Assert.Contains("2024-12-01T10:30:00Z", stdout);
+            Assert.Contains("Reason:", stdout);
             Assert.Contains("maintenance", stdout);
-            Assert.Contains("Items:", stdout);
-            Assert.Contains("42", stdout);
-            Assert.Contains("Next:", stdout);
-            Assert.Contains("abc-123", stdout);
             Assert.Empty(output.Error.ToString());
         }
         finally
@@ -64,7 +62,7 @@ public sealed class QueueStatusTests
     [Fact]
     public async Task Status_Json_PrintsRawResponse()
     {
-        const string responseBody = "{\"paused\":false,\"itemCount\":7}";
+        const string responseBody = "{\"state\":\"Running\",\"pausedAt\":null}";
 
         var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.OK)
         {
@@ -90,7 +88,7 @@ public sealed class QueueStatusTests
     [Fact]
     public async Task Status_MinimalResponse_PrintsAvailableFields()
     {
-        const string responseBody = "{\"paused\":false}";
+        const string responseBody = "{\"state\":\"Running\"}";
 
         var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.OK)
         {
@@ -105,10 +103,10 @@ public sealed class QueueStatusTests
 
             Assert.Equal(0, code);
             var stdout = output.Out.ToString();
-            Assert.Contains("Paused:", stdout);
+            Assert.Contains("State:", stdout);
+            Assert.Contains("Running", stdout);
+            Assert.DoesNotContain("Paused:", stdout);
             Assert.DoesNotContain("Reason:", stdout);
-            Assert.DoesNotContain("Items:", stdout);
-            Assert.DoesNotContain("Next:", stdout);
             Assert.Empty(output.Error.ToString());
         }
         finally

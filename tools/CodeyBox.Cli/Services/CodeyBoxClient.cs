@@ -104,21 +104,13 @@ internal sealed class CodeyBoxClient
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
-    internal async Task PauseQueueAsync(string? reason, CancellationToken ct = default)
+    internal async Task PauseQueueAsync(string reason, CancellationToken ct = default)
     {
-        HttpResponseMessage resp;
-        if (reason is not null)
-        {
-            resp = await _http.PostAsJsonAsync(
-                "/queue/pause",
-                new PauseQueueRequest { Reason = reason },
-                CliJsonContext.Default.PauseQueueRequest,
-                ct);
-        }
-        else
-        {
-            resp = await _http.PostAsync("/queue/pause", content: null, ct);
-        }
+        var resp = await _http.PostAsJsonAsync(
+            "/queue/pause",
+            new PauseQueueRequest { Reason = reason },
+            CliJsonContext.Default.PauseQueueRequest,
+            ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
 
@@ -138,11 +130,10 @@ internal sealed class CodeyBoxClient
     internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
-            "/reorder",
+            "/workitems/reorder",
             new ReorderRequest { Ids = ids },
             CliJsonContext.Default.ReorderRequest,
             ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
     }
-
 }

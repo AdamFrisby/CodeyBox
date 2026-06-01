@@ -17,36 +17,6 @@ public sealed class QueuePauseTests
     }
 
     [Fact]
-    public async Task Pause_WithoutReason_PostsWithoutBody()
-    {
-        HttpRequestMessage? captured = null;
-        var factory = MakeFactory(req =>
-        {
-            captured = req;
-            return new HttpResponseMessage(HttpStatusCode.OK);
-        });
-
-        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
-        using var output = new TestOutput();
-        try
-        {
-            var code = await CliApp.InvokeAsync(["queue", "pause"], factory);
-
-            Assert.Equal(0, code);
-            Assert.NotNull(captured);
-            Assert.Equal(HttpMethod.Post, captured.Method);
-            Assert.Contains("/queue/pause", captured.RequestUri!.ToString());
-            Assert.Null(captured.Content);
-            Assert.Contains("Queue paused", output.Out.ToString());
-            Assert.Empty(output.Error.ToString());
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
-        }
-    }
-
-    [Fact]
     public async Task Pause_WithReason_PostsWithBody()
     {
         HttpRequestMessage? captured = null;
@@ -90,7 +60,7 @@ public sealed class QueuePauseTests
         using var output = new TestOutput();
         try
         {
-            var code = await CliApp.InvokeAsync(["queue", "pause"], factory);
+            var code = await CliApp.InvokeAsync(["queue", "pause", "--reason", "test"], factory);
 
             Assert.NotEqual(0, code);
             Assert.Empty(output.Out.ToString());
@@ -114,7 +84,7 @@ public sealed class QueuePauseTests
         using var output = new TestOutput();
         try
         {
-            var code = await CliApp.InvokeAsync(["queue", "pause"], factory);
+            var code = await CliApp.InvokeAsync(["queue", "pause", "--reason", "test"], factory);
 
             Assert.NotEqual(0, code);
             Assert.Empty(output.Out.ToString());
