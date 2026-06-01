@@ -171,6 +171,186 @@ public sealed class CheckAndActApiTests : IDisposable
     }
 
     [Fact]
+    public async Task PostWorkItems_CheckQuestionTooLarge_Returns400()
+    {
+        var oversized = new string('q', 64 * 1024 + 1);
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = oversized,
+                onYes = new { title = "fix", prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("question", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesTitleTooLong_Returns400()
+    {
+        // Boundary: 201 chars must fail (cap is <= 200).
+        var oversizedTitle = new string('t', 201);
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new { title = oversizedTitle, prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("onYes.title", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesTitleWithControlChars_Returns400()
+    {
+        // Validation.ValidateNoOptionLikeOrControl rejects \n / \r / \0 in
+        // the follow-up title so the operator can't sneak log/audit-bending
+        // characters into a downstream work item via the check spec.
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new { title = "fix\nme", prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("control", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesTitleLeadingDash_Returns400()
+    {
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new { title = "--fix-now", prompt = "go" },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("onYes.title", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesPromptTooLarge_Returns400()
+    {
+        var oversizedPrompt = new string('p', 64 * 1024 + 1);
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new { title = "fix", prompt = oversizedPrompt },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("onYes.prompt", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesUnknownAgent_Returns400()
+    {
+        // The test app's agent registry does not include "ghostagent". The
+        // endpoint must reject an unknown agent kind on the on-yes spec at
+        // create time so the follow-up cannot fail later for the same reason.
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new
+                {
+                    title = "fix",
+                    prompt = "go",
+                    agent = "ghostagent",
+                },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("unknown agent", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesAgentClassIdTooLong_Returns400()
+    {
+        var oversizedClass = new string('c', 201);
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new
+                {
+                    title = "fix",
+                    prompt = "go",
+                    agentClassId = oversizedClass,
+                },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("onYes.agentClassId", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task PostWorkItems_CheckOnYesDependsOnTooMany_Returns400()
+    {
+        // Cap is 100 entries; 101 must fail.
+        var deps = Enumerable.Range(0, 101).Select(i => $"dep-{i}").ToArray();
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "bad",
+            prompt = "x",
+            check = new
+            {
+                question = "is x?",
+                onYes = new
+                {
+                    title = "fix",
+                    prompt = "go",
+                    dependsOn = deps,
+                },
+            },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("onYes.dependsOn", err.GetProperty("error").GetString());
+    }
+
+    [Fact]
     public async Task GetWorkItem_AfterVerdictPersisted_ReturnsVerdictField()
     {
         // Direct-store mutation: simulate the pipeline persisting a verdict on
@@ -206,5 +386,44 @@ public sealed class CheckAndActApiTests : IDisposable
         Assert.True(verdict.GetProperty("answer").GetBoolean());
         Assert.Contains("Foo.cs", verdict.GetProperty("evidence").GetString());
         Assert.Equal("high", verdict.GetProperty("confidence").GetString());
+    }
+
+    [Fact]
+    public async Task GetWorkItem_FollowupBackLink_SurfacesOriginCheckWorkItemId()
+    {
+        // The follow-up Normal item's back-link to its check (the field added
+        // in this diff) must surface via the API DTO. A regression that
+        // forgot to wire the column or used the wrong Id would only be
+        // caught by reading the store directly otherwise.
+        var checkId = WorkItemId.New();
+        var followupId = WorkItemId.New();
+        await _factory.Store.CreateAsync(new WorkItem
+        {
+            Id = checkId,
+            ProjectId = new ProjectId("test-project"),
+            Title = "the check",
+            Prompt = "x",
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "is x?",
+                OnYes = new OnYesActionSpec { Title = "fix", Prompt = "go" },
+            },
+        });
+        await _factory.Store.CreateAsync(new WorkItem
+        {
+            Id = followupId,
+            ProjectId = new ProjectId("test-project"),
+            Title = "the follow-up",
+            Prompt = "remediate",
+            JobType = JobType.Normal,
+            OriginCheckWorkItemId = checkId,
+        });
+
+        var get = await _client.GetAsync($"/workitems/{followupId}");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        var doc = await get.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("Normal", doc.GetProperty("jobType").GetString());
+        Assert.Equal(checkId.ToString(), doc.GetProperty("originCheckWorkItemId").GetString());
     }
 }

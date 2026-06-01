@@ -161,6 +161,23 @@ public sealed class CheckAndActParserTests
     }
 
     [Fact]
+    public void TryParse_LiteralNullJson_FailsCleanly()
+    {
+        // The JSON literal `null` between the sentinels deserialises to a
+        // null payload object. The parser guards against this and surfaces a
+        // descriptive error rather than NullReferenceException-ing on access.
+        var stdout = $$"""
+            {{CheckAndActPipeline.StartSentinel}}
+            null
+            {{CheckAndActPipeline.EndSentinel}}
+            """;
+        var ok = CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var error);
+        Assert.False(ok);
+        Assert.Null(verdict);
+        Assert.Contains("null", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void TryParse_NullOrEmptyStdout_Fails()
     {
         Assert.False(CheckAndActPipeline.TryParseVerdict(null, out _, out var errNull));

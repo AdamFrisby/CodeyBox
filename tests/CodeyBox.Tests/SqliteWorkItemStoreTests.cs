@@ -142,6 +142,175 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RoundTrip_CheckAndActFields_Preserved()
+    {
+        // Pin the four new columns added for the check-and-act job type:
+        // job_type, check_spec_json, check_verdict_json, origin_check_work_item_id.
+        // Use a fully-populated CheckAndActSpec (with OnYes carrying every
+        // optional field including DependsOn) so a serialiser shape mismatch
+        // would surface as a missing/changed value on read.
+        var deps = new[] { "JIRA-101", "github:PR-7" };
+        var spec = new CheckAndActSpec
+        {
+            Question = "Is the code vulnerable?",
+            ActionableAnswer = false,
+            OnYes = new OnYesActionSpec
+            {
+                Title = "Fix all the things",
+                Prompt = "Remediate",
+                MinModelScore = 75,
+                Priority = 250,
+                Agent = "claude",
+                AgentClassId = "secure-class",
+                DependsOn = deps,
+            },
+        };
+        var verdict = new CheckVerdict
+        {
+            Answer = true,
+            Evidence = "src/Foo.cs:42 builds SQL via interpolation",
+            Confidence = "medium",
+        };
+        var originId = WorkItemId.New();
+        var item = Sample() with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = spec,
+            Verdict = verdict,
+            OriginCheckWorkItemId = originId,
+        };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(JobType.CheckAndAct, read!.JobType);
+        Assert.Equal(originId, read.OriginCheckWorkItemId);
+
+        Assert.NotNull(read.Check);
+        Assert.Equal(spec.Question, read.Check!.Question);
+        Assert.False(read.Check.ActionableAnswer);
+        Assert.Equal("Fix all the things", read.Check.OnYes.Title);
+        Assert.Equal("Remediate", read.Check.OnYes.Prompt);
+        Assert.Equal(75, read.Check.OnYes.MinModelScore);
+        Assert.Equal(250, read.Check.OnYes.Priority);
+        Assert.Equal("claude", read.Check.OnYes.Agent);
+        Assert.Equal("secure-class", read.Check.OnYes.AgentClassId);
+        Assert.NotNull(read.Check.OnYes.DependsOn);
+        Assert.Equal(deps, read.Check.OnYes.DependsOn);
+
+        Assert.NotNull(read.Verdict);
+        Assert.True(read.Verdict!.Answer);
+        Assert.Contains("Foo.cs", read.Verdict.Evidence);
+        Assert.Equal("medium", read.Verdict.Confidence);
+    }
+
+    [Fact]
+    public async Task RoundTrip_NormalItem_DefaultsToJobTypeNormal_NoCheckOrVerdict()
+    {
+        // The migration defaults legacy / new-row job_type to 'Normal' and the
+        // check/verdict columns to NULL. Reads must surface those as JobType.Normal
+        // and null Check/Verdict — never as a phantom CheckAndAct row.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(JobType.Normal, read!.JobType);
+        Assert.Null(read.Check);
+        Assert.Null(read.Verdict);
+        Assert.Null(read.OriginCheckWorkItemId);
+    }
+
+    [Fact]
+    public async Task ReadRow_CorruptCheckSpecJson_ReturnsNullSpec()
+    {
+        // ReadCheckSpec catches JsonException and returns null so a corrupt
+        // payload doesn't kill the row entirely. Unlike required_capabilities
+        // (a clearance gate that fails closed), the check spec is operator
+        // metadata — surfacing null is the documented behaviour.
+        var item = Sample() with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "is x?",
+                OnYes = new OnYesActionSpec { Title = "fix", Prompt = "go" },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET check_spec_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "not-json");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Null(read!.Check);
+    }
+
+    [Fact]
+    public async Task ReadRow_CorruptCheckVerdictJson_ReturnsNullVerdict()
+    {
+        var item = Sample() with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "is x?",
+                OnYes = new OnYesActionSpec { Title = "fix", Prompt = "go" },
+            },
+            Verdict = new CheckVerdict { Answer = true, Evidence = "e" },
+        };
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET check_verdict_json = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "not-json");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Null(read!.Verdict);
+        // The check spec is still valid and must survive a corrupt verdict.
+        Assert.NotNull(read.Check);
+    }
+
+    [Fact]
+    public async Task ReadRow_UnknownJobType_FallsBackToNormal()
+    {
+        // ReadJobType defends against schema drift (a column value the enum
+        // doesn't know about) by falling back to JobType.Normal — keeps the
+        // row pickable instead of failing the whole query.
+        var item = Sample();
+        await _store.CreateAsync(item);
+
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_dbPath}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE work_items SET job_type = $junk WHERE id = $id";
+            cmd.Parameters.AddWithValue("$junk", "FutureKind");
+            cmd.Parameters.AddWithValue("$id", item.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.Equal(JobType.Normal, read!.JobType);
+    }
+
+    [Fact]
     public async Task ReadRow_CorruptRequiredCapabilitiesJson_FailsClosed()
     {
         // Persist normally, then poison the column directly via raw SQLite.
