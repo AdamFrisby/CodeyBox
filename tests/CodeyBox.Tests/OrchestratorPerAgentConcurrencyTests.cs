@@ -479,15 +479,16 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // StartedAt/Agent store write, so observedTotal==3 only proves
             // the slots are pinned — we still have to wait for the store
             // stamps to land before reading them.
-            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
-            AgentKind?[] agents;
-            while (true)
+            AgentKind?[] agents = [];
+            var assignmentDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < assignmentDeadline)
             {
                 var snap1 = await _store.GetAsync(i1.Id);
                 var snap2 = await _store.GetAsync(i2.Id);
                 var snap3 = await _store.GetAsync(i3.Id);
                 agents = [snap1?.Agent, snap2?.Agent, snap3?.Agent];
-                if (agents.All(a => a is not null) || DateTimeOffset.UtcNow >= stampDeadline)
+                if (agents.Count(a => a == Codex) == 1 &&
+                    agents.Count(a => a == Claude) == 2)
                     break;
                 await Task.Delay(25);
             }
