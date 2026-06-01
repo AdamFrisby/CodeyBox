@@ -176,16 +176,19 @@ See [`docs/projects.md`](docs/projects.md) for the full project schema
   microVM with least-privilege credentials; network policy lives on the host
   as nftables profiles a guest can't flush.
   → [`docs/host-firewall.md`](docs/host-firewall.md)
-- **An audit + rework gate.** Tool auditors (format/build/test, gitleaks,
-  semgrep) and LLM reviewers (security, completeness, anti-cheating) run in
-  capability-scoped sandboxes; failures loop back to the agent until they
-  converge. → [`docs/audit.md`](docs/audit.md)
+- **Quality gates you stack.** Compose exactly which auditors must pass before
+  a merge — tool checks (format/build/test, gitleaks, semgrep) and LLM reviews
+  (security, architecture, quality, completeness, anti-cheating) — and nothing
+  lands until it clears all of them. → [Quality gates you control](#quality-gates-you-control)
+- **Per-item cost tracking.** Every work item's token spend is tracked by phase
+  and agent, so you know what each bugfix or feature actually cost to run.
+  → [Know what every change costs](#know-what-every-change-costs)
 - **Agentic conflict resolution.** The agent resolves merge conflicts inside
   its own sandbox through its normal CLI, then a deterministic host-side scope
   fence verifies the result before the push is accepted.
-- **Cost & quota governance.** Per-agent/per-model pricing, spend reports,
-  budgets, alerts, and a burn-rate-aware quota gate.
-  → [`docs/quota-gate.md`](docs/quota-gate.md), [`docs/cost-reporting.md`](docs/cost-reporting.md)
+- **Quota governance.** Per-agent/per-model pricing, budgets, alerts, and a
+  burn-rate-aware quota gate that routes around exhausted providers.
+  → [`docs/quota-gate.md`](docs/quota-gate.md)
 - **Durable and restartable.** SQLite-backed state, crash/restart tolerance,
   sandbox suspend-resilience, and deterministic replay.
   → [`docs/restart-tolerance.md`](docs/restart-tolerance.md)
@@ -195,6 +198,72 @@ See [`docs/projects.md`](docs/projects.md) for the full project schema
 - **Pluggable everything.** Ship custom auditors, upstream remotes, credential
   providers, or sandbox backends as NuGet plugins — no fork.
   → [`docs/plugins.md`](docs/plugins.md)
+
+## Quality gates you control
+
+Auditors stack. You choose exactly which checks gate a merge — pick from
+built-in tool auditors (formatting, build, the full test suite, gitleaks
+secret scanning, semgrep SAST) and LLM reviewers (security, architecture,
+quality, completeness, anti-cheating, test coverage), or bring your own. Each
+runs in its own capability-scoped sandbox.
+
+And the gate is hard: when any auditor fails, its findings go straight back to
+the agent, which reworks and resubmits — the loop repeats until **every** gate
+passes or it hits the iteration cap (at which point the item is flagged
+`AuditFailed` and is *not* merged). Nothing lands until it clears the bar you
+set. The auditor set, the failing-severity threshold, and the iteration cap
+are all per-project config. → [`docs/audit.md`](docs/audit.md)
+
+## Know what every change costs
+
+CodeyBox tracks **token usage and estimated spend for every work item**, broken
+down by phase (work, each rework, each audit iteration, merge) and by
+agent/model. So you can answer "what did this bugfix actually cost to run?" —
+and build a real feel for the economics of automated work before you scale it
+up.
+
+Costs are normalised to pay-per-API list prices — even on subscription plans,
+and accounting for cached tokens — so they're comparable across agents and
+over time. Query per item or per project:
+
+```bash
+curl -H "authorization: Bearer $CODEYBOX_API_KEY" \
+  http://localhost:5036/workitems/<id>/costs       # one item, broken out by phase
+curl -H "authorization: Bearer $CODEYBOX_API_KEY" \
+  http://localhost:5036/projects/my-app/costs      # the whole project
+```
+
+The admin dashboard's Costs tab charts the same data.
+→ [`docs/cost-reporting.md`](docs/cost-reporting.md)
+
+## Drive it from the CLI
+
+`codeybox` is a typed client for the whole API — no more `curl + jq`. Run it
+from source (`dotnet run --project tools/CodeyBox.Cli -- <command>`) or publish
+a self-contained binary:
+
+```bash
+dotnet publish tools/CodeyBox.Cli -c Release -r linux-x64 -o ./bin/codeybox
+codeybox configure          # save API URL + token to ~/.config/codeybox
+```
+
+Everyday use:
+
+```bash
+# Queue a task (inline, --prompt-file, or piped in) and follow it live
+ID=$(codeybox queue add --project my-app --title "Add /healthz" \
+       --prompt "Add a /healthz endpoint returning 200." --quiet)
+codeybox queue watch "$ID"                    # streams state transitions over SSE
+
+codeybox queue ls --state Working,Auditing    # what's in flight
+codeybox queue show <id>                       # full detail for one item
+codeybox queue retry <id> --from audit         # re-drive a failed item
+codeybox queue cancel <id>
+```
+
+`queue add` also takes `--agent`, `--work-branch`, `--push-upstream`, and
+`--depends-on` (to chain dependent items); `--json` / `--quiet` make every
+command pipe-friendly. → [`docs/cli.md`](docs/cli.md)
 
 ## The agent fleet
 
