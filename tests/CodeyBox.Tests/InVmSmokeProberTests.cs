@@ -1183,6 +1183,74 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureProbedAsync_GateDeadline_FailOpenOptOut_ReturnsWithoutBenching()
+    {
+        // The outer gate-deadline branch (Task.WhenAny picks the deadline before
+        // the inner probeTask completes) has distinct fail-open behavior from
+        // every other fault path: under FailClosedOnProbeFault=false the gate
+        // must RETURN without benching when the deadline elapses, leaving the
+        // agent routable. The fail-open coverage elsewhere targets the inner
+        // provisioning catch; a regression that always benched on the deadline
+        // branch — but still observed the fail-open flag for provisioning —
+        // would pass every other test, so pin this branch specifically.
+        //
+        // ProvisionTimeoutSeconds=0 disables the inner bound so we exercise the
+        // outer gate-deadline net unambiguously.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 0, gateDeadlineSeconds: 1, failClosed: false));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; deadline did not fire under fail-open");
+        // Fail-open: deadline expiry does NOT bench the agent.
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_LateSuccess_OrphanObserverDisposesSandbox()
+    {
+        // The orphan observer's reason for existing: if CreateAsync eventually
+        // succeeds AFTER the provisioning wall-clock timeout has fired, the
+        // late-arriving sandbox must be disposed so we don't leak a real VM the
+        // gate already walked away from. The hanging / non-cooperative tests
+        // exercise the bench-and-bail path but cannot catch a regression that
+        // removes (or breaks) the late-success cleanup, because their
+        // CreateAsync never produces a sandbox.
+        var sandbox = new RecordedDisposeSandbox();
+        var provider = new DelayedSuccessSandboxProvider(sandbox);
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // The gate already returned on the provisioning timeout.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.False(sandbox.Disposed); // CreateAsync hasn't completed yet
+
+        // Now let CreateAsync complete with a real sandbox. The orphan observer
+        // must dispose it — otherwise we'd leak a live VM for every wedged
+        // provisioning that eventually recovers.
+        provider.Complete();
+        Assert.True(await sandbox.WaitForDisposeAsync(TimeSpan.FromSeconds(10)),
+            "orphan observer did not dispose the late-arriving sandbox");
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_GateDeadlineDisabled_DoesNotFireAsImmediateTimeout_InnerTimeoutStillBoundsHang()
     {
         // GateDeadlineSeconds <= 0 disables the outer wall-clock deadline (for
@@ -1344,6 +1412,61 @@ public sealed class InVmSmokeProberTests
             await Task.Delay(Timeout.Infinite, ct); // completes only on cancellation
             throw new InvalidOperationException("unreachable");
         }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that records when DisposeAsync is invoked, so a test can assert
+    /// the orphan-observer cleanup path actually disposes a late-arriving VM
+    /// rather than leaking it.
+    /// </summary>
+    private sealed class RecordedDisposeSandbox : ISandbox
+    {
+        private readonly TaskCompletionSource _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public string Id => "recorded-dispose";
+
+        public bool Disposed => _disposed.Task.IsCompletedSuccessfully;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync()
+        {
+            _disposed.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+
+        public async Task<bool> WaitForDisposeAsync(TimeSpan timeout)
+        {
+            var winner = await Task.WhenAny(_disposed.Task, Task.Delay(timeout));
+            return winner == _disposed.Task;
+        }
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync only completes when the test invokes
+    /// <see cref="Complete"/>. Models the failure mode the orphan observer
+    /// exists to handle: a provider that the gate timed out on, but whose
+    /// CreateAsync eventually returns a usable sandbox after the gate already
+    /// walked away. The orphan observer must dispose that late-arriving VM
+    /// rather than leak it.
+    /// </summary>
+    private sealed class DelayedSuccessSandboxProvider : ISandboxProvider
+    {
+        private readonly TaskCompletionSource<ISandbox> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ISandbox _sandbox;
+
+        public DelayedSuccessSandboxProvider(ISandbox sandbox) => _sandbox = sandbox;
+
+        public string Name => "delayed-success";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => _tcs.Task;
+
+        public void Complete() => _tcs.TrySetResult(_sandbox);
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);

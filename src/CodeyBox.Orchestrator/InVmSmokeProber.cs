@@ -479,8 +479,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// the timeout produces a transient-fault verdict even if the provider call
     /// itself never returns. The orphaned create task is handed to
     /// <see cref="ObserveOrphanedSandboxCreateAsync"/>, which disposes any
-    /// sandbox the provider eventually yields and the linked-CTS pair so
-    /// neither a sandbox leak nor an UnobservedTaskException can escape.</para>
+    /// sandbox the provider eventually yields so a late-arriving VM does not
+    /// leak. The linked / provisioning CTS pair is disposed before we walk away
+    /// from a non-cooperative create — the token's cancelled state is preserved
+    /// after dispose (so a cooperative provider still observes the cancel) and
+    /// disposing unregisters the linked source from the parent worker token, so
+    /// repeated timed-out probes cannot accumulate registrations against
+    /// <paramref name="ct"/> for the process lifetime.</para>
     /// </summary>
     private async Task<ISandbox> CreateSandboxWithProvisionTimeoutAsync(
         SandboxSpec spec, CancellationToken ct)
@@ -492,7 +497,23 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         var provisionCts = new CancellationTokenSource(provisionTimeout);
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, provisionCts.Token);
 
-        var createTask = _provider.CreateAsync(spec, linked.Token);
+        // ISandboxProvider.CreateAsync is not required to be an async state
+        // machine — it can throw synchronously before returning a Task. Without
+        // this guard those throws would leak both CTSes (the try/finally below
+        // is only reached once a Task exists), so wrap construction and dispose
+        // on a synchronous boundary failure.
+        Task<ISandbox> createTask;
+        try
+        {
+            createTask = _provider.CreateAsync(spec, linked.Token);
+        }
+        catch
+        {
+            linked.Dispose();
+            provisionCts.Dispose();
+            throw;
+        }
+
         var winner = await Task.WhenAny(createTask, Task.Delay(provisionTimeout, ct));
         if (winner == createTask)
         {
@@ -512,17 +533,25 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             }
         }
 
-        // Wall-clock timeout (or the caller's ct) fired before CreateAsync
-        // returned. Propagate caller cancellation first so a real shutdown is
+        // Either the wall-clock timeout or the caller's ct fired before
+        // CreateAsync returned. In BOTH cases the in-flight task is left
+        // running: ownership passes to the orphan observer (it disposes any
+        // sandbox the provider eventually yields) and the CTS pair is disposed
+        // immediately so we don't keep registrations on the parent worker
+        // token alive for a non-cooperative create that may never settle. The
+        // CancellationToken state is preserved after dispose, so a cooperative
+        // provider still observes cancellation; disposing only unregisters the
+        // linked-source callback from ct. We always hand off / dispose BEFORE
+        // propagating either cancellation or the timeout exception, so a
+        // caller-cancelled provisioning never falls through unobserved.
+        provisionCts.Cancel();
+        _ = ObserveOrphanedSandboxCreateAsync(createTask);
+        linked.Dispose();
+        provisionCts.Dispose();
+
+        // Propagate caller cancellation first so a real shutdown is
         // distinguishable from a provisioning hang.
         ct.ThrowIfCancellationRequested();
-        // Signal the linked token in case the provider is cooperative — it'll
-        // observe cancellation and wind down. But we do NOT await it: a wedged
-        // provider that ignores cancellation would otherwise still hang the
-        // gate. Ownership of the orphaned create task and its CTS pair passes
-        // to the observer below.
-        provisionCts.Cancel();
-        _ = ObserveOrphanedSandboxCreateAsync(createTask, provisionCts, linked);
         throw new TimeoutException(
             $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
     }
@@ -530,38 +559,29 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// <summary>
     /// Owns the post-timeout cleanup for a sandbox-create task we walked away
     /// from: disposes the sandbox if the provider eventually returns one (so a
-    /// late-arriving VM does not leak), logs any eventual fault for diagnosis,
-    /// and disposes the linked-CTS pair only after the create task has settled
-    /// so the provider's cancellation registrations are still valid until then.
+    /// late-arriving VM does not leak) and logs any eventual fault for
+    /// diagnosis. The linked / provision CTS pair is owned by the caller and
+    /// disposed before this observer is started — we deliberately do NOT keep
+    /// CTS references here, since a non-cooperative create may never settle and
+    /// holding them would leak registrations on the parent worker token.
     /// </summary>
-    private async Task ObserveOrphanedSandboxCreateAsync(
-        Task<ISandbox> createTask,
-        CancellationTokenSource provisionCts,
-        CancellationTokenSource linked)
+    private async Task ObserveOrphanedSandboxCreateAsync(Task<ISandbox> createTask)
     {
         try
         {
-            try
-            {
-                var sandbox = await createTask.ConfigureAwait(false);
-                try { await sandbox.DisposeAsync().ConfigureAwait(false); }
-                catch (Exception ex)
-                {
-                    _log.LogDebug(ex,
-                        "In-VM smoke: failed to dispose post-timeout orphaned sandbox");
-                }
-            }
-            catch (OperationCanceledException) { /* expected — we cancelled it */ }
+            var sandbox = await createTask.ConfigureAwait(false);
+            try { await sandbox.DisposeAsync().ConfigureAwait(false); }
             catch (Exception ex)
             {
                 _log.LogDebug(ex,
-                    "In-VM smoke: post-timeout orphaned provisioning eventually faulted");
+                    "In-VM smoke: failed to dispose post-timeout orphaned sandbox");
             }
         }
-        finally
+        catch (OperationCanceledException) { /* expected — we cancelled it */ }
+        catch (Exception ex)
         {
-            linked.Dispose();
-            provisionCts.Dispose();
+            _log.LogDebug(ex,
+                "In-VM smoke: post-timeout orphaned provisioning eventually faulted");
         }
     }
 
