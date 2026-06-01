@@ -49,6 +49,10 @@ internal static class CliApp
         queueCmd.AddCommand(QueueReorder.Build(apiUrlOpt, apiKeyOpt, clientFactory));
 
         root.AddCommand(queueCmd);
+        root.AddCommand(WorkersCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        root.AddCommand(QuotaCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        root.AddCommand(ConcurrencyCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        root.AddCommand(FleetCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(ConfigureCommand.Build());
         root.AddCommand(VersionCommand.Build());
 
