@@ -66,6 +66,13 @@ internal sealed class CodeyBoxClient
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
+    internal async Task<QueueTemplateResponse> QueueTemplateAsync(QueueTemplateRequest req, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync("/templates/queue", req, CliJsonContext.Default.QueueTemplateRequest, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.QueueTemplateResponse, ct))!;
+    }
+
     internal async Task DeleteWorkItemAsync(string id, CancellationToken ct = default)
     {
         var resp = await _http.DeleteAsync($"/workitems/{Uri.EscapeDataString(id)}", ct);

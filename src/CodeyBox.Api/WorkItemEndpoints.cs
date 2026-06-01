@@ -2139,7 +2139,7 @@ internal static class WorkItemEndpoints
         return branch[..len];
     }
 
-    private static WorkItemDto ToDto(
+    internal static WorkItemDto ToDto(
         WorkItem item,
         Project? project,
         IReadOnlyDictionary<WorkItemId, WorkItemState> statesById,
@@ -2200,7 +2200,9 @@ internal static class WorkItemEndpoints
             Check: item.Check,
             Verdict: item.Verdict,
             OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString(),
-            ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts);
+            ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
+            TemplateName: item.TemplateName,
+            TemplateEntryIndex: item.TemplateEntryIndex);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -2549,7 +2551,11 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyList<AgentInvolvementDto>? AgentHistory = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    string? WorkAgent = null);
+    string? WorkAgent = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? TemplateName = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    int? TemplateEntryIndex = null);
 
 /// <summary>
 /// One entry in a work item's per-phase agent involvement trail. Mirrors

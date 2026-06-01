@@ -178,6 +178,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             Check = spec,
             Verdict = verdict,
             OriginCheckWorkItemId = originId,
+            TemplateName = "security",
+            TemplateEntryIndex = 3,
         };
         await _store.CreateAsync(item);
 
@@ -185,6 +187,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.NotNull(read);
         Assert.Equal(JobType.CheckAndAct, read!.JobType);
         Assert.Equal(originId, read.OriginCheckWorkItemId);
+        Assert.Equal("security", read.TemplateName);
+        Assert.Equal(3, read.TemplateEntryIndex);
 
         Assert.NotNull(read.Check);
         Assert.Equal(spec.Question, read.Check!.Question);

@@ -1610,6 +1610,7 @@ builder.Services.AddSingleton<IQueueController>(sp =>
 });
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
+builder.Services.AddSingleton<ITaskTemplateRegistry, FileTaskTemplateRegistry>();
 
 // --- Dead-worker registry + reaper -------------------------------------------
 builder.Services.AddSingleton<IWorkerRegistry>(sp =>
@@ -2178,6 +2179,7 @@ app.UseApiKeyAuth(anonymousPrefixes: ["/healthz", "/webhooks/"]);
 IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
+TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
@@ -2570,7 +2572,7 @@ namespace CodeyBox.Api
     /// <item><b>Hot-reloadable</b> fields are read fresh from
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
-    ///   <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
+    ///   <c>TemplateDirectory</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
     ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>SandboxLeak</c> (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
@@ -2596,6 +2598,7 @@ namespace CodeyBox.Api
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
+        public string TemplateDirectory { get; set; } = "templates";
         public string SandboxImageReference { get; set; } = "";
         public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
         public string[] AuditToolAllowedHosts { get; set; } =

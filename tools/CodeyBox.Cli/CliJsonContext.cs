@@ -7,6 +7,8 @@ namespace CodeyBox.Cli;
 [JsonSerializable(typeof(List<WorkItemDto>))]
 [JsonSerializable(typeof(CliConfig))]
 [JsonSerializable(typeof(CreateWorkItemRequest))]
+[JsonSerializable(typeof(QueueTemplateRequest))]
+[JsonSerializable(typeof(QueueTemplateResponse))]
 [JsonSerializable(typeof(RetryRequest))]
 [JsonSerializable(typeof(PauseQueueRequest))]
 [JsonSerializable(typeof(ReorderRequest))]

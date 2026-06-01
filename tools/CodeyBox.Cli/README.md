@@ -77,6 +77,20 @@ codeybox queue add \
 
 Prints the new work item ID to stdout (use `--quiet` for ID only, `--json` for raw JSON).
 
+### `codeybox queue template`
+
+Expand a server-side task template into one queued check-and-act work item per
+template entry:
+
+```bash
+codeybox queue templates/security --project myapp
+codeybox queue template templates/security --project myapp
+codeybox queue templates security --project myapp --priority 25 --quiet
+```
+
+Templates are read by the API from `CodeyBox:TemplateDirectory` (default
+`templates`). Invalid templates fail before any items are queued.
+
 ### `codeybox queue ls`
 
 List work items:

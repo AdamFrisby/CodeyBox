@@ -15,6 +15,7 @@ internal static class CliApp
         Func<ResolvedConfig, CodeyBoxClient>? clientFactory = null,
         CancellationToken cancellationToken = default)
     {
+        args = RewriteTemplateShortcut(args);
         var parser = new CommandLineBuilder(BuildRootCommand(clientFactory, cancellationToken))
             .UseDefaults()
             .Build();
@@ -47,6 +48,7 @@ internal static class CliApp
         queueCmd.AddCommand(QueueResume.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueStatus.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueReorder.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueTemplate.Build(apiUrlOpt, apiKeyOpt, clientFactory));
 
         root.AddCommand(queueCmd);
         root.AddCommand(WorkersCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
@@ -57,5 +59,23 @@ internal static class CliApp
         root.AddCommand(VersionCommand.Build());
 
         return root;
+    }
+
+    private static string[] RewriteTemplateShortcut(string[] args)
+    {
+        if (args.Length < 2) return args;
+        if (!string.Equals(args[0], "queue", StringComparison.OrdinalIgnoreCase)) return args;
+        var templateRef = args[1];
+        if (!templateRef.StartsWith("templates/", StringComparison.OrdinalIgnoreCase)
+            && !templateRef.StartsWith("templates\\", StringComparison.OrdinalIgnoreCase))
+        {
+            return args;
+        }
+
+        var rewritten = new string[args.Length + 1];
+        rewritten[0] = args[0];
+        rewritten[1] = "template";
+        Array.Copy(args, 1, rewritten, 2, args.Length - 1);
+        return rewritten;
     }
 }

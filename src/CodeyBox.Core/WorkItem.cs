@@ -405,6 +405,21 @@ public sealed record WorkItem
     public IReadOnlyList<CheckVerdict> ReCheckVerdicts { get; init; } = [];
 
     /// <summary>
+    /// Name of the task template that produced this work item, when the item
+    /// was created by expanding a JSON template from the templates directory.
+    /// Null for manually-created, replayed, suggestion-promoted, and
+    /// check-follow-up items.
+    /// </summary>
+    public string? TemplateName { get; init; }
+
+    /// <summary>
+    /// Zero-based index of the template entry that produced this work item.
+    /// Paired with <see cref="TemplateName"/> to trace an expanded work item
+    /// back to a specific JSON array element.
+    /// </summary>
+    public int? TemplateEntryIndex { get; init; }
+
+    /// <summary>
     /// Content-hashed identifier of the sandbox baseline image this work item is
     /// pinned to. Stamped at pickup time from the sandbox provider's live config
     /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved

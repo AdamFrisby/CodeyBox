@@ -22,6 +22,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
     private readonly Project[] _projects;
 
     public SqliteWorkItemStore Store { get; }
+    public string? TemplateDirectory { get; set; }
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
@@ -64,6 +65,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:TemplateDirectory"] = TemplateDirectory,
             });
         });
         builder.ConfigureTestServices(services =>
