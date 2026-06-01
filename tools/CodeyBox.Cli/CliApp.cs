@@ -42,7 +42,11 @@ internal static class CliApp
         queueCmd.AddCommand(QueueList.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueShow.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueCancel.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueAbandon.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueUncancel.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueuePromote.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueRetry.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        queueCmd.AddCommand(QueueReplay.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueWatch.Build(apiUrlOpt, apiKeyOpt, clientFactory, externalCancellation));
         queueCmd.AddCommand(QueuePause.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         queueCmd.AddCommand(QueueResume.Build(apiUrlOpt, apiKeyOpt, clientFactory));

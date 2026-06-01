@@ -111,6 +111,16 @@ internal sealed class CodeyBoxClient
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
+    internal async Task<string> PostWorkItemVerbAsync(string id, string verb, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync(
+            $"/workitems/{Uri.EscapeDataString(id)}/{verb}",
+            content: null,
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     internal async Task PauseQueueAsync(string reason, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
