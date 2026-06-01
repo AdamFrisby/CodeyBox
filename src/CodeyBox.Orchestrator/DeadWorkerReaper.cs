@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -24,6 +25,8 @@ public sealed class DeadWorkerReaper : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<DeadWorkerOptions> _optsAccessor;
     private readonly ILogger<DeadWorkerReaper> _log;
+    private readonly ConcurrentDictionary<WorkItemId, byte> _recoveredItemsThisProcess = new();
+    private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Resolves the current DeadWorkerOptions value on every read so MaxRecoveryAttempts /
     // DeadWorkerThreshold edits applied via IOptionsMonitor take effect on the next sweep
@@ -40,8 +43,9 @@ public sealed class DeadWorkerReaper : BackgroundService
         ITaskQueue queue,
         DeadWorkerOptions opts,
         ILogger<DeadWorkerReaper> log,
-        IWebhookDispatcher? webhooks = null)
-        : this(registry, store, queue, () => opts, log, webhooks) { }
+        IWebhookDispatcher? webhooks = null,
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
+        : this(registry, store, queue, () => opts, log, webhooks, slotReleaser) { }
 
     public DeadWorkerReaper(
         IWorkerRegistry registry,
@@ -49,7 +53,8 @@ public sealed class DeadWorkerReaper : BackgroundService
         ITaskQueue queue,
         Func<DeadWorkerOptions> optionsAccessor,
         ILogger<DeadWorkerReaper> log,
-        IWebhookDispatcher? webhooks = null)
+        IWebhookDispatcher? webhooks = null,
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
     {
         _registry = registry;
         _store = store;
@@ -57,7 +62,14 @@ public sealed class DeadWorkerReaper : BackgroundService
         _optsAccessor = optionsAccessor;
         _log = log;
         _webhooks = webhooks;
+        _slotReleaser = slotReleaser;
     }
+
+    internal void AttachWorkerPoolSlotReleaser(IWorkerPoolRecoverySlotReleaser slotReleaser)
+        => _slotReleaser = slotReleaser;
+
+    internal bool HasRecoveredItemInCurrentProcess(WorkItemId itemId)
+        => _recoveredItemsThisProcess.ContainsKey(itemId);
 
     /// <summary>
     /// Runs a single reaper sweep. Safe to call concurrently or repeatedly;
@@ -80,11 +92,10 @@ public sealed class DeadWorkerReaper : BackgroundService
     }
 
     /// <summary>
-    /// One-shot startup sweep that finds work items left in worker-owned
-    /// states (<see cref="WorkItemState.Working"/>, <see cref="WorkItemState.Reworking"/>,
-    /// <see cref="WorkItemState.Auditing"/>, <see cref="WorkItemState.Merging"/>)
-    /// with no live worker row holding them, and routes each through the
-    /// same recovery helper the periodic reaper uses.
+    /// One-shot startup sweep that finds work items left in a state the reaper
+    /// owns (mid-flight worker-owned states plus durable phase-boundary resume
+    /// states) with no live worker row holding them, and routes each through
+    /// the same recovery helper the periodic reaper uses.
     ///
     /// <para>
     /// Closes the crash-before-heartbeat edge case: the periodic
@@ -119,19 +130,15 @@ public sealed class DeadWorkerReaper : BackgroundService
                 liveOwnedIds.Add(new WorkItemId(guid));
             }
 
-            // Plain array — ReadOnlySpan cannot cross await boundaries.
-            var strandedStates = new[]
+            foreach (var state in Enum.GetValues<WorkItemState>())
             {
-                WorkItemState.Working,
-                WorkItemState.Reworking,
-                WorkItemState.Auditing,
-                WorkItemState.Merging,
-            };
+                if (!HandlesRecoveryState(state))
+                    continue;
 
-            foreach (var state in strandedStates)
-            {
                 await foreach (var item in _store.ListByStateAsync(state, ct))
                 {
+                    if (HasRecoveredItemInCurrentProcess(item.Id))
+                        continue;
                     if (liveOwnedIds.Contains(item.Id))
                         continue;
                     await RecoverWorkItemAsync(
@@ -162,12 +169,14 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (worker.CurrentWorkItemId is null)
         {
             _log.LogDebug("Dead worker {WorkerId} (host={Host}) had no active work item; row removed", worker.WorkerId, worker.HostName);
+            ReleaseRecoveredWorkerSlot(worker.WorkerId, null, "dead worker row had no active work item");
             return;
         }
 
         if (!Guid.TryParse(worker.CurrentWorkItemId, out var guid))
         {
             _log.LogWarning("Dead worker {WorkerId} had malformed work item id '{ItemId}'; skipping", worker.WorkerId, worker.CurrentWorkItemId);
+            ReleaseRecoveredWorkerSlot(worker.WorkerId, null, "dead worker row had malformed work item id");
             return;
         }
 
@@ -176,6 +185,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (item is null)
         {
             _log.LogWarning("Dead worker {WorkerId} referenced work item {ItemId} which no longer exists", worker.WorkerId, itemId);
+            ReleaseRecoveredWorkerSlot(worker.WorkerId, itemId, "dead worker row referenced a missing work item");
             return;
         }
 
@@ -192,9 +202,9 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// worker whose heartbeat row has been claimed) and the orchestrator's
     /// startup stranded-item sweep (called for each mid-flight item with no
     /// live worker row). State transitions, recovery-attempt accounting, audit
-    /// logging, webhook dispatch, and re-enqueue are identical across both
-    /// callers — only the worker-identity log token, the no-preempt-checkpoint
-    /// <c>LastError</c> phrasing, and the webhook reason vary.
+    /// logging, state-changing recovery webhooks, and re-enqueue are identical
+    /// across both callers — only the worker-identity log token, the
+    /// no-preempt-checkpoint <c>LastError</c> phrasing, and the webhook reason vary.
     /// </summary>
     private async Task RecoverWorkItemAsync(
         WorkItem item,
@@ -211,6 +221,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             var preempted = item with { StartedAt = null, UpdatedAt = DateTimeOffset.UtcNow };
             await _store.UpdateAsync(preempted, ct);
             await _queue.EnqueueAsync(itemId, ct);
+            MarkRecoveredItem(itemId);
             _log.LogInformation(
                 "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume",
                 workerIdContext, itemId, item.PreemptCheckpoint);
@@ -230,9 +241,11 @@ public sealed class DeadWorkerReaper : BackgroundService
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
             await _store.UpdateAsync(failed, ct);
+            MarkRecoveredItem(itemId);
             _log.LogWarning(
                 "Recovery ({WorkerId}): work item {ItemId} was Working without a preempt checkpoint; marked Failed",
                 workerIdContext, itemId);
+            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery marked Working item Failed without re-dispatch");
             return;
         }
 
@@ -242,6 +255,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             _log.LogInformation(
                 "Recovery ({WorkerId}): item {ItemId} in non-recoverable state {State} (already terminal or not worker-owned); no action",
                 workerIdContext, itemId, item.State);
+            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery found non-recoverable state and did not re-dispatch");
             return;
         }
 
@@ -269,7 +283,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             updated = item with
             {
                 State = recoveryTarget.Value,
-                LastError = null,
+                LastError = isInterruptedWork ? null : item.LastError,
                 RecoveryAttempts = attempt,
                 UpdatedAt = DateTimeOffset.UtcNow,
                 // Re-queued items must not appear in-flight to CountInFlightAsync.
@@ -283,7 +297,7 @@ public sealed class DeadWorkerReaper : BackgroundService
 
         await _store.UpdateAsync(updated, ct);
 
-        if (_webhooks is not null)
+        if (_webhooks is not null && isInterruptedWork)
         {
             _ = _webhooks.PublishAsync(new WebhookEvent
             {
@@ -303,12 +317,39 @@ public sealed class DeadWorkerReaper : BackgroundService
         }
 
         if (updated.State != WorkItemState.Failed)
+        {
             await _queue.EnqueueAsync(itemId, ct);
+            MarkRecoveredItem(itemId);
+        }
+        else
+        {
+            MarkRecoveredItem(itemId);
+            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery failed item permanently without re-dispatch");
+        }
     }
 
+    private void MarkRecoveredItem(WorkItemId itemId)
+        => _recoveredItemsThisProcess[itemId] = 0;
+
+    private void ReleaseRecoveredWorkerSlot(string workerId, WorkItemId? itemId, string reason)
+    {
+        if (_slotReleaser?.TryReleaseRecoveredWorkerSlot(workerId, itemId, reason) == true)
+        {
+            _log.LogWarning(
+                "Recovery ({WorkerId}): released worker-pool slot for item {ItemId}: {Reason}",
+                workerId, itemId?.ToString() ?? "<none>", reason);
+        }
+    }
+
+    internal static bool HandlesRecoveryState(WorkItemState state)
+        => state == WorkItemState.Working || MapToRecoveryState(state) is not null;
+
     /// <summary>
-    /// Maps a worker-owned state to the state the reaper should recover or
-    /// redispatch it into, or null if the state is terminal / not worker-owned.
+    /// Maps a state for which a stale worker row could exist to the state the
+    /// reaper should recover or redispatch it into. Mid-flight states map back
+    /// to durable resume points and consume a recovery attempt; phase-boundary
+    /// resting states map to themselves and are only re-dispatched. Returns
+    /// null for terminal, parked, or otherwise dispatcher-owned states.
     /// </summary>
     internal static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {

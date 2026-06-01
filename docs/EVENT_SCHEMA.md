@@ -120,7 +120,7 @@ subscribe to.
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
 | `work_item.auto_retry` | 1.0 | Quota auto-retry re-queued a failed item. |
-| `work_item.recovered` | 1.0 | Dead-worker reaper recovered a mid-flight item. |
+| `work_item.recovered` | 1.0 | Dead-worker reaper recovered an item with a state-changing transition. |
 | `work_item.suggestion` | 1.0 | Agent emitted a suggestion entry. |
 | `work_item.question_asked` | 1.0 | Agent parked an item waiting for an answer. |
 | `work_item.question_answered` | 1.0 | Operator answered a parked question. |

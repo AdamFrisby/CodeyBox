@@ -110,6 +110,8 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [Fact]
     public async Task Reaper_WorkItemIdNull_DeletesRowWithoutTouchingAnyItem()
     {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
         var workerId = Guid.NewGuid().ToString();
         await PlantDeadWorkerAsync(workerId, null);
 
@@ -119,6 +121,9 @@ public sealed class DeadWorkerReaperTests : IDisposable
         Assert.Empty(await _registry.ListAsync());
         // No webhook should fire.
         Assert.Empty(_webhooks.Events);
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Null(release.WorkItemId);
     }
 
     [Fact]
@@ -170,22 +175,66 @@ public sealed class DeadWorkerReaperTests : IDisposable
         Assert.NotNull(after);
         Assert.Equal(state, after.State);
         Assert.Equal(3, after.RecoveryAttempts);
-        Assert.Null(after.LastError);
+        Assert.Equal("stale worker died", after.LastError);
         Assert.Equal(1, _queue.Count);
+        Assert.Empty(_webhooks.Events);
     }
 
     [Fact]
     public async Task Reaper_TerminalState_SkipsItem()
     {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
         var item = MakeItem(WorkItemState.Done);
+        var workerId = Guid.NewGuid().ToString();
         await _store.CreateAsync(item);
-        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
 
         await _reaper.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, after!.State);
         Assert.Empty(_webhooks.Events);
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+    }
+
+    [Fact]
+    public async Task Reaper_MaxRecoveryAttemptsFailure_ReleasesWorkerSlot()
+    {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+        };
+        var workerId = Guid.NewGuid().ToString();
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+    }
+
+    [Fact]
+    public async Task Reaper_RedispatchedItem_DoesNotReleaseWorkerSlot()
+    {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
+        var item = MakeItem(WorkItemState.AuditPassed);
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        Assert.Empty(slotReleaser.Releases);
+        Assert.Equal(1, _queue.Count);
     }
 
     [Fact]
@@ -222,6 +271,17 @@ public sealed class DeadWorkerReaperTests : IDisposable
             WorkItemState.Cancelled, WorkItemState.AuditFailed })
         {
             Assert.Null(DeadWorkerReaper.MapToRecoveryState(state));
+        }
+    }
+
+    private sealed class RecordingWorkerPoolRecoverySlotReleaser : IWorkerPoolRecoverySlotReleaser
+    {
+        public List<(string WorkerId, WorkItemId? WorkItemId, string Reason)> Releases { get; } = [];
+
+        public bool TryReleaseRecoveredWorkerSlot(string workerId, WorkItemId? workItemId, string reason)
+        {
+            Releases.Add((workerId, workItemId, reason));
+            return true;
         }
     }
 }
