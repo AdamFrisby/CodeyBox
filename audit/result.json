@@ -1,5 +1,5 @@
 {
-  "iteration": 14,
+  "iteration": 15,
   "resolvedFindings": [
     {
       "id": "completeness-001",
@@ -43,14 +43,14 @@
     }
   ],
   "notes": [
-    "iteration-14 security:gitleaks: Info — tool not installed in sandbox (auditor skipped).",
-    "iteration-14 security:semgrep: Info — tool not installed in sandbox (auditor skipped).",
-    "iteration-14 security:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
-    "iteration-14 architecture:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
-    "iteration-14 quality:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
-    "iteration-14 completeness:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
-    "iteration-14 cheating:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
-    "iteration-14 tests:meaningfulness-review: Error — review agent failed: Unknown server error; infrastructure issue.",
-    "All Error-severity findings in iteration 14 are infrastructure failures (LLM model configuration, server errors, missing tools); no code changes required."
+    "iteration-15 security:gitleaks: Info — tool not installed in sandbox (auditor skipped).",
+    "iteration-15 security:semgrep: Info — tool not installed in sandbox (auditor skipped).",
+    "iteration-15 security:llm-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "iteration-15 architecture:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-15 quality:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-15 completeness:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-15 cheating:llm-review: Error — review agent failed: Model not found deepseek/deepseek-coder; infrastructure issue.",
+    "iteration-15 tests:meaningfulness-review: Error — review agent failed: Unknown server error; infrastructure issue.",
+    "All Error-severity findings in iteration 15 are infrastructure failures (LLM model configuration, server errors, missing tools); no code changes required."
   ]
 }
