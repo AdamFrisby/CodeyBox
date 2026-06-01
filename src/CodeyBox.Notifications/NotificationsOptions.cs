@@ -17,6 +17,13 @@ public sealed class NotificationsOptions
     public EmailProviderOptions Email { get; set; } = new();
 
     /// <summary>
+    /// Chat provider configuration (Slack/Discord incoming webhooks).
+    /// Set <c>Enabled</c> to <c>true</c> and configure at least one webhook
+    /// to activate the chat notification path.
+    /// </summary>
+    public ChatProviderOptions Chat { get; set; } = new();
+
+    /// <summary>
     /// Notification rules. Each rule maps a condition → providers + recipients
     /// + severity override + debounce cooldown.
     /// </summary>
@@ -53,6 +60,47 @@ public sealed class EmailProviderOptions
 
     /// <summary>When true, skips certificate validation (dev only).</summary>
     public bool IgnoreCertificateErrors { get; set; }
+}
+
+/// <summary>
+/// Chat provider configuration. Supports Slack and Discord incoming webhooks.
+/// Webhook URLs are NEVER set directly in config — they must be loaded from an
+/// environment variable named by <see cref="ChatWebhookOptions.UrlEnvVar"/>
+/// (the existing <c>CODEYBOX_*</c> secret-env-var pattern).
+/// </summary>
+public sealed class ChatProviderOptions
+{
+    /// <summary>Enable chat notifications. Default false.</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>One or more chat webhook destinations. A single firing rule
+    /// fans out to every configured destination.</summary>
+    public List<ChatWebhookOptions> Webhooks { get; set; } = [];
+}
+
+/// <summary>One chat webhook destination — either Slack or Discord.</summary>
+public sealed class ChatWebhookOptions
+{
+    /// <summary>Target chat platform. Determines the JSON payload shape and
+    /// severity colour mapping.</summary>
+    public ChatPlatform Platform { get; set; } = ChatPlatform.Slack;
+
+    /// <summary>Environment variable holding the incoming-webhook URL.
+    /// Never set the URL directly in config.</summary>
+    public string? UrlEnvVar { get; set; }
+
+    /// <summary>Optional username override for the posted message. Slack
+    /// honours this; Discord renders it as the embed author name when set.</summary>
+    public string? Username { get; set; }
+}
+
+/// <summary>Supported chat platforms. Each has a distinct webhook JSON shape.</summary>
+public enum ChatPlatform
+{
+    /// <summary>Slack incoming webhook (text + attachments[colour]).</summary>
+    Slack,
+    /// <summary>Discord incoming webhook (content + embeds[colour]).</summary>
+    Discord,
 }
 
 /// <summary>
