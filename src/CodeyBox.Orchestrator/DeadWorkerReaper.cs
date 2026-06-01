@@ -246,10 +246,11 @@ public sealed class DeadWorkerReaper : BackgroundService
         }
 
         var fromState = item.State;
-        var attempt = item.RecoveryAttempts + 1;
+        var isInterruptedWork = recoveryTarget.Value != fromState;
+        var attempt = isInterruptedWork ? item.RecoveryAttempts + 1 : item.RecoveryAttempts;
         WorkItem updated;
 
-        if (attempt > _opts.MaxRecoveryAttempts)
+        if (isInterruptedWork && attempt > _opts.MaxRecoveryAttempts)
         {
             updated = item with
             {
@@ -306,14 +307,17 @@ public sealed class DeadWorkerReaper : BackgroundService
     }
 
     /// <summary>
-    /// Maps a mid-flight worker-owned state to the state the reaper should
-    /// recover it into, or null if the state is terminal / not worker-owned.
+    /// Maps a worker-owned state to the state the reaper should recover or
+    /// redispatch it into, or null if the state is terminal / not worker-owned.
     /// </summary>
     internal static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {
         WorkItemState.Reworking => WorkItemState.Queued,
+        WorkItemState.WorkComplete => WorkItemState.WorkComplete,
         WorkItemState.Auditing => WorkItemState.WorkComplete,
+        WorkItemState.AuditPassed => WorkItemState.AuditPassed,
         WorkItemState.Merging => WorkItemState.AuditPassed,
+        WorkItemState.Merged => WorkItemState.Merged,
         // A dead worker mid-ReworkingForConflict resumes from AuditPassed so
         // the merge phase re-runs. The ConflictReworkAttempts counter is
         // preserved so the third-line fallback cannot fire a second time.

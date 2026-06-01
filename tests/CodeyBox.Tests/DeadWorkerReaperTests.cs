@@ -149,6 +149,31 @@ public sealed class DeadWorkerReaperTests : IDisposable
         Assert.Equal(1, _queue.Count);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    public async Task Reaper_RedispatchesDurablePhaseBoundaryStates_WithoutIncrementingRecoveryAttempts(
+        WorkItemState state)
+    {
+        var item = MakeItem(state) with
+        {
+            LastError = "stale worker died",
+            RecoveryAttempts = 3,
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(state, after.State);
+        Assert.Equal(3, after.RecoveryAttempts);
+        Assert.Null(after.LastError);
+        Assert.Equal(1, _queue.Count);
+    }
+
     [Fact]
     public async Task Reaper_TerminalState_SkipsItem()
     {
@@ -193,8 +218,7 @@ public sealed class DeadWorkerReaperTests : IDisposable
     public async Task MapToRecoveryState_NonWorkerStates_ReturnNull()
     {
         foreach (var state in new[] {
-            WorkItemState.Queued, WorkItemState.WorkComplete, WorkItemState.AuditPassed,
-            WorkItemState.Merged, WorkItemState.Done, WorkItemState.Failed,
+            WorkItemState.Queued, WorkItemState.Done, WorkItemState.Failed,
             WorkItemState.Cancelled, WorkItemState.AuditFailed })
         {
             Assert.Null(DeadWorkerReaper.MapToRecoveryState(state));

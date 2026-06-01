@@ -153,6 +153,87 @@ public sealed class StartupReaperTests : IDisposable
         Assert.Equal(WorkItemState.Done, final.State);
         Assert.Equal(0, final.RecoveryAttempts);
     }
+
+    [Fact]
+    public async Task StartupReaper_AuditPassedWorkerRow_RedispatchesAndDoesNotLeakWorkerSlot()
+    {
+        var auditPassed = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "audit passed",
+            Prompt = "p",
+            State = WorkItemState.AuditPassed,
+        };
+        var queued = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "queued",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await _store.CreateAsync(auditPassed);
+        await _store.CreateAsync(queued);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = Guid.NewGuid().ToString(),
+            HostName = "crashed-host",
+            ProcessId = 9999,
+            StartedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            LastHeartbeatAt = DateTimeOffset.UtcNow.AddHours(-1),
+            CurrentWorkItemId = auditPassed.Id.ToString(),
+        });
+
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new ImmediateDonePipeline(_store);
+        var cancellations = new CancellationRegistry(CancellationToken.None);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1 };
+        var deadWorkerOpts = new DeadWorkerOptions
+        {
+            HeartbeatInterval = TimeSpan.FromSeconds(5),
+            DeadWorkerThreshold = TimeSpan.FromSeconds(15),
+            MaxRecoveryAttempts = 2,
+        };
+        var reaper = new DeadWorkerReaper(
+            _registry, _store, queue, deadWorkerOpts,
+            NullLogger<DeadWorkerReaper>.Instance);
+
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, cancellations, opts,
+            NullLogger<OrchestratorService>.Instance,
+            workerRegistry: _registry,
+            deadWorkerOpts: deadWorkerOpts,
+            reaper: reaper);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        WorkerPoolStatus? status = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var auditPassedAfter = await _store.GetAsync(auditPassed.Id);
+            var queuedAfter = await _store.GetAsync(queued.Id);
+            status = await svc.GetStatusAsync(CancellationToken.None);
+            if (auditPassedAfter?.State == WorkItemState.Done
+                && queuedAfter?.State == WorkItemState.Done
+                && status.CurrentlyRunning == 0)
+                break;
+            await Task.Delay(30);
+        }
+
+        status ??= await svc.GetStatusAsync(CancellationToken.None);
+        await svc.StopAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(auditPassed.Id);
+        var nextItem = await _store.GetAsync(queued.Id);
+        Assert.Equal(WorkItemState.Done, recovered!.State);
+        Assert.Equal(WorkItemState.Done, nextItem!.State);
+        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Equal(WorkItemState.AuditPassed, pipeline.EntryStates[auditPassed.Id]);
+        Assert.Contains(queued.Id, pipeline.Executed);
+        Assert.Equal(0, status.CurrentlyRunning);
+    }
 }
 
 /// <summary>Pipeline that immediately transitions every item to Done.</summary>
@@ -160,13 +241,16 @@ internal sealed class ImmediateDonePipeline : IPipelineRunner
 {
     private readonly IWorkItemStore _store;
     private readonly ConcurrentBag<WorkItemId> _executed = new();
+    private readonly ConcurrentDictionary<WorkItemId, WorkItemState> _entryStates = new();
     public IReadOnlyCollection<WorkItemId> Executed => _executed;
+    public IReadOnlyDictionary<WorkItemId, WorkItemState> EntryStates => _entryStates;
 
     public ImmediateDonePipeline(IWorkItemStore store) => _store = store;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _executed.Add(item.Id);
+        _entryStates[item.Id] = item.State;
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 }

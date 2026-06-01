@@ -52,13 +52,16 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
-| `Working` | `Queued` | Re-run the work phase from scratch |
+| `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
 | `Reworking` | `Queued` | Re-run the work phase from scratch |
+| `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary without consuming a recovery attempt |
 | `Auditing` | `WorkComplete` | Re-audit the same commit |
+| `AuditPassed` | `AuditPassed` | Re-dispatch merge from the phase boundary without consuming a recovery attempt |
 | `Merging` | `AuditPassed` | Re-attempt the merge |
+| `Merged` | `Merged` | Re-dispatch upstream push/finalization from the phase boundary without consuming a recovery attempt |
 | `UpstreamPushing` | `Merged` | Re-attempt the upstream push |
 | Any terminal state | — (no action) | Already finished |
-| `Queued`, `WorkComplete`, `AuditPassed`, `Merged` | — (no action) | Not worker-owned; safe without intervention |
+| `Queued` | — (no action) | Not worker-owned; safe without intervention |
 
 ---
 
