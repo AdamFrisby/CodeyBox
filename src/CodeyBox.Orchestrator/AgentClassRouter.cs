@@ -1487,14 +1487,12 @@ public sealed class QuotaRouterOptions
 
     public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
 
+    /// <summary>
     /// Suggested recheck delay surfaced by <see cref="AgentClassRouter.ResolveAsync"/>
     /// when every eligible candidate was blocked by its per-agent concurrency
     /// cap rather than quota exhaustion. Short enough that the deferred item is
     /// reconsidered as soon as another worker on any of those agents finishes;
-    /// long enough not to busy-loop. Default 15s, matching
-    /// <c>OrchestratorService._agentCapRetryDelay</c> (the fallback the
-    /// orchestrator applies if its own atomic slot reservation races and fails
-    /// after the router's pre-check).
+    /// long enough not to busy-loop. Default 15s.
     /// </summary>
     public TimeSpan CapRetryRecheckInterval { get; set; } = TimeSpan.FromSeconds(15);
 }

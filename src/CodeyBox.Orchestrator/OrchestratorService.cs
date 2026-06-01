@@ -147,6 +147,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private int _pendingDeferrals = 0;
     private const int DeferralWarningThreshold = 100;
 
+    /// <summary>
+    /// Fallback deferral interval when <c>QuotaRouterOptions</c> is not wired
+    /// (DI omits it). 15s keeps the deferred item visible without busy-looping.
+    /// Matches the hardcoded default that <see cref="AgentClassRouter"/>
+    /// surfaces through <c>QuotaRouterOptions.CapRetryRecheckInterval</c>.
+    /// </summary>
+    private static readonly TimeSpan DefaultCapRetryRecheckInterval = TimeSpan.FromSeconds(15);
+
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
     // any of them has committed StartedAt to the database.
@@ -1204,7 +1212,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
                             workerIndex, id, routedAgent.Value, running, cap);
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
-                        ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? TimeSpan.FromSeconds(15), ct);
+                        ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.

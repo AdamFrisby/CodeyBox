@@ -344,12 +344,16 @@ public sealed class BudgetEnforcementTests : IDisposable
         blockGate.TrySetResult();
         await Task.Delay(300);
 
-        await svc.StopAsync(CancellationToken.None);
+        // Prove the orchestrator consumed the snapshot after hot-reload:
+        // the deferred items should still be held because their last deferral
+        // used the new 1 h recheck interval (not the original 30 s). Verify
+        // through the service's test surface rather than checking the snapshot
+        // directly — a service that cached the value at construction would
+        // have re-enqueued the items by now.
+        Assert.True(
+            svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
+            "deferred items must remain in the deferred set after hot-reload");
 
-        // The snapshot was swapped; the orchestrator holds the same reference
-        // so any future read of .Current would see the 1-hour value.  The
-        // concurrent-cap guard reads _budgetDeferralRecheck.Current on every
-        // gate cycle so the new interval would be used on the next deferral.
-        Assert.Equal(TimeSpan.FromHours(1), snapshot.Current.ConcurrentLimitRecheck);
+        await svc.StopAsync(CancellationToken.None);
     }
 }

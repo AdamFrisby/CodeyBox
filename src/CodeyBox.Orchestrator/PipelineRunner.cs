@@ -101,19 +101,15 @@ public sealed class PipelineRunner : IPipelineRunner
     // resolve large conflict files). Hot-reloadable through the options
     // snapshot the resolver holds; the same instance is reused across phases.
     private readonly AgenticConflictResolver _agenticConflictResolver;
-    // Last-resort pause for quota-shaped terminal failures when neither the
-    // agent output nor quota probes expose a reset window.
-    internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
-    // Per-process exhausted-member TTL when the chosen agent hits quota mid-flight.
-    // Subscription windows reset on the order of hours; one hour is a conservative
-    // upper bound that keeps the in-process cache useful across consecutive pickups
-    // without blocking long enough to delay an actual reset by a meaningful amount.
-    private static readonly TimeSpan QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1);
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
     // subscription reset cadence we know about (Gemini daily); anything beyond is treated
     // as suspect and clamped.
+    // <para><b>Legacy security fallback:</b> used only by <see cref="ClampQuotaReset"/>
+    // when the caller omits <c>maxWindow</c>. Production consumers pass
+    // <c>_pipelineTuning.Current.MaxParsedQuotaResetWindow</c>; this static remains so
+    // that defensive-callers and tests that don't wire the snapshot still get the 24h cap.</para>
     internal static readonly TimeSpan MaxParsedQuotaResetWindow = TimeSpan.FromHours(24);
     // Subscription-billed quota probes, keyed by AgentKind. PayPerApi / Null probes are
     // routing utilities (not real quota sources) and intentionally excluded.
@@ -4381,12 +4377,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Clamps a parsed reset-window hint against <paramref name="maxWindow"/>
-    /// (or the legacy static <see cref="MaxParsedQuotaResetWindow"/> when not
-    /// supplied). The hint comes from agent stdout/stderr and is
-    /// attacker-influenceable via prompt injection; without a ceiling, a
-    /// hostile output could park an item arbitrarily far in the future and
-    /// re-arm targeted retry timers for that instant. Returns null when input
-    /// is null.
+    /// (production callers pass <c>_pipelineTuning.Current.MaxParsedQuotaResetWindow</c>;
+    /// falls back to the legacy static <see cref="MaxParsedQuotaResetWindow"/>
+    /// when <paramref name="maxWindow"/> is omitted). The hint comes from agent
+    /// stdout/stderr and is attacker-influenceable via prompt injection; without
+    /// a ceiling, a hostile output could park an item arbitrarily far in the
+    /// future and re-arm targeted retry timers for that instant. Returns null
+    /// when input is null.
     /// </summary>
     internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt, TimeSpan? maxWindow = null)
     {
@@ -4948,6 +4945,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// host path. One re-clone-and-retry is the production heal contract — if
     /// the source disappears AGAIN after restore, the loop falls through to
     /// rethrow rather than spinning indefinitely on a structural failure.
+    /// <para><b>Legacy reference:</b> production code reads through
+    /// <c>_pipelineTuning.Current.MergeSandboxStagingRestoreAttempts</c>
+    /// (hot-reloadable, default 2). This const is retained for test fixtures
+    /// that don't wire the snapshot and for internal documentation of the
+    /// canonical default.</para>
     /// </summary>
     internal const int MergeSandboxStagingRestoreAttempts = 2;
 
