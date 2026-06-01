@@ -8,6 +8,8 @@ namespace CodeyBox.Cli;
 [JsonSerializable(typeof(CliConfig))]
 [JsonSerializable(typeof(CreateWorkItemRequest))]
 [JsonSerializable(typeof(RetryRequest))]
+[JsonSerializable(typeof(PauseQueueRequest))]
+[JsonSerializable(typeof(ReorderRequest))]
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
