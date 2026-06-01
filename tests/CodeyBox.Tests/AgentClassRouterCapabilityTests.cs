@@ -203,26 +203,28 @@ public sealed class AgentClassRouterCapabilityTests
     // ── OrderedFallbackCandidates also respects the capability gate ──────────
 
     [Fact]
-    public void OrderedFallbackCandidates_FiltersByRequiredCapabilities()
+    public async Task OrderedFallbackCandidates_FiltersByRequiredCapabilities()
     {
         var cls = Class(
             Member(Claude, 100),
             Member(Codex, 70, "sensitive"));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
 
-        var candidates = router.OrderedFallbackCandidates(Item(required: "sensitive"), null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(
+            Item(required: "sensitive"), null, CancellationToken.None);
 
         Assert.Single(candidates);
         Assert.Equal(Codex, candidates[0].Agent);
     }
 
     [Fact]
-    public void OrderedFallbackCandidates_NoCapabilityRequired_AllEligibleReturned()
+    public async Task OrderedFallbackCandidates_NoCapabilityRequired_AllEligibleReturned()
     {
         var cls = Class(Member(Claude, 100), Member(Codex, 90));
         var router = BuildRouter([cls], [new FakeProbe(Claude, 50.0), new FakeProbe(Codex, 50.0)]);
 
-        var candidates = router.OrderedFallbackCandidates(Item(), null);
+        var candidates = await router.OrderedFallbackCandidatesAsync(
+            Item(), null, CancellationToken.None);
 
         Assert.Equal(2, candidates.Count);
         // Preference order: highest score first.
