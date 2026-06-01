@@ -1251,6 +1251,58 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureProbedAsync_CallerCancelledMidProvisioning_PropagatesCancellation_DoesNotBench_AndOrphanDisposesLateSandbox()
+    {
+        // Distinct caller-cancellation branch of CreateSandboxWithProvisionTimeoutAsync
+        // (worker / shutdown token fired before CreateAsync returns). The branch
+        // MUST: (1) hand the orphaned create task off so a sandbox the provider
+        // eventually yields is disposed; (2) rethrow cancellation instead of
+        // converting it into a TimeoutException / transient bench, because
+        // worker shutdown is not evidence the CLI is broken; (3) leave the agent
+        // routable so a later worker (with a non-cancelled token) is not refused
+        // by a phantom bench. All timeout / hanging-provider tests above pass
+        // CancellationToken.None, so a regression that benches on shutdown
+        // cancellation, swallows the OCE, or skips the orphan handoff would not
+        // be caught — this pins the three behaviours together.
+        var sandbox = new RecordedDisposeSandbox();
+        var provider = new DelayedSuccessSandboxProvider(sandbox);
+        var cache = NewCache();
+        var registry = NewRegistry();
+        // ProvisionTimeout / GateDeadline are well above the cancellation we
+        // drive manually, so any failure of the assertions below points at the
+        // caller-cancellation path, not at the wall-clock timer winning a race.
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 60, gateDeadlineSeconds: 120));
+
+        using var cts = new CancellationTokenSource();
+        var probeTask = prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, cts.Token);
+
+        // Wait long enough for the probe to enter the wrapper's WhenAny on
+        // CreateAsync (DelayedSuccessSandboxProvider returns a Task that only
+        // completes when Complete() is called). Then cancel — this drives the
+        // wrapper's "winner != createTask" / ct-cancelled branch.
+        await Task.Delay(50);
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+
+        // Shutdown cancellation must not bench the agent: a later worker (with a
+        // non-cancelled token) would otherwise see a CLI that was never actually
+        // smoke-checked falsely marked broken. The cache likewise stays empty.
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+
+        // Orphan handoff: the gate already walked away, but CreateAsync will
+        // eventually return a sandbox. Without the orphan observer disposing
+        // it, every cancelled probe would leak a live multipass VM until
+        // process exit. Drive the provider to completion and assert the
+        // late-arriving sandbox is disposed.
+        provider.Complete();
+        Assert.True(await sandbox.WaitForDisposeAsync(TimeSpan.FromSeconds(10)),
+            "orphan observer did not dispose the late-arriving sandbox after caller cancellation");
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_GateDeadlineDisabled_DoesNotFireAsImmediateTimeout_InnerTimeoutStillBoundsHang()
     {
         // GateDeadlineSeconds <= 0 disables the outer wall-clock deadline (for

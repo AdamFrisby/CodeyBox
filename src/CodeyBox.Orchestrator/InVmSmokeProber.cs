@@ -363,6 +363,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             _log.LogWarning(ex, "In-VM smoke for {Agent}: provisioning timed out; treating as transient", probe.Kind.Value);
             return BenchTransientFaultIfRequested(probe.Kind, "probe provisioning timed out", benchOnTransientFault);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller-driven cancellation (worker / shutdown token fired) is NOT
+            // evidence the CLI is broken — propagate so the wrapper's distinct
+            // caller-cancellation branch surfaces a real shutdown rather than
+            // being swallowed by the catch-all below and converted into a
+            // "broken binary" bench. EnsureProbedAsync's outer filter on
+            // ct.IsCancellationRequested re-throws to the router so dispatch
+            // unwinds cleanly.
+            throw;
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             // A step timed out — treat as transient infra, not an agent fault.
@@ -471,13 +482,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// ("probe provisioning timed out") distinct from per-step exec timeouts.
     /// Non-positive disables the timeout (tests with synthetic clocks).
     ///
-    /// <para>The timeout is a hard wall-clock bound, not a cooperative-cancel
-    /// signal: a cancellation token passed to <see cref="ISandboxProvider.CreateAsync"/>
-    /// only fires the timeout if the provider observes the token, and a wedged
-    /// multipass daemon (the production hang this method exists for) does not.
-    /// We race <see cref="Task.WhenAny(Task[])"/> against a wall-clock delay so
-    /// the timeout produces a transient-fault verdict even if the provider call
-    /// itself never returns. The orphaned create task is handed to
+    /// <para>The timeout is a wall-clock bound on the <em>returned Task</em>,
+    /// not a cooperative-cancel signal: once <see cref="ISandboxProvider.CreateAsync"/>
+    /// has handed back a Task, a wedged multipass daemon (the production hang
+    /// this method exists for) cannot stall this method beyond
+    /// <paramref name="provisionTimeout"/> — the <see cref="Task.WhenAny(Task[])"/>
+    /// race against a wall-clock delay still fires. This does NOT guard against
+    /// a provider that blocks synchronously <em>before</em> returning a Task
+    /// (we'd be inside the <c>_provider.CreateAsync</c> call and have not yet
+    /// armed the timer); the production <c>MultipassSandboxProvider</c> returns
+    /// a Task around its CLI waits, so this is not a real boundary, but the
+    /// wrapper alone cannot bound a synchronously-blocking provider. The orphaned create task is handed to
     /// <see cref="ObserveOrphanedSandboxCreateAsync"/>, which disposes any
     /// sandbox the provider eventually yields so a late-arriving VM does not
     /// leak. The linked / provisioning CTS pair is disposed before we walk away

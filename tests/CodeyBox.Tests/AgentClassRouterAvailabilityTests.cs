@@ -1,6 +1,10 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -320,5 +324,143 @@ public sealed class AgentClassRouterAvailabilityTests
         // Cursor is highest-quality and at/above the floor, so it is probed first
         // and chosen; its observed headroom is recorded.
         Assert.Contains(snap, s => s.Agent == Cursor && s.ModelId is null && Math.Abs(s.AvailablePct - 64.0) < 1e-9);
+    }
+
+    // ── Dispatch path with a wedged in-VM probe (acceptance for #187) ────────
+
+    [Fact]
+    public async Task DispatchPath_RealInVmProberWedged_GateBenches_RouterSpillsToFallback_NoSlotLeakForBenchedAgent()
+    {
+        // End-to-end acceptance for the wedged in-VM probe cascade: a real
+        // InVmSmokeProber wired into a real AgentClassRouter, with a
+        // non-returning ISandboxProvider.CreateAsync. The prober-only unit tests
+        // assert "transient verdict within the bound" but cannot verify the
+        // dispatch path actually unwinds — a plausible regression where (a) the
+        // gate returns but the worker stays counted in-flight, (b) a benched
+        // first item prevents subsequent queue work, or (c) the per-agent slot
+        // gate is incremented for the benched candidate would all pass the
+        // prober-direct tests. This pins all three:
+        //   1. ResolveAsync returns within the gate deadline (queue continues).
+        //   2. The router routes to the fallback agent (Claude), so a benched
+        //      candidate cannot stall items the class can still service.
+        //   3. The per-agent slot gate is invoked only for the chosen Claude,
+        //      not for the benched Cursor — the router benches BEFORE
+        //      TryReserve, so the orchestrator's outer-finally Release path
+        //      never sees a phantom Cursor reservation to leak.
+        var hangingProvider = new HangingCreateSandboxProvider();
+        var registry = NewRegistry();
+        var cache = new InVmSmokeCache(TimeSpan.FromMinutes(60));
+        var credential = new AgentCredential(
+            Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
+            new Dictionary<string, string>());
+        var prober = new InVmSmokeProber(
+            hangingProvider,
+            new StubBaselineResolver("base-A"),
+            new ConstantCredentialProvider(credential),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            cache,
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                // Short provisioning timeout so the wedged CreateAsync fires
+                // the wall-clock race quickly; gate deadline well above so the
+                // assertion below pins the prober timeout, not the outer net.
+                ProvisionTimeoutSeconds = 1,
+                GateDeadlineSeconds = 30,
+                FailClosedOnProbeFault = true,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var cls = FrontierClass(Sub(Cursor, score: 150), Sub(Claude, score: 100));
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            availability: registry,
+            inVmSmokeGate: prober);
+
+        var slotGate = new SlotCountingGate();
+
+        var sw = Stopwatch.StartNew();
+        var decision = await router.ResolveAsync(
+            MakeItem(), project: null, CancellationToken.None, slotGate: slotGate);
+        sw.Stop();
+
+        // 1. Dispatch gate must return within bound. A regression that lost the
+        //    provisioning timeout / gate deadline would hang here forever.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15),
+            $"router.ResolveAsync hung for {sw.Elapsed} — the wedged in-VM probe was not time-bounded");
+
+        // 2. Queue continues draining: Cursor was benched by the timed-out probe,
+        //    so the router must spill to the next eligible class member.
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+        Assert.False(registry.GetAvailability(Cursor).Available);
+        Assert.Contains("probe provisioning timed out", registry.GetAvailability(Cursor).Reason);
+
+        // 3. Slot-leak guard: TryReserve was NEVER called for the benched Cursor.
+        //    The router calls the smoke gate BEFORE the cap/quota probe + slot
+        //    reservation, so a benched agent's slot cannot be reserved-and-leaked.
+        //    Only Claude (the agent actually committed to) has its slot reserved.
+        Assert.DoesNotContain(Cursor, slotGate.ReserveCalls);
+        Assert.Contains(Claude, slotGate.ReserveCalls);
+        Assert.Equal(0, slotGate.Running(Cursor));
+        Assert.Equal(1, slotGate.Running(Claude));
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync hangs until its cancellation token
+    /// fires — models the wedged multipass clone the in-VM gate must bound by
+    /// wall-clock. Inlined here so the router-level dispatch-path test does
+    /// not depend on private fakes inside <c>InVmSmokeProberTests</c>.
+    /// </summary>
+    private sealed class HangingCreateSandboxProvider : ISandboxProvider
+    {
+        public string Name => "hanging-create";
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// <see cref="IAgentSlotGate"/> that records every <see cref="TryReserve"/>
+    /// invocation and the per-agent running count, so the dispatch-path test
+    /// can prove the benched candidate's slot was never touched (slot-leak
+    /// guard 67cd6311) while the chosen fallback's slot WAS reserved.
+    /// </summary>
+    private sealed class SlotCountingGate : IAgentSlotGate
+    {
+        private readonly Dictionary<AgentKind, int> _running = [];
+        public List<AgentKind> ReserveCalls { get; } = [];
+
+        public bool TryReserve(AgentKind agent)
+        {
+            ReserveCalls.Add(agent);
+            _running[agent] = _running.GetValueOrDefault(agent) + 1;
+            return true;
+        }
+
+        public void Release(AgentKind agent)
+        {
+            if (_running.TryGetValue(agent, out var cur) && cur > 0)
+                _running[agent] = cur - 1;
+        }
+
+        public int Running(AgentKind agent) => _running.GetValueOrDefault(agent);
     }
 }
