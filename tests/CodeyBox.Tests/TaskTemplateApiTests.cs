@@ -103,6 +103,27 @@ public sealed class TaskTemplateApiTests : IDisposable
     }
 
     [Fact]
+    public async Task QueueTemplate_PersistsTopLevelAgentClassAndRequiredCapabilities()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            agent = "codex",
+            agentClassId = "frontier",
+            requiredCapabilities = new[] { " sensitive ", "Sensitive", "", "architecture\t" },
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var item = Assert.Single(await ReadAllItemsAsync());
+        Assert.Equal(new AgentKind("codex"), item.Agent);
+        Assert.Equal("frontier", item.AgentClassId);
+        Assert.Equal(["sensitive", "architecture"], item.RequiredCapabilities);
+    }
+
+    [Fact]
     public async Task ListTemplates_ReturnsDiscoveredTemplateSummariesAndErrors()
     {
         await WriteValidTemplateAsync("security");
@@ -169,7 +190,14 @@ public sealed class TaskTemplateApiTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad.json"), """
             {
               "checks": [
-                { "question": "This entry has no action." }
+                {
+                  "question": "This valid entry must not be enqueued before later validation fails.",
+                  "onYes": {
+                    "title": "Fix first issue",
+                    "prompt": "This should not be queued."
+                  }
+                },
+                { "question": "This later entry has no action." }
               ]
             }
             """);
@@ -190,6 +218,53 @@ public sealed class TaskTemplateApiTests : IDisposable
 
         var queue = _factory.Services.GetRequiredService<InMemoryTaskQueue>();
         Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task QueueTemplate_MissingTemplateInRequest_Returns400WithoutPartialEnqueue()
+    {
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("template is required", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_MissingProjectId_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("projectId is required", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_InvalidProjectId_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "bad project",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("ProjectId", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
     }
 
     [Fact]
@@ -246,6 +321,73 @@ public sealed class TaskTemplateApiTests : IDisposable
         await AssertNoItemsQueuedAsync();
     }
 
+    [Theory]
+    [MemberData(nameof(InvalidRequiredCapabilitiesCases))]
+    public async Task QueueTemplate_InvalidRequiredCapabilities_Returns400WithoutPartialEnqueue(
+        string[] requiredCapabilities,
+        string expectedMessage)
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            requiredCapabilities,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains(expectedMessage, err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_PriorityOutsideGlobalRange_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            priority = 1001,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("priority", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync();
+    }
+
+    [Fact]
+    public async Task QueueTemplate_PriorityAboveProjectMax_Returns400WithoutPartialEnqueue()
+    {
+        await WriteValidTemplateAsync("security");
+        var project = new Project
+        {
+            Id = new ProjectId("limited"),
+            DisplayName = "Limited",
+            RepositoryUrl = "https://github.com/test/limited",
+            MaxPriority = 10,
+        };
+
+        using var factory = new WorkItemApiFactory(null, project) { TemplateDirectory = _templateDir };
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "limited",
+            priority = 11,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("maxPriority", err.GetProperty("error").GetString());
+        await AssertNoItemsQueuedAsync(factory);
+    }
+
     [Fact]
     public async Task QueueTemplate_UnknownOnYesAgent_Returns400WithoutPartialEnqueue()
     {
@@ -291,6 +433,17 @@ public sealed class TaskTemplateApiTests : IDisposable
         Assert.Empty(await ReadAllItemsAsync());
     }
 
+    public static IEnumerable<object[]> InvalidRequiredCapabilitiesCases()
+    {
+        yield return new object[]
+        {
+            Enumerable.Range(0, 17).Select(i => $"cap-{i}").ToArray(),
+            "at most 16 entries",
+        };
+        yield return new object[] { new[] { new string('x', 65) }, "64 chars" };
+        yield return new object[] { new[] { "sens\nitive" }, "control characters" };
+    }
+
     private Task WriteValidTemplateAsync(string name) =>
         File.WriteAllTextAsync(Path.Combine(_templateDir, $"{name}.json"), """
             {
@@ -306,17 +459,21 @@ public sealed class TaskTemplateApiTests : IDisposable
             }
             """);
 
-    private async Task AssertNoItemsQueuedAsync()
+    private Task AssertNoItemsQueuedAsync() => AssertNoItemsQueuedAsync(_factory);
+
+    private static async Task AssertNoItemsQueuedAsync(WorkItemApiFactory factory)
     {
-        Assert.Empty(await ReadAllItemsAsync());
-        var queue = _factory.Services.GetRequiredService<InMemoryTaskQueue>();
+        Assert.Empty(await ReadAllItemsAsync(factory.Store));
+        var queue = factory.Services.GetRequiredService<InMemoryTaskQueue>();
         Assert.Equal(0, queue.Count);
     }
 
-    private async Task<List<WorkItem>> ReadAllItemsAsync()
+    private Task<List<WorkItem>> ReadAllItemsAsync() => ReadAllItemsAsync(_factory.Store);
+
+    private static async Task<List<WorkItem>> ReadAllItemsAsync(IWorkItemStore store)
     {
         var items = new List<WorkItem>();
-        await foreach (var item in _factory.Store.ListAsync()) items.Add(item);
+        await foreach (var item in store.ListAsync()) items.Add(item);
         return items;
     }
 }

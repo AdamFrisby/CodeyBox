@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Api;
 
 namespace CodeyBox.Tests;
@@ -65,6 +66,30 @@ public sealed class TaskTemplateRegistryTests : IDisposable
     }
 
     [Fact]
+    public async Task LoadAsync_ReadsTopLevelArrayTemplate()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "security.json"), """
+            [
+              {
+                "question": "Is user input interpolated into SQL?",
+                "onYes": {
+                  "title": "Fix SQL injection",
+                  "prompt": "Replace unsafe SQL construction with parameters."
+                }
+              }
+            ]
+            """);
+
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var loaded = await registry.LoadAsync("security");
+
+        var check = Assert.Single(loaded.Checks);
+        Assert.Equal("security", loaded.Name);
+        Assert.Equal("Is user input interpolated into SQL?", check.Question);
+        Assert.Equal("Fix SQL injection", check.OnYes.Title);
+    }
+
+    [Fact]
     public async Task LoadAsync_InvalidTemplateShape_ThrowsClearError()
     {
         await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad.json"), """{"checks":[{"question":"missing action"}]}""");
@@ -108,4 +133,76 @@ public sealed class TaskTemplateRegistryTests : IDisposable
 
         Assert.Contains("..", ex.Message);
     }
+
+    [Theory]
+    [MemberData(nameof(InvalidTemplateCases))]
+    public async Task LoadAsync_InvalidTemplateBranches_ThrowClearErrors(string json, string expectedMessage)
+    {
+        await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad.json"), json);
+
+        var registry = new FileTaskTemplateRegistry(_templateDir);
+        var ex = await Assert.ThrowsAsync<TaskTemplateLoadException>(() => registry.LoadAsync("bad"));
+
+        Assert.Contains(expectedMessage, ex.Message);
+    }
+
+    public static IEnumerable<object[]> InvalidTemplateCases()
+    {
+        yield return Case("""{"checks":[{"question":"   ","onYes":{"title":"Fix","prompt":"Prompt"}}]}""",
+            ".question is required");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":" + JsonString(new string('q', 64 * 1024 + 1)) +
+            ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
+            ".question must be <= 64KB");
+        yield return Case("""{"checks":[null]}""", "checks[0] must be an object");
+        yield return Case("""{"checks":[1]}""", "not a valid check entry");
+        yield return Case("{", "not valid JSON");
+        yield return Case("42", "JSON array or an object");
+        yield return Case("{}", "must contain a checks array");
+        yield return Case("""{"checks":{}}""", "checks must be an array");
+        yield return Case("""{"checks":[]}""", "at least one");
+        yield return Case("""{"checks":[{"question":"q"}]}""", ".onYes is required");
+        yield return Case("""{"checks":[{"question":"q","onYes":{"prompt":"Prompt"}}]}""",
+            ".onYes.title is required");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":\"q\",\"onYes\":{\"title\":" + JsonString(new string('t', 201)) +
+            ",\"prompt\":\"Prompt\"}}"),
+            ".onYes.title must be <= 200 chars");
+        yield return Case("""{"checks":[{"question":"q","onYes":{"title":"-Fix","prompt":"Prompt"}}]}""",
+            ".onYes.title must not start with '-'");
+        yield return Case("""{"checks":[{"question":"q","onYes":{"title":"Fix\nnow","prompt":"Prompt"}}]}""",
+            ".onYes.title must not contain control characters");
+        yield return Case("""{"checks":[{"question":"q","onYes":{"title":"Fix"}}]}""",
+            ".onYes.prompt is required");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":" +
+            JsonString(new string('p', 64 * 1024 + 1)) + "}}"),
+            ".onYes.prompt must be <= 64KB");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\",\"agentClassId\":" +
+            JsonString(new string('c', 201)) + "}}"),
+            ".onYes.agentClassId must be <= 200 chars");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\",\"dependsOn\":" +
+            JsonSerializer.Serialize(Enumerable.Range(0, 101).Select(i => $"dep-{i}").ToArray()) + "}}"),
+            ".onYes.dependsOn must contain at most 100 entries");
+        yield return Case("""{"checks":[{"question":"q","onYes":{"title":"Fix","prompt":"Prompt","dependsOn":["  "]}}]}""",
+            ".onYes.dependsOn must not contain empty entries");
+        yield return Case(TemplateWithCheck(
+            "{\"title\":" + JsonString(new string('t', 201)) +
+            ",\"question\":\"q\",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
+            ".title must be <= 200 chars");
+        yield return Case("""{"checks":[{"title":"Fix\nnow","question":"q","onYes":{"title":"Fix","prompt":"Prompt"}}]}""",
+            ".title must not contain control characters");
+        yield return Case(TemplateWithCheck(
+            "{\"question\":\"q\",\"prompt\":" + JsonString(new string('p', 64 * 1024 + 1)) +
+            ",\"onYes\":{\"title\":\"Fix\",\"prompt\":\"Prompt\"}}"),
+            ".prompt must be <= 64KB");
+    }
+
+    private static object[] Case(string json, string expectedMessage) => [json, expectedMessage];
+
+    private static string TemplateWithCheck(string checkJson) => "{\"checks\":[" + checkJson + "]}";
+
+    private static string JsonString(string value) => JsonSerializer.Serialize(value);
 }

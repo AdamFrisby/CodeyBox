@@ -23,10 +23,19 @@ internal sealed record TaskTemplateDefinition(
 
 internal sealed record TaskTemplateCheck(
     string Question,
-    OnYesActionRequest OnYes,
+    TaskTemplateOnYesAction OnYes,
     bool? ActionableAnswer = null,
     string? Title = null,
     string? Prompt = null);
+
+internal sealed record TaskTemplateOnYesAction(
+    string Title,
+    string Prompt,
+    int? MinModelScore = null,
+    int? Priority = null,
+    string? Agent = null,
+    string? AgentClassId = null,
+    string[]? DependsOn = null);
 
 internal class TaskTemplateLoadException : Exception
 {
@@ -160,6 +169,11 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
             throw new TaskTemplateLoadException(
                 $"template '{name}' could not be read: {ex.Message}");
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new TaskTemplateLoadException(
+                $"template '{name}' could not be read: {ex.Message}");
+        }
 
         using (doc)
         {
@@ -198,7 +212,7 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
 
         if (root.ValueKind != JsonValueKind.Object)
             throw new TaskTemplateLoadException(
-                $"template '{name}' must be a JSON object with a checks array");
+                $"template '{name}' must be a JSON array or an object with a checks array");
 
         if (!root.TryGetProperty("checks", out var checks))
             throw new TaskTemplateLoadException(

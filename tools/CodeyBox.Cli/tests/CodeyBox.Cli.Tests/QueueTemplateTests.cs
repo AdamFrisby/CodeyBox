@@ -1,4 +1,6 @@
+using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using CodeyBox.Cli.Models;
 using CodeyBox.Cli.Tests.Helpers;
 
@@ -113,6 +115,119 @@ public sealed class QueueTemplateTests
         finally
         {
             Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Template_Json_PrintsRawJsonResponse()
+    {
+        var factory = MakeFactory(_ => QueueTemplateResponse());
+
+        using var output = new TestOutput();
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        try
+        {
+            var code = await CliApp.InvokeAsync([
+                "queue", "template", "security",
+                "--project", "myapp",
+                "--json",
+            ], factory);
+
+            Assert.Equal(0, code);
+            var parsed = JsonSerializer.Deserialize(
+                output.Out.ToString(),
+                CliJsonContext.Default.QueueTemplateResponse);
+            Assert.Equal("security", parsed!.Template);
+            Assert.Equal(2, parsed.Enqueued);
+            Assert.Empty(output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Template_ApiError_WritesToStderrNonZeroExit()
+    {
+        var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.BadRequest)
+        {
+            Content = new StringContent("""{"error":"bad template"}"""),
+        });
+
+        using var output = new TestOutput();
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        try
+        {
+            var code = await CliApp.InvokeAsync([
+                "queue", "template", "security",
+                "--project", "myapp",
+            ], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("400", output.Error.ToString());
+            Assert.Contains("bad template", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Template_NetworkFailure_WritesToStderrNonZeroExit()
+    {
+        Func<ResolvedConfig, CodeyBoxClient> factory = config => new CodeyBoxClient(
+            new HttpClient(new FakeHttpMessageHandler(_ =>
+                throw new HttpRequestException("Connection refused")))
+            { BaseAddress = new Uri(config.ApiBaseUrl) });
+
+        using var output = new TestOutput();
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        try
+        {
+            var code = await CliApp.InvokeAsync([
+                "queue", "template", "security",
+                "--project", "myapp",
+            ], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("Connection", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task Template_MissingApiKey_PrintsHintAndDoesNotCreateClient()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+
+        using var output = new TestOutput();
+        try
+        {
+            Func<ResolvedConfig, CodeyBoxClient> factory =
+                _ => throw new InvalidOperationException("client should not be created without an API key");
+
+            var code = await CliApp.InvokeAsync([
+                "queue", "template", "security",
+                "--project", "myapp",
+            ], factory);
+
+            Assert.NotEqual(0, code);
+            Assert.Empty(output.Out.ToString());
+            Assert.Contains("codeybox configure", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", null);
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
         }
     }
 
