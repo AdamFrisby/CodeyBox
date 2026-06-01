@@ -324,11 +324,17 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Give the dispatcher time to pick up the first item and defer the
-        // other two.
-        await Task.Delay(200);
+        // Poll until at least one of the later items is deferred. The
+        // dispatch loop spawns RunItemAsync via Task.Run and the budget
+        // lock serialises the check + StartedAt write, so a fixed
+        // millisecond sleep is brittle on slow/loaded CI machines.
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (!(svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]))
+               && DateTimeOffset.UtcNow < deferDeadline)
+        {
+            await Task.Delay(50);
+        }
 
-        // At least one of the later items must be deferred.
         Assert.True(
             svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
             "one of the items queued after the first must be deferred by the concurrent cap");
@@ -342,14 +348,12 @@ public sealed class BudgetEnforcementTests : IDisposable
         // Unblock the first item so it finishes and releases the concurrent
         // slot, allowing the deferred items to be re-enqueued.
         blockGate.TrySetResult();
+
+        // Let the first item finish and the dispatch loop observe the
+        // released slot. The deferred items' 30 s recheck intervals
+        // have not elapsed, so they must still be in the deferred set.
         await Task.Delay(300);
 
-        // Prove the orchestrator consumed the snapshot after hot-reload:
-        // the deferred items should still be held because their last deferral
-        // used the new 1 h recheck interval (not the original 30 s). Verify
-        // through the service's test surface rather than checking the snapshot
-        // directly — a service that cached the value at construction would
-        // have re-enqueued the items by now.
         Assert.True(
             svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
             "deferred items must remain in the deferred set after hot-reload");
