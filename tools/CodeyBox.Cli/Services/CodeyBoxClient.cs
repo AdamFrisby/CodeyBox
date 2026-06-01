@@ -104,4 +104,36 @@ internal sealed class CodeyBoxClient
         return (await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct))!;
     }
 
+    internal async Task PauseQueueAsync(string reason, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            "/queue/pause",
+            new PauseQueueRequest { Reason = reason },
+            CliJsonContext.Default.PauseQueueRequest,
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    internal async Task ResumeQueueAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync("/queue/resume", content: null, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    internal async Task<string> GetQueueStatusAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/queue/status", ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            "/workitems/reorder",
+            new ReorderRequest { Ids = ids },
+            CliJsonContext.Default.ReorderRequest,
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
 }
