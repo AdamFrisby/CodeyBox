@@ -183,6 +183,13 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // own IOptionsMonitor-driven resilience-provider delegate.
             var src = opts.QuotaRouter;
             _quotaRouterOptions.MinQuotaPct = src.MinQuotaPct;
+            var windowFloors = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in src.MinQuotaPctByWindow)
+            {
+                if (kv.Value < 0) continue;
+                windowFloors[kv.Key] = kv.Value;
+            }
+            _quotaRouterOptions.MinQuotaPctByWindow = windowFloors;
             _quotaRouterOptions.StartFloorPct = src.StartFloorPct;
             _quotaRouterOptions.EndFloorPct = src.EndFloorPct;
             if (src.RampWindowSeconds > 0)
@@ -535,6 +542,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             new
             {
                 opts.MinQuotaPct,
+                MinQuotaPctByWindow = opts.MinQuotaPctByWindow
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value),
                 opts.StartFloorPct,
                 opts.EndFloorPct,
                 opts.RampWindowSeconds,

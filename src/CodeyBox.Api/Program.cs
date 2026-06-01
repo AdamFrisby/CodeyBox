@@ -699,6 +699,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
     return new QuotaRouterOptions
     {
         MinQuotaPct = qr.MinQuotaPct,
+        MinQuotaPctByWindow = BuildWindowFloorOverrides(qr.MinQuotaPctByWindow),
         StartFloorPct = qr.StartFloorPct,
         EndFloorPct = qr.EndFloorPct,
         RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
@@ -719,6 +720,18 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         {
             if (kv.Value <= 0) continue;
             dst[kv.Key] = TimeSpan.FromSeconds(kv.Value);
+        }
+        return dst;
+    }
+
+    static Dictionary<string, double> BuildWindowFloorOverrides(IDictionary<string, double>? src)
+    {
+        var dst = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (kv.Value < 0) continue;
+            dst[kv.Key] = kv.Value;
         }
         return dst;
     }
@@ -2822,6 +2835,26 @@ namespace CodeyBox.Api
         /// ramped floor that supersedes this when the window IS known.
         /// </summary>
         public double MinQuotaPct { get; set; } = 10.0;
+        /// <summary>
+        /// Per-window absolute floors, keyed by provider window name
+        /// (e.g. <c>five_hour</c>, <c>seven_day</c>). Dispatch requires every
+        /// window's available percentage to be at or above its window's
+        /// floor — block if any window is below its own floor — using the
+        /// per-window readings the probe surfaces in
+        /// <c>AgentQuotaSnapshot.PerModel[].Windows</c>. Unlisted windows
+        /// fall back to <see cref="MinQuotaPct"/>. The 5 h window's absolute
+        /// budget is far smaller than the 7 d, so 10 % of 5 h is thin headroom
+        /// for the in-flight + cache-staleness overshoot during a burst (up to
+        /// MaxConcurrent concurrent long opus runs already dispatched + new
+        /// dispatches inside <c>QuotaCacheTtlSeconds</c>); a higher 5 h floor
+        /// absorbs that overshoot. Default <c>{five_hour: 25}</c> for
+        /// MaxConcurrent=4; tune up for higher fleet concurrency. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, double> MinQuotaPctByWindow { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["five_hour"] = 25.0,
+            };
         /// <summary>
         /// Early-window quota floor — the effective minimum just after the
         /// quota window resets. Reserves headroom for the operator's
