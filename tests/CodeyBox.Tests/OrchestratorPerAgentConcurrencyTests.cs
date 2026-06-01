@@ -825,18 +825,20 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             Assert.Equal(1, observedCodex);
 
             // Cross-check: the work item's stamped Agent field reflects the
-            // chosen-and-reserved member from the re-pickup. The reservation
-            // counter increments inside the router before the subsequent
-            // StartedAt/Agent store write, so wait for the persisted stamp.
+            // chosen-and-reserved member from the re-pickup (router writes it
+            // via UpdateAsync alongside StartedAt). Snapshot polling observes
+            // the in-memory counters which update before the store write, so
+            // poll until the persisted stamp catches up.
+            AgentKind? agent = null;
             var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
-            WorkItem? snap = null;
             while (DateTimeOffset.UtcNow < stampDeadline)
             {
-                snap = await _store.GetAsync(item.Id);
-                if (snap?.Agent == Codex) break;
+                var snap = await _store.GetAsync(item.Id);
+                agent = snap?.Agent;
+                if (agent == Codex) break;
                 await Task.Delay(25);
             }
-            Assert.Equal(Codex, snap!.Agent);
+            Assert.Equal(Codex, agent);
         }
         finally
         {
