@@ -381,6 +381,23 @@ public sealed record WorkItem
     public WorkItemId? OriginCheckWorkItemId { get; init; }
 
     /// <summary>
+    /// Ordered history of post-act re-check verdicts recorded against this
+    /// work item. Populated only on follow-up items (those with
+    /// <see cref="OriginCheckWorkItemId"/> set) and only by the post-act
+    /// re-validation loop that re-runs the originating check's question
+    /// against the modified repo state before the merge phase. Each entry
+    /// corresponds to one re-validation iteration; the FIRST entry is the
+    /// initial post-act re-check (after the work phase committed the
+    /// remediation), subsequent entries are recorded after each rework
+    /// iteration. The originating check item's own
+    /// <see cref="Verdict"/> remains the authoritative initial verdict —
+    /// this collection captures only the post-act re-validations on the
+    /// follow-up itself. Empty for items that have never been re-validated
+    /// (the steady-state for non-follow-up items).
+    /// </summary>
+    public IReadOnlyList<CheckVerdict> ReCheckVerdicts { get; init; } = [];
+
+    /// <summary>
     /// Content-hashed identifier of the sandbox baseline image this work item is
     /// pinned to. Stamped at pickup time from the sandbox provider's live config
     /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved

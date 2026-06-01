@@ -645,6 +645,323 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Empty(followup.DependsOn);
     }
 
+    [Fact]
+    public async Task PostActReValidation_NonActionableReCheck_AcceptsFollowupAsDone_WithBothVerdictsRecorded()
+    {
+        // Acceptance path (1): check==yes → act applies the fix → post-act
+        // re-check==no → the follow-up reaches Done. Pins:
+        //   - the follow-up's ReCheckVerdicts records the single
+        //     non-actionable verdict (this is the post-act re-validation
+        //     trace),
+        //   - the originating check's initial verdict remains on the check
+        //     item (both verdicts on the timeline),
+        //   - the post-act re-check used the same in-VM execution path as
+        //     the initial check (BuildPrompt scaffold) — assert on the
+        //     prompt the agent received.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        // 1) The originating check returns "yes" (actionable) → enqueues
+        // the on-yes follow-up.
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "src/Foo.cs L42 uses interpolation", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for SQL injection",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-acc1",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation (SQLi risk)?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix SQL injection", Prompt = "remediate" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        // The check enqueued exactly one follow-up parented to itself.
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+        Assert.Empty(followup.ReCheckVerdicts); // none recorded yet — the act hasn't run
+
+        // 2) Run the follow-up's pipeline. The agent applies a remediation
+        // in the work phase, then the post-act re-check returns "no" —
+        // the remediation closed the gap.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "parameterised"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "no interpolation remains in src/**", "high"));
+
+        var checkInvocationsBefore = tp.Agent.CheckInvocations.Count;
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Done, finalFollowup!.State);
+
+        // The post-act re-check fired exactly once and used the SAME prompt
+        // shape as the original check (same sentinels, same question).
+        Assert.Equal(checkInvocationsBefore + 1, tp.Agent.CheckInvocations.Count);
+        var reCheckPrompt = tp.Agent.CheckInvocations[^1];
+        Assert.StartsWith("# Check-and-Act task", reCheckPrompt);
+        Assert.Contains(check.Check!.Question, reCheckPrompt);
+        Assert.Contains(CheckAndActPipeline.StartSentinel, reCheckPrompt);
+
+        // Re-check verdict recorded on the follow-up's history (the
+        // post-act trace). One non-actionable entry.
+        var verdict = Assert.Single(finalFollowup.ReCheckVerdicts);
+        Assert.False(verdict.Answer);
+        Assert.Contains("no interpolation", verdict.Evidence);
+
+        // The originating check still carries its initial verdict —
+        // both verdicts on the item-chain timeline.
+        var finalCheck = await tp.Store.GetAsync(check.Id);
+        Assert.NotNull(finalCheck!.Verdict);
+        Assert.True(finalCheck.Verdict!.Answer);
+        Assert.Equal(check.Id, finalFollowup.OriginCheckWorkItemId);
+    }
+
+    [Fact]
+    public async Task PostActReValidation_StillActionableAfterCap_FailsWithRemediationDidNotSatisfy()
+    {
+        // Acceptance path (2): check==yes → act does NOT close the gap →
+        // post-act re-check==yes → rework → re-check==yes → cap exhausted
+        // → Failed with a clear "remediation did not satisfy the check
+        // after N attempts" reason; every re-check verdict is recorded on
+        // the follow-up's history so the operator can see the failure
+        // trace.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, maxAuditIterations: 2);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "SQLi present", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-acc2",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        // Cap = 2. Sequence is: work writes v1 → re-check #1=yes → rework
+        // writes v2 → re-check #2=yes → cap exhausted → Failed.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v1"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "iter1 still present", "high"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v2"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "iter2 still present", "high"));
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Failed, finalFollowup!.State);
+        Assert.Equal("other", finalFollowup.FailureKind);
+        Assert.Contains("remediation did not satisfy", finalFollowup.LastError!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("2", finalFollowup.LastError!); // surfaces the attempt count
+
+        // Both re-check verdicts recorded on the follow-up's history.
+        Assert.Equal(2, finalFollowup.ReCheckVerdicts.Count);
+        Assert.All(finalFollowup.ReCheckVerdicts, v => Assert.True(v.Answer));
+        Assert.Contains("iter1", finalFollowup.ReCheckVerdicts[0].Evidence);
+        Assert.Contains("iter2", finalFollowup.ReCheckVerdicts[1].Evidence);
+
+        // The originating check's initial verdict is preserved on the
+        // check item — both verdicts traceable end-to-end.
+        var finalCheck = await tp.Store.GetAsync(check.Id);
+        Assert.NotNull(finalCheck!.Verdict);
+        Assert.True(finalCheck.Verdict!.Answer);
+    }
+
+    [Fact]
+    public async Task PostActReValidation_StillActionableThenFlipsAfterRework_FollowupReachesDone()
+    {
+        // Mid-cap convergence: re-check #1 fails (actionable) → rework →
+        // re-check #2 passes (non-actionable). The follow-up reaches Done
+        // with two recorded verdicts (yes, then no) and the cap is not
+        // exhausted. Pins the iterative rework-then-revalidate loop.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, maxAuditIterations: 3);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initial yes", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-acc3",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Vulnerable?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        // Sequence: work writes v1 → re-check #1 = yes → rework writes v2
+        // → re-check #2 = no → Done.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v1"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "still vulnerable", "high"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.cs", "v2"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "now clean", "high"));
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Done, finalFollowup!.State);
+
+        // Both verdicts recorded in order: actionable, then non-actionable.
+        Assert.Equal(2, finalFollowup.ReCheckVerdicts.Count);
+        Assert.True(finalFollowup.ReCheckVerdicts[0].Answer);
+        Assert.False(finalFollowup.ReCheckVerdicts[1].Answer);
+        Assert.Contains("still vulnerable", finalFollowup.ReCheckVerdicts[0].Evidence);
+        Assert.Contains("now clean", finalFollowup.ReCheckVerdicts[1].Evidence);
+    }
+
+    [Fact]
+    public async Task PostActReValidation_RegularItemWithoutOrigin_GatesSkipped_NoCheckInvocation()
+    {
+        // Sanity-pin: items without OriginCheckWorkItemId never trigger
+        // the re-validation gate. The pipeline must not invoke the check
+        // agent on plain work items.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        var regular = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "regular work item",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/regular-noorigin",
+            PushUpstream = false,
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        await tp.Store.CreateAsync(regular);
+        await tp.Pipeline.RunAsync(regular, CancellationToken.None);
+
+        var finalReg = await tp.Store.GetAsync(regular.Id);
+        Assert.Equal(WorkItemState.Done, finalReg!.State);
+        Assert.Empty(finalReg.ReCheckVerdicts);
+        Assert.Empty(tp.Agent.CheckInvocations);
+    }
+
+    [Fact]
+    public async Task PostActReValidation_OrphanedFollowup_OriginCheckMissing_GateSkipped()
+    {
+        // Resilience: a follow-up whose originating check item no longer
+        // exists (deleted) or has no Check spec must still complete the
+        // normal pipeline. The re-validation gate logs a warning and
+        // returns without raising — losing the check item shouldn't
+        // strand the follow-up forever.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        var orphan = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "orphaned follow-up",
+            Prompt = "fix the thing",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/orphan-followup",
+            PushUpstream = false,
+            // OriginCheckWorkItemId points at an id that was never created in the store.
+            OriginCheckWorkItemId = WorkItemId.New(),
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        await tp.Store.CreateAsync(orphan);
+        await tp.Pipeline.RunAsync(orphan, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(orphan.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Empty(final.ReCheckVerdicts);
+        // The check agent was never invoked because the gate found no
+        // originating check spec.
+        Assert.Empty(tp.Agent.CheckInvocations);
+    }
+
+    [Fact]
+    public async Task PostActReValidation_NonActionableReCheck_PublishesCompletionWebhook()
+    {
+        // The post-act re-validation gate emits one
+        // work_item.post_act_recheck_completed webhook per iteration with
+        // the verdict outcome and the originating check id, so operators
+        // can build a timeline of "what the re-check decided" without
+        // re-reading the verdict history.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, webhookDispatcher: webhooks);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initial yes", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-webhook-recheck",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Vulnerable?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "parameterised"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "clean", "high"));
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var reCheckEvt = Assert.Single(webhooks.Events,
+            e => e.Event == "work_item.post_act_recheck_completed");
+        Assert.NotNull(reCheckEvt.WorkItem);
+        Assert.Equal(followup.Id, reCheckEvt.WorkItem!.Id);
+        Assert.NotNull(reCheckEvt.Details);
+        var detailsJson = System.Text.Json.JsonSerializer.Serialize(reCheckEvt.Details);
+        var doc = System.Text.Json.JsonDocument.Parse(detailsJson).RootElement;
+        Assert.Equal(1, doc.GetProperty("iteration").GetInt32());
+        Assert.False(doc.GetProperty("answer").GetBoolean());
+        Assert.False(doc.GetProperty("actionable").GetBoolean());
+        Assert.Equal(check.Id.ToString(), doc.GetProperty("originCheckWorkItemId").GetString());
+    }
+
     private static string BuildVerdictStdout(bool answer, string evidence, string? confidence)
     {
         var ans = answer ? "true" : "false";

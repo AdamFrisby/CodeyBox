@@ -202,6 +202,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
 
+        // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
+        // Populated only on follow-up items by the re-validation loop that re-runs
+        // the originating check's question against the modified repo before merge.
+        // Default '[]' so legacy rows behave as "never re-validated".
+        RunMigration("ALTER TABLE work_items ADD COLUMN re_check_verdicts_json TEXT NOT NULL DEFAULT '[]';");
+
         // Per-iteration dispatch record. One row per (work_item_id, iteration);
         // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
         // restart-recovery for the same iteration) overwrites the row via
@@ -302,7 +308,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
-                        job_type, check_spec_json, check_verdict_json, origin_check_work_item_id)
+                        job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
+                        re_check_verdicts_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
@@ -310,7 +317,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
-                        $job_type, $check_spec, $check_verdict, $origin_check);
+                        $job_type, $check_spec, $check_verdict, $origin_check,
+                        $re_check_verdicts);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -415,7 +423,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     job_type = $job_type,
                     check_spec_json = $check_spec,
                     check_verdict_json = $check_verdict,
-                    origin_check_work_item_id = $origin_check
+                    origin_check_work_item_id = $origin_check,
+                    re_check_verdicts_json = $re_check_verdicts
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -472,7 +481,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     job_type = $job_type,
                     check_spec_json = $check_spec,
                     check_verdict_json = $check_verdict,
-                    origin_check_work_item_id = $origin_check
+                    origin_check_work_item_id = $origin_check,
+                    re_check_verdicts_json = $re_check_verdicts
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -1322,6 +1332,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             item.Verdict is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Verdict));
         cmd.Parameters.AddWithValue("$origin_check",
             (object?)item.OriginCheckWorkItemId?.ToString() ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$re_check_verdicts",
+            item.ReCheckVerdicts.Count == 0 ? "[]" : JsonSerializer.Serialize(item.ReCheckVerdicts));
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1379,7 +1391,29 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         Check = ReadCheckSpec(r),
         Verdict = ReadCheckVerdict(r),
         OriginCheckWorkItemId = ReadNullableWorkItemId(r, "origin_check_work_item_id"),
+        ReCheckVerdicts = ReadReCheckVerdicts(r),
     };
+
+    private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("re_check_verdicts_json");
+        if (r.IsDBNull(ord)) return [];
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return [];
+        try
+        {
+            var arr = JsonSerializer.Deserialize<CheckVerdict[]>(json);
+            return arr is null || arr.Length == 0 ? [] : arr;
+        }
+        catch (JsonException)
+        {
+            // Corruption-tolerant: an unreadable history shouldn't strand the
+            // work item. The orchestrator treats this as "no recorded
+            // re-checks yet" — the next re-validation iteration will append
+            // a fresh entry and the corrupted slot is implicitly discarded.
+            return [];
+        }
+    }
 
     private static JobType ReadJobType(SqliteDataReader r)
     {

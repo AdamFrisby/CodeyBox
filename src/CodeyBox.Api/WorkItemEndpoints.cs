@@ -2108,7 +2108,8 @@ internal static class WorkItemEndpoints
             JobType: item.JobType.ToString(),
             Check: item.Check,
             Verdict: item.Verdict,
-            OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString());
+            OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString(),
+            ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts);
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -2441,7 +2442,9 @@ public sealed record WorkItemDto(
     CheckAndActSpec? Check = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     CheckVerdict? Verdict = null,
-    string? OriginCheckWorkItemId = null);
+    string? OriginCheckWorkItemId = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<CheckVerdict>? ReCheckVerdicts = null);
 
 public sealed record AgentFallbackDto(
     string Id,
