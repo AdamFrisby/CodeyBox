@@ -9,10 +9,11 @@ namespace CodeyBox.Orchestrator;
 /// feed it:
 /// <list type="number">
 ///   <item>
-///     <b>Credential smoke probe</b> results — fed in by
-///     <see cref="StartupSmokeProbeService"/> and the periodic
-///     <see cref="PeriodicSmokeProbeService"/>. A failed probe excludes the
-///     agent until a subsequent probe passes or an operator resets it.
+///     <b>Smoke probe</b> results — fed in by the credential probes
+///     (<see cref="StartupSmokeProbeService"/> / <see cref="PeriodicSmokeProbeService"/>,
+///     host-side API checks) and by <see cref="InVmSmokeProber"/> (in-sandbox
+///     CLI checks: binary present, auth materialised). A failed probe excludes
+///     the agent until a subsequent probe passes or an operator resets it.
 ///   </item>
 ///   <item>
 ///     <b>Fast-fail circuit breaker</b> — runs that exit non-zero in less than
@@ -35,7 +36,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -64,50 +65,74 @@ public sealed class AgentAvailabilityRegistry
 
         lock (entry.Sync)
         {
-            if (entry.ExcludedReason is null)
-                return new AgentAvailability(true, null, entry.LastSmokePassedAt);
-            return new AgentAvailability(false, entry.ExcludedReason, entry.LastSmokePassedAt);
+            var reason = entry.CombinedReason();
+            return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
 
     /// <summary>
-    /// Feeds a smoke-probe outcome. Passing transitions the agent to available
-    /// and resets the fast-fail counter; failing excludes the agent until a
-    /// later probe passes or <see cref="Reset"/> is called.
+    /// Feeds a smoke-probe outcome from a specific <paramref name="source"/>
+    /// (host credential check vs. in-sandbox CLI check). Passing clears that
+    /// source's exclusion; failing excludes the agent under that source until a
+    /// later probe from the <em>same</em> source passes or <see cref="Reset"/>
+    /// is called.
+    ///
+    /// <para>Exclusions are tracked per source so the over-permissive host
+    /// credential probe can never clear an in-VM exclusion (exit 127 / auth
+    /// path drift) it cannot itself observe — the agent stays benched until the
+    /// in-VM probe that benched it passes again.</para>
+    ///
+    /// <para>The fast-fail circuit breaker (earned from real sub-threshold
+    /// dispatch failures) is only lifted when <paramref name="clearsFastFail"/>
+    /// is set — i.e. by a <em>freshly executed</em> in-VM probe that actually
+    /// ran the binary in a sandbox. A host credential check (proves nothing
+    /// about whether the binary launches) and a <em>cached</em> in-VM verdict
+    /// (no CLI was re-executed) must pass <c>false</c>, so a stale or
+    /// over-permissive pass can never un-bench a circuit-broken agent without a
+    /// fresh run.</para>
     /// </summary>
-    public AvailabilityTransition MarkSmokeResult(AgentKind kind, AgentSmokeResult result)
+    public AvailabilityTransition MarkSmokeResult(
+        AgentKind kind,
+        AgentSmokeResult result,
+        SmokeExclusionSource source = SmokeExclusionSource.HostSmoke,
+        bool clearsFastFail = false)
     {
         var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
         var now = _time.GetUtcNow();
 
         lock (entry.Sync)
         {
-            var wasExcluded = entry.ExcludedReason is not null;
+            var wasExcluded = entry.IsExcluded;
             if (result.Ok)
             {
                 entry.LastSmokePassedAt = now;
-                entry.ConsecutiveFastFails = 0;
-                entry.ExcludedReason = null;
-                if (wasExcluded)
+                entry.Exclusions.Remove(source);
+                if (clearsFastFail)
+                {
+                    entry.ConsecutiveFastFails = 0;
+                    entry.Exclusions.Remove(SmokeExclusionSource.FastFail);
+                }
+                var stillExcluded = entry.IsExcluded;
+                if (wasExcluded && !stillExcluded)
                     _log.LogInformation(
-                        "Agent {Agent} smoke transitioned FAIL -> PASS at {At}",
-                        kind.Value, now);
+                        "Agent {Agent} smoke transitioned FAIL -> PASS at {At} (source {Source})",
+                        kind.Value, now, source);
                 return new AvailabilityTransition(
                     PreviouslyExcluded: wasExcluded,
-                    NowExcluded: false,
-                    Reason: null);
+                    NowExcluded: stillExcluded,
+                    Reason: entry.CombinedReason());
             }
 
             entry.LastSmokeFailedAt = now;
-            entry.ExcludedReason = $"smoke probe failed: {result.FailureReason ?? "unknown"}";
+            entry.Exclusions[source] = $"smoke probe failed: {result.FailureReason ?? "unknown"}";
             if (!wasExcluded)
                 _log.LogWarning(
-                    "Agent {Agent} smoke transitioned PASS -> FAIL at {At}: {Reason}",
-                    kind.Value, now, entry.ExcludedReason);
+                    "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
+                    kind.Value, now, source, entry.Exclusions[source]);
             return new AvailabilityTransition(
                 PreviouslyExcluded: wasExcluded,
                 NowExcluded: true,
-                Reason: entry.ExcludedReason);
+                Reason: entry.CombinedReason());
         }
     }
 
@@ -130,28 +155,52 @@ public sealed class AgentAvailabilityRegistry
 
         lock (entry.Sync)
         {
-            var wasExcluded = entry.ExcludedReason is not null;
+            var wasExcluded = entry.IsExcluded;
             if (success || duration >= fastFailThreshold)
             {
                 entry.ConsecutiveFastFails = 0;
-                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.ExcludedReason);
+                return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
             }
 
             entry.ConsecutiveFastFails++;
             entry.LastFastFailAt = now;
             entry.LastFastFailDuration = duration;
 
-            if (entry.ConsecutiveFastFails >= _opts.MaxConsecutiveFastFails && entry.ExcludedReason is null)
+            if (entry.ConsecutiveFastFails >= _opts.MaxConsecutiveFastFails
+                && !entry.Exclusions.ContainsKey(SmokeExclusionSource.FastFail))
             {
-                entry.ExcludedReason =
+                entry.Exclusions[SmokeExclusionSource.FastFail] =
                     $"fast-fail circuit breaker: {entry.ConsecutiveFastFails} consecutive sub-{_opts.FastFailThresholdSeconds}s non-zero exits";
                 _log.LogWarning(
                     "Agent {Agent} excluded by fast-fail circuit breaker after {Count} consecutive sub-{Threshold}s failures",
                     kind.Value, entry.ConsecutiveFastFails, _opts.FastFailThresholdSeconds);
-                return new AvailabilityTransition(wasExcluded, true, entry.ExcludedReason);
+                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
             }
 
-            return new AvailabilityTransition(wasExcluded, wasExcluded, entry.ExcludedReason);
+            return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
+        }
+    }
+
+    /// <summary>
+    /// Benches <paramref name="kind"/> because it is named in an
+    /// <c>AgentClass</c> but has no registered in-VM smoke probe, so its
+    /// in-sandbox CLI can never be verified. Called once at startup by the
+    /// coverage validator. The exclusion is tracked under its own
+    /// <see cref="SmokeExclusionSource.MissingProbe"/> source so neither a
+    /// host- nor an in-VM-smoke pass can clear it (there is no probe to ever
+    /// pass) — only an operator <see cref="Reset"/> after a probe is registered
+    /// lifts it. Returns the transition so the caller can fire a webhook.
+    /// </summary>
+    public AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason)
+    {
+        var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        lock (entry.Sync)
+        {
+            var wasExcluded = entry.IsExcluded;
+            entry.Exclusions[SmokeExclusionSource.MissingProbe] = reason;
+            if (!wasExcluded)
+                _log.LogWarning("Agent {Agent} benched: {Reason}", kind.Value, reason);
+            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
         }
     }
 
@@ -170,7 +219,7 @@ public sealed class AgentAvailabilityRegistry
         lock (entry.Sync)
         {
             entry.ConsecutiveFastFails = 0;
-            entry.ExcludedReason = null;
+            entry.Exclusions.Clear();
             entry.LastFastFailAt = null;
             entry.LastFastFailDuration = null;
             entry.LastSmokePassedAt = null;
@@ -191,10 +240,11 @@ public sealed class AgentAvailabilityRegistry
             var entry = kvp.Value;
             lock (entry.Sync)
             {
+                var reason = entry.CombinedReason();
                 results.Add(new AgentAvailabilitySnapshot(
                     Agent: kvp.Key,
-                    Excluded: entry.ExcludedReason is not null,
-                    Reason: entry.ExcludedReason,
+                    Excluded: reason is not null,
+                    Reason: reason,
                     ConsecutiveFastFails: entry.ConsecutiveFastFails,
                     LastSmokePassedAt: entry.LastSmokePassedAt,
                     LastSmokeFailedAt: entry.LastSmokeFailedAt,
@@ -212,30 +262,89 @@ public sealed class AgentAvailabilityRegistry
         public DateTimeOffset? LastSmokeFailedAt;
         public DateTimeOffset? LastFastFailAt;
         public TimeSpan? LastFastFailDuration;
-        public string? ExcludedReason;
+
+        /// <summary>
+        /// Active exclusions keyed by the signal that raised them. The agent is
+        /// excluded while any entry is present; each source clears only its own
+        /// entry, so a host-smoke pass cannot lift an in-VM-smoke exclusion.
+        /// </summary>
+        public readonly Dictionary<SmokeExclusionSource, string> Exclusions = new();
+
+        public bool IsExcluded => Exclusions.Count > 0;
+
+        /// <summary>Null when available; the joined reasons across sources otherwise.</summary>
+        public string? CombinedReason() =>
+            Exclusions.Count == 0 ? null : string.Join("; ", Exclusions.Values);
     }
 }
 
-/// <summary>Result of <see cref="AgentAvailabilityRegistry.GetAvailability"/>.</summary>
-public sealed record AgentAvailability(bool Available, string? Reason, DateTimeOffset? LastSmokePassedAt);
+/// <summary>
+/// The signal that benched an agent. Tracked separately so a pass from one
+/// signal never clears another's exclusion — the over-permissive host
+/// credential probe must not be able to un-bench an agent that the in-sandbox
+/// CLI probe (or the fast-fail breaker) marked broken.
+/// </summary>
+public enum SmokeExclusionSource
+{
+    /// <summary>Host-side credential probe (<see cref="CredentialSmokeGate"/> / periodic sweeps).</summary>
+    HostSmoke,
+
+    /// <summary>In-sandbox CLI probe (<see cref="InVmSmokeProber"/>).</summary>
+    InVmSmoke,
+
+    /// <summary>Fast-fail circuit breaker over real run outcomes.</summary>
+    FastFail,
+
+    /// <summary>
+    /// Agent named in an <c>AgentClass</c> but with no registered in-VM smoke
+    /// probe, so its sandbox CLI cannot be verified. Set once at startup by the
+    /// coverage validator; cleared only by operator <see cref="AgentAvailabilityRegistry.Reset"/>.
+    /// </summary>
+    MissingProbe,
+}
 
 /// <summary>
-/// State transition returned by registry mutators. Callers use
-/// <c>!PreviouslyExcluded &amp;&amp; NowExcluded</c> to fire "agent newly
-/// excluded" webhook events and <c>PreviouslyExcluded &amp;&amp; !NowExcluded</c>
-/// to fire "agent recovered" events without duplicates on steady state.
+/// Smoke-subsystem port over <see cref="AgentAvailabilityRegistry"/>. Carries
+/// the exclusion-taxonomy mutators that the in-VM prober
+/// (<see cref="InVmSmokeProber"/>), the coverage policy
+/// (<see cref="InVmSmokeCoveragePolicy"/>), and the host smoke services
+/// (<see cref="StartupSmokeProbeService"/> / <see cref="PeriodicSmokeProbeService"/>)
+/// need to feed probe verdicts back into availability.
+///
+/// <para>Deliberately separate from <see cref="IAgentAvailabilityRegistry"/>:
+/// routing/dispatch/admin consumers depend on that narrow read/run-outcome port
+/// and must not see <see cref="MarkSmokeResult"/> (source + clearsFastFail) or
+/// <see cref="ExcludeForMissingProbe"/>, while the smoke services that own the
+/// exclusion model depend on this one — so neither side is pinned to the
+/// concrete registry type (interface segregation; loose coupling).</para>
 /// </summary>
-public sealed record AvailabilityTransition(bool PreviouslyExcluded, bool NowExcluded, string? Reason);
+public interface ISmokeAvailabilityRegistry
+{
+    /// <summary>Current routable verdict for an agent (shared with the read port).</summary>
+    AgentAvailability GetAvailability(AgentKind kind);
 
-/// <summary>Per-agent state surfaced via the admin / concurrency endpoints.</summary>
-public sealed record AgentAvailabilitySnapshot(
-    AgentKind Agent,
-    bool Excluded,
-    string? Reason,
-    int ConsecutiveFastFails,
-    DateTimeOffset? LastSmokePassedAt,
-    DateTimeOffset? LastSmokeFailedAt,
-    DateTimeOffset? LastFastFailAt);
+    /// <summary>Feeds a smoke-probe outcome from a specific source into availability.</summary>
+    AvailabilityTransition MarkSmokeResult(
+        AgentKind kind,
+        AgentSmokeResult result,
+        SmokeExclusionSource source = SmokeExclusionSource.HostSmoke,
+        bool clearsFastFail = false);
+
+    /// <summary>Benches an agent named in a class but with no registered in-VM probe.</summary>
+    AvailabilityTransition ExcludeForMissingProbe(AgentKind kind, string reason);
+
+    /// <summary>
+    /// Clears <paramref name="kind"/>'s exclusion state, fast-fail counter, and
+    /// prior probe timestamps. Lives on the smoke port (which owns the exclusion
+    /// taxonomy) rather than the narrow routing port, so the operator-reset
+    /// adapter (<see cref="AgentAvailabilityReset"/>) can pair it with the in-VM
+    /// cache invalidation through an abstraction instead of binding to the
+    /// concrete registry. Deliberately absent from
+    /// <see cref="IAgentAvailabilityRegistry"/> so routing/dispatch consumers
+    /// cannot clear the registry without also dropping the cache.
+    /// </summary>
+    void Reset(AgentKind kind);
+}
 
 /// <summary>
 /// Tuning for <see cref="AgentAvailabilityRegistry"/> and

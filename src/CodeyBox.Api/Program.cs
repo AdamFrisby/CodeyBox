@@ -896,9 +896,10 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
-        sp.GetService<AgentAvailabilityRegistry>(),
+        sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
-        sp.GetService<AgentConcurrencySnapshot>());
+        sp.GetService<AgentConcurrencySnapshot>(),
+        sp.GetService<IInVmSmokeGate>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1009,6 +1010,23 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
 
+// --- In-VM smoke probes ------------------------------------------------------
+// Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
+// These exec the agent CLI inside a sandbox cloned from the active baseline,
+// catching exit-127 / auth-path failures the host-only probes above cannot see.
+// Copilot has no in-VM probe (no first-party CLI driven by this pipeline).
+builder.Services.AddSingleton<IInVmSmokeProbe, ClaudeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
+// Startup guard (AC#1): bench any configured AgentClass member with no in-VM
+// probe (so a CLI-backed agent that would fail at first dispatch is routed past
+// at smoke time, not first dispatch). Agents with no sandbox CLI — copilot by
+// default, see InVmSmokeOptions.ExemptAgentsWithoutProbe — are warned but not
+// benched.
+builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
+
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
 // Registered as IEnumerable<IAgentModelListProbe>; the validator resolves by Kind.
 // Copilot has no probe — its CLI does not accept a --model flag, so AgentClass
@@ -1092,6 +1110,15 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
     sp.GetRequiredService<AvailabilityOptions>(),
     TimeProvider.System,
     sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentAvailabilityRegistry>()));
+// The narrow availability port routing/dispatch/admin consumers bind to —
+// same singleton, exposed as the read/run-outcome/snapshot/reset surface.
+builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+// The smoke-mutator port the in-VM prober, coverage policy, and host smoke
+// services bind to — same singleton, exposed as the exclusion-taxonomy
+// surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
+builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1104,6 +1131,81 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
         sp.GetRequiredService<IAgentSmokeCache>(),
         sp.GetRequiredService<SmokeOptions>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CredentialSmokeGate>()));
+
+// --- In-VM smoke prober ------------------------------------------------------
+builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var v = cbOpts.Smoke.InVm;
+    // When the operator did not pin an explicit smoke network profile, inherit
+    // the default project work-phase profile. The baseline-clone path only
+    // triggers when ProfileName is non-empty; a null profile silently forces
+    // the cloud-init launch path, so the probe would test a different image
+    // than the dispatch (which clones the work-profile baseline) and miss drift
+    // baked only into that baseline (e.g. PATH symlinks from MultipassExtraRuncmd).
+    // Inheriting the work profile keeps the probe on the same clone-vs-launch
+    // path as dispatch by default; an explicit Smoke:InVm:NetworkProfile wins.
+    // Read straight from configuration rather than IOptions<ProjectsOptions>:
+    // resolving the latter eagerly runs ProjectsOptionsRemovalValidator, whose
+    // store query throws whenever non-terminal work items reference a project
+    // absent from the bound config — which would surface here as a spurious
+    // construction failure (e.g. test hosts that seed the store but not the
+    // Projects config section). This singleton is built once at startup and
+    // does not hot-reload the profile, so a one-shot config read is sufficient.
+    var defaultWorkProfile = sp.GetRequiredService<IConfiguration>()
+        .GetValue<string?>("CodeyBox:Defaults:NetworkProfiles:Work");
+    return new InVmSmokeOptions
+    {
+        Enabled = v.Enabled,
+        ImageReference = cbOpts.SandboxImageReference,
+        AllowedHosts = cbOpts.AgentAllowedHosts,
+        NetworkProfile = v.NetworkProfile ?? defaultWorkProfile,
+        StepTimeoutSeconds = v.StepTimeoutSeconds,
+        CacheTtlMinutes = v.CacheTtlMinutes,
+        SweepIntervalSeconds = v.SweepIntervalSeconds,
+        FailClosedOnProbeFault = v.FailClosedOnProbeFault,
+        // Null (unset) keeps the InVmSmokeOptions default (copilot); an explicit
+        // list — including empty — overrides it so operators can opt every agent
+        // into the in-VM coverage requirement.
+        ExemptAgentsWithoutProbe = v.ExemptAgentsWithoutProbe is { } ex ? ex : new InVmSmokeOptions().ExemptAgentsWithoutProbe,
+    };
+});
+builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
+    new InVmSmokeCache(TimeSpan.FromMinutes(sp.GetRequiredService<InVmSmokeOptions>().CacheTtlMinutes)));
+// Single operator-reset port: clears the availability registry AND invalidates
+// the in-VM smoke cache atomically, so a reset can never leave a stale cached
+// pass to reconcile back onto the registry before the operator's fix is
+// re-verified. The admin endpoint depends on this one contract.
+builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
+    sp.GetRequiredService<IInVmSmokeCache>()));
+builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IBaselineImageResolver>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetServices<IInVmSmokeProbe>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
+    sp.GetRequiredService<IInVmSmokeCache>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<InVmSmokeOptions>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>()));
+// The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
+// first work item per baseline is verified in-VM before routing; share the
+// single InVmSmokeProber instance so the gate, the background sweep service,
+// and the cache all observe the same state.
+builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSmokeProber>());
+// Coverage enforcement (startup validator + hot-reload) is a pure config policy
+// with no VM provisioning, kept in a separate type from the runtime dispatch
+// gate so those consumers depend only on the narrow IInVmSmokeCoveragePolicy
+// port rather than the full gate contract (interface segregation).
+builder.Services.AddSingleton<IInVmSmokeCoveragePolicy>(sp => new InVmSmokeCoveragePolicy(
+    sp.GetServices<IInVmSmokeProbe>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
+    sp.GetRequiredService<InVmSmokeOptions>()));
+builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
+    sp.GetRequiredService<IInVmSmokeGate>(),
+    sp.GetRequiredService<InVmSmokeOptions>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProbeService>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
 // ProjectRepository observes IOptionsMonitor<ProjectsOptions>, so an
@@ -1604,14 +1706,15 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>>(),
     sp.GetService<ITaskQueue>(),
     sp.GetService<OrchestratorOptions>(),
-    sp.GetService<AgentAvailabilityRegistry>(),
+    sp.GetService<IAgentAvailabilityRegistry>(),
     sp.GetService<IAgentRunningCounters>(),
     sp.GetService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<IPreMergeVerifier>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetService<IAgentUsageStore>(),
     sp.GetService<IAgentBudgetProvider>(),
-    sp.GetRequiredService<IncrementalRebaseSnapshot>()));
+    sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+    inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1622,7 +1725,9 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     sp.GetRequiredService<AgentClassRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
-    sp.GetRequiredService<IWebhookDispatcher>()));
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<IBaselineImageResolver>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -1746,7 +1851,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
-        quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>());
+        quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
+        coverage: sp.GetService<IInVmSmokeCoveragePolicy>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -1755,16 +1861,19 @@ builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
     sp.GetRequiredService<ILogger<StartupSmokeProbeService>>(),
-    sp.GetService<AgentAvailabilityRegistry>()));
+    sp.GetService<ISmokeAvailabilityRegistry>()));
 builder.Services.AddSingleton<PeriodicSmokeProbeService>(sp => new PeriodicSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<SmokeOptions>(),
     sp.GetRequiredService<AvailabilityOptions>(),
-    sp.GetRequiredService<AgentAvailabilityRegistry>(),
+    sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<ILogger<PeriodicSmokeProbeService>>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
+// Expose the host-side on-demand probe through the core port so the admin
+// /smoke endpoint depends on the abstraction, not the background-service type.
+builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService<PeriodicSmokeProbeService>());
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<ICredentialProvider>(),
@@ -2032,7 +2141,7 @@ app.MapGet("/concurrency", async (
     OrchestratorService orchestrator,
     AgentClassRouter router,
     IAgentBurnEstimator burnEstimator,
-    AgentAvailabilityRegistry? availability,
+    IAgentAvailabilityRegistry? availability,
     CancellationToken ct) =>
 {
     var state = orchestrator.GetConcurrencyState();
@@ -2107,8 +2216,9 @@ app.MapGet("/concurrency", async (
 
 app.MapPost("/admin/agent/{name}/smoke", async (
     string name,
-    PeriodicSmokeProbeService periodic,
-    AgentAvailabilityRegistry registry,
+    IHostSmokeProbeRunner hostProbe,
+    IInVmSmokeGate inVmGate,
+    IAgentAvailabilityRegistry registry,
     CancellationToken ct) =>
 {
     // Canonical AgentKind values are lowercase ("cursor", "claude", ...) so a
@@ -2116,19 +2226,41 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     // even when the underlying probe was registered. Normalise so case
     // never silently shadows the operator's intent.
     var kind = new AgentKind(name.ToLowerInvariant());
-    var result = await periodic.ProbeAsync(kind, ct);
-    if (result is null)
+
+    // Host-side credential probe (env-var presence on the orchestrator host).
+    var hostResult = await hostProbe.ProbeAsync(kind, ct);
+
+    // In-VM gate: the real in-sandbox CLI verification the host probe could not
+    // be (exit 127 / auth-path drift / workspace-trust). Force a re-probe so an
+    // operator who just corrected such an issue clears the in-VM bench here
+    // rather than waiting for the next background sweep — otherwise "smoke ok"
+    // from the host probe could mask a standing in-VM exclusion. Routes through
+    // the IInVmSmokeGate port, not the concrete prober. Null when in-VM smoke is
+    // disabled or no in-VM probe is registered for this agent.
+    var inVmAvailability = await inVmGate.ForceProbeAsync(kind, ct);
+
+    // 404 only when neither layer knows this agent — a typo, not a healthy agent
+    // that simply has one probe layer.
+    if (hostResult is null && inVmAvailability is null)
         return Results.NotFound(new { error = $"no smoke probe registered for agent '{name}'" });
+
     var availability = registry.GetAvailability(kind);
+    object? hostSmoke = hostResult is null ? null : new
+    {
+        ok = hostResult.Ok,
+        reason = hostResult.FailureReason,
+        durationMs = (long)hostResult.Duration.TotalMilliseconds,
+    };
+    object? inVmSmoke = inVmAvailability is null ? null : new
+    {
+        available = inVmAvailability.Available,
+        reason = inVmAvailability.Reason,
+    };
     return Results.Ok(new
     {
         agent = kind.Value,
-        smoke = new
-        {
-            ok = result.Ok,
-            reason = result.FailureReason,
-            durationMs = (long)result.Duration.TotalMilliseconds,
-        },
+        smoke = hostSmoke,
+        inVmSmoke,
         availability = new
         {
             available = availability.Available,
@@ -2137,7 +2269,7 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry registry, IAgentRegistry agents) =>
+app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IAgentAvailabilityReset reset) =>
 {
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
@@ -2147,7 +2279,10 @@ app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry
     // never realises the call did nothing.
     if (!agents.Available.Contains(kind))
         return Results.NotFound(new { error = $"unknown agent '{name}'" });
-    registry.Reset(kind);
+    // Single reset port: clears the registry AND invalidates the in-VM smoke
+    // cache together, so a stale cached pass can't reconcile straight back onto
+    // the registry before the operator's fix is re-verified.
+    reset.Reset(kind);
     var availability = registry.GetAvailability(kind);
     return Results.Ok(new
     {
@@ -2160,7 +2295,7 @@ app.MapPost("/admin/agent/{name}/reset", (string name, AgentAvailabilityRegistry
     });
 });
 
-app.MapGet("/admin/agents/availability", (AgentAvailabilityRegistry registry) =>
+app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry) =>
 {
     return Results.Ok(new
     {
@@ -2773,6 +2908,57 @@ namespace CodeyBox.Api
         /// periodic smoke probe sweep). Bound from <c>CodeyBox:Smoke:Availability</c>.
         /// </summary>
         public AvailabilityConfig Availability { get; set; } = new();
+
+        /// <summary>
+        /// Tuning for the in-VM smoke prober (binary-presence + auth checks run
+        /// inside a sandbox cloned from the active baseline). Bound from
+        /// <c>CodeyBox:Smoke:InVm</c>.
+        /// </summary>
+        public InVmSmokeConfig InVm { get; set; } = new();
+    }
+
+    /// <summary>Config binding for the in-VM smoke prober.</summary>
+    public sealed class InVmSmokeConfig
+    {
+        /// <summary>Enable or disable the in-VM smoke prober. Default true.</summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>Per-step exec timeout inside the sandbox, in seconds. Default 30.</summary>
+        public int StepTimeoutSeconds { get; set; } = 30;
+
+        /// <summary>Result cache TTL per baseline ref, in minutes. Default 60.</summary>
+        public int CacheTtlMinutes { get; set; } = 60;
+
+        /// <summary>Background sweep interval in seconds. Default 300 (5 min); set 0 to disable.</summary>
+        public int SweepIntervalSeconds { get; set; } = 300;
+
+        /// <summary>
+        /// Fail-closed dispatch-gate policy. When true (the default), an in-VM
+        /// probe that cannot reach a verdict (provisioning/exec/timeout/credential
+        /// fault) temporarily benches the agent so the router never dispatches to
+        /// an unverified CLI; the bench self-heals on the next successful probe.
+        /// Set false only on infra so flaky that benching disrupts more than the
+        /// exit-127 / auth cascade it guards against. See
+        /// <see cref="InVmSmokeOptions.FailClosedOnProbeFault"/>.
+        /// </summary>
+        public bool FailClosedOnProbeFault { get; set; } = true;
+
+        /// <summary>
+        /// Host network profile for the probe sandbox; also selects which
+        /// baseline ref to probe (baselines are keyed by profile+flavor). When
+        /// unset, inherits <c>CodeyBox:Defaults:NetworkProfiles:Work</c> so the
+        /// probe clones the same baseline image dispatch does — set it only to
+        /// override that inheritance. Leave both null only when not using
+        /// baseline images (the probe then matches dispatch's cloud-init path).
+        /// </summary>
+        public string? NetworkProfile { get; set; }
+
+        /// <summary>
+        /// Agents allowed to route without a registered in-VM smoke probe.
+        /// Uncovered agents are otherwise benched at startup (AC#1). Defaults to
+        /// <c>copilot</c> when unset (no sandbox CLI). Set explicitly to override.
+        /// </summary>
+        public List<string>? ExemptAgentsWithoutProbe { get; set; }
     }
 
     /// <summary>Config binding for the availability registry.</summary>

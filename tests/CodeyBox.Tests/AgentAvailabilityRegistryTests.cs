@@ -171,6 +171,58 @@ public sealed class AgentAvailabilityRegistryTests
         Assert.True(reg.GetAvailability(Claude).Available);
     }
 
+    // ── MissingProbe bench (coverage validator) ───────────────────────────────
+
+    [Fact]
+    public void MissingProbeExclusion_NotClearedByHostOrInVmSmokePass()
+    {
+        // An agent benched because it has no in-VM smoke probe can never be
+        // un-benched by a smoke pass: there is no probe to ever pass, and a
+        // pass from another source must not reach across to lift it. Only an
+        // operator Reset (after a probe is registered) clears it.
+        var reg = NewRegistry();
+        reg.ExcludeForMissingProbe(Claude, "no in-VM smoke probe registered for claude");
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        // A host credential pass: clears HostSmoke only, leaves MissingProbe.
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero), SmokeExclusionSource.HostSmoke);
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        // A freshly-executed in-VM pass: clears InVmSmoke + fast-fail, still
+        // leaves MissingProbe (a different source).
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero),
+            SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.Contains("no in-VM smoke probe", reg.GetAvailability(Claude).Reason);
+
+        reg.Reset(Claude);
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
+    [Fact]
+    public void CachedInVmPass_DoesNotClearFastFailExclusion()
+    {
+        // A cached in-VM verdict re-executed no CLI, so replaying it must NOT
+        // lift a fast-fail bench earned from real sub-threshold dispatch
+        // failures. Only a freshly executed in-VM probe (clearsFastFail:true)
+        // or operator Reset may clear it.
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        for (var i = 0; i < 3; i++)
+            reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.False(reg.GetAvailability(Claude).Available);
+
+        // Cache-hit reconciliation path: pass with clearsFastFail:false.
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero),
+            SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.Contains("fast-fail circuit breaker", reg.GetAvailability(Claude).Reason);
+
+        // A freshly executed in-VM probe clears it.
+        reg.MarkSmokeResult(Claude, new AgentSmokeResult(true, null, TimeSpan.Zero),
+            SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+        Assert.True(reg.GetAvailability(Claude).Available);
+    }
+
     [Fact]
     public void Reset_UnknownAgent_DoesNotThrow()
     {

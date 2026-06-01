@@ -19,14 +19,19 @@ namespace CodeyBox.Agents.Cursor;
 ///
 /// <para><b>Auth model.</b> Cursor's CLI uses subscription auth written by
 /// <c>agent login</c> to a credentials file on the host. The path is operator-
-/// configurable via <c>CODEYBOX_CURSOR_AUTH_FILE</c> with a sensible default
-/// (<c>~/.cursor/credentials.json</c>). The file's contents are shipped to the
-/// sandbox via <c>CODEYBOX_CURSOR_AUTH_JSON</c> and materialised at sandbox-
-/// prepare time (same pattern as Codex's <c>~/.codex/auth.json</c> flow); the
-/// host's credential directory is never bind-mounted into untrusted agent
-/// sandboxes. When the env var is absent, this is a no-op and the in-sandbox
-/// CLI is expected to use whatever auth path the operator provisioned in the
-/// image.</para>
+/// configurable via <c>CODEYBOX_CURSOR_AUTH_FILE</c> with a sensible default of
+/// the XDG path current Cursor CLI versions read — <c>~/.config/cursor/auth.json</c>
+/// (the legacy <c>~/.cursor/credentials.json</c> path is no longer read by the
+/// binary; materialising to it was the PR #138 cascade). The file's contents are
+/// shipped to the sandbox via <c>CODEYBOX_CURSOR_AUTH_JSON</c> and re-materialised
+/// at sandbox-prepare time to the matching in-VM path
+/// (<see cref="AuthMaterialiseScript"/> / <see cref="PrepareSandboxAsync"/> both
+/// write <c>~/.config/cursor/auth.json</c>); the host's credential directory is
+/// never bind-mounted into untrusted agent sandboxes. When the env var is absent,
+/// this is a no-op and the in-sandbox CLI is expected to use whatever auth path
+/// the operator provisioned in the image. The in-VM smoke probe execs this exact
+/// script and an <c>agent status</c> check, so auth-path drift between this runner
+/// and the CLI is caught at smoke time rather than on first dispatch.</para>
 /// </summary>
 public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
@@ -42,11 +47,57 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     public override AgentKind Kind => AgentKind.Cursor;
 
     /// <summary>
+    /// Default Cursor CLI binary name inside the sandbox. The binary is
+    /// <c>agent</c>, NOT <c>cursor-agent</c>. Shared with
+    /// <c>CursorInVmSmokeProbe</c> so the smoke check and the real runner
+    /// always invoke the same binary.
+    /// </summary>
+    public const string DefaultBinary = "agent";
+
+    /// <summary>
+    /// The flag that auto-accepts Cursor's workspace-trust prompt — stage 3 of
+    /// the 2026-05-28 cascade ("Workspace Trust Required", exit 1). The runner
+    /// must ALWAYS pass it (the multipass VM boundary is the security perimeter,
+    /// so per-workspace consent inside the sandbox is noise). Exposed as a single
+    /// source of truth so <c>BuildInvocation</c> (real dispatch),
+    /// <c>CursorInVmSmokeProbe</c>'s stage-3 trust step (via
+    /// <see cref="WorkspaceTrustInvocationPrefix"/>), and
+    /// <c>CursorAgentRunnerTrustRegressionTests</c> (the argv-level pin) all
+    /// reference the same literal and cannot drift apart. Stage 3 is therefore
+    /// caught at smoke time too, not only by the argv regression test.
+    /// </summary>
+    public const string WorkspaceTrustFlag = "--trust";
+
+    /// <summary>
+    /// The leading argv every real workspace invocation uses:
+    /// <c>agent --print --trust --force</c>. Extracted as a single builder so
+    /// <see cref="BuildInvocation"/> (real dispatch) and
+    /// <c>CursorInVmSmokeProbe</c> (stage-3 in-VM trust check) construct the
+    /// exact same trust-bearing prefix — if <see cref="WorkspaceTrustFlag"/> is
+    /// ever dropped here, both the dispatch path and the smoke step lose it, so
+    /// the smoke step surfaces "Workspace Trust Required" at smoke time instead
+    /// of letting it cascade on first dispatch.
+    /// </summary>
+    public static IReadOnlyList<string> WorkspaceTrustInvocationPrefix(string binary) =>
+        [binary, "--print", WorkspaceTrustFlag, "--force"];
+
+    /// <summary>
+    /// Bash that materialises Cursor's subscription credentials into the
+    /// sandbox at <c>~/.config/cursor/auth.json</c> from
+    /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
+    /// <c>CursorInVmSmokeProbe</c> so the smoke probe exercises the exact same
+    /// destination path as a real dispatch — path drift here is the PR #138
+    /// failure this probe is meant to catch.
+    /// </summary>
+    public const string AuthMaterialiseScript =
+        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi";
+
+    /// <summary>
     /// Path to the Cursor CLI inside the sandbox. The binary is <c>agent</c>,
     /// not <c>cursor-agent</c>. Override only if the sandbox image installs
     /// it elsewhere.
     /// </summary>
-    public string Binary { get; init; } = "agent";
+    public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
     /// Default model passed to <c>--model</c> when no per-item override is
@@ -76,7 +127,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     {
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi"],
+            Argv = ["bash", "-c", AuthMaterialiseScript],
         }, ct);
         if (!write.Success)
         {
@@ -109,7 +160,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
         // noise. --force is the same idea for per-command tool prompts (see
         // Claude's --dangerously-skip-permissions for the equivalent
         // rationale on that runner).
-        var argv = new List<string> { Binary, "--print", "--trust", "--force" };
+        var argv = new List<string>(WorkspaceTrustInvocationPrefix(Binary));
 
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))

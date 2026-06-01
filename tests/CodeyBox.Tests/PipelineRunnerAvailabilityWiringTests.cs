@@ -2,12 +2,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -198,6 +201,106 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(item.Id, transition.WorkItem.Id);
         Assert.NotNull(transition.Project);
         Assert.Equal("test-project", transition.Project.Id.Value);
+    }
+
+    [Fact]
+    public async Task DirectAgentPickup_InVmGate_Exit127_FailsItemBeforeRunner_AndPublishesWebhook()
+    {
+        // The tests:meaningfulness-review Error: wire a REAL InVmSmokeProber into
+        // PipelineRunner and prove the work-item gate (PipelineRunner.cs ~331)
+        // actually short-circuits a direct-agent pickup (no AgentClass) when the
+        // agent CLI exits 127 on `agent --version` inside the sandbox. A
+        // regression that dropped this block, tied it back to
+        // SkipCredentialSmokeTest, or wired it incorrectly would let the runner
+        // be invoked and the exit-127 cascade reach first dispatch.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var cursorAgent = new ScriptableAgent(AgentKind.Cursor);
+        var registry = new AgentRegistry([cursorAgent]);
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+
+        // Scripted sandbox the prober clones: `agent --version` returns 127
+        // (binary missing from PATH), everything else passes.
+        var probeProvider = new ScriptedSandboxProvider(exec =>
+            exec.Argv.Count >= 2 && exec.Argv[1] == "--version"
+                ? new SandboxExecResult(127, "", "bash: agent: command not found")
+                : new SandboxExecResult(0, "", ""));
+        var cursorCred = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
+            new Dictionary<string, string>());
+        var prober = new InVmSmokeProber(
+            probeProvider,
+            new StubBaselineResolver("base-A"),
+            new ConstantCredentialProvider(cursorCred),
+            [new CursorInVmSmokeProbe()],
+            availability,
+            new InVmSmokeCache(TimeSpan.FromMinutes(60)),
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var prs = new InMemoryPullRequestService();
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Cursor,
+            // No DefaultAgentClass — this is the direct-agent path the gate must
+            // still cover. SkipCredentialSmokeTest stays false; even if it were
+            // true the in-VM gate is now decoupled from it.
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+
+        var pipeline = new PipelineRunner(
+            sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
+            projects, new TestUpstreamFactory(), composer,
+            store, webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            availability: availability,
+            inVmSmokeGate: prober);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "in-vm gate",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            Agent = AgentKind.Cursor,
+            PushUpstream = false,
+        };
+        await store.CreateAsync(item);
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        // The gate fired: the item failed without ever invoking the agent runner.
+        var final = await store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("in-VM smoke gate", final.LastError);
+        Assert.Equal(0, cursorAgent.CallCount);
+
+        // The prober benched cursor on the exit-127 version step.
+        Assert.False(availability.GetAvailability(AgentKind.Cursor).Available);
+
+        // PipelineRunner published the agent.smoke_failed transition for the item.
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("cursor", details.AgentKind);
     }
 
     // ── Harness ──────────────────────────────────────────────────────────────

@@ -1048,6 +1048,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
 
+            // Pin the baseline image ref BEFORE routing so the in-VM smoke gate
+            // probes (and caches against) the exact image this dispatch will
+            // clone, not whatever baseline happens to be active now. Without
+            // this, the router gates on a null ref → the gate's active-baseline
+            // fallback, while pickup below stamps the project work-phase baseline
+            // hash that PipelineRunner later re-gates on; a mismatch can route to
+            // an agent that passed the wrong image and then fail the whole item
+            // (AC#1). The persisted StartedAt/BaselineImageRef write still happens
+            // under the budget lock below; this only settles the in-memory ref.
+            if (item.BaselineImageRef is null)
+            {
+                var pinnedRef = ResolveBaselineRefForPickup(item, project);
+                if (pinnedRef is not null)
+                    item = item with { BaselineImageRef = pinnedRef };
+            }
+
             // Quota routing: resolve which agent to use, or decide to wait.
             // Skipped entirely (no probe, no wait) when no agent class is configured.
             //

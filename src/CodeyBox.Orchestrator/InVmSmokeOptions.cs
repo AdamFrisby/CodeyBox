@@ -1,0 +1,91 @@
+using CodeyBox.Core;
+
+namespace CodeyBox.Orchestrator;
+
+/// <summary>
+/// Tuning for the in-VM smoke prober (<see cref="InVmSmokeProber"/>). Bound
+/// from <c>CodeyBox:Smoke:InVm</c>.
+/// </summary>
+public sealed record InVmSmokeOptions
+{
+    /// <summary>
+    /// Enable or disable the in-VM smoke prober entirely. Default true.
+    /// Operators whose sandbox provider has no VM (process / bubblewrap local
+    /// dev) or who want to skip the per-baseline provision can set this false.
+    /// </summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>Sandbox image to clone the probe VM from (mirrors the dispatch image).</summary>
+    public string ImageReference { get; init; } = "";
+
+    /// <summary>
+    /// Hosts the probe sandbox is allowed to reach. The auth/status steps
+    /// (cursor <c>agent status</c>, opencode <c>opencode providers</c>) need
+    /// egress to the agent's API; mirror the agent allow-list here.
+    /// </summary>
+    public IReadOnlyList<string> AllowedHosts { get; init; } = [];
+
+    /// <summary>
+    /// Host network profile used both to attach the probe sandbox and to
+    /// resolve the active baseline ref (baselines are keyed by profile+flavor).
+    /// Null = resolve against the provider's default.
+    /// </summary>
+    public string? NetworkProfile { get; init; }
+
+    /// <summary>Per-step exec timeout inside the sandbox. Default 30s.</summary>
+    public int StepTimeoutSeconds { get; init; } = 30;
+
+    /// <summary>
+    /// How the <em>dispatch gate</em> (<see cref="InVmSmokeProber.EnsureProbedAsync"/>)
+    /// reacts when an in-VM probe cannot run to a verdict — provisioning fault,
+    /// exec error, step timeout, or credential-store fault.
+    ///
+    /// <para><b>true (default, fail-closed):</b> an inconclusive dispatch-gate
+    /// probe temporarily benches the agent under the in-VM smoke source so the
+    /// router never dispatches to a CLI that was never verified in-sandbox —
+    /// the first work item after startup or a baseline rebake is gated by a real
+    /// in-VM check rather than racing the background sweep, which is the whole
+    /// point of this gate. The bench is not cached and self-heals on the next
+    /// successful probe (background sweep or a later gate probe), so it converges
+    /// back without an operator reset once the host recovers — keep the
+    /// background sweep enabled so benched agents can recover. <b>false
+    /// (fail-open):</b> a transient fault leaves availability unchanged, so a
+    /// flaky host never benches a working agent; the trade-off is that the
+    /// exit-127 / auth cascade window stays open for the first dispatch until a
+    /// later probe runs. Operators on infra so flaky that benching causes more
+    /// disruption than the cascade risk can opt out by setting this false.</para>
+    ///
+    /// <para>The background sweep (<see cref="InVmSmokeProber.ProbeAllAsync"/>)
+    /// always fails open regardless of this setting — it performs no dispatch,
+    /// so a transient sweep fault has no cascade to gate and benching there
+    /// would only risk a self-inflicted outage.</para>
+    /// </summary>
+    public bool FailClosedOnProbeFault { get; init; } = true;
+
+    /// <summary>
+    /// Agents allowed to route without a registered <c>IInVmSmokeProbe</c>.
+    /// When the prober is active, an agent named in an <c>AgentClass</c> with no
+    /// in-VM probe is benched at startup (AC#1: caught at smoke time, not first
+    /// dispatch) unless its <see cref="AgentKind.Value"/> is listed here —
+    /// the escape hatch for agents with no first-party sandbox CLI driven by
+    /// this pipeline. Defaults to <c>copilot</c> (no CLI / no <c>--model</c>
+    /// flag, so it never runs the in-VM dispatch path). Matched
+    /// case-insensitively.
+    /// </summary>
+    public IReadOnlyList<string> ExemptAgentsWithoutProbe { get; init; } = [AgentKind.Copilot.Value];
+
+    /// <summary>
+    /// How long an in-VM result is cached for a given baseline ref before a
+    /// re-probe. Default 60 minutes — a rebake invalidates immediately via the
+    /// changed ref, so this only bounds intra-baseline staleness.
+    /// </summary>
+    public int CacheTtlMinutes { get; init; } = 60;
+
+    /// <summary>
+    /// Interval between background re-probe sweeps. The first sweep runs at
+    /// startup. Cache hits make steady-state sweeps free; a sweep only
+    /// provisions a VM when the baseline ref changed or the TTL expired.
+    /// Default 5 minutes. Non-positive disables the periodic sweep.
+    /// </summary>
+    public int SweepIntervalSeconds { get; init; } = 300;
+}

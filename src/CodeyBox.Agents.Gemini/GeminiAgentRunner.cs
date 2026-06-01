@@ -39,7 +39,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// Path to the gemini binary inside the sandbox. Override only if the
     /// sandbox image installs it elsewhere.
     /// </summary>
-    public string Binary { get; init; } = "gemini";
+    /// <summary>Default gemini binary name on the sandbox PATH. The in-VM smoke probe pins to this so the probe and runner can never drift.</summary>
+    public const string DefaultBinary = "gemini";
+
+    public string Binary { get; init; } = DefaultBinary;
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
 

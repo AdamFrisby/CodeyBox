@@ -18,14 +18,14 @@ namespace CodeyBox.Orchestrator;
 /// fires after one full interval — startup probes (<see cref="StartupSmokeProbeService"/>)
 /// already cover boot-time coverage, so re-firing on tick 0 would be redundant.</para>
 /// </summary>
-public sealed class PeriodicSmokeProbeService : BackgroundService
+public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokeProbeRunner
 {
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IAgentSmokeProbe> _probes;
     private readonly IWebhookDispatcher _webhooks;
     private readonly SmokeOptions _smokeOpts;
     private readonly AvailabilityOptions _availOpts;
-    private readonly AgentAvailabilityRegistry _availability;
+    private readonly ISmokeAvailabilityRegistry _availability;
     private readonly ILogger<PeriodicSmokeProbeService> _log;
 
     public PeriodicSmokeProbeService(
@@ -34,7 +34,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService
         IWebhookDispatcher webhooks,
         SmokeOptions smokeOpts,
         AvailabilityOptions availOpts,
-        AgentAvailabilityRegistry availability,
+        ISmokeAvailabilityRegistry availability,
         ILogger<PeriodicSmokeProbeService> log)
     {
         _credentials = credentials;
@@ -80,8 +80,9 @@ public sealed class PeriodicSmokeProbeService : BackgroundService
     }
 
     /// <summary>
-    /// Runs the probe registered for <paramref name="kind"/>, if any, and
-    /// returns the result. Returns null when no probe is registered.
+    /// <see cref="IHostSmokeProbeRunner.ProbeAsync"/>. Runs the probe registered
+    /// for <paramref name="kind"/>, if any, and returns the result. Returns null
+    /// when no probe is registered.
     /// </summary>
     public async Task<AgentSmokeResult?> ProbeAsync(AgentKind kind, CancellationToken ct)
     {

@@ -21,7 +21,7 @@ public sealed class StartupSmokeProbeService : IHostedService
     private readonly IWebhookDispatcher _webhooks;
     private readonly SmokeOptions _opts;
     private readonly ILogger<StartupSmokeProbeService> _log;
-    private readonly AgentAvailabilityRegistry? _availability;
+    private readonly ISmokeAvailabilityRegistry? _availability;
 
     // Exposed for test awaiting — callers can await this after StartAsync
     // to know when all background probes have completed.
@@ -33,7 +33,7 @@ public sealed class StartupSmokeProbeService : IHostedService
         IWebhookDispatcher webhooks,
         SmokeOptions opts,
         ILogger<StartupSmokeProbeService> log,
-        AgentAvailabilityRegistry? availability = null)
+        ISmokeAvailabilityRegistry? availability = null)
     {
         _credentials = credentials;
         _probes = probes.ToList();

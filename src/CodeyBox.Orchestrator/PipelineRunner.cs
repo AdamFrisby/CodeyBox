@@ -68,7 +68,8 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly QuotaRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
-    private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IAgentAvailabilityRegistry? _availability;
+    private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     // Hot-reloadable feature flag for the between-iteration incremental
     // rebase. Optional: when null the feature is disabled regardless of
@@ -182,7 +183,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         ITaskQueue? taskQueue = null,
         OrchestratorOptions? orchestratorOptions = null,
-        AgentAvailabilityRegistry? availability = null,
+        IAgentAvailabilityRegistry? availability = null,
         IAgentRunningCounters? agentRunningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
         IPreMergeVerifier? preMergeVerifier = null,
@@ -190,7 +191,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentUsageStore? usageStore = null,
         IAgentBudgetProvider? budgetProvider = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
-        AgenticConflictResolver? agenticConflictResolver = null)
+        AgenticConflictResolver? agenticConflictResolver = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -247,6 +249,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
+        _inVmSmokeGate = inVmSmokeGate;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -349,6 +352,45 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (smokeResult is { Ok: true })
                 AuditLog.AgentSmokeSucceeded(agentKind, smokeResult.Duration);
+        }
+
+        // ── In-VM smoke gate ─────────────────────────────────────────────────────
+        // The host credential gate above only proves the host holds the right
+        // env-vars; it cannot see whether the agent CLI actually runs inside the
+        // sandbox. On the class-routed path the router already gated the chosen
+        // member, but a direct-agent work item (no AgentClass / DefaultAgentClass)
+        // would otherwise reach the runner without any in-VM check and reproduce
+        // the exit-127 / auth cascade. Gate the work-phase agent here too — a
+        // cache hit is free, so a class-routed item just re-asserts its verdict.
+        //
+        // Deliberately NOT tied to project.SkipCredentialSmokeTest: that flag
+        // opts out of the host-side *credential* probe (HTTP env-var check),
+        // which is exactly the over-permissive check this in-VM gate exists to
+        // backstop. Skipping the in-sandbox binary/auth/trust verification for a
+        // project that disabled credential smoke would reopen the very cascade
+        // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
+        // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
+        // gate is a free pass-through for them regardless of this flag.
+        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(agentKind, item.BaselineImageRef, ct);
+        if (!smokeAvailability.Available)
+        {
+            var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
+            AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = agentKind.Value,
+                    Reason = reason,
+                },
+            }, CancellationToken.None);
+            await TransitionFailed(item,
+                $"in-VM smoke gate: {reason}",
+                CancellationToken.None, project, failureKind: "infrastructure");
+            return;
         }
 
         // ── check-and-act branch ─────────────────────────────────────────────
@@ -1513,7 +1555,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
         if (_classRouter is not null && classId is not null)
         {
-            foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
+            foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
             {
                 if (!seenKinds.Add(member.Agent))
                     continue;
@@ -3386,14 +3428,27 @@ public sealed class PipelineRunner : IPipelineRunner
             QualityScore = 100,
         };
 
+        // Gate the preferred agent on in-VM smoke + availability exactly as the
+        // work-phase router (AgentClassRouter.ResolveAsync) does, BEFORE trusting
+        // it. An agent benched by in-VM smoke (exit 127 / auth drift) or by the
+        // fast-fail breaker must not run audit even when named explicitly — the
+        // class-chain walk below already gates its members via
+        // OrderedFallbackCandidatesAsync, so without this the preferred fast path
+        // was the one hole left open.
+        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, item.BaselineImageRef, ct);
+        var preferredAvailable = preferredAvailability.Available;
+
         var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
             preferredKind.Value, preferredProbeMember, ct);
-        if (preferredOk)
+        if (preferredAvailable && preferredOk)
             return preferredRunner;
 
+        var rejectReason = preferredAvailable
+            ? preferredReason
+            : $"smoke gate: {(preferredAvailability.Reason ?? "unavailable")}";
         _log.LogInformation(
             "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
-            preferredKind.Value.Value, preferredReason, auditorName);
+            preferredKind.Value.Value, rejectReason, auditorName);
 
         // No class chain to walk — preserve legacy fall-through to the work
         // agent. With no class configured, the operator hasn't opted into
@@ -3410,7 +3465,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // LlmAuditorSkippedQuota event reports. Candidates skipped for other
         // reasons (missing runner / credentials) are intentionally excluded.
         var quotaRejectedCount = 1;   // the preferred agent we just rejected
-        foreach (var member in _classRouter.OrderedFallbackCandidates(item, project))
+        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
         {
             if (member.Agent == preferredKind.Value)
                 continue;   // already counted above
@@ -3577,6 +3632,35 @@ public sealed class PipelineRunner : IPipelineRunner
             // above) means we have no evidence the candidate is unavailable.
             _ => (true, "quota unknown; no recent observed failure"),
         };
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="kind"/> is currently routable per the
+    /// availability registry, gating the FIRST trust of an apparently-available
+    /// agent on a real in-sandbox CLI check (<see cref="IInVmSmokeGate"/>, cache
+    /// hit = free) so the exit-127 / auth cascade is caught here rather than at
+    /// dispatch. Mirrors <see cref="AgentClassRouter.ResolveAsync"/>'s gate so
+    /// the audit phase and the work phase agree on what "available" means.
+    /// Returns true when no availability registry is wired (legacy callers
+    /// preserve their prior behaviour).
+    /// </summary>
+    private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    {
+        // The in-VM gate (when wired) owns the read→probe→re-read and returns the
+        // reconciled availability — including the exclusion Reason — so callers
+        // get a verdict from this one call and never re-read the availability
+        // registry alongside the gate (that dual binding is exactly what
+        // IInVmSmokeGate was extracted to remove; re-reading would also degrade
+        // the reason to a generic placeholder under gate-only wiring). Falls back
+        // to a plain registry read, then to "available" when neither is wired
+        // (legacy callers preserve their prior behaviour). baselineRef pins the
+        // probe to the image this work item will clone (B1), not just the active
+        // baseline.
+        if (_inVmSmokeGate is not null)
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
+        if (_availability is not null)
+            return _availability.GetAvailability(kind);
+        return new AgentAvailability(true, null, null);
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
@@ -3761,7 +3845,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // Find the next candidate that we haven't already tried this run.
-            var candidates = _classRouter.OrderedFallbackCandidates(item, project);
+            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct);
             AgentMembership? nextMember = null;
             foreach (var candidate in candidates)
             {

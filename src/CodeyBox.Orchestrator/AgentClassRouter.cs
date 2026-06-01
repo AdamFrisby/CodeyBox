@@ -44,7 +44,7 @@ public sealed class AgentClassRouter
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
-    private readonly AgentAvailabilityRegistry? _availability;
+    private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentBudgetProvider? _budgetProvider;
     // Shared swappable holder for per-agent operator caps. Same instance is
     // held by OrchestratorService and PipelineRunner so hot-reload writes
@@ -52,6 +52,7 @@ public sealed class AgentClassRouter
     // (legacy test fixtures) — the cap-spill check falls back to "no cap" and
     // the router behaves as before this feature.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
+    private readonly IInVmSmokeGate? _inVmSmokeGate;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -73,9 +74,10 @@ public sealed class AgentClassRouter
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
-        AgentAvailabilityRegistry? availability = null,
+        IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
-        AgentConcurrencySnapshot? concurrencySnapshot = null)
+        AgentConcurrencySnapshot? concurrencySnapshot = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -97,6 +99,7 @@ public sealed class AgentClassRouter
         _availability = availability;
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
+        _inVmSmokeGate = inVmSmokeGate;
     }
 
     /// <summary>
@@ -284,6 +287,20 @@ public sealed class AgentClassRouter
         }
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
+        // Track subscription members benched purely by the availability gate
+        // (in-VM smoke / fast-fail breaker / missing-probe). If every
+        // subscription member fell out for that reason — and none for quota —
+        // the "wait" we return below is unblocked by the smoke sweep / operator
+        // reset, NOT a quota recheck, so the reason text must say so rather than
+        // claim a quota threshold.
+        var subscriptionTotal = sorted.Count(x => x.Member.Billing == AgentBilling.Subscription);
+        var subscriptionSmokeExcluded = 0;
+        // Every member the availability gate benched (in-VM smoke / fast-fail /
+        // missing-probe), regardless of billing. The PayPerApi-only fallback below
+        // must never fire one of these: a smoke bench means the binary is broken,
+        // which the "fire despite low quota" fallback exists to override only for
+        // quota inaccuracy, not for a CLI that will exit 127 / fail auth (AC#1).
+        var smokeExcluded = new HashSet<(AgentKind, string?)>();
 
         // PayPerApi members that an exhausted operator budget pushed below threshold:
         // these must NOT be fired by the no-Subscription fallthrough below (doing so
@@ -321,19 +338,22 @@ public sealed class AgentClassRouter
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
                 continue;
             }
-            // Smoke gate / fast-fail circuit breaker excluded this agent. Skip
-            // it without probing — the binary or credentials are known-broken
-            // and a dispatch would either exit 127 immediately or fail auth.
-            if (_availability is { } reg)
+            // Smoke gate / fast-fail circuit breaker excluded this agent? Skip
+            // it — the binary or credentials are known-broken and a dispatch
+            // would either exit 127 immediately or fail auth. The in-VM gate
+            // (when wired) also probes an apparently-Available-but-never-probed
+            // agent here so the exit-127 / auth cascade is caught on the FIRST
+            // dispatch, not on first run; a cache hit is free.
+            var availability = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
+            if (availability is { Available: false })
             {
-                var av = reg.GetAvailability(member.Agent);
-                if (!av.Available)
-                {
-                    var smokeReason = $"smoke gate: {av.Reason}";
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
-                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
-                    continue;
-                }
+                var smokeReason = $"smoke gate: {availability.Reason}";
+                _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
+                smokeExcluded.Add((member.Agent, member.ModelId));
+                if (member.Billing == AgentBilling.Subscription)
+                    subscriptionSmokeExcluded++;
+                continue;
             }
             if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
             {
@@ -453,25 +473,24 @@ public sealed class AgentClassRouter
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
-        // No member was chosen. If at least one quota-passing member was
-        // blocked by the per-agent concurrency cap, surface AnyMemberAtCap
-        // so the caller can defer with the short cap-retry instead of the
-        // full quota recheck — operator-set caps free up much faster than a
-        // quota window resets, and a 5-minute idle on a fleet that's just
-        // rate-limited by config is wasted throughput. The flag is set on
-        // any-at-cap (not all-at-cap) because even one cap-blocked member
-        // means a worker finishing on that agent will free up a routable
-        // slot within the cap-retry window.
+        // No member was chosen. Distinguish stall reasons so the caller picks
+        // the right defer interval and the audit log shows what actually
+        // blocked dispatch:
+        //  - cap-blocked: operator concurrency cap — clears in seconds, so
+        //    surface AnyMemberAtCap and use the cap-retry interval. Even one
+        //    cap-blocked member means a worker finishing on that agent will
+        //    free up a routable slot within the cap-retry window.
+        //  - smoke-excluded: cleared by the in-VM smoke sweep / operator
+        //    reset, NOT by quota recovery — don't misreport it as quota.
+        //  - quota-below-floor: clears when the quota window resets.
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
         {
-            // Reason text differentiates a pure cap stall from a mixed stall
-            // (cap + quota/availability) so audit-log readers can tell them
-            // apart. When a member was blocked only by per-agent cap (not
-            // quota), a slot frees up far sooner than a quota window resets,
-            // so the soonest of cap-retry vs quota-recheck is surfaced — the
-            // operator may have configured a shorter QuotaRecheckInterval and
-            // we always honour the earliest plausible retry.
+            // When a member was blocked only by per-agent cap (not quota), a
+            // slot frees up far sooner than a quota window resets, so the
+            // soonest of cap-retry vs quota-recheck is surfaced — the operator
+            // may have configured a shorter QuotaRecheckInterval and we always
+            // honour the earliest plausible retry.
             var capBlocked = atCapAgents.Count > 0 || capSaturatedMembers.Count > 0;
             var capRetry = _opts.QuotaRecheckInterval < _opts.CapRetryRecheckInterval
                 ? _opts.QuotaRecheckInterval
@@ -480,6 +499,7 @@ public sealed class AgentClassRouter
                 r.RejectReason != "per-agent cap reached"
                 && r.RejectReason != "ranked lower"
                 && !r.RejectReason.StartsWith("per-agent cap:", StringComparison.Ordinal));
+            var allSmokeExcluded = subscriptionTotal > 0 && subscriptionSmokeExcluded == subscriptionTotal;
             string reason;
             TimeSpan suggested;
             if (capBlocked && hasNonCapRejection)
@@ -491,6 +511,12 @@ public sealed class AgentClassRouter
             {
                 reason = $"every quota-passing member of class '{classId}' is at its per-agent concurrency cap";
                 suggested = capRetry;
+            }
+            else if (allSmokeExcluded)
+            {
+                reason = $"all subscription members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
+                         + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+                suggested = _opts.QuotaRecheckInterval;
             }
             else
             {
@@ -514,6 +540,11 @@ public sealed class AgentClassRouter
         // EXCEPTIONS that must NOT be fired:
         //  - budget-exhausted: a configured operator spend cap (fail-open would burn money).
         //  - cap-saturated: the slot gate would refuse the dispatch.
+        //  - smoke-excluded: the in-VM smoke / fast-fail breaker benched the CLI
+        //    because the binary is broken; routing to it would reproduce the
+        //    exit-127 / auth cascade the gate exists to catch (AC#1). The
+        //    "fire despite low quota" fallback exists to override probe
+        //    inaccuracy, not to dispatch to a known-broken binary.
         // Spill through eligible candidates in score order, honouring the caller's
         // slot gate so the per-agent cap remains an authoritative gate for
         // PayPerApi members too.
@@ -521,6 +552,7 @@ public sealed class AgentClassRouter
         {
             if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
+            if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
             var fallback = candidate.Member;
             if (slotGate is not null && !slotGate.TryReserve(fallback.Agent))
             {
@@ -542,7 +574,9 @@ public sealed class AgentClassRouter
         // Build the park interval from whichever blocker is the soonest to clear.
         // budget-reset is typically minutes-to-hours; cap-retry is seconds. Both
         // can be active simultaneously (some PayPerApi members budget-exhausted,
-        // others cap-saturated) so we take the soonest.
+        // others cap-saturated) so we take the soonest. A smoke-only bench is
+        // cleared by the in-VM smoke sweep / operator reset, NOT by quota or
+        // budget reset, so it uses the full quota recheck window.
         var budgetRecheck = _opts.QuotaRecheckInterval;
         if (earliestBudgetReset is { } budgetReset)
         {
@@ -553,8 +587,13 @@ public sealed class AgentClassRouter
         var fallbackCapBlocked = capSaturatedMembers.Count > 0 || atCapAgents.Count > 0;
         if (fallbackCapBlocked && budgetRecheck > _opts.CapRetryRecheckInterval)
             budgetRecheck = _opts.CapRetryRecheckInterval;
+        var allFallbackSmokeExcluded = sorted.Count > 0
+            && sorted.All(x => smokeExcluded.Contains((x.Member.Agent, x.Member.ModelId)));
         string parkReason;
-        if (budgetExhaustedMembers.Count > 0 && fallbackCapBlocked)
+        if (allFallbackSmokeExcluded)
+            parkReason = $"all PayPerApi members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
+                         + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+        else if (budgetExhaustedMembers.Count > 0 && fallbackCapBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted or at their per-agent concurrency cap";
         else if (fallbackCapBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
@@ -652,8 +691,18 @@ public sealed class AgentClassRouter
     /// not cover the work item's <see cref="WorkItem.RequiredCapabilities"/>),
     /// or every eligible member is currently marked exhausted in this process.
     /// </para>
+    /// <para>
+    /// Like <see cref="ResolveAsync"/>, this gates each apparently-available
+    /// candidate on a real in-sandbox CLI check (<see cref="IInVmSmokeGate"/>)
+    /// before returning it, so a mid-iteration / audit / rebase fallback never
+    /// hands work to an agent whose CLI was never in-VM smoke-checked (the
+    /// exit-127 / auth cascade). A cache hit is free; an agent the probe
+    /// benches is dropped from the returned list exactly as the primary path
+    /// would skip it.
+    /// </para>
     /// </summary>
-    public IReadOnlyList<AgentMembership> OrderedFallbackCandidates(WorkItem item, Project? project)
+    public async Task<IReadOnlyList<AgentMembership>> OrderedFallbackCandidatesAsync(
+        WorkItem item, Project? project, CancellationToken ct)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -671,12 +720,15 @@ public sealed class AgentClassRouter
                 _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), DateTimeOffset>(key, expiry));
         }
 
-        return agentClass.Members
+        // Score + order the eligible, non-exhausted members first. Availability
+        // (and the in-VM gate) is applied last, in score order, so we only probe
+        // members we would actually return — and never burn a probe on a member
+        // already filtered out by score or in-process exhaustion.
+        var ordered = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
             .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
             .Where(x => !IsExhausted(x.Member, nowUtc))
-            .Where(x => _availability is null || _availability.GetAvailability(x.Member.Agent).Available)
             .Select(x => new
             {
                 x.Member,
@@ -688,12 +740,48 @@ public sealed class AgentClassRouter
             .ThenBy(x => x.ConfigIndex)
             .Select(x => x.Member)
             .ToList();
+
+        if (_availability is null && _inVmSmokeGate is null)
+            return ordered;
+
+        // Apply the same gate-or-registry verdict ResolveAsync uses, so a
+        // mid-iteration / audit / rebase fallback never hands work to an agent
+        // whose CLI was never in-VM smoke-checked (cache hit = free).
+        var result = new List<AgentMembership>(ordered.Count);
+        foreach (var member in ordered)
+        {
+            var av = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
+            if (av is null || av.Available)
+                result.Add(member);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Single source of truth for an agent's routable verdict on the dispatch
+    /// path. When the in-VM smoke gate is wired it owns the read→probe→re-read
+    /// (so an apparently-Available-but-never-probed agent is verified in-sandbox
+    /// before it is trusted); otherwise the availability registry is read
+    /// directly. Returns null only when neither is wired (no availability
+    /// tracking → legacy behaviour, every candidate is routable). Centralised
+    /// so primary routing and fallback selection cannot drift in gate semantics.
+    /// <paramref name="baselineRef"/> is the work item's pinned baseline so the
+    /// gate probes the image the dispatch will clone (B1 pinning), not just the
+    /// active baseline.
+    /// </summary>
+    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    {
+        if (_inVmSmokeGate is not null)
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
+        if (_availability is not null)
+            return _availability.GetAvailability(kind);
+        return null;
     }
 
     /// <summary>
     /// Marks a class member as exhausted in this process for <paramref name="ttl"/>
     /// (or until <paramref name="resetAt"/>, whichever is sooner). Subsequent
-    /// calls to <see cref="OrderedFallbackCandidates"/> and
+    /// calls to <see cref="OrderedFallbackCandidatesAsync"/> and
     /// <see cref="ResolveAsync"/> will skip the member while the suppression is
     /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
     /// so the suppression also reaches any probe-side cache.

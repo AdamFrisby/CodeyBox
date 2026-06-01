@@ -61,11 +61,14 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     public override AgentKind Kind => AgentKind.Claude;
 
+    /// <summary>Default claude binary name on the sandbox PATH. The in-VM smoke probe pins to this so the probe and runner can never drift.</summary>
+    public const string DefaultBinary = "claude";
+
     /// <summary>
     /// Path to the claude binary inside the sandbox. Override only if the
     /// sandbox image installs it elsewhere.
     /// </summary>
-    public string Binary { get; init; } = "claude";
+    public string Binary { get; init; } = DefaultBinary;
 
     /// <summary>
     /// Default model passed to <c>--model</c> when no per-item override is

@@ -20,13 +20,15 @@ namespace CodeyBox.Agents.Cursor;
 /// authoritative credential check; <see cref="CursorQuotaFailureDetector"/>
 /// classifies limit and auth failures from dispatch output.</para>
 ///
-/// <para>This probe deliberately does NOT verify that the <c>agent</c> binary
-/// is present in the sandbox image — see the comment above re. multipass
-/// cold-start cost. The missing-binary case (the cb-216a2230 incident) is
-/// caught by the <b>fast-fail circuit breaker</b> in <c>AgentAvailabilityRegistry</c>:
-/// runs that exit non-zero in under <c>FastFailThresholdSeconds</c> for
-/// <c>MaxConsecutiveFastFails</c> consecutive attempts exclude the agent from
-/// routing until a smoke probe passes or an operator calls
+/// <para>This host probe deliberately does NOT verify that the <c>agent</c>
+/// binary is present in the sandbox image — see the comment above re. multipass
+/// cold-start cost. That in-sandbox check now lives in <c>CursorInVmSmokeProbe</c>
+/// (exec'd by <c>InVmSmokeProber</c>), which catches a missing binary (exit
+/// 127), auth-path drift, and workspace-trust regressions at smoke time. The
+/// <b>fast-fail circuit breaker</b> in <c>AgentAvailabilityRegistry</c> remains
+/// the last-resort backstop for a real dispatch that exits non-zero in under
+/// <c>FastFailThresholdSeconds</c> for <c>MaxConsecutiveFastFails</c> attempts,
+/// excluding the agent until a smoke probe passes or an operator calls
 /// <c>/admin/agent/cursor/reset</c>.</para>
 /// </summary>
 public sealed class CursorSmokeProbe : IAgentSmokeProbe

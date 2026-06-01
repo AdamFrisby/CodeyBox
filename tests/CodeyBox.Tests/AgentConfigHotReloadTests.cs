@@ -313,6 +313,69 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_BenchesNewlyAddedMemberWithoutInVmProbe()
+    {
+        // AC#1 must hold across hot-reloads, not just at startup: a member added
+        // at runtime with no registered in-VM probe would otherwise stay
+        // default-Available and fail on first dispatch. The reload must re-run
+        // coverage enforcement through the gate so the new uncovered member is
+        // benched immediately.
+        var initial = new CodeyBoxOptions
+        {
+            AgentClasses = [HotReloadClass("frontier", "claude")],
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            AgentClassesConfigBuilder.Build(initial.AgentClasses, NullLogger<AgentClassRouter>.Instance),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // Real coverage policy: claude has a probe (covered), cursor does not.
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var coverage = new InVmSmokeCoveragePolicy(
+            [new CodeyBox.Agents.Claude.ClaudeInVmSmokeProbe()],
+            registry,
+            new InVmSmokeOptions { Enabled = true });
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            coverage: coverage);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        // Add a class naming an uncovered agent at runtime.
+        var updated = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                HotReloadClass("frontier", "claude"),
+                HotReloadClass("extra", "cursor"),
+            ],
+        };
+        monitor.Fire(updated);
+
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("no registered IInVmSmokeProbe", registry.GetAvailability(AgentKind.Cursor).Reason);
+        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    private static AgentClassOptions HotReloadClass(string id, params string[] agents)
+    {
+        var cls = new AgentClassOptions { Id = id, DisplayName = id };
+        foreach (var a in agents)
+            cls.Members.Add(new AgentMembershipOptions { Agent = a, Billing = "Subscription", QualityScore = 100 });
+        return cls;
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_InvalidAgentClassesPayload_KeepsPriorSnapshot_AndAllowsFollowupValidEdit()
     {
         // Acceptance criterion: "a bad edit can't break a running orchestrator"

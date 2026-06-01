@@ -32,7 +32,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     public override AgentKind Kind => AgentKind.Codex;
 
-    public string Binary { get; init; } = "codex";
+    /// <summary>Default codex binary name on the sandbox PATH. The in-VM smoke probe pins to this so the probe and runner can never drift.</summary>
+    public const string DefaultBinary = "codex";
+
+    public string Binary { get; init; } = DefaultBinary;
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex/sessions", ".codex/history.jsonl"];
 

@@ -60,6 +60,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
+    private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -90,7 +91,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
-        QuotaRouterOptions? quotaRouterOptions = null)
+        QuotaRouterOptions? quotaRouterOptions = null,
+        IInVmSmokeCoveragePolicy? coverage = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -110,6 +112,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
         _quotaRouterOptions = quotaRouterOptions;
+        _coverage = coverage;
         _log = log;
     }
 
@@ -311,6 +314,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _lastRouter = next;
             AuditLog.ConfigReloaded("AgentClasses", prev, next);
             _log.LogInformation("Hot-reloaded AgentClasses+AgentScoreModifiers: {OldValue} → {NewValue}", prev, next);
+
+            // AC#1 must hold across hot-reloads too: a member added at runtime
+            // with no registered in-VM probe would otherwise stay default-Available
+            // and fail on first dispatch (the startup coverage validator only runs
+            // once). Re-run coverage enforcement through the gate so newly-added
+            // uncovered members are benched immediately. Idempotent for members
+            // already covered or already benched.
+            EnforceProbeCoverage(opts);
         }
         catch (Exception ex)
         {
@@ -318,6 +329,20 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 "Hot-reload of AgentClasses rejected; keeping prior router catalog ({Prev}). " +
                 "Fix the configuration error and re-save to retry.",
                 prev);
+        }
+    }
+
+    private void EnforceProbeCoverage(CodeyBoxOptions opts)
+    {
+        if (_coverage is null) return;
+        var coverage = InVmSmokeCoverageRequest.FromAgentClasses(opts.AgentClasses);
+        foreach (var outcome in _coverage.EnforceMissingProbeCoverage(coverage))
+        {
+            if (outcome.Action == InVmSmokeCoverageAction.Benched)
+                _log.LogWarning(
+                    "Hot-reload added AgentClass member '{Agent}' (class(es): {ClassIds}) with no registered " +
+                    "IInVmSmokeProbe; BENCHED so work routes past it instead of failing on first dispatch (AC#1).",
+                    outcome.Agent, string.Join(", ", outcome.ClassIds));
         }
     }
 
