@@ -1343,6 +1343,227 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(1, sandbox2.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude"));
     }
 
+    // ── PipelineTuning hot-reload ────────────────────────────────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningPushesToSnapshot()
+    {
+        // End-to-end: an edit to CodeyBox:PipelineTuning must reach the live
+        // PipelineTuningSnapshot without a restart so PipelineRunner's
+        // quota-fallback and merge-staging retry paths observe the new values.
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
+                MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
+                MergeSandboxStagingRestoreAttempts = 2,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(
+            new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+                QuotaExhaustionFallbackTtl = initial.PipelineTuning.QuotaExhaustionFallbackTtl,
+                MaxParsedQuotaResetWindow = initial.PipelineTuning.MaxParsedQuotaResetWindow,
+                MergeSandboxStagingRestoreAttempts = initial.PipelineTuning.MergeSandboxStagingRestoreAttempts,
+            });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pipelineTuning: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(2, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        // Hot-reload: shorten the quota pause and bump retry attempts.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MergeSandboxStagingRestoreAttempts = 3,
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        // Same-value fire should be a no-op.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MergeSandboxStagingRestoreAttempts = 3,
+            },
+        });
+        Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningNoOpWhenSnapshotNull()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions(),
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // No pipelineTuning snapshot — the coordinator must not throw.
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pipelineTuning: null);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+            },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    // ── BudgetDeferralRecheck hot-reload ─────────────────────────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_BudgetDeferralRecheckPushesToSnapshot()
+    {
+        // End-to-end: an edit to CodeyBox:BudgetDeferralRecheck must reach the
+        // live BudgetDeferralRecheckSnapshot without a restart so
+        // OrchestratorService's budget-cap deferral paths observe the new
+        // recheck intervals on the next pickup attempt.
+        var initial = new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = TimeSpan.FromMinutes(1),
+                HourlyLimitRecheck = TimeSpan.FromMinutes(5),
+                DailyLimitRecheck = TimeSpan.FromHours(1),
+                ConcurrentLimitRecheck = TimeSpan.FromMinutes(1),
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new BudgetDeferralRecheckSnapshot(
+            new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = initial.BudgetDeferralRecheck.PausedProjectRecheck,
+                HourlyLimitRecheck = initial.BudgetDeferralRecheck.HourlyLimitRecheck,
+                DailyLimitRecheck = initial.BudgetDeferralRecheck.DailyLimitRecheck,
+                ConcurrentLimitRecheck = initial.BudgetDeferralRecheck.ConcurrentLimitRecheck,
+            });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            budgetDeferralRecheck: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
+
+        // Hot-reload: shorten the hourly recheck and lengthen the paused recheck.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+                PausedProjectRecheck = TimeSpan.FromMinutes(15),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(15), snapshot.Current.PausedProjectRecheck);
+
+        // Same-value fire should be a no-op.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+                PausedProjectRecheck = TimeSpan.FromMinutes(15),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_BudgetDeferralRecheckNoOpWhenSnapshotNull()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions(),
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // No budgetDeferralRecheck snapshot — the coordinator must not throw.
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            budgetDeferralRecheck: null);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+            },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()

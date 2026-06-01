@@ -924,6 +924,21 @@ builder.Services.AddSingleton<IncrementalRebaseSnapshot>(sp =>
     new IncrementalRebaseSnapshot(
         sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.IncrementalRebase));
 
+// PipelineTuningSnapshot — hot-reloadable quota-fallback and merge-staging
+// retry tuning knobs consumed by PipelineRunner. Same swappable-singleton
+// pattern as AgentConcurrencySnapshot.
+builder.Services.AddSingleton<PipelineTuningSnapshot>(sp =>
+    new PipelineTuningSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.PipelineTuning));
+
+// BudgetDeferralRecheckSnapshot — hot-reloadable budget-cap deferral recheck
+// intervals consumed by OrchestratorService. Edits to
+// CodeyBox:BudgetDeferralRecheck take effect on the next pickup attempt
+// without a process restart.
+builder.Services.AddSingleton<BudgetDeferralRecheckSnapshot>(sp =>
+    new BudgetDeferralRecheckSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.BudgetDeferralRecheck));
+
 // AgentDefaultsSnapshot — per-agent default model ids, swappable by the
 // hot-reload coordinator. Every runner reads through this same instance so
 // an operator edit to CodeyBox:AgentDefaults takes effect on the next
@@ -1714,6 +1729,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IAgentUsageStore>(),
     sp.GetService<IAgentBudgetProvider>(),
     sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+    sp.GetRequiredService<PipelineTuningSnapshot>(),
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
@@ -1785,11 +1801,13 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IWorkerRegistry>(),
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
-    sp.GetService<ReleaseService>(),
+    sp.GetRequiredService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
-    sp.GetRequiredService<OrchestratorProgressClock>()));
+    sp.GetRequiredService<OrchestratorProgressClock>(),
+    sp.GetRequiredService<QuotaRouterOptions>(),
+    sp.GetRequiredService<BudgetDeferralRecheckSnapshot>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -1828,7 +1846,9 @@ builder.Services.AddHostedService(sp => new StartupSandboxReconciliationService(
 builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>()));
+    sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>(),
+    adoptionDeadline: TimeSpan.FromSeconds(
+        Math.Max(1, sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Shutdown.SandboxAdoptionDeadlineSeconds))));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -1851,6 +1871,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+        pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
+        budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>());
 });
@@ -2482,6 +2504,12 @@ namespace CodeyBox.Api
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
 
+        /// <summary>Pipeline-runner quota-fallback and retry tuning. Hot-reloadable.</summary>
+        public PipelineTuningOptions PipelineTuning { get; set; } = new();
+
+        /// <summary>Per-project budget-cap deferral recheck intervals. Hot-reloadable.</summary>
+        public BudgetDeferralRecheckOptions BudgetDeferralRecheck { get; set; } = new();
+
         /// <summary>
         /// Which sandbox provider to use. One of: <c>multipass</c>,
         /// <c>bubblewrap</c>, <c>process</c>.
@@ -2778,6 +2806,16 @@ namespace CodeyBox.Api
         /// during SIGTERM/Ctrl-C. Defaults to 60 seconds.
         /// </summary>
         public int GraceSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// Upper bound on how long the startup resume handler waits for an
+        /// adopted in-VM agent process to finish post-resume. Long enough that
+        /// a real LLM call can finish, short enough that a wedged agent does
+        /// not block the orchestrator boot indefinitely. Default 1800 (30 min).
+        /// Only sampled at construction (startup) — changes do not hot-reload.
+        /// Bound from <c>CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds</c>.
+        /// </summary>
+        public int SandboxAdoptionDeadlineSeconds { get; set; } = 1800;
 
         /// <summary>
         /// How to tear down in-flight worker sandboxes during graceful shutdown.

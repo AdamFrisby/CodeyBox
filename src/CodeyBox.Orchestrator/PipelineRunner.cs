@@ -76,6 +76,9 @@ public sealed class PipelineRunner : IPipelineRunner
     // config — tests and embeddings that don't wire the snapshot keep the
     // pre-feature behaviour.
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
+    // Hot-reloadable quota-fallback and merge-staging retry knobs. Defaulted to
+    // a private snapshot (unchanging defaults) when DI does not supply one.
+    private readonly PipelineTuningSnapshot _pipelineTuning;
     // Per-agent concurrency view used by BuildAgenticConflictCandidatesAsync to
     // deprioritize agents whose operator-configured cap is at ceiling. The cap
     // is shorthand for "this agent's API account budget is currently
@@ -191,6 +194,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentUsageStore? usageStore = null,
         IAgentBudgetProvider? budgetProvider = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
+        PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null)
     {
@@ -260,6 +264,7 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _incrementalRebase = incrementalRebase;
+        _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
         // a cross-kind fallback candidate (whose file-based creds aren't yet on
         // disk in the sandbox the primary provisioned) can authenticate before
@@ -4101,17 +4106,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 // windows are extracted from attacker-influenceable agent output;
                 // a maliciously-crafted Retry-After could otherwise park an item
                 // arbitrarily far in the future.
-                var clampedReset = ClampQuotaReset(quotaResetAt);
+                var clampedReset = ClampQuotaReset(quotaResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
 
                 // Mark the member exhausted in the router and the probe so the
                 // next pickup (or the rest of this pipeline) skips it.
-                _classRouter.MarkExhausted(currentMember, QuotaExhaustionFallbackTtl, clampedReset);
+                _classRouter.MarkExhausted(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset);
                 if (_quotaProbesByKind is not null
                     && _quotaProbesByKind.TryGetValue(currentMember.Agent, out var probe))
                 {
                     try
                     {
-                        await probe.MarkExhaustedAsync(currentMember, QuotaExhaustionFallbackTtl, clampedReset, ct);
+                        await probe.MarkExhaustedAsync(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset, ct);
                     }
                     catch (Exception probeEx) when (probeEx is not OperationCanceledException)
                     {
@@ -4375,17 +4380,19 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Clamps a parsed reset-window hint against <see cref="MaxParsedQuotaResetWindow"/>.
-    /// The hint comes from agent stdout/stderr and is attacker-influenceable via
-    /// prompt injection; without a ceiling, a hostile output could park an item
-    /// arbitrarily far in the future and re-arm targeted retry timers for that
-    /// instant. Returns null when input is null.
+    /// Clamps a parsed reset-window hint against <paramref name="maxWindow"/>
+    /// (or the legacy static <see cref="MaxParsedQuotaResetWindow"/> when not
+    /// supplied). The hint comes from agent stdout/stderr and is
+    /// attacker-influenceable via prompt injection; without a ceiling, a
+    /// hostile output could park an item arbitrarily far in the future and
+    /// re-arm targeted retry timers for that instant. Returns null when input
+    /// is null.
     /// </summary>
-    internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt)
+    internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt, TimeSpan? maxWindow = null)
     {
         if (resetAt is not { } parsed) return null;
         var now = DateTimeOffset.UtcNow;
-        var ceiling = now + MaxParsedQuotaResetWindow;
+        var ceiling = now + (maxWindow ?? MaxParsedQuotaResetWindow);
         return parsed > ceiling ? ceiling : parsed;
     }
 
@@ -4964,13 +4971,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 return await _sandboxes.CreateAsync(spec, ct);
             }
             catch (SandboxMountSourceMissingException ex)
-                when (attempt < MergeSandboxStagingRestoreAttempts
+                when (attempt < _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts
                     && string.Equals(ex.HostPath, stagingPath, StringComparison.Ordinal))
             {
                 _log.LogWarning(
                     ex,
                     "merge sandbox mount source missing — re-cloning staging clone and retrying CreateAsync (attempt {Attempt}/{Max}): {Path}",
-                    attempt, MergeSandboxStagingRestoreAttempts, stagingPath);
+                    attempt, _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts, stagingPath);
                 await RestoreIsolatedMergeRepositoryAsync(repoId, stagingPath, ct);
             }
         }
@@ -7764,7 +7771,7 @@ Original merge-phase failure (for context):
         DateTimeOffset? detectedResetAt,
         CancellationToken ct)
     {
-        var resetAt = ClampQuotaReset(detectedResetAt);
+        var resetAt = ClampQuotaReset(detectedResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
         if (resetAt is not null)
             return resetAt.Value;
 
@@ -7790,7 +7797,7 @@ Original merge-phase failure (for context):
             }
         }
 
-        return DateTimeOffset.UtcNow.Add(DefaultQuotaFailurePause);
+        return DateTimeOffset.UtcNow.Add(_pipelineTuning.Current.DefaultQuotaFailurePause);
     }
 
     private async Task TransitionWaitingForQuotaResetAsync(
