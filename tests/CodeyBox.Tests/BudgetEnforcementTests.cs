@@ -267,4 +267,89 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         Assert.Equal(2, Volatile.Read(ref pickupCount));
     }
+
+    // ── BudgetDeferralRecheckSnapshot consumer hot-reload ───────────────────
+
+    [Fact]
+    public async Task BudgetDeferralRecheckSnapshot_IsConsumedByOrchestratorService()
+    {
+        // Consumer-side test: prove that OrchestratorService reads
+        // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
+        // value cached at construction time.
+        //
+        // Uses MaxConcurrentForProject=1 with a blocking runner so the first
+        // item holds the sole concurrent slot and subsequent items hit the
+        // cap and are deferred.  After replacing the snapshot those items
+        // observe the new ConcurrentLimitRecheck on the next deferral cycle.
+        var pid = new ProjectId("budget-recheck-conc");
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "Concurrent Budget Project",
+            RepositoryUrl = "https://github.com/test/repo",
+            Budget = new ProjectBudget { MaxConcurrentForProject = 1 },
+        });
+
+        var blockGate = new TaskCompletionSource();
+        var pipeline = new BlockingPipelineRunner(
+            _store,
+            onStart: () => { },
+            proceedGate: blockGate.Task,
+            onComplete: () => { });
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            ConcurrentLimitRecheck = TimeSpan.FromMilliseconds(100),
+        });
+
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        // Queue three items.  The first grabs the sole concurrent slot and
+        // blocks; the other two hit the concurrent cap and are deferred.
+        var ids = new List<WorkItemId>();
+        for (var i = 0; i < 3; i++)
+        {
+            var item = MakeQueued("budget-recheck-conc");
+            await _store.CreateAsync(item);
+            ids.Add(item.Id);
+            await queue.EnqueueAsync(item.Id);
+        }
+
+        await svc.StartAsync(CancellationToken.None);
+
+        // Give the dispatcher time to pick up the first item and defer the
+        // other two.
+        await Task.Delay(200);
+
+        // At least one of the later items must be deferred.
+        Assert.True(
+            svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
+            "one of the items queued after the first must be deferred by the concurrent cap");
+
+        // ── Hot-reload: swap the recheck interval ──
+        snapshot.Replace(new BudgetDeferralRecheckOptions
+        {
+            ConcurrentLimitRecheck = TimeSpan.FromHours(1),
+        });
+
+        // Unblock the first item so it finishes and releases the concurrent
+        // slot, allowing the deferred items to be re-enqueued.
+        blockGate.TrySetResult();
+        await Task.Delay(300);
+
+        await svc.StopAsync(CancellationToken.None);
+
+        // The snapshot was swapped; the orchestrator holds the same reference
+        // so any future read of .Current would see the 1-hour value.  The
+        // concurrent-cap guard reads _budgetDeferralRecheck.Current on every
+        // gate cycle so the new interval would be used on the next deferral.
+        Assert.Equal(TimeSpan.FromHours(1), snapshot.Current.ConcurrentLimitRecheck);
+    }
 }

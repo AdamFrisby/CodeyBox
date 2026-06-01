@@ -567,6 +567,84 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after); // Was deleted by the racing provider.
     }
 
+    // ── Adoption deadline wiring ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task AdoptionDeadline_ConfiguredValue_IsPassedToProvider()
+    {
+        // Verifies the SandboxAdoptionDeadlineSeconds config knob (Program.cs:1716)
+        // flows through the constructor into the WaitForAdoptedAgentCompletionAsync call.
+        var customDeadline = TimeSpan.FromMinutes(10);
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-dl-config",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/abc.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = new SandboxResumeOnStartupService(
+            provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            adoptionDeadline: customDeadline);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-dl-config", adoption.VmName);
+        Assert.Equal(customDeadline, adoption.Deadline);
+    }
+
+    [Fact]
+    public async Task AdoptionDeadline_DefaultValue_IsUsedWhenNotConfigured()
+    {
+        // Without an explicit adoptionDeadline the constructor must fall back
+        // to DefaultAdoptionDeadline (30 min) — the same value that the
+        // SandboxAdoptionDeadlineSeconds config key defaults to.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-dl-default",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/abc.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-dl-default", adoption.VmName);
+        Assert.Equal(SandboxResumeOnStartupService.DefaultAdoptionDeadline, adoption.Deadline);
+    }
+
+    [Fact]
+    public async Task AdoptionDeadline_ZeroOrNegative_ClampedToDefault()
+    {
+        // The constructor guard (d > TimeSpan.Zero) must reject TimeSpan.Zero
+        // and negative values, falling back to DefaultAdoptionDeadline so a
+        // misconfiguration doesn't produce an immediate timeout.
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-dl-zero",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/abc.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = new SandboxResumeOnStartupService(
+            provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            adoptionDeadline: TimeSpan.Zero);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-dl-zero", adoption.VmName);
+        Assert.Equal(SandboxResumeOnStartupService.DefaultAdoptionDeadline, adoption.Deadline);
+    }
+
     [Fact]
     public async Task StartupResume_WithAgentLogPath_WaitsForAdoptionAndClearsLogPath()
     {

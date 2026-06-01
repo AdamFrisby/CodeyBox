@@ -7,6 +7,7 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -1435,10 +1436,12 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), initial.AgentBurnEstimator,
             NullLogger<AgentBurnEstimator>.Instance);
 
+        var capturingLog = new CapturingLogger<AgentConfigHotReload>();
+
         // No pipelineTuning snapshot — the coordinator must not throw.
         var coordinator = new AgentConfigHotReload(
             monitor, orchFixture.Orchestrator, router, burnEstimator,
-            NullLogger<AgentConfigHotReload>.Instance,
+            capturingLog,
             pipelineTuning: null);
         await coordinator.StartAsync(CancellationToken.None);
 
@@ -1451,6 +1454,11 @@ public sealed class AgentConfigHotReloadTests
         });
 
         await coordinator.StopAsync(CancellationToken.None);
+
+        // Null-guard must have returned early without logging any warning or error
+        // (a bug that threw or logged an error would still pass the "no-throw"
+        //  contract but would indicate the guard wasn't wired correctly).
+        Assert.DoesNotContain(capturingLog.Entries, e => e.Level >= LogLevel.Warning);
     }
 
     // ── BudgetDeferralRecheck hot-reload ─────────────────────────────────────
@@ -1546,10 +1554,12 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), initial.AgentBurnEstimator,
             NullLogger<AgentBurnEstimator>.Instance);
 
+        var capturingLog = new CapturingLogger<AgentConfigHotReload>();
+
         // No budgetDeferralRecheck snapshot — the coordinator must not throw.
         var coordinator = new AgentConfigHotReload(
             monitor, orchFixture.Orchestrator, router, burnEstimator,
-            NullLogger<AgentConfigHotReload>.Instance,
+            capturingLog,
             budgetDeferralRecheck: null);
         await coordinator.StartAsync(CancellationToken.None);
 
@@ -1562,6 +1572,9 @@ public sealed class AgentConfigHotReloadTests
         });
 
         await coordinator.StopAsync(CancellationToken.None);
+
+        // Null-guard must have returned early without logging any warning or error.
+        Assert.DoesNotContain(capturingLog.Entries, e => e.Level >= LogLevel.Warning);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
