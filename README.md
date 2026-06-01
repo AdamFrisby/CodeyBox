@@ -1,156 +1,276 @@
 # CodeyBox
 
-C#/.NET orchestration framework that runs LLM coding agents (Claude Code,
-GitHub Copilot CLI, OpenAI Codex CLI, ...) inside VM-isolated sandboxes and
-merges their output through a controlled git workflow. The framework itself
-is implemented in .NET, but the projects it works on can be Python, Node, Go,
-Rust, C#, or other stacks through custom auditors. The parent orchestrator
-runs **no LLMs** - its only job is to schedule sandboxes and shepherd state.
+**An autonomous coding orchestrator.** Hand it a task — a title and a prompt
+against one of your repos — and CodeyBox picks a coding agent, runs it inside
+a throwaway VM, reviews the result, resolves merge conflicts, and lands the
+change on your branch (and on GitHub, if you point it there). You stay in the
+loop for product decisions; it handles the delivery grind.
 
-## Why
+It drives a *fleet* of agent CLIs — Claude Code, OpenAI Codex, GitHub Copilot,
+Cursor, Gemini, opencode — and routes each task to whichever one is best and
+available, falling back automatically when a provider hits a rate limit. The
+orchestrator itself runs **no LLMs**: it schedules sandboxes, gates quality,
+tracks spend, and keeps state durably across restarts.
 
-Plain containers share the host kernel; an agent that finds a Linux LPE
-escapes into the host. CodeyBox runs each agent inside a real VM — the
-recommended provider is **Multipass** (KVM-backed, single-package install)
-— so a guest kernel exploit doesn't reach the host. Egress is enforced on
-the *host* via per-profile nftables bridges, so a compromised agent with
-sudo cannot disable its own network policy. Credentials are tiered: each
-sandbox sees only what it needs, and upstream remote credentials (e.g. a
-GitHub PAT) live only in the orchestrator process and are never visible to
-any sandbox.
+And because every agent is boxed in a real VM behind a host-enforced firewall,
+it's one of the few orchestrators of this kind designed to be **safe to
+actually leave running** — see [Security: defense in depth](#security-defense-in-depth).
 
-## Pipeline
+> Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go,
+> Rust, C#, or your own — through config-driven auditors.
 
-For each work item, the orchestrator resolves the project's per-phase
-network profile and spawns a fresh sandbox:
+---
 
-1. **Work sandbox** clones the host bare repo, runs the agent, commits, and
-   pushes a feature branch.
-2. **Audit + rework loop** (skipped if no auditors are registered) runs
-   tool auditors in a credential-free sandbox and LLM auditors in a
-   sandbox with agent credentials. On failure the agent reworks; on
-   convergence we proceed.
-3. **Merge sandbox** runs the agent against the merge — `git merge` is the
-   nominal path, but the agent can resolve conflicts and run the project's
-   tests if the project's `merge` network profile allows it. The
-   orchestrator verifies merge state before pushing.
-4. **Upstream push** (host, no sandbox) replicates the target branch to
-   GitHub (or any git URL).
+## Why you might want this
 
-Phases 1–3 together are the atomic unit: failure of any of them marks the
-item failed. Phase 4 is retried independently.
+- **You have more coding work than reviewer attention.** Queue it. CodeyBox
+  works items in parallel, runs the same audit gate a human reviewer would,
+  and only bothers you when it genuinely needs a decision.
+- **You don't trust an LLM agent with `sudo` on your machine.** Every agent
+  runs in a real VM with kernel isolation and a host-enforced firewall — a
+  compromised agent can't reach your host or exfiltrate past its allowlist.
+- **You pay for several coding subscriptions.** CodeyBox pools them: one task
+  queue, automatic routing across agents, quota-aware fallback, and per-agent
+  cost tracking so you can see where the money goes.
+- **You want it to be hackable.** Every subsystem sits behind an interface;
+  add an agent, an auditor, a forge, or a credential backend without forking.
 
-## Commit-message trailers
-
-Every commit the orchestrator produces stamps a trailer block so attribution
-survives a DB wipe — `git log --grep 'CodeyBox-Agent: gemini'` is the
-source of truth.
+## How it works
 
 ```
-codeybox: <subject>
-
-CodeyBox-WorkItem: <work-item id>
-CodeyBox-Agent: <agent>[/<model>]
-CodeyBox-Fallbacks: <from>→<to> (×N <reason>); …      # only if fallbacks happened
-Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+   POST /workitems  ──►  queue  ──►  worker pool
+                                        │  (one fresh VM per phase)
+                                        ▼
+        ┌──────────────────────────────────────────────────────┐
+        │  1. Work     run the agent, commit, push a branch     │
+        │  2. Audit    tool + LLM review → rework until it passes│
+        │  3. Merge    resolve conflicts in-VM, verify on host  │
+        │  4. Push     replicate to GitHub / any git remote     │
+        └──────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+                         a reviewed, merged change
 ```
 
-`CodeyBox-Fallbacks` summarises the work item's `AgentFallbackRecord`
-events grouped by `from→to` agent, count, and most-common reason; it is
-omitted when no fallback occurred. All trailers are valid RFC-5322 single
-lines. See `CodeyBox.Core.CodeyBoxTrailers.Compose` for the canonical
-producer.
+Phases 1–3 are atomic — the change lands cleanly or not at all. Push is a
+separate retryable tier, so a flaky remote never corrupts your local result.
+The full state machine is in [`docs/architecture.md`](docs/architecture.md).
 
-## Status
+## Security: defense in depth
 
-Built and building clean:
+Most agent orchestrators run the model in a container or straight on the
+host. CodeyBox is built to be **one of the few you can reasonably leave
+running unattended**, with several independent layers between an agent and
+your machine — so a prompt-injected or actively malicious agent has to defeat
+all of them, not one:
 
-* `CodeyBox.Core` — interfaces and domain types
-* `CodeyBox.Sandbox.Process` — dev-only sandbox provider (UNSAFE)
-* `CodeyBox.Git` — host bare-repo manager + in-memory PR records
-* `CodeyBox.Agents.{Claude,Copilot,Codex}` — agent runners
-* `CodeyBox.Upstream{,.GitHub}` — upstream remotes
-* `CodeyBox.Orchestrator` — pipeline runner + worker pool + SQLite store
-* `CodeyBox.Api` — REST host wiring everything together
+- **Real VMs, not containers.** Each agent runs in a KVM-backed microVM. A
+  container shares the host kernel — one Linux privilege-escalation bug and
+  the agent is on your host. A guest-kernel exploit inside a VM isn't.
+- **Host-enforced egress.** The firewall is nftables rules on the *host*, not
+  inside the guest. An agent that gains `sudo` in its sandbox still can't
+  reach your LAN, cloud-metadata endpoints, or anything off its allowlist —
+  it can't flush a firewall it can't see.
+- **Least-privilege credentials.** Audit-tool sandboxes get no agent secrets
+  at all. Your upstream/GitHub credentials never leave the orchestrator
+  process. An injected agent has nothing to exfiltrate beyond its own scoped
+  token.
+- **No host-side provider HTTP.** The orchestrator never makes raw model API
+  calls; all model work goes through agent CLIs *inside* sandboxes, so
+  there's no token-bearing request path to hijack on the host.
+- **A deterministic merge fence.** Conflict resolutions are accepted by a
+  host-side, non-LLM scope check — changed lines must fall within the actual
+  conflict spans — so a model can't smuggle edits outside the conflict under
+  cover of "resolving" it.
+- **A review gate before merge.** The audit phase runs secret scanning, SAST,
+  and LLM security review, catching a class of malicious or low-quality output
+  before it ever lands.
 
-Three sandbox providers — pick by `CodeyBox.SandboxProvider`:
+**Honest caveat:** this is defense in depth, not a guarantee. A determined
+adversary — especially one targeting a weaker coding agent you've installed —
+may still find a path, and a misconfigured egress profile or an over-broad
+project setup weakens the model. The goal is to be meaningfully harder to
+abuse than comparable tools, not unbreakable. Read
+[`docs/security.md`](docs/security.md) before you trust it with anything that
+matters.
 
-| Provider     | Setup                       | Status                                             |
-|--------------|-----------------------------|----------------------------------------------------|
-| `process`    | None                        | UNSAFE; dev only                                   |
-| `bubblewrap` | `apt install bubblewrap`    | **Working, integration-tested** (shared kernel)    |
-| `multipass`  | `snap install multipass`    | **Working, integration-tested (kernel isolation)** |
+## Quickstart
 
-See `docs/sandbox-providers.md` for the full setup and trade-offs of
-each.
+The fastest way to watch it work end-to-end, on your own machine:
 
-Projects that need GUI build/test plumbing can set `GraphicalSandbox: true`.
-With Multipass this routes work and rework through the conventional `graphical`
-network profile, uses the `cb-baseline-graphical` baseline, and starts an
-XFCE/Xvfb desktop with screenshot and input synthesis exposed through the
-sandbox API. Audit sandboxes use the graphical flavor when the auditor declares
-`AuditCapabilities.Graphical`.
+> The default sandbox is `process` — it runs the agent **directly on your
+> host with no isolation**. Great for kicking the tires on a throwaway repo,
+> **not** safe for untrusted prompts. For real use, switch to Multipass
+> (see [Going to production](#going-to-production)).
 
-See [`docs/`](docs/README.md) for the full write-up. **Read
-[`docs/security.md`](docs/security.md) before deploying.**
+**1. Requirements:** the [.NET 10 SDK](https://dotnet.microsoft.com/download),
+git, and at least one agent CLI installed and logged in (e.g. `claude`).
 
-## Build
+**2. Build:**
 
 ```bash
+git clone https://github.com/AdamFrisby/CodeyBox.git
+cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
-## Test Host Prerequisites
+**3. Configure a project.** Drop a JSON file somewhere and point
+`CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
 
-The test suite creates host-side file watchers for hot-reload and credential
-rotation coverage. On Linux CI hosts, set a higher inotify watch limit before
-running the full suite:
-
-```bash
-sudo sysctl fs.inotify.max_user_watches=524288
-sudo sysctl fs.inotify.max_user_instances=1024
+```json
+{
+  "CodeyBox": {
+    "Projects": [
+      {
+        "Id": "my-app",
+        "RepositoryUrl": "https://github.com/you/my-app.git",
+        "BaseBranch": "main",
+        "Agent": "claude"
+      }
+    ]
+  }
+}
 ```
 
-The test assembly also prints this guidance at startup when it detects lower
-Linux inotify limits.
-
-For managed projects, configure the audit language that matches the repo:
-`"Languages": ["python"]`, `"Languages": ["node"]`, or
-`"Languages": ["csharp"]` all use the same preset mechanism.
-
-## Run (dev)
-
-The default DI wiring uses `Sandbox.Process`, which is **not safe** for
-real prompts. It exists to develop and test the orchestrator pipeline.
+**4. Run:**
 
 ```bash
-export CODEYBOX_CLAUDE_API_KEY=...
-dotnet run --project src/CodeyBox.Api
+export CODEYBOX_API_KEY=pick-any-bearer-token      # auth for the REST API
+export CODEYBOX_CLAUDE_API_KEY=...                 # the agent's own credential
+export CODEYBOX_EXTRA_CONFIG=/path/to/your.json
+dotnet run --project src/CodeyBox.Api              # http://localhost:5036
 ```
 
-POST a work item (project must be configured first — see
-[`docs/projects.md`](docs/projects.md)):
+**5. Queue a task:**
 
 ```bash
-curl -X POST http://localhost:5000/workitems \
-  -H 'authorization: Bearer <CODEYBOX_API_KEY>' \
+curl -X POST http://localhost:5036/workitems \
+  -H "authorization: Bearer $CODEYBOX_API_KEY" \
   -H 'content-type: application/json' \
   -d '{
     "projectId": "my-app",
-    "title": "demo",
-    "prompt": "Add a hello.txt file with the word hello.",
+    "title": "Add a hello file",
+    "prompt": "Add a hello.txt file containing the word hello.",
     "agent": "claude"
   }'
 ```
 
-## Host-side egress enforcement (recommended)
+Watch it move through the pipeline with the CLI:
 
-For Multipass, egress filtering belongs on the host — an in-VM firewall
-would be voluntary (a compromised agent with sudo could flush it), so
-the orchestrator installs none. CodeyBox ships
-`scripts/setup-host-networks.sh` which (with sudo, once) creates a Linux
-bridge per network profile and writes nftables rules that drop
-everything not on the profile's allowlist. Profiles support three modes:
-no egress, "internet" (block RFC1918/link-local/cloud-metadata), or a
-specific hostname allowlist. Per-project, per-phase profile selection
-lives in project config. See [`docs/host-firewall.md`](docs/host-firewall.md).
+```bash
+dotnet run --project tools/CodeyBox.Cli -- queue watch <work-item-id>
+```
+
+See [`docs/projects.md`](docs/projects.md) for the full project schema
+(auditors, per-phase network profiles, upstream config) and
+[`docs/configuration.md`](docs/configuration.md) for everything tunable.
+
+## Features
+
+- **Agent fleet with quota-aware routing.** Group agents into a *class* with
+  quality scores and concurrency caps; CodeyBox routes each task to the best
+  available member and **falls back mid-task** when one hits a quota wall, so
+  a single provider's 5-hour limit never stalls the queue.
+  → [`docs/agent-classes.md`](docs/agent-classes.md)
+- **VM isolation with host-enforced egress.** Each agent runs in a fresh
+  microVM with least-privilege credentials; network policy lives on the host
+  as nftables profiles a guest can't flush.
+  → [`docs/host-firewall.md`](docs/host-firewall.md)
+- **An audit + rework gate.** Tool auditors (format/build/test, gitleaks,
+  semgrep) and LLM reviewers (security, completeness, anti-cheating) run in
+  capability-scoped sandboxes; failures loop back to the agent until they
+  converge. → [`docs/audit.md`](docs/audit.md)
+- **Agentic conflict resolution.** The agent resolves merge conflicts inside
+  its own sandbox through its normal CLI, then a deterministic host-side scope
+  fence verifies the result before the push is accepted.
+- **Cost & quota governance.** Per-agent/per-model pricing, spend reports,
+  budgets, alerts, and a burn-rate-aware quota gate.
+  → [`docs/quota-gate.md`](docs/quota-gate.md), [`docs/cost-reporting.md`](docs/cost-reporting.md)
+- **Durable and restartable.** SQLite-backed state, crash/restart tolerance,
+  sandbox suspend-resilience, and deterministic replay.
+  → [`docs/restart-tolerance.md`](docs/restart-tolerance.md)
+- **Three ways to drive it.** A REST API, a typed CLI, and a Blazor admin
+  dashboard — plus HMAC-signed outbound webhooks.
+  → [`docs/api.md`](docs/api.md), [`docs/webhooks.md`](docs/webhooks.md)
+- **Pluggable everything.** Ship custom auditors, upstream remotes, credential
+  providers, or sandbox backends as NuGet plugins — no fork.
+  → [`docs/plugins.md`](docs/plugins.md)
+
+## The agent fleet
+
+| Agent          | Add a new one by implementing `IAgentRunner` in… |
+|----------------|--------------------------------------------------|
+| Claude Code    | `CodeyBox.Agents.Claude`                         |
+| OpenAI Codex   | `CodeyBox.Agents.Codex`                          |
+| GitHub Copilot | `CodeyBox.Agents.Copilot`                        |
+| Cursor         | `CodeyBox.Agents.Cursor`                         |
+| Gemini         | `CodeyBox.Agents.Gemini`                         |
+| opencode       | `CodeyBox.Agents.Opencode`                       |
+
+Agents are interchangeable. A class lists members with quality scores; the
+router prefers the highest-scoring one that's within quota and under its
+concurrency cap. Every fallback is recorded in the commit trailer. Aider,
+Goose, or anything else is just a new `IAgentRunner` —
+see [`docs/agents.md`](docs/agents.md).
+
+## Sandbox providers
+
+Pick with `CodeyBox.SandboxProvider`:
+
+| Provider     | Setup                    | Isolation                                       |
+|--------------|--------------------------|-------------------------------------------------|
+| `process`    | none                     | **none — dev only**, shares your host           |
+| `bubblewrap` | `apt install bubblewrap` | namespaces, shared kernel; integration-tested   |
+| `multipass`  | `snap install multipass` | **KVM kernel isolation** — recommended for real use |
+| `graphical`  | Multipass + XFCE/Xvfb    | kernel isolation **with a desktop**, for GUI build/test |
+
+The `graphical` flavor exposes screenshots and input synthesis through the
+sandbox API for projects that need a display.
+See [`docs/sandbox-providers.md`](docs/sandbox-providers.md).
+
+## Going to production
+
+1. **Install Multipass** and set `"SandboxProvider": "multipass"`.
+2. **Set up host egress** once, with sudo: `scripts/setup-host-networks.sh`
+   creates a Linux bridge per network profile and writes nftables rules that
+   drop anything not on the profile's allowlist. A compromised agent with
+   `sudo` can't disable this because it lives on the host, not in the guest.
+   → [`docs/host-firewall.md`](docs/host-firewall.md)
+3. **Read [`docs/security.md`](docs/security.md)** — the threat model, the
+   trust boundaries, and the sharp edges. This is not optional.
+
+Credentials are tiered: tool-only audit sandboxes hold **no** agent secrets,
+and upstream remote credentials (e.g. a GitHub PAT) live **only** in the
+orchestrator process and never cross into a sandbox.
+
+## Provenance
+
+Every commit CodeyBox produces carries a trailer block, so attribution
+survives even a full database wipe — `git log` is the source of truth:
+
+```
+codeybox: <subject>
+
+CodeyBox-WorkItem: <id>
+CodeyBox-Agent: <agent>[/<model>]
+CodeyBox-Fallbacks: claude→codex (×2 quota); …       # only if fallbacks happened
+Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
+```
+
+## Documentation
+
+The [`docs/`](docs/README.md) tree is the full reference. Good entry points:
+
+- [`architecture.md`](docs/architecture.md) — the system, plugin points, state machine
+- [`security.md`](docs/security.md) — threat model (**read before deploying**)
+- [`projects.md`](docs/projects.md) — project, auditor, and upstream config
+- [`agent-classes.md`](docs/agent-classes.md) — routing, quotas, and fallback
+- [`plugins.md`](docs/plugins.md) — the Plugin SDK
+- [`api.md`](docs/api.md) — the full REST reference
+
+## Status
+
+CodeyBox is under active development and builds clean against .NET 10. The
+`process` sandbox is for development only; the Multipass path is the
+integration-tested, isolation-providing configuration. Issues and
+contributions are welcome.
