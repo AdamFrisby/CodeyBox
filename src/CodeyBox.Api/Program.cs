@@ -1610,6 +1610,7 @@ builder.Services.AddSingleton<IQueueController>(sp =>
 });
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
+builder.Services.AddSingleton<WorkItemCreationService>();
 builder.Services.AddSingleton<ITaskTemplateRegistry, FileTaskTemplateRegistry>();
 
 // --- Dead-worker registry + reaper -------------------------------------------

@@ -79,6 +79,15 @@ public sealed class TaskTemplateApiTests : IDisposable
         await foreach (var item in _factory.Store.ListAsync()) stored.Add(item);
 
         Assert.Equal(2, stored.Count);
+        var queuedIds = new List<WorkItemId>();
+        for (var i = 0; i < 2; i++)
+        {
+            var queuedId = await queue.DequeueAsync();
+            Assert.True(queuedId.HasValue);
+            queuedIds.Add(queuedId.Value);
+        }
+        Assert.Equal(stored.Select(item => item.Id).OrderBy(id => id.ToString()), queuedIds.OrderBy(id => id.ToString()));
+
         Assert.All(stored, item =>
         {
             Assert.Equal(JobType.CheckAndAct, item.JobType);
@@ -177,6 +186,26 @@ public sealed class TaskTemplateApiTests : IDisposable
         Assert.Equal("path-route", item.TemplateName);
         Assert.Equal(0, item.TemplateEntryIndex);
         Assert.Equal(new ProjectId("test-project"), item.ProjectId);
+    }
+
+    [Fact]
+    public async Task QueueTemplate_ByNameRoute_AllowsMatchingBodyTemplate()
+    {
+        await WriteValidTemplateAsync("path-route");
+
+        var response = await _client.PostAsJsonAsync("/templates/path-route/queue", new
+        {
+            template = "templates/path-route.json",
+            projectId = "test-project",
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var doc = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("path-route", doc.GetProperty("template").GetString());
+
+        var item = Assert.Single(await ReadAllItemsAsync());
+        Assert.Equal("path-route", item.TemplateName);
+        Assert.Equal(0, item.TemplateEntryIndex);
     }
 
     [Fact]
@@ -402,7 +431,7 @@ public sealed class TaskTemplateApiTests : IDisposable
     }
 
     [Fact]
-    public async Task QueueTemplate_OnYesPriorityAboveProjectMax_Returns400WithoutPartialEnqueue()
+    public async Task QueueTemplate_OnYesPriorityAboveProjectMax_IsStoredForPipelineClamp()
     {
         await File.WriteAllTextAsync(Path.Combine(_templateDir, "bad-followup-priority.json"), """
             {
@@ -435,11 +464,32 @@ public sealed class TaskTemplateApiTests : IDisposable
             projectId = "limited",
         });
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        var err = await response.Content.ReadFromJsonAsync<JsonElement>();
-        Assert.Contains("checks[0].onYes.priority", err.GetProperty("error").GetString());
-        Assert.Contains("maxPriority", err.GetProperty("error").GetString());
-        await AssertNoItemsQueuedAsync(factory);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var item = Assert.Single(await ReadAllItemsAsync(factory.Store));
+        Assert.Equal(11, item.Check!.OnYes.Priority);
+        var queue = factory.Services.GetRequiredService<InMemoryTaskQueue>();
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Theory]
+    [InlineData(-5, 0)]
+    [InlineData(250, 200)]
+    public async Task QueueTemplate_MinModelScore_IsClampedToSupportedRange(
+        int requested,
+        int expected)
+    {
+        await WriteValidTemplateAsync("security");
+
+        var response = await _client.PostAsJsonAsync("/templates/queue", new
+        {
+            template = "security",
+            projectId = "test-project",
+            minModelScore = requested,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var item = Assert.Single(await ReadAllItemsAsync());
+        Assert.Equal(expected, item.MinModelScore);
     }
 
     [Fact]

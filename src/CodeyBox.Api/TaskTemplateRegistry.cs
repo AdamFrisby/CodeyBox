@@ -61,7 +61,8 @@ internal sealed class FileTaskTemplateRegistry : ITaskTemplateRegistry
     public FileTaskTemplateRegistry(IOptionsMonitor<CodeyBoxOptions> options, IHostEnvironment env)
         : this(
             () => ResolveRoot(options.CurrentValue.TemplateDirectory, env.ContentRootPath),
-            () => options.CurrentValue.MaxTemplateChecks) { }
+            () => options.CurrentValue.MaxTemplateChecks)
+    { }
 
     internal FileTaskTemplateRegistry(
         string templateDirectory,

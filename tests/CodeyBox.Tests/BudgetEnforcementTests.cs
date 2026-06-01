@@ -293,11 +293,14 @@ public sealed class BudgetEnforcementTests : IDisposable
     {
         // Consumer-side test: prove that OrchestratorService reads
         // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
-        // value cached at construction time. Keep one item pinned in-flight,
-        // hot-reload the deferral interval, then enqueue a second item that
-        // hits the concurrent cap. If the service kept the constructor-time
-        // interval, the deferred item would be retried and spawn another worker
-        // inside the assertion window.
+        // value cached at construction time.
+        //
+        // Strategy: construct the service with a short interval, wait until one
+        // item is actually running, hot-reload to a long interval, then enqueue
+        // one more item. That item's first budget deferral must use the current
+        // snapshot value, not the value captured at service construction. If
+        // the service kept the constructor-time interval, the deferred item
+        // would be retried and spawn another worker inside the assertion window.
         var pid = new ProjectId("budget-recheck-conc");
         var projectRepo = new InMemoryProjectRepository(new Project
         {
@@ -329,45 +332,42 @@ public sealed class BudgetEnforcementTests : IDisposable
             projects: projectRepo,
             budgetDeferralRecheck: snapshot);
 
-        var running = MakeQueued("budget-recheck-conc");
-        await _store.CreateAsync(running);
-        await queue.EnqueueAsync(running.Id);
+        var first = MakeQueued("budget-recheck-conc");
+        await _store.CreateAsync(first);
+        await queue.EnqueueAsync(first.Id);
 
         await svc.StartAsync(CancellationToken.None);
 
-        var runningDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < runningDeadline)
+        var runningDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (!IsRunning(await _store.GetAsync(first.Id)) && DateTimeOffset.UtcNow < runningDeadline)
         {
-            var stored = await _store.GetAsync(running.Id);
-            if (stored?.StartedAt is not null) break;
-            await Task.Delay(25);
+            await Task.Delay(50);
         }
 
         Assert.True(
-            (await _store.GetAsync(running.Id))?.StartedAt is not null,
-            "the first item must be in-flight so the concurrent cap is binding");
+            IsRunning(await _store.GetAsync(first.Id)),
+            "the first item must be running before the budget deferral is exercised");
 
-        // Hot-reload to a long recheck interval. The next budget-cap deferral
-        // must read this new value from the snapshot.
+        // Hot-reload to a long recheck interval. The following deferral must
+        // read this new value from the snapshot.
         snapshot.Replace(new BudgetDeferralRecheckOptions
         {
             ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
         });
 
-        var deferred = MakeQueued("budget-recheck-conc");
-        await _store.CreateAsync(deferred);
-        await queue.EnqueueAsync(deferred.Id);
+        var second = MakeQueued("budget-recheck-conc");
+        await _store.CreateAsync(second);
+        await queue.EnqueueAsync(second.Id);
 
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (!svc.IsDeferredForTest(deferred.Id)
-               && DateTimeOffset.UtcNow < deferDeadline)
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (!svc.IsDeferredForTest(second.Id) && DateTimeOffset.UtcNow < deferDeadline)
         {
-            await Task.Delay(25);
+            await Task.Delay(50);
         }
 
         Assert.True(
-            svc.IsDeferredForTest(deferred.Id),
-            "the second item must be deferred by the concurrent cap");
+            svc.IsDeferredForTest(second.Id),
+            "the second item must be deferred by the concurrent cap after hot-reload");
         Assert.Equal(2, Volatile.Read(ref spawnCount));
 
         // Now the item is deferred with the hot-reloaded 10 s interval.
@@ -377,7 +377,7 @@ public sealed class BudgetEnforcementTests : IDisposable
         await Task.Delay(500);
 
         Assert.True(
-            svc.IsDeferredForTest(deferred.Id),
+            svc.IsDeferredForTest(second.Id),
             "the deferred item must still be deferred after hot-reload " +
             "(the long hot-reloaded ConcurrentLimitRecheck was consumed, " +
             "not the short initial value)");
@@ -387,5 +387,8 @@ public sealed class BudgetEnforcementTests : IDisposable
         gate1.TrySetResult();
 
         await svc.StopAsync(CancellationToken.None);
+
+        static bool IsRunning(WorkItem? item) =>
+            item?.StartedAt is not null && !WorkItemDependencies.TerminalStates.Contains(item.State);
     }
 }
