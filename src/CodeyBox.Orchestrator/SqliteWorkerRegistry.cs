@@ -260,8 +260,14 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        _conn.Dispose();
-        _writeLock.Dispose();
+        try
+        {
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(_conn);
+        }
+        finally
+        {
+            _writeLock.Dispose();
+        }
     }
 
     private static void Bind(SqliteCommand cmd, WorkerRegistration reg)
