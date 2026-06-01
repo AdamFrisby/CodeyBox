@@ -1284,6 +1284,8 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
         AllowedHosts = cbOpts.AgentAllowedHosts,
         NetworkProfile = v.NetworkProfile ?? defaultWorkProfile,
         StepTimeoutSeconds = v.StepTimeoutSeconds,
+        ProvisionTimeoutSeconds = v.ProvisionTimeoutSeconds,
+        GateDeadlineSeconds = v.GateDeadlineSeconds,
         CacheTtlMinutes = v.CacheTtlMinutes,
         SweepIntervalSeconds = v.SweepIntervalSeconds,
         FailClosedOnProbeFault = v.FailClosedOnProbeFault,
@@ -3186,6 +3188,24 @@ namespace CodeyBox.Api
 
         /// <summary>Per-step exec timeout inside the sandbox, in seconds. Default 30.</summary>
         public int StepTimeoutSeconds { get; set; } = 30;
+
+        /// <summary>
+        /// Hard wall-clock timeout on VM provisioning (the
+        /// <see cref="ISandboxProvider.CreateAsync"/> call), in seconds. Default 120.
+        /// The per-step exec timeout cannot bound this because no sandbox exists
+        /// to exec into; a wedged baseline clone would otherwise hang the
+        /// dispatch gate forever. Non-positive disables it (tests / synthetic
+        /// clocks). See <see cref="InVmSmokeOptions.ProvisionTimeoutSeconds"/>.
+        /// </summary>
+        public int ProvisionTimeoutSeconds { get; set; } = 120;
+
+        /// <summary>
+        /// Top-level deadline on the dispatch-gate call (defect-in-depth net for
+        /// any inner step the per-operation timeouts don't cover), in seconds.
+        /// Default 180. Non-positive disables it. See
+        /// <see cref="InVmSmokeOptions.GateDeadlineSeconds"/>.
+        /// </summary>
+        public int GateDeadlineSeconds { get; set; } = 180;
 
         /// <summary>Result cache TTL per baseline ref, in minutes. Default 60.</summary>
         public int CacheTtlMinutes { get; set; } = 60;

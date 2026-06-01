@@ -26,8 +26,12 @@ public sealed class InVmSmokeProberTests
         new Dictionary<string, string> { ["OPENCODE_AUTH_JSON"] = "{\"token\":\"t\"}" },
         new Dictionary<string, string>());
 
+    // ISandboxProvider (not FakeSandboxProvider) so timeout tests that swap in a
+    // hanging-create / non-cooperative provider reuse the same construction site
+    // — keeps future option-list edits to one place rather than 4+ inline
+    // InVmSmokeProber constructions.
     private static InVmSmokeProber Build(
-        FakeSandboxProvider provider,
+        ISandboxProvider provider,
         AgentAvailabilityRegistry registry,
         InVmSmokeCache cache,
         FakeBaselineResolver resolver,
@@ -1027,6 +1031,20 @@ public sealed class InVmSmokeProberTests
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
+    private static InVmSmokeOptions TimeoutOpts(
+        int provisionTimeoutSeconds,
+        int gateDeadlineSeconds,
+        bool failClosed = true) =>
+        new()
+        {
+            Enabled = true,
+            ImageReference = "img",
+            SweepIntervalSeconds = 0,
+            ProvisionTimeoutSeconds = provisionTimeoutSeconds,
+            GateDeadlineSeconds = gateDeadlineSeconds,
+            FailClosedOnProbeFault = failClosed,
+        };
+
     [Fact]
     public async Task EnsureProbedAsync_ProvisioningHang_DefaultFailClosed_BenchesWithinProvisionTimeout()
     {
@@ -1035,36 +1053,19 @@ public sealed class InVmSmokeProberTests
         // can't fire because no sandbox exists to exec into. Without a hard
         // provisioning timeout the entire dispatch gate hangs and the worker pool
         // wedges. ProvisionTimeoutSeconds=1 makes the prober bench-and-continue
-        // rather than wait forever for the inner CreateAsync.
+        // rather than wait forever for the inner CreateAsync. Gate deadline well
+        // above the provisioning timeout so we exercise the provisioning catch
+        // rather than the outer deadline net.
         var provider = new HangingCreateSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
-        var prober = new InVmSmokeProber(
-            provider,
-            new FakeBaselineResolver("base-A"),
-            new ConstantCredentialProvider(CursorCred),
-            [new CursorInVmSmokeProbe()],
-            registry,
-            cache,
-            new NullWebhookDispatcher(),
-            new InVmSmokeOptions
-            {
-                Enabled = true,
-                ImageReference = "img",
-                SweepIntervalSeconds = 0,
-                ProvisionTimeoutSeconds = 1,
-                // Gate deadline higher than provisioning timeout so we exercise
-                // the provisioning catch, not the outer deadline net.
-                GateDeadlineSeconds = 30,
-            },
-            NullLogger<InVmSmokeProber>.Instance);
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
         sw.Stop();
 
-        // Provisioning timeout (1s) fires; the gate returns well under the gate
-        // deadline (30s) and well before any wall-clock deadlock would mature.
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
             $"gate took {sw.Elapsed}; provisioning timeout did not fire");
         var av = registry.GetAvailability(AgentKind.Cursor);
@@ -1085,23 +1086,8 @@ public sealed class InVmSmokeProberTests
         var provider = new HangingCreateSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
-        var prober = new InVmSmokeProber(
-            provider,
-            new FakeBaselineResolver("base-A"),
-            new ConstantCredentialProvider(CursorCred),
-            [new CursorInVmSmokeProbe()],
-            registry,
-            cache,
-            new NullWebhookDispatcher(),
-            new InVmSmokeOptions
-            {
-                Enabled = true,
-                ImageReference = "img",
-                SweepIntervalSeconds = 0,
-                ProvisionTimeoutSeconds = 1,
-                GateDeadlineSeconds = 30,
-            },
-            NullLogger<InVmSmokeProber>.Instance);
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await prober.ProbeAllAsync(CancellationToken.None);
@@ -1122,24 +1108,8 @@ public sealed class InVmSmokeProberTests
         var provider = new HangingCreateSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
-        var prober = new InVmSmokeProber(
-            provider,
-            new FakeBaselineResolver("base-A"),
-            new ConstantCredentialProvider(CursorCred),
-            [new CursorInVmSmokeProbe()],
-            registry,
-            cache,
-            new NullWebhookDispatcher(),
-            new InVmSmokeOptions
-            {
-                Enabled = true,
-                ImageReference = "img",
-                SweepIntervalSeconds = 0,
-                ProvisionTimeoutSeconds = 1,
-                GateDeadlineSeconds = 30,
-                FailClosedOnProbeFault = false,
-            },
-            NullLogger<InVmSmokeProber>.Instance);
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30, failClosed: false));
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
@@ -1152,34 +1122,53 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureProbedAsync_NonCooperativeProvisioningHang_StillBenchesWithinProvisionTimeout()
+    {
+        // The production failure mode the provisioning timeout exists for: a
+        // wedged ISandboxProvider.CreateAsync that IGNORES its cancellation token
+        // (multipass daemon stuck mid-clone). A cooperative-cancellation-only
+        // implementation — i.e. just passing a linked CT into CreateAsync and
+        // awaiting it — would still hang forever here. The provisioning timeout
+        // must be a hard wall-clock bound, so we model the non-cooperative
+        // provider explicitly and assert the gate still returns a transient
+        // verdict within the provisioning bound. Without this test, a regression
+        // back to the cooperative-only approach would not be caught.
+        var provider = new NonCooperativeHangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 60));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // Provisioning timeout (1s) fires via the wall-clock race well before
+        // the gate deadline (60s) would even fire — i.e. it's the provisioning
+        // bound, not the outer deadline, that caught this.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; non-cooperative provisioning hang was not bounded");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.DoesNotContain("probe deadline exceeded", av.Reason);
+    }
+
+    [Fact]
     public async Task EnsureProbedAsync_GateDeadline_BenchesWithinBound_EvenIfInnerNeverReturns()
     {
-        // Defect-in-depth: an inner step that ignores the per-operation timeouts
-        // (here the sandbox dispose hangs and CreateAsync also hangs without
-        // honouring ProvisionTimeout) must still not wedge the worker forever.
-        // GateDeadlineSeconds=1 with the provisioning timeout disabled and the
-        // provider's CreateAsync hanging forces the outer deadline to be the only
-        // thing that can unwedge the gate.
+        // Defect-in-depth: with the inner provisioning timeout disabled
+        // (ProvisionTimeoutSeconds=0) the outer GateDeadlineSeconds is the only
+        // bound left. A wedged CreateAsync must still not be allowed to stall
+        // the worker forever — the gate deadline is the safety net for any inner
+        // step the per-operation timeouts don't cover (e.g. a stuck sandbox
+        // DisposeAsync in some future code path).
         var provider = new HangingCreateSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
-        var prober = new InVmSmokeProber(
-            provider,
-            new FakeBaselineResolver("base-A"),
-            new ConstantCredentialProvider(CursorCred),
-            [new CursorInVmSmokeProbe()],
-            registry,
-            cache,
-            new NullWebhookDispatcher(),
-            new InVmSmokeOptions
-            {
-                Enabled = true,
-                ImageReference = "img",
-                SweepIntervalSeconds = 0,
-                ProvisionTimeoutSeconds = 0, // disable inner provisioning timeout
-                GateDeadlineSeconds = 1,     // only the outer deadline can fire
-            },
-            NullLogger<InVmSmokeProber>.Instance);
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 0, gateDeadlineSeconds: 1));
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
@@ -1191,6 +1180,42 @@ public sealed class InVmSmokeProberTests
         Assert.False(av.Available);
         Assert.Contains("in-VM probe inconclusive", av.Reason);
         Assert.Contains("probe deadline exceeded", av.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_GateDeadlineDisabled_DoesNotFireAsImmediateTimeout_InnerTimeoutStillBoundsHang()
+    {
+        // GateDeadlineSeconds <= 0 disables the outer wall-clock deadline (for
+        // tests on synthetic clocks, or operators tuning policy). The disabled
+        // branch is structurally separate, so this pins two things together:
+        //   1. Zero is NOT treated as an immediate-timeout (a regression that
+        //      flipped the comparison would bench every probe in 0s with a
+        //      "deadline exceeded" reason).
+        //   2. The inner provisioning bound is still in force, so a wedged
+        //      CreateAsync still produces a transient verdict — the prober
+        //      doesn't silently lose all defence-in-depth when the outer
+        //      deadline is off.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 0));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // The provisioning bound (1s) fires; the disabled deadline did NOT
+        // immediate-timeout (would have returned in ~0s with a deadline-exceeded
+        // reason instead).
+        Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(500),
+            $"gate returned in {sw.Elapsed}; GateDeadlineSeconds=0 was wrongly treated as immediate");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; inner provisioning bound failed to fire under disabled deadline");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.DoesNotContain("probe deadline exceeded", av.Reason);
     }
 
     private static bool IsAgent(SandboxExec exec, string sub) =>
@@ -1305,11 +1330,10 @@ public sealed class InVmSmokeProberTests
     }
 
     /// <summary>
-    /// Sandbox provider whose CreateAsync hangs forever (until cancelled). Pins
-    /// the production hang observed 2026-06-01: VM provisioning (clone + launch)
-    /// never returns, so per-step exec timeouts never get a chance to fire
-    /// because no sandbox exists to exec into. Drives the provisioning timeout
-    /// and the gate deadline tests.
+    /// Sandbox provider whose CreateAsync hangs until its cancellation token
+    /// fires. Models a COOPERATIVE wedge (the linked CT eventually unblocks the
+    /// provider) so tests can drive both the inner provisioning timeout and the
+    /// outer gate deadline through the same fake.
     /// </summary>
     private sealed class HangingCreateSandboxProvider : ISandboxProvider
     {
@@ -1320,6 +1344,33 @@ public sealed class InVmSmokeProberTests
             await Task.Delay(Timeout.Infinite, ct); // completes only on cancellation
             throw new InvalidOperationException("unreachable");
         }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync NEVER returns — it ignores its
+    /// cancellation token entirely. Models the production failure that motivated
+    /// the wall-clock provisioning timeout: a wedged multipass daemon stuck mid
+    /// clone whose CreateAsync call observes no cancellation signal. A
+    /// cooperative-cancellation-only implementation (just passing a linked CT
+    /// into CreateAsync and awaiting it) would still hang forever against this
+    /// fake; the test guards the wall-clock race against that regression.
+    /// </summary>
+    private sealed class NonCooperativeHangingCreateSandboxProvider : ISandboxProvider
+    {
+        // A TaskCompletionSource that is never completed by anything — and is
+        // never tied to ct in any way — so the returned Task is exactly the
+        // "completion never observable" shape we need.
+        private readonly TaskCompletionSource<ISandbox> _never = new();
+
+        public string Name => "non-cooperative-hanging-create";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            _never.Task;
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
