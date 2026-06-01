@@ -46,7 +46,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver
+public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -1203,6 +1203,19 @@ git push origin HEAD:{refName}";
         if (!opts.UseBaselineImages) return null;
         if (!opts.NetworkProfiles.ContainsKey(profileName)) return null;
         return ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+    }
+
+    /// <inheritdoc/>
+    public async Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(profileName)) return null;
+        var opts = ReadOptions();
+        if (!opts.UseBaselineImages) return null;
+        return await EnsureBaselineForProfileAsync(opts, profileName, flavor, workItemId: null, pinnedBaselineRef, ct);
     }
 
     /// <inheritdoc/>

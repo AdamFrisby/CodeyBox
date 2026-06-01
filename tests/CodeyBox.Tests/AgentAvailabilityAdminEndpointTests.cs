@@ -366,10 +366,15 @@ public sealed class AgentAvailabilityAdminEndpointTests
             ForceProbeCalls.Clear();
         }
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            string? baselineRef,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
             => Task.FromResult(new AgentAvailability(true, null, null));
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
         {

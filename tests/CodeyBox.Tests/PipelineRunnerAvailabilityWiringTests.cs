@@ -252,7 +252,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             availability,
             new InVmSmokeCache(TimeSpan.FromMinutes(60)),
             new NullWebhookDispatcher(),
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
 
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);

@@ -25,6 +25,9 @@ internal static class SandboxTargetResolver
 
         return new SandboxTarget(SandboxConventions.GraphicalNetworkProfile, SandboxProfileFlavor.Graphical);
     }
+
+    public static InVmSmokeSandboxTarget ToInVmSmokeTarget(SandboxTarget target) =>
+        new(target.NetworkProfile, target.Flavor);
 }
 
 internal readonly record struct SandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);

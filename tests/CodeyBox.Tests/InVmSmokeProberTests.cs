@@ -16,6 +16,9 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class InVmSmokeProberTests
 {
+    private static readonly InVmSmokeSandboxTarget WorkTarget =
+        new("work-profile", SandboxProfileFlavor.Headless);
+
     private static readonly AgentCredential CursorCred = new(
         AgentKind.Cursor,
         new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
@@ -39,6 +42,16 @@ public sealed class InVmSmokeProberTests
         ICredentialProvider? credentials = null,
         IEnumerable<IInVmSmokeProbe>? probes = null)
     {
+        var effectiveOpts = opts ?? new InVmSmokeOptions
+        {
+            Enabled = true,
+            ImageReference = "img",
+            NetworkProfile = WorkTarget.NetworkProfile,
+            SweepIntervalSeconds = 0,
+        };
+        if (string.IsNullOrWhiteSpace(effectiveOpts.NetworkProfile))
+            effectiveOpts = effectiveOpts with { NetworkProfile = WorkTarget.NetworkProfile };
+
         return new InVmSmokeProber(
             provider,
             resolver,
@@ -47,7 +60,7 @@ public sealed class InVmSmokeProberTests
             registry,
             cache,
             new NullWebhookDispatcher(),
-            opts ?? new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            effectiveOpts,
             NullLogger<InVmSmokeProber>.Instance);
     }
 
@@ -142,6 +155,24 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ProbeAllAsync_UsesResolvedProfileAndBaselineCloneTarget()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var resolver = new FakeBaselineResolver("base-A");
+        var prober = Build(provider, NewRegistry(), NewCache(), resolver);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
+        Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-A", ensureCall.PinnedRef);
+    }
+
+    [Fact]
     public async Task ProvisioningFailure_DoesNotExcludeAndIsNotCached()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
@@ -161,7 +192,7 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
-    public async Task NullBaselineRef_FallsBackToLiveSentinel_AndStillProbes()
+    public async Task NullBaselineRef_OnSweep_DoesNotLaunchLiveSandbox()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
         var registry = NewRegistry();
@@ -170,9 +201,23 @@ public sealed class InVmSmokeProberTests
 
         await prober.ProbeAllAsync(CancellationToken.None);
 
-        Assert.Equal(1, provider.CreateCount);
-        Assert.Null(provider.LastBaselineRef); // spec pins null, not the sentinel string
-        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task NullBaselineRef_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver(null));
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("no clonable baseline", availability.Reason);
     }
 
     [Fact]
@@ -438,6 +483,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0,
             },
@@ -476,6 +522,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0,
             },
@@ -553,7 +600,8 @@ public sealed class InVmSmokeProberTests
 
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, baselineRef: null, WorkTarget, CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount); // no redundant provision for an already-skipped agent
@@ -579,7 +627,8 @@ public sealed class InVmSmokeProberTests
         cache.Set(AgentKind.Cursor, "base-PINNED", new AgentSmokeResult(true, null, TimeSpan.Zero));
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-PINNED", CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, baselineRef: "base-PINNED", WorkTarget, CancellationToken.None);
 
         Assert.True(av.Available); // pinned-image verdict, not the active-image bench
         Assert.Equal(0, provider.CreateCount); // cache hit → no VM provisioned
@@ -599,7 +648,8 @@ public sealed class InVmSmokeProberTests
             new AgentSmokeResult(false, "exit 127 on base-ACTIVE", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-OTHER", CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, baselineRef: "base-OTHER", WorkTarget, CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount);
@@ -1039,6 +1089,7 @@ public sealed class InVmSmokeProberTests
         {
             Enabled = true,
             ImageReference = "img",
+            NetworkProfile = WorkTarget.NetworkProfile,
             SweepIntervalSeconds = 0,
             ProvisionTimeoutSeconds = provisionTimeoutSeconds,
             GateDeadlineSeconds = gateDeadlineSeconds,
@@ -1348,6 +1399,8 @@ public sealed class InVmSmokeProberTests
         private readonly Func<SandboxExec, SandboxExecResult> _onExec;
         public int CreateCount { get; private set; }
         public string? LastBaselineRef { get; private set; }
+        public string? LastProfileName { get; private set; }
+        public SandboxProfileFlavor? LastFlavor { get; private set; }
         public Exception? ThrowOnCreate { get; set; }
         // Every argv exec'd across all sandboxes this provider created, in order.
         public List<IReadOnlyList<string>> ExecutedArgv { get; } = new();
@@ -1360,6 +1413,8 @@ public sealed class InVmSmokeProberTests
         {
             CreateCount++;
             LastBaselineRef = spec.BaselineImageRef;
+            LastProfileName = spec.Network.ProfileName;
+            LastFlavor = spec.Flavor;
             if (ThrowOnCreate is not null) throw ThrowOnCreate;
             return Task.FromResult<ISandbox>(new FakeSandbox(exec =>
             {
@@ -1561,12 +1616,24 @@ public sealed class InVmSmokeProberTests
         public void Advance(TimeSpan by) => _now += by;
     }
 
-    private sealed class FakeBaselineResolver : IBaselineImageResolver
+    private sealed class FakeBaselineResolver : IBaselineImageResolver, IBaselineImageProvisioner
     {
         public string? Ref { get; set; }
+        public bool CanEnsure { get; set; } = true;
+        public List<(string Profile, SandboxProfileFlavor Flavor, string? PinnedRef)> EnsureCalls { get; } = [];
         public FakeBaselineResolver(string? r) => Ref = r;
 
         public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor) => Ref;
+
+        public Task<string?> EnsureBaselineImageAsync(
+            string profileName,
+            SandboxProfileFlavor flavor,
+            string? pinnedBaselineRef,
+            CancellationToken ct)
+        {
+            EnsureCalls.Add((profileName, flavor, pinnedBaselineRef));
+            return Task.FromResult(CanEnsure ? pinnedBaselineRef ?? Ref : null);
+        }
 
         public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);

@@ -52,6 +52,32 @@ public sealed class InVmSmokeOptionsWiringTests
         Assert.Equal(180, opts.GateDeadlineSeconds);
     }
 
+    [Fact]
+    public void ProgramMapsExplicitInVmSmokeNetworkProfileIntoOptions()
+    {
+        using var factory = new InVmSmokeOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:Smoke:InVm:NetworkProfile"] = "smoke-explicit",
+        });
+
+        var opts = factory.Services.GetRequiredService<InVmSmokeOptions>();
+
+        Assert.Equal("smoke-explicit", opts.NetworkProfile);
+    }
+
+    [Fact]
+    public void ProgramDoesNotFallbackToDefaultsWorkNetworkProfile()
+    {
+        using var factory = new InVmSmokeOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:Defaults:NetworkProfiles:Work"] = "default-work",
+        });
+
+        var opts = factory.Services.GetRequiredService<InVmSmokeOptions>();
+
+        Assert.Null(opts.NetworkProfile);
+    }
+
     private sealed class InVmSmokeOptionsWiringFactory : WebApplicationFactory<Program>
     {
         private readonly Dictionary<string, string?> _extraConfig;

@@ -35,7 +35,7 @@ public sealed class InVmSmokeGateTests
             registry,
             new InVmSmokeCache(TimeSpan.FromMinutes(60)),
             new NullWebhookDispatcher(),
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
 
     private static AgentClassRouter BuildRouter(
@@ -75,6 +75,14 @@ public sealed class InVmSmokeGateTests
         BaselineImageRef = baselineImageRef,
     };
 
+    private static Project MakeProject() => new()
+    {
+        Id = new ProjectId("proj"),
+        DisplayName = "Project",
+        RepositoryUrl = "https://example.invalid/repo.git",
+        NetworkProfiles = new ProjectNetworkProfiles { Work = "work-profile" },
+    };
+
     [Fact]
     public async Task ResolveAsync_ForwardsWorkItemBaselineRef_ToGate()
     {
@@ -85,9 +93,12 @@ public sealed class InVmSmokeGateTests
         var gate = new RecordingGate();
         var router = BuildRouter(NewRegistry(), gate);
 
-        await router.ResolveAsync(MakeItem(baselineImageRef: "base-PINNED"), project: null, CancellationToken.None);
+        await router.ResolveAsync(MakeItem(baselineImageRef: "base-PINNED"), MakeProject(), CancellationToken.None);
 
         Assert.Contains("base-PINNED", gate.SeenBaselineRefs);
+        var target = Assert.Single(gate.SeenTargets);
+        Assert.Equal("work-profile", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
     }
 
     /// <summary>
@@ -97,15 +108,22 @@ public sealed class InVmSmokeGateTests
     private sealed class RecordingGate : IInVmSmokeGate
     {
         public List<string?> SeenBaselineRefs { get; } = [];
+        public List<InVmSmokeSandboxTarget> SeenTargets { get; } = [];
         public bool Enabled => true;
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            string? baselineRef,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
         {
             SeenBaselineRefs.Add(baselineRef);
+            SeenTargets.Add(target);
             return Task.FromResult(new AgentAvailability(true, null, null));
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
             Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
@@ -125,7 +143,7 @@ public sealed class InVmSmokeGateTests
         await prober.ProbeAllAsync(CancellationToken.None);
 
         var router = BuildRouter(registry, gate: null);
-        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+        var decision = await router.ResolveAsync(MakeItem(), MakeProject(), CancellationToken.None);
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Claude, decision.Chosen!.Agent);
@@ -145,7 +163,7 @@ public sealed class InVmSmokeGateTests
         var prober = BuildProber(provider, registry);
 
         var router = BuildRouter(registry, gate: prober);
-        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+        var decision = await router.ResolveAsync(MakeItem(), MakeProject(), CancellationToken.None);
 
         Assert.Equal(1, provider.CreateCount); // the gate provisioned exactly once
         Assert.NotNull(decision.Chosen);
@@ -162,8 +180,8 @@ public sealed class InVmSmokeGateTests
         var prober = BuildProber(provider, registry);
         var router = BuildRouter(registry, gate: prober);
 
-        var first = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
-        var second = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+        var first = await router.ResolveAsync(MakeItem(), MakeProject(), CancellationToken.None);
+        var second = await router.ResolveAsync(MakeItem(), MakeProject(), CancellationToken.None);
 
         Assert.Equal(Cursor, first.Chosen!.Agent);
         Assert.Equal(Cursor, second.Chosen!.Agent);

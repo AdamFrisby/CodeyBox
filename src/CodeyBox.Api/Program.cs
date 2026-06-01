@@ -1260,29 +1260,15 @@ builder.Services.AddSingleton<InVmSmokeOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var v = cbOpts.Smoke.InVm;
-    // When the operator did not pin an explicit smoke network profile, inherit
-    // the default project work-phase profile. The baseline-clone path only
-    // triggers when ProfileName is non-empty; a null profile silently forces
-    // the cloud-init launch path, so the probe would test a different image
-    // than the dispatch (which clones the work-profile baseline) and miss drift
-    // baked only into that baseline (e.g. PATH symlinks from MultipassExtraRuncmd).
-    // Inheriting the work profile keeps the probe on the same clone-vs-launch
-    // path as dispatch by default; an explicit Smoke:InVm:NetworkProfile wins.
-    // Read straight from configuration rather than IOptions<ProjectsOptions>:
-    // resolving the latter eagerly runs ProjectsOptionsRemovalValidator, whose
-    // store query throws whenever non-terminal work items reference a project
-    // absent from the bound config — which would surface here as a spurious
-    // construction failure (e.g. test hosts that seed the store but not the
-    // Projects config section). This singleton is built once at startup and
-    // does not hot-reload the profile, so a one-shot config read is sufficient.
-    var defaultWorkProfile = sp.GetRequiredService<IConfiguration>()
-        .GetValue<string?>("CodeyBox:Defaults:NetworkProfiles:Work");
     return new InVmSmokeOptions
     {
         Enabled = v.Enabled,
         ImageReference = cbOpts.SandboxImageReference,
         AllowedHosts = cbOpts.AgentAllowedHosts,
-        NetworkProfile = v.NetworkProfile ?? defaultWorkProfile,
+        // Dispatch calls pass the resolved project sandbox target directly to
+        // IInVmSmokeGate. This option is only an explicit operator override for
+        // project-less paths such as manual/admin probes and legacy sweeps.
+        NetworkProfile = v.NetworkProfile,
         StepTimeoutSeconds = v.StepTimeoutSeconds,
         ProvisionTimeoutSeconds = v.ProvisionTimeoutSeconds,
         GateDeadlineSeconds = v.GateDeadlineSeconds,
@@ -1330,7 +1316,8 @@ builder.Services.AddSingleton<IInVmSmokeCoveragePolicy>(sp => new InVmSmokeCover
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<IInVmSmokeGate>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
-    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProbeService>()));
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProbeService>(),
+    sp.GetRequiredService<IProjectRepository>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
 // ProjectRepository observes IOptionsMonitor<ProjectsOptions>, so an
@@ -3225,12 +3212,9 @@ namespace CodeyBox.Api
         public bool FailClosedOnProbeFault { get; set; } = true;
 
         /// <summary>
-        /// Host network profile for the probe sandbox; also selects which
-        /// baseline ref to probe (baselines are keyed by profile+flavor). When
-        /// unset, inherits <c>CodeyBox:Defaults:NetworkProfiles:Work</c> so the
-        /// probe clones the same baseline image dispatch does — set it only to
-        /// override that inheritance. Leave both null only when not using
-        /// baseline images (the probe then matches dispatch's cloud-init path).
+        /// Explicit host network profile for project-less probe paths. Dispatch
+        /// gates pass the resolved project sandbox target directly, so this is
+        /// not used as a fallback for work items.
         /// </summary>
         public string? NetworkProfile { get; set; }
 

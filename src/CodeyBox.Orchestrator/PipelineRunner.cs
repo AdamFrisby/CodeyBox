@@ -399,7 +399,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
-        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(agentKind, item.BaselineImageRef, ct);
+        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, "work");
+        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(
+            agentKind, item.BaselineImageRef, initialSmokeTarget, ct);
         if (!smokeAvailability.Available)
         {
             var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
@@ -1647,7 +1649,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (_classRouter is not null && classId is not null)
         {
-            foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
+            foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
+                item, project, ct, ResolvePhaseSmokeTarget(project, "merge")))
             {
                 if (seenKinds.Contains(member.Agent))
                     continue;
@@ -3366,7 +3369,7 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             if (a.Required.HasFlag(AuditCapabilities.AgentCredentials))
             {
-                var runner = await ResolveAuditAgentRunnerAsync(item, project, a.Name, workRunner, ct);
+                var runner = await ResolveAuditAgentRunnerAsync(item, project, a.Name, a.Required, workRunner, ct);
                 if (runner is null)
                     continue;
                 resolved.Add((a, runner));
@@ -3545,7 +3548,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         // sandbox run (incl. the transient retry), so the wrapper
                         // must not also record one per attempt — that would
                         // double-count and collapse the retry into a single row.
-                        recordInvolvement: false);
+                        recordInvolvement: false,
+                        smokeTarget: SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget));
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -3862,7 +3866,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </list>
     /// </summary>
     private async Task<IAgentRunner?> ResolveAuditAgentRunnerAsync(
-        WorkItem item, Project project, string auditorName, IAgentRunner workRunner, CancellationToken ct)
+        WorkItem item,
+        Project project,
+        string auditorName,
+        AuditCapabilities required,
+        IAgentRunner workRunner,
+        CancellationToken ct)
     {
         AgentKind? preferredKind = project.Audit.PerAuditorAgent.TryGetValue(auditorName, out var perAuditor)
             ? perAuditor
@@ -3907,7 +3916,10 @@ public sealed class PipelineRunner : IPipelineRunner
         // class-chain walk below already gates its members via
         // OrderedFallbackCandidatesAsync, so without this the preferred fast path
         // was the one hole left open.
-        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(preferredKind.Value, item.BaselineImageRef, ct);
+        var auditSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
+            SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditAgent, required));
+        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(
+            preferredKind.Value, item.BaselineImageRef, auditSmokeTarget, ct);
         var preferredAvailable = preferredAvailability.Available;
 
         var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
@@ -3937,7 +3949,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // LlmAuditorSkippedQuota event reports. Candidates skipped for other
         // reasons (missing runner / credentials) are intentionally excluded.
         var quotaRejectedCount = 1;   // the preferred agent we just rejected
-        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
+        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, auditSmokeTarget))
         {
             if (member.Agent == preferredKind.Value)
                 continue;   // already counted above
@@ -4116,7 +4128,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Returns true when no availability registry is wired (legacy callers
     /// preserve their prior behaviour).
     /// </summary>
-    private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(
+        AgentKind kind,
+        string? baselineRef,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
     {
         // The in-VM gate (when wired) owns the read→probe→re-read and returns the
         // reconciled availability — including the exclusion Reason — so callers
@@ -4129,10 +4145,25 @@ public sealed class PipelineRunner : IPipelineRunner
         // probe to the image this work item will clone (B1), not just the active
         // baseline.
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, target, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return new AgentAvailability(true, null, null);
+    }
+
+    private static InVmSmokeSandboxTarget ResolvePhaseSmokeTarget(Project project, string phase)
+    {
+        var sandboxTarget = phase switch
+        {
+            "rework" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework),
+            "merge" => new SandboxTarget(project.NetworkProfiles.Merge, SandboxProfileFlavor.Headless),
+            "audit" => SandboxTargetResolver.ResolveAudit(
+                project.NetworkProfiles.AuditAgent,
+                AuditCapabilities.AgentCredentials),
+            _ => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
+        };
+
+        return SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget);
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
@@ -4179,7 +4210,8 @@ public sealed class PipelineRunner : IPipelineRunner
         TimeSpan? attemptTimeout = null,
         IAgentRunner? initialRunnerOverride = null,
         AgentMembership? initialMemberOverride = null,
-        bool recordInvolvement = true)
+        bool recordInvolvement = true,
+        InVmSmokeSandboxTarget? smokeTarget = null)
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
@@ -4319,6 +4351,7 @@ public sealed class PipelineRunner : IPipelineRunner
         DateTimeOffset? earliestReset = null;
         var currentRunner = initialRunner;
         var currentItem = initialItem;
+        var fallbackSmokeTarget = smokeTarget ?? ResolvePhaseSmokeTarget(project, phase);
         // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
         // ReasoningMode) so probe write-backs receive an accurate record. Only fall
         // back to a synthesised placeholder when the catalog has no matching row —
@@ -4372,7 +4405,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // Find the next candidate that we haven't already tried this run.
-            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct);
+            var candidates = await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, fallbackSmokeTarget);
             AgentMembership? nextMember = null;
             foreach (var candidate in candidates)
             {

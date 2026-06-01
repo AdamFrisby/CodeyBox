@@ -51,6 +51,14 @@ public sealed class AgentClassRouterAvailabilityTests
         AgentClassId = "frontier",
     };
 
+    private static Project MakeProject() => new()
+    {
+        Id = new ProjectId("proj"),
+        DisplayName = "Project",
+        RepositoryUrl = "https://example.invalid/repo.git",
+        NetworkProfiles = new ProjectNetworkProfiles { Work = "work-profile" },
+    };
+
     private static AgentClass FrontierClass(params AgentMembership[] members) => new()
     {
         Id = "frontier",
@@ -144,7 +152,11 @@ public sealed class AgentClassRouterAvailabilityTests
 
         public bool Enabled => true;
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            string? baselineRef,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
         {
             Probed.Add(kind);
             _onProbe(kind);
@@ -152,6 +164,7 @@ public sealed class AgentClassRouterAvailabilityTests
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
         {
@@ -366,6 +379,7 @@ public sealed class AgentClassRouterAvailabilityTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = "work-profile",
                 SweepIntervalSeconds = 0,
                 // Short provisioning timeout so the wedged CreateAsync fires
                 // the wall-clock race quickly; gate deadline well above so the
@@ -389,7 +403,7 @@ public sealed class AgentClassRouterAvailabilityTests
 
         var sw = Stopwatch.StartNew();
         var decision = await router.ResolveAsync(
-            MakeItem(), project: null, CancellationToken.None, slotGate: slotGate);
+            MakeItem(), MakeProject(), CancellationToken.None, slotGate: slotGate);
         sw.Stop();
 
         // 1. Dispatch gate must return within bound. A regression that lost the

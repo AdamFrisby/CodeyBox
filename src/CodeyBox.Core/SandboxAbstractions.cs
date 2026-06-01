@@ -522,6 +522,27 @@ public interface IBaselineImageResolver
 }
 
 /// <summary>
+/// Optional provider capability: eagerly ensures a clonable baseline image
+/// exists for a profile/flavor before a dispatch gate asks for a sandbox. This
+/// keeps callers off the provider's slow live cloud-init launch path.
+/// </summary>
+public interface IBaselineImageProvisioner
+{
+    /// <summary>
+    /// Ensures the baseline image named by <paramref name="pinnedBaselineRef"/>
+    /// (or the provider's active ref when null) exists for
+    /// <paramref name="profileName"/> and <paramref name="flavor"/>. Returns the
+    /// clonable baseline ref/name, or null when the provider cannot clone this
+    /// target (for example baseline images are disabled).
+    /// </summary>
+    Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct);
+}
+
+/// <summary>
 /// Snapshot of one baseline image on the host, returned by
 /// <see cref="IBaselineImageResolver.ListBaselineImagesAsync"/>.
 /// </summary>

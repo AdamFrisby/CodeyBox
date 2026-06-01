@@ -1,6 +1,13 @@
 namespace CodeyBox.Core;
 
 /// <summary>
+/// Sandbox target the in-VM smoke gate must probe. It mirrors the resolved
+/// dispatch sandbox target, not a process-wide smoke default, so the probe uses
+/// the same baseline clone path as the work item.
+/// </summary>
+public readonly record struct InVmSmokeSandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);
+
+/// <summary>
 /// Dispatch-path hook that guarantees an agent's in-sandbox CLI has been smoke
 /// probed against the active baseline before the router trusts the agent as
 /// routable. Unlike the background sweep — which only converges <em>eventually</em>
@@ -48,6 +55,12 @@ public interface IInVmSmokeGate
     /// returned unchanged. Never throws — a probe fault must not take down
     /// dispatch.</para>
     ///
+    /// <para><paramref name="target"/> is the resolved sandbox target for the
+    /// dispatch phase being gated. The implementation must use this target's
+    /// profile and flavor when resolving and cloning the baseline; a null or
+    /// unclonable target is an inconclusive probe and should fail closed on the
+    /// dispatch path rather than falling back to a live cloud-init launch.</para>
+    ///
     /// <para><paramref name="baselineRef"/> is the work item's pinned
     /// <see cref="WorkItem.BaselineImageRef"/> (B1 pinning) — the image the
     /// sandbox will be cloned from at dispatch. The gate probes and caches against
@@ -56,7 +69,11 @@ public interface IInVmSmokeGate
     /// rebake. Pass <c>null</c> for unpinned work; the gate then falls back to the
     /// active baseline resolved internally.</para>
     /// </summary>
-    Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct);
+    Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        string? baselineRef,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct);
 
     /// <summary>
     /// Probes every registered agent against the active baseline. Driven by the
@@ -64,6 +81,14 @@ public interface IInVmSmokeGate
     /// at a time) and never throws. A no-op when disabled.
     /// </summary>
     Task ProbeAllAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Probes every registered agent against the active baseline for
+    /// <paramref name="target"/>. Background warm-up uses this overload to bake
+    /// and clone each resolved project work profile instead of falling back to a
+    /// process-wide profile.
+    /// </summary>
+    Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct);
 
     /// <summary>
     /// Operator-triggered forced re-probe of a single agent against the active

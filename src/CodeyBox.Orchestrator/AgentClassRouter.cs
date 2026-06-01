@@ -223,6 +223,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
             return new AgentRoutingDecision { Reason = "no agent class configured" };
+        var smokeTarget = ResolveWorkSmokeTarget(project);
 
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
         {
@@ -352,7 +353,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             // (when wired) also probes an apparently-Available-but-never-probed
             // agent here so the exit-127 / auth cascade is caught on the FIRST
             // dispatch, not on first run; a cache hit is free.
-            var availability = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
+            var availability = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, smokeTarget, ct);
             if (availability is { Available: false })
             {
                 var smokeReason = $"smoke gate: {availability.Reason}";
@@ -720,12 +721,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     /// </para>
     /// </summary>
     public async Task<IReadOnlyList<AgentMembership>> OrderedFallbackCandidatesAsync(
-        WorkItem item, Project? project, CancellationToken ct)
+        WorkItem item,
+        Project? project,
+        CancellationToken ct,
+        InVmSmokeSandboxTarget? smokeTarget = null)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null || !cfg.Catalog.TryGetValue(classId, out var agentClass))
             return [];
+        var target = smokeTarget ?? ResolveWorkSmokeTarget(project);
 
         var nowUtc = _time.GetUtcNow();
         // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
@@ -768,7 +773,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, ct);
+            var av = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, target, ct);
             if (av is null || av.Available)
                 result.Add(member);
         }
@@ -787,10 +792,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     /// gate probes the image the dispatch will clone (B1 pinning), not just the
     /// active baseline.
     /// </summary>
-    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    private static InVmSmokeSandboxTarget ResolveWorkSmokeTarget(Project? project)
+    {
+        if (project is null)
+            return default;
+
+        return SandboxTargetResolver.ToInVmSmokeTarget(
+            SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work));
+    }
+
+    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(
+        AgentKind kind,
+        string? baselineRef,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
     {
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, target, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return null;
