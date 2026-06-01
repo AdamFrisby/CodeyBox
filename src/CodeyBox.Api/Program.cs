@@ -710,6 +710,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
+        ColdStartFitInWindow = qr.ColdStartFitInWindow,
     };
 
     static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)

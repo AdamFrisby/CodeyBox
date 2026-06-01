@@ -270,6 +270,25 @@ public sealed class BudgetEnforcementTests : IDisposable
 
     // ── BudgetDeferralRecheckSnapshot consumer hot-reload ───────────────────
 
+    /// <summary>
+    /// Pipeline stub that blocks on a per-invocation gate so we can trigger
+    /// deterministic second-cycle deferrals. Gates[0] blocks the first item
+    /// picked up, Gates[1] the second, etc. Items beyond the last gate run
+    /// immediately.
+    /// </summary>
+    private sealed class GatedPipelineRunner(TaskCompletionSource[] gates, IWorkItemStore store) : IPipelineRunner
+    {
+        private int _started;
+
+        public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        {
+            var n = Interlocked.Increment(ref _started) - 1;
+            if (n < gates.Length)
+                await gates[n].Task.WaitAsync(ct);
+            await store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        }
+    }
+
     [Fact]
     public async Task BudgetDeferralRecheckSnapshot_IsConsumedByOrchestratorService()
     {
@@ -277,10 +296,14 @@ public sealed class BudgetEnforcementTests : IDisposable
         // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
         // value cached at construction time.
         //
-        // Uses MaxConcurrentForProject=1 with a blocking runner so the first
-        // item holds the sole concurrent slot and subsequent items hit the
-        // cap and are deferred.  After replacing the snapshot those items
-        // observe the new ConcurrentLimitRecheck on the next deferral cycle.
+        // Strategy: block the first TWO items so a third successor hits the
+        // concurrent cap twice — once on initial pickup (reading the
+        // original snapshot value) and once after a hot-reload Replace (which
+        // must be read on the second deferral).  We use a short initial
+        // ConcurrentLimitRecheck to keep the test fast and swap to a long
+        // value afterwards; the assertion that the item is still deferred
+        // after the unblock proves the long hot-reloaded value was read
+        // (otherwise the short initial value would have re-enqueued it).
         var pid = new ProjectId("budget-recheck-conc");
         var projectRepo = new InMemoryProjectRepository(new Project
         {
@@ -290,19 +313,16 @@ public sealed class BudgetEnforcementTests : IDisposable
             Budget = new ProjectBudget { MaxConcurrentForProject = 1 },
         });
 
-        var blockGate = new TaskCompletionSource();
-        var pipeline = new BlockingPipelineRunner(
-            _store,
-            onStart: () => { },
-            proceedGate: blockGate.Task,
-            onComplete: () => { });
+        var gate1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new GatedPipelineRunner([gate1, gate2], _store);
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
         var reg = new CancellationRegistry(CancellationToken.None);
 
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            ConcurrentLimitRecheck = TimeSpan.FromSeconds(30),
+            ConcurrentLimitRecheck = TimeSpan.FromMilliseconds(200),
         });
 
         var svc = new OrchestratorService(
@@ -311,8 +331,6 @@ public sealed class BudgetEnforcementTests : IDisposable
             projects: projectRepo,
             budgetDeferralRecheck: snapshot);
 
-        // Queue three items.  The first grabs the sole concurrent slot and
-        // blocks; the other two hit the concurrent cap and are deferred.
         var ids = new List<WorkItemId>();
         for (var i = 0; i < 3; i++)
         {
@@ -324,10 +342,7 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Poll until at least one of the later items is deferred. The
-        // dispatch loop spawns RunItemAsync via Task.Run and the budget
-        // lock serialises the check + StartedAt write, so a fixed
-        // millisecond sleep is brittle on slow/loaded CI machines.
+        // Poll until at least one of items [1] or [2] is deferred.
         var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
         while (!(svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]))
                && DateTimeOffset.UtcNow < deferDeadline)
@@ -335,28 +350,52 @@ public sealed class BudgetEnforcementTests : IDisposable
             await Task.Delay(50);
         }
 
+        var firstDeferredIdx = svc.IsDeferredForTest(ids[1]) ? 1 : 2;
         Assert.True(
-            svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
+            svc.IsDeferredForTest(ids[firstDeferredIdx]),
             "one of the items queued after the first must be deferred by the concurrent cap");
 
-        // ── Hot-reload: swap the recheck interval ──
+        // Hot-reload to a long recheck interval. The next deferral cycle
+        // (after items are re-enqueued and hit the cap again) must read this
+        // new value from the snapshot.
         snapshot.Replace(new BudgetDeferralRecheckOptions
         {
-            ConcurrentLimitRecheck = TimeSpan.FromHours(1),
+            ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
         });
 
-        // Unblock the first item so it finishes and releases the concurrent
-        // slot, allowing the deferred items to be re-enqueued.
-        blockGate.TrySetResult();
+        // Unblock the first item so the deferred items can be re-enqueued
+        // when their 200 ms deferral expires.
+        gate1.TrySetResult();
 
-        // Let the first item finish and the dispatch loop observe the
-        // released slot. The deferred items' 30 s recheck intervals
-        // have not elapsed, so they must still be in the deferred set.
-        await Task.Delay(300);
+        // Wait for the initial 200 ms deferral to expire and the dispatch
+        // loop to process both items again. One will grab the freed slot
+        // and block on gate2; the other hits the concurrent cap and is
+        // deferred again — this time reading the hot-reloaded 10 s interval.
+        await Task.Delay(600);
+
+        // Identify the item that was deferred in the second cycle.
+        // It should be one of ids[1] or ids[2]; the other is running
+        // (blocking on gate2) and therefore not in the deferred set.
+        int? secondDeferredIdx = null;
+        if (svc.IsDeferredForTest(ids[1])) secondDeferredIdx = 1;
+        else if (svc.IsDeferredForTest(ids[2])) secondDeferredIdx = 2;
+
+        Assert.NotNull(secondDeferredIdx);
+
+        // Now the item is deferred with the hot-reloaded 10 s interval.
+        // If the old 200 ms value was cached, it would have re-enqueued the
+        // item within 500 ms. Wait past the old window and verify the item
+        // is still deferred.
+        await Task.Delay(500);
 
         Assert.True(
-            svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]),
-            "deferred items must remain in the deferred set after hot-reload");
+            svc.IsDeferredForTest(ids[secondDeferredIdx.Value]),
+            "the deferred item must still be deferred after hot-reload " +
+            "(the long hot-reloaded ConcurrentLimitRecheck was consumed, " +
+            "not the short initial value)");
+
+        // Release the blocked item so StopAsync can drain cleanly.
+        gate2.TrySetResult();
 
         await svc.StopAsync(CancellationToken.None);
     }

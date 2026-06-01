@@ -143,6 +143,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
 
+        AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
+
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
             "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen}",
