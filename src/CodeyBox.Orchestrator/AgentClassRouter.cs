@@ -1037,7 +1037,7 @@ public sealed class AgentClassRouter
         double fit;
         if (estimate.SampleCount <= 0 || estimate.AvgBurnPctPerItem <= 0)
         {
-            fit = DefaultColdStartFitInWindow;
+            fit = _opts.ColdStartFitInWindow;
         }
         else
         {
@@ -1082,7 +1082,7 @@ public sealed class AgentClassRouter
             catch { est = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 }; }
 
             double fit;
-            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = DefaultColdStartFitInWindow;
+            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = _opts.ColdStartFitInWindow;
             else if (quota.AvailablePct < 0) fit = double.NaN;
             else fit = quota.AvailablePct / est.AvgBurnPctPerItem;
 
@@ -1487,16 +1487,21 @@ public sealed class QuotaRouterOptions
 
     public TimeSpan ObservedFailureRetention { get; set; } = TimeSpan.FromMinutes(30);
 
+    /// <summary>
     /// Suggested recheck delay surfaced by <see cref="AgentClassRouter.ResolveAsync"/>
     /// when every eligible candidate was blocked by its per-agent concurrency
     /// cap rather than quota exhaustion. Short enough that the deferred item is
     /// reconsidered as soon as another worker on any of those agents finishes;
-    /// long enough not to busy-loop. Default 15s, matching
-    /// <c>OrchestratorService._agentCapRetryDelay</c> (the fallback the
-    /// orchestrator applies if its own atomic slot reservation races and fails
-    /// after the router's pre-check).
+    /// long enough not to busy-loop. Default 15s.
     /// </summary>
     public TimeSpan CapRetryRecheckInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Default "how many concurrent burns fit in the remaining quota window"
+    /// used when the estimator has no historical samples yet. Keeps the
+    /// dispatch queue from stalling on cold start. Default 2.0.
+    /// </summary>
+    public double ColdStartFitInWindow { get; set; } = 2.0;
 }
 
 public enum QuotaUnknownPolicy

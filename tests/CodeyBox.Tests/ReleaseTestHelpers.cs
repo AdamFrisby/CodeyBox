@@ -76,6 +76,8 @@ internal static class ReleaseTestHelper
             taskQueue ?? new InMemoryTaskQueue(),
             new NullHostApplicationLifetime(),
             NullLogger<ReleaseService>.Instance,
+            () => 4,
+            () => TimeSpan.FromMinutes(30),
             agentStreams);
     }
 

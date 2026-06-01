@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Hosting;
@@ -59,6 +60,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
+    private readonly PipelineTuningSnapshot? _pipelineTuning;
+    private readonly BudgetDeferralRecheckSnapshot? _budgetDeferralRecheck;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly ILogger<AgentConfigHotReload> _log;
@@ -76,6 +79,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastIncrementalRebase = "";
     private string _lastSanitizer = "";
     private string _lastQuotaRouter = "";
+    private string _lastPipelineTuning = "";
+    private string _lastBudgetDeferralRecheck = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -91,6 +96,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
+        PipelineTuningSnapshot? pipelineTuning = null,
+        BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         QuotaRouterOptions? quotaRouterOptions = null,
         IInVmSmokeCoveragePolicy? coverage = null)
     {
@@ -111,6 +118,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
+        _pipelineTuning = pipelineTuning;
+        _budgetDeferralRecheck = budgetDeferralRecheck;
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
         _log = log;
@@ -131,6 +140,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
         _lastSanitizer = SerializeSanitizer(initial.ClaudeThinkingBlockSanitizer);
         _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
+        _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
+        _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
+
+        AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
@@ -164,6 +177,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyIncrementalRebaseIfChanged(opts);
             ApplySanitizerIfChanged(opts);
             ApplyQuotaRouterIfChanged(opts);
+            ApplyPipelineTuningIfChanged(opts);
+            ApplyBudgetDeferralRecheckIfChanged(opts);
         }
     }
 
@@ -209,6 +224,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _quotaRouterOptions.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
             _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
             _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
+            _quotaRouterOptions.ColdStartFitInWindow = src.ColdStartFitInWindow;
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -581,6 +597,82 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.ObservedFailureWindowMinutes,
                 opts.ObservedFailureRetentionMinutes,
                 opts.CapRetryIntervalSeconds,
+                opts.ColdStartFitInWindow,
+            },
+            JsonOpts);
+
+    private void ApplyPipelineTuningIfChanged(CodeyBoxOptions opts)
+    {
+        if (_pipelineTuning is null) return;
+
+        var next = SerializePipelineTuning(opts.PipelineTuning);
+        if (string.Equals(_lastPipelineTuning, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastPipelineTuning;
+        try
+        {
+            _pipelineTuning.Replace(opts.PipelineTuning);
+            AgentSuspendResilience.SetMaxRetries(opts.PipelineTuning.AgentSuspendMaxRetries);
+            _lastPipelineTuning = next;
+            AuditLog.ConfigReloaded("PipelineTuning", prev, next);
+            _log.LogInformation("Hot-reloaded PipelineTuning: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of PipelineTuning rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private void ApplyBudgetDeferralRecheckIfChanged(CodeyBoxOptions opts)
+    {
+        if (_budgetDeferralRecheck is null) return;
+
+        var next = SerializeBudgetDeferralRecheck(opts.BudgetDeferralRecheck);
+        if (string.Equals(_lastBudgetDeferralRecheck, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastBudgetDeferralRecheck;
+        try
+        {
+            _budgetDeferralRecheck.Replace(opts.BudgetDeferralRecheck);
+            _lastBudgetDeferralRecheck = next;
+            AuditLog.ConfigReloaded("BudgetDeferralRecheck", prev, next);
+            _log.LogInformation("Hot-reloaded BudgetDeferralRecheck: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of BudgetDeferralRecheck rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private static string SerializePipelineTuning(PipelineTuningOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                DefaultQuotaFailurePauseSeconds = opts.DefaultQuotaFailurePause.TotalSeconds,
+                QuotaExhaustionFallbackTtlSeconds = opts.QuotaExhaustionFallbackTtl.TotalSeconds,
+                MaxParsedQuotaResetWindowSeconds = opts.MaxParsedQuotaResetWindow.TotalSeconds,
+                opts.MergeSandboxStagingRestoreAttempts,
+                opts.MaxQuestionsPerWorkItem,
+                opts.AgentSuspendMaxRetries,
+            },
+            JsonOpts);
+
+    private static string SerializeBudgetDeferralRecheck(BudgetDeferralRecheckOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                PausedProjectRecheckSeconds = opts.PausedProjectRecheck.TotalSeconds,
+                HourlyLimitRecheckSeconds = opts.HourlyLimitRecheck.TotalSeconds,
+                DailyLimitRecheckSeconds = opts.DailyLimitRecheck.TotalSeconds,
+                ConcurrentLimitRecheckSeconds = opts.ConcurrentLimitRecheck.TotalSeconds,
             },
             JsonOpts);
 }

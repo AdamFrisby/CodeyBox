@@ -710,6 +710,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
+        ColdStartFitInWindow = qr.ColdStartFitInWindow,
     };
 
     static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)
@@ -923,6 +924,21 @@ builder.Services.AddSingleton<AgentConcurrencySnapshot>(sp =>
 builder.Services.AddSingleton<IncrementalRebaseSnapshot>(sp =>
     new IncrementalRebaseSnapshot(
         sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.IncrementalRebase));
+
+// PipelineTuningSnapshot — hot-reloadable quota-fallback and merge-staging
+// retry tuning knobs consumed by PipelineRunner. Same swappable-singleton
+// pattern as AgentConcurrencySnapshot.
+builder.Services.AddSingleton<PipelineTuningSnapshot>(sp =>
+    new PipelineTuningSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.PipelineTuning));
+
+// BudgetDeferralRecheckSnapshot — hot-reloadable budget-cap deferral recheck
+// intervals consumed by OrchestratorService. Edits to
+// CodeyBox:BudgetDeferralRecheck take effect on the next pickup attempt
+// without a process restart.
+builder.Services.AddSingleton<BudgetDeferralRecheckSnapshot>(sp =>
+    new BudgetDeferralRecheckSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.BudgetDeferralRecheck));
 
 // AgentDefaultsSnapshot — per-agent default model ids, swappable by the
 // hot-reload coordinator. Every runner reads through this same instance so
@@ -1714,6 +1730,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetService<IAgentUsageStore>(),
     sp.GetService<IAgentBudgetProvider>(),
     sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+    sp.GetRequiredService<PipelineTuningSnapshot>(),
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
@@ -1762,7 +1779,9 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IHostApplicationLifetime>(),
     sp.GetRequiredService<ILogger<ReleaseService>>(),
-    sp.GetService<IAgentStreamStore>()));
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
+    () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
+    agentStreams: sp.GetService<IAgentStreamStore>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -1785,11 +1804,13 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IWorkerRegistry>(),
     sp.GetRequiredService<DeadWorkerOptions>(),
     sp.GetRequiredService<DeadWorkerReaper>(),
-    sp.GetService<ReleaseService>(),
+    sp.GetRequiredService<ReleaseService>(),
     sp.GetRequiredService<AgentConcurrencyOptions>(),
     sp.GetRequiredService<AgentConcurrencySnapshot>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
-    sp.GetRequiredService<OrchestratorProgressClock>()));
+    sp.GetRequiredService<OrchestratorProgressClock>(),
+    sp.GetRequiredService<QuotaRouterOptions>(),
+    sp.GetRequiredService<BudgetDeferralRecheckSnapshot>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -1828,7 +1849,9 @@ builder.Services.AddHostedService(sp => new StartupSandboxReconciliationService(
 builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>()));
+    sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>(),
+    adoptionDeadline: TimeSpan.FromSeconds(
+        Math.Max(1, sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Shutdown.SandboxAdoptionDeadlineSeconds))));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -1851,6 +1874,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
+        pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
+        budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>());
 });
@@ -2483,6 +2508,26 @@ namespace CodeyBox.Api
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
 
         /// <summary>
+        /// Maximum concurrent release deep-audit phases across all releases.
+        /// Bounds LLM/sandbox resource usage. Default 4.
+        /// Hot-reloadable: read on each deep-audit start attempt.
+        /// </summary>
+        public int DeepAuditMaxConcurrency { get; set; } = 4;
+
+        /// <summary>
+        /// Maximum seconds to wait for a single remediation work item to reach a
+        /// terminal state before failing the deep audit. Default 1800 (30 min).
+        /// Hot-reloadable: read on each remediation dispatch.
+        /// </summary>
+        public int DeepAuditRemediationItemTimeoutSeconds { get; set; } = 1800;
+
+        /// <summary>Pipeline-runner quota-fallback and retry tuning. Hot-reloadable.</summary>
+        public PipelineTuningOptions PipelineTuning { get; set; } = new();
+
+        /// <summary>Per-project budget-cap deferral recheck intervals. Hot-reloadable.</summary>
+        public BudgetDeferralRecheckOptions BudgetDeferralRecheck { get; set; } = new();
+
+        /// <summary>
         /// Which sandbox provider to use. One of: <c>multipass</c>,
         /// <c>bubblewrap</c>, <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
@@ -2778,6 +2823,16 @@ namespace CodeyBox.Api
         /// during SIGTERM/Ctrl-C. Defaults to 60 seconds.
         /// </summary>
         public int GraceSeconds { get; set; } = 60;
+
+        /// <summary>
+        /// Upper bound on how long the startup resume handler waits for an
+        /// adopted in-VM agent process to finish post-resume. Long enough that
+        /// a real LLM call can finish, short enough that a wedged agent does
+        /// not block the orchestrator boot indefinitely. Default 1800 (30 min).
+        /// Only sampled at construction (startup) — changes do not hot-reload.
+        /// Bound from <c>CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds</c>.
+        /// </summary>
+        public int SandboxAdoptionDeadlineSeconds { get; set; } = 1800;
 
         /// <summary>
         /// How to tear down in-flight worker sandboxes during graceful shutdown.
@@ -3084,6 +3139,12 @@ namespace CodeyBox.Api
         /// 15s cadence, so leave defaults aligned unless you have a reason.
         /// </summary>
         public int CapRetryIntervalSeconds { get; set; } = 15;
+        /// <summary>
+        /// Default "how many concurrent burns fit in the remaining quota window"
+        /// used when the estimator has no historical samples yet. Keeps the
+        /// dispatch queue from stalling on cold start. Default 2.0.
+        /// </summary>
+        public double ColdStartFitInWindow { get; set; } = 2.0;
         /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.

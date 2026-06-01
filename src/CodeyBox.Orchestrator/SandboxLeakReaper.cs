@@ -315,7 +315,7 @@ public sealed class SandboxLeakReaper : BackgroundService
 
     private async Task<string?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        using var timeoutCts = new CancellationTokenSource(_opts.DisposeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
 
         var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
@@ -456,4 +456,13 @@ public sealed class SandboxLeakOptions
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public int MaxConcurrentAutoDispose { get; set; } = 4;
+
+    /// <summary>
+    /// Per-sandbox timeout for a single <c>multipass delete --purge</c> call.
+    /// Default 5 minutes — matches the worst-case latency observed when
+    /// multipassd is under load. Raising this allows slow purges to complete
+    /// instead of being abandoned mid-operation.
+    /// <para><b>Hot-reloadable:</b> read from the Func accessor on each sweep.</para>
+    /// </summary>
+    public TimeSpan DisposeTimeout { get; set; } = TimeSpan.FromMinutes(5);
 }

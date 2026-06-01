@@ -41,6 +41,23 @@ public sealed class QuotaFallbackHelpersTests
             $"expected clamp to fit within the ceiling, was {diff}");
     }
 
+    [Fact]
+    public void ClampQuotaReset_ExplicitMaxWindow_CapsToCustomCeiling()
+    {
+        // Prove the maxWindow parameter (as supplied by production code from
+        // PipelineTuningOptions.MaxParsedQuotaResetWindow) is actually
+        // honoured. A far-future reset with a narrow maxWindow must be clamped
+        // to the custom ceiling, not the legacy static fallback.
+        var farFuture = DateTimeOffset.UtcNow.AddDays(100);
+        var customMax = TimeSpan.FromMinutes(5);
+        var clamped = PipelineRunner.ClampQuotaReset(farFuture, maxWindow: customMax);
+        Assert.NotNull(clamped);
+
+        var diff = clamped!.Value - DateTimeOffset.UtcNow;
+        Assert.True(diff <= customMax + TimeSpan.FromSeconds(2),
+            $"expected clamp to fit within custom ceiling {customMax}, was {diff}");
+    }
+
     [Theory]
     [InlineData("simple message", "simple message")]
     [InlineData("first line\r\nsecond line", "first line second line")]

@@ -1311,6 +1311,84 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         Assert.Contains("merge staging root", ex.Message);
     }
 
+    // ── PipelineTuningSnapshot consumer hot-reload ─────────────────────────
+
+    [Fact]
+    public async Task MergeSandboxStagingRestoreAttempts_HonoursSnapshotAndHotReload()
+    {
+        // Consumer-side test for PipelineTuningSnapshot: prove that
+        // CreateMergeSandboxWithStagingRestoreAsync reads
+        // _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts on each
+        // invocation, not a value cached at construction time.
+        var gitRoot = Path.Combine(_workspace, "git-root-hotreload");
+        var inner = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var spyHost = new StagingRootRecordingHost(inner);
+
+        var seed = await CreateSeedRepoAsync();
+        var workItemId = WorkItemId.New();
+        var repoId = await inner.EnsureRepositoryAsync(workItemId, seed);
+
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            MergeSandboxStagingRestoreAttempts = 2,
+        });
+
+        var provider1 = new AlwaysMissingSourceSandboxProvider();
+        var pipeline1 = CreatePipeline(spyHost, provider1, pipelineTuning: snapshot);
+
+        var stagingPath1 = await pipeline1.CreateIsolatedMergeRepositoryAsync(
+            repoId, workItemId, CancellationToken.None);
+        try
+        {
+            var access1 = ((IGitHost)inner).GetIsolatedRepoSandboxAccess(stagingPath1);
+            var spec1 = new SandboxSpec { ImageReference = "ignored", Mounts = access1.Mounts };
+
+            var ex1 = await Assert.ThrowsAsync<SandboxMountSourceMissingException>(() =>
+                pipeline1.CreateMergeSandboxWithStagingRestoreAsync(
+                    spec1, repoId, stagingPath1, CancellationToken.None));
+            Assert.Equal(stagingPath1, ex1.HostPath);
+
+            // Snapshot says 2 → two CreateAsync calls (initial + one retry).
+            Assert.Equal(2, provider1.CreateAsyncCalls);
+        }
+        finally
+        {
+            try { Directory.Delete(stagingPath1, recursive: true); } catch { }
+        }
+
+        // Hot-reload: bump the retry ceiling to 4.  The snapshot is shared so
+        // the next pipeline sees the new value.
+        snapshot.Replace(new PipelineTuningOptions
+        {
+            MergeSandboxStagingRestoreAttempts = 4,
+        });
+
+        var provider2 = new AlwaysMissingSourceSandboxProvider();
+        var pipeline2 = CreatePipeline(spyHost, provider2, pipelineTuning: snapshot);
+
+        var stagingPath2 = await pipeline2.CreateIsolatedMergeRepositoryAsync(
+            repoId, workItemId, CancellationToken.None);
+        try
+        {
+            var access2 = ((IGitHost)inner).GetIsolatedRepoSandboxAccess(stagingPath2);
+            var spec2 = new SandboxSpec { ImageReference = "ignored", Mounts = access2.Mounts };
+
+            var ex2 = await Assert.ThrowsAsync<SandboxMountSourceMissingException>(() =>
+                pipeline2.CreateMergeSandboxWithStagingRestoreAsync(
+                    spec2, repoId, stagingPath2, CancellationToken.None));
+            Assert.Equal(stagingPath2, ex2.HostPath);
+
+            // Snapshot now says 4 → four CreateAsync calls (initial + three retries).
+            Assert.Equal(4, provider2.CreateAsyncCalls);
+        }
+        finally
+        {
+            try { Directory.Delete(stagingPath2, recursive: true); } catch { }
+        }
+    }
+
     private async Task<string> CreateSeedRepoAsync()
     {
         var seed = Path.Combine(_workspace, "seed-" + Guid.NewGuid().ToString("N")[..8]);
@@ -1328,6 +1406,10 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         => CreatePipeline(gitHost, new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
 
     private PipelineRunner CreatePipeline(IGitHost gitHost, ISandboxProvider sandboxProvider)
+        => CreatePipeline(gitHost, sandboxProvider, pipelineTuning: null);
+
+    private PipelineRunner CreatePipeline(
+        IGitHost gitHost, ISandboxProvider sandboxProvider, PipelineTuningSnapshot? pipelineTuning)
     {
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
         var project = new Project
@@ -1350,7 +1432,8 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             new SqliteWorkItemStore(stateDb),
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            pipelineTuning: pipelineTuning);
     }
 
     /// <summary>

@@ -20,6 +20,7 @@ public sealed class SandboxLeakReaperTests
         TimeSpan? leakAgeThreshold = null,
         TimeSpan? preemptRetention = null,
         int? maxConcurrentAutoDispose = null,
+        TimeSpan? disposeTimeout = null,
         IWebhookDispatcher? webhooks = null)
     {
         var opts = new SandboxLeakOptions
@@ -30,6 +31,7 @@ public sealed class SandboxLeakReaperTests
             PreemptRetention = preemptRetention ?? TimeSpan.FromHours(24),
             AutoDispose = autoDispose,
             MaxConcurrentAutoDispose = maxConcurrentAutoDispose ?? 4,
+            DisposeTimeout = disposeTimeout ?? TimeSpan.FromMinutes(5),
         };
         return new SandboxLeakReaper(provider, webhooks ?? new NullWebhookDispatcher(), opts, NullLogger<SandboxLeakReaper>.Instance);
     }
@@ -492,6 +494,66 @@ public sealed class SandboxLeakReaperTests
         // _latestLeaks must remain the same object — the failed sweep must not
         // have overwritten it with partial or empty results.
         Assert.Same(initialLeaks, reaper.GetLatestLeaks());
+    }
+
+    [Fact]
+    public async Task DisposeTimeout_HonorsConfiguredValue()
+    {
+        // Verify that SandboxLeakOptions.DisposeTimeout is plumbed through to
+        // the per-sandbox CancellationTokenSource in DisposeSingleAsync.  When the
+        // timeout is tighter than the actual dispose latency the reaper must
+        // surface a "timeout" failure — not wait indefinitely or crash.
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo("codeybox-timeoutcfg000", OldEnough(threshold), null, false));
+        // DisposeDelay is far longer than the configured timeout so the linked CTS
+        // fires while Task.Delay is still waiting.
+        provider.SetDisposeDelay(TimeSpan.FromMinutes(10));
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var reaper = BuildReaper(
+            provider,
+            autoDispose: true,
+            leakAgeThreshold: threshold,
+            disposeTimeout: TimeSpan.FromMilliseconds(50),
+            webhooks: webhooks);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        // The sandbox must NOT have been disposed — the CTS fired first.
+        Assert.Empty(provider.DisposedNames);
+        var leak = Assert.Single(reaper.GetLatestLeaks());
+        Assert.Equal("codeybox-timeoutcfg000", leak.Name);
+
+        // The reaper must have emitted a timeout-specific failure event.
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
+        var details = Assert.IsType<SandboxLeakDetails>(failed.Details);
+        Assert.Equal("timeout", details.Error);
+    }
+
+    [Fact]
+    public async Task DisposeTimeout_LongEnoughToComplete_DisposeSucceeds()
+    {
+        // Sanity check: when the configured timeout comfortably exceeds the
+        // actual dispose latency, the dispose must complete normally (no
+        // spurious timeout).
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new FakeSandboxProvider();
+        provider.AddSandbox(new ManagedSandboxInfo("codeybox-timeoutok0000", OldEnough(threshold), null, false));
+        provider.SetDisposeDelay(TimeSpan.FromMilliseconds(10));
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var reaper = BuildReaper(
+            provider,
+            autoDispose: true,
+            leakAgeThreshold: threshold,
+            disposeTimeout: TimeSpan.FromSeconds(30),
+            webhooks: webhooks);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Contains("codeybox-timeoutok0000", provider.DisposedNames);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "sandbox.leak_dispose_failed");
     }
 
     // ── Age threshold boundary ───────────────────────────────────────────────

@@ -76,6 +76,9 @@ public sealed class PipelineRunner : IPipelineRunner
     // config — tests and embeddings that don't wire the snapshot keep the
     // pre-feature behaviour.
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
+    // Hot-reloadable quota-fallback and merge-staging retry knobs. Defaulted to
+    // a private snapshot (unchanging defaults) when DI does not supply one.
+    private readonly PipelineTuningSnapshot _pipelineTuning;
     // Per-agent concurrency view used by BuildAgenticConflictCandidatesAsync to
     // deprioritize agents whose operator-configured cap is at ceiling. The cap
     // is shorthand for "this agent's API account budget is currently
@@ -98,19 +101,15 @@ public sealed class PipelineRunner : IPipelineRunner
     // resolve large conflict files). Hot-reloadable through the options
     // snapshot the resolver holds; the same instance is reused across phases.
     private readonly AgenticConflictResolver _agenticConflictResolver;
-    // Last-resort pause for quota-shaped terminal failures when neither the
-    // agent output nor quota probes expose a reset window.
-    internal static readonly TimeSpan DefaultQuotaFailurePause = TimeSpan.FromMinutes(5);
-    // Per-process exhausted-member TTL when the chosen agent hits quota mid-flight.
-    // Subscription windows reset on the order of hours; one hour is a conservative
-    // upper bound that keeps the in-process cache useful across consecutive pickups
-    // without blocking long enough to delay an actual reset by a meaningful amount.
-    private static readonly TimeSpan QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1);
     // Upper bound for parsed reset-window hints extracted from an agent's stdout/stderr.
     // Without a cap, a maliciously-crafted Retry-After header (or prompt-injected output)
     // could park an item arbitrarily far in the future. 24h is the longest legitimate
     // subscription reset cadence we know about (Gemini daily); anything beyond is treated
     // as suspect and clamped.
+    // <para><b>Legacy security fallback:</b> used only by <see cref="ClampQuotaReset"/>
+    // when the caller omits <c>maxWindow</c>. Production consumers pass
+    // <c>_pipelineTuning.Current.MaxParsedQuotaResetWindow</c>; this static remains so
+    // that defensive-callers and tests that don't wire the snapshot still get the 24h cap.</para>
     internal static readonly TimeSpan MaxParsedQuotaResetWindow = TimeSpan.FromHours(24);
     // Subscription-billed quota probes, keyed by AgentKind. PayPerApi / Null probes are
     // routing utilities (not real quota sources) and intentionally excluded.
@@ -191,6 +190,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentUsageStore? usageStore = null,
         IAgentBudgetProvider? budgetProvider = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
+        PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null)
     {
@@ -260,6 +260,7 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _incrementalRebase = incrementalRebase;
+        _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
         // a cross-kind fallback candidate (whose file-based creds aren't yet on
         // disk in the sandbox the primary provisioned) can authenticate before
@@ -4101,17 +4102,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 // windows are extracted from attacker-influenceable agent output;
                 // a maliciously-crafted Retry-After could otherwise park an item
                 // arbitrarily far in the future.
-                var clampedReset = ClampQuotaReset(quotaResetAt);
+                var clampedReset = ClampQuotaReset(quotaResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
 
                 // Mark the member exhausted in the router and the probe so the
                 // next pickup (or the rest of this pipeline) skips it.
-                _classRouter.MarkExhausted(currentMember, QuotaExhaustionFallbackTtl, clampedReset);
+                _classRouter.MarkExhausted(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset);
                 if (_quotaProbesByKind is not null
                     && _quotaProbesByKind.TryGetValue(currentMember.Agent, out var probe))
                 {
                     try
                     {
-                        await probe.MarkExhaustedAsync(currentMember, QuotaExhaustionFallbackTtl, clampedReset, ct);
+                        await probe.MarkExhaustedAsync(currentMember, _pipelineTuning.Current.QuotaExhaustionFallbackTtl, clampedReset, ct);
                     }
                     catch (Exception probeEx) when (probeEx is not OperationCanceledException)
                     {
@@ -4375,17 +4376,20 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Clamps a parsed reset-window hint against <see cref="MaxParsedQuotaResetWindow"/>.
-    /// The hint comes from agent stdout/stderr and is attacker-influenceable via
-    /// prompt injection; without a ceiling, a hostile output could park an item
-    /// arbitrarily far in the future and re-arm targeted retry timers for that
-    /// instant. Returns null when input is null.
+    /// Clamps a parsed reset-window hint against <paramref name="maxWindow"/>
+    /// (production callers pass <c>_pipelineTuning.Current.MaxParsedQuotaResetWindow</c>;
+    /// falls back to the legacy static <see cref="MaxParsedQuotaResetWindow"/>
+    /// when <paramref name="maxWindow"/> is omitted). The hint comes from agent
+    /// stdout/stderr and is attacker-influenceable via prompt injection; without
+    /// a ceiling, a hostile output could park an item arbitrarily far in the
+    /// future and re-arm targeted retry timers for that instant. Returns null
+    /// when input is null.
     /// </summary>
-    internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt)
+    internal static DateTimeOffset? ClampQuotaReset(DateTimeOffset? resetAt, TimeSpan? maxWindow = null)
     {
         if (resetAt is not { } parsed) return null;
         var now = DateTimeOffset.UtcNow;
-        var ceiling = now + MaxParsedQuotaResetWindow;
+        var ceiling = now + (maxWindow ?? MaxParsedQuotaResetWindow);
         return parsed > ceiling ? ceiling : parsed;
     }
 
@@ -4941,6 +4945,11 @@ public sealed class PipelineRunner : IPipelineRunner
     /// host path. One re-clone-and-retry is the production heal contract — if
     /// the source disappears AGAIN after restore, the loop falls through to
     /// rethrow rather than spinning indefinitely on a structural failure.
+    /// <para><b>Legacy reference:</b> production code reads through
+    /// <c>_pipelineTuning.Current.MergeSandboxStagingRestoreAttempts</c>
+    /// (hot-reloadable, default 2). This const is retained for test fixtures
+    /// that don't wire the snapshot and for internal documentation of the
+    /// canonical default.</para>
     /// </summary>
     internal const int MergeSandboxStagingRestoreAttempts = 2;
 
@@ -4964,13 +4973,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 return await _sandboxes.CreateAsync(spec, ct);
             }
             catch (SandboxMountSourceMissingException ex)
-                when (attempt < MergeSandboxStagingRestoreAttempts
+                when (attempt < _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts
                     && string.Equals(ex.HostPath, stagingPath, StringComparison.Ordinal))
             {
                 _log.LogWarning(
                     ex,
                     "merge sandbox mount source missing — re-cloning staging clone and retrying CreateAsync (attempt {Attempt}/{Max}): {Path}",
-                    attempt, MergeSandboxStagingRestoreAttempts, stagingPath);
+                    attempt, _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts, stagingPath);
                 await RestoreIsolatedMergeRepositoryAsync(repoId, stagingPath, ct);
             }
         }
@@ -7764,7 +7773,7 @@ Original merge-phase failure (for context):
         DateTimeOffset? detectedResetAt,
         CancellationToken ct)
     {
-        var resetAt = ClampQuotaReset(detectedResetAt);
+        var resetAt = ClampQuotaReset(detectedResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
         if (resetAt is not null)
             return resetAt.Value;
 
@@ -7790,7 +7799,7 @@ Original merge-phase failure (for context):
             }
         }
 
-        return DateTimeOffset.UtcNow.Add(DefaultQuotaFailurePause);
+        return DateTimeOffset.UtcNow.Add(_pipelineTuning.Current.DefaultQuotaFailurePause);
     }
 
     private async Task TransitionWaitingForQuotaResetAsync(
@@ -8011,8 +8020,6 @@ Original merge-phase failure (for context):
 
     // ── Question parsing + NeedsOperatorInput parking ───────────────────────
 
-    private const int MaxQuestionsPerWorkItem = 10;
-
     /// <summary>
     /// Parses agent stdout for question blocks, persists new ones, and transitions
     /// the work item to NeedsOperatorInput if at least one new question was created.
@@ -8031,11 +8038,11 @@ Original merge-phase failure (for context):
         var newQuestions = new List<WorkItemQuestion>();
         foreach (var p in parsed)
         {
-            if (existingCount + newQuestions.Count >= MaxQuestionsPerWorkItem)
+            if (existingCount + newQuestions.Count >= _pipelineTuning.Current.MaxQuestionsPerWorkItem)
             {
                 _log.LogWarning(
                     "Work item {Id}: question cap ({Max}) reached; ignoring additional <codeybox-question> blocks",
-                    item.Id, MaxQuestionsPerWorkItem);
+                    item.Id, _pipelineTuning.Current.MaxQuestionsPerWorkItem);
                 break;
             }
 

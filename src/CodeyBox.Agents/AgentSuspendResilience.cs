@@ -1,3 +1,4 @@
+using System.Threading;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents;
@@ -11,8 +12,15 @@ namespace CodeyBox.Agents;
 /// </summary>
 public static class AgentSuspendResilience
 {
-    /// <summary>Maximum automatic re-invocations after a failed agent exec.</summary>
-    public const int MaxRetries = 1;
+    private static int _maxRetries = 1;
+    /// <summary>Maximum automatic re-invocations after a failed agent exec. Hot-reloadable via <see cref="SetMaxRetries"/>.</summary>
+    public static int MaxRetries => Volatile.Read(ref _maxRetries);
+
+    public static void SetMaxRetries(int value)
+    {
+        if (value < 0) value = 0;
+        Volatile.Write(ref _maxRetries, value);
+    }
 
     /// <summary>
     /// Exit codes commonly observed when an HTTP client gives up after a long

@@ -7,6 +7,7 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -1343,6 +1344,239 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(1, sandbox2.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude"));
     }
 
+    // ── PipelineTuning hot-reload ────────────────────────────────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningPushesToSnapshot()
+    {
+        // End-to-end: an edit to CodeyBox:PipelineTuning must reach the live
+        // PipelineTuningSnapshot without a restart so PipelineRunner's
+        // quota-fallback and merge-staging retry paths observe the new values.
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
+                MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
+                MergeSandboxStagingRestoreAttempts = 2,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(
+            new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+                QuotaExhaustionFallbackTtl = initial.PipelineTuning.QuotaExhaustionFallbackTtl,
+                MaxParsedQuotaResetWindow = initial.PipelineTuning.MaxParsedQuotaResetWindow,
+                MergeSandboxStagingRestoreAttempts = initial.PipelineTuning.MergeSandboxStagingRestoreAttempts,
+            });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pipelineTuning: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(2, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        // Hot-reload: shorten the quota pause and bump retry attempts.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MergeSandboxStagingRestoreAttempts = 3,
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        // Same-value fire should be a no-op.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MergeSandboxStagingRestoreAttempts = 3,
+            },
+        });
+        Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningNoOpWhenSnapshotNull()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions(),
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var capturingLog = new CapturingLogger<AgentConfigHotReload>();
+
+        // No pipelineTuning snapshot — the coordinator must not throw.
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            capturingLog,
+            pipelineTuning: null);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+            },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+
+        // Null-guard must have returned early without logging any warning or error
+        // (a bug that threw or logged an error would still pass the "no-throw"
+        //  contract but would indicate the guard wasn't wired correctly).
+        Assert.DoesNotContain(capturingLog.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
+    // ── BudgetDeferralRecheck hot-reload ─────────────────────────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_BudgetDeferralRecheckPushesToSnapshot()
+    {
+        // End-to-end: an edit to CodeyBox:BudgetDeferralRecheck must reach the
+        // live BudgetDeferralRecheckSnapshot without a restart so
+        // OrchestratorService's budget-cap deferral paths observe the new
+        // recheck intervals on the next pickup attempt.
+        var initial = new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = TimeSpan.FromMinutes(1),
+                HourlyLimitRecheck = TimeSpan.FromMinutes(5),
+                DailyLimitRecheck = TimeSpan.FromHours(1),
+                ConcurrentLimitRecheck = TimeSpan.FromMinutes(1),
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new BudgetDeferralRecheckSnapshot(
+            new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = initial.BudgetDeferralRecheck.PausedProjectRecheck,
+                HourlyLimitRecheck = initial.BudgetDeferralRecheck.HourlyLimitRecheck,
+                DailyLimitRecheck = initial.BudgetDeferralRecheck.DailyLimitRecheck,
+                ConcurrentLimitRecheck = initial.BudgetDeferralRecheck.ConcurrentLimitRecheck,
+            });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            budgetDeferralRecheck: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
+
+        // Hot-reload: shorten the hourly recheck and lengthen the paused recheck.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+                PausedProjectRecheck = TimeSpan.FromMinutes(15),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(15), snapshot.Current.PausedProjectRecheck);
+
+        // Same-value fire should be a no-op.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+                PausedProjectRecheck = TimeSpan.FromMinutes(15),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_BudgetDeferralRecheckNoOpWhenSnapshotNull()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions(),
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var capturingLog = new CapturingLogger<AgentConfigHotReload>();
+
+        // No budgetDeferralRecheck snapshot — the coordinator must not throw.
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            capturingLog,
+            budgetDeferralRecheck: null);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                HourlyLimitRecheck = TimeSpan.FromMinutes(2),
+            },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+
+        // Null-guard must have returned early without logging any warning or error.
+        Assert.DoesNotContain(capturingLog.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()
@@ -1429,6 +1663,120 @@ public sealed class AgentConfigHotReloadTests
         public Task DeleteByWorkItemAsync(string workItemId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<decimal> SumEstimatedUsdAsync(string projectId, DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default) =>
             Task.FromResult(0m);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterColdStartFitInWindowPropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                ColdStartFitInWindow = 2.0,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = new QuotaRouterOptions
+        {
+            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
+            ColdStartFitInWindow = initial.QuotaRouter.ColdStartFitInWindow,
+        };
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(2.0, qro.ColdStartFitInWindow);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 5.0 },
+        });
+        Assert.Equal(5.0, qro.ColdStartFitInWindow);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 1.5 },
+        });
+        Assert.Equal(1.5, qro.ColdStartFitInWindow);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningPushesNewFieldsToSnapshot()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                MaxQuestionsPerWorkItem = 10,
+                AgentSuspendMaxRetries = 1,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+            MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
+            AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
+        });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        // Capture the static default before the coordinator sets it.
+        var originalMaxRetries = AgentSuspendResilience.MaxRetries;
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pipelineTuning: snapshot);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
+        Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
+
+        // SetMaxRetries is called on start; verify the static was initialised.
+        Assert.Equal(1, AgentSuspendResilience.MaxRetries);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            PipelineTuning = new PipelineTuningOptions
+            {
+                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                MaxQuestionsPerWorkItem = 20,
+                AgentSuspendMaxRetries = 3,
+            },
+        });
+        Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
+        Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
+        Assert.Equal(3, AgentSuspendResilience.MaxRetries);
+
+        // Restore original (shared static).
+        AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
+
+        await coordinator.StopAsync(CancellationToken.None);
     }
 
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>

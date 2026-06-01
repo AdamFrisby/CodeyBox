@@ -104,7 +104,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // (the router surfaces it via AgentRoutingDecision.SuggestedRecheckIn).
     // Short enough that the deferred item is reconsidered as soon as another
     // worker on the same agent finishes; long enough not to busy-loop.
-    private static readonly TimeSpan _agentCapRetryDelay = TimeSpan.FromSeconds(15);
+    // Read from the shared QuotaRouterOptions singleton so the hot-reload
+    // coordinator's edits take effect without restart.
+    private readonly QuotaRouterOptions? _quotaRouterOptions;
+    private readonly BudgetDeferralRecheckSnapshot? _budgetDeferralRecheck;
 
     // Tracks work item IDs that are currently being processed by a worker.
     // Guards against double-execution when two workers both enqueue the same
@@ -144,6 +147,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private int _pendingDeferrals = 0;
     private const int DeferralWarningThreshold = 100;
 
+    /// <summary>
+    /// Fallback deferral interval when <c>QuotaRouterOptions</c> is not wired
+    /// (DI omits it). 15s keeps the deferred item visible without busy-looping.
+    /// Matches the hardcoded default that <see cref="AgentClassRouter"/>
+    /// surfaces through <c>QuotaRouterOptions.CapRetryRecheckInterval</c>.
+    /// </summary>
+    private static readonly TimeSpan DefaultCapRetryRecheckInterval = TimeSpan.FromSeconds(15);
+
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
     // any of them has committed StartedAt to the database.
@@ -167,7 +178,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         AgentConcurrencyOptions? agentConcurrency = null,
         AgentConcurrencySnapshot? agentConcurrencySnapshot = null,
         IBaselineImageResolver? baselineResolver = null,
-        OrchestratorProgressClock? progressClock = null)
+        OrchestratorProgressClock? progressClock = null,
+        QuotaRouterOptions? quotaRouterOptions = null,
+        BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null)
     {
         _queue = queue;
         _store = store;
@@ -185,7 +198,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
-        _reaper?.AttachWorkerPoolSlotReleaser(this);
+        _reaper?.AttachWorkerPoolSlotReaser(this);
+        _quotaRouterOptions = quotaRouterOptions;
+        _budgetDeferralRecheck = budgetDeferralRecheck;
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -1197,7 +1212,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
                             workerIndex, id, routedAgent.Value, running, cap);
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
-                        ScheduleDeferredRequeue(item.Id, _agentCapRetryDelay, ct);
+                        ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
@@ -1216,7 +1231,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     _log.LogInformation(
                         "Worker {WorkerId} skipping {Id}: project {ProjectId} queue is paused — {Reason}",
                         workerIndex, id, item.ProjectId.Value, projState.PausedReason);
-                    ScheduleDeferredRequeue(item.Id, TimeSpan.FromMinutes(1), ct);
+                    ScheduleDeferredRequeue(item.Id, _budgetDeferralRecheck?.Current.PausedProjectRecheck ?? TimeSpan.FromMinutes(1), ct);
                     return;
                 }
             }
@@ -1443,7 +1458,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (count >= budget.MaxItemsPerHour)
                 return new BudgetDeferral(
                     $"hourly limit: {count}/{budget.MaxItemsPerHour} items started in last hour",
-                    TimeSpan.FromMinutes(5));
+                    _budgetDeferralRecheck?.Current.HourlyLimitRecheck ?? TimeSpan.FromMinutes(5));
         }
 
         if (budget.MaxItemsPerDay > 0)
@@ -1452,7 +1467,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (count >= budget.MaxItemsPerDay)
                 return new BudgetDeferral(
                     $"daily limit: {count}/{budget.MaxItemsPerDay} items started in last 24h",
-                    TimeSpan.FromHours(1));
+                    _budgetDeferralRecheck?.Current.DailyLimitRecheck ?? TimeSpan.FromHours(1));
         }
 
         if (budget.MaxConcurrentForProject > 0)
@@ -1461,7 +1476,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (count >= budget.MaxConcurrentForProject)
                 return new BudgetDeferral(
                     $"concurrent limit: {count}/{budget.MaxConcurrentForProject} items in flight",
-                    TimeSpan.FromMinutes(1));
+                    _budgetDeferralRecheck?.Current.ConcurrentLimitRecheck ?? TimeSpan.FromMinutes(1));
         }
 
         return null;
