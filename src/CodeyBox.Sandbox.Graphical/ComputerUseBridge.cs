@@ -33,73 +33,100 @@ public sealed class ComputerUseBridge
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(request);
 
+        var (events, _) = ResolveInputEvents(request);
+
+        if (events.Length == 0)
+        {
+            return new ComputerUseResult(
+                ScreenshotPng: await WithToolTimeoutAsync(sandbox.GetScreenshotAsync, ct),
+                Message: "screenshot");
+        }
+
+        return await ExecuteInputAsync(sandbox, events, ResolveCanonicalAction(request), ct);
+    }
+
+    public static (SandboxInputEvent[] Events, string CanonicalAction) ResolveInputEvents(ComputerUseRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
         if (string.IsNullOrWhiteSpace(request.Action))
             throw new ArgumentException("Computer-use Action is required.", nameof(request));
 
         var action = request.Action.Trim().ToLowerInvariant();
+        SandboxInputEvent[] events;
+        string canonical;
+
         switch (action)
         {
             case "screenshot":
-                return new ComputerUseResult(
-                    ScreenshotPng: await WithToolTimeoutAsync(sandbox.GetScreenshotAsync, ct),
-                    Message: "screenshot");
+                events = [];
+                canonical = "screenshot";
+                break;
 
             case "click":
             case "left_click":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y }],
-                    "click",
-                    ct);
+                events = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y }];
+                canonical = "click";
+                break;
 
             case "double_click":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [
-                        new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
-                        new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
-                    ],
-                    "double_click",
-                    ct);
+                events =
+                [
+                    new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
+                    new SandboxInputEvent { Type = SandboxInputEventType.Click, X = request.X, Y = request.Y },
+                ];
+                canonical = "double_click";
+                break;
 
             case "move":
             case "mouse_move":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [new SandboxInputEvent { Type = SandboxInputEventType.Move, X = request.X, Y = request.Y }],
-                    "move",
-                    ct);
+                events = [new SandboxInputEvent { Type = SandboxInputEventType.Move, X = request.X, Y = request.Y }];
+                canonical = "move";
+                break;
 
             case "scroll":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = request.ScrollX ?? request.X, Y = request.ScrollY ?? request.Y }],
-                    "scroll",
-                    ct);
+                events = [new SandboxInputEvent { Type = SandboxInputEventType.Scroll, X = request.ScrollX ?? request.X, Y = request.ScrollY ?? request.Y }];
+                canonical = "scroll";
+                break;
 
             case "key":
             case "keypress":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = request.Key ?? request.Text }],
-                    "key",
-                    ct);
+                events = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = request.Key ?? request.Text }];
+                canonical = "key";
+                break;
 
             case "type":
-                return await ExecuteInputAsync(
-                    sandbox,
-                    [new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = request.Text }],
-                    "type",
-                    ct);
+                events = [new SandboxInputEvent { Type = SandboxInputEventType.Type, Text = request.Text }];
+                canonical = "type";
+                break;
 
             case "events":
                 if (request.Events is null)
                     throw new ArgumentException("The 'events' action requires Events.", nameof(request));
-                return await ExecuteInputAsync(sandbox, request.Events, "events", ct);
+                if (request.Events.Count == 0)
+                    throw new ArgumentException("Graphical input requires at least one event.", nameof(request));
+                events = request.Events.ToArray();
+                canonical = "events";
+                break;
 
             default:
                 throw new NotSupportedException($"Unsupported computer-use action '{request.Action}'.");
         }
+
+        return (events, canonical);
+    }
+
+    public static string ResolveCanonicalAction(ComputerUseRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var action = (request.Action ?? "").Trim().ToLowerInvariant();
+        return action switch
+        {
+            "left_click" => "click",
+            "mouse_move" => "move",
+            "keypress" => "key",
+            _ => action,
+        };
     }
 
     private async Task<ComputerUseResult> ExecuteInputAsync(

@@ -114,6 +114,12 @@ public interface ISandbox : IAsyncDisposable
     /// </summary>
     Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default) =>
         throw new NotSupportedException("This sandbox does not expose a graphical desktop.");
+
+    Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default) =>
+        Task.FromResult<SandboxAccessibilitySnapshot?>(null);
+
+    Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
 }
 
 /// <summary>
@@ -600,6 +606,14 @@ public sealed record SandboxInputEvent
     public int? Y { get; init; }
     public string? Key { get; init; }
     public string? Text { get; init; }
+}
+
+public sealed record SandboxAccessibilitySnapshot
+{
+    public string? Role { get; init; }
+    public string? Name { get; init; }
+    public string? Text { get; init; }
+    public string? ElementType { get; init; }
 }
 
 public static class SandboxInputEventValidation
