@@ -5728,11 +5728,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
-    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase)
-    /// or exceeds the configured per-attempt timeout, picks the next-best class
-    /// member, swaps the runner + ModelId + ReasoningMode on a trial copy of
-    /// the work item, and retries the same iteration. Quota failures also mark
-    /// the member exhausted in the router's in-process cache.
+    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
+    /// exceeds the configured per-attempt timeout, or exhausts CLI-native session
+    /// resume attempts, picks the next-best class member, swaps the runner +
+    /// ModelId + ReasoningMode on a trial copy of the work item, and retries the
+    /// same iteration. Quota failures also mark the member exhausted in the
+    /// router's in-process cache.
     ///
     /// <para>
     /// When no class router is wired or the item has no agent class, the wrapper
@@ -5957,13 +5958,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
         async Task MoveToNextMemberOrThrowAsync(
             string safeReason,
-            bool quotaExhausted,
+            AgentFallbackTrigger trigger,
             DateTimeOffset? quotaResetAt,
             Exception terminalException,
             bool smokeRejected = false,
             bool pausedRejected = false)
         {
-            var fallbackKind = quotaExhausted ? "quota" : pausedRejected ? "paused" : smokeRejected ? "smoke" : "timeout";
+            var quotaExhausted = trigger == AgentFallbackTrigger.Quota;
+            var fallbackKind = pausedRejected ? "paused" : smokeRejected ? "smoke" : FallbackMetricKind(trigger);
             if (pausedRejected)
                 pausedFallbackAgent ??= currentRunner.Kind;
             if (quotaExhausted)
@@ -6119,11 +6121,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (pausedRejected)
                     throw new AgentPausedException(phase, pausedFallbackAgent ?? currentMember.Agent, safeReason);
 
-                var timeoutPhase = phaseCancellation?.Phase ?? phase;
-                throw new PhaseCancellationException(
-                    timeoutPhase,
-                    CancellationSources.PhaseTimeout(timeoutPhase),
-                    terminalException);
+                if (trigger == AgentFallbackTrigger.Timeout)
+                {
+                    var timeoutPhase = phaseCancellation?.Phase ?? phase;
+                    throw new PhaseCancellationException(
+                        timeoutPhase,
+                        CancellationSources.PhaseTimeout(timeoutPhase),
+                        terminalException);
+                }
+
+                throw terminalException;
             }
 
             if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
@@ -6137,7 +6144,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     toAgent: nextMember.Agent, toModel: nextMember.ModelId,
                     reason: safeReason);
             }
-            else
+            else if (trigger == AgentFallbackTrigger.Timeout)
             {
                 if (smokeRejected)
                 {
@@ -6161,6 +6168,14 @@ public sealed class PipelineRunner : IPipelineRunner
                         toAgent: nextMember.Agent, toModel: nextMember.ModelId,
                         reason: safeReason);
                 }
+            }
+            else
+            {
+                AuditLog.AgentResumeExhaustedFallback(
+                    item.Id, phase, iteration,
+                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                    reason: safeReason);
             }
             CodeyBoxMeters.AgentFallbacks.Add(1,
                 new KeyValuePair<string, object?>("from_agent", currentMember.Agent.Value),
@@ -6247,7 +6262,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix);
                     await MoveToNextMemberOrThrowAsync(
                         pausedReason,
-                        quotaExhausted: false,
+                        AgentFallbackTrigger.Timeout,
                         quotaResetAt: null,
                         terminalException: new AgentPausedException(phase, currentRunner.Kind, pausedReason),
                         pausedRejected: true);
@@ -6258,7 +6273,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     $"smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: false,
+                    AgentFallbackTrigger.Timeout,
                     quotaResetAt: null,
                     terminalException: new AgentUnavailableException(
                         $"agent '{currentRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {safeReason}",
@@ -6279,7 +6294,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 var safeReason = SingleLineSummary(quotaEx.Message);
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: true,
+                    AgentFallbackTrigger.Quota,
                     quotaResetAt: quotaEx.ResetAt,
                     terminalException: quotaEx);
             }
@@ -6288,12 +6303,36 @@ public sealed class PipelineRunner : IPipelineRunner
                 var safeReason = SingleLineSummary(timeoutEx.Message);
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: false,
+                    AgentFallbackTrigger.Timeout,
                     quotaResetAt: null,
                     terminalException: timeoutEx);
             }
+            catch (AgentSessionResumeExhaustedException resumeEx)
+            {
+                var safeReason = SingleLineSummary(resumeEx.Message);
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    AgentFallbackTrigger.ResumeExhausted,
+                    quotaResetAt: null,
+                    terminalException: resumeEx);
+            }
         }
     }
+
+    private enum AgentFallbackTrigger
+    {
+        Quota,
+        Timeout,
+        ResumeExhausted,
+    }
+
+    private static string FallbackMetricKind(AgentFallbackTrigger trigger) => trigger switch
+    {
+        AgentFallbackTrigger.Quota => "quota",
+        AgentFallbackTrigger.Timeout => "timeout",
+        AgentFallbackTrigger.ResumeExhausted => "resume_exhausted",
+        _ => "agent",
+    };
 
     /// <summary>
     /// Appends an in-progress <see cref="AgentInvolvement"/> row for the agent

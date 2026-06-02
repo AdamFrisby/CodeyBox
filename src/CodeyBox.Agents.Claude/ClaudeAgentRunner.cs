@@ -43,7 +43,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
     private readonly HttpClient _textOnlyHttp;
-    private readonly IQuotaFailureClassifier _sessionResumeQuotaClassifier;
+    private readonly IQuotaFailureClassifier? _sessionResumeQuotaClassifier;
 
     public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, quotaFailureClassifier: null) { }
 
@@ -103,8 +103,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         _rotationPusher = rotationPusher;
         _sanitizerConfig = sanitizerConfig;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
-        _sessionResumeQuotaClassifier = quotaFailureClassifier
-            ?? new CompositeQuotaFailureClassifier([new ClaudeQuotaFailureDetector()]);
+        _sessionResumeQuotaClassifier = quotaFailureClassifier;
     }
 
     public override AgentKind Kind => AgentKind.Claude;

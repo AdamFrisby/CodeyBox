@@ -493,7 +493,11 @@ builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredB
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();
 
 // --- Agents ------------------------------------------------------------------
-builder.Services.AddSingleton<IAgentRunner, ClaudeAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>(),
+    sp.GetRequiredService<IClaudeTokenRotationPusher>(),
+    sp.GetRequiredService<ClaudeThinkingBlockSanitizerConfig>(),
+    sp.GetRequiredService<IQuotaFailureClassifier>()));
 builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();

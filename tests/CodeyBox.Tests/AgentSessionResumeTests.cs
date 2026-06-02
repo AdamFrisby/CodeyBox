@@ -1,6 +1,7 @@
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
@@ -197,7 +198,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_PlainStdoutRun_DoesNotForceStreamJsonForResumeCapture()
+    public async Task ClaudeRunner_PlainStdoutRun_DoesNotUseModelControlledSessionIdForResume()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
@@ -215,9 +216,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[0]);
         Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[0]);
         Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[0]);
-        var resumeIdx = IndexOf(sandbox.ClaudeInvocations[1], "--resume");
-        Assert.True(resumeIdx >= 0, "resume can use a session id already present in the caller-visible stdout");
-        Assert.Equal(sessionId, sandbox.ClaudeInvocations[1][resumeIdx + 1]);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[1]);
         Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[1]);
         Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[1]);
         Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[1]);
@@ -234,7 +233,7 @@ public sealed class AgentSessionResumeTests : IDisposable
                 Stderr: "Killed")
             : new SandboxExecResult(0, "ok", ""));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.True(result.Success);
@@ -254,7 +253,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         var sandbox = new ResumeRecordingSandbox(_ =>
             new SandboxExecResult(1, "no init line was emitted", ""));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
@@ -277,7 +276,24 @@ public sealed class AgentSessionResumeTests : IDisposable
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "usage_limit reached: weekly cap"));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Theory]
+    [InlineData("hit your usage limit")]
+    [InlineData("hit your limit")]
+    public async Task ClaudeRunner_HardQuotaNaturalLanguagePhrases_DoNotResumeHammer(string quotaPhrase)
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: quotaPhrase));
+
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
@@ -306,7 +322,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_SoftRateLimitWithCapturedSessionId_RetriesWithResumeFlag()
+    public async Task ClaudeRunner_RateLimitWithCapturedSessionId_DoesNotResumeHammer()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
@@ -316,12 +332,11 @@ public sealed class AgentSessionResumeTests : IDisposable
                 Stderr: "API Error: 429 rate_limit_exceeded")
             : new SandboxExecResult(0, "ok", ""));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
-        Assert.True(result.Success);
-        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
-        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
     }
 
     [Fact]
@@ -332,7 +347,7 @@ public sealed class AgentSessionResumeTests : IDisposable
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
@@ -349,7 +364,7 @@ public sealed class AgentSessionResumeTests : IDisposable
                 Stderr: "API Error: 400: `thinking` blocks in the latest assistant message cannot be modified.")
             : new SandboxExecResult(0, "ok", ""));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.True(result.Success);
@@ -398,7 +413,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_LivenessProbeUnexpectedFailure_Propagates()
+    public async Task ClaudeRunner_LivenessProbeFailure_ReturnsFailedResultForRedrive()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(
@@ -409,10 +424,10 @@ public sealed class AgentSessionResumeTests : IDisposable
                 ? throw new InvalidOperationException("liveness implementation failed")
                 : new SandboxExecResult(0, "", ""));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new ClaudeAgentRunner().RunAsync(
-                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
+        Assert.False(result.Success);
         Assert.Single(sandbox.ClaudeInvocations);
     }
 
@@ -427,10 +442,12 @@ public sealed class AgentSessionResumeTests : IDisposable
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "ECONNRESET"));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+        var ex = await Assert.ThrowsAsync<AgentSessionResumeExhaustedException>(() =>
+            new ClaudeAgentRunner().RunAsync(
+                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
 
-        Assert.False(result.Success);
+        Assert.False(ex.LastResult.Success);
+        Assert.Equal(2, ex.MaxResumeAttempts);
         // 1 original + 2 resume attempts = 3 claude invocations.
         Assert.Equal(3, sandbox.ClaudeInvocations.Count);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
@@ -448,10 +465,11 @@ public sealed class AgentSessionResumeTests : IDisposable
             Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
             Stderr: "ECONNRESET"));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+        var ex = await Assert.ThrowsAsync<AgentSessionResumeExhaustedException>(() =>
+            new ClaudeAgentRunner().RunAsync(
+                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
 
-        Assert.False(result.Success);
+        Assert.False(ex.LastResult.Success);
         // Regression guard for original, --resume, --resume, original.
         Assert.Equal(3, sandbox.ClaudeInvocations.Count);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
@@ -608,6 +626,13 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.True(idx + 1 < argv.Count, $"{flag} must have a value");
         Assert.Equal(expected, argv[idx + 1]);
     }
+
+    private static ClaudeAgentRunner ClaudeRunnerWithQuotaClassifier() =>
+        new(
+            defaults: null,
+            rotationPusher: null,
+            sanitizerConfig: null,
+            quotaFailureClassifier: new CompositeQuotaFailureClassifier([new ClaudeQuotaFailureDetector()]));
 
     // ── Test harness ──────────────────────────────────────────────────────────
 

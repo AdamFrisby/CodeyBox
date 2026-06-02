@@ -213,11 +213,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             if (last.Success)
                 return last;
 
-            // Capture / refresh the session id from whatever this attempt
-            // managed to emit on stdout before crashing. Best-effort: a parse
-            // failure or absent id leaves the previously-captured id (if any)
-            // in place.
+            // Capture / refresh the session id only from runs where the runner
+            // explicitly requested the CLI's structured stream. Plain stdout is
+            // model-controlled for several production call paths and must never
+            // select the local session that reaches the next process argv.
             if (sessionResumeContext is not null
+                && sessionResumeContext.CaptureStructuredStream
                 && TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
             {
                 capturedSessionId = freshId;
@@ -254,7 +255,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 }
 
                 if (maxResumeAttempts > 0)
-                    return last;
+                    throw new AgentSessionResumeExhaustedException(Kind, maxResumeAttempts, last);
             }
 
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
@@ -306,6 +307,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             }, ct).ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return false;
         }

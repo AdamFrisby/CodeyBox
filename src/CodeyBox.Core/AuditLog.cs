@@ -444,6 +444,29 @@ public static class AuditLog
                 reason);
 
     /// <summary>
+    /// Emitted when CLI-native session resume was attempted up to the configured
+    /// bound and the pipeline retries the same iteration against the next class
+    /// member.
+    /// </summary>
+    public static void AgentResumeExhaustedFallback(
+        WorkItemId workItemId,
+        string phase,
+        int? iteration,
+        AgentKind fromAgent,
+        string? fromModel,
+        AgentKind toAgent,
+        string? toModel,
+        string reason) =>
+        Audit("agent.resume_exhausted_fallback")
+            .Warning(
+                "Mid-iteration resume-exhausted fallback: workItem={WorkItemId} phase={Phase} iteration={Iteration} " +
+                "from={FromAgent}/{FromModel} to={ToAgent}/{ToModel} reason={Reason}",
+                workItemId.ToString(), phase, iteration,
+                fromAgent.Value, fromModel ?? "(default)",
+                toAgent.Value, toModel ?? "(default)",
+                reason);
+
+    /// <summary>
     /// Emitted when every eligible class member returned QuotaExhausted within
     /// a single pickup, and the pipeline parked the item in WaitingForQuotaReset
     /// rather than transitioning it to Failed.
