@@ -53,6 +53,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     // the router behaves as before this feature.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
+    private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -85,7 +86,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        InVmSmokeSandboxTarget? configuredSmokeTarget = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -108,6 +110,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
         _inVmSmokeGate = inVmSmokeGate;
+        _configuredSmokeTarget = configuredSmokeTarget;
     }
 
     /// <summary>
@@ -223,7 +226,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
             return new AgentRoutingDecision { Reason = "no agent class configured" };
-        var smokeTarget = ResolveWorkSmokeTarget(project);
+        var smokeTarget = ResolveWorkSmokeTarget(project).WithBaselineRef(item.BaselineImageRef);
 
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
         {
@@ -353,7 +356,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             // (when wired) also probes an apparently-Available-but-never-probed
             // agent here so the exit-127 / auth cascade is caught on the FIRST
             // dispatch, not on first run; a cache hit is free.
-            var availability = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, smokeTarget, ct);
+            var availability = await GetGatedAvailabilityAsync(member.Agent, smokeTarget, ct);
             if (availability is { Available: false })
             {
                 var smokeReason = $"smoke gate: {availability.Reason}";
@@ -730,7 +733,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null || !cfg.Catalog.TryGetValue(classId, out var agentClass))
             return [];
-        var target = smokeTarget ?? ResolveWorkSmokeTarget(project);
+        var target = (smokeTarget ?? ResolveWorkSmokeTarget(project))
+            .WithBaselineRef(item.BaselineImageRef);
 
         var nowUtc = _time.GetUtcNow();
         // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
@@ -773,7 +777,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = await GetGatedAvailabilityAsync(member.Agent, item.BaselineImageRef, target, ct);
+            var av = await GetGatedAvailabilityAsync(member.Agent, target, ct);
             if (av is null || av.Available)
                 result.Add(member);
         }
@@ -788,14 +792,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     /// directly. Returns null only when neither is wired (no availability
     /// tracking → legacy behaviour, every candidate is routable). Centralised
     /// so primary routing and fallback selection cannot drift in gate semantics.
-    /// <paramref name="baselineRef"/> is the work item's pinned baseline so the
-    /// gate probes the image the dispatch will clone (B1 pinning), not just the
-    /// active baseline.
+    /// <see cref="InVmSmokeSandboxTarget.BaselineRef"/> is the work item's pinned
+    /// baseline so the gate probes the image the dispatch will clone (B1
+    /// pinning), not just the active baseline.
     /// </summary>
-    private static InVmSmokeSandboxTarget ResolveWorkSmokeTarget(Project? project)
+    private InVmSmokeSandboxTarget ResolveWorkSmokeTarget(Project? project)
     {
         if (project is null)
-            return default;
+            return _configuredSmokeTarget ?? default;
 
         return SandboxTargetResolver.ToInVmSmokeTarget(
             SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work));
@@ -803,12 +807,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
 
     private async Task<AgentAvailability?> GetGatedAvailabilityAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, target, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return null;

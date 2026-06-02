@@ -74,6 +74,10 @@ public sealed class InVmSmokeProbeService : BackgroundService
             foreach (var target in targets)
                 await _gate.ProbeAllAsync(target, ct);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return;
+        }
         catch (Exception ex)
         {
             // Warning, not Debug: a sustained sweep failure (bad image ref,

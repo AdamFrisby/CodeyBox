@@ -977,6 +977,11 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 
     // Build and validate time-of-day score modifiers.
     var todModifiers = AgentClassesConfigBuilder.BuildTodModifiers(cbOpts.AgentScoreModifiers, startupLog);
+    var inVmSmokeOptions = sp.GetService<InVmSmokeOptions>();
+    InVmSmokeSandboxTarget? configuredSmokeTarget =
+        string.IsNullOrWhiteSpace(inVmSmokeOptions?.NetworkProfile)
+            ? null
+            : new InVmSmokeSandboxTarget(inVmSmokeOptions.NetworkProfile, SandboxProfileFlavor.Headless);
 
     return new AgentClassRouter(
         catalog,
@@ -991,7 +996,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
-        sp.GetService<IInVmSmokeGate>());
+        sp.GetService<IInVmSmokeGate>(),
+        configuredSmokeTarget);
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------

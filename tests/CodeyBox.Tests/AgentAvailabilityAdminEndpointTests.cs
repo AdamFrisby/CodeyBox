@@ -368,7 +368,6 @@ public sealed class AgentAvailabilityAdminEndpointTests
 
         public Task<AgentAvailability> EnsureAvailableAsync(
             AgentKind kind,
-            string? baselineRef,
             InVmSmokeSandboxTarget target,
             CancellationToken ct)
             => Task.FromResult(new AgentAvailability(true, null, null));

@@ -104,6 +104,7 @@ public sealed class InVmSmokeGateTests
         var target = Assert.Single(gate.SeenTargets);
         Assert.Equal("work-profile", target.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+        Assert.Equal("base-PINNED", target.BaselineRef);
     }
 
     /// <summary>
@@ -118,11 +119,10 @@ public sealed class InVmSmokeGateTests
 
         public Task<AgentAvailability> EnsureAvailableAsync(
             AgentKind kind,
-            string? baselineRef,
             InVmSmokeSandboxTarget target,
             CancellationToken ct)
         {
-            SeenBaselineRefs.Add(baselineRef);
+            SeenBaselineRefs.Add(target.BaselineRef);
             SeenTargets.Add(target);
             return Task.FromResult(new AgentAvailability(true, null, null));
         }

@@ -164,10 +164,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             _log.LogWarning(
                 "In-VM smoke force-probe for {Agent} skipped: no explicit Smoke:InVm:NetworkProfile is configured",
                 kind.Value);
-            return _availability.GetAvailability(kind);
+            return null;
         }
 
-        await EnsureProbedAsync(kind, baselineRef: null, target, ct, bypassCache: true);
+        await EnsureProbedAsync(kind, target, ct, bypassCache: true);
         return _availability.GetAvailability(kind);
     }
 
@@ -197,18 +197,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// </summary>
     public async Task<AgentAvailability> EnsureAvailableAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
         var current = _availability.GetAvailability(kind);
         if (!Enabled)
             return current;
-        var cacheBaselineRef = baselineRef ?? TryResolveBaselineRef(target);
+        var cacheBaselineRef = target.BaselineRef ?? TryResolveBaselineRef(target);
         if (!current.Available &&
             (cacheBaselineRef is null || _cache.TryGet(kind, cacheBaselineRef) is null))
             return current;
-        await EnsureProbedAsync(kind, baselineRef, target, ct);
+        await EnsureProbedAsync(kind, target, ct);
         return _availability.GetAvailability(kind);
     }
 
@@ -238,12 +237,11 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             return Task.CompletedTask;
         }
 
-        return EnsureProbedAsync(kind, baselineRef, target, ct, bypassCache);
+        return EnsureProbedAsync(kind, target.WithBaselineRef(baselineRef), ct, bypassCache);
     }
 
     internal async Task EnsureProbedAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct,
         bool bypassCache = false)
@@ -260,7 +258,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // the pinned baseline when supplied so the verdict matches the image
             // the dispatch will clone; otherwise fall back to the active baseline.
             var probeTask = ProbeAgentAsync(
-                probe, target, baselineRef, ct,
+                probe, target, target.BaselineRef, ct,
                 benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
 
             // The provisioning/exec/step timeouts inside ProbeAgentAsync cover the

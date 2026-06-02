@@ -139,11 +139,35 @@ public sealed class AgentClassRouterAvailabilityTests
         Assert.Equal(Claude, candidates[0].Agent);
     }
 
+    [Fact]
+    public async Task ResolveAsync_Projectless_UsesConfiguredSmokeTarget()
+    {
+        var cls = FrontierClass(Sub(Cursor, score: 150));
+        var reg = NewRegistry();
+        var gate = new FakeInVmSmokeGate(reg, _ => { });
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Cursor, 90.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            availability: reg,
+            inVmSmokeGate: gate,
+            configuredSmokeTarget: new InVmSmokeSandboxTarget("smoke-profile", SandboxProfileFlavor.Headless));
+
+        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("smoke-profile", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+    }
+
     private sealed class FakeInVmSmokeGate : IInVmSmokeGate
     {
         private readonly AgentAvailabilityRegistry _reg;
         private readonly Action<AgentKind> _onProbe;
         public List<AgentKind> Probed { get; } = [];
+        public List<InVmSmokeSandboxTarget> Targets { get; } = [];
         public FakeInVmSmokeGate(AgentAvailabilityRegistry reg, Action<AgentKind> onProbe)
         {
             _reg = reg;
@@ -154,11 +178,11 @@ public sealed class AgentClassRouterAvailabilityTests
 
         public Task<AgentAvailability> EnsureAvailableAsync(
             AgentKind kind,
-            string? baselineRef,
             InVmSmokeSandboxTarget target,
             CancellationToken ct)
         {
             Probed.Add(kind);
+            Targets.Add(target);
             _onProbe(kind);
             return Task.FromResult(_reg.GetAvailability(kind));
         }

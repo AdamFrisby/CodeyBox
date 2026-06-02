@@ -379,7 +379,6 @@ internal sealed class BenchOnProbeGate : IInVmSmokeGate
 
     public Task<AgentAvailability> EnsureAvailableAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {

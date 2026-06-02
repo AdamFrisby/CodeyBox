@@ -40,7 +40,8 @@ public sealed class InVmSmokeProberTests
         FakeBaselineResolver resolver,
         InVmSmokeOptions? opts = null,
         ICredentialProvider? credentials = null,
-        IEnumerable<IInVmSmokeProbe>? probes = null)
+        IEnumerable<IInVmSmokeProbe>? probes = null,
+        bool fillDefaultNetworkProfile = true)
     {
         var effectiveOpts = opts ?? new InVmSmokeOptions
         {
@@ -49,7 +50,7 @@ public sealed class InVmSmokeProberTests
             NetworkProfile = WorkTarget.NetworkProfile,
             SweepIntervalSeconds = 0,
         };
-        if (string.IsNullOrWhiteSpace(effectiveOpts.NetworkProfile))
+        if (fillDefaultNetworkProfile && string.IsNullOrWhiteSpace(effectiveOpts.NetworkProfile))
             effectiveOpts = effectiveOpts with { NetworkProfile = WorkTarget.NetworkProfile };
 
         return new InVmSmokeProber(
@@ -171,6 +172,30 @@ public sealed class InVmSmokeProberTests
         Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
         Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
         Assert.Equal("base-A", ensureCall.PinnedRef);
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_WithDispatchTarget_UsesTargetProfile_NotConfiguredOption()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var resolver = new FakeBaselineResolver("base-A");
+        var dispatchTarget = new InVmSmokeSandboxTarget("dispatch-profile", SandboxProfileFlavor.Headless);
+        var prober = Build(provider, NewRegistry(), NewCache(), resolver,
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "configured-smoke-profile",
+                SweepIntervalSeconds = 0,
+            });
+
+        await prober.ProbeAllAsync(dispatchTarget, CancellationToken.None);
+
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal("dispatch-profile", provider.LastProfileName);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal("dispatch-profile", ensureCall.Profile);
+        Assert.Equal(dispatchTarget.Flavor, ensureCall.Flavor);
     }
 
     [Fact]
@@ -646,7 +671,7 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
 
         var av = await prober.EnsureAvailableAsync(
-            AgentKind.Cursor, baselineRef: null, WorkTarget, CancellationToken.None);
+            AgentKind.Cursor, WorkTarget, CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount); // no redundant provision for an already-skipped agent
@@ -673,7 +698,7 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
         var av = await prober.EnsureAvailableAsync(
-            AgentKind.Cursor, baselineRef: "base-PINNED", WorkTarget, CancellationToken.None);
+            AgentKind.Cursor, WorkTarget.WithBaselineRef("base-PINNED"), CancellationToken.None);
 
         Assert.True(av.Available); // pinned-image verdict, not the active-image bench
         Assert.Equal(0, provider.CreateCount); // cache hit → no VM provisioned
@@ -694,7 +719,7 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
         var av = await prober.EnsureAvailableAsync(
-            AgentKind.Cursor, baselineRef: "base-OTHER", WorkTarget, CancellationToken.None);
+            AgentKind.Cursor, WorkTarget.WithBaselineRef("base-OTHER"), CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount);
@@ -839,6 +864,54 @@ public sealed class InVmSmokeProberTests
 
         Assert.Null(result);
         Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task ForceProbeAsync_NoConfiguredProfile_ReturnsNull_NoProvision()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_NoConfiguredProfile_SkipsWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_NoConfiguredProfile_FailClosedBenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline target has no network profile", availability.Reason);
     }
 
     [Fact]
@@ -1048,6 +1121,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0, // immediate-timeout for deterministic test
                 FailClosedOnProbeFault = true,
@@ -1059,6 +1133,8 @@ public sealed class InVmSmokeProberTests
         var av = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(av.Available);
         Assert.Contains("[transient]", av.Reason);
+        Assert.Contains("probe step timed out", av.Reason);
+        Assert.Equal(1, provider.CreateCount);
     }
 
     [Fact]

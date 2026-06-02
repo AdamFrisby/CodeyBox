@@ -51,11 +51,10 @@ internal sealed class RecordingInVmSmokeGate : IInVmSmokeGate
 
     public Task<AgentAvailability> EnsureAvailableAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
-        SeenBaselineRefs.Add(baselineRef);
+        SeenBaselineRefs.Add(target.BaselineRef);
         SeenTargets.Add(target);
         return Task.FromResult(new AgentAvailability(true, null, null));
     }

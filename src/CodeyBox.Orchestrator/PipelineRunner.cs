@@ -399,9 +399,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
-        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, "work");
+        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, "work", item.BaselineImageRef);
         var smokeAvailability = await EnsureAgentSmokeAvailableAsync(
-            agentKind, item.BaselineImageRef, initialSmokeTarget, ct);
+            agentKind, initialSmokeTarget, ct);
         if (!smokeAvailability.Available)
         {
             var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
@@ -1617,6 +1617,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var seenKinds = new HashSet<AgentKind>();
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
+        var resolverSmokeTarget = ResolvePhaseSmokeTarget(project, "merge", item.BaselineImageRef);
 
         var resolverPrimary = primaryRunner;
         var resolverPrimaryModelId = item.ModelId;
@@ -1650,7 +1651,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is not null && classId is not null)
         {
             foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
-                item, project, ct, ResolvePhaseSmokeTarget(project, "merge")))
+                item, project, ct, resolverSmokeTarget))
             {
                 if (seenKinds.Contains(member.Agent))
                     continue;
@@ -1727,6 +1728,14 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             if (!seenKinds.Add(candidate.Kind))
                 return null;
+
+            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(candidate.Kind, resolverSmokeTarget, token);
+            if (!smokeAvailability.Available)
+            {
+                var reason = $"{candidate.Kind.Value}: smoke gate: {smokeAvailability.Reason ?? "unavailable"}";
+                skipReasons.Add(reason);
+                return reason;
+            }
 
             var quotaMember = BuildQuotaMember(candidate, configuredMember, modelId, reasoningMode);
             var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(candidate.Kind, quotaMember, token);
@@ -3549,7 +3558,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         // must not also record one per attempt — that would
                         // double-count and collapse the retry into a single row.
                         recordInvolvement: false,
-                        smokeTarget: SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget));
+                        smokeTarget: SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget, item.BaselineImageRef));
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -3917,9 +3926,10 @@ public sealed class PipelineRunner : IPipelineRunner
         // OrderedFallbackCandidatesAsync, so without this the preferred fast path
         // was the one hole left open.
         var auditSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
-            SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditAgent, required));
+            SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditAgent, required),
+            item.BaselineImageRef);
         var preferredAvailability = await EnsureAgentSmokeAvailableAsync(
-            preferredKind.Value, item.BaselineImageRef, auditSmokeTarget, ct);
+            preferredKind.Value, auditSmokeTarget, ct);
         var preferredAvailable = preferredAvailability.Available;
 
         var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
@@ -4121,7 +4131,6 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </summary>
     private async Task<AgentAvailability> EnsureAgentSmokeAvailableAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
@@ -4132,17 +4141,20 @@ public sealed class PipelineRunner : IPipelineRunner
         // IInVmSmokeGate was extracted to remove; re-reading would also degrade
         // the reason to a generic placeholder under gate-only wiring). Falls back
         // to a plain registry read, then to "available" when neither is wired
-        // (legacy callers preserve their prior behaviour). baselineRef pins the
-        // probe to the image this work item will clone (B1), not just the active
-        // baseline.
+        // (legacy callers preserve their prior behaviour). target.BaselineRef
+        // pins the probe to the image this work item will clone (B1), not just
+        // the active baseline.
         if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, baselineRef, target, ct);
+            return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);
         if (_availability is not null)
             return _availability.GetAvailability(kind);
         return new AgentAvailability(true, null, null);
     }
 
-    private static InVmSmokeSandboxTarget ResolvePhaseSmokeTarget(Project project, string phase)
+    private static InVmSmokeSandboxTarget ResolvePhaseSmokeTarget(
+        Project project,
+        string phase,
+        string? baselineRef = null)
     {
         var sandboxTarget = phase switch
         {
@@ -4154,7 +4166,7 @@ public sealed class PipelineRunner : IPipelineRunner
             _ => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
         };
 
-        return SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget);
+        return SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget, baselineRef);
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
@@ -4317,12 +4329,23 @@ public sealed class PipelineRunner : IPipelineRunner
                 ModelId = initialMemberOverride?.ModelId ?? item.ModelId,
                 ReasoningMode = initialMemberOverride?.ReasoningMode ?? item.ReasoningMode,
             };
+        var fallbackSmokeTarget = (smokeTarget ?? ResolvePhaseSmokeTarget(project, phase))
+            .WithBaselineRef(item.BaselineImageRef);
 
         // Single-attempt path when fallback is not wired (no class, no router).
         // The behaviour matches the legacy code: TerminalQuotaError bubbles out.
         if (_classRouter is null
             || (item.AgentClassId is null && project.DefaultAgentClass is null))
         {
+            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, fallbackSmokeTarget, ct);
+            if (!smokeAvailability.Available)
+            {
+                var reason = smokeAvailability.Reason ?? "unavailable";
+                throw new AgentUnavailableException(
+                    $"agent '{initialRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {reason}",
+                    $"{initialRunner.Kind.Value}: smoke gate: {reason}");
+            }
+
             try
             {
                 return await InvokeAttemptAsync(initialRunner, initialItem);
@@ -4342,7 +4365,6 @@ public sealed class PipelineRunner : IPipelineRunner
         DateTimeOffset? earliestReset = null;
         var currentRunner = initialRunner;
         var currentItem = initialItem;
-        var fallbackSmokeTarget = smokeTarget ?? ResolvePhaseSmokeTarget(project, phase);
         // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
         // ReasoningMode) so probe write-backs receive an accurate record. Only fall
         // back to a synthesised placeholder when the catalog has no matching row —
@@ -4362,8 +4384,10 @@ public sealed class PipelineRunner : IPipelineRunner
             string safeReason,
             bool quotaExhausted,
             DateTimeOffset? quotaResetAt,
-            Exception terminalException)
+            Exception terminalException,
+            bool smokeRejected = false)
         {
+            var fallbackKind = quotaExhausted ? "quota" : smokeRejected ? "smoke" : "timeout";
             if (quotaExhausted)
             {
                 // Cap the reset hint against a sane operator-visible ceiling. Reset
@@ -4485,6 +4509,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw new AgentClassExhaustedException(classId, phase, triedCount, earliestReset, msg);
                 }
 
+                if (smokeRejected)
+                    throw new AgentUnavailableException(
+                        $"all eligible member(s) of class '{classId}' were rejected by the in-VM smoke gate in phase '{phase}'; last rejection: {safeReason}",
+                        safeReason);
+
                 var timeoutPhase = phaseCancellation?.Phase ?? phase;
                 throw new PhaseCancellationException(
                     timeoutPhase,
@@ -4505,16 +4534,26 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             else
             {
-                AuditLog.AgentAttemptTimeoutFallback(
-                    item.Id, phase, iteration,
-                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
-                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
-                    reason: safeReason);
+                if (smokeRejected)
+                {
+                    _log.LogInformation(
+                        "Class '{ClassId}' member {FromAgent}/{FromModel} rejected by smoke gate; routing phase '{Phase}' to {ToAgent}/{ToModel}",
+                        classId, currentMember.Agent.Value, currentMember.ModelId ?? "(default)",
+                        phase, nextMember.Agent.Value, nextMember.ModelId ?? "(default)");
+                }
+                else
+                {
+                    AuditLog.AgentAttemptTimeoutFallback(
+                        item.Id, phase, iteration,
+                        fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                        toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                        reason: safeReason);
+                }
             }
             CodeyBoxMeters.AgentFallbacks.Add(1,
                 new KeyValuePair<string, object?>("from_agent", currentMember.Agent.Value),
                 new KeyValuePair<string, object?>("to_agent", nextMember.Agent.Value),
-                new KeyValuePair<string, object?>("kind", quotaExhausted ? "quota" : "timeout"),
+                new KeyValuePair<string, object?>("kind", fallbackKind),
                 new KeyValuePair<string, object?>("phase", phase));
 
             // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
@@ -4583,6 +4622,22 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
             triedCount++;
+
+            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
+            if (!smokeAvailability.Available)
+            {
+                var safeReason = SingleLineSummary(
+                    $"smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    quotaExhausted: false,
+                    quotaResetAt: null,
+                    terminalException: new AgentUnavailableException(
+                        $"agent '{currentRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {safeReason}",
+                        safeReason),
+                    smokeRejected: true);
+                continue;
+            }
 
             try
             {
@@ -6761,6 +6816,18 @@ public sealed class PipelineRunner : IPipelineRunner
             // Run the agent. We use the same agent identity/class as the
             // original work agent (this method's `runner` parameter); the
             // contract is `IAgentRunner.RunAsync`, identical to the work phase.
+            var smokeTarget = ResolvePhaseSmokeTarget(project, "rework", item.BaselineImageRef);
+            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(runner.Kind, smokeTarget, ct);
+            if (!smokeAvailability.Available)
+            {
+                return new ConflictReworkAgentOutcome(
+                    AgentSucceeded: false,
+                    NewTip: null,
+                    FailureReason: $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}",
+                    SemanticIncompatibleReason: null,
+                    FilesChanged: null, Insertions: null, Deletions: null);
+            }
+
             using var phase = new PhaseCancellation(ConflictReworkPhaseKey, ct, _opts.TimeProvider);
             phase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             phase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);

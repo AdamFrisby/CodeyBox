@@ -93,18 +93,21 @@ public sealed class InVmSmokeProbeServiceTests
     [Fact]
     public async Task SweepException_IsSwallowed_ExecuteAsyncCompletes()
     {
-        // ProbeAllAsync resolves the baseline ref before its per-probe try/catch,
-        // so a resolver fault escapes it; SafeSweepAsync must swallow it.
-        var provider = new ScriptedSandboxProvider(_ => new SandboxExecResult(0, "", ""));
-        var resolver = new StubBaselineResolver("base-A") { ThrowOnResolve = true };
-        var prober = BuildProber(provider, NewRegistry(), resolver, enabled: true);
-        var service = BuildService(prober);
+        // The prober now handles expected resolver/provisioning faults internally,
+        // so use a gate that throws directly from ProbeAllAsync. This pins the
+        // service boundary catch itself: removing SafeSweepAsync's catch would make
+        // ExecuteAsync fault here.
+        var gate = new ThrowingGate();
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance);
 
         await service.StartAsync(CancellationToken.None);
         await AwaitExecute(service); // would throw here if SafeSweepAsync let it escape
         await service.StopAsync(CancellationToken.None);
 
-        Assert.Equal(0, provider.CreateCount);
+        Assert.Equal(1, gate.ThrowCount);
     }
 
     [Fact]
@@ -189,7 +192,6 @@ public sealed class InVmSmokeProbeServiceTests
 
         public Task<AgentAvailability> EnsureAvailableAsync(
             AgentKind kind,
-            string? baselineRef,
             InVmSmokeSandboxTarget target,
             CancellationToken ct)
             => Task.FromResult(new AgentAvailability(true, null, null));
@@ -207,5 +209,29 @@ public sealed class InVmSmokeProbeServiceTests
             var winner = await Task.WhenAny(_reached.Task, Task.Delay(timeout));
             return winner == _reached.Task;
         }
+    }
+
+    private sealed class ThrowingGate : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+        public int ThrowCount { get; private set; }
+
+        public Task ProbeAllAsync(CancellationToken ct)
+        {
+            ThrowCount++;
+            throw new InvalidOperationException("sweep failed");
+        }
+
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) =>
+            ProbeAllAsync(ct);
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+            => Task.FromResult(new AgentAvailability(true, null, null));
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+            => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 }

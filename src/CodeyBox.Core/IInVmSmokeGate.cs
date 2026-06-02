@@ -3,9 +3,19 @@ namespace CodeyBox.Core;
 /// <summary>
 /// Sandbox target the in-VM smoke gate must probe. It mirrors the resolved
 /// dispatch sandbox target, not a process-wide smoke default, so the probe uses
-/// the same baseline clone path as the work item.
+/// the same baseline clone path as the work item. When <see cref="BaselineRef"/>
+/// is set it is the work item's pinned baseline image ref for this target; null
+/// means the gate resolves the active baseline for <see cref="NetworkProfile"/>
+/// and <see cref="Flavor"/>.
 /// </summary>
-public readonly record struct InVmSmokeSandboxTarget(string? NetworkProfile, SandboxProfileFlavor Flavor);
+public readonly record struct InVmSmokeSandboxTarget(
+    string? NetworkProfile,
+    SandboxProfileFlavor Flavor,
+    string? BaselineRef = null)
+{
+    public InVmSmokeSandboxTarget WithBaselineRef(string? baselineRef) =>
+        this with { BaselineRef = baselineRef };
+}
 
 /// <summary>
 /// Dispatch-path hook that guarantees an agent's in-sandbox CLI has been smoke
@@ -37,7 +47,7 @@ public interface IInVmSmokeGate
     /// gate.
     ///
     /// <para><b>What provisions a VM.</b> Only a cache <em>miss</em> for the
-    /// target <paramref name="baselineRef"/> provisions a VM. A cache hit never
+    /// target <paramref name="target"/>'s baseline ref provisions a VM. A cache hit never
     /// does — but a hit is not a no-op: the cached passing verdict is re-applied
     /// to the registry (reconciliation), so a cache-hit call can still <em>clear</em>
     /// an exclusion. An already-excluded agent normally short-circuits with no
@@ -61,7 +71,7 @@ public interface IInVmSmokeGate
     /// unclonable target is an inconclusive probe and should fail closed on the
     /// dispatch path rather than falling back to a live cloud-init launch.</para>
     ///
-    /// <para><paramref name="baselineRef"/> is the work item's pinned
+    /// <para><see cref="InVmSmokeSandboxTarget.BaselineRef"/> is the work item's pinned
     /// <see cref="WorkItem.BaselineImageRef"/> (B1 pinning) — the image the
     /// sandbox will be cloned from at dispatch. The gate probes and caches against
     /// that exact ref so a pass proves the CLI on the <em>pinned</em> image is
@@ -71,7 +81,6 @@ public interface IInVmSmokeGate
     /// </summary>
     Task<AgentAvailability> EnsureAvailableAsync(
         AgentKind kind,
-        string? baselineRef,
         InVmSmokeSandboxTarget target,
         CancellationToken ct);
 
