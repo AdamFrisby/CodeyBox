@@ -11,6 +11,9 @@ public static class SandboxConventions
     /// <summary>Cloned working tree the agent edits.</summary>
     public const string WorkDir = "/work";
 
+    /// <summary>Bare repository mount used as the sandbox clone origin and push target.</summary>
+    public const string RepoDir = "/repo";
+
     /// <summary>Tmpfs mount for credential files; ephemeral, never persisted.</summary>
     public const string CredentialsDir = "/run/codeybox/creds";
 

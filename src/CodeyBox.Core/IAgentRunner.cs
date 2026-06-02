@@ -145,10 +145,10 @@ public sealed record AgentResumeContext(
 ///
 /// <para>
 /// Implementations must declare whether their session-id extractor depends on
-/// id-bearing structured output, provide the extractor, expose the quota gate
-/// classifier that blocks hard quota/rate failures, and build the exact resume
-/// invocation. This keeps orchestration code from relying on an empty marker or
-/// protected base-class conventions.
+/// id-bearing structured output, provide the extractor, and expose the quota
+/// gate classifier that blocks hard quota/rate failures. The concrete CLI
+/// invocation remains an agent-layer concern so Core consumers do not depend on
+/// argv/environment/stdin process-launch details.
 /// </para>
 /// </summary>
 public interface ICliSessionResumableAgentRunner : IAgentRunner
@@ -172,18 +172,6 @@ public interface ICliSessionResumableAgentRunner : IAgentRunner
     /// run. Returns null when no usable id was emitted.
     /// </summary>
     string? TryExtractSessionId(string? stdout);
-
-    /// <summary>
-    /// Builds the same-sandbox invocation used to continue the crashed native
-    /// CLI session.
-    /// </summary>
-    AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        bool captureStructuredStream = false);
 }
 
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);

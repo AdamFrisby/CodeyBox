@@ -422,7 +422,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// than the original task prompt again. The conversation restored by the
     /// CLI carries the original user prompt and in-progress context.
     /// </summary>
-    public AgentInvocation BuildSessionResumeInvocation(
+    protected override AgentInvocation BuildSessionResumeInvocation(
         string sessionId,
         string prompt,
         AgentCredential? credential,

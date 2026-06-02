@@ -54,6 +54,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
 
     /// <summary>
+    /// Build the invocation used to continue a crashed native CLI session in
+    /// the same sandbox. Only subclasses that implement
+    /// <see cref="ICliSessionResumableAgentRunner"/> should override this hook.
+    /// </summary>
+    protected virtual AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => throw new NotSupportedException(
+            $"{Kind} declares CLI session resume but does not implement {nameof(BuildSessionResumeInvocation)}.");
+
+    /// <summary>
     /// Gives subclasses a chance to materialise non-argv CLI prerequisites
     /// immediately before invoking the binary. Returning a result short-circuits
     /// the run with that failure.
@@ -222,7 +237,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         return WithLivenessProbeNote(last, livenessProbe);
 
                     resumeAttempts++;
-                    current = sessionResumeContext.Capability.BuildSessionResumeInvocation(
+                    current = BuildSessionResumeInvocation(
                         capturedSessionId,
                         sessionResumeContext.Prompt,
                         sessionResumeContext.Credential,
@@ -313,16 +328,29 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                     "-c",
                     """
                     target=$1
+                    repo=$2
                     [ -n "$target" ] || exit 1
+                    [ -n "$repo" ] || exit 1
                     [ -d "$target" ] || exit 1
                     [ -x "$target" ] || exit 1
                     [ -w "$target" ] || exit 1
                     [ -e "$target/.git" ] || exit 1
                     git -C "$target" rev-parse --git-dir >/dev/null 2>&1 || exit 1
                     git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+                    [ -d "$repo" ] || exit 1
+                    [ -x "$repo" ] || exit 1
+                    [ -w "$repo" ] || exit 1
+                    [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = "true" ] || exit 1
+                    origin=$(git -C "$target" remote get-url origin 2>/dev/null) || exit 1
+                    case "$origin" in
+                        "$repo"|"$repo/"|file://"$repo"|file://"$repo/") ;;
+                        *) exit 1 ;;
+                    esac
+                    git -C "$target" ls-remote --exit-code origin HEAD >/dev/null 2>&1 || exit 1
                     """,
                     "codeybox-resume-liveness",
                     workingDirectory,
+                    SandboxConventions.RepoDir,
                 ],
                 WorkingDirectory = "/",
             }, ct).ConfigureAwait(false);
@@ -345,10 +373,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // non-resumable exit so an infrastructure problem doesn't look
             // like an ordinary agent failure.
             AuditLog.SessionResumeLivenessProbeFailed(Kind, ex.GetType().Name, ex.Message);
-            return new ResumeLivenessProbeResult(
-                IsAlive: false,
-                FailureKind: "probe-exception",
-                FailureDetail: $"{ex.GetType().Name}: {ex.Message}");
+            throw;
         }
 
         return result.Success

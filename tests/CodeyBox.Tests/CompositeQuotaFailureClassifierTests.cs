@@ -16,6 +16,12 @@ public sealed class CompositeQuotaFailureClassifierTests
     ]);
 
     [Fact]
+    public void QuotaClassification_Quota_RejectsNullDetection()
+    {
+        Assert.Throws<ArgumentNullException>(() => QuotaFailureClassification.Quota(null!));
+    }
+
+    [Fact]
     public void Detect_DispatchesByAgentKind_ClaudeRateLimit()
     {
         var detection = _classifier.Detect(AgentKind.Claude, "rate_limit_exceeded", stdout: null);

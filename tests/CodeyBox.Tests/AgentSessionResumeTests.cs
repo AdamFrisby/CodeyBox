@@ -71,6 +71,31 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":123}"""));
     }
 
+    [Fact]
+    public void Extractor_DoesNotScanPastByteLimit()
+    {
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var stdout = new string('x', ClaudeSessionIdExtractor.MaxScannedBytes)
+            + "\n"
+            + $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""";
+
+        Assert.Null(ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
+    [Fact]
+    public void Extractor_DoesNotScanPastJsonLineLimit()
+    {
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var prefix = string.Join('\n',
+            Enumerable.Range(0, ClaudeSessionIdExtractor.MaxScannedLines)
+                .Select(i => $$"""{"type":"assistant","message":"{{i}}"}"""));
+        var stdout = prefix
+            + "\n"
+            + $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""";
+
+        Assert.Null(ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
     // ── Resume configuration ─────────────────────────────────────────────────
 
     [Fact]
@@ -105,40 +130,15 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public void ClaudeRunner_BuildSessionResumeInvocation_RejectsEmptySessionId()
-    {
-        // Defensive guard: an extractor that mistakenly hands back an empty
-        // string would otherwise produce an invocation with `--resume ""` and
-        // the CLI would fail with an unhelpful argparse error. Reject up-front.
-        var runner = (ICliSessionResumableAgentRunner)new ClaudeAgentRunner();
-        Assert.Throws<ArgumentException>(() => runner.BuildSessionResumeInvocation(
-            sessionId: "",
-            prompt: "prompt",
-            credential: null));
-        Assert.Throws<ArgumentException>(() => runner.BuildSessionResumeInvocation(
-            sessionId: "   ",
-            prompt: "prompt",
-            credential: null));
-    }
-
-    [Fact]
     public void ClaudeRunner_DeclaresSessionResumeContract()
     {
         var runner = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(new ClaudeAgentRunner());
 
         Assert.True(runner.RequiresStructuredStreamForSessionId);
         Assert.NotNull(runner.SessionResumeQuotaClassifier);
-
-        var invocation = runner.BuildSessionResumeInvocation(
-            "e61b65a0-0f1e-4469-94f0-0be82d71b909",
-            "prompt",
-            credential: null,
-            captureStructuredStream: true);
-
-        Assert.Contains("--resume", invocation.Argv);
-        AssertFlagValue(invocation.Argv, "--resume", "e61b65a0-0f1e-4469-94f0-0be82d71b909");
-        AssertFlagValue(invocation.Argv, "--output-format", "stream-json");
-        Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, invocation.Stdin);
+        Assert.Equal("e61b65a0-0f1e-4469-94f0-0be82d71b909",
+            runner.TryExtractSessionId(
+                """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
     }
 
     [Theory]
@@ -215,7 +215,12 @@ public sealed class AgentSessionResumeTests : IDisposable
             e.Argv.Count > 0 && e.Argv[0] == "sh" && e.Argv.Contains("codeybox-resume-liveness"));
         Assert.Contains(".git", liveness.Argv[2], StringComparison.Ordinal);
         Assert.Contains("git -C", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Contains("repo=$2", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Contains("--is-bare-repository", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Contains("remote get-url origin", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Contains("ls-remote --exit-code origin HEAD", liveness.Argv[2], StringComparison.Ordinal);
         Assert.Equal("/work", liveness.Argv[4]);
+        Assert.Equal(SandboxConventions.RepoDir, liveness.Argv[5]);
         Assert.Equal("/", liveness.WorkingDirectory);
     }
 
@@ -455,6 +460,28 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaudeRunner_MissingRepoMountBeforeResume_DoesNotLaunchResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(
+            _ => new SandboxExecResult(1,
+                Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+                Stderr: "ECONNRESET"),
+            exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
+                ? new SandboxExecResult(1, "", "missing /repo")
+                : new SandboxExecResult(0, "", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.Contains("resume liveness probe rejected", result.Stderr);
+        Assert.Contains("missing /repo", result.Stderr);
+    }
+
+    [Fact]
     public async Task ClaudeRunner_SandboxDeathBeforeResume_ReturnsFailedResultForRedrive()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
@@ -475,7 +502,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_LivenessProbeFailure_ReturnsFailedResultForRedrive()
+    public async Task ClaudeRunner_LivenessProbeException_PropagatesInfrastructureFailure()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(
@@ -486,10 +513,11 @@ public sealed class AgentSessionResumeTests : IDisposable
                 ? throw new InvalidOperationException("liveness implementation failed")
                 : new SandboxExecResult(0, "", ""));
 
-        var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new ClaudeAgentRunner().RunAsync(
+                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
 
-        Assert.False(result.Success);
+        Assert.Contains("liveness implementation failed", ex.Message);
         Assert.Single(sandbox.ClaudeInvocations);
     }
 
@@ -645,6 +673,30 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task PlainStdoutResumableRunner_CrashWithSessionId_ResumesWithoutStructuredStream()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1, "plain-session-id:sid-123", "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var runner = new PlainStdoutResumableTestRunner();
+        var result = await runner.RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            captureStructuredStream: false);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
+        AssertFlagValue(sandbox.ClaudeInvocations[1], "--resume", "sid-123");
+        Assert.Equal(PlainStdoutResumableTestRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
+    }
+
+    [Fact]
     public async Task ClaudeRunner_SessionIdCapturedOnFirstAttempt_IsReusedAcrossLaterCrashes()
     {
         // A second attempt that crashes WITHOUT emitting a fresh init line
@@ -792,6 +844,48 @@ public sealed class AgentSessionResumeTests : IDisposable
             string? reasoningMode = null,
             bool captureStructuredStream = false)
             => new(["fake-agent", "run"], Stdin: prompt);
+    }
+
+    private sealed class PlainStdoutResumableTestRunner : CliAgentRunnerBase, ICliSessionResumableAgentRunner
+    {
+        public const string SessionResumePrompt = "continue";
+
+        public override AgentKind Kind { get; } = new("opencode");
+
+        public bool RequiresStructuredStreamForSessionId => false;
+
+        public IQuotaFailureClassifier SessionResumeQuotaClassifier { get; } = new NoQuotaFailureClassifier();
+
+        public string? TryExtractSessionId(string? stdout)
+            => stdout?.Contains("plain-session-id:sid-123", StringComparison.Ordinal) == true
+                ? "sid-123"
+                : null;
+
+        protected override AgentInvocation BuildInvocation(
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            bool captureStructuredStream = false)
+            => new(["fake-agent", "run"], Stdin: prompt);
+
+        protected override AgentInvocation BuildSessionResumeInvocation(
+            string sessionId,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            bool captureStructuredStream = false)
+            => new(["fake-agent", "--resume", sessionId], Stdin: SessionResumePrompt);
+
+        private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
+        {
+            public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+                => QuotaFailureClassification.None;
+
+            public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+                => null;
+        }
     }
 
     private sealed class ThrowingQuotaDetector(string throwAt) : IAgentQuotaFailureDetector

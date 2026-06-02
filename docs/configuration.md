@@ -188,6 +188,24 @@ the live admission gate.
 
 ---
 
+## `PipelineTuning`
+
+Hot-reloadable retry and recovery bounds used by pipeline execution.
+
+```json
+"PipelineTuning": {
+  "AgentSuspendMaxRetries": 1,
+  "AgentSessionResumeMaxAttempts": 2
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count after suspend-related transient exits. |
+| `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
+
+---
+
 ## `WorkerPoolHealthWatchdog`
 
 Detects a dispatcher/pool stall where worker slots are free, dependency-ready

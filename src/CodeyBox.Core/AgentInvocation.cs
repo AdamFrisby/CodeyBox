@@ -1,9 +1,9 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Sandbox CLI invocation built by an agent runner. Public so optional runner
-/// capabilities can describe their resume command shape without depending on
-/// <c>CliAgentRunnerBase</c> internals.
+/// Sandbox CLI invocation built by an agent runner. Consumers call runner
+/// methods; argv/environment/stdin construction remains owned by concrete
+/// agent implementations.
 /// </summary>
 public sealed record AgentInvocation(
     IReadOnlyList<string> Argv,

@@ -96,6 +96,23 @@ public sealed class AgentSuspendResilienceRetryTests
         Assert.True(AgentSuspendResilience.ShouldRetry(AgentKind.Claude, classification, exitCode));
     }
 
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(52, true)]
+    [InlineData(56, true)]
+    [InlineData(92, true)]
+    [InlineData(0, false)]
+    [InlineData(2, false)]
+    [InlineData(51, false)]
+    [InlineData(57, false)]
+    [InlineData(91, false)]
+    [InlineData(93, false)]
+    [InlineData(137, false)]
+    public void IsSuspendRelatedExitCode_ReturnsExpectedBoundaryValues(int exitCode, bool expected)
+    {
+        Assert.Equal(expected, AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode));
+    }
+
     [Fact]
     public void ShouldRetry_UnknownWithUnrelatedExitCode_ReturnsFalse()
     {

@@ -744,15 +744,6 @@ internal sealed class CliSessionResumableScriptedAgent(IEnumerable<MergeStrategy
             ? null
             : "scripted-session";
 
-    public AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        bool captureStructuredStream = false)
-        => new(["scripted-agent", "--resume", sessionId], Stdin: prompt);
-
     private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
     {
         public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)

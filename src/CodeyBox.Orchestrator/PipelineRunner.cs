@@ -2872,17 +2872,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 projectId: item.ProjectId,
                 stdout: agentResult.Stdout);
 
-            // Truncate agent-controlled output to prevent unbounded content from
-            // reaching the audit log via the exception message chain.
-            const int MaxOutputBytes = 4096;
-            static string Truncate(string s) =>
-                s.Length <= MaxOutputBytes ? s : s[..MaxOutputBytes] + $"… [{s.Length - MaxOutputBytes} bytes truncated]";
-
+            // Redact and truncate agent-controlled output before it reaches
+            // LastError, audit persistence, webhooks, or API responses via the
+            // exception message chain.
             var detail = string.Join("\n",
                 new[] {
-                    $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
-                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{Truncate(agentResult.Stderr)}" : null,
-                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{Truncate(agentResult.Stdout)}" : null,
+                    $"Agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
                 }.Where(s => s is not null));
             throw new InvalidOperationException(detail);
         }
@@ -3793,6 +3790,12 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         const int max = 2000;
         return string.IsNullOrEmpty(s) ? null : s.Length <= max ? s : "…" + s[^max..];
+    }
+
+    private static string RedactAndTruncateAgentDetail(string s)
+    {
+        const int MaxOutputBytes = 4096;
+        return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
     }
 
     /// <summary>
@@ -6937,7 +6940,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                throw new InvalidOperationException($"Merge agent {chosenMergeRunner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+                var detail = string.Join("\n",
+                    new[] {
+                        $"Merge agent {chosenMergeRunner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                        !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
+                        !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
+                    }.Where(s => s is not null));
+                throw new InvalidOperationException(detail);
             }
 
             // Read suggestions.json before cleaning the working tree, then remove it
