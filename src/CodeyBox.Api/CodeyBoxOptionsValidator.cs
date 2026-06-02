@@ -1,3 +1,4 @@
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
@@ -26,14 +27,18 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:Shutdown:SandboxResumeMode must be Background or Blocking");
         }
 
-        if (options.Shutdown.SandboxResumeTimeout <= TimeSpan.Zero)
+        if (options.Shutdown.SandboxResumeTimeout <= TimeSpan.Zero
+            || options.Shutdown.SandboxResumeTimeout > SandboxResumeOnStartupService.MaximumResumeTimeout)
         {
-            failures.Add("CodeyBox:Shutdown:SandboxResumeTimeout must be a positive TimeSpan");
+            failures.Add(
+                $"CodeyBox:Shutdown:SandboxResumeTimeout must be a positive TimeSpan <= {SandboxResumeOnStartupService.MaximumResumeTimeout}");
         }
 
-        if (options.Shutdown.SandboxAdoptionDeadlineSeconds <= 0)
+        if (options.Shutdown.SandboxAdoptionDeadlineSeconds <= 0
+            || options.Shutdown.SandboxAdoptionDeadlineSeconds > (int)SandboxResumeOnStartupService.MaximumAdoptionDeadline.TotalSeconds)
         {
-            failures.Add("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds must be > 0");
+            failures.Add(
+                $"CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds must be > 0 and <= {(int)SandboxResumeOnStartupService.MaximumAdoptionDeadline.TotalSeconds}");
         }
 
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));

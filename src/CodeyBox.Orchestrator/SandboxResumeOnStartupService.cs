@@ -101,14 +101,22 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     /// </summary>
     public static readonly TimeSpan DefaultResumeTimeout = SuspendTimeoutPolicy.DefaultFloor;
 
+    /// <summary>
+    /// Hard ceiling for startup resume/adoption waits. The operator-facing
+    /// values are configurable, but startup recovery must stay bounded.
+    /// </summary>
+    public static readonly TimeSpan MaximumResumeTimeout = TimeSpan.FromHours(2);
+    public static readonly TimeSpan MaximumAdoptionDeadline = TimeSpan.FromHours(2);
+
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
     private readonly IStartupSandboxResumeCompletionSink _barrier;
+    private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
-    private int _resumeStarted;
+    private bool _resumeStarted;
 
     public SandboxResumeOnStartupService(
         ISandboxProvider? provider,
@@ -197,20 +205,24 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     private Task StartResumeOnceAsync(bool background, CancellationToken ct)
     {
-        if (Interlocked.Exchange(ref _resumeStarted, 1) != 0)
-            return background ? Task.CompletedTask : _resumeTask ?? Task.CompletedTask;
-
-        if (background)
+        lock (_resumeStartGate)
         {
-            _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            _resumeTask = Task.Run(
-                () => ResumeAllAndSignalAsync(_backgroundCts.Token),
-                CancellationToken.None);
-            return Task.CompletedTask;
-        }
+            if (_resumeStarted)
+                return background ? Task.CompletedTask : _resumeTask ?? Task.CompletedTask;
 
-        _resumeTask = ResumeAllAndSignalAsync(ct);
-        return _resumeTask;
+            _resumeStarted = true;
+            if (background)
+            {
+                _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                _resumeTask = Task.Run(
+                    () => ResumeAllAndSignalAsync(_backgroundCts.Token),
+                    CancellationToken.None);
+                return Task.CompletedTask;
+            }
+
+            _resumeTask = ResumeAllAndSignalAsync(ct);
+            return _resumeTask;
+        }
     }
 
     private async Task ResumeAllAndSignalAsync(CancellationToken ct)
@@ -240,10 +252,10 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             ? raw.MaxParallelResumes
             : DefaultMaxParallelResumes;
         var resumeTimeout = raw.ResumeTimeout > TimeSpan.Zero
-            ? raw.ResumeTimeout
+            ? Cap(raw.ResumeTimeout, MaximumResumeTimeout)
             : DefaultResumeTimeout;
         var adoptionDeadline = raw.AdoptionDeadline > TimeSpan.Zero
-            ? raw.AdoptionDeadline
+            ? Cap(raw.AdoptionDeadline, MaximumAdoptionDeadline)
             : DefaultAdoptionDeadline;
         var mode = Enum.IsDefined(raw.Mode)
             ? raw.Mode
@@ -257,6 +269,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             Mode = mode,
         };
     }
+
+    private static TimeSpan Cap(TimeSpan value, TimeSpan maximum)
+        => value <= maximum ? value : maximum;
 
     internal async Task ResumeAllAsync(CancellationToken ct)
     {

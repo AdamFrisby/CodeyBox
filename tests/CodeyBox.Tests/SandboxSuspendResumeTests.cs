@@ -939,6 +939,29 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task AdoptionDeadline_AboveMaximum_IsCappedBeforeProvider()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-dl-max",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/max.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = new SandboxResumeOnStartupService(
+            provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            adoptionDeadline: SandboxResumeOnStartupService.MaximumAdoptionDeadline + TimeSpan.FromTicks(1));
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-dl-max", adoption.VmName);
+        Assert.Equal(SandboxResumeOnStartupService.MaximumAdoptionDeadline, adoption.Deadline);
+    }
+
+    [Fact]
     public async Task AdoptionDeadline_DefaultValue_IsUsedWhenNotConfigured()
     {
         // Without an explicit adoptionDeadline the constructor must fall back
