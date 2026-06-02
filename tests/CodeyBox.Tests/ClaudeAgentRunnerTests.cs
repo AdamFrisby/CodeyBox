@@ -192,8 +192,10 @@ public sealed class ClaudeAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        // First exec should be the bash hook that writes the creds file.
-        var prep = sandbox.AllExecs[0];
+        // The bash hook should write the creds file; the runner may probe
+        // `claude --help` first to decide whether session recovery can capture
+        // a structured init event.
+        var prep = Assert.Single(sandbox.AllExecs, IsBashInvocation);
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
@@ -216,8 +218,9 @@ public sealed class ClaudeAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential);
 
-        Assert.Single(sandbox.AllExecs);
-        Assert.Equal("claude", sandbox.AllExecs[0].Argv[0]);
+        Assert.DoesNotContain(sandbox.AllExecs, IsBashInvocation);
+        var agent = Assert.Single(sandbox.AllExecs, IsClaudeAgentInvocation);
+        Assert.Equal("claude", agent.Argv[0]);
     }
 
     [Fact]
@@ -228,8 +231,9 @@ public sealed class ClaudeAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
-        Assert.Single(sandbox.AllExecs);
-        Assert.Equal("claude", sandbox.AllExecs[0].Argv[0]);
+        Assert.DoesNotContain(sandbox.AllExecs, IsBashInvocation);
+        var agent = Assert.Single(sandbox.AllExecs, IsClaudeAgentInvocation);
+        Assert.Equal("claude", agent.Argv[0]);
     }
 
     [Fact]
@@ -252,7 +256,8 @@ public sealed class ClaudeAgentRunnerTests
 
         Assert.False(result.Success);
         Assert.Contains("claude auth", result.Summary);
-        Assert.Single(sandbox.AllExecs);
+        Assert.Single(sandbox.AllExecs, IsBashInvocation);
+        Assert.DoesNotContain(sandbox.AllExecs, IsClaudeAgentInvocation);
     }
 
     // ── Rotation pusher registration ──────────────────────────────────────────
@@ -327,6 +332,13 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Contains(typeof(ITextOnlyAgentRunner), interfaces);
     }
 
+    private static bool IsBashInvocation(SandboxExec exec) =>
+        exec.Argv.Count > 0 && exec.Argv[0] == "bash";
+
+    private static bool IsClaudeAgentInvocation(SandboxExec exec) =>
+        exec.Argv.Count > 0
+        && exec.Argv[0] == "claude"
+        && exec.Argv.Contains("--print");
 }
 
 internal sealed class RecordingRotationPusher : IClaudeTokenRotationPusher

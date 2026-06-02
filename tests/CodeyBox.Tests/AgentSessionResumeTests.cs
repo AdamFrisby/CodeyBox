@@ -63,6 +63,8 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant"}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","session_id":""}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"result","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":"not-a-uuid"}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":123}"""));
     }
@@ -126,6 +128,17 @@ public sealed class AgentSessionResumeTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("terminal")]
+    [InlineData("scope")]
+    [InlineData("detect")]
+    public void QuotaGate_DetectorExceptions_BlockResume(string throwAt)
+    {
+        var detector = new ThrowingQuotaDetector(throwAt);
+
+        Assert.False(SessionResumeQuotaGate.AllowsResume(detector, stderr: "stderr", stdout: "stdout"));
+    }
+
     // ── Integration with ClaudeAgentRunner ────────────────────────────────────
 
     [Fact]
@@ -180,19 +193,26 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_UnstructuredStdoutSessionId_DoesNotResume()
+    public async Task ClaudeRunner_CrashWithCapturedSessionId_RetriesWhenStreamCaptureNotRequested()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
-        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
-            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-            Stderr: ""));
+        var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1,
+                Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                Stderr: "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: false);
 
-        Assert.False(result.Success);
-        Assert.Single(sandbox.ClaudeInvocations);
-        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        AssertFlagValue(sandbox.ClaudeInvocations[0], "--output-format", "stream-json");
+        Assert.Contains("--verbose", sandbox.ClaudeInvocations[0]);
+        var resumeIdx = IndexOf(sandbox.ClaudeInvocations[1], "--resume");
+        Assert.True(resumeIdx >= 0, "production resume path must not depend on optional AgentStreams capture");
+        Assert.Equal(sessionId, sandbox.ClaudeInvocations[1][resumeIdx + 1]);
     }
 
     [Fact]
@@ -593,5 +613,19 @@ public sealed class AgentSessionResumeTests : IDisposable
             string? reasoningMode = null,
             bool captureStructuredStream = false)
             => new(["fake-agent", "run"], Stdin: prompt);
+    }
+
+    private sealed class ThrowingQuotaDetector(string throwAt) : IAgentQuotaFailureDetector
+    {
+        public AgentKind Kind => AgentKind.Claude;
+
+        public bool IsTerminalNonQuotaCrash(string? stderr, string? stdout) =>
+            throwAt == "terminal" ? throw new InvalidOperationException("terminal hook failed") : false;
+
+        public string? ScopeStdoutForQuotaDetection(string? stdout) =>
+            throwAt == "scope" ? throw new InvalidOperationException("scope hook failed") : stdout;
+
+        public QuotaDetection? Detect(string? stderr, string? stdout) =>
+            throwAt == "detect" ? throw new InvalidOperationException("detect hook failed") : null;
     }
 }

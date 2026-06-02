@@ -66,9 +66,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// <summary>
     /// Inspects a (typically structured-stream) stdout payload for the agent
     /// CLI's session identifier. Returns <c>null</c> when no id was captured —
-    /// e.g. structured stream capture was disabled, or the crash happened
-    /// before the CLI emitted its init event. Without a captured id, session
-    /// resume is impossible and the loop falls back to the legacy retry path.
+    /// e.g. the runner could not enable its id-bearing output mode, or the crash
+    /// happened before the CLI emitted its init event. Without a captured id,
+    /// session resume is impossible and the loop falls back to the legacy retry
+    /// path.
     /// </summary>
     protected virtual string? TryExtractSessionId(string? stdout) => null;
 
@@ -217,7 +218,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // managed to emit on stdout before crashing. Best-effort: a parse
             // failure or absent id leaves the previously-captured id (if any)
             // in place.
-            if (sessionResumeContext is { CaptureStructuredStream: true }
+            if (sessionResumeContext is not null
                 && TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
             {
                 capturedSessionId = freshId;

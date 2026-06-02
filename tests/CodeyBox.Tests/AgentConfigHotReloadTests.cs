@@ -1678,7 +1678,7 @@ public sealed class AgentConfigHotReloadTests
             initialFailures: 1, sanitizerExitsZero: true);
         var result1 = await runner.RunAsync(sandbox1, "/work", "prompt", credential: null);
         Assert.True(result1.Success);
-        Assert.True(sandbox1.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude") >= 2);
+        Assert.True(sandbox1.AllExecs.Count(IsClaudeAgentInvocation) >= 2);
 
         // Hot-reload: disable the sanitizer via the shared config object.
         sanitizerConfig.Enabled = false;
@@ -1688,8 +1688,13 @@ public sealed class AgentConfigHotReloadTests
             initialFailures: 1, sanitizerExitsZero: true);
         var result2 = await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
         Assert.False(result2.Success);
-        Assert.Equal(1, sandbox2.AllExecs.Count(e => e.Argv.Count > 0 && e.Argv[0] == "claude"));
+        Assert.Equal(1, sandbox2.AllExecs.Count(IsClaudeAgentInvocation));
     }
+
+    private static bool IsClaudeAgentInvocation(SandboxExec exec) =>
+        exec.Argv.Count > 0
+        && exec.Argv[0] == "claude"
+        && !exec.Argv.Contains("--help");
 
     // ── PipelineTuning hot-reload ────────────────────────────────────────────
 

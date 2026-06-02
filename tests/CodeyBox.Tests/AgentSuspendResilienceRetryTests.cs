@@ -130,7 +130,16 @@ public sealed class AgentSuspendResilienceRetryTests
         public string Id => "codeybox-retry-test";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
-            => Task.FromResult(onExec());
+        {
+            if (exec.Argv.Count > 0
+                && exec.Argv[0] == "claude"
+                && exec.Argv.Contains("--help"))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "--output-format stream-json --verbose", string.Empty));
+            }
+
+            return Task.FromResult(onExec());
+        }
 
         public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
             => throw new NotSupportedException();

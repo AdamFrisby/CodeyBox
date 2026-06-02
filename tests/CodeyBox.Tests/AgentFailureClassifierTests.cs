@@ -54,6 +54,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Theory]
@@ -64,6 +65,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Theory]
@@ -76,6 +78,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
@@ -121,6 +124,7 @@ public sealed class AgentFailureClassifierTests
         var c = AgentFailureClassifier.Classify(
             stderr: "API Error: 401 Unauthorized; subsequent ECONNRESET");
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
@@ -128,6 +132,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: null);
         Assert.Equal(AgentFailureKind.Unknown, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
@@ -136,6 +141,7 @@ public sealed class AgentFailureClassifierTests
         IAgentRunner runner = new ProbeOnlyRunner();
         var c = runner.ClassifyFailure(new AgentResult(true, "ok", "", null));
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
