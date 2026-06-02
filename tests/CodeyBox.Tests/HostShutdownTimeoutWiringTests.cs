@@ -216,9 +216,44 @@ public sealed class HostShutdownTimeoutWiringTests
         await shutdownService.StoppingAsync(CancellationToken.None);
 
         Assert.True(sandbox.SuspendCalled);
+        Assert.False(sandbox.StopAndPreserveCalled);
         var after = await store.GetAsync(item.Id);
         Assert.Equal("vm-from-di", after!.SuspendedVmName);
         Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task SandboxSuspendOnShutdownService_FromDi_DefaultsToStop_WhenModeConfigAbsent()
+    {
+        var fakeProvider = new FakeSuspendingProvider();
+        using var factory = new SandboxShutdownServiceWiringFactory(fakeProvider);
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var shutdownService = factory.Services.GetServices<IHostedService>()
+            .OfType<SandboxSuspendOnShutdownService>()
+            .Single();
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+        await store.CreateAsync(item);
+
+        var sandbox = new FakeSuspendableSandbox("vm-default-stop");
+        fakeProvider.Register(item.Id, sandbox);
+
+        await shutdownService.StoppingAsync(CancellationToken.None);
+
+        Assert.False(sandbox.SuspendCalled);
+        Assert.True(sandbox.StopAndPreserveCalled);
+        var after = await store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
     }
 
     [Fact]
@@ -303,13 +338,13 @@ public sealed class HostShutdownTimeoutWiringTests
     private sealed class SandboxShutdownServiceWiringFactory : WebApplicationFactory<Program>
     {
         private readonly ISandboxProvider _provider;
-        private readonly SandboxTeardownMode _teardownMode;
+        private readonly SandboxTeardownMode? _teardownMode;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-shutdownsvc-{Guid.NewGuid():N}.db");
 
         public SandboxShutdownServiceWiringFactory(
             ISandboxProvider provider,
-            SandboxTeardownMode teardownMode)
+            SandboxTeardownMode? teardownMode = null)
         {
             _provider = provider;
             _teardownMode = teardownMode;
@@ -322,7 +357,7 @@ public sealed class HostShutdownTimeoutWiringTests
             {
                 cfg.Sources.Clear();
                 var tmp = Path.GetTempPath();
-                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                var values = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
@@ -330,8 +365,10 @@ public sealed class HostShutdownTimeoutWiringTests
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
-                    ["CodeyBox:Shutdown:SandboxTeardownMode"] = _teardownMode.ToString(),
-                });
+                };
+                if (_teardownMode is { } teardownMode)
+                    values["CodeyBox:Shutdown:SandboxTeardownMode"] = teardownMode.ToString();
+                cfg.AddInMemoryCollection(values);
             });
             builder.ConfigureTestServices(services =>
             {
@@ -404,16 +441,22 @@ public sealed class HostShutdownTimeoutWiringTests
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox
+    private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox, IPreemptibleSandbox
     {
         public string Id { get; } = id;
         public bool SuspendCalled { get; private set; }
+        public bool StopAndPreserveCalled { get; private set; }
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => throw new NotSupportedException();
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         public Task SuspendAsync(CancellationToken ct = default)
         {
             SuspendCalled = true;
+            return Task.CompletedTask;
+        }
+        public Task StopAndPreserveAsync(CancellationToken ct = default)
+        {
+            StopAndPreserveCalled = true;
             return Task.CompletedTask;
         }
     }

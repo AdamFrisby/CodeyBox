@@ -2094,17 +2094,15 @@ public sealed class PipelineRunner : IPipelineRunner
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let
             // the legacy git-checkpoint + multipass-stop path race that
-            // in-flight suspend. Stop mode intentionally does NOT set shutdown
-            // ownership: the VM must stay available here so this catch block can
-            // write the preempt checkpoint before StopAndPreserveAsync runs.
-            // Dispose mode still sets the ownership flag because the VM is being
-            // destroyed and in-VM checkpoint commands would fault. We re-read the
-            // store under CancellationToken.None (ct is already cancelled by host
-            // shutdown): on the per-VM suspend-timeout path the handler has
-            // persisted SuspendedVmName and returned while multipassd is still
-            // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
-            // still be false on the sandbox instance, so the persisted mapping is
-            // the authoritative late signal.
+            // in-flight suspend. Stop and Dispose modes set the ownership flag
+            // because the VM is already stopped or being destroyed and in-VM
+            // checkpoint commands would fault. We re-read the store under
+            // CancellationToken.None (ct is already cancelled by host shutdown):
+            // on the per-VM suspend-timeout path the handler has persisted
+            // SuspendedVmName and returned while multipassd is still writing
+            // the snapshot and IsSuspended / IsOwnedByShutdownHandler may still
+            // be false on the sandbox instance, so the persisted mapping is the
+            // authoritative late signal.
             if (sandbox is ISuspendableSandbox suspendable)
             {
                 var suspendHandled = suspendable.IsOwnedByShutdownHandler;

@@ -3209,14 +3209,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// <see cref="IsSuspended"/>; set explicitly by
     /// <see cref="MarkOwnedByShutdownHandler"/> for teardown modes whose
     /// recovery path does not go through SuspendAsync but still cannot run the
-    /// in-VM checkpoint flow. Stop mode deliberately leaves this false so
-    /// PipelineRunner can write a PreemptCheckpoint before stopping the VM.
+    /// in-VM checkpoint flow against a stopped or deleted VM.
     /// </summary>
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
 
     /// <summary>
-    /// Called by <c>SandboxSuspendOnShutdownService</c> before destructive
-    /// teardown modes begin so PipelineRunner's shutdown catch sees the
+    /// Called by <c>SandboxSuspendOnShutdownService</c> before Stop or Dispose
+    /// teardown begins so PipelineRunner's shutdown catch sees the
     /// "skip in-VM checkpoint" signal even though the suspend path was not
     /// taken. Idempotent; safe to call multiple times.
     /// </summary>

@@ -1981,9 +1981,9 @@ builder.Services.AddHostedService(sp =>
     return watchdog;
 });
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
-// operator-selected SandboxTeardownMode. Stop is the default and leaves active
-// VMs to PipelineRunner's existing preempt-checkpoint + preserve path; Suspend
-// remains opt-in and writes resume bookkeeping so the next process can reattach.
+// operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
+// bookkeeping so the next process can reattach; Stop is the default and
+// cleanly stops active VMs without writing RAM snapshots.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
 // to background mode so a wedged multipassd cannot keep Kestrel offline;
 // OrchestratorService waits for startup recovery input before its dead-worker
@@ -3062,9 +3062,9 @@ namespace CodeyBox.Api
         /// Hot-reloadable: read by the shutdown handler when graceful shutdown
         /// begins, so an operator can switch modes without restarting first.
         /// Default <see cref="SandboxTeardownMode.Stop"/>: avoid RAM snapshots
-        /// and recover through the preempt-checkpoint flow, which stops and
-        /// preserves the VM after the checkpoint is written. Operators who
-        /// explicitly want RAM-state preservation can opt in to
+        /// and preserve the VM disk through a clean stop during the shutdown
+        /// lifecycle sweep. Operators who explicitly want RAM-state
+        /// preservation can opt in to
         /// <see cref="SandboxTeardownMode.Suspend"/>; it freezes RAM via
         /// <c>multipass suspend</c> and resumes on next startup, but can hit the
         /// qemu disk-image write-lock wedge that caused the 2026-05-29 incident.

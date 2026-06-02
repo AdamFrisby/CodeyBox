@@ -255,13 +255,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     // ── Stop / Dispose teardown modes ────────────────────────────────────────
 
     [Fact]
-    public async Task ShutdownHandler_StopMode_DefersToPipelinePreemptCheckpoint_NotSuspend()
+    public async Task ShutdownHandler_StopMode_CallsStopAndPreserve_NotSuspend()
     {
-        // The R8.1 alternative teardown mode the post-incident review
-        // recommended: multipass stop is faster and far less likely to wedge
-        // multipassd than suspend. The lifecycle service must leave the VM live
-        // for PipelineRunner's host-shutdown catch so it can write a
-        // PreemptCheckpoint before StopAndPreserveAsync runs.
+        // The R8.1 default teardown mode the post-incident review recommended:
+        // multipass stop is faster and far less likely to wedge multipassd than
+        // suspend, and the lifecycle service must apply it to every active
+        // suspendable sandbox in its shutdown snapshot.
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -277,12 +276,15 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Stop mode must not call SuspendAsync");
-        Assert.False(sandbox.StopAndPreserveCalled,
-            "Stop mode must leave StopAndPreserveAsync to PipelineRunner after preempt checkpoint");
-        Assert.False(sandbox.OwnedByShutdownHandler,
-            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path");
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Stop mode must stop and preserve every active suspendable sandbox");
+        Assert.False(sandbox.DisposeCalled, "Stop mode must not dispose preemptible sandboxes");
+        Assert.True(sandbox.OwnedByShutdownHandler,
+            "Stop mode must suppress PipelineRunner's in-VM preempt-checkpoint path against the stopped VM");
+        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.StopAndPreserveOrder,
+            "Stop mode must mark shutdown ownership before stopping the sandbox");
         // Stop mode does not persist SuspendedVmName: the work item recovers via
-        // its preempt-checkpoint, same as a non-suspending provider would.
+        // the standard stopped-sandbox recovery path, not suspend-resume.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
     }
@@ -325,7 +327,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     public async Task ShutdownHandler_DisposeMode_CallsDispose_NotSuspend()
     {
         // The simplest teardown mode against lock contention: delete --purge
-        // outright. No resume bookkeeping is written; recovery via preempt-checkpoint.
+        // outright. No resume bookkeeping is written.
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -341,8 +343,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Dispose mode must not call SuspendAsync");
+        Assert.False(sandbox.StopAndPreserveCalled, "Dispose mode must not call StopAndPreserveAsync");
         Assert.True(sandbox.DisposeCalled,
             "Dispose mode should DisposeAsync the sandbox");
+        Assert.True(sandbox.OwnedByShutdownHandler,
+            "Dispose mode must suppress PipelineRunner's in-VM preempt-checkpoint path against the deleted VM");
+        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.DisposeOrder,
+            "Dispose mode must mark shutdown ownership before disposal");
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
     }
@@ -884,11 +891,16 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public bool DisposeCalled { get; private set; }
         public bool SawDispatchPaused { get; private set; }
         public bool OwnedByShutdownHandler { get; private set; }
+        public int MarkOwnedOrder { get; private set; }
+        public int StopAndPreserveOrder { get; private set; }
+        public int DisposeOrder { get; private set; }
+        private int _order;
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
         public ValueTask DisposeAsync()
         {
             DisposeCalled = true;
+            DisposeOrder = ++_order;
             return ValueTask.CompletedTask;
         }
         public Task SuspendAsync(CancellationToken ct = default)
@@ -901,10 +913,15 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         {
             if (_isDispatchPaused?.Invoke() == true) SawDispatchPaused = true;
             StopAndPreserveCalled = true;
+            StopAndPreserveOrder = ++_order;
             return Task.CompletedTask;
         }
         public bool IsOwnedByShutdownHandler => OwnedByShutdownHandler;
-        public void MarkOwnedByShutdownHandler() => OwnedByShutdownHandler = true;
+        public void MarkOwnedByShutdownHandler()
+        {
+            OwnedByShutdownHandler = true;
+            MarkOwnedOrder = ++_order;
+        }
     }
 
     private sealed class ReconcilingFakeProvider : ISandboxProvider, ISuspendingSandboxProvider
