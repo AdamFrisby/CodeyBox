@@ -26,9 +26,11 @@ public sealed record InVmSmokeOptions
     public IReadOnlyList<string> AllowedHosts { get; init; } = [];
 
     /// <summary>
-    /// Host network profile used both to attach the probe sandbox and to
-    /// resolve the active baseline ref (baselines are keyed by profile+flavor).
-    /// Null = resolve against the provider's default.
+    /// Optional host network profile override for project-less probe paths
+    /// such as manual force-probes and legacy sweeps. Dispatch passes an
+    /// explicit project phase target; when both this option and a project target
+    /// are absent, the prober treats the baseline target as unclonable rather
+    /// than falling back to a live launch.
     /// </summary>
     public string? NetworkProfile { get; init; }
 

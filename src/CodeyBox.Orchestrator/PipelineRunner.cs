@@ -4001,15 +4001,6 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Returns <c>(true, reason)</c> when the candidate passes both the
-    /// observed-failure breaker and the live quota probe (reason is a short
-    /// human-readable description like "available (80.0%)" or
-    /// "quota unknown; fail-open"); otherwise returns <c>(false, reason)</c>
-    /// describing which gate rejected the candidate. Mirrors the gating logic
-    /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
-    /// on what counts as "available".
-    /// </summary>
-    /// <summary>
     /// Reads the operator's local spend budget for (<paramref name="kind"/>,
     /// <paramref name="modelId"/>) and classifies it for the mid-iteration fallback
     /// gates. Returns the budget <c>AvailablePct</c> (or <c>-1</c> when no budget is

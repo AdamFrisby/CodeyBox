@@ -284,6 +284,9 @@ builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 builder.Services.AddSingleton(sp =>
     sp.GetRequiredService<ISandboxProvider>() as IBaselineImageResolver
         ?? NullBaselineImageResolver.Instance);
+builder.Services.AddSingleton(sp =>
+    sp.GetRequiredService<ISandboxProvider>() as IBaselineImageProvisioner
+        ?? NullBaselineImageProvisioner.Instance);
 
 static void ConfigureOtlp(OtlpExporterOptions o, OtelOptions opts)
 {
@@ -1293,6 +1296,7 @@ builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabili
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
+    sp.GetRequiredService<IBaselineImageProvisioner>(),
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IInVmSmokeProbe>(),
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),

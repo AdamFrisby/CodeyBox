@@ -27,9 +27,13 @@ public sealed class InVmSmokeGateTests
     private static AgentAvailabilityRegistry NewRegistry() =>
         new(new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
 
-    private static InVmSmokeProber BuildProber(ScriptedSandboxProvider provider, AgentAvailabilityRegistry registry) =>
-        new(provider,
-            new StubBaselineResolver("base-A"),
+    private static InVmSmokeProber BuildProber(ScriptedSandboxProvider provider, AgentAvailabilityRegistry registry)
+    {
+        var resolver = new StubBaselineResolver("base-A");
+        return new(
+            provider,
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -37,6 +41,7 @@ public sealed class InVmSmokeGateTests
             new NullWebhookDispatcher(),
             new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
+    }
 
     private static AgentClassRouter BuildRouter(
         AgentAvailabilityRegistry registry, IInVmSmokeGate? gate)

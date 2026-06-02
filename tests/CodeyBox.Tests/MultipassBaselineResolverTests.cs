@@ -47,6 +47,42 @@ public sealed class MultipassBaselineResolverTests
         Assert.Null(provider.ResolveBaselineRef("unknown", SandboxProfileFlavor.Headless));
     }
 
+    [Fact]
+    public async Task EnsureBaselineImageAsync_BlankProfile_ReturnsNull()
+    {
+        var provider = new MultipassSandboxProvider(
+            new MultipassSandboxOptions { UseBaselineImages = true },
+            NullLogger<MultipassSandboxProvider>.Instance);
+
+        var result = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "  ",
+            SandboxProfileFlavor.Headless,
+            "cb-baseline-pinned",
+            CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_UseBaselineImagesDisabled_ReturnsNull()
+    {
+        var provider = new MultipassSandboxProvider(
+            new MultipassSandboxOptions
+            {
+                UseBaselineImages = false,
+                NetworkProfiles = new Dictionary<string, string> { ["work"] = "cb-net" },
+            },
+            NullLogger<MultipassSandboxProvider>.Instance);
+
+        var result = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "work",
+            SandboxProfileFlavor.Headless,
+            "cb-baseline-pinned",
+            CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
     /// <summary>
     /// Two calls with the same live config and same (profile, flavor) return
     /// the same ref — this is what makes a stamped pin look "fresh" until

@@ -30,6 +30,7 @@ public sealed class InVmSmokeProbeServiceTests
         return new InVmSmokeProber(
             provider,
             resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,

@@ -125,6 +125,38 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         Assert.Equal(expectedFallbackName, cloneSource);
     }
 
+    [Fact]
+    public async Task EnsureBaselineImageAsync_WithPinnedBaselineRef_BakesPinnedName()
+    {
+        const string PinnedName = "cb-baseline-pinned123";
+
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources);
+        var opts = MakeOptions(extraRuncmd: ["touch /opt/codeybox-LIVE-drift"]);
+        var provider = new MultipassSandboxProvider(opts, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
+
+        var liveComposed = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            opts, "claude", SandboxProfileFlavor.Headless);
+        Assert.NotEqual(PinnedName, liveComposed);
+
+        var ensured = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "claude",
+            SandboxProfileFlavor.Headless,
+            PinnedName,
+            CancellationToken.None);
+
+        Assert.Equal(PinnedName, ensured);
+        Assert.Contains(PinnedName, infoQueries);
+        Assert.DoesNotContain(liveComposed, infoQueries);
+        Assert.Contains(PinnedName, launchNames);
+        Assert.DoesNotContain(liveComposed, launchNames);
+        Assert.Empty(cloneSources);
+    }
+
     private MultipassSandboxOptions MakeOptions(IReadOnlyList<string> extraRuncmd) => new()
     {
         MultipassBinary = "/bin/false",

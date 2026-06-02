@@ -367,9 +367,11 @@ public sealed class AgentClassRouterAvailabilityTests
             Cursor,
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
             new Dictionary<string, string>());
+        var resolver = new StubBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             hangingProvider,
-            new StubBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(credential),
             [new CursorInVmSmokeProbe()],
             registry,

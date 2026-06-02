@@ -543,6 +543,30 @@ public interface IBaselineImageProvisioner
 }
 
 /// <summary>
+/// Null Object provisioner for sandbox providers that cannot eagerly prepare
+/// clonable baseline images.
+/// </summary>
+public sealed class NullBaselineImageProvisioner : IBaselineImageProvisioner
+{
+    public static readonly NullBaselineImageProvisioner Instance = new();
+
+    private NullBaselineImageProvisioner() { }
+
+    public Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct)
+    {
+        _ = profileName;
+        _ = flavor;
+        _ = pinnedBaselineRef;
+        _ = ct;
+        return Task.FromResult<string?>(null);
+    }
+}
+
+/// <summary>
 /// Snapshot of one baseline image on the host, returned by
 /// <see cref="IBaselineImageResolver.ListBaselineImagesAsync"/>.
 /// </summary>

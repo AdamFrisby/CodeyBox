@@ -55,6 +55,7 @@ public sealed class InVmSmokeProberTests
         return new InVmSmokeProber(
             provider,
             resolver,
+            resolver,
             credentials ?? new ConstantCredentialProvider(CursorCred),
             probes ?? [new CursorInVmSmokeProbe()],
             registry,
@@ -218,6 +219,26 @@ public sealed class InVmSmokeProberTests
         var availability = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(availability.Available);
         Assert.Contains("no clonable baseline", availability.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureBaselineReturnsNull_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A") { CanEnsure = false };
+        var prober = Build(provider, registry, NewCache(), resolver);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("no clonable baseline", availability.Reason);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
+        Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-A", ensureCall.PinnedRef);
     }
 
     [Fact]
@@ -471,9 +492,11 @@ public sealed class InVmSmokeProberTests
         var provider = new HangingSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -510,9 +533,11 @@ public sealed class InVmSmokeProberTests
         var registry = NewRegistry();
         // Build() uses the default InVmSmokeOptions → FailClosedOnProbeFault = true;
         // StepTimeoutSeconds=0 trips the timeout path immediately.
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -581,6 +606,26 @@ public sealed class InVmSmokeProberTests
         // so a later recovered probe self-heals it.
         Assert.Equal(0, provider.CreateCount);
         Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task CallerCancellationDuringCredentialLookup_PropagatesAndDoesNotBench()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var credentials = new BlockingCredentialProvider();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: credentials);
+
+        using var cts = new CancellationTokenSource();
+        var probeTask = prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, cts.Token);
+
+        await credentials.Started.Task;
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Equal(0, provider.CreateCount);
     }
 
     [Fact]
@@ -946,11 +991,14 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
 
         var result = await prober.ProbeAgentAsync(
-            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+            new CursorInVmSmokeProbe(), WorkTarget, "base-A", CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.False(result!.Ok);
         Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
         // The registry encodes the category in the reason tag, so the router
         // log / /concurrency surface it alongside the message.
         Assert.Contains("[persistent]", registry.GetAvailability(AgentKind.Cursor).Reason);
@@ -966,11 +1014,14 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, NewRegistry(), NewCache(), new FakeBaselineResolver("base-A"));
 
         var result = await prober.ProbeAgentAsync(
-            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+            new CursorInVmSmokeProbe(), WorkTarget, "base-A", CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.True(result!.Ok);
         Assert.Equal(SmokeFailureCategory.None, result.Category);
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
     }
 
     [Fact]
@@ -983,9 +1034,11 @@ public sealed class InVmSmokeProberTests
         // on recovery rather than paging the operator.
         var provider = new HangingSandboxProvider();
         var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -1466,6 +1519,21 @@ public sealed class InVmSmokeProberTests
     {
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
             throw new InvalidOperationException("credential store unavailable");
+    }
+
+    /// <summary>Credential provider that blocks until caller cancellation fires.</summary>
+    private sealed class BlockingCredentialProvider : ICredentialProvider
+    {
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            _ = agent;
+            Started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return null;
+        }
     }
 
     /// <summary>

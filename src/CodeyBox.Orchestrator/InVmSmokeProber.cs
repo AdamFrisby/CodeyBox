@@ -49,7 +49,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 {
     private readonly ISandboxProvider _provider;
     private readonly IBaselineImageResolver _resolver;
-    private readonly IBaselineImageProvisioner? _baselineProvisioner;
+    private readonly IBaselineImageProvisioner _baselineProvisioner;
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
     private readonly ISmokeAvailabilityRegistry _availability;
@@ -61,6 +61,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     public InVmSmokeProber(
         ISandboxProvider provider,
         IBaselineImageResolver resolver,
+        IBaselineImageProvisioner baselineProvisioner,
         ICredentialProvider credentials,
         IEnumerable<IInVmSmokeProbe> probes,
         ISmokeAvailabilityRegistry availability,
@@ -71,7 +72,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     {
         _provider = provider;
         _resolver = resolver;
-        _baselineProvisioner = resolver as IBaselineImageProvisioner;
+        _baselineProvisioner = baselineProvisioner;
         _credentials = credentials;
         _probes = probes.ToList();
         _availability = availability;
@@ -422,6 +423,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             credential = await _credentials.GetAsync(probe.Kind, ct);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             // Credential store fault is an infra problem, not an agent fault.
@@ -718,8 +723,6 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(target.NetworkProfile))
-            return null;
-        if (_baselineProvisioner is null)
             return null;
 
         var baselineRef = string.IsNullOrWhiteSpace(pinnedBaselineRef)
