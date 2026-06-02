@@ -77,10 +77,11 @@ internal sealed class UatCliRunner(IReadOnlyList<string>? scratchpadHomeDirector
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
         _ = resume;
-        return BuildInvocation(prompt, credential, modelId, reasoningMode);
+        return BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
     }
 }
 

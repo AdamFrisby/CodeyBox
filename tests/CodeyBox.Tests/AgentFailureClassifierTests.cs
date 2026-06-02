@@ -65,11 +65,23 @@ public sealed class AgentFailureClassifierTests
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
         // A 429-with-ECONNRESET-tail must classify as quota — falling back to
-        // a different agent on a 429 is correct; trying again on the same one
-        // because we mistook it for a network blip wastes the operator's day.
+        // quota/rate handling is still correct even when the native session
+        // resume loop later chooses to spend its bounded soft-rate retry.
         var c = AgentFailureClassifier.Classify(
             stderr: "API rate_limit_exceeded\nECONNRESET while retrying");
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void QuotaClassification_SeparatesHardQuotaFromSoftRateLimitReason()
+    {
+        var hard = AgentFailureClassifier.Classify(stderr: "usage_limit reached");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, hard.Kind);
+        Assert.Equal(AgentFailureClassifier.HardQuotaReason, hard.Reason);
+
+        var soft = AgentFailureClassifier.Classify(stderr: "API Error: 429 rate_limit_exceeded");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, soft.Kind);
+        Assert.Equal(AgentFailureClassifier.SoftRateLimitReason, soft.Reason);
     }
 
     [Fact]

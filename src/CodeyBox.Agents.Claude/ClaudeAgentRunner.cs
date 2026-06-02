@@ -368,8 +368,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream: false);
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
 
     /// <summary>
     /// Opt this runner into the suspend-resilience loop's CLI-native session
@@ -397,13 +398,10 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     /// <summary>
     /// Builds the argv for a CLI-native session resume after a transient crash.
-    /// Note: <c>claude --resume &lt;id&gt; --print</c> appends the supplied
-    /// prompt as a NEW user turn on top of the restored conversation, so the
-    /// agent observes the original instruction twice (once in the restored
-    /// transcript, once as a fresh stdin user message). This is acceptable
-    /// because an empty resume prompt errors out on the CLI side; the duplicate
-    /// turn typically reads as a "continue from where you crashed" nudge and
-    /// the in-progress work is preserved by the restored conversation history.
+    /// <c>claude --resume &lt;id&gt; --print</c> requires a non-empty stdin turn,
+    /// so the resumed process receives a short continuation instruction rather
+    /// than the original task prompt again. The conversation restored by the
+    /// CLI carries the original user prompt and in-progress context.
     /// </summary>
     protected override AgentInvocation BuildSessionResumeInvocation(
         string sessionId,
@@ -415,8 +413,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     {
         if (string.IsNullOrWhiteSpace(sessionId))
             throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
-        return BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
+        _ = prompt;
+        return BuildClaudeInvocation(SessionResumePrompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
     }
+
+    internal const string SessionResumePrompt =
+        "Continue from the restored session after the interrupted run. Do not restart completed work or repeat the original instructions.";
 
     private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, string? sessionIdForResume, bool captureStructuredStream)
         => BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: sessionIdForResume, captureStructuredStream);

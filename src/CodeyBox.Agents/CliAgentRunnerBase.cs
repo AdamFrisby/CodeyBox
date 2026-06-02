@@ -49,8 +49,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
-        => BuildInvocation(prompt, credential, modelId, reasoningMode);
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
 
     /// <summary>
     /// When true, this runner's CLI exposes a native session-resume mode
@@ -142,19 +143,18 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return preparation;
 
-        var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
-        // CaptureStructuredStream: false here mirrors what BuildResumeInvocation
-        // produces by default (no --output-format stream-json). The CLI's
-        // session id only appears on the structured stream, so in practice the
-        // resume branch is dormant on this path and a transient crash during a
-        // restore-from-checkpoint run falls through to the legacy retry. That
-        // matches the motivating bug (the work phase that suffered the mid-run
-        // crash uses RunAsync with captureStructuredStream=true), and keeps
-        // this path's behaviour identical to its pre-resume shape.
+        var captureStructuredStream = SupportsSessionResume;
+        var invocation = BuildResumeInvocation(
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
             sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
             sessionResumeContext: SupportsSessionResume
-                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, CaptureStructuredStream: false)
+                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, captureStructuredStream)
                 : null);
     }
 
@@ -166,14 +166,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         CancellationToken ct,
         SessionResumeRebuildContext? sessionResumeContext = null)
     {
-        // VM-liveness check is intentionally implicit: if the sandbox itself
-        // has died, the very next sandbox.ExecAsync call inside
-        // ExecuteInvocationOnceAsync surfaces the failure and propagates out
-        // of this loop, bubbling up to the caller who re-drives the work item
-        // in a fresh sandbox. We do not need an explicit pre-flight ping —
-        // session resume is gated on the next exec succeeding well enough to
-        // emit a CLI exit code, so VM-death naturally short-circuits the
-        // resume branch rather than papering over it.
         var attempt = 0;
         var resumeAttempts = 0;
         var current = invocation;
@@ -203,17 +195,20 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             var exitCode = ParseExitCodeFromSummary(last.Summary);
 
             // Prefer a CLI-native session resume when this runner opted in,
-            // a session id was captured, and the failure shape looks transient
-            // (NOT quota/auth — those would just re-fail on resume). When all
-            // three hold, the resume budget is consumed; otherwise we fall
-            // through to the legacy suspend-resilience retry below.
+            // a session id was captured, and the failure shape is eligible
+            // for in-place continuation. Hard quota/auth failures are filtered
+            // out by SessionResumeOptions; soft rate-limit blips may spend the
+            // bounded resume budget.
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
-                && SessionResumeOptions.IsResumeEligible(classification))
+                && SessionResumeOptions.IsResumeEligible(classification, last.Stderr, last.Stdout))
             {
                 var maxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
                 if (resumeAttempts < maxResumeAttempts)
                 {
+                    if (!await CanResumeInPlaceAsync(sandbox, workingDirectory, ct).ConfigureAwait(false))
+                        return last;
+
                     resumeAttempts++;
                     current = BuildSessionResumeInvocation(
                         capturedSessionId,
@@ -242,6 +237,27 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // not restarted from scratch in the same sandbox.
             current = invocation;
         }
+    }
+
+    private static async Task<bool> CanResumeInPlaceAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh",
+                "-c",
+                "target=$1; [ -n \"$target\" ] && [ -d \"$target\" ] && [ -x \"$target\" ] && [ -w \"$target\" ]",
+                "codeybox-resume-liveness",
+                workingDirectory,
+            ],
+            WorkingDirectory = "/",
+        }, ct).ConfigureAwait(false);
+
+        return result.Success;
     }
 
     /// <summary>

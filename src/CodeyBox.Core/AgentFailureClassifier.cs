@@ -17,23 +17,37 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class AgentFailureClassifier
 {
+    public const string HardQuotaReason = "hard quota pattern matched";
+    public const string SoftRateLimitReason = "soft rate-limit pattern matched";
+
     /// <summary>
-    /// Substrings (case-insensitive) that signal mid-flight quota exhaustion
-    /// across the supported agent CLIs (codex, claude, gemini, copilot).
+    /// Quota / capacity exhaustion shapes where an immediate same-agent resume
+    /// would almost certainly re-fail.
     /// </summary>
-    public static readonly IReadOnlyList<string> QuotaPatterns = new[]
+    public static readonly IReadOnlyList<string> HardQuotaPatterns = new[]
+    {
+        // Anthropic / OpenAI account caps
+        "usage_limit",
+        "hit your usage limit",
+        "hit your limit",
+        // Google / Gemini capacity caps
+        "RESOURCE_EXHAUSTED",
+        "quota exceeded",
+        "exhausted your capacity",
+    };
+
+    /// <summary>
+    /// Short-window rate / overload shapes. These still classify as quota for
+    /// the orchestrator fallback chain, but in-VM CLI session resume may spend
+    /// its bounded retry budget on them because they can be transient blips.
+    /// </summary>
+    public static readonly IReadOnlyList<string> SoftRateLimitPatterns = new[]
     {
         // Anthropic / OpenAI
         "rate_limit_exceeded",
         "rate limit exceeded",
-        "usage_limit",
-        "hit your usage limit",
-        "hit your limit",
         // Google / Gemini
-        "RESOURCE_EXHAUSTED",
         "exceeded the rate limit",
-        "quota exceeded",
-        "exhausted your capacity",
         // Anthropic overloaded shape
         "overloaded_error",
         // Bare HTTP shapes the CLIs surface verbatim
@@ -43,6 +57,12 @@ public static class AgentFailureClassifier
         "HTTP 529",
         "status 529",
     };
+
+    /// <summary>
+    /// All quota/rate substrings recognised by the shared classifier.
+    /// </summary>
+    public static readonly IReadOnlyList<string> QuotaPatterns =
+        HardQuotaPatterns.Concat(SoftRateLimitPatterns).ToArray();
 
     /// <summary>
     /// Substrings that signal an authentication / authorisation failure —
@@ -106,8 +126,11 @@ public static class AgentFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
-        if (ContainsAny(stderr, QuotaPatterns) || ContainsAny(stdout, QuotaPatterns))
-            return new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: "quota pattern matched");
+        if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
+            return new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: HardQuotaReason);
+
+        if (ContainsAny(stderr, SoftRateLimitPatterns) || ContainsAny(stdout, SoftRateLimitPatterns))
+            return new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: SoftRateLimitReason);
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
