@@ -193,7 +193,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // managed to emit on stdout before crashing. Best-effort: a parse
             // failure or absent id leaves the previously-captured id (if any)
             // in place.
-            if (sessionResumeContext is not null
+            if (sessionResumeContext is { CaptureStructuredStream: true }
                 && TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
             {
                 capturedSessionId = freshId;
@@ -209,18 +209,24 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // through to the legacy suspend-resilience retry below.
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
-                && SessionResumeOptions.IsResumeEligible(classification)
-                && resumeAttempts < SessionResumeOptions.MaxResumeAttempts)
+                && SessionResumeOptions.IsResumeEligible(classification))
             {
-                resumeAttempts++;
-                current = BuildSessionResumeInvocation(
-                    capturedSessionId,
-                    sessionResumeContext.Prompt,
-                    sessionResumeContext.Credential,
-                    sessionResumeContext.ModelId,
-                    sessionResumeContext.ReasoningMode,
-                    sessionResumeContext.CaptureStructuredStream);
-                continue;
+                var maxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
+                if (resumeAttempts < maxResumeAttempts)
+                {
+                    resumeAttempts++;
+                    current = BuildSessionResumeInvocation(
+                        capturedSessionId,
+                        sessionResumeContext.Prompt,
+                        sessionResumeContext.Credential,
+                        sessionResumeContext.ModelId,
+                        sessionResumeContext.ReasoningMode,
+                        sessionResumeContext.CaptureStructuredStream);
+                    continue;
+                }
+
+                if (maxResumeAttempts > 0)
+                    return last;
             }
 
             if (attempt >= AgentSuspendResilience.MaxRetries)
@@ -229,11 +235,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 return last;
 
             attempt++;
-            // Fall through to the pre-resume single-shot retry shape: the
-            // resume budget was either unavailable (no captured id /
-            // QuotaExhausted / AuthError) or exhausted, so restart the run
-            // from the original argv rather than re-resuming a session that
-            // can no longer recover here.
+            // Fall through to the pre-resume single-shot retry shape only when
+            // native session resume was unavailable or disabled (no captured id,
+            // non-eligible failure, or MaxResumeAttempts=0). A positive resume
+            // budget that has been exhausted returns above so the same agent is
+            // not restarted from scratch in the same sandbox.
             current = invocation;
         }
     }

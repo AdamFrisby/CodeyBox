@@ -40,8 +40,8 @@ public sealed class AgentSessionResumeTests : IDisposable
     [Fact]
     public void Extractor_AcceptsCamelCaseSessionId()
     {
-        var stdout = """{"type":"system","subtype":"init","sessionId":"abc-123","tools":[]}""";
-        Assert.Equal("abc-123", ClaudeSessionIdExtractor.Extract(stdout));
+        var stdout = """{"type":"system","subtype":"init","sessionId":"c8e8171a-5c61-42e6-a633-936d2362886a","tools":[]}""";
+        Assert.Equal("c8e8171a-5c61-42e6-a633-936d2362886a", ClaudeSessionIdExtractor.Extract(stdout));
     }
 
     [Fact]
@@ -50,9 +50,9 @@ public sealed class AgentSessionResumeTests : IDisposable
         var stdout = """
             not json at all
             {"broken json
-            {"type":"system","subtype":"init","session_id":"good"}
+            {"type":"system","subtype":"init","session_id":"d6d9e7c3-a8d7-4f86-ab19-6318a1f95a3e"}
             """;
-        Assert.Equal("good", ClaudeSessionIdExtractor.Extract(stdout));
+        Assert.Equal("d6d9e7c3-a8d7-4f86-ab19-6318a1f95a3e", ClaudeSessionIdExtractor.Extract(stdout));
     }
 
     [Fact]
@@ -62,6 +62,8 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Null(ClaudeSessionIdExtractor.Extract(""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant"}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","session_id":""}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":"not-a-uuid"}"""));
     }
 
     // ── Resume eligibility ────────────────────────────────────────────────────
@@ -149,7 +151,13 @@ public sealed class AgentSessionResumeTests : IDisposable
             : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            modelId: "claude-sonnet-4-6",
+            reasoningMode: "high",
+            captureStructuredStream: true);
 
         Assert.True(result.Success);
         Assert.Equal(2, sandbox.ClaudeInvocations.Count);
@@ -161,6 +169,26 @@ public sealed class AgentSessionResumeTests : IDisposable
         var resumeIdx = IndexOf(second, "--resume");
         Assert.True(resumeIdx >= 0, "resume retry must pass --resume flag");
         Assert.Equal(sessionId, second[resumeIdx + 1]);
+        AssertFlagValue(second, "--output-format", "stream-json");
+        Assert.Contains("--verbose", second);
+        AssertFlagValue(second, "--model", "claude-sonnet-4-6");
+        AssertFlagValue(second, "--effort", "high");
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_UnstructuredStdoutSessionId_DoesNotResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: false);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
     }
 
     [Fact]
@@ -175,7 +203,7 @@ public sealed class AgentSessionResumeTests : IDisposable
             new SandboxExecResult(1, "no init line was emitted", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
         Assert.Single(sandbox.ClaudeInvocations);
@@ -194,11 +222,11 @@ public sealed class AgentSessionResumeTests : IDisposable
             // The init line was emitted, so a session id IS available — but
             // the failure shape is a hard 429 quota event. A resume would
             // immediately re-fail; we must NOT consume the resume budget.
-            Stdout: """{"type":"system","subtype":"init","session_id":"sid"}""",
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "API Error: 429 rate_limit_exceeded"));
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
         Assert.Single(sandbox.ClaudeInvocations);
@@ -214,14 +242,35 @@ public sealed class AgentSessionResumeTests : IDisposable
         var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
             // Every attempt crashes with the init line on stdout, simulating
             // a process that consistently dies mid-stream.
-            Stdout: """{"type":"system","subtype":"init","session_id":"sid"}""",
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
         // 1 original + 2 resume attempts = 3 claude invocations.
+        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[2]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_ResumeExhaustionOnTransientFailure_DoesNotRestartFromScratch()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+
+        var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+            Stderr: "ECONNRESET"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        // Regression guard for original, --resume, --resume, original.
         Assert.Equal(3, sandbox.ClaudeInvocations.Count);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
         Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
@@ -237,12 +286,12 @@ public sealed class AgentSessionResumeTests : IDisposable
         // exactly one legacy retry, which is the behaviour this test pins.
 
         var sandbox = new ResumeRecordingSandbox(call => call == 1
-            ? new SandboxExecResult(1, """{"type":"system","subtype":"init","session_id":"sid"}""",
+            ? new SandboxExecResult(1, """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
                 "ECONNRESET")
             : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.True(result.Success);
         // No --resume because the resume budget is 0; the legacy
@@ -286,7 +335,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         // Stderr is empty (classification = Normal) so the legacy retry path
         // is never engaged — resume is the only retry mechanism in scope.
 
-        var sessionId = "carry-over-id";
+        var sessionId = "c8e8171a-5c61-42e6-a633-936d2362886a";
         var sandbox = new ResumeRecordingSandbox(call => call switch
         {
             1 => new SandboxExecResult(1,
@@ -297,7 +346,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         });
 
         var result = await new ClaudeAgentRunner().RunAsync(
-            sandbox, "/work", "prompt", credential: null);
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.True(result.Success);
         Assert.Equal(3, sandbox.ClaudeInvocations.Count);
@@ -313,6 +362,14 @@ public sealed class AgentSessionResumeTests : IDisposable
             if (string.Equals(argv[i], token, StringComparison.Ordinal))
                 return i;
         return -1;
+    }
+
+    private static void AssertFlagValue(IReadOnlyList<string> argv, string flag, string expected)
+    {
+        var idx = IndexOf(argv, flag);
+        Assert.True(idx >= 0, $"argv must contain {flag}");
+        Assert.True(idx + 1 < argv.Count, $"{flag} must have a value");
+        Assert.Equal(expected, argv[idx + 1]);
     }
 
     // ── Test harness ──────────────────────────────────────────────────────────
@@ -334,7 +391,15 @@ public sealed class AgentSessionResumeTests : IDisposable
             // ClaudeInvocations count is meaningful regardless of base-class
             // bookkeeping.
             if (exec.Argv.Count > 0
-                && (exec.Argv[0] == ClaudeAgentRunner.DefaultBinary || exec.Argv[0] == "fake-agent"))
+                && exec.Argv[0] == ClaudeAgentRunner.DefaultBinary
+                && exec.Argv.Contains("--help"))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "--output-format stream-json --verbose", ""));
+            }
+
+            if (exec.Argv.Count > 0
+                && ((exec.Argv[0] == ClaudeAgentRunner.DefaultBinary && exec.Argv.Contains("--print"))
+                    || exec.Argv[0] == "fake-agent"))
             {
                 ClaudeInvocations.Add(exec.Argv);
                 return Task.FromResult(onClaudeCall(ClaudeInvocations.Count));

@@ -2130,6 +2130,7 @@ public sealed class AgentConfigHotReloadTests
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
                 MaxQuestionsPerWorkItem = 10,
                 AgentSuspendMaxRetries = 1,
+                AgentSessionResumeMaxAttempts = 4,
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -2138,6 +2139,7 @@ public sealed class AgentConfigHotReloadTests
             DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
             MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
+            AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
         });
 
         var router = new AgentClassRouter(
@@ -2152,36 +2154,53 @@ public sealed class AgentConfigHotReloadTests
 
         // Capture the static default before the coordinator sets it.
         var originalMaxRetries = AgentSuspendResilience.MaxRetries;
+        var originalMaxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
+        AgentConfigHotReload? coordinator = null;
 
-        var coordinator = new AgentConfigHotReload(
-            monitor, orchFixture.Orchestrator, router, burnEstimator,
-            NullLogger<AgentConfigHotReload>.Instance,
-            pipelineTuning: snapshot);
-        await coordinator.StartAsync(CancellationToken.None);
-
-        Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
-        Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
-
-        // SetMaxRetries is called on start; verify the static was initialised.
-        Assert.Equal(1, AgentSuspendResilience.MaxRetries);
-
-        monitor.Fire(new CodeyBoxOptions
+        try
         {
-            PipelineTuning = new PipelineTuningOptions
+            coordinator = new AgentConfigHotReload(
+                monitor, orchFixture.Orchestrator, router, burnEstimator,
+                NullLogger<AgentConfigHotReload>.Instance,
+                pipelineTuning: snapshot);
+            await coordinator.StartAsync(CancellationToken.None);
+
+            Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
+            Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
+            Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
+
+            // SetMaxRetries / SetMaxResumeAttempts are called on start; verify
+            // the process-wide runner knobs were initialised.
+            Assert.Equal(1, AgentSuspendResilience.MaxRetries);
+            Assert.Equal(4, SessionResumeOptions.MaxResumeAttempts);
+
+            monitor.Fire(new CodeyBoxOptions
             {
-                DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
-                MaxQuestionsPerWorkItem = 20,
-                AgentSuspendMaxRetries = 3,
-            },
-        });
-        Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
-        Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
-        Assert.Equal(3, AgentSuspendResilience.MaxRetries);
+                PipelineTuning = new PipelineTuningOptions
+                {
+                    DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                    MaxQuestionsPerWorkItem = 20,
+                    AgentSuspendMaxRetries = 3,
+                    AgentSessionResumeMaxAttempts = 6,
+                },
+            });
+            Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
+            Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
+            Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(3, AgentSuspendResilience.MaxRetries);
+            Assert.Equal(6, SessionResumeOptions.MaxResumeAttempts);
 
-        // Restore original (shared static).
-        AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
-
-        await coordinator.StopAsync(CancellationToken.None);
+            await coordinator.StopAsync(CancellationToken.None);
+            coordinator = null;
+        }
+        finally
+        {
+            if (coordinator is not null)
+                await coordinator.StopAsync(CancellationToken.None);
+            // Restore original shared statics even when an assertion fails.
+            AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
+            SessionResumeOptions.SetMaxResumeAttempts(originalMaxResumeAttempts);
+        }
     }
 
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>
