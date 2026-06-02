@@ -368,17 +368,31 @@ public sealed class BudgetEnforcementTests : IDisposable
         gate1.TrySetResult();
 
         // Wait for the initial 200 ms deferral to expire and the dispatch
-        // loop to process both items again. One will grab the freed slot
+        // loop to process both successors again. One will grab the freed slot
         // and block on gate2; the other hits the concurrent cap and is
         // deferred again — this time reading the hot-reloaded 10 s interval.
-        await Task.Delay(600);
-
-        // Identify the item that was deferred in the second cycle.
-        // It should be one of ids[1] or ids[2]; the other is running
-        // (blocking on gate2) and therefore not in the deferred set.
+        var secondDeferDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
         int? secondDeferredIdx = null;
-        if (svc.IsDeferredForTest(ids[1])) secondDeferredIdx = 1;
-        else if (svc.IsDeferredForTest(ids[2])) secondDeferredIdx = 2;
+        while (DateTimeOffset.UtcNow < secondDeferDeadline)
+        {
+            var second = await _store.GetAsync(ids[1]);
+            var third = await _store.GetAsync(ids[2]);
+            int? runningIdx = second?.StartedAt is not null ? 1
+                : third?.StartedAt is not null ? 2
+                : null;
+
+            if (runningIdx is not null)
+            {
+                var otherIdx = runningIdx == 1 ? 2 : 1;
+                if (svc.IsDeferredForTest(ids[otherIdx]))
+                {
+                    secondDeferredIdx = otherIdx;
+                    break;
+                }
+            }
+
+            await Task.Delay(25);
+        }
 
         Assert.NotNull(secondDeferredIdx);
 

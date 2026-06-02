@@ -39,8 +39,14 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         Assert.Equal(ready.Id, picked);
     }
 
-    [Fact]
-    public async Task FullPool_DispatchesAuditPassedBeforeHigherPriorityQueuedItem()
+    [Theory]
+    [InlineData(WorkItemState.AuditPassed, WorkItemState.Merging)]
+    [InlineData(WorkItemState.Merging, WorkItemState.Merging)]
+    [InlineData(WorkItemState.Merged, WorkItemState.UpstreamPushing)]
+    [InlineData(WorkItemState.UpstreamPushing, WorkItemState.UpstreamPushing)]
+    public async Task FullPool_DispatchesFinishingPhaseBeforeHigherPriorityQueuedItem(
+        WorkItemState finishingState,
+        WorkItemState expectedActiveState)
     {
         var queue = new InMemoryTaskQueue();
         var pipeline = new FinishingPrecedencePipeline(_store);
@@ -51,7 +57,6 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
             NullLogger<OrchestratorService>.Instance);
 
         await svc.StartAsync(CancellationToken.None);
-        await Task.Delay(100);
 
         var reworkA = Item(WorkItemState.Reworking);
         var reworkB = Item(WorkItemState.Reworking);
@@ -64,27 +69,26 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         Assert.True(await pipeline.WaitForEnteredAsync(reworkB.Id, TimeSpan.FromSeconds(5)));
 
         var highPriorityQueued = Item(WorkItemState.Queued, priority: 100);
-        var audited = Item(WorkItemState.AuditPassed, priority: 0);
+        var finishing = Item(finishingState, priority: 0);
         await _store.CreateAsync(highPriorityQueued);
-        await _store.CreateAsync(audited);
+        await _store.CreateAsync(finishing);
 
         // Queue the fresh high-priority work first. With the pool full, the
         // dispatcher can consume this kick and wait on the gate; when a slot
-        // frees, the DB phase precedence must still choose the audited item.
+        // frees, the DB phase precedence must still choose the finishing item.
         await queue.EnqueueAsync(highPriorityQueued.Id);
-        await queue.EnqueueAsync(audited.Id);
-        await Task.Delay(100);
+        await queue.EnqueueAsync(finishing.Id);
 
         pipeline.Release(reworkA.Id);
 
-        Assert.True(await pipeline.WaitForMergingAsync(audited.Id, TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForStateAsync(finishing.Id, expectedActiveState, TimeSpan.FromSeconds(5)));
         Assert.False(pipeline.HasEntered(highPriorityQueued.Id));
         var thirdEntered = pipeline.ThirdEntered;
         Assert.True(thirdEntered.HasValue);
-        Assert.Equal(audited.Id, thirdEntered.Value);
+        Assert.Equal(finishing.Id, thirdEntered.Value);
 
-        pipeline.Release(audited.Id);
-        Assert.True(await pipeline.WaitForDoneAsync(audited.Id, TimeSpan.FromSeconds(5)));
+        pipeline.Release(finishing.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(finishing.Id, TimeSpan.FromSeconds(5)));
 
         pipeline.Release(reworkB.Id);
         pipeline.Release(highPriorityQueued.Id);
@@ -107,7 +111,7 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         private readonly IWorkItemStore _store;
         private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _entered = new();
         private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _released = new();
-        private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _merging = new();
+        private readonly ConcurrentDictionary<(WorkItemId, WorkItemState), TaskCompletionSource> _stateReached = new();
         private readonly ConcurrentDictionary<WorkItemId, TaskCompletionSource> _done = new();
         private readonly ConcurrentQueue<WorkItemId> _entryOrder = new();
 
@@ -124,8 +128,8 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         public Task<bool> WaitForEnteredAsync(WorkItemId id, TimeSpan timeout) =>
             WaitForSignalAsync(_entered.GetOrAdd(id, static _ => NewSignal()), timeout);
 
-        public Task<bool> WaitForMergingAsync(WorkItemId id, TimeSpan timeout) =>
-            WaitForSignalAsync(_merging.GetOrAdd(id, static _ => NewSignal()), timeout);
+        public Task<bool> WaitForStateAsync(WorkItemId id, WorkItemState state, TimeSpan timeout) =>
+            WaitForSignalAsync(_stateReached.GetOrAdd((id, state), static _ => NewSignal()), timeout);
 
         public Task<bool> WaitForDoneAsync(WorkItemId id, TimeSpan timeout) =>
             WaitForSignalAsync(_done.GetOrAdd(id, static _ => NewSignal()), timeout);
@@ -135,10 +139,10 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
             _entryOrder.Enqueue(item.Id);
             _entered.GetOrAdd(item.Id, static _ => NewSignal()).TrySetResult();
 
-            if (item.State == WorkItemState.AuditPassed)
+            if (ActiveFinishingState(item.State) is { } activeState)
             {
-                await _store.UpdateAsync(item.With(WorkItemState.Merging), ct);
-                _merging.GetOrAdd(item.Id, static _ => NewSignal()).TrySetResult();
+                await _store.UpdateAsync(item.With(activeState), ct);
+                _stateReached.GetOrAdd((item.Id, activeState), static _ => NewSignal()).TrySetResult();
                 await _released.GetOrAdd(item.Id, static _ => NewSignal()).Task.WaitAsync(ct);
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
                 _done.GetOrAdd(item.Id, static _ => NewSignal()).TrySetResult();
@@ -152,6 +156,13 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
             await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
             _done.GetOrAdd(item.Id, static _ => NewSignal()).TrySetResult();
         }
+
+        private static WorkItemState? ActiveFinishingState(WorkItemState state) => state switch
+        {
+            WorkItemState.AuditPassed or WorkItemState.Merging => WorkItemState.Merging,
+            WorkItemState.Merged or WorkItemState.UpstreamPushing => WorkItemState.UpstreamPushing,
+            _ => null,
+        };
 
         private static TaskCompletionSource NewSignal() =>
             new(TaskCreationOptions.RunContinuationsAsynchronously);
