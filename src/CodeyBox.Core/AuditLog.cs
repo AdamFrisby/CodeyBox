@@ -452,6 +452,22 @@ public static class AuditLog
                 exhaustedAgent.Value, fallbackAgent.Value, auditorName);
 
     /// <summary>
+    /// Emitted when the operator's preferred audit agent
+    /// (<c>Project.Audit.AuditAgent</c> or
+    /// <c>Project.Audit.PerAuditorAgent[auditorName]</c>) is NOT tagged with
+    /// the <c>audit</c> capability in the routed agent class, so the audit
+    /// router demoted the preference and picked a tagged member from the
+    /// class instead. Surfaces a configuration mismatch the operator should
+    /// fix — the routing system kept going, but the operator's named
+    /// preference was overridden.
+    /// </summary>
+    public static void AuditAgentNotAuditCapable(AgentKind preferredAgent, string auditorName, string classId) =>
+        Audit("quota_router.audit_agent_not_audit_capable")
+            .Warning(
+                "Preferred audit agent '{PreferredAgent}' for auditor '{AuditorName}' is not tagged with the 'audit' capability in class '{ClassId}'; routing to an audit-capable member instead",
+                preferredAgent.Value, auditorName, classId);
+
+    /// <summary>
     /// Emitted when every candidate agent (configured audit agent + class-chain
     /// members + work agent fallback) was quota-exhausted, so the LLM auditor
     /// is being skipped for this audit iteration. The work item continues with

@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are there changed code paths without new or updated tests covering the behavior change (changed behavior lacks test)? (TST-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix untested behavior change (TST-001): add tests for the change",
+        "prompt": "Problem: Behavior changes without tests can silently regress.\n\nFind all instances: Search recently changed code paths for missing/updated tests covering the new behavior.\n\nFix correctly: Add tests that prove the intended behavior of the changed code.\n\nConstraints: Test observable behavior, not implementation details (TST-009). Don't weaken code to make tests pass.\n\nAcceptance: Changed behavior is covered by passing tests that would fail on the old behavior."
+      }
+    },
+    {
+      "question": "Do validation, auth, upload, parser, and API changes lack invalid/malicious/unauthorized input tests (missing negative/abuse-case test)? (TST-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing negative tests (TST-002): add abuse-case tests",
+        "prompt": "Problem: Without negative/abuse tests, security and validation regressions go unnoticed.\n\nFind all instances: Search validation/auth/upload/parser/API code for missing tests of invalid, malicious, and unauthorized inputs.\n\nFix correctly: Add negative and abuse-case tests (rejected input, denied access, malformed payloads).\n\nConstraints: Don't weaken security to make tests pass; assert the secure rejection.\n\nAcceptance: Abuse cases are tested and rejected. Add the negative tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Do numeric, string, date, pagination, size, and collection logic lack boundary-value tests (missing boundary-value test)? (TST-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing boundary tests (TST-003): test edge cases",
+        "prompt": "Problem: Boundary bugs (off-by-one, overflow, empty) are common and often untested.\n\nFind all instances: Search numeric/string/date/pagination/size/collection logic for missing boundary tests.\n\nFix correctly: Add tests for empty, one, many, min, max, overflow, and edge cases.\n\nConstraints: Coordinate with boundary correctness (DAT-003) and bounds (VAL-005/VAL-006).\n\nAcceptance: Boundary cases are covered. Add the boundary tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Do concurrent, async, retry, transaction, or event-processing code lack race/interleaving tests (missing concurrency test)? (TST-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing concurrency tests (TST-004): test races and interleavings",
+        "prompt": "Problem: Concurrency bugs rarely surface without targeted tests.\n\nFind all instances: Search concurrent/async/retry/transaction/event code for missing race/interleaving/duplicate/ordering/cancellation tests.\n\nFix correctly: Add tests for races, duplicate processing, ordering, and cancellation (parallel execution asserting consistency).\n\nConstraints: Make tests deterministic where possible (control scheduling/clock). Coordinate with CON checks.\n\nAcceptance: Concurrency behavior is tested. Add the tests and confirm they pass reliably."
+      }
+    },
+    {
+      "question": "Do integrations lack tests against a schema, mock contract, recorded fixture, or provider contract (missing external contract test)? (TST-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing contract tests (TST-005): verify request/response compatibility",
+        "prompt": "Problem: Integrations without contract tests break silently when the external contract changes.\n\nFind all instances: Search integrations for missing tests against schema/mock contract/recorded fixture/provider contract.\n\nFix correctly: Add contract tests verifying request/response compatibility with the external contract.\n\nConstraints: Keep mocks faithful to the real contract (TST-016). Don't depend on live services (TST-007).\n\nAcceptance: Integration contracts are tested. Add the contract tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Are there tests depending on current time, random values, ordering, real timers, or global state, making them flaky (flaky test from time/random/order)? (TST-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix flaky tests (TST-006): control time, randomness, and order",
+        "prompt": "Problem: Flaky tests erode trust and hide real failures.\n\nFind all instances: Search tests for dependence on real time, randomness, ordering, real timers, or shared global state.\n\nFix correctly: Inject/control the clock and randomness, remove order dependence, and isolate shared state.\n\nConstraints: Don't just retry flaky tests; fix the cause. Coordinate with test isolation (TST-018).\n\nAcceptance: Tests are deterministic. Make the fixes and confirm stable repeated runs."
+      }
+    },
+    {
+      "question": "Do tests require live third-party services, networks, credentials, or production-like external state (test depends on live external service)? (TST-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix live-service test dependency (TST-007): use fakes/fixtures",
+        "prompt": "Problem: Tests that hit live services are flaky, slow, and may incur cost or leak credentials.\n\nFind all instances: Search tests for calls to live third-party services/networks requiring real credentials or external state.\n\nFix correctly: Use fakes, contract tests, recorded fixtures, containers, or isolated test environments.\n\nConstraints: Keep fakes faithful to the contract (TST-016). Don't embed real secrets (CSP-003).\n\nAcceptance: Tests run without live external dependencies. Replace the live calls and confirm tests pass offline."
+      }
+    },
+    {
+      "question": "Do tests use fixed sleeps/timeouts to wait for async work or eventual state (sleep-based test synchronization)? (TST-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix sleep-based tests (TST-008): use deterministic waits",
+        "prompt": "Problem: Fixed sleeps make tests slow and flaky (too short fails, too long wastes time).\n\nFind all instances: Search tests for fixed sleeps/timeouts used to await async work.\n\nFix correctly: Use deterministic waits: hooks, event signals, or polling with a deadline tied to the actual condition.\n\nConstraints: Avoid sleep loops; wait on real conditions.\n\nAcceptance: Tests synchronize deterministically. Replace sleeps and confirm stable, faster runs."
+      }
+    },
+    {
+      "question": "Are tests tightly coupled to private methods, internal ordering, mocks, or incidental structure (test asserts implementation detail)? (TST-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix implementation-detail tests (TST-009): assert observable behavior",
+        "prompt": "Problem: Tests coupled to internals break on harmless refactors and don't verify real behavior.\n\nFind all instances: Search tests asserting private methods, internal ordering, or incidental structure/mocks.\n\nFix correctly: Assert observable behavior and the public contract instead of internals.\n\nConstraints: Keep meaningful coverage; don't delete real assertions (TST-011).\n\nAcceptance: Tests assert behavior, not internals. Refactor the tests and confirm they still catch real regressions."
+      }
+    },
+    {
+      "question": "Are there snapshots/golden files asserting huge outputs where only small semantics matter (overbroad snapshot/golden test)? (TST-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix overbroad snapshots (TST-010): narrow to meaningful output",
+        "prompt": "Problem: Huge snapshots produce noisy diffs, get rubber-stamped, and don't pinpoint failures.\n\nFind all instances: Search for large snapshot/golden tests asserting big outputs where only specific semantics matter.\n\nFix correctly: Narrow assertions to the meaningful, stable parts of the output.\n\nConstraints: Keep coverage of the important behavior.\n\nAcceptance: Snapshots assert only meaningful output. Tighten them and confirm they still detect relevant changes."
+      }
+    },
+    {
+      "question": "Are there tests with no assertions, truthy checks, broad matchers, or assertions that cannot fail meaningfully (weak assertion)? (TST-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix weak assertions (TST-011): assert exact behavior",
+        "prompt": "Problem: Weak/absent assertions give false confidence; the test passes regardless of behavior.\n\nFind all instances: Search tests for missing assertions, truthy-only checks, or overly broad matchers.\n\nFix correctly: Assert exact behavior: outputs, side effects, errors, and important state.\n\nConstraints: Make assertions specific enough to fail on the real bug.\n\nAcceptance: Tests have meaningful assertions. Strengthen them and confirm they fail on incorrect behavior."
+      }
+    },
+    {
+      "question": "Do test data builders/factories obscure the fields responsible for the behavior under test (test data builder hides important input)? (TST-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hidden test inputs (TST-012): make relevant inputs explicit",
+        "prompt": "Problem: When builders hide the inputs that drive behavior, tests are hard to understand and can mask bugs.\n\nFind all instances: Search tests where the field(s) under test are buried in builder/factory defaults.\n\nFix correctly: Make the inputs relevant to the behavior explicit in the test body.\n\nConstraints: Keep builders for irrelevant boilerplate; surface the meaningful values.\n\nAcceptance: Behavior-driving inputs are explicit. Adjust the tests and confirm clarity without losing coverage."
+      }
+    },
+    {
+      "question": "Are there bug-fix patches without a test that fails before the fix and passes after (bug fix lacks regression test)? (TST-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing regression test (TST-013): add a test for the original defect",
+        "prompt": "Problem: A fix without a regression test can silently break again.\n\nFind all instances: Search recent bug fixes for an accompanying regression test reproducing the original defect.\n\nFix correctly: Add a regression test that fails on the pre-fix behavior and passes with the fix.\n\nConstraints: Test the actual defect scenario, not a proxy.\n\nAcceptance: The defect has a regression test. Add it and confirm it would catch the original bug."
+      }
+    },
+    {
+      "question": "Do auth, crypto, input-validation, upload, parser, webhook, or permission changes lack exploit-oriented tests (security-sensitive code lacks threat test)? (TST-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing threat tests (TST-014): add abuse-case tests for security code",
+        "prompt": "Problem: Security-sensitive code without exploit-oriented tests regresses into vulnerabilities.\n\nFind all instances: Search auth/crypto/validation/upload/parser/webhook/permission code for missing abuse/exploit tests.\n\nFix correctly: Add tests that attempt the relevant abuse case (injection, auth bypass, traversal, forged signature) and assert it is blocked.\n\nConstraints: Don't weaken security to pass; assert secure behavior. Coordinate with the relevant INJ/IAM/CSP checks.\n\nAcceptance: Threat scenarios are tested and blocked. Add the tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Do migrations lack tests checking data shape, count, constraints, defaults, and reversibility/forward compatibility (migration lacks data correctness test)? (TST-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing migration tests (TST-015): verify data correctness",
+        "prompt": "Problem: Untested migrations can corrupt or lose data.\n\nFind all instances: Search migrations for tests verifying data shape, counts, constraints, defaults, and reversibility/forward compatibility.\n\nFix correctly: Add tests checking before/after data correctness and invariants, including rollback/forward-fix behavior.\n\nConstraints: Coordinate with migration recovery (OPS-013) and rolling-deploy safety (OPS-015).\n\nAcceptance: Migrations have data-correctness tests. Add them and confirm they pass."
+      }
+    },
+    {
+      "question": "Are there mocks/fakes/stubs whose behavior is not generated from or checked against the real contract (mock diverges from real dependency)? (TST-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix divergent mocks (TST-016): align fakes with the real contract",
+        "prompt": "Problem: Mocks that drift from the real dependency make tests pass while production fails.\n\nFind all instances: Search mocks/fakes/stubs not generated from or verified against the real contract.\n\nFix correctly: Generate mocks from the contract or validate fake behavior against the real dependency's expectations (contract tests).\n\nConstraints: Keep fakes faithful; pair with contract tests (TST-005).\n\nAcceptance: Mocks match the real contract. Add contract verification and confirm alignment."
+      }
+    },
+    {
+      "question": "Do parsers, validators, decoders, and normalizers have only example-based tests without fuzzing or property tests (parser/validator lacks fuzz or property test)? (TST-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing fuzz/property tests (TST-017): test broad input spaces",
+        "prompt": "Problem: Example-only tests miss the broad input space that parsers/validators must handle safely.\n\nFind all instances: Search parsers/validators/decoders/normalizers for missing fuzz/property-based tests.\n\nFix correctly: Add fuzzing or property-based tests asserting invariants (no crash, idempotent normalization, round-trip) over generated inputs.\n\nConstraints: Coordinate with parser limits (VAL-014) and ReDoS (PER-013).\n\nAcceptance: Broad input spaces are tested. Add fuzz/property tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Do tests mutate globals, environment, files, database rows, clocks, or caches without cleanup (test suite leaks shared state)? (TST-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix leaked test state (TST-018): isolate and reset fixtures",
+        "prompt": "Problem: Tests leaking shared state cause order-dependent flakiness and hide coupling.\n\nFind all instances: Search tests for mutation of globals/env/files/DB/clock/caches without cleanup.\n\nFix correctly: Isolate fixtures, reset state between tests, and randomize order to detect coupling.\n\nConstraints: Coordinate with parallel-state isolation (CON-008).\n\nAcceptance: Tests are isolated and order-independent. Add cleanup and confirm tests pass under randomized order."
+      }
+    },
+    {
+      "question": "Are error branches, cleanup paths, retries, fallback logic, and exception handlers untested (error path coverage gap)? (TST-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix error-path coverage gap (TST-019): test failure branches",
+        "prompt": "Problem: Untested error paths frequently hide bugs that only appear during failures.\n\nFind all instances: Search error branches/cleanup/retries/fallbacks/exception handlers for missing tests.\n\nFix correctly: Add tests for each important error path and cleanup behavior.\n\nConstraints: Coordinate with error-handling checks (ERR-015). Don't weaken handling to pass tests.\n\nAcceptance: Important error paths are tested. Add the tests and confirm they pass."
+      }
+    },
+    {
+      "question": "Are changes merged without tests, static checks, benchmark evidence, migration validation, or reasoned proof (patch lacks verification evidence)? (TST-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing verification evidence (TST-020): require checks before merge",
+        "prompt": "Problem: Merging without verification evidence lets regressions through.\n\nFind all instances: Search recent changes for missing automated checks/tests/benchmark/migration validation or reasoned proof.\n\nFix correctly: Add the appropriate automated checks (tests, static analysis, benchmarks, migration validation) so changes carry verification evidence before merge.\n\nConstraints: Match the evidence to the change type. Don't lower the quality bar.\n\nAcceptance: Changes carry verification evidence. Add the relevant checks and confirm they pass in CI."
+      }
+    }
+  ]
+}

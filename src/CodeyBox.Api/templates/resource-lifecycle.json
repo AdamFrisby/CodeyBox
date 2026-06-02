@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are opened resources (files, sockets, handles) not closed on all success and failure paths (file/socket/handle leak)? (RES-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix handle leak (RES-001): close resources deterministically",
+        "prompt": "Problem: Leaked file/socket/handle resources exhaust OS limits and crash the service.\n\nFind all instances: Search for resource acquisition (open file/socket/handle) without guaranteed closing on all paths, especially error paths.\n\nFix correctly: Use scope-managed cleanup (using/try-with-resources/defer) so resources close deterministically on success and failure.\n\nConstraints: Ensure cleanup runs even on exceptions (ERR-004).\n\nAcceptance: All handles close on every path. Add a test forcing an error after acquisition asserting the resource is closed."
+      }
+    },
+    {
+      "question": "Are database cursors, iterators, result sets, or streams not closed after use (cursor/resultset leak)? (RES-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix cursor/resultset leak (RES-002): scope and close iteration resources",
+        "prompt": "Problem: Unclosed cursors/result sets/streams hold server and connection resources, degrading the DB.\n\nFind all instances: Search for DB cursors/result sets/iterators/streams opened without scoped closing.\n\nFix correctly: Use scoped resource management to close iteration resources after use on all paths.\n\nConstraints: Combine with connection release (RES-003) and error cleanup (ERR-004).\n\nAcceptance: Iteration resources are closed. Add a test asserting cursors/streams are disposed after use (including on error)."
+      }
+    },
+    {
+      "question": "Are database/HTTP/queue/RPC connections acquired without release, or used with unbounded concurrency, risking pool exhaustion (connection pool exhaustion)? (RES-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix connection pool exhaustion (RES-003): release promptly and bound usage",
+        "prompt": "Problem: Connections not returned to the pool (or unbounded concurrency) exhaust the pool and stall the app.\n\nFind all instances: Search for connection/client acquisition without prompt release and for unbounded concurrent acquisition.\n\nFix correctly: Release connections promptly with scoped cleanup; bound concurrency to the pool size; set acquisition timeouts.\n\nConstraints: Config over hardcoding for pool/concurrency limits. Don't hold connections across slow work (CON-003).\n\nAcceptance: Connections are released and concurrency bounded. Add a test asserting connections return to the pool even on error."
+      }
+    },
+    {
+      "question": "Do long-lived collections, callbacks, closures, caches, or globals retain objects beyond their lifecycle, causing a memory leak via retained references? (RES-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix memory leak via retained references (RES-004): define ownership/lifetime",
+        "prompt": "Problem: Unintended retention grows memory until the process degrades or crashes.\n\nFind all instances: Search for long-lived collections/caches/registries, event handler/closure retention, and statics that accumulate objects without release.\n\nFix correctly: Remove unintended retention; define clear ownership/lifetime; deregister listeners; use weak references where appropriate.\n\nConstraints: Combine with unbounded-cache (RES-005) and listener (RES-020) fixes.\n\nAcceptance: Retained references are bounded/released. Add a test/check asserting objects are released when no longer needed."
+      }
+    },
+    {
+      "question": "Do maps, caches, registries, or accumulators grow with user input or runtime events without eviction/TTL/size limits (unbounded cache/map growth)? (RES-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unbounded cache growth (RES-005): add size limits, TTL, and eviction",
+        "prompt": "Problem: Caches/maps that grow without bound exhaust memory (also a DoS vector).\n\nFind all instances: Search for caches/maps/registries/accumulators keyed by user input or events without eviction.\n\nFix correctly: Add size limits, TTL, and an eviction policy (e.g. LRU); define lifecycle/ownership.\n\nConstraints: Config over hardcoding for limits/TTL. Combine with invalidation policy (PER-015).\n\nAcceptance: Caches are bounded. Add a test asserting eviction occurs past the configured limit."
+      }
+    },
+    {
+      "question": "Does code read entire files, request/response bodies, blobs, or query results into memory when streaming would suffice (full-buffering large streams)? (RES-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix full-buffering large streams (RES-006): stream or chunk large data",
+        "prompt": "Problem: Buffering large data fully into memory causes spikes and OOM under load.\n\nFind all instances: Search for read-all of files/bodies/blobs/result sets into memory where the data can be large.\n\nFix correctly: Stream or chunk large data end to end instead of materializing it all.\n\nConstraints: Bound sizes for untrusted input (RES-007/VAL-006).\n\nAcceptance: Large data is streamed. Add a test/check asserting memory does not scale with payload size for the affected path."
+      }
+    },
+    {
+      "question": "Are request or response body reads performed without size limits (unbounded body read)? (RES-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unbounded body read (RES-007): enforce request/response size limits",
+        "prompt": "Problem: Reading untrusted bodies without a size cap enables memory-exhaustion DoS.\n\nFind all instances: Search request/response/upload reads and parse steps for missing size limits.\n\nFix correctly: Enforce maximum request, response, upload, and parse sizes; reject oversized input early.\n\nConstraints: Config over hardcoding for limits. Combine with collection limits (VAL-006).\n\nAcceptance: Body reads are size-bounded. Add a test sending an over-limit body asserting rejection."
+      }
+    },
+    {
+      "question": "Are temporary files/directories created without cleanup on success and failure (temporary file not removed)? (RES-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix temp file not removed (RES-008): clean up via finally/defer",
+        "prompt": "Problem: Orphaned temp files fill disk and may leak sensitive data.\n\nFind all instances: Search temp-file/dir creation for guaranteed cleanup on both success and failure.\n\nFix correctly: Delete temp artifacts using finally/defer/scope cleanup; prefer auto-deleting temp APIs.\n\nConstraints: Create temp files securely (VAL-017).\n\nAcceptance: Temp artifacts are removed on all paths. Add a test forcing an error asserting the temp file is deleted."
+      }
+    },
+    {
+      "question": "Are files, directories, sockets, or keys created with broad or inherited permissions instead of least privilege (unsafe file/directory permissions)? (RES-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe permissions (RES-009): create with least privilege",
+        "prompt": "Problem: Overly broad permissions expose sensitive files/keys to other users/processes.\n\nFind all instances: Search file/dir/socket/key creation for broad or default-inherited permissions on sensitive artifacts.\n\nFix correctly: Create with least-privilege permissions (restrict to the owning user/process) and verify ownership; set umask/explicit modes.\n\nConstraints: Especially tighten secrets/keys. Don't rely on later chmod (race).\n\nAcceptance: Sensitive artifacts have restrictive permissions at creation. Add a test asserting created files have the expected restrictive mode."
+      }
+    },
+    {
+      "question": "Is synchronous filesystem/network/database/crypto/compression/subprocess work performed on an event loop, UI, or main thread (blocking I/O on event loop/main thread)? (RES-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix blocking I/O on event loop (RES-010): use async or offload",
+        "prompt": "Problem: Blocking the event loop/main thread freezes the whole application/UI.\n\nFind all instances: Search for synchronous I/O/crypto/compression/subprocess calls on event-loop/UI/main threads.\n\nFix correctly: Use async/non-blocking APIs, or offload blocking work to a worker/thread pool.\n\nConstraints: Don't introduce unbounded thread usage; bound the offload pool.\n\nAcceptance: Event-loop/main threads don't block. Add a test/check confirming the blocking call is async/offloaded."
+      }
+    },
+    {
+      "question": "Are connect/read/write/DNS/TLS/streaming network operations performed without specific deadlines (network operation without deadline)? (RES-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix network ops without deadline (RES-011): add per-phase deadlines",
+        "prompt": "Problem: Network operations without deadlines can hang on each phase (connect/read/write/DNS/TLS), stalling resources.\n\nFind all instances: Search network clients/operations for missing connect/read/write/total deadlines.\n\nFix correctly: Set connect, read, write, and total operation deadlines; fail fast on expiry.\n\nConstraints: Config over hardcoding for timeouts. Combine with ERR-008.\n\nAcceptance: Network operations have deadlines. Add a test simulating a slow peer asserting the operation times out."
+      }
+    },
+    {
+      "question": "Are hosts, IPs, ports, or service endpoints hard-coded outside controlled configuration (hard-coded DNS/host assumption)? (RES-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hard-coded endpoints (RES-012): externalize and handle failures",
+        "prompt": "Problem: Hard-coded hosts/IPs/ports break across environments and can't be rotated.\n\nFind all instances: Search for literal hosts/IPs/ports/endpoints in code outside configuration.\n\nFix correctly: Externalize endpoints to configuration; handle resolution/connection failures gracefully.\n\nConstraints: Config over hardcoding; values hot-reloadable where possible. Combine with ARC-012.\n\nAcceptance: Endpoints come from config. Add a test/check asserting no hard-coded endpoint remains in the affected code."
+      }
+    },
+    {
+      "question": "Do network clients bypass required proxies, custom DNS, egress policy, or environment network configuration (proxy/network environment ignored)? (RES-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix ignored network environment (RES-013): respect proxy/egress config",
+        "prompt": "Problem: Clients that ignore configured proxy/DNS/egress policy fail in restricted environments or bypass egress controls.\n\nFind all instances: Search network clients for hard-coded direct connections that ignore proxy/DNS/egress environment settings.\n\nFix correctly: Respect configured proxies, custom DNS, and egress policy/environment variables.\n\nConstraints: Config over hardcoding. Honor the platform's network boundaries.\n\nAcceptance: Clients honor configured network boundaries. Add a test/check asserting proxy/egress config is applied."
+      }
+    },
+    {
+      "question": "Does path handling use hard-coded separators, drive assumptions, case assumptions, or platform-specific roots instead of platform path APIs (platform-specific path assumption)? (RES-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix platform path assumptions (RES-014): use platform path APIs",
+        "prompt": "Problem: Manual path string handling breaks across OSes (separators, drives, case).\n\nFind all instances: Search for manual path joins with hard-coded separators, drive-letter assumptions, or case assumptions.\n\nFix correctly: Use the platform's path APIs for joining/normalizing; avoid manual separator concatenation.\n\nConstraints: Combine with path confinement (VAL-009).\n\nAcceptance: Path handling is platform-correct. Add a test/check covering path construction on the target platforms."
+      }
+    },
+    {
+      "question": "Are subprocess stdout/stderr piped but not consumed, risking pipe-buffer deadlock (child process output not drained)? (RES-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix undrained subprocess output (RES-015): drain or redirect output",
+        "prompt": "Problem: If piped child output isn't read, the child blocks when the pipe buffer fills, deadlocking both processes.\n\nFind all instances: Search subprocess invocations that pipe stdout/stderr without consuming them.\n\nFix correctly: Drain/stream both stdout and stderr concurrently, or redirect to files/devnull; read before/while waiting.\n\nConstraints: Avoid reading stdout fully before stderr (can deadlock); read concurrently.\n\nAcceptance: Subprocess output can't deadlock. Add a test with a high-output child asserting it completes."
+      }
+    },
+    {
+      "question": "Are spawned processes not waited on or reaped, leaving zombie child processes (zombie child process)? (RES-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix zombie processes (RES-016): wait for and reap children",
+        "prompt": "Problem: Unwaited child processes become zombies, consuming PIDs and hiding failures.\n\nFind all instances: Search subprocess spawns for missing wait/reap and exit-status handling.\n\nFix correctly: Wait for child processes, collect exit status, and handle failures; clean up on the error path.\n\nConstraints: Combine with output draining (RES-015) to avoid wait deadlocks.\n\nAcceptance: Children are reaped and exit status checked. Add a test asserting the child's exit code is observed."
+      }
+    },
+    {
+      "question": "Do services or CLIs fail to handle termination/interrupt/shutdown signals (missing signal/interrupt handling)? (RES-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing signal handling (RES-017): handle termination gracefully",
+        "prompt": "Problem: Without signal handling, processes are killed abruptly, losing in-flight work.\n\nFind all instances: Search service/CLI entry points for handling of termination/interrupt signals.\n\nFix correctly: Handle termination/interrupt signals to initiate a controlled shutdown.\n\nConstraints: Combine with graceful shutdown (RES-018). Don't ignore shutdown errors (ERR-020).\n\nAcceptance: Signals trigger controlled shutdown. Add a test/check asserting a termination signal initiates graceful shutdown."
+      }
+    },
+    {
+      "question": "Do services stop immediately without draining requests, workers, queues, or connections (graceful shutdown missing)? (RES-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing graceful shutdown (RES-018): drain and close cleanly",
+        "prompt": "Problem: Abrupt shutdown drops in-flight requests and unflushed data.\n\nFind all instances: Search shutdown paths for draining of in-flight work, rejecting new traffic, closing resources, and flushing telemetry.\n\nFix correctly: On shutdown, stop accepting new work, drain in-flight requests/workers/queues within a deadline, close resources, and flush telemetry.\n\nConstraints: Bound drain time. Report shutdown errors (ERR-020).\n\nAcceptance: Shutdown drains and closes cleanly. Add a test asserting in-flight work completes (or is safely handled) on shutdown."
+      }
+    },
+    {
+      "question": "Are important files written directly in place where interruption may corrupt them, instead of write-temp-then-atomic-rename (non-atomic file write)? (RES-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-atomic file write (RES-019): write temp then atomic rename",
+        "prompt": "Problem: Writing important files in place risks corruption/partial files if interrupted.\n\nFind all instances: Search for in-place writes/overwrites of important files (config, data, state).\n\nFix correctly: Write to a temp file in the same directory, flush/fsync as needed, then atomically rename over the target.\n\nConstraints: Ensure same-filesystem rename for atomicity. Clean up temp on failure (RES-008).\n\nAcceptance: Important writes are atomic. Add a test simulating interruption asserting the original file isn't corrupted."
+      }
+    },
+    {
+      "question": "Are event listeners, observers, subscriptions, timers, or watchers added repeatedly without removal, leaking registrations (unbounded listener/watcher registration)? (RES-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unbounded listeners (RES-020): deregister and cap registrations",
+        "prompt": "Problem: Listeners/watchers added without removal accumulate, leaking memory and causing duplicate handling.\n\nFind all instances: Search for listener/observer/subscription/timer/watcher registration without matching deregistration, especially in re-entered code paths.\n\nFix correctly: Deregister listeners on teardown; cap or dedupe registrations; tie subscription lifetime to ownership.\n\nConstraints: Combine with retained-reference cleanup (RES-004).\n\nAcceptance: Registrations are bounded and removed. Add a test repeatedly registering/tearing down asserting no accumulation."
+      }
+    }
+  ]
+}

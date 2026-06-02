@@ -190,10 +190,42 @@ Recommended tag vocabulary (start small, extend as needs emerge):
 | `sensitive` | Anything you would not want a weaker or unverified model to touch — auth flows, secrets handling, billing logic. |
 | `architectural` | Cross-cutting refactors and design-doc-shaped work. |
 | `security` | Threat-modelling, dependency vulns, anything in a security review. |
+| `audit` | **Framework-recognised.** Marks a member as eligible to run the [audit phase](audit.md). See [Audit-capability pool](#audit-capability-pool) below. |
 
 Tag comparison is case-insensitive; values are otherwise free-form so you can
 extend the vocabulary without code changes. The builder de-dupes and trims, so
 `"Sensitive"` and `"sensitive"` collapse to a single tag.
+
+### Audit-capability pool
+
+The `audit` tag is framework-recognised: when AT LEAST ONE member of the routed
+class declares it, the audit phase is restricted to those members — a non-tagged
+member is **NEVER** picked for auditing, even when it is the only one with
+quota. Tag the agents you trust to audit and the pool keeps your audit
+throughput resilient under quota crunches: if `codex` is exhausted, an
+`audit`-tagged `claude` takes over (and vice-versa), while a member you didn't
+trust to audit (e.g. a faster but weaker model) stays out of the audit pool.
+
+```json
+{
+  "Id": "frontier-coding",
+  "Members": [
+    { "Agent": "claude", "Billing": "Subscription", "QualityScore": 100, "Capabilities": ["audit"] },
+    { "Agent": "codex",  "Billing": "Subscription", "QualityScore": 100, "Capabilities": ["audit"] },
+    { "Agent": "gemini", "Billing": "Subscription", "QualityScore": 95,  "ReasoningMode": "high" }
+  ]
+}
+```
+
+`Project.Audit.AuditAgent` (and `PerAuditorAgent[name]`) remain honoured as
+the **preferred primary** when set: if the named agent is tagged audit-capable,
+quota-available, and credentialed, it runs first. When it is NOT tagged the
+preference is demoted with a warning and routing falls back to the audit pool.
+When the operator hasn't tagged anyone — no opt-in — the audit phase keeps
+its pre-capability behaviour for backward compatibility.
+
+The capability tag is config-driven and hot-reloadable: edit
+`codeybox-extra.json` and the audit pool changes on the next pickup attempt.
 
 ### Default-open
 

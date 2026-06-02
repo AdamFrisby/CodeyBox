@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are there nested loops, repeated scans, brute-force matching, or quadratic behavior over potentially large inputs (algorithmic complexity unsuitable for input size)? (PER-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix algorithmic complexity (PER-001): use better algorithms/data structures",
+        "prompt": "Problem: Super-linear algorithms over large inputs cause severe slowdowns and timeouts.\n\nFind all instances: Search for nested loops, repeated scans, and brute-force matching over collections that can grow large.\n\nFix correctly: Use better algorithms, maps/sets for lookups, indexes, batching, or precomputation to reduce complexity.\n\nConstraints: Preserve correctness; verify results match. Measure before/after where feasible.\n\nAcceptance: Hot paths scale acceptably with input size. Add a test/benchmark or complexity check for large inputs."
+      }
+    },
+    {
+      "question": "Are there loops issuing one database query per item or per relation (N+1 database query)? (PER-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix N+1 query (PER-002): batch, join, or eager-load",
+        "prompt": "Problem: N+1 queries multiply DB round trips and dominate latency.\n\nFind all instances: Search for loops that query the DB per element or per related entity.\n\nFix correctly: Batch, join, prefetch/eager-load, or use set-based queries to fetch in bulk.\n\nConstraints: Avoid over-fetching (PER-004). Preserve result correctness.\n\nAcceptance: Per-item DB fan-out is eliminated. Add a test/check asserting a bounded query count for N items."
+      }
+    },
+    {
+      "question": "Do hot-path database queries filter/sort on unindexed or low-selectivity fields (query not aligned with index/selectivity)? (PER-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unindexed queries (PER-003): align predicates with indexes",
+        "prompt": "Problem: Queries that can't use an index scan large amounts of data, slowing hot paths.\n\nFind all instances: Search hot-path queries filtering/sorting on unindexed or low-selectivity columns.\n\nFix correctly: Add appropriate indexes or rewrite the query/predicate to use existing indexes; verify with the query plan.\n\nConstraints: Weigh index write/storage cost. Keep migrations safe (OPS-013/OPS-015).\n\nAcceptance: Hot queries use indexes. Add a migration/index and verify the plan; keep tests passing."
+      }
+    },
+    {
+      "question": "Do queries retrieve full rows, large blobs, or unbounded result sets when only small fields are needed (over-fetching rows/columns)? (PER-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix over-fetching (PER-004): select only needed fields and limit rows",
+        "prompt": "Problem: Over-fetching wastes bandwidth, memory, and time.\n\nFind all instances: Search for SELECT * / full-entity loads / unbounded result sets where only a few fields/rows are needed.\n\nFix correctly: Select only required columns, apply limits/pagination, and avoid loading large blobs unnecessarily.\n\nConstraints: Keep correctness; don't drop fields the caller needs. Use stable pagination (PER-017).\n\nAcceptance: Queries fetch only what's needed. Add a test/check asserting bounded result size."
+      }
+    },
+    {
+      "question": "Are large collections loaded into memory then filtered, grouped, joined, or sorted locally (large in-memory sort/filter)? (PER-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix in-memory sort/filter (PER-005): push down to storage or stream",
+        "prompt": "Problem: Loading everything then filtering in memory wastes memory and time.\n\nFind all instances: Search for fetch-all-then-filter/sort/group/join in application code.\n\nFix correctly: Push filtering/sorting/aggregation to the database/storage, or process as a stream.\n\nConstraints: Preserve result correctness/ordering (use stable order, DAT-013).\n\nAcceptance: Filtering/sorting happens at the source or via streaming. Add a test/check confirming the data isn't fully materialized."
+      }
+    },
+    {
+      "question": "Are expensive deterministic computations repeated in loops, hot paths, or request handlers (recomputing expensive pure result)? (PER-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix recomputation (PER-006): memoize/precompute with invalidation",
+        "prompt": "Problem: Recomputing the same expensive pure result wastes CPU.\n\nFind all instances: Search for repeated expensive deterministic computations in loops/hot paths.\n\nFix correctly: Memoize, cache, or precompute the result and hoist it out of loops, with correct invalidation if inputs change.\n\nConstraints: Bound cache size/TTL (RES-005). Ensure invalidation correctness (PER-015).\n\nAcceptance: Expensive pure results are computed once. Add a test/benchmark confirming reduced recomputation."
+      }
+    },
+    {
+      "question": "Are independent API/database/RPC calls performed sequentially despite no data dependency (serial independent external calls)? (PER-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix serial independent calls (PER-007): parallelize under bounded concurrency",
+        "prompt": "Problem: Running independent calls serially adds up their latencies needlessly.\n\nFind all instances: Search for sequential independent external calls with no data dependency.\n\nFix correctly: Batch or run them in parallel under bounded concurrency; await all and handle partial failures.\n\nConstraints: Bound concurrency to avoid overload (ERR-010). Handle individual failures (ERR-011).\n\nAcceptance: Independent calls run concurrently. Add a test/check confirming parallel execution and correct aggregation."
+      }
+    },
+    {
+      "question": "Are hot locks protecting large critical sections or unrelated shared state, causing excessive lock contention? (PER-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix lock contention (PER-008): shrink critical sections or shard state",
+        "prompt": "Problem: Coarse hot locks serialize work and limit throughput.\n\nFind all instances: Search for hot locks guarding large sections or unrelated state.\n\nFix correctly: Reduce critical-section size, shard/partition state, use lock-free/concurrent structures, or isolate ownership.\n\nConstraints: Preserve correctness/invariants; avoid introducing races (CON-001).\n\nAcceptance: Lock contention is reduced. Add a benchmark/check or review confirming smaller/partitioned critical sections."
+      }
+    },
+    {
+      "question": "Are there frequent polling loops checking external state or database rows (inefficient polling)? (PER-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inefficient polling (PER-009): use events or bounded backoff",
+        "prompt": "Problem: Tight polling wastes CPU/DB/network and adds latency.\n\nFind all instances: Search for frequent polling of external state or DB rows.\n\nFix correctly: Use events/subscriptions/notifications where available, or bounded backoff with jitter when polling is unavoidable.\n\nConstraints: Config over hardcoding for intervals. Avoid busy-wait (CON-020).\n\nAcceptance: Polling is event-driven or backed off. Add a test/check asserting the reduced polling frequency."
+      }
+    },
+    {
+      "question": "Do workflows require many small network round trips for one user-visible operation (chatty network protocol)? (PER-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix chatty protocol (PER-010): batch, coarsen, pipeline, or cache",
+        "prompt": "Problem: Many small round trips per operation add latency and overhead.\n\nFind all instances: Search for operations that make many small sequential network calls.\n\nFix correctly: Batch requests, coarsen the API, pipeline, or cache to reduce round trips.\n\nConstraints: Preserve correctness; bound batch sizes.\n\nAcceptance: Round trips per operation are reduced. Add a test/check asserting fewer calls per operation."
+      }
+    },
+    {
+      "question": "Is there repeated large object/buffer/string/array/collection allocation in hot paths (large allocation in hot path)? (PER-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hot-path allocation (PER-011): reuse buffers or reduce allocation",
+        "prompt": "Problem: Frequent large allocations in hot paths cause GC pressure and latency spikes.\n\nFind all instances: Search hot paths for repeated large allocations (buffers, strings, arrays, collections).\n\nFix correctly: Reuse buffers/pools, stream data, reduce allocation size, or hoist allocation out of the hot path.\n\nConstraints: Preserve correctness and thread-safety of any reused buffers (CON-009).\n\nAcceptance: Hot-path allocations are reduced. Add a benchmark/check confirming lower allocation."
+      }
+    },
+    {
+      "question": "Is there repeated concatenation, slicing, encoding, decoding, cloning, or serialization in loops (excessive string/data copying)? (PER-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix excessive copying (PER-012): use builders/buffers/views",
+        "prompt": "Problem: Repeated copying/encoding in loops wastes CPU and memory.\n\nFind all instances: Search loops for repeated string concatenation, slicing, encode/decode, clone, or serialize operations.\n\nFix correctly: Use builders/buffers, views/slices, streaming encoders, or fewer transformations.\n\nConstraints: Preserve output correctness.\n\nAcceptance: Redundant copying is reduced. Add a benchmark/check or review confirming the improvement."
+      }
+    },
+    {
+      "question": "Are complex regexes run on untrusted or long input that may backtrack exponentially (catastrophic regex backtracking)? (PER-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix catastrophic backtracking (PER-013): simplify regex or bound input",
+        "prompt": "Problem: Pathological regexes (nested quantifiers) can hang on crafted input (ReDoS).\n\nFind all instances: Search for complex regexes (nested/ambiguous quantifiers) applied to untrusted or long input.\n\nFix correctly: Simplify the regex to avoid ambiguity, use a linear-time regex engine, bound input length, and apply a match timeout.\n\nConstraints: Preserve matching semantics for valid input. Combine with regex-injection (INJ-008).\n\nAcceptance: Regexes can't be DoS'd. Add a test with a backtracking payload asserting bounded time/rejection."
+      }
+    },
+    {
+      "question": "Do cache misses cause many concurrent workers to recompute or refetch the same expensive value (cache stampede/thundering herd)? (PER-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix cache stampede (PER-014): coalesce requests and add jitter",
+        "prompt": "Problem: On a cache miss, many workers recompute the same value simultaneously, overloading the source.\n\nFind all instances: Search for cache-miss paths where concurrent callers recompute/refetch the same key.\n\nFix correctly: Add request coalescing (single-flight), per-key locking, TTL jitter, and stale-while-revalidate.\n\nConstraints: Bound recompute concurrency. Keep correctness of served data.\n\nAcceptance: Concurrent misses don't stampede. Add a concurrency test asserting a single recompute for many simultaneous callers."
+      }
+    },
+    {
+      "question": "Are there caches without TTL, versioning, invalidation events, or clear ownership (missing cache invalidation policy)? (PER-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing cache invalidation (PER-015): define TTL and invalidation",
+        "prompt": "Problem: Caches without an invalidation policy serve stale data indefinitely.\n\nFind all instances: Search caches for missing TTL, versioned keys, invalidation triggers, or ownership.\n\nFix correctly: Define TTL, invalidation triggers on writes, versioned keys, and clear ownership/consistency expectations.\n\nConstraints: Config over hardcoding for TTLs. Invalidate transactionally with source writes (DAT-020).\n\nAcceptance: Caches have a clear invalidation policy. Add a test asserting cached values invalidate on the relevant write."
+      }
+    },
+    {
+      "question": "Do caches store sensitive, authorization-dependent, user-specific, or rapidly changing data too broadly or too long (over-caching stale/sensitive data)? (PER-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix over-caching sensitive data (PER-016): scope keys and shorten TTL",
+        "prompt": "Problem: Caching authorization-dependent or sensitive data too broadly leaks data across users or serves stale/private data.\n\nFind all instances: Search caches for sensitive/user-specific/authorization-dependent or fast-changing data cached broadly or for long TTLs.\n\nFix correctly: Key caches by authorization/user context, shorten TTLs, or avoid caching unsafe data entirely.\n\nConstraints: Don't cache per-user data under shared keys. Coordinate with privacy (CSP-016/CSP-017).\n\nAcceptance: Caching respects authorization and freshness. Add a test asserting one user can't receive another's cached data."
+      }
+    },
+    {
+      "question": "Is offset/limit pagination used over large or frequently changing datasets (offset pagination on large dataset)? (PER-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix offset pagination (PER-017): use keyset/cursor pagination",
+        "prompt": "Problem: Large offsets are slow (the DB scans/skips many rows) and unstable under concurrent changes.\n\nFind all instances: Search for offset/limit pagination over large/changing datasets.\n\nFix correctly: Use keyset/cursor pagination with a stable, deterministic ordering.\n\nConstraints: Provide opaque cursors (API-008); keep ordering stable (DAT-013).\n\nAcceptance: Pagination is cursor-based and efficient. Add a test paging deep into a large set asserting stable, fast results."
+      }
+    },
+    {
+      "question": "Do startup paths eagerly load large data, initialize unused dependencies, or make slow network calls (slow startup from eager initialization)? (PER-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix slow startup (PER-018): lazy-load or parallelize initialization",
+        "prompt": "Problem: Heavy eager initialization slows startup and delays readiness/scaling.\n\nFind all instances: Search startup for eager loading of large data, initialization of unused dependencies, and slow network calls.\n\nFix correctly: Lazy-load on first use, parallelize safe initialization, or move non-essential work out of the startup path.\n\nConstraints: Don't defer required validation (validate config at startup, OPS-009). Avoid config-read-too-early issues (OPS-010).\n\nAcceptance: Startup is faster without losing required checks. Add a test/check confirming deferred/parallel init."
+      }
+    },
+    {
+      "question": "Are there high-volume logs inside tight loops, per-item operations, or request hot paths (excessive hot-path logging)? (PER-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hot-path logging (PER-019): reduce volume, aggregate, or use metrics",
+        "prompt": "Problem: Logging per item/iteration floods logs and adds latency/I/O.\n\nFind all instances: Search tight loops/per-item/hot paths for verbose logging.\n\nFix correctly: Lower log volume/level, aggregate or sample, or move counts to metrics instead of per-item logs.\n\nConstraints: Keep essential diagnostics. Avoid high-cardinality labels (OPS-017).\n\nAcceptance: Hot-path logging is bounded. Add a test/check asserting reduced log volume per operation."
+      }
+    },
+    {
+      "question": "Are there repeated encode/decode/compress/decompress cycles where data could remain in native or streamed form (unnecessary serialization/compression overhead)? (PER-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix redundant serialization (PER-020): avoid needless transformations",
+        "prompt": "Problem: Repeated serialize/deserialize/compress/decompress cycles waste CPU.\n\nFind all instances: Search for data repeatedly encoded/decoded/compressed/decompressed where it could stay native or streamed.\n\nFix correctly: Eliminate redundant transformations; keep data in native/streamed form; compress only when beneficial.\n\nConstraints: Preserve correctness and any required wire formats.\n\nAcceptance: Redundant transformations are removed. Add a benchmark/check confirming fewer encode/decode cycles."
+      }
+    }
+  ]
+}

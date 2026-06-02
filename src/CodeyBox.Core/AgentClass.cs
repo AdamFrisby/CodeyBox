@@ -77,6 +77,27 @@ public sealed record AgentMembership
     public IReadOnlyList<string> Capabilities { get; init; } = [];
 }
 
+/// <summary>
+/// Framework-defined capability tag names with built-in routing meaning.
+/// Operators still declare which members carry them in
+/// <c>CodeyBox:AgentClasses[].Members[].Capabilities</c> — the framework
+/// never hardcodes which agent kinds get tagged. Free-form tags
+/// (<c>sensitive</c>, <c>architectural</c>, etc.) live alongside these.
+/// </summary>
+public static class WellKnownCapabilities
+{
+    /// <summary>
+    /// Marks a class member as eligible to run the audit phase. When AT LEAST
+    /// ONE member of the routed class carries this tag, the audit phase is
+    /// restricted to tagged members ("opt-in pool"); a non-tagged member is
+    /// NEVER picked for auditing — including the project's
+    /// <see cref="ProjectAudit.AuditAgent"/> preference and the work agent.
+    /// When NO class member carries the tag, the audit phase falls back to
+    /// the legacy "any agent is allowed" routing for backward compatibility.
+    /// </summary>
+    public const string Audit = "audit";
+}
+
 /// <summary>How the agent is billed, which determines quota-wait behaviour.</summary>
 public enum AgentBilling
 {
@@ -92,4 +113,24 @@ public enum AgentBilling
     /// the call to fail. The orchestrator never waits for PayPerApi members.
     /// </summary>
     PayPerApi,
+}
+
+/// <summary>Convenience helpers for inspecting <see cref="AgentMembership"/> capability tags.</summary>
+public static class AgentMembershipExtensions
+{
+    /// <summary>
+    /// Returns true when <paramref name="member"/> declares <paramref name="capability"/>
+    /// in its <see cref="AgentMembership.Capabilities"/> list. Ordinal,
+    /// case-insensitive — matches the comparison the router uses.
+    /// </summary>
+    public static bool HasCapability(this AgentMembership member, string capability)
+    {
+        if (string.IsNullOrEmpty(capability)) return false;
+        foreach (var tag in member.Capabilities)
+        {
+            if (string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 }

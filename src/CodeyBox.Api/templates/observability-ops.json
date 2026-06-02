@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are important security, business, payment, job, migration, and integration events missing structured logs (missing structured logs for key events)? (OPS-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing structured logs (OPS-001): log key events with structured fields",
+        "prompt": "Problem: Without structured logs for key events, incidents are hard to investigate and audit.\n\nFind all instances: Search important security/business/payment/job/migration/integration events for missing or unstructured logging.\n\nFix correctly: Emit structured logs with consistent event names and fields at the right level.\n\nConstraints: Never log secrets/PII (CSP-002/CSP-017). Use the project's logging framework.\n\nAcceptance: Key events are logged structurally. Add a test asserting the event log is emitted with expected fields."
+      }
+    },
+    {
+      "question": "Are errors logged as info/debug, expected events logged as errors, or are logs noisy enough to obscure real failures (wrong log level/noisy logging)? (OPS-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix log levels (OPS-002): tune severity to actionability",
+        "prompt": "Problem: Wrong log levels hide real failures or flood logs with noise.\n\nFind all instances: Search for errors logged below error level, normal events logged as errors, and noisy logs.\n\nFix correctly: Set log levels to match severity and operator actionability; reduce noise.\n\nConstraints: Keep diagnostics useful. Coordinate with hot-path logging (PER-019).\n\nAcceptance: Log levels reflect severity. Review/adjust the affected logs; add a check where feasible."
+      }
+    },
+    {
+      "question": "Are request/job/message/trace identifiers not propagated across service boundaries (missing correlation/request ID propagation)? (OPS-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix correlation ID propagation (OPS-003): propagate IDs across boundaries",
+        "prompt": "Problem: Without correlation IDs, tracing a request across services/async work is nearly impossible.\n\nFind all instances: Search service/async boundaries for missing propagation of request/correlation/trace IDs.\n\nFix correctly: Propagate correlation IDs through logs, metrics, traces, outbound headers, and async work; generate one at the edge if absent.\n\nConstraints: Don't use high-cardinality IDs as metric labels (OPS-017).\n\nAcceptance: Correlation IDs flow end to end. Add a test asserting the ID propagates across a boundary/async hop."
+      }
+    },
+    {
+      "question": "Are key operations missing latency, throughput, error, saturation, or business-outcome metrics (missing critical-path metrics)? (OPS-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing metrics (OPS-004): add critical-path metrics",
+        "prompt": "Problem: Without metrics on critical paths, you can't detect or diagnose degradation.\n\nFind all instances: Search user-visible and dependency-critical operations for missing latency/throughput/error/saturation/business metrics.\n\nFix correctly: Add metrics for these paths using the project's metrics system.\n\nConstraints: Use bounded labels (OPS-017); no sensitive values in telemetry (OPS-018).\n\nAcceptance: Critical paths are instrumented. Add a test/check asserting the metric is recorded."
+      }
+    },
+    {
+      "question": "Are severe failures visible only in logs or user reports, not in metrics/alerts (no alertable failure signal)? (OPS-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix no alertable signal (OPS-005): expose alertable symptoms",
+        "prompt": "Problem: Failures only visible in logs go unnoticed until users complain.\n\nFind all instances: Search severe failure paths for an alertable metric/signal.\n\nFix correctly: Expose SLO/error-budget or symptom-based alert signals (metrics) for severe failures.\n\nConstraints: Alert on symptoms users feel, not just internals. Bounded labels (OPS-017).\n\nAcceptance: Severe failures emit alertable signals. Add a test/check asserting the failure increments an alertable metric."
+      }
+    },
+    {
+      "question": "Are there health checks that always return healthy or check irrelevant dependencies (weak health check)? (OPS-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix weak health check (OPS-006): check only relevant dependencies",
+        "prompt": "Problem: Health checks that always pass (or check the wrong things) mask outages and mislead orchestration.\n\nFind all instances: Search health checks for always-healthy responses or checks of irrelevant dependencies.\n\nFix correctly: Check only the dependencies required for the health level being reported; reflect real health.\n\nConstraints: Separate liveness from readiness (OPS-007). Don't leak internals (API-016).\n\nAcceptance: Health checks reflect real dependency health. Add a test asserting the check fails when a required dependency is down."
+      }
+    },
+    {
+      "question": "Is one health endpoint used both to restart the process and to decide traffic readiness (readiness/liveness mixed)? (OPS-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix mixed liveness/readiness (OPS-007): separate the two",
+        "prompt": "Problem: Conflating liveness and readiness causes needless restarts or routing of traffic to unready instances.\n\nFind all instances: Search for a single health endpoint used for both restart and traffic decisions.\n\nFix correctly: Separate liveness (is the process alive) from readiness (can it serve traffic) with distinct checks.\n\nConstraints: Liveness should not fail on transient dependency issues.\n\nAcceptance: Liveness and readiness are distinct. Add tests asserting each reflects the correct condition."
+      }
+    },
+    {
+      "question": "Are there defaults that enable debug mode, broad permissions, insecure transport, verbose errors, or weak limits in production (unsafe production default)? (OPS-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe production default (OPS-008): make defaults safe and fail closed",
+        "prompt": "Problem: Insecure defaults (debug on, verbose errors, broad permissions) expose production systems.\n\nFind all instances: Search defaults for debug mode, broad permissions, insecure transport, verbose errors, and weak limits applied in production.\n\nFix correctly: Make production-safe defaults explicit and fail closed; require opt-in for risky settings.\n\nConstraints: Config over hardcoding. Don't leak internals in errors (ERR-014).\n\nAcceptance: Production defaults are safe. Add a test/check asserting risky features are off by default."
+      }
+    },
+    {
+      "question": "Are mandatory config values replaced with implicit defaults when missing (required config silently defaulted)? (OPS-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix silently defaulted config (OPS-009): validate and fail fast",
+        "prompt": "Problem: Silently defaulting required config can run the system misconfigured or insecure.\n\nFind all instances: Search config loading for required values that fall back to defaults.\n\nFix correctly: Validate required config at startup and fail fast with a clear message when absent/invalid.\n\nConstraints: Distinguish required from optional. Config over hardcoding (ARC-011).\n\nAcceptance: Missing required config aborts startup clearly. Add a test asserting startup fails when a required value is missing."
+      }
+    },
+    {
+      "question": "Is configuration read during import/static initialization before environment and secrets are ready (config read too early)? (OPS-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix config read too early (OPS-010): load at controlled startup boundary",
+        "prompt": "Problem: Reading config at import/static-init time captures stale/empty values before env/secrets are ready.\n\nFind all instances: Search for config/secret reads in static initializers or module top-level code.\n\nFix correctly: Load and validate runtime config at a controlled startup boundary, not at import/static init.\n\nConstraints: Coordinate with config validation (OPS-009).\n\nAcceptance: Config is read at a controlled boundary. Add a test/check confirming no static-init config reads remain."
+      }
+    },
+    {
+      "question": "Are there feature flags without owner, removal criteria, expiry, or cleanup plan (feature flag lacks owner/expiry)? (OPS-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unmanaged feature flags (OPS-011): add owner, expiry, and cleanup",
+        "prompt": "Problem: Long-lived orphan flags accumulate complexity and risk.\n\nFind all instances: Search feature flags for missing owner, expiry, removal criteria, or cleanup plan.\n\nFix correctly: Record owner, expiry, and removal criteria; file/track a cleanup task; gate removal.\n\nConstraints: Keep flag evaluation consistent (OPS-012).\n\nAcceptance: Flags have owner/expiry/cleanup. Document or annotate the affected flags accordingly."
+      }
+    },
+    {
+      "question": "Are feature-flag checks duplicated or applied inconsistently across UI, API, jobs, and permissions (feature flag inconsistently applied)? (OPS-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent feature flags (OPS-012): centralize flag evaluation",
+        "prompt": "Problem: Inconsistent flag checks cause partial rollouts that expose half-enabled behavior.\n\nFind all instances: Search for the same flag evaluated differently/duplicated across UI/API/jobs/permissions.\n\nFix correctly: Centralize flag evaluation and enforce consistent behavior across all layers.\n\nConstraints: Keep flag semantics consistent. Coordinate with authorization (IAM-020).\n\nAcceptance: Flags are evaluated consistently. Add a test asserting all layers honor the same flag state."
+      }
+    },
+    {
+      "question": "Do schema/data migrations lack rollback, forward-fix, verification, or failure recovery (migration lacks rollback/forward-fix path)? (OPS-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix migration without recovery (OPS-013): add rollback/forward-fix",
+        "prompt": "Problem: Migrations without a recovery path can leave the database broken with no safe way back.\n\nFind all instances: Search migrations for missing rollback/forward-fix, verification, and failure handling.\n\nFix correctly: Provide a reversible migration or a forward-compatible recovery plan with verification.\n\nConstraints: Make schema changes rolling-deploy safe (OPS-015). Add data-correctness tests (TST-015).\n\nAcceptance: Migrations have a recovery path. Add a test verifying migration and its rollback/forward-fix."
+      }
+    },
+    {
+      "question": "Do code changes require simultaneous deploy of all services, clients, workers, or schema (deployment not backward/forward compatible)? (OPS-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix incompatible deployment (OPS-014): support rolling deploys",
+        "prompt": "Problem: Requiring a lockstep deploy causes downtime and risky big-bang releases.\n\nFind all instances: Search for changes that assume all components deploy at once (incompatible wire/schema/contract changes).\n\nFix correctly: Make changes backward/forward compatible so components can deploy independently (additive changes, tolerate old+new).\n\nConstraints: Version contracts (API-001). Use expand/contract for schema (OPS-015).\n\nAcceptance: Components deploy independently. Add a compatibility test across old/new versions."
+      }
+    },
+    {
+      "question": "Do migrations rename/drop/change fields before all old code paths stop using them (schema change unsafe for rolling deploy)? (OPS-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe schema change (OPS-015): use expand/migrate/contract",
+        "prompt": "Problem: Destructive schema changes during a rolling deploy break old instances still running.\n\nFind all instances: Search migrations for rename/drop/type-change of fields still used by deployed code.\n\nFix correctly: Use expand/migrate/contract across separate deploys: add new, migrate/dual-write, switch reads, then remove old once no code uses it.\n\nConstraints: Coordinate with deploy compatibility (OPS-014).\n\nAcceptance: Schema changes are rolling-deploy safe. Document/sequence the expand-contract steps and add migration tests."
+      }
+    },
+    {
+      "question": "Are admin, billing, security, access-control, data-export, or destructive actions performed without audit records (missing audit trail for privileged action)? (OPS-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing audit trail (OPS-016): record privileged actions",
+        "prompt": "Problem: Without audit records, privileged/destructive actions can't be investigated or attributed.\n\nFind all instances: Search admin/billing/security/access-control/export/destructive actions for audit logging.\n\nFix correctly: Record actor, action, target, time, source, and outcome for privileged actions in a tamper-evident audit log.\n\nConstraints: Don't log secrets/PII beyond what's needed (CSP-017). Make audit logs durable.\n\nAcceptance: Privileged actions are audited. Add a test asserting an audit record is written for a privileged action."
+      }
+    },
+    {
+      "question": "Are user-controlled or high-cardinality values used as metric labels, log event names, or trace attributes (unbounded log/metric cardinality)? (OPS-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unbounded cardinality (OPS-017): use bounded labels",
+        "prompt": "Problem: High-cardinality labels (user IDs, URLs) explode metric/trace storage and cost.\n\nFind all instances: Search metric labels/log event names/trace attributes for user-controlled or high-cardinality values.\n\nFix correctly: Use bounded label sets; move high-cardinality identifiers into sampled logs/traces, not metric dimensions.\n\nConstraints: Keep correlation possible via IDs in logs (OPS-003).\n\nAcceptance: Metric/label cardinality is bounded. Add a check asserting no unbounded values are used as labels."
+      }
+    },
+    {
+      "question": "Are secrets, PII, tokens, URLs with credentials, or user content present in metrics, tags, or traces (sensitive value in metric/tag/trace)? (OPS-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix sensitive telemetry (OPS-018): redact or omit sensitive values",
+        "prompt": "Problem: Sensitive values in telemetry leak to observability backends and dashboards.\n\nFind all instances: Search metrics/tags/traces for secrets, PII, tokens, credentialed URLs, or user content.\n\nFix correctly: Redact or omit sensitive telemetry before emission.\n\nConstraints: Coordinate with log/response redaction (CSP-002/CSP-017).\n\nAcceptance: No sensitive value reaches telemetry. Add a test asserting a sensitive value is redacted/omitted from emitted telemetry."
+      }
+    },
+    {
+      "question": "Do severe logs/errors lack an actionable message, category, dependency name, or runbook hint (critical error lacks operator action)? (OPS-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-actionable critical errors (OPS-019): add operator guidance",
+        "prompt": "Problem: Critical errors without actionable context slow incident response.\n\nFind all instances: Search severe logs/errors for missing actionable message, category, dependency name, or runbook hint.\n\nFix correctly: Include safe context and operator action guidance (what failed, which dependency, suggested next step) without leaking secrets.\n\nConstraints: Don't leak sensitive details (ERR-014/CSP-002).\n\nAcceptance: Critical errors are actionable. Review/update the affected error messages."
+      }
+    },
+    {
+      "question": "Is behavior depending on environment, config, region, cloud, filesystem, OS, or deployment mode left untested (environment-specific behavior untested)? (OPS-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix untested environment behavior (OPS-020): add environment-matrix tests",
+        "prompt": "Problem: Environment-dependent behavior that's untested breaks in some deployments.\n\nFind all instances: Search for behavior branching on environment/config/region/cloud/filesystem/OS/deployment mode without tests.\n\nFix correctly: Add environment-matrix tests or startup config validation covering the relevant variations.\n\nConstraints: Don't rely on a single environment. Validate config at startup (OPS-009).\n\nAcceptance: Environment-specific behavior is tested/validated. Add tests for the key environment variations."
+      }
+    }
+  ]
+}

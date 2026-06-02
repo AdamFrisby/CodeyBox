@@ -296,6 +296,46 @@ Resolution precedence (per LLM auditor):
 2. Else `AuditAgent` if set.
 3. Else the work agent (current behaviour; backwards compat).
 
+### Audit-capability pool (capability-gated routing)
+
+When at least one member of the routed agent class is tagged
+`"Capabilities": ["audit"]`, the audit phase is restricted to those tagged
+members across ALL routing paths (preferred agent, mid-iteration spill, class
+fallback). A non-tagged member is **NEVER** picked for auditing — even when it
+is the only one with quota. This removes the single-agent bottleneck that
+serialised audits when the configured `AuditAgent` was the only one allowed to
+run audit and its quota was exhausted.
+
+```json
+"AgentClasses": [
+  {
+    "Id": "frontier-coding",
+    "Members": [
+      { "Agent": "claude", "Billing": "Subscription", "QualityScore": 100, "Capabilities": ["audit"] },
+      { "Agent": "codex",  "Billing": "Subscription", "QualityScore": 100, "Capabilities": ["audit"] },
+      { "Agent": "gemini", "Billing": "Subscription", "QualityScore": 95,  "ReasoningMode": "high" }
+    ]
+  }
+]
+```
+
+With both `claude` and `codex` tagged audit-capable, an exhausted `codex`
+spills to `claude` (and vice-versa), and the two can run audits concurrently
+up to their per-agent caps. `gemini` stays out of the audit pool even when it
+has quota.
+
+`AuditAgent` and `PerAuditorAgent[...]` are honoured as the **preferred
+primary** within the audit-capable pool when set: a named agent that is itself
+tagged audit-capable runs first; a named agent that is NOT tagged is demoted
+with a warning (`quota_router.audit_agent_not_audit_capable`) and routing
+falls back to the pool. With no `AuditAgent` set, the highest-quality
+audit-capable member runs.
+
+**Backward compat:** when NO member of the class carries the `audit` tag, the
+opt-in pool is inactive and audit routing keeps its pre-capability behaviour
+(legacy fall-through to the work agent and unfiltered class chain). The tag is
+config-driven and hot-reloadable.
+
 ### Trade-offs
 
 | Benefit | Cost |

@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Does the codebase build SQL queries by concatenating or interpolating user-controlled values (request bodies, query strings, headers, cookies, route params, or unsanitized values read back from the database) directly into SQL text, rather than using parameterized queries, prepared statements, or a safe query builder? (INJ-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix SQL injection (INJ-001): parameterize user-controlled SQL",
+        "prompt": "Problem: SQL strings are being assembled from untrusted input, allowing attackers to alter query structure (SQL injection), read/modify arbitrary data, or bypass auth.\n\nFind all instances: Search for SQL built with string concatenation, interpolation, or formatting (e.g. \"SELECT ... \" + var, $\"...{var}...\", string.Format into SQL, f-strings, template literals). Trace where the interpolated values originate; flag any reachable from request data, headers, cookies, route/query params, message payloads, or values previously stored from untrusted sources. Include ORM raw/escape-hatch calls (e.g. FromSqlRaw, ExecuteSqlRaw, raw query APIs).\n\nFix correctly: Use parameterized queries / prepared statements so values are bound as parameters, never spliced into SQL text. For identifiers that genuinely cannot be parameterized (table/column names), use a strict allowlist of permitted values. Prefer the project's existing data-access layer / query builder. Never hand-roll SQL escaping.\n\nConstraints: Do not change query results for legitimate inputs. Do not weaken any other validation. Keep parameter types correct to avoid implicit conversions.\n\nAcceptance: No remaining user-controlled value reaches SQL via concatenation/interpolation; all such paths use parameters or an allowlist. Add or extend tests covering an injection-style input to prove it is treated as data, not SQL. No regressions in existing data-access tests."
+      }
+    },
+    {
+      "question": "Does the codebase build NoSQL/document/aggregation queries where user input can control operators, filters, selectors, aggregation stages, or raw query fragments (e.g. passing a request object straight into a query filter so an attacker can inject operator objects like {\"$gt\": \"\"})? (INJ-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix NoSQL/query injection (INJ-002): validate query shape and allowlist fields",
+        "prompt": "Problem: Untrusted input flows into NoSQL/document queries in a way that lets it control operators or query structure, enabling filter bypass, data exposure, or denial of service.\n\nFind all instances: Search for query/filter construction where request data is passed directly into a query object, where operator keys can come from user input, or where raw query fragments / aggregation stages are built from untrusted strings. Cover MongoDB-style filters, search DSLs, and any \"raw query\" escape hatches.\n\nFix correctly: Validate the query shape before use; coerce user values to expected scalar types so they cannot smuggle operator objects. Allowlist the fields and operators a caller may filter/sort on. Build queries through the driver's safe APIs rather than string fragments.\n\nConstraints: Preserve legitimate query behavior and pagination. Prefer allowlists over denylists. Validate at the trust boundary.\n\nAcceptance: User input can no longer inject operators or alter query structure; only allowlisted fields/operators are reachable. Add a test feeding an operator-injection payload and asserting it is rejected or treated as a literal value."
+      }
+    },
+    {
+      "question": "Does the codebase construct LDAP filters or distinguished names via string concatenation/interpolation of untrusted input without escaping LDAP special characters? (INJ-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix LDAP injection (INJ-003): escape and safely build LDAP filters",
+        "prompt": "Problem: LDAP filters/DNs built from unescaped untrusted input let attackers alter the filter (LDAP injection) to bypass authentication or enumerate directory data.\n\nFind all instances: Search for LDAP filter or DN strings assembled with concatenation/interpolation of user-supplied values (usernames, search terms, group names).\n\nFix correctly: Escape all user-controlled filter/DN components using the platform's LDAP escaping helper, or build filters with a safe filter-construction API that handles escaping. Allowlist attribute names used in filters.\n\nConstraints: Do not change directory lookup semantics for valid input. Validate at the boundary.\n\nAcceptance: Every LDAP filter/DN component derived from untrusted input is escaped or built via a safe API. Add a test with LDAP metacharacters (e.g. *()\\\\) proving the filter is not altered."
+      }
+    },
+    {
+      "question": "Does the codebase invoke OS/shell commands built from untrusted input (user input, file names, config values, environment variables, or database values), e.g. via a shell string, system()-style call, or shell=true, instead of invoking a fixed executable with a validated argument array? (INJ-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix OS command injection (INJ-004): use fixed exec with argument arrays",
+        "prompt": "Problem: Building shell commands from untrusted values allows command injection (chaining, redirection, substitution), giving attackers arbitrary command execution.\n\nFind all instances: Search for process/shell execution where the command line is a single string assembled from variables, or where a shell is invoked (sh -c, cmd /c, shell=true, ProcessStartInfo with UseShellExecute=true and untrusted args). Trace argument origins back to untrusted sources, including config and DB values.\n\nFix correctly: Avoid the shell entirely. Invoke a fixed executable path and pass arguments as a separate array/list so the OS does not re-parse them. Validate/allowlist any argument that selects behavior (subcommands, flags). If a shell is truly unavoidable, allowlist and quote rigorously, but prefer the no-shell approach.\n\nConstraints: Preserve the intended command behavior. Do not introduce a denylist of \"bad characters\" as the primary defense. Honor least privilege for the spawned process.\n\nAcceptance: No untrusted value is concatenated into a shell command string; commands run via argument arrays without a shell. Add a test with shell metacharacters in input proving they are passed literally and not interpreted."
+      }
+    },
+    {
+      "question": "Does the codebase pass untrusted input into eval, dynamic code execution, dynamic compilation, dynamic import, or runtime expression evaluation? (INJ-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix code/eval injection (INJ-005): remove dynamic execution of untrusted input",
+        "prompt": "Problem: Feeding untrusted input into eval/dynamic execution lets attackers run arbitrary code in the application's context.\n\nFind all instances: Search for eval, Function constructors, dynamic compile/execute APIs, reflection-driven code execution, dynamic import()/require() of computed names, and expression evaluators that receive user input.\n\nFix correctly: Remove dynamic execution. Replace with an explicit dispatch table / switch mapping allowlisted external identifiers to fixed internal handlers, a real parser for the data being interpreted, or a constrained, sandboxed interpreter with no host-language escape.\n\nConstraints: Do not preserve a code-execution path \"just in case.\" Prefer allowlists over denylists.\n\nAcceptance: No untrusted input reaches a code-execution sink; behavior selection goes through an allowlisted dispatch. Add a test proving an injection payload cannot execute code."
+      }
+    },
+    {
+      "question": "Does the codebase let untrusted input control template content, template names/paths, partials, or template expressions in a server-side rendering or templating engine (server-side template injection)? (INJ-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix template injection (INJ-006): treat templates as trusted code only",
+        "prompt": "Problem: When user input becomes part of the template (not just template data), the engine may evaluate attacker expressions, leading to RCE or data disclosure (SSTI).\n\nFind all instances: Search for places where a template string, template name/path, or expression is built from user input, or where user content is concatenated into a template before rendering.\n\nFix correctly: Treat templates as trusted code authored by developers. Pass user data only as bound/escaped variables into a fixed template. Select templates by name only from an allowlist, never from raw user input.\n\nConstraints: Keep output encoding context-aware. Do not disable the engine's auto-escaping.\n\nAcceptance: No template, template name, or expression is derived from untrusted input; user data flows only as escaped values. Add a test with template-syntax payloads proving they render as inert text."
+      }
+    },
+    {
+      "question": "Does the codebase build XPath or XQuery expressions by concatenating/interpolating untrusted values instead of using variable binding or proper escaping? (INJ-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix XPath/XQuery injection (INJ-007): bind variables instead of concatenating",
+        "prompt": "Problem: XPath/XQuery built from unescaped untrusted input lets attackers alter the expression to extract or bypass data (XPath injection).\n\nFind all instances: Search for XPath/XQuery expression strings assembled with concatenation/interpolation of user-supplied values.\n\nFix correctly: Use parameter/variable binding provided by the XPath/XQuery API, or escape all untrusted components. Allowlist any node/attribute names selected from input.\n\nConstraints: Preserve query semantics for valid input. Validate at the boundary.\n\nAcceptance: All untrusted expression parameters are bound or escaped. Add a test with XPath metacharacters proving the expression is not altered."
+      }
+    },
+    {
+      "question": "Does the codebase compile regular expressions from user-controlled input (or untrusted config) without escaping the user-controlled fragments and without bounding pattern/complexity, enabling regex injection or pathological patterns? (INJ-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix regex injection (INJ-008): escape user fragments and bound complexity",
+        "prompt": "Problem: Building regexes from untrusted input allows attackers to inject pattern syntax (altering matching) or supply patterns that cause catastrophic backtracking (denial of service).\n\nFind all instances: Search for regex construction where the pattern (or part of it) comes from user input or untrusted configuration.\n\nFix correctly: If the user value should be matched literally, escape it (regex-quote) before embedding, or use literal string matching instead of regex. If users must supply patterns, bound input length, apply a regex timeout, and prefer a linear-time regex engine. Allowlist where the set of patterns is known.\n\nConstraints: Do not silently change matching semantics for existing valid patterns; document any new limits.\n\nAcceptance: No unescaped user fragment alters regex structure, and untrusted patterns are length/time-bounded. Add a test proving metacharacters in input are matched literally (or rejected)."
+      }
+    },
+    {
+      "question": "Does the codebase write untrusted values into log messages without sanitizing newlines/carriage returns/tabs and other control characters, allowing log injection/forgery (fake log lines, fake timestamps, or fake severity)? (INJ-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix log injection (INJ-009): use structured logging and sanitize control chars",
+        "prompt": "Problem: Untrusted values containing CR/LF or control characters can forge log entries, hide attacker activity, or corrupt log parsing.\n\nFind all instances: Search for log statements that interpolate raw user input (usernames, paths, URLs, headers) into the message string, especially string-concatenated log calls.\n\nFix correctly: Use the logging framework's structured logging (named fields / message templates) so values are captured as data, not concatenated into the line. Where values must appear inline, strip or encode CR, LF, tab, and other control characters first.\n\nConstraints: Keep useful diagnostic context; do not log secrets or PII (see CSP checks). Prefer structured fields over string building.\n\nAcceptance: Untrusted values are logged as structured fields or sanitized of control characters. Add a test feeding a value with embedded newlines proving it cannot create a second log line."
+      }
+    },
+    {
+      "question": "Does the codebase populate HTTP response headers, redirect Location values, cookies, or status messages from untrusted values without rejecting CR/LF, enabling HTTP response/header injection or response splitting? (INJ-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix HTTP header/response injection (INJ-010): reject CR/LF, use safe header APIs",
+        "prompt": "Problem: Untrusted CR/LF in headers/cookies/redirects enables response splitting, cache poisoning, and cookie/header forgery.\n\nFind all instances: Search for code that sets response headers, redirect targets, cookies, or status text from request-derived values, especially low-level header writes.\n\nFix correctly: Use the framework's header/cookie APIs (which reject control characters) rather than writing raw header strings. Reject or strip CR/LF from any untrusted value placed in a header. For redirects, also enforce a destination allowlist (see open-redirect guidance).\n\nConstraints: Preserve legitimate header values. Validate at the boundary.\n\nAcceptance: No untrusted CR/LF can reach a response header; framework-safe APIs are used. Add a test injecting \\r\\n into a header-bound value proving it is rejected/stripped."
+      }
+    },
+    {
+      "question": "Does the codebase render untrusted values into HTML, attributes, JavaScript, CSS, URLs, markdown, or other DOM sinks without context-aware output encoding (or sanitization for explicitly trusted rich content), enabling XSS? (INJ-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix XSS/DOM injection (INJ-011): context-aware encoding of untrusted output",
+        "prompt": "Problem: Writing untrusted data into HTML/JS/CSS/URL/DOM sinks without proper encoding lets attackers run script in users' browsers (XSS), stealing sessions or acting as the victim.\n\nFind all instances: Search for dangerous sinks: innerHTML/outerHTML, dangerouslySetInnerHTML, document.write, raw HTML helpers, template raw/unescaped output, attribute/URL/JS-context interpolation, and markdown rendered as HTML. Trace which receive untrusted data.\n\nFix correctly: Apply context-aware output encoding (HTML body, attribute, JS, CSS, URL contexts each differ); prefer framework auto-escaping and avoid raw-HTML sinks. For rich content that must allow some HTML, sanitize with a vetted allowlist-based sanitizer. Build URLs with safe APIs and validate schemes (block javascript:).\n\nConstraints: Do not disable framework escaping. Prefer allowlists for permitted HTML.\n\nAcceptance: Every untrusted value reaching a DOM/HTML sink is context-encoded or allowlist-sanitized. Add a test with a script payload proving it is rendered inert."
+      }
+    },
+    {
+      "question": "Does the codebase configure XML parsers in a way that allows DTD processing, external entities, external/network resource fetching, or unbounded entity expansion (enabling XXE or billion-laughs attacks)? (INJ-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix XXE/entity expansion (INJ-012): disable DTDs, external entities, and expansion",
+        "prompt": "Problem: XML parsers that resolve external entities or DTDs can read local files, perform SSRF, or be DoS'd by entity expansion (XXE / billion laughs).\n\nFind all instances: Search for XML parser/reader/document creation that parses untrusted input. Check whether DTD processing, external entity resolution, and external resource access are disabled.\n\nFix correctly: Configure parsers to disable DTDs (or prohibit them), disable external general/parameter entities, disable external resource resolution/network access, and bound entity expansion. Use the platform's hardened/secure-processing settings.\n\nConstraints: Keep parsing valid documents working; only well-formed, entity-free XML should be accepted from untrusted sources.\n\nAcceptance: All XML parsers handling untrusted input have DTDs/external entities/network access disabled and expansion bounded. Add a test feeding an XXE/entity-expansion payload proving it is rejected and resolves no external resource."
+      }
+    },
+    {
+      "question": "Does the codebase deserialize untrusted data using a mechanism that can instantiate arbitrary types, invoke constructors/callbacks, or reconstruct polymorphic objects (e.g. native binary deserialization, type-name-driven polymorphic JSON), creating an unsafe deserialization RCE risk? (INJ-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe deserialization (INJ-013): use safe formats and explicit DTO mapping",
+        "prompt": "Problem: Deserializing untrusted data into arbitrary object graphs can trigger gadget chains and remote code execution, or unexpected type instantiation.\n\nFind all instances: Search for native/binary deserializers, type-name-resolving polymorphic settings (e.g. type handling that reads the target type from the payload), and any deserialization of request/queue/file data into rich objects.\n\nFix correctly: Deserialize untrusted data only into explicit, known DTOs using a safe data format (e.g. plain JSON without polymorphic type resolution). Disable type-name handling. Validate the resulting object against a schema, then map into domain types.\n\nConstraints: Do not allow the payload to choose its own concrete type. Prefer allowlists if polymorphism is genuinely required (bind a small fixed set of types by a discriminator you control).\n\nAcceptance: No untrusted payload can drive arbitrary type instantiation; deserialization targets fixed DTOs with type handling off. Add a test with a malicious type-discriminator payload proving it is rejected."
+      }
+    },
+    {
+      "question": "Does the codebase make server-side HTTP/file/network requests to a destination that can be controlled by user or external input, without an allowlist and without blocking internal/private IP ranges and metadata endpoints (SSRF)? (INJ-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix SSRF (INJ-014): allowlist destinations and block internal ranges",
+        "prompt": "Problem: Server-side requests to user-controlled URLs let attackers reach internal services, cloud metadata endpoints, and private networks (SSRF), or exfiltrate data.\n\nFind all instances: Search for outbound HTTP clients, fetch/curl-style calls, file/URL openers, webhook callers, image/URL fetchers, and PDF/preview generators whose target URL/host derives from user input or fetched content.\n\nFix correctly: Enforce a destination allowlist (scheme + host, and port where relevant). Resolve and validate the target IP, rejecting private/loopback/link-local/metadata ranges; re-validate after redirects (or disable redirects). Restrict egress at the network layer where possible. Parse URLs structurally; do not rely on substring checks.\n\nConstraints: Prefer allowlists over denylists. Beware DNS rebinding (validate the IP actually connected to). Do not follow redirects to disallowed hosts.\n\nAcceptance: User-controlled outbound requests are confined to allowlisted destinations with private ranges blocked across redirects. Add tests for an internal-IP target and a redirect-to-internal payload proving both are blocked."
+      }
+    },
+    {
+      "question": "Does the codebase compute redirect targets from query params, form fields, headers, cookies, or referrer values without restricting them to relative paths or an allowlist of approved destinations (open redirect)? (INJ-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix open redirect (INJ-015): allow only relative paths or approved targets",
+        "prompt": "Problem: Redirects to user-controlled absolute URLs enable phishing and OAuth token theft (open redirect).\n\nFind all instances: Search for redirect responses whose Location/return-url comes from request input (returnUrl, next, redirect, callback params, Referer).\n\nFix correctly: Accept only relative paths (rooted to the app, rejecting protocol-relative //evil.com and backslash tricks) or match against an explicit allowlist of approved absolute destinations. Canonicalize before checking.\n\nConstraints: Prefer allowlists over denylists. Validate at the boundary; reject rather than \"fix\" suspicious values.\n\nAcceptance: All redirects are restricted to same-app relative paths or allowlisted destinations. Add tests for //evil.com, https://evil.com, and \\\\evil.com proving they are rejected."
+      }
+    },
+    {
+      "question": "Does the codebase perform dynamic file includes, module/plugin loading, or template loading based on untrusted names or paths instead of a fixed registry or allowlisted identifiers (user-controlled file/module include)? (INJ-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe dynamic include (INJ-016): load only allowlisted modules",
+        "prompt": "Problem: Loading files/modules/templates by untrusted name or path enables local/remote file inclusion and code execution.\n\nFind all instances: Search for dynamic include/import/require, plugin loaders, and template loaders whose target is built from user input.\n\nFix correctly: Replace dynamic loading with a fixed registry mapping allowlisted identifiers to concrete modules/files. If a path must be used, canonicalize and confine it to an approved root and an allowlisted extension.\n\nConstraints: Prefer allowlists over denylists. Confine paths to approved roots (see path-traversal guidance).\n\nAcceptance: Module/file/template selection goes through an allowlist or fixed registry; no untrusted path reaches a loader. Add a test with a traversal/remote payload proving it is rejected."
+      }
+    },
+    {
+      "question": "Does the codebase select method names, class names, handlers, jobs, or commands directly from user-controlled strings (e.g. reflective invocation of a method named by the request) instead of mapping external names through an allowlisted dispatch table? (INJ-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe dynamic dispatch (INJ-017): allowlist external-to-internal mapping",
+        "prompt": "Problem: Choosing code to run from a user-supplied name (reflection/dynamic dispatch) lets attackers invoke unintended internal methods.\n\nFind all instances: Search for reflective invocation, handler/command lookup, or job dispatch where the target name comes from request data.\n\nFix correctly: Map external names to internal handlers through an explicit allowlisted dispatch table/switch. Reject unknown names. Never reflectively invoke a method named directly by the client.\n\nConstraints: Prefer allowlists over denylists. Keep the mapping centralized.\n\nAcceptance: All external-name-driven dispatch goes through an allowlist; unknown names are rejected. Add a test invoking an unmapped/internal name proving it is refused."
+      }
+    },
+    {
+      "question": "Does the codebase use an expression language, rules engine, formula evaluator, or scripting feature that evaluates untrusted expressions with access to host objects, without a constrained grammar and no host-language escape? (INJ-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe expression-language use (INJ-018): constrain the grammar",
+        "prompt": "Problem: Expression/rule/formula evaluators that accept untrusted expressions and expose host objects can be escaped to run arbitrary code.\n\nFind all instances: Search for expression-language, rules-engine, formula, or embedded-scripting evaluation fed by user input.\n\nFix correctly: Use a constrained grammar/sandbox with an explicit allowlist of permitted operations and no access to host functions, reflection, I/O, or the runtime. Where possible, replace free-form expressions with a fixed set of configured operations.\n\nConstraints: Prefer allowlists over denylists. Do not expose host objects to evaluated expressions.\n\nAcceptance: Untrusted expressions run only within a constrained, allowlisted grammar with no host escape. Add a test attempting a host-escape expression proving it is blocked."
+      }
+    },
+    {
+      "question": "In LLM-integrated workflows, does the codebase concatenate untrusted content (documents, tickets, web pages, user text, tool outputs) into the same instruction channel as system/developer instructions, so that untrusted content could override instructions (prompt injection across a trust boundary)? (INJ-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix prompt injection across trust boundary (INJ-019): separate data from instructions",
+        "prompt": "Problem: Mixing untrusted content with instructions lets that content hijack the model (prompt injection), causing it to ignore policy, exfiltrate data, or misuse tools.\n\nFind all instances: Search for prompt assembly where untrusted documents/tickets/web content/user text/tool outputs are concatenated into system or instruction text.\n\nFix correctly: Keep untrusted content in a clearly delimited data section, explicitly labeled as untrusted, separate from instructions. Do not let model output alone authorize sensitive actions; enforce policy and permissions deterministically outside the model (allowlists, schema validation, gates). Minimize the authority granted to any single model turn.\n\nConstraints: Treat all external content as untrusted regardless of source. Enforce security outside the model, not via prompt wording alone.\n\nAcceptance: Untrusted content is quoted as data and cannot alter instructions; sensitive actions are gated by external policy. Add a test with an injected \"ignore previous instructions\" payload proving it does not change enforced behavior."
+      }
+    },
+    {
+      "question": "Does the codebase execute model-generated actions (tool calls, shell commands, code changes, SQL, API calls, file operations) without validating them against schemas, permissions, allowlists, dry-runs, or human/CI gates? (INJ-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe LLM tool invocation (INJ-020): validate model actions before execution",
+        "prompt": "Problem: Executing model-proposed actions without validation lets a hijacked or hallucinating model take dangerous actions (delete data, run commands, call APIs).\n\nFind all instances: Search for code that takes model/tool-call output and directly executes it (runs a command, writes a file, issues SQL/API calls, applies a code change) without checks.\n\nFix correctly: Validate every tool call against a strict schema (allowed tools, allowed argument shapes/values). Enforce permissions/allowlists for what each tool may touch. Use dry-runs/previews and human or CI approval gates for destructive or high-impact actions. Apply least privilege to the execution context.\n\nConstraints: Prefer allowlists over denylists. Do not rely on the model to self-restrict; enforce externally.\n\nAcceptance: Model-generated actions pass schema + permission validation and high-impact ones are gated. Add a test with an out-of-policy tool call proving it is rejected before execution."
+      }
+    }
+  ]
+}

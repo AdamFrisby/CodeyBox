@@ -56,6 +56,18 @@
     <Content Update="agent-pricing-defaults.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!--
+    Bundled default task-templates (check-and-act definitions). Copied into a
+    `templates` directory next to the binary so FileTaskTemplateRegistry can
+    resolve them via IHostEnvironment.ContentRootPath in both `dotnet run` and
+    published deployments. Uses Update (not Include) because the .NET Web SDK
+    auto-discovers Content items under the project root; this only sets the copy
+    behaviour so the JSON ships next to the binary.
+  -->
+  <ItemGroup>
+    <Content Update="templates\**\*.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.3" />
     <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />

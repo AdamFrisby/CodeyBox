@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Do dependency manifests, lockfiles, containers, vendored code, or generated artifacts include known-vulnerable dependency versions (known-vulnerable dependency)? (BLD-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix vulnerable dependency (BLD-001): upgrade, patch, or isolate",
+        "prompt": "Problem: Known-vulnerable dependencies expose the app to published exploits.\n\nFind all instances: Search manifests/lockfiles/containers/vendored code for versions flagged by the ecosystem's advisory/audit tooling.\n\nFix correctly: Upgrade to a patched version, apply a patch, replace the dependency, or isolate it if no fix exists. Re-run the audit.\n\nConstraints: Check license of any replacement (BLD-016). Keep the build green; update lockfiles (BLD-010).\n\nAcceptance: No known-vulnerable dependency remains (or it's documented/suppressed with rationale). Re-run dependency audit clean."
+      }
+    },
+    {
+      "question": "Are there unpinned dependencies, floating version ranges, missing lockfiles, or network-dependent resolution making builds non-reproducible (non-reproducible dependency resolution)? (BLD-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-reproducible deps (BLD-002): pin versions and commit lockfiles",
+        "prompt": "Problem: Floating dependency versions make builds non-reproducible and can pull in breaking/malicious updates.\n\nFind all instances: Search for unpinned/floating dependency ranges and missing lockfiles.\n\nFix correctly: Pin versions and commit lockfiles (or equivalent dependency-graph locks) so resolution is deterministic.\n\nConstraints: Keep the build green. Combine with integrity verification (BLD-010).\n\nAcceptance: Dependency resolution is deterministic. Add/commit lockfiles; add a CI check for unpinned deps."
+      }
+    },
+    {
+      "question": "Are there dependencies in manifests not imported, referenced, or required at runtime/build/test (unused dependency)? (BLD-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unused dependency (BLD-003): remove from manifest",
+        "prompt": "Problem: Unused dependencies enlarge the attack surface and artifact size.\n\nFind all instances: Search manifests for dependencies with no import/reference/runtime use.\n\nFix correctly: Remove unused dependencies from the manifest and lockfile.\n\nConstraints: Confirm no dynamic/reflective/plugin use before removing. Keep the build/tests passing.\n\nAcceptance: No unused dependencies remain. Ensure build and tests pass after removal."
+      }
+    },
+    {
+      "question": "Are there imports/usages of packages not declared as direct dependencies (direct reliance on transitive dependency)? (BLD-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix transitive dependency reliance (BLD-004): declare direct deps",
+        "prompt": "Problem: Relying on transitive deps breaks unexpectedly when an intermediate dep changes its own dependencies.\n\nFind all instances: Search for imports of packages not declared as direct dependencies.\n\nFix correctly: Declare those packages as explicit direct dependencies with pinned versions.\n\nConstraints: Keep versions consistent with the resolved graph. Update lockfiles.\n\nAcceptance: Used packages are declared directly. Ensure build/tests pass; add a lint check if available."
+      }
+    },
+    {
+      "question": "Are there manual edits in generated, vendored, compiled, or checked-in third-party code (manual edit to generated/vendor code)? (BLD-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix manual edits to generated/vendor code (BLD-005): move to source",
+        "prompt": "Problem: Manual edits to generated/vendored code are lost on regeneration/update and hide intent.\n\nFind all instances: Search generated/vendored/third-party code for manual modifications.\n\nFix correctly: Move changes to the source generator/config, a managed patch process, a fork, or an upstream contribution; then regenerate/re-vendor.\n\nConstraints: Don't hand-edit generated output. Keep regeneration deterministic (BLD-015).\n\nAcceptance: Generated/vendored code matches its source with no manual edits. Add a drift check (BLD-014)."
+      }
+    },
+    {
+      "question": "Are compiled/minified/generated artifacts committed as source without a clear policy or need (build artifact committed as source without reason)? (BLD-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix committed build artifacts (BLD-006): remove or document policy",
+        "prompt": "Problem: Committed build artifacts cause drift, bloat, and confusion about the source of truth.\n\nFind all instances: Search for committed compiled/minified/generated artifacts lacking a documented reason.\n\nFix correctly: Remove the artifacts and generate them in the build, or document and enforce a generated-asset policy where committing is intentional.\n\nConstraints: Don't break consumers that depend on a committed artifact without providing the build step.\n\nAcceptance: Committed artifacts are removed or policy-documented. Ensure the build produces them; update .gitignore."
+      }
+    },
+    {
+      "question": "Do builds depend on current time, randomness, machine path, environment, network, or filesystem ordering (non-deterministic build input)? (BLD-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-deterministic build (BLD-007): remove nondeterminism",
+        "prompt": "Problem: Non-deterministic builds produce different artifacts from the same source, breaking reproducibility and caching.\n\nFind all instances: Search build steps for dependence on time, randomness, machine paths, environment, network, or filesystem ordering.\n\nFix correctly: Remove nondeterminism (fixed timestamps/seeds, sorted ordering, relative paths) or make it explicit and reproducible.\n\nConstraints: Combine with reproducible deps (BLD-002) and deterministic codegen (BLD-015).\n\nAcceptance: Builds are reproducible. Add a check building twice and comparing outputs where feasible."
+      }
+    },
+    {
+      "question": "Do build/test/release scripts pass branch names, filenames, env vars, or package metadata into shell commands unsafely (build script executes untrusted input)? (BLD-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe build script input (BLD-008): avoid shell expansion of untrusted input",
+        "prompt": "Problem: Interpolating untrusted values (branch names, PR titles) into build shell commands enables command injection in CI.\n\nFind all instances: Search build/CI scripts for untrusted values (branch/tag/filename/env/metadata) interpolated into shell commands.\n\nFix correctly: Avoid shell expansion of untrusted input; pass values as arguments/environment to fixed commands, and validate/allowlist where they drive behavior.\n\nConstraints: Prefer allowlists. Apply OS command-injection guidance (INJ-004).\n\nAcceptance: Build scripts don't shell-expand untrusted input. Add a test/review with a malicious branch name proving it can't inject."
+      }
+    },
+    {
+      "question": "Do CI workflows expose secrets to pull requests, forks, logs, artifacts, or untrusted scripts (CI secret exposed to fork/log)? (BLD-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix CI secret exposure (BLD-009): restrict and mask secrets",
+        "prompt": "Problem: Secrets available to fork PRs or printed to logs/artifacts get stolen.\n\nFind all instances: Search CI configs for secrets available to fork/PR-triggered jobs, untrusted scripts, or echoed into logs/artifacts.\n\nFix correctly: Restrict secret availability to trusted (non-fork) jobs, mask outputs, and separate trusted/untrusted job stages.\n\nConstraints: Rotate any exposed secret. Never log secrets (CSP-002).\n\nAcceptance: Secrets aren't exposed to untrusted CI contexts. Review/adjust the workflow; confirm masking."
+      }
+    },
+    {
+      "question": "Do package managers or artifact downloads operate without lockfiles, checksums, signatures, or integrity verification (missing lockfile/integrity verification)? (BLD-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing integrity verification (BLD-010): commit lockfiles and verify checksums",
+        "prompt": "Problem: Without integrity verification, dependencies/artifacts can be tampered with in transit or at the registry.\n\nFind all instances: Search dependency installs and artifact downloads for missing lockfiles, checksums, or signature verification.\n\nFix correctly: Commit lockfiles with integrity hashes and verify checksums/signatures for downloaded artifacts.\n\nConstraints: Combine with reproducible deps (BLD-002) and provenance (BLD-011).\n\nAcceptance: Dependencies/artifacts are integrity-verified. Ensure lockfiles/checksums are present and enforced."
+      }
+    },
+    {
+      "question": "Do release/deploy pipelines accept packages or containers without provenance or signing checks (package provenance not verified where required)? (BLD-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unverified provenance (BLD-011): require signed/attested artifacts",
+        "prompt": "Problem: Deploying unsigned/unattested artifacts allows supply-chain substitution attacks.\n\nFind all instances: Search release/deploy pipelines for acceptance of packages/containers without provenance/signature verification.\n\nFix correctly: Require signed or provenance-attested artifacts and verify before deploy.\n\nConstraints: Combine with integrity verification (BLD-010).\n\nAcceptance: Only verified artifacts deploy. Add a pipeline check rejecting unsigned/unattested artifacts."
+      }
+    },
+    {
+      "question": "Are there mutable tags, reused version numbers, latest labels, or artifacts without immutable build identifiers (ambiguous artifact versioning)? (BLD-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix ambiguous versioning (BLD-012): use immutable identifiers",
+        "prompt": "Problem: Mutable tags/'latest' make it impossible to know exactly what's deployed and break rollbacks.\n\nFind all instances: Search for mutable tags, reused versions, and 'latest' references in build/deploy.\n\nFix correctly: Use immutable semantic/build identifiers (pinned digests/versions) with traceable provenance.\n\nConstraints: Keep references to specific digests/versions in deploy config.\n\nAcceptance: Artifacts are referenced by immutable identifiers. Update references; add a check against mutable tags."
+      }
+    },
+    {
+      "question": "Are there absolute local paths, developer home directories, machine-specific paths, or workspace assumptions in build config (environment-specific absolute build path)? (BLD-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix absolute build paths (BLD-013): use relative paths and variables",
+        "prompt": "Problem: Absolute/machine-specific paths break builds on other machines and CI.\n\nFind all instances: Search build config/scripts for absolute local paths, home dirs, or machine-specific workspace assumptions.\n\nFix correctly: Use relative paths and build variables; resolve paths from the project root.\n\nConstraints: Combine with platform path handling (RES-014).\n\nAcceptance: Build config is path-portable. Ensure the build works from a clean checkout on another machine/CI."
+      }
+    },
+    {
+      "question": "Do generated code, clients, docs, migrations, or assets differ from the source schema/spec (generated files stale versus schema/source)? (BLD-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix stale generated files (BLD-014): regenerate and enforce drift checks",
+        "prompt": "Problem: Stale generated artifacts drift from their source, causing subtle integration bugs.\n\nFind all instances: Search generated code/clients/docs/migrations for divergence from the source schema/spec.\n\nFix correctly: Regenerate from source and add a CI drift check that fails when generated output is stale.\n\nConstraints: Don't hand-edit generated output (BLD-005). Keep generation deterministic (BLD-015).\n\nAcceptance: Generated files match source and a drift check exists. Regenerate; ensure CI catches future drift."
+      }
+    },
+    {
+      "question": "Do generators produce unstable ordering, timestamps, random IDs, or environment-specific output (non-deterministic code generation)? (BLD-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-deterministic codegen (BLD-015): stabilize generator output",
+        "prompt": "Problem: Non-deterministic generators produce noisy diffs and defeat drift checks/reproducibility.\n\nFind all instances: Search code generators for unstable ordering, embedded timestamps, random IDs, or environment-specific output.\n\nFix correctly: Stabilize ordering, fix timestamps/seeds, and normalize formatting so output is deterministic.\n\nConstraints: Combine with deterministic build (BLD-007) and drift checks (BLD-014).\n\nAcceptance: Generation is deterministic. Add a check generating twice and comparing output."
+      }
+    },
+    {
+      "question": "Are there dependencies, vendored code, snippets, models, or assets with missing, incompatible, or unclear licenses (unknown/incompatible license)? (BLD-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix license issues (BLD-016): review and resolve incompatible licenses",
+        "prompt": "Problem: Incompatible/unknown licenses create legal risk (copyleft/commercial-tier/SSPL/BSL constraints).\n\nFind all instances: Search dependencies/vendored code/snippets/models/assets for missing, incompatible, or unclear licenses. Flag commercial-tier, copyleft (GPL/AGPL), SSPL, BSL, or EOL packages.\n\nFix correctly: Review each license and replace, isolate, attribute, or get approval as required by project policy; prefer permissively licensed alternatives.\n\nConstraints: Honor the project's license rules; flag problematic licenses before adoption rather than assuming.\n\nAcceptance: All dependencies have known, compatible licenses (or documented approvals). Add a license check to CI where feasible."
+      }
+    },
+    {
+      "question": "Are there build/test commands that pass only if another manual command ran earlier (build/test command order dependency)? (BLD-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix command order dependency (BLD-017): make commands self-sufficient",
+        "prompt": "Problem: Hidden ordering requirements between commands cause flaky/failed builds for anyone who doesn't know the magic sequence.\n\nFind all instances: Search build/test commands that depend on a prior manual step (codegen, install, fixture setup) without declaring it.\n\nFix correctly: Make each command declare and create its own prerequisites (dependencies in the build graph), so it works from a clean state.\n\nConstraints: Keep determinism (BLD-007).\n\nAcceptance: Commands work from a clean checkout without manual pre-steps. Verify on a clean environment."
+      }
+    },
+    {
+      "question": "Are there projects without pinned compiler, runtime, package manager, formatter, or build-tool versions (toolchain version undeclared)? (BLD-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix undeclared toolchain (BLD-018): pin and document tool versions",
+        "prompt": "Problem: Unpinned toolchains cause 'works on my machine' inconsistencies and build drift.\n\nFind all instances: Search for missing pins of compiler/runtime/package-manager/formatter/build-tool versions.\n\nFix correctly: Pin and document toolchain versions (version files/config) so all environments match.\n\nConstraints: Keep CI and local in sync.\n\nAcceptance: Toolchain versions are pinned/documented. Add the pins and confirm CI uses them."
+      }
+    },
+    {
+      "question": "Do production images, packages, bundles, or deploy artifacts contain test tools, dev servers, mocks, or build-only dependencies (dev/test dependency in production artifact)? (BLD-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix dev deps in production (BLD-019): exclude non-runtime dependencies",
+        "prompt": "Problem: Shipping dev/test tooling enlarges the attack surface and artifact size.\n\nFind all instances: Search production artifacts/images for test tools, dev servers, mocks, or build-only dependencies.\n\nFix correctly: Exclude non-runtime dependencies from production artifacts (multi-stage builds, prod-only installs) and shrink the image.\n\nConstraints: Keep runtime dependencies intact. Combine with least-privilege containers (BLD-020).\n\nAcceptance: Production artifacts contain only runtime deps. Verify the built image excludes dev/test tooling."
+      }
+    },
+    {
+      "question": "Do container configs run as root, privileged, with broad capabilities, a writable root filesystem, or unnecessary tools (container/image runs with excessive privilege)? (BLD-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix excessive container privilege (BLD-020): drop root and capabilities",
+        "prompt": "Problem: Over-privileged containers amplify the impact of any compromise.\n\nFind all instances: Search container/image configs for running as root, privileged mode, broad capabilities, writable root FS, and unnecessary tools.\n\nFix correctly: Run as a non-root user, drop unneeded capabilities, use a read-only root filesystem, and remove unnecessary tools.\n\nConstraints: Keep the app functional with least privilege. Combine with dev-dep removal (BLD-019).\n\nAcceptance: Containers run least-privilege. Verify the image runs as non-root with restricted capabilities."
+      }
+    }
+  ]
+}
