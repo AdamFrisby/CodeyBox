@@ -65,7 +65,7 @@ public sealed class StartupResumeApiAvailabilityTests
                                 AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
                             };
                         },
-                        barrier: sp.GetRequiredService<StartupSandboxResumeBarrier>());
+                        barrier: sp.GetRequiredService<IStartupSandboxResumeCompletionSink>());
                 });
             });
         });

@@ -14,7 +14,7 @@ public enum SandboxStartupResumeMode
 public sealed record SandboxStartupResumeOptions
 {
     public int MaxParallelResumes { get; init; } = SandboxResumeOnStartupService.DefaultMaxParallelResumes;
-    public TimeSpan ResumeTimeout { get; init; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
+    public TimeSpan ResumeTimeout { get; init; } = SuspendTimeoutPolicy.DefaultFloor;
     public TimeSpan AdoptionDeadline { get; init; } = SandboxResumeOnStartupService.DefaultAdoptionDeadline;
     public SandboxStartupResumeMode Mode { get; init; } = SandboxStartupResumeMode.Background;
 }
@@ -24,13 +24,18 @@ public interface IStartupSandboxResumeBarrier
     Task Completion { get; }
 }
 
-public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier
+public interface IStartupSandboxResumeCompletionSink
+{
+    void MarkCompleted();
+}
+
+public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier, IStartupSandboxResumeCompletionSink
 {
     private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Task Completion => _completion.Task;
 
-    internal void MarkCompleted() => _completion.TrySetResult();
+    public void MarkCompleted() => _completion.TrySetResult();
 }
 
 /// <summary>
@@ -45,7 +50,7 @@ public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier
 /// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
 /// only when configured for blocking mode. The default background mode starts
 /// the resume sweep from <see cref="StartAsync"/> and signals
-/// <see cref="StartupSandboxResumeBarrier"/> when done, so the HTTP listener can
+/// <see cref="IStartupSandboxResumeCompletionSink"/> when done, so the HTTP listener can
 /// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
 /// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
 /// consistent picture (the VM is back to Running, the work item still carries
@@ -100,7 +105,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
-    private readonly StartupSandboxResumeBarrier _barrier;
+    private readonly IStartupSandboxResumeCompletionSink _barrier;
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
     private int _resumeStarted;
@@ -113,7 +118,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         TimeSpan? adoptionDeadline = null,
         TimeSpan? resumeTimeout = null,
         SandboxStartupResumeMode? mode = null,
-        StartupSandboxResumeBarrier? barrier = null)
+        IStartupSandboxResumeCompletionSink? barrier = null)
         : this(
             provider,
             store,
@@ -138,7 +143,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
         Func<SandboxStartupResumeOptions> optionsAccessor,
-        StartupSandboxResumeBarrier? barrier = null)
+        IStartupSandboxResumeCompletionSink? barrier = null)
     {
         _provider = provider;
         _store = store;

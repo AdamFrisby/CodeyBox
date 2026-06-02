@@ -1933,6 +1933,8 @@ builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
 builder.Services.AddSingleton<StartupSandboxResumeBarrier>();
 builder.Services.AddSingleton<IStartupSandboxResumeBarrier>(
     sp => sp.GetRequiredService<StartupSandboxResumeBarrier>());
+builder.Services.AddSingleton<IStartupSandboxResumeCompletionSink>(
+    sp => sp.GetRequiredService<StartupSandboxResumeBarrier>());
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -1974,7 +1976,7 @@ builder.Services.AddHostedService(sp =>
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
 // can resume them. The shutdown half is lifecycle-bound (StoppingAsync). Startup
 // resume defaults to background mode so a wedged multipassd cannot keep Kestrel
-// offline; OrchestratorService waits on StartupSandboxResumeBarrier before its
+// offline; OrchestratorService waits on IStartupSandboxResumeBarrier before its
 // dead-worker startup recovery sweep.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
@@ -1994,10 +1996,9 @@ builder.Services.AddHostedService(sp =>
         dispatchGate: sp.GetService<IShutdownDispatchGate>(),
         teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);
 });
-// Startup reconciler runs BEFORE the resume handler (registration order ==
-// StartingAsync execution order) so VMs left wedged in Suspending state from
-// a prior unclean shutdown are returned to a clean state before resume tries
-// to multipass-start them or the leak reaper considers them on its first sweep.
+// Startup reconciler runs as a background sweep so Multipass recovery cannot
+// keep Kestrel offline. It skips VMs with live SuspendedVmName mappings; those
+// are owned by the resume handler below.
 builder.Services.AddHostedService(sp => new StartupSandboxReconciliationService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2016,7 +2017,7 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
     },
-    sp.GetRequiredService<StartupSandboxResumeBarrier>()));
+    sp.GetRequiredService<IStartupSandboxResumeCompletionSink>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -3027,7 +3028,7 @@ namespace CodeyBox.Api
         /// observe cancellation. Hot-reloadable for pending resume attempts.
         /// Bound from <c>CodeyBox:Shutdown:SandboxResumeTimeout</c>.
         /// </summary>
-        public TimeSpan SandboxResumeTimeout { get; set; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
+        public TimeSpan SandboxResumeTimeout { get; set; } = SuspendTimeoutPolicy.DefaultFloor;
 
         /// <summary>
         /// Upper bound on how long the startup resume handler waits for an

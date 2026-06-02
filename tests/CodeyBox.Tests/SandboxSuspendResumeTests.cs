@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -485,6 +486,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_ResumeTimeout_MarksWorkingItemFailedAndClearsBookkeeping()
     {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item with
         {
@@ -497,6 +499,72 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
+            resumeTimeout: configuredTimeout);
+
+        var sw = Stopwatch.StartNew();
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+        sw.Stop();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("timed out", after.LastError);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"configured {configuredTimeout} resume timeout was not honored; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StartupResume_BlockingMode_RunsFromStartingAsyncOnlyAndHonorsTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-blocking-timeout",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            resumeTimeout: configuredTimeout,
+            mode: SandboxStartupResumeMode.Blocking);
+
+        await svc.StartAsync(CancellationToken.None);
+        Assert.Empty(provider.ResumedNames);
+
+        var sw = Stopwatch.StartNew();
+        await svc.StartingAsync(CancellationToken.None);
+        sw.Stop();
+        await svc.StartAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Single(provider.ResumedNames);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"blocking startup did not honor configured {configuredTimeout} resume timeout; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StartupResume_CancellationObservingTimeout_MarksFailedInsteadOfHostCancellation()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-cancel-observing",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
             resumeTimeout: TimeSpan.FromMilliseconds(50));
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -504,8 +572,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
         Assert.Null(after.SuspendedVmName);
-        Assert.Null(after.SuspendedAt);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.True(provider.ResumeCancellationObserved);
         Assert.Contains("timed out", after.LastError);
     }
 
@@ -1339,6 +1406,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
         public bool ResumeHangs { get; set; }
+        public bool ResumeObservesCancellation { get; set; }
+        public bool ResumeCancellationObserved { get; private set; }
         public int? AdoptionExitCodeToReturn { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
@@ -1365,6 +1434,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             if (ResumeHangs)
                 return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+            if (ResumeObservesCancellation)
+            {
+                while (!ct.IsCancellationRequested)
+                    Thread.Sleep(1);
+                ResumeCancellationObserved = true;
+                throw new OperationCanceledException(ct);
+            }
             return Task.CompletedTask;
         }
 

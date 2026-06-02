@@ -389,4 +389,70 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         // Pipeline must NOT have executed the stranded item.
         Assert.DoesNotContain(item.Id, pipeline.Executed);
     }
+
+    [Fact]
+    public async Task OrchestratorStartup_WaitsForResumeBarrierBeforeStartupReaperAndReplay()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var barrier = new TestStartupResumeBarrier();
+        var pipeline = new ImmediateDonePipeline(_store);
+        var cancellations = new CancellationRegistry(CancellationToken.None);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1, MaxRecoveryAttempts = 5 };
+
+        using var svc = new OrchestratorService(
+            _queue, _store, pipeline, cancellations, opts,
+            NullLogger<OrchestratorService>.Instance,
+            workerRegistry: _registry,
+            deadWorkerOpts: _opts,
+            reaper: _reaper,
+            startupResumeBarrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+        await barrier.WaitObserved.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+
+        var beforeSignal = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, beforeSignal!.State);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+
+        barrier.MarkCompleted();
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        WorkItem? final = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            final = await _store.GetAsync(item.Id);
+            if (final?.State == WorkItemState.Failed) break;
+            await Task.Delay(30);
+        }
+
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+    }
+
+    private sealed class TestStartupResumeBarrier : IStartupSandboxResumeBarrier
+    {
+        private readonly TaskCompletionSource _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _waitObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task WaitObserved => _waitObserved.Task;
+
+        public Task Completion
+        {
+            get
+            {
+                _waitObserved.TrySetResult();
+                return _completion.Task;
+            }
+        }
+
+        public void MarkCompleted() => _completion.TrySetResult();
+    }
 }

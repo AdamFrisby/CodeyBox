@@ -32,9 +32,9 @@ namespace CodeyBox.Tests;
 ///   BEFORE per-VM teardown, so no new sandboxes race the snapshot;</item>
 ///   <item>operator-tunable <see cref="SandboxTeardownMode"/> picks between
 ///   Suspend (legacy), Stop (multipass stop, lock-safe), Dispose (purge);</item>
-///   <item>startup reconciler runs BEFORE the resume handler and tries to
-///   recover orphaned suspend-lifecycle VMs (stop, then purge) instead of
-///   waiting out the leak reaper's grace.</item>
+    ///   <item>startup reconciler runs in the background and tries to recover
+    ///   orphaned suspend-lifecycle VMs (stop, then purge) without blocking the
+    ///   API listener.</item>
 /// </list>
 /// </summary>
 public sealed class SandboxShutdownOrderingTests : IDisposable
@@ -451,6 +451,23 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
         Assert.Equal("vm-untouched", after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupReconciler_LifecycleStartup_DoesNotBlockOnProviderRecovery()
+    {
+        var provider = new BlockingReconcilingProvider();
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        Assert.False(provider.ReconcileEntered.Task.IsCompleted);
+
+        await svc.StartAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        await provider.ReconcileEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        provider.Release();
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -898,6 +915,33 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             UnrecoverableReturned = unrecoverable;
             return unrecoverable;
         }
+    }
+
+    private sealed class BlockingReconcilingProvider : ISandboxProvider, ISuspendingSandboxProvider
+    {
+        private readonly TaskCompletionSource<IReadOnlyList<string>> _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReconcileEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string Name => "fake-blocking-reconciling";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotImplementedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
+            IReadOnlySet<string> liveSuspendedNames, CancellationToken ct)
+        {
+            ReconcileEntered.TrySetResult();
+            return _release.Task;
+        }
+
+        public void Release() => _release.TrySetResult([]);
     }
 
     private sealed class ShortCircuitPipelineRunner : IPipelineRunner
