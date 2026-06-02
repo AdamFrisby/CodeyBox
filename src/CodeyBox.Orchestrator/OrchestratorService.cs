@@ -198,7 +198,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
-        _reaper?.AttachWorkerPoolSlotReaser(this);
+        _reaper?.AttachWorkerPoolSlotReleaser(this);
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
         // Prefer the shared snapshot when DI provides one (production path —
