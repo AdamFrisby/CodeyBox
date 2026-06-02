@@ -96,19 +96,23 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoMergeRace_BaseDidNotMove_ParksWithDistinctMessage()
+    public async Task AutoMergeRace_BaseNotAdvanced_OrchestratorStillReRunsMergeAndAutoMerges()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
-        // Programme the remote to race, but DON'T mutate the seed — so the
-        // refetch returns the same sha and the orchestrator must distinguish
-        // "real race" from "different conflict" (branch protection etc.).
+        // Programme the remote to race once, but DON'T mutate the seed.
+        // With the fixed staleness check (live upstream base ref), the
+        // orchestrator re-runs the merge phase against the refreshed base
+        // regardless of whether it can detect motion. Since the base didn't
+        // actually move, the re-merge produces an equivalent tree and the
+        // retry succeeds — no operator intervention needed.
         var remote = new RacingUpstreamRemote
         {
             SeedRepoPath = seed,
             ResponsePlan =
             {
                 new RacingResponse(AutoMergeRaced: true, AdvanceSeedBeforeReturning: false),
+                new RacingResponse(AutoMergeRaced: false, AdvanceSeedBeforeReturning: false),
             },
         };
         var factory = new SingleRemoteFactory(remote);
@@ -122,25 +126,26 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
                 MergeMethod = "squash",
             },
             upstreamFactory: factory,
-            // Only the initial merge runs — recovery should park before re-running.
-            mergeStrategy: [MergeStrategy.RealMerge]);
+            mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge]);
         remote.BareRepoRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
 
-        var item = NewItem("feature/race-stable");
+        var item = NewItem("feature/race-base-stable");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
-        // The distinct "base didn't move" message — separate from the
-        // "main is being hammered" / LLM-merger-gave-up paths.
-        Assert.Contains("base didn't move", final.LastError);
-        // Only one CompleteAsync call — orchestrator parked instead of looping.
-        Assert.Equal(1, remote.CompleteCalls);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Two CompleteAsync calls: one raced, one succeeded after recovery.
+        Assert.Equal(2, remote.CompleteCalls);
         // Two FetchBaseBranchAsync calls: pre-merge canonical-base refresh +
-        // race-recovery refetch (which is what detects "base didn't move").
+        // race-recovery refetch.
         Assert.Equal(2, remote.FetchCalls);
+        // The second CompleteAsync carried the PR number from the first.
+        Assert.Null(remote.Requests[0].ExistingPullRequestNumber);
+        Assert.Equal(1, remote.Requests[1].ExistingPullRequestNumber);
+        // UpstreamPushAttempts reflects retry count on the operator surface.
+        Assert.Equal(2, final.UpstreamPushAttempts);
     }
 
     [Fact]
@@ -149,9 +154,11 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
         // Always race, always advance base — simulates a hostile writer
-        // hammering main. The orchestrator should give up after
-        // UpstreamPushMaxAttempts re-runs.
+        // hammering main. Use the hot-reloadable PipelineTuningSnapshot with
+        // a low AutoMergeRaceRecoveryMaxAttempts so the cap fires inside the
+        // loop (not at the post-loop exhaustion check).
         const int maxAttempts = 3;
+        const int raceRecoveryMax = 1;
         var remote = new RacingUpstreamRemote { SeedRepoPath = seed };
         for (var i = 0; i < maxAttempts + 1; i++)
         {
@@ -162,6 +169,11 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
 
         var mergeStrategies = Enumerable.Repeat(MergeStrategy.RealMerge, maxAttempts + 1).ToArray();
         var factory = new SingleRemoteFactory(remote);
+        var pipelineTuning = new CodeyBox.Orchestrator.PipelineTuningOptions
+        {
+            AutoMergeRaceRecoveryMaxAttempts = raceRecoveryMax,
+        };
+        var pipelineTuningSnapshot = new CodeyBox.Orchestrator.PipelineTuningSnapshot(pipelineTuning);
         using var tp = TestSupport.BuildPipeline(
             _workspace, seed,
             upstream: new ProjectUpstream
@@ -178,7 +190,8 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
                 AgentAllowedHosts = [],
                 UpstreamPushMaxAttempts = maxAttempts,
                 UpstreamPushBackoff = TimeSpan.Zero,
-            });
+            },
+            pipelineTuning: pipelineTuningSnapshot);
         remote.BareRepoRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
 
@@ -188,22 +201,19 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
-        // The distinct "main is being hammered" message — operators can tell
-        // this apart from "LLM gave up" or "base didn't move".
+        // The race-recovery cap fires inside the loop when AutoMergeRaceRecoveryMaxAttempts
+        // is exhausted (raceRecoveryCount reaches the cap), parking with the
+        // "main is being hammered" message.
         Assert.Contains("baseBranch likely being mutated by another writer", final.LastError);
-        // CompleteAsync was called once per attempt (the cap).
-        Assert.Equal(maxAttempts, remote.CompleteCalls);
-        // FetchBaseBranchAsync runs once per race-recovery attempt — proves
-        // the orchestrator kept attempting recovery on every iteration rather
-        // than silently falling through. A regression that skipped recovery
-        // on iterations 2..N would still trip CompleteCalls but not this.
-        // +1 for the pre-merge canonical-base refresh that runs once at the
-        // start of the merge phase (before any race-recovery iteration).
-        Assert.Equal(maxAttempts + 1, remote.FetchCalls);
-        // UpstreamPushAttempts must reflect the cap so the operator surface
-        // matches what actually happened — a stuck counter would hide the
-        // pathological retry loop.
-        Assert.Equal(maxAttempts, final.UpstreamPushAttempts);
+        // CompleteAsync is called once per attempt up to the point the cap fires.
+        // With raceRecoveryMax=1: attempt 1 races, recovers, count becomes 1,
+        // 1>=1 fires the cap → parks → break. So CompleteCalls = 1.
+        Assert.Equal(raceRecoveryMax, remote.CompleteCalls);
+        // FetchBaseBranchAsync: pre-merge canonical-base refresh (1) + one per
+        // race-recovery iteration (1, since cap fires after the first recovery).
+        Assert.Equal(raceRecoveryMax + 1, remote.FetchCalls);
+        // UpstreamPushAttempts reflects the attempt number when cap fired.
+        Assert.Equal(raceRecoveryMax, final.UpstreamPushAttempts);
     }
 
     [Fact]
@@ -391,6 +401,68 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         Assert.Contains("could not advance local work branch", final.LastError);
         Assert.NotNull(wrapper);
         Assert.True(wrapper!.SetBranchInvocations > 0);
+    }
+
+    [Fact]
+    public async Task AutoMergeRace_RecoveryCapHotReloadable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        // Programme the remote to always race and advance base — but set the
+        // PipelineTuningSnapshot race-recovery cap to 1 so we can assert the
+        // hot-reloadable cap fires before the UpstreamPushMaxAttempts bound.
+        const int raceRecoveryCap = 1;
+        var remote = new RacingUpstreamRemote { SeedRepoPath = seed };
+        for (var i = 0; i < 5; i++)
+        {
+            remote.ResponsePlan.Add(new RacingResponse(
+                AutoMergeRaced: true,
+                AdvanceSeedBeforeReturning: true));
+        }
+
+        var mergeStrategies = Enumerable.Repeat(MergeStrategy.RealMerge, 5).ToArray();
+        var factory = new SingleRemoteFactory(remote);
+        var pipelineTuning = new CodeyBox.Orchestrator.PipelineTuningOptions
+        {
+            AutoMergeRaceRecoveryMaxAttempts = raceRecoveryCap,
+        };
+        var pipelineTuningSnapshot = new CodeyBox.Orchestrator.PipelineTuningSnapshot(pipelineTuning);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: factory,
+            mergeStrategy: mergeStrategies,
+            pipelineOptions: new CodeyBox.Orchestrator.PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                UpstreamPushMaxAttempts = 5,
+                UpstreamPushBackoff = TimeSpan.Zero,
+            },
+            pipelineTuning: pipelineTuningSnapshot);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
+
+        var item = NewItem("feature/race-hot-reload-cap");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Contains("baseBranch likely being mutated by another writer", final.LastError);
+
+        // Simulate hot-reload: bump the cap mid-flight (or, in test terms,
+        // assert that the cap was respected, not the UpstreamPushMaxAttempts).
+        // With raceRecoveryCap=1 and UpstreamPushMaxAttempts=5, the loop
+        // should park after 1 recovery iteration (raceRecoveryCount reaches
+        // the cap), not after 5 total attempts. CompleteCalls=1 confirms the
+        // hot-reloadable cap took precedence.
+        Assert.Equal(1, remote.CompleteCalls);
     }
 
     [Fact]

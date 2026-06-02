@@ -102,6 +102,7 @@ internal static class TestSupport
         string? stateDbPathOverride = null,
         IPreMergeVerifier? preMergeVerifier = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
+        PipelineTuningSnapshot? pipelineTuning = null,
         ITaskQueue? taskQueue = null,
         IAgentInvolvementStore? involvement = null)
     {
@@ -179,6 +180,7 @@ internal static class TestSupport
             }),
             preMergeVerifier: preMergeVerifier,
             incrementalRebase: incrementalRebase,
+            pipelineTuning: pipelineTuning,
             taskQueue: queue,
             involvement: involvement);
 
