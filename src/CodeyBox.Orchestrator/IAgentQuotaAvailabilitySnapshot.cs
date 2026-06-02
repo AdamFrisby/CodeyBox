@@ -19,3 +19,13 @@ public interface IAgentQuotaAvailabilitySnapshot
     /// </summary>
     IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability();
 }
+
+/// <summary>
+/// Emits a wake-up signal when a quota probe observes a class member cross from
+/// below its effective floor to usable. Consumers can react without depending
+/// on the concrete router.
+/// </summary>
+public interface IAgentQuotaAvailabilitySignal
+{
+    event Action? QuotaUsableThresholdCrossed;
+}

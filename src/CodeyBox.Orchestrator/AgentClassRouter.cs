@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -75,8 +75,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
 
     /// <summary>
     /// Raised when a routing probe observes an eligible member move from below
-    /// the effective quota floor to usable. The quota retry scheduler treats
-    /// this as an immediate wake-up signal for parked quota-reset items.
+    /// the effective quota floor to usable. Exposed through
+    /// <see cref="IAgentQuotaAvailabilitySignal"/> so consumers do not need the
+    /// concrete router for quota wake-up notifications.
     /// </summary>
     public event Action? QuotaUsableThresholdCrossed;
 
