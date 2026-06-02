@@ -158,6 +158,38 @@ public sealed class InVmSmokeProbeServiceTests
     }
 
     [Fact]
+    public async Task StartupSweep_ExplicitSmokeProfile_UsesTargetAwareGate_AndWinsOverProjectProfile()
+    {
+        var gate = new CountingGate();
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.invalid/repo.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "project-work" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "smoke-explicit",
+                SweepIntervalSeconds = 0,
+            },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(project));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("smoke-explicit", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+    }
+
+    [Fact]
     public async Task StartupSweep_SkipsBlankProjectProfiles()
     {
         var gate = new CountingGate();

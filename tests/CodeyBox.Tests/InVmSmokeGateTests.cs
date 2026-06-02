@@ -122,6 +122,24 @@ public sealed class InVmSmokeGateTests
         Assert.Null(target.BaselineRef);
     }
 
+    [Fact]
+    public async Task ResolveAsync_CheckAndActGraphicalProject_ForwardsHeadlessWorkTarget()
+    {
+        var gate = new RecordingGate();
+        var router = BuildRouter(NewRegistry(), gate);
+        var project = MakeProject() with { GraphicalSandbox = true };
+
+        await router.ResolveAsync(
+            MakeItem(baselineImageRef: "base-HEADLESS-WORK") with { JobType = JobType.CheckAndAct },
+            project,
+            CancellationToken.None);
+
+        var target = Assert.Single(gate.SeenTargets);
+        Assert.Equal("work-profile", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+        Assert.Equal("base-HEADLESS-WORK", target.BaselineRef);
+    }
+
     /// <summary>
     /// Records the baselineRef forwarded by the router and reports every agent as
     /// available so routing proceeds normally.

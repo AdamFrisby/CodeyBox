@@ -226,7 +226,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
             return new AgentRoutingDecision { Reason = "no agent class configured" };
-        var smokeTarget = ResolveWorkSmokeTarget(project, item.BaselineImageRef);
+        var smokeTarget = ResolveInitialSmokeTarget(item, project);
 
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
         {
@@ -804,6 +804,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             project,
             SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
             workBaselineRef);
+    }
+
+    private InVmSmokeSandboxTarget ResolveInitialSmokeTarget(WorkItem item, Project? project)
+    {
+        if (project is null)
+            return _configuredSmokeTarget ?? default;
+
+        var target = item.JobType == JobType.CheckAndAct
+            ? new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless)
+            : SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+
+        return SandboxTargetResolver.ToInVmSmokeTarget(project, target, item.BaselineImageRef);
     }
 
     private async Task<AgentAvailability?> GetGatedAvailabilityAsync(

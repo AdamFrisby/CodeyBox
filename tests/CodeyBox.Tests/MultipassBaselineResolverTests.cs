@@ -83,6 +83,28 @@ public sealed class MultipassBaselineResolverTests
         Assert.Null(result);
     }
 
+    [Fact]
+    public async Task EnsureBaselineImageAsync_UnknownProfile_ThrowsBeforeBakeOrClone()
+    {
+        var provider = new MultipassSandboxProvider(
+            new MultipassSandboxOptions
+            {
+                UseBaselineImages = true,
+                NetworkProfiles = new Dictionary<string, string> { ["work"] = "cb-net" },
+            },
+            NullLogger<MultipassSandboxProvider>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "unknown",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("Network profile 'unknown' is not configured", ex.Message);
+        Assert.Contains("work", ex.Message);
+    }
+
     /// <summary>
     /// Two calls with the same live config and same (profile, flavor) return
     /// the same ref — this is what makes a stamped pin look "fresh" until

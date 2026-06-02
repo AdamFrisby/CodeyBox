@@ -399,7 +399,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
-        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, "work", item.BaselineImageRef);
+        var initialSmokePhase = item.JobType == JobType.CheckAndAct ? "check" : "work";
+        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, initialSmokePhase, item.BaselineImageRef);
         var smokeAvailability = await EnsureAgentSmokeAvailableAsync(
             agentKind, initialSmokeTarget, ct);
         if (!smokeAvailability.Available)
@@ -4177,6 +4178,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     ?? project.NetworkProfiles.AuditAgent
                     ?? project.NetworkProfiles.AuditTool,
                 SandboxProfileFlavor.Headless),
+            "check" => new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
             "rework" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework),
             "merge" => new SandboxTarget(project.NetworkProfiles.Merge, SandboxProfileFlavor.Headless),
             "audit" => SandboxTargetResolver.ResolveAudit(
