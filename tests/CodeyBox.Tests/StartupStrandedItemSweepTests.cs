@@ -429,14 +429,20 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
             await Task.Delay(30);
         }
 
+        await barrier.InitialRecoveryCompleted.WaitAsync(TimeSpan.FromSeconds(5));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final.State);
         Assert.DoesNotContain(item.Id, pipeline.Executed);
+        Assert.Equal(1, barrier.InitialRecoveryCompletedSignals);
     }
 
-    private sealed class TestStartupRecoveryBarrier : IStartupRecoveryBarrier, IStartupRecoveryCompletionSink
+    private sealed class TestStartupRecoveryBarrier :
+        IStartupRecoveryInputBarrier,
+        IStartupRecoveryInputSink,
+        IStartupInitialRecoveryBarrier,
+        IStartupInitialRecoverySink
     {
         private readonly TaskCompletionSource _recoveryInputReady =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -444,8 +450,10 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _waitObserved =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _initialRecoveryCompletedSignals;
 
         public Task WaitObserved => _waitObserved.Task;
+        public int InitialRecoveryCompletedSignals => Volatile.Read(ref _initialRecoveryCompletedSignals);
 
         public Task RecoveryInputReady
         {
@@ -460,6 +468,10 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         public void MarkRecoveryInputReady() => _recoveryInputReady.TrySetResult();
 
-        public void MarkInitialRecoveryCompleted() => _initialRecoveryCompleted.TrySetResult();
+        public void MarkInitialRecoveryCompleted()
+        {
+            Interlocked.Increment(ref _initialRecoveryCompletedSignals);
+            _initialRecoveryCompleted.TrySetResult();
+        }
     }
 }

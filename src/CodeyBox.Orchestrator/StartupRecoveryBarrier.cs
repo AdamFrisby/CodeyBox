@@ -1,18 +1,30 @@
 namespace CodeyBox.Orchestrator;
 
-public interface IStartupRecoveryBarrier
+public interface IStartupRecoveryInputBarrier
 {
     Task RecoveryInputReady { get; }
+}
+
+public interface IStartupRecoveryInputSink
+{
+    void MarkRecoveryInputReady();
+}
+
+public interface IStartupInitialRecoveryBarrier
+{
     Task InitialRecoveryCompleted { get; }
 }
 
-public interface IStartupRecoveryCompletionSink
+public interface IStartupInitialRecoverySink
 {
-    void MarkRecoveryInputReady();
     void MarkInitialRecoveryCompleted();
 }
 
-public sealed class StartupRecoveryBarrier : IStartupRecoveryBarrier, IStartupRecoveryCompletionSink
+public sealed class StartupRecoveryBarrier :
+    IStartupRecoveryInputBarrier,
+    IStartupRecoveryInputSink,
+    IStartupInitialRecoveryBarrier,
+    IStartupInitialRecoverySink
 {
     private readonly TaskCompletionSource _recoveryInputReady =
         new(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -1,8 +1,9 @@
-namespace CodeyBox.Core;
+using CodeyBox.Core;
+
+namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Public policy limits for startup resume configuration. Kept in Core so API
-/// validation does not depend on a concrete orchestrator hosted service.
+/// Host-side policy limits for startup sandbox resume configuration.
 /// </summary>
 public static class SandboxStartupResumePolicy
 {

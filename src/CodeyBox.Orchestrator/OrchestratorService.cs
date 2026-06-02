@@ -74,8 +74,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IWorkerRegistry? _workerRegistry;
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
-    private readonly IStartupRecoveryBarrier? _startupRecoveryBarrier;
-    private readonly IStartupRecoveryCompletionSink? _startupRecoveryCompletion;
+    private readonly IStartupRecoveryInputBarrier? _startupRecoveryBarrier;
+    private readonly IStartupInitialRecoverySink? _startupRecoveryCompletion;
     private readonly ReleaseService? _releaseService;
     // B1 baseline-pinning: stamps the work/headless baseline ref at pickup time
     // so matching work-profile sandboxes keep using that baseline even after an
@@ -185,8 +185,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         OrchestratorProgressClock? progressClock = null,
         QuotaRouterOptions? quotaRouterOptions = null,
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
-        IStartupRecoveryBarrier? startupRecoveryBarrier = null,
-        IStartupRecoveryCompletionSink? startupRecoveryCompletion = null)
+        IStartupRecoveryInputBarrier? startupRecoveryBarrier = null,
+        IStartupInitialRecoverySink? startupRecoveryCompletion = null)
     {
         _queue = queue;
         _store = store;

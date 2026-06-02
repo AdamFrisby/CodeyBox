@@ -38,7 +38,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
-    private readonly IStartupRecoveryBarrier? _startupRecoveryBarrier;
+    private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -57,7 +57,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _registry = registry;
         _store = store;
@@ -79,7 +79,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
         : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier) { }
 
     /// <summary>

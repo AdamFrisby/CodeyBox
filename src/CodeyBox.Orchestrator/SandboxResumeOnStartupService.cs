@@ -31,7 +31,7 @@ public sealed record SandboxStartupResumeOptions
 /// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
 /// only when configured for blocking mode. The default background mode starts
 /// the resume sweep from <see cref="StartAsync"/> and signals
-/// <see cref="IStartupRecoveryCompletionSink"/> when done, so the HTTP listener can
+/// <see cref="IStartupRecoveryInputSink"/> when done, so the HTTP listener can
 /// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
 /// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
 /// consistent picture (the VM is back to Running, the work item still carries
@@ -97,7 +97,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
-    private readonly IStartupRecoveryCompletionSink _startupRecovery;
+    private readonly IStartupRecoveryInputSink _startupRecovery;
     private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
@@ -107,11 +107,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         ISandboxProvider? provider,
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
+        IStartupRecoveryInputSink recoveryInput,
         int? maxParallel = null,
         TimeSpan? adoptionDeadline = null,
         TimeSpan? resumeTimeout = null,
-        SandboxStartupResumeMode? mode = null,
-        IStartupRecoveryCompletionSink? barrier = null)
+        SandboxStartupResumeMode? mode = null)
         : this(
             provider,
             store,
@@ -127,7 +127,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                     : DefaultResumeTimeout,
                 Mode = mode ?? SandboxStartupResumeMode.Background,
             },
-            barrier)
+            recoveryInput)
     {
     }
 
@@ -136,13 +136,14 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
         Func<SandboxStartupResumeOptions> optionsAccessor,
-        IStartupRecoveryCompletionSink? barrier = null)
+        IStartupRecoveryInputSink recoveryInput)
     {
+        ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
         _store = store;
         _log = log;
         _optionsAccessor = optionsAccessor;
-        _startupRecovery = barrier ?? new StartupRecoveryBarrier();
+        _startupRecovery = recoveryInput;
     }
 
     public Task StartAsync(CancellationToken ct)

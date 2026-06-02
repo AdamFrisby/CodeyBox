@@ -1643,7 +1643,7 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         () => monitor.CurrentValue.DeadWorker,
         sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
 
 // --- Worker progress watchdog -----------------------------------------------
@@ -1671,7 +1671,7 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         sp.GetRequiredService<ILogger<WorkerProgressWatchdog>>(),
         sp.GetService<IAgentStreamStore>(),
         sp.GetService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
 
 // --- Agent cost extractors + calculator ------------------------------------
@@ -1933,9 +1933,13 @@ builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<ILogger<ReleaseMainSyncService>>()));
 
 builder.Services.AddSingleton<StartupRecoveryBarrier>();
-builder.Services.AddSingleton<IStartupRecoveryBarrier>(
+builder.Services.AddSingleton<IStartupRecoveryInputBarrier>(
     sp => sp.GetRequiredService<StartupRecoveryBarrier>());
-builder.Services.AddSingleton<IStartupRecoveryCompletionSink>(
+builder.Services.AddSingleton<IStartupRecoveryInputSink>(
+    sp => sp.GetRequiredService<StartupRecoveryBarrier>());
+builder.Services.AddSingleton<IStartupInitialRecoveryBarrier>(
+    sp => sp.GetRequiredService<StartupRecoveryBarrier>());
+builder.Services.AddSingleton<IStartupInitialRecoverySink>(
     sp => sp.GetRequiredService<StartupRecoveryBarrier>());
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
@@ -1958,8 +1962,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<OrchestratorProgressClock>(),
     sp.GetRequiredService<QuotaRouterOptions>(),
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
-    sp.GetRequiredService<IStartupRecoveryBarrier>(),
-    sp.GetRequiredService<IStartupRecoveryCompletionSink>()));
+    sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
+    sp.GetRequiredService<IStartupInitialRecoverySink>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -2022,7 +2026,7 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
     },
-    sp.GetRequiredService<IStartupRecoveryCompletionSink>()));
+    sp.GetRequiredService<IStartupRecoveryInputSink>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the

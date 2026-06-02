@@ -495,7 +495,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var provider = new FakeSuspendingProvider { ResumeThrows = true };
         var log = new CapturingLogger<SandboxResumeOnStartupService>();
-        var svc = new SandboxResumeOnStartupService(provider, _store, log);
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
@@ -528,6 +532,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             log,
+            NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: configuredTimeout);
 
         var sw = Stopwatch.StartNew();
@@ -644,6 +649,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: configuredTimeout,
             mode: SandboxStartupResumeMode.Blocking);
 
@@ -714,6 +720,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: TimeSpan.FromMilliseconds(50));
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -769,7 +776,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            () => options);
+            () => options,
+            NoopStartupRecoveryInputSink.Instance);
 
         var resumeTask = svc.ResumeAllForTestAsync(CancellationToken.None);
         await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-0-hot-gate"));
@@ -815,7 +823,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             new FakeSuspendingProvider(),
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            barrier: barrier);
+            barrier);
 
         await svc.StartAsync(CancellationToken.None);
 
@@ -839,9 +847,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
             resumeTimeout: TimeSpan.FromHours(1),
-            mode: SandboxStartupResumeMode.Background,
-            barrier: barrier);
+            mode: SandboxStartupResumeMode.Background);
 
         await svc.StartAsync(CancellationToken.None);
         await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-stop-cancel"));
@@ -854,6 +862,49 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         // Host/factory disposal paths may call StopAsync more than once.
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundRecoveryInput_StaysBlockedDuringSlowAdoption()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-slow-input",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/slow-input.log",
+        });
+
+        var barrier = new StartupRecoveryBarrier();
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionResultSource = new TaskCompletionSource<int?>(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            adoptionDeadline: TimeSpan.FromSeconds(30),
+            mode: SandboxStartupResumeMode.Background);
+
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => provider.AdoptionCalls.Count == 1);
+
+            Assert.False(barrier.RecoveryInputReady.IsCompleted);
+            var duringAdoption = await _store.GetAsync(item.Id);
+            Assert.Equal("vm-slow-input", duringAdoption!.SuspendedVmName);
+
+            provider.AdoptionResultSource!.SetResult(0);
+            await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            await svc.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -872,7 +923,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxResumeOnStartupService(
             new NonSuspendingProvider(), _store,
-            NullLogger<SandboxResumeOnStartupService>.Instance);
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
@@ -894,7 +946,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxResumeOnStartupService(
             new NonSuspendingProvider(), _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            barrier: barrier);
+            barrier);
 
         await svc.StartAsync(CancellationToken.None);
 
@@ -917,7 +969,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxResumeOnStartupService(
             provider: null, _store,
-            NullLogger<SandboxResumeOnStartupService>.Instance);
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
         // Rows untouched — operator-visible signal that the suspended VM
@@ -940,7 +993,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxResumeOnStartupService(
             provider: null, _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            barrier: barrier);
+            barrier);
 
         await svc.StartAsync(CancellationToken.None);
 
@@ -956,7 +1009,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             new FakeSuspendingProvider(),
             new StubWorkItemStore(),
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            barrier: barrier);
+            barrier);
 
         await svc.StartAsync(CancellationToken.None);
 
@@ -1006,6 +1059,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
         var svc = new SandboxResumeOnStartupService(
             provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: customDeadline);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -1029,6 +1083,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
         var svc = new SandboxResumeOnStartupService(
             provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: SandboxResumeOnStartupService.MaximumAdoptionDeadline + TimeSpan.FromTicks(1));
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -1079,6 +1134,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
         var svc = new SandboxResumeOnStartupService(
             provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: TimeSpan.Zero);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -1110,6 +1166,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             log,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: configuredDeadline);
 
         var sw = Stopwatch.StartNew();
@@ -1494,7 +1551,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider,
             _store,
             NullLogger<SandboxResumeOnStartupService>.Instance,
-            barrier: barrier);
+            barrier);
         var reaper = new DeadWorkerReaper(
             registry,
             _store,
@@ -1780,7 +1837,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private SandboxResumeOnStartupService MakeResumeService(ISandboxProvider provider) =>
-        new(provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance);
+        new(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
+
+    private sealed class NoopStartupRecoveryInputSink : IStartupRecoveryInputSink
+    {
+        public static readonly NoopStartupRecoveryInputSink Instance = new();
+
+        private NoopStartupRecoveryInputSink() { }
+
+        public void MarkRecoveryInputReady() { }
+    }
 
     private sealed class DeleteOnResumeProvider : ISandboxProvider, ISuspendingSandboxProvider
     {

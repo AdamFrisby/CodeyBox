@@ -25,7 +25,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<DeadWorkerOptions> _optsAccessor;
     private readonly ILogger<DeadWorkerReaper> _log;
-    private readonly IStartupRecoveryBarrier? _startupRecoveryBarrier;
+    private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
     private readonly ConcurrentDictionary<WorkItemId, byte> _recoveredItemsThisProcess = new();
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
@@ -46,7 +46,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
         : this(registry, store, queue, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier) { }
 
     public DeadWorkerReaper(
@@ -57,7 +57,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _registry = registry;
         _store = store;
