@@ -88,8 +88,9 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // preserves VM disk but kills the agent process — far less likely to wedge
     // multipassd than suspend), or Dispose (delete --purge, full teardown — no
     // suspended-resume bookkeeping is written, the work item recovers via the
-    // existing preempt-checkpoint flow). Default Suspend for backward compat.
-    private readonly SandboxTeardownMode _teardownMode;
+    // existing preempt-checkpoint flow). Resolved at teardown time so operator
+    // config hot-reload takes effect on the next graceful shutdown.
+    private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
     public SandboxSuspendOnShutdownService(
         ISandboxProvider provider,
@@ -99,7 +100,8 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         TimeSpan? perSuspendTimeout = null,
         TimeSpan? perGiBSuspendBudget = null,
         IShutdownDispatchGate? dispatchGate = null,
-        SandboxTeardownMode teardownMode = SandboxTeardownMode.Suspend)
+        SandboxTeardownMode teardownMode = SandboxTeardownMode.Suspend,
+        Func<SandboxTeardownMode>? teardownModeAccessor = null)
     {
         _provider = provider;
         _store = store;
@@ -108,7 +110,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         _perSuspendTimeout = perSuspendTimeout is { } t && t > TimeSpan.Zero ? t : DefaultPerSuspendTimeout;
         _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
         _dispatchGate = dispatchGate;
-        _teardownMode = teardownMode;
+        _teardownModeAccessor = teardownModeAccessor ?? (() => teardownMode);
     }
 
     /// <summary>The dispatch-pause-was-called signal as observed by SuspendAllAsync.</summary>
@@ -180,10 +182,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             return;
         }
 
+        var teardownMode = _teardownModeAccessor();
         var entries = suspending.SnapshotSuspendableActive();
         if (entries.Count == 0)
         {
-            _log.LogInformation("Suspend-on-shutdown: no in-flight sandboxes to {Mode} before exit", _teardownMode);
+            _log.LogInformation("Suspend-on-shutdown: no in-flight sandboxes to {Mode} before exit", teardownMode);
             return;
         }
 
@@ -193,7 +196,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
         _log.LogInformation(
             "Sandbox shutdown teardown ({Mode}): {Count} in-flight sandbox(es)",
-            _teardownMode, entries.Count);
+            teardownMode, entries.Count);
 
         using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
         var tasks = new List<Task>(entries.Count);
@@ -204,7 +207,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             {
                 try
                 {
-                    await TeardownOneAsync(workItemId, sandbox);
+                    await TeardownOneAsync(workItemId, sandbox, teardownMode);
                 }
                 finally
                 {
@@ -215,20 +218,20 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         await Task.WhenAll(tasks);
     }
 
-    private Task TeardownOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox) =>
+    private Task TeardownOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox, SandboxTeardownMode teardownMode) =>
         // The default arm throws rather than silently routing through suspend.
         // Silent fallthrough would defeat the whole feature's intent: a new
         // teardown mode added without an explicit case here would re-introduce
         // the qemu-lock wedge this code path exists to avoid. The throw is
         // caught by SuspendAllAsync's per-VM Task.Run / await Task.WhenAll
         // wrapper so one mis-bound enum value cannot break the whole drain.
-        _teardownMode switch
+        teardownMode switch
         {
             SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
             SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox),
             SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox),
             _ => Task.FromException(new InvalidOperationException(
-                $"SandboxTeardownMode {(int)_teardownMode} is not handled; add an explicit case in TeardownOneAsync rather than relying on silent fallthrough.")),
+                $"SandboxTeardownMode {(int)teardownMode} is not handled; add an explicit case in TeardownOneAsync rather than relying on silent fallthrough.")),
         };
 
     /// <summary>

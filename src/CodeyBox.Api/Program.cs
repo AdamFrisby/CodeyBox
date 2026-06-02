@@ -1979,14 +1979,18 @@ builder.Services.AddHostedService(sp =>
 // suspendable set — without that ordering, the dispatch loop keeps creating
 // new sandboxes that race the snapshot. Teardown mode is operator-tunable via
 // CodeyBox:Shutdown:SandboxTeardownMode (Suspend / Stop / Dispose); default
-// Suspend for backward compatibility.
-builder.Services.AddHostedService(sp => new SandboxSuspendOnShutdownService(
-    sp.GetRequiredService<ISandboxProvider>(),
-    sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>(),
-    dispatchGate: sp.GetService<IShutdownDispatchGate>(),
-    teardownMode: sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
-        .CurrentValue.Shutdown.SandboxTeardownMode));
+// Suspend for backward compatibility. Resolve it through IOptionsMonitor at
+// shutdown time so a hot config edit affects the next graceful shutdown.
+builder.Services.AddHostedService(sp =>
+{
+    var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new SandboxSuspendOnShutdownService(
+        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>(),
+        dispatchGate: sp.GetService<IShutdownDispatchGate>(),
+        teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);
+});
 // Startup reconciler runs BEFORE the resume handler (registration order ==
 // StartingAsync execution order) so VMs left wedged in Suspending state from
 // a prior unclean shutdown are returned to a clean state before resume tries
@@ -2577,7 +2581,8 @@ namespace CodeyBox.Api
     ///   (per-sweep), <c>SandboxLeak</c> (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
     ///   sandbox launch fields (<c>Multipass*</c>, <c>SandboxNetworkProfiles</c>,
-    ///   per-launch).</item>
+    ///   per-launch), and <c>Shutdown.SandboxTeardownMode</c> (next graceful
+    ///   shutdown).</item>
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
     ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
@@ -3002,6 +3007,8 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// How to tear down in-flight worker sandboxes during graceful shutdown.
+        /// Hot-reloadable: read by the shutdown handler when graceful shutdown
+        /// begins, so an operator can switch modes without restarting first.
         /// Default <see cref="SandboxTeardownMode.Suspend"/> (original
         /// behaviour: freeze RAM via <c>multipass suspend</c> and resume on
         /// next startup). Operators running stateless workloads that recover

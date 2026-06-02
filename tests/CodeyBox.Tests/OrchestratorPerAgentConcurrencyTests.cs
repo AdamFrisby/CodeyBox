@@ -388,21 +388,27 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             new FakeProbe(Codex, 90.0),
             new FakeProbe(Claude, 90.0),
         };
+        // Mirror production DI: the router sees live counters via a deferred
+        // wrapper and shares the same hot-reloadable cap snapshot as the pool.
+        var sharedConcurrency = new AgentConcurrencySnapshot(concurrency);
+        OrchestratorService orchestrator = null!;
         var router = new AgentClassRouter(
             [cls],
             probes,
             new QuotaRouterOptions { MinQuotaPct = 5.0 },
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            runningCounters: new DeferredAgentRunningCounters(() => orchestrator),
+            concurrencySnapshot: sharedConcurrency);
 
         var pipeline = new PinnedPipelineRunner(_store);
         var queue = new InMemoryTaskQueue();
         var reg = new CancellationRegistry(CancellationToken.None);
-        var orchestrator = new OrchestratorService(
+        orchestrator = new OrchestratorService(
             queue, _store, pipeline, reg,
             new OrchestratorOptions { MaxConcurrentWorkers = 4 },
             NullLogger<OrchestratorService>.Instance,
             router: router,
-            agentConcurrency: concurrency);
+            agentConcurrencySnapshot: sharedConcurrency);
 
         // 3 items into the same class. Without spill, only one would run
         // (the others queue on Codex's cap=1); with spill, all three run
@@ -441,11 +447,22 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // Per-item agent assignment: exactly one item routed to Codex
             // (the top-scoring member, picked first) and the other two
             // spilled to Claude. Without spill, items 2&3 would have stayed
-            // Queued and their Agent field would be null.
-            var snap1 = await _store.GetAsync(i1.Id);
-            var snap2 = await _store.GetAsync(i2.Id);
-            var snap3 = await _store.GetAsync(i3.Id);
-            var agents = new[] { snap1?.Agent, snap2?.Agent, snap3?.Agent };
+            // Queued and their Agent field would be null. The reservation
+            // counter increments inside the router just before the worker
+            // persists the chosen Agent, so wait for the store stamps too.
+            AgentKind?[] agents = [];
+            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (DateTimeOffset.UtcNow < stampDeadline)
+            {
+                var snap1 = await _store.GetAsync(i1.Id);
+                var snap2 = await _store.GetAsync(i2.Id);
+                var snap3 = await _store.GetAsync(i3.Id);
+                agents = [snap1?.Agent, snap2?.Agent, snap3?.Agent];
+                if (agents.Count(a => a == Codex) == 1
+                    && agents.Count(a => a == Claude) == 2)
+                    break;
+                await Task.Delay(25);
+            }
             Assert.Equal(1, agents.Count(a => a == Codex));
             Assert.Equal(2, agents.Count(a => a == Claude));
         }
