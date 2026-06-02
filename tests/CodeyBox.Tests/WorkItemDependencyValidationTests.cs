@@ -318,4 +318,152 @@ public sealed class WorkItemDependencyValidationTests
         Assert.Single(targets);
         Assert.Equal(b, targets[0].Id);
     }
+
+    // ── FindDescendantsToRestore (inverse of cascade-cancel) ──────────────────
+
+    private static WorkItem CascadedItem(WorkItemId id, params WorkItemId[] deps) => new()
+    {
+        Id = id,
+        ProjectId = new ProjectId("test-project"),
+        Title = "t",
+        Prompt = "p",
+        State = WorkItemState.Cancelled,
+        CancellationReason = WorkItemCancellationReason.ParentCascaded,
+        LastError = "parent dependency cancelled",
+        DependsOn = deps,
+    };
+
+    [Fact]
+    public void FindDescendantsToRestore_NoCancelledDependents_ReturnsEmpty()
+    {
+        var a = WorkItemId.New();
+        var allItems = new List<WorkItem> { Item(a, WorkItemState.Queued) };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Empty(restore);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_DirectCascadedDependent_IsIncluded()
+    {
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var allItems = new List<WorkItem>
+        {
+            Item(a, WorkItemState.Queued),
+            CascadedItem(b, a),
+        };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Single(restore);
+        Assert.Equal(b, restore[0].Id);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_TransitiveCascade_AllIncluded()
+    {
+        // a (head, being recovered) → b → c, both b and c were cascade-cancelled
+        // because of a. Both should be restored.
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var c = WorkItemId.New();
+        var allItems = new List<WorkItem>
+        {
+            Item(a, WorkItemState.Queued),
+            CascadedItem(b, a),
+            CascadedItem(c, b),
+        };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Equal(2, restore.Count);
+        Assert.Contains(restore, r => r.Id == b);
+        Assert.Contains(restore, r => r.Id == c);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_OperatorCancelledDescendant_IsExcluded()
+    {
+        // An operator-cancelled descendant must NOT be quietly resurrected by
+        // a watchdog recovery. Only ParentCascaded items are restored.
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var operatorCancelled = new WorkItem
+        {
+            Id = b,
+            ProjectId = new ProjectId("test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Cancelled,
+            CancellationReason = WorkItemCancellationReason.OperatorRequested,
+            DependsOn = [a],
+        };
+        var allItems = new List<WorkItem> { Item(a, WorkItemState.Queued), operatorCancelled };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Empty(restore);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_DescendantBlockedByOtherFailure_IsExcluded()
+    {
+        // c depends on both a (recovered) and b (Failed). Even though c was
+        // cascade-cancelled because of a, restoring c would let it run against
+        // a genuinely failed prerequisite — leave it parked.
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var c = WorkItemId.New();
+        var allItems = new List<WorkItem>
+        {
+            Item(a, WorkItemState.Queued),
+            Item(b, WorkItemState.Failed),
+            CascadedItem(c, a, b),
+        };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Empty(restore);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_DescendantWithSatisfyingSiblingDep_IsIncluded()
+    {
+        // c depends on a (recovered) and b (Done). b satisfies its half of the
+        // gate already, so once a is back to Queued, c is restorable.
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var c = WorkItemId.New();
+        var allItems = new List<WorkItem>
+        {
+            Item(a, WorkItemState.Queued),
+            Item(b, WorkItemState.Done),
+            CascadedItem(c, a, b),
+        };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Single(restore);
+        Assert.Equal(c, restore[0].Id);
+    }
+
+    [Fact]
+    public void FindDescendantsToRestore_TransitiveChainWithBlockedSibling_PartialRestore()
+    {
+        // a (recovered) → b cascaded; c depends on b and on an independently
+        // Failed item. b is restorable; c is not (b is being restored to
+        // Queued, not Done, so c would have to wait — but its OTHER dependency
+        // is Failed and blocks it permanently regardless).
+        var a = WorkItemId.New();
+        var b = WorkItemId.New();
+        var failed = WorkItemId.New();
+        var c = WorkItemId.New();
+        var allItems = new List<WorkItem>
+        {
+            Item(a, WorkItemState.Queued),
+            CascadedItem(b, a),
+            Item(failed, WorkItemState.Failed),
+            CascadedItem(c, b, failed),
+        };
+
+        var restore = WorkItemDependencies.FindDescendantsToRestore(a, allItems);
+        Assert.Single(restore);
+        Assert.Equal(b, restore[0].Id);
+    }
 }

@@ -189,6 +189,47 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         }
     }
 
+    /// <summary>
+    /// Single-row atomic claim: SELECT-then-DELETE by primary key inside an
+    /// IMMEDIATE transaction. Returns the deleted row, or null when no row
+    /// matched (already claimed by another caller, or never existed).
+    /// </summary>
+    public async Task<WorkerRegistration?> TryClaimWorkerAsync(string workerId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+
+            WorkerRegistration? claimed = null;
+            using (var sel = _conn.CreateCommand())
+            {
+                sel.Transaction = tx;
+                sel.CommandText = "SELECT * FROM worker_registry WHERE worker_id = $id;";
+                sel.Parameters.AddWithValue("$id", workerId);
+                using var reader = await sel.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                    claimed = Read(reader);
+            }
+
+            if (claimed is not null)
+            {
+                using var del = _conn.CreateCommand();
+                del.Transaction = tx;
+                del.CommandText = "DELETE FROM worker_registry WHERE worker_id = $id;";
+                del.Parameters.AddWithValue("$id", workerId);
+                await del.ExecuteNonQueryAsync(ct);
+            }
+
+            tx.Commit();
+            return claimed;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         _conn.Dispose();

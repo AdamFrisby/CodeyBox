@@ -1636,6 +1636,33 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         sp.GetRequiredService<IWebhookDispatcher>());
 });
 
+// --- Worker progress watchdog -----------------------------------------------
+// Lifecycle-wide progress enforcer that complements the dead-worker reaper
+// (heartbeat-stale path) and WorkTimeout (agent subprocess only). Trips when
+// a bound worker is heartbeating but its item shows no progress
+// (item.updatedAt + agent-stream mtime both stale) for ProgressTimeout.
+builder.Services.AddSingleton<WorkerProgressWatchdogOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.WorkerProgressWatchdog;
+    opts.Validate();
+    return opts;
+});
+builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    // Validate the startup-resolved value here too so a misconfigured options
+    // block surfaces at DI resolve time, matching the reaper's pattern.
+    sp.GetRequiredService<WorkerProgressWatchdogOptions>();
+    return new WorkerProgressWatchdog(
+        sp.GetRequiredService<IWorkerRegistry>(),
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<ITaskQueue>(),
+        () => monitor.CurrentValue.WorkerProgressWatchdog,
+        sp.GetRequiredService<ILogger<WorkerProgressWatchdog>>(),
+        sp.GetService<IAgentStreamStore>(),
+        sp.GetService<IWebhookDispatcher>());
+});
+
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
 {
@@ -1831,7 +1858,11 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
     pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
-    involvement: sp.GetService<IAgentInvolvementStore>()));
+    involvement: sp.GetService<IAgentInvolvementStore>(),
+    // Resolve through the live IOptionsMonitor so PostAgentTransitionTimeout
+    // edits applied via config hot-reload take effect on the next bounded
+    // transition without restart, mirroring the watchdog's own sweep accessor.
+    watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1918,6 +1949,15 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorServic
 builder.Services.AddSingleton<IShutdownDispatchGate>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
+// Run the watchdog as a hosted service. AttachWorkerPoolSlotReleaser is called
+// after OrchestratorService is fully constructed so the watchdog can release
+// a wedged worker's pool slot synchronously.
+builder.Services.AddHostedService(sp =>
+{
+    var watchdog = sp.GetRequiredService<WorkerProgressWatchdog>();
+    watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
+    return watchdog;
+});
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
 // can resume them. Both halves of the cycle are IHostedLifecycleService so the
 // host awaits StoppingAsync (suspend) and StartingAsync (resume) natively
@@ -2602,6 +2642,18 @@ namespace CodeyBox.Api
 
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
+
+        /// <summary>
+        /// Lifecycle-wide worker progress watchdog: catches the
+        /// "heartbeating-but-no-progress" wedge (pre-agent setup hang OR
+        /// post-agent commit/transition hang) that neither the dead-worker
+        /// reaper nor <c>WorkTimeout</c> covers. Hot-reloadable: edits to
+        /// <c>ProgressTimeout</c>, <c>AutoRecover</c>, and
+        /// <c>PostAgentTransitionTimeout</c> take effect on the next sweep
+        /// without restart. <c>CheckInterval</c> is sampled at PeriodicTimer
+        /// construction and requires a restart to change.
+        /// </summary>
+        public WorkerProgressWatchdogOptions WorkerProgressWatchdog { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;

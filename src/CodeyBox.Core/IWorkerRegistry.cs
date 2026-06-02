@@ -29,4 +29,14 @@ public interface IWorkerRegistry
     /// restart races.
     /// </summary>
     Task<IReadOnlyList<WorkerRegistration>> ClaimDeadWorkersAsync(DateTimeOffset cutoff, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically claims (DELETEs) a single worker row by id and returns the
+    /// deleted row, or <c>null</c> if no row matched. Used by the progress
+    /// watchdog to force-claim a heartbeating-but-wedged worker without
+    /// collateral damage to peers — a cutoff-based claim would also delete
+    /// every other worker whose heartbeat is older than the target instant
+    /// (i.e. all healthy peers).
+    /// </summary>
+    Task<WorkerRegistration?> TryClaimWorkerAsync(string workerId, CancellationToken ct = default);
 }
