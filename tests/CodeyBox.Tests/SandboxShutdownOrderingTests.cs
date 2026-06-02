@@ -94,7 +94,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            dispatchGate: gate);
+            dispatchGate: gate,
+            teardownMode: SandboxTeardownMode.Suspend);
 
         Assert.False(gate.IsDispatchPaused);
         Assert.False(svc.DispatchPauseObserved);
@@ -125,7 +126,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            dispatchGate: null);
+            dispatchGate: null,
+            teardownMode: SandboxTeardownMode.Suspend);
 
         await svc.SuspendAllAsync();
 
@@ -339,15 +341,14 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
-    public void SandboxTeardownMode_DefaultIsSuspend_OnProductionOptions()
+    public void SandboxTeardownMode_DefaultIsStop_OnProductionOptions()
     {
-        // Backward-compat assertion: the default behaviour does NOT change
-        // from R8-core. Operators have to opt in to Stop or Dispose. Asserts
-        // on the actual CodeyBoxOptions.ShutdownOptions wired in Program.cs —
-        // a regression that flips the production default (e.g. to Dispose)
-        // must FAIL this test, not pass against a private mirror class.
+        // Production default assertion: operators have to opt in to Suspend.
+        // Asserts on the actual CodeyBoxOptions.ShutdownOptions wired in
+        // Program.cs — a regression that flips the production default must FAIL
+        // this test, not pass against a private mirror class.
         var opts = new CodeyBoxOptions();
-        Assert.Equal(SandboxTeardownMode.Suspend, opts.Shutdown.SandboxTeardownMode);
+        Assert.Equal(SandboxTeardownMode.Stop, opts.Shutdown.SandboxTeardownMode);
     }
 
     // ── Startup reconciliation of stale Suspending/Unknown VMs ───────────────

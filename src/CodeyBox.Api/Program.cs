@@ -244,19 +244,19 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptions
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
 
-// Sized from the resolved sandbox provider's capability, not its config name:
-// a provider that implements ISuspendingSandboxProvider freezes VMs on shutdown
-// and needs the raised ceiling; everything else keeps the tighter grace. Using
-// the DI-resolved provider keeps the deployment knowledge (name → provider) in
-// the composition root and out of the Core policy. See ComputeHostShutdownTimeout.
+// Sized from the resolved sandbox provider's capability and the selected
+// teardown mode, not the provider config name: only actual Suspend teardown needs
+// the raised RAM-snapshot ceiling. Stop/Dispose keep the tighter grace window.
+// Using the DI-resolved provider keeps the deployment knowledge (name → provider)
+// in the composition root and out of the Core policy. See ComputeHostShutdownTimeout.
 builder.Services.AddOptions<HostOptions>()
     .Configure<IOptions<CodeyBoxOptions>, ISandboxProvider, ILoggerFactory>(
         (o, cbOptsAccessor, sandboxProvider, loggerFactory) =>
         {
-            var providerSuspendsOnShutdown = sandboxProvider is ISuspendingSandboxProvider;
+            var providerSupportsSuspend = sandboxProvider is ISuspendingSandboxProvider;
             o.ShutdownTimeout = Program.ComputeHostShutdownTimeout(
                 cbOptsAccessor.Value,
-                providerSuspendsOnShutdown,
+                providerSupportsSuspend,
                 loggerFactory.CreateLogger("CodeyBox.HostShutdown"));
         });
 
@@ -1980,19 +1980,22 @@ builder.Services.AddHostedService(sp =>
     watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
     return watchdog;
 });
-// R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
-// can resume them. The shutdown half is lifecycle-bound (StoppingAsync). Startup
-// resume defaults to background mode so a wedged multipassd cannot keep Kestrel
-// offline; OrchestratorService waits for startup recovery input before its
-// dead-worker startup recovery sweep.
+// R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
+// operator-selected SandboxTeardownMode. Stop is the default and recovers
+// through the existing preempt-checkpoint path; Suspend remains opt-in and
+// writes resume bookkeeping so the next process can reattach. The shutdown half
+// is lifecycle-bound (StoppingAsync). Startup resume defaults to background mode
+// so a wedged multipassd cannot keep Kestrel offline; OrchestratorService waits
+// for startup recovery input before its dead-worker startup recovery sweep.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
 // as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
 // suspendable set — without that ordering, the dispatch loop keeps creating
 // new sandboxes that race the snapshot. Teardown mode is operator-tunable via
-// CodeyBox:Shutdown:SandboxTeardownMode (Suspend / Stop / Dispose); default
-// Suspend for backward compatibility. Resolve it through IOptionsMonitor at
-// shutdown time so a hot config edit affects the next graceful shutdown.
+// CodeyBox:Shutdown:SandboxTeardownMode (Stop / Suspend / Dispose); default
+// Stop to avoid multipass suspend/qemu-lock wedges unless an operator opts in.
+// Resolve it through IOptionsMonitor at shutdown time so a hot config edit
+// affects the next graceful shutdown.
 builder.Services.AddHostedService(sp =>
 {
     var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
@@ -2003,9 +2006,11 @@ builder.Services.AddHostedService(sp =>
         dispatchGate: sp.GetService<IShutdownDispatchGate>(),
         teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);
 });
-// Startup reconciler runs as a background sweep so Multipass recovery cannot
-// keep Kestrel offline. It skips VMs with live SuspendedVmName mappings; those
-// are owned by the resume handler below.
+// Startup reconciler is registered before the resume handler and runs as a
+// background sweep so Multipass recovery cannot keep Kestrel offline. It skips
+// VMs with live SuspendedVmName mappings; those are owned by the resume handler
+// below, while orphaned Suspending VMs from a prior unclean shutdown get an
+// early cleanup attempt before regular leak handling has to deal with them.
 builder.Services.AddHostedService(sp => new StartupSandboxReconciliationService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -3055,17 +3060,16 @@ namespace CodeyBox.Api
         /// How to tear down in-flight worker sandboxes during graceful shutdown.
         /// Hot-reloadable: read by the shutdown handler when graceful shutdown
         /// begins, so an operator can switch modes without restarting first.
-        /// Default <see cref="SandboxTeardownMode.Suspend"/> (original
-        /// behaviour: freeze RAM via <c>multipass suspend</c> and resume on
-        /// next startup). Operators running stateless workloads that recover
-        /// fully from the preempt-checkpoint flow should consider
-        /// <see cref="SandboxTeardownMode.Stop"/> or
-        /// <see cref="SandboxTeardownMode.Dispose"/> — both avoid the qemu disk-image
-        /// write-lock wedge that caused the 2026-05-29 incident, where a
-        /// SIGKILL during suspend stranded the orphan qemu processes and
-        /// blocked <c>multipass stop</c>/<c>multipass delete --purge</c>.
+        /// Default <see cref="SandboxTeardownMode.Stop"/>: cleanly stop the VM
+        /// and recover through the preempt-checkpoint flow. Operators who
+        /// explicitly want RAM-state preservation can opt in to
+        /// <see cref="SandboxTeardownMode.Suspend"/>; it freezes RAM via
+        /// <c>multipass suspend</c> and resumes on next startup, but can hit the
+        /// qemu disk-image write-lock wedge that caused the 2026-05-29 incident.
+        /// <see cref="SandboxTeardownMode.Dispose"/> remains available for full
+        /// delete-and-purge teardown.
         /// </summary>
-        public SandboxTeardownMode SandboxTeardownMode { get; set; } = SandboxTeardownMode.Suspend;
+        public SandboxTeardownMode SandboxTeardownMode { get; set; } = SandboxTeardownMode.Stop;
     }
 
     /// <summary>
@@ -3560,17 +3564,18 @@ namespace CodeyBox.Api
 public partial class Program
 {
     /// <summary>
-    /// Resolve <c>HostOptions.ShutdownTimeout</c> from operator config and the
-    /// resolved provider's suspend capability. Shutdown:GraceSeconds bounds the
-    /// normal request-drain / preempt-checkpoint window; a suspend-on-shutdown
-    /// provider can legitimately need far longer to let the host finish writing
-    /// each VM's RAM snapshot (the RAM-scaled <see cref="SuspendTimeoutPolicy"/>
-    /// budget — 30 min for the default 12 GiB VM) and drains in parallel batches,
-    /// so a deployment with more in-flight VMs than the batch cap spans
-    /// <c>ceil(N/batch)</c> sequential waves. The ceiling must cover the slowest
-    /// wave-chain PLUS the post-suspend drain grace (suspend runs in StoppingAsync,
-    /// the preempt-checkpoint / listener-drain window runs after), not one VM, or
-    /// the host SIGKILLs us mid-snapshot on a later wave or mid-drain.
+    /// Resolve <c>HostOptions.ShutdownTimeout</c> from operator config, the
+    /// resolved provider's suspend capability, and the selected teardown mode.
+    /// Shutdown:GraceSeconds bounds the normal request-drain / preempt-checkpoint
+    /// window. Only opt-in Suspend teardown can legitimately need far longer to
+    /// let the host finish writing each VM's RAM snapshot (the RAM-scaled
+    /// <see cref="SuspendTimeoutPolicy"/> budget — 30 min for the default 12 GiB
+    /// VM) and drains in parallel batches, so a deployment with more in-flight
+    /// VMs than the batch cap spans <c>ceil(N/batch)</c> sequential waves. The
+    /// ceiling must cover the slowest wave-chain PLUS the post-suspend drain
+    /// grace (suspend runs in StoppingAsync, the preempt-checkpoint /
+    /// listener-drain window runs after), not one VM, or the host SIGKILLs us
+    /// mid-snapshot on a later wave or mid-drain.
     /// ShutdownTimeout is a CEILING, not a fixed wait: a shutdown with
     /// nothing to suspend still returns as soon as every hosted service's
     /// StoppingAsync completes, so raising it only affects the suspend case.
@@ -3584,13 +3589,15 @@ public partial class Program
     /// profile RAM is the largest per-VM suspend budget the host must cover.</para>
     /// </summary>
     internal static TimeSpan ComputeHostShutdownTimeout(
-        CodeyBoxOptions cbOpts, bool providerSuspendsOnShutdown, ILogger log)
+        CodeyBoxOptions cbOpts, bool providerSupportsSuspend, ILogger log)
     {
         var grace = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
         var maxConcurrent = OrchestratorOptionsFactory
             .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
             .MaxConcurrentWorkers;
+        var suspendsOnShutdown = providerSupportsSuspend
+            && cbOpts.Shutdown.SandboxTeardownMode == SandboxTeardownMode.Suspend;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
-            providerSuspendsOnShutdown, grace, maxConcurrent);
+            suspendsOnShutdown, grace, maxConcurrent);
     }
 }

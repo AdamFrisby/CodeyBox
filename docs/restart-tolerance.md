@@ -20,7 +20,7 @@ complementary half of the restart story.
 
 | Phase | Duration (typical) | Caller-visible symptom |
 |---|---|---|
-| Old process draining (`HostOptions.ShutdownTimeout`, **set by CodeyBox to `Shutdown:GraceSeconds`, default 60 s** — the ASP.NET Core framework default is 30 s; under the **multipass** provider this ceiling is raised to the RAM-scaled suspend budget, ~30 min for the default 12 GiB VM, so suspend-on-shutdown can finish writing a RAM snapshot. It is a ceiling, not a fixed wait — shutdowns with nothing to suspend still return in seconds) | up to `CodeyBox:Shutdown:GraceSeconds` (multipass: up to the suspend budget) | Process still bound; new requests accepted until the listener stops, then `connection refused` |
+| Old process draining (`HostOptions.ShutdownTimeout`, **set by CodeyBox to `Shutdown:GraceSeconds`, default 60 s** — the ASP.NET Core framework default is 30 s. When `CodeyBox:Shutdown:SandboxTeardownMode=Suspend` is explicitly selected with a suspend-capable provider, this ceiling is raised to the RAM-scaled suspend budget, ~30 min for the default 12 GiB VM, so the RAM snapshot can finish. It is a ceiling, not a fixed wait — shutdowns with nothing to tear down still return in seconds) | up to `CodeyBox:Shutdown:GraceSeconds` (opt-in Suspend: up to the suspend budget) | Process still bound; new requests accepted until the listener stops, then `connection refused` |
 | Port unbound → new process listening | 5–30 s | TCP `connection refused` |
 | Warm-up before first request served | < 1 s | First request may take longer (cold path) |
 

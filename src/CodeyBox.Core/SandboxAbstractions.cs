@@ -280,9 +280,9 @@ public static class SuspendTimeoutPolicy
     }
 
     /// <summary>
-    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Providers
-    /// that suspend on shutdown must not have a healthy RAM snapshot truncated by
-    /// a SIGKILL, so when <paramref name="providerSuspendsOnShutdown"/> is set the
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Shutdown
+    /// paths that suspend VMs must not have a healthy RAM snapshot truncated by
+    /// a SIGKILL, so when <paramref name="suspendsOnShutdown"/> is set the
     /// ceiling is the worst-case suspend drain
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
@@ -293,15 +293,15 @@ public static class SuspendTimeoutPolicy
     /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
     /// two would let a suspend that consumes its whole reserve leave zero room for
     /// the post-suspend drain, so the host could SIGKILL the process while
-    /// PipelineRunner is still shutting down. Providers that don't suspend keep the
+    /// PipelineRunner is still shutting down. Non-Suspend teardown keeps the
     /// tighter <paramref name="grace"/> alone.
     ///
-    /// <para>This is deliberately capability-driven, not provider-name-driven:
-    /// the caller passes whether the configured provider implements
-    /// <see cref="ISuspendingSandboxProvider"/> (i.e. participates in
-    /// suspend-on-shutdown). Core therefore stays provider-agnostic — a new
-    /// suspend-capable backend raises the ceiling automatically without adding
-    /// another magic string here.</para>
+    /// <para>This is deliberately mode-and-capability-driven, not
+    /// provider-name-driven: the caller folds together whether the configured
+    /// provider implements <see cref="ISuspendingSandboxProvider"/> and whether
+    /// the selected shutdown mode will actually suspend. Core therefore stays
+    /// provider-agnostic — a new suspend-capable backend raises the ceiling in
+    /// Suspend mode without adding another magic string here.</para>
     ///
     /// <para>Lives on the Core policy (rather than on the orchestrator suspend
     /// handler) so the API composition root can size the ceiling without
@@ -309,19 +309,19 @@ public static class SuspendTimeoutPolicy
     /// and the max() logic stay co-located with the suspend/resume budget
     /// formula they must agree with.</para>
     /// </summary>
-    /// <param name="providerSuspendsOnShutdown">True when the configured provider implements <see cref="ISuspendingSandboxProvider"/> and so freezes VMs on shutdown.</param>
+    /// <param name="suspendsOnShutdown">True when the effective shutdown path freezes VMs on shutdown.</param>
     /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
     /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
     /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
     /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
     public static TimeSpan ResolveHostShutdownTimeout(
-        bool providerSuspendsOnShutdown,
+        bool suspendsOnShutdown,
         TimeSpan grace,
         int maxConcurrentSandboxes,
         int maxParallelSuspends = DefaultMaxParallelSuspends,
         long? maxVmMemoryBytes = null)
     {
-        if (!providerSuspendsOnShutdown)
+        if (!suspendsOnShutdown)
             return grace;
         var reserve = HostShutdownReserve(
             maxConcurrentSandboxes,

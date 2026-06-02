@@ -113,7 +113,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
 
         await svc.StartAsync(CancellationToken.None);
         await svc.SuspendAllAsync();
@@ -140,7 +141,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
         await svc.SuspendAllAsync();
 
         // The handler persists the (work item → VM) mapping BEFORE awaiting
@@ -172,7 +174,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled);
@@ -200,7 +203,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            perSuspendTimeout: TimeSpan.FromMilliseconds(50));
+            perSuspendTimeout: TimeSpan.FromMilliseconds(50),
+            teardownMode: SandboxTeardownMode.Suspend);
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);
@@ -237,7 +241,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
             perSuspendTimeout: TimeSpan.FromMilliseconds(100),
-            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000));
+            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000),
+            teardownMode: SandboxTeardownMode.Suspend);
 
         // The budget SuspendOneAsync must apply is the scaled 12s, not the 100ms floor.
         Assert.Equal(TimeSpan.FromSeconds(12), svc.SuspendTimeoutFor(sandbox));
@@ -277,7 +282,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            perSuspendTimeout: TimeSpan.FromMinutes(5));
+            perSuspendTimeout: TimeSpan.FromMinutes(5),
+            teardownMode: SandboxTeardownMode.Suspend);
 
         var suspendAll = svc.SuspendAllAsync();
 
@@ -414,7 +420,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         // Providers that don't suspend on shutdown → ceiling stays at the grace
         // window regardless of worker count. The decision is capability-driven
-        // (providerSuspendsOnShutdown=false), not a provider-name comparison.
+        // (suspendsOnShutdown=false), not a provider-name comparison.
         Assert.Equal(grace,
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(false, grace, 32));
 

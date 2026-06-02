@@ -5,26 +5,29 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// R8-core: on graceful host shutdown, freeze every in-flight sandbox via
-/// <see cref="ISuspendableSandbox.SuspendAsync"/> and persist the
+/// R8-core/R8.1: on graceful host shutdown, tear down every in-flight sandbox
+/// according to <see cref="SandboxTeardownMode"/>. Suspend mode freezes the VM
+/// via <see cref="ISuspendableSandbox.SuspendAsync"/> and persists the
 /// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
 /// orchestrator process can <c>multipass start</c> the same VM and re-tail the
 /// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
-/// resume half).
+/// resume half). Stop and Dispose recover through the existing
+/// preempt-checkpoint flow instead.
 ///
 /// <para>This sits alongside — not on top of — the existing per-phase
 /// preempt-checkpoint flow in <see cref="PipelineRunner"/>: that path commits a
-/// git ref the pipeline can resume from, and is still the safety net when the
-/// sandbox provider does not support suspend (process, bubblewrap). The
-/// suspend path is strictly an improvement when both are available.</para>
+/// git ref the pipeline can resume from, and is still the safety net for Stop,
+/// Dispose, and sandbox providers that do not support suspend (process,
+/// bubblewrap). Suspend is an opt-in state-preservation path for operators who
+/// accept the RAM-snapshot tradeoff.</para>
 ///
 /// <para>Implements <see cref="IHostedLifecycleService.StoppingAsync"/> rather
 /// than registering a synchronous callback on
 /// <see cref="IHostApplicationLifetime.ApplicationStopping"/>. StoppingAsync
 /// is awaited by the host before the BackgroundService cancellation token
-/// fires, so the in-VM agent process is still running when multipass takes
-/// its snapshot, AND the host honours the async signature instead of being
-/// blocked on a sync-over-async fan-out.</para>
+/// fires, so in Suspend mode the in-VM agent process is still running when
+/// multipass takes its snapshot, AND the host honours the async signature
+/// instead of being blocked on a sync-over-async fan-out.</para>
 /// </summary>
 public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 {
@@ -50,9 +53,9 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     ///
     /// <para>This bounds how long shutdown blocks per stuck VM, but it is not the
     /// only bound: the host's global <c>HostOptions.ShutdownTimeout</c> still caps
-    /// total shutdown time. <c>Program.cs</c> raises that ceiling to cover the
-    /// largest scaled suspend budget when the multipass provider is selected, so a
-    /// healthy snapshot is not truncated. And because the (work item → VM) mapping
+    /// total shutdown time. <c>Program.cs</c> raises that ceiling only when
+    /// Suspend teardown is selected, so a healthy snapshot is not truncated. And
+    /// because the (work item → VM) mapping
     /// is persisted BEFORE the suspend is awaited (see
     /// <see cref="SuspendOneAsync"/>), even a SIGKILL mid-snapshot still leaves a
     /// resume mapping for the next startup — recovery does not depend on the
@@ -83,13 +86,13 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
     // directly don't need to hand in a gate.
     private readonly IShutdownDispatchGate? _dispatchGate;
-    // R8.1: ephemeral worker VMs can be torn down by Suspend (current default,
-    // preserves in-RAM agent state across restart), Stop (clean multipass stop,
-    // preserves VM disk but kills the agent process — far less likely to wedge
-    // multipassd than suspend), or Dispose (delete --purge, full teardown — no
-    // suspended-resume bookkeeping is written, the work item recovers via the
-    // existing preempt-checkpoint flow). Resolved at teardown time so operator
-    // config hot-reload takes effect on the next graceful shutdown.
+    // R8.1: ephemeral worker VMs can be torn down by Stop (default; clean
+    // multipass stop, preserves VM disk but kills the agent process), Suspend
+    // (opt-in; preserves in-RAM agent state across restart but can wedge
+    // multipassd if interrupted), or Dispose (delete --purge, full teardown —
+    // no suspended-resume bookkeeping is written, the work item recovers via
+    // the existing preempt-checkpoint flow). Resolved at teardown time so
+    // operator config hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
     public SandboxSuspendOnShutdownService(
@@ -100,7 +103,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         TimeSpan? perSuspendTimeout = null,
         TimeSpan? perGiBSuspendBudget = null,
         IShutdownDispatchGate? dispatchGate = null,
-        SandboxTeardownMode teardownMode = SandboxTeardownMode.Suspend,
+        SandboxTeardownMode teardownMode = SandboxTeardownMode.Stop,
         Func<SandboxTeardownMode>? teardownModeAccessor = null)
     {
         _provider = provider;
@@ -148,11 +151,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             // calls — each suspend gets its own RAM-scaled per-VM timeout (see
             // SuspendTimeoutFor / SuspendOneAsync) so one stuck multipassd call
             // can't block the rest of the drain. The host still enforces
-            // HostOptions.ShutdownTimeout overall; Program.cs sizes that ceiling to
-            // cover the largest scaled suspend budget for the multipass provider so
-            // a healthy snapshot is not truncated. If the host kills us before a
-            // slow snapshot finishes, the (work item → VM) mapping persisted before
-            // the await (SuspendOneAsync) still lets the next startup resume it.
+            // HostOptions.ShutdownTimeout overall; Program.cs raises that ceiling
+            // only when Suspend teardown is selected so a healthy RAM snapshot is
+            // not truncated. If the host kills us before a slow snapshot finishes,
+            // the (work item → VM) mapping persisted before the await
+            // (SuspendOneAsync) still lets the next startup resume it.
             await SuspendAllAsync();
         }
         catch (Exception ex)

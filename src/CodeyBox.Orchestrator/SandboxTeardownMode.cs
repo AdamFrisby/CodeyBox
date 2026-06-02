@@ -18,7 +18,8 @@ public enum SandboxTeardownMode
     /// Original behaviour: freeze the VM's RAM via <c>multipass suspend</c> and
     /// resume from the snapshot on restart. Preserves in-VM agent state across
     /// the restart. Vulnerable to qemu-lock wedging if the host is SIGKILLed
-    /// before the snapshot finishes. Default for backward-compat.
+    /// before the snapshot finishes. Opt-in via
+    /// <c>CodeyBox:Shutdown:SandboxTeardownMode=Suspend</c>.
     /// </summary>
     Suspend = 0,
 
@@ -27,7 +28,8 @@ public enum SandboxTeardownMode
     /// preserves the VM's disk. Far less likely to wedge multipassd than
     /// suspend (no RAM snapshot, qemu shuts down cleanly and releases the
     /// disk-image lock). The work item recovers via its preempt-checkpoint
-    /// the same way it would under any non-suspending provider.
+    /// the same way it would under any non-suspending provider. This is the
+    /// <c>ShutdownOptions</c> default.
     /// </summary>
     Stop = 1,
 
@@ -39,4 +41,3 @@ public enum SandboxTeardownMode
     /// </summary>
     Dispose = 2,
 }
-
