@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
 using CodeyBox.Core;
@@ -72,6 +73,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
+    private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
     // hang in store.UpdateAsync (sqlite write contention) or
     // webhooks.PublishAsync (slow remote sink) fails the item within bounded
@@ -204,7 +206,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null,
         IAgentInvolvementStore? involvement = null,
-        Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null)
+        Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -272,6 +275,13 @@ public sealed class PipelineRunner : IPipelineRunner
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
+        _requiredBuildVerifier = requiredBuildVerifier
+            ?? new SandboxRequiredBuildVerifier(
+                sandboxes,
+                gitHost,
+                opts,
+                auditReports,
+                NullLogger<SandboxRequiredBuildVerifier>.Instance);
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
@@ -612,13 +622,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var requiredBuildApplies = false;
             if (!skipAudit)
             {
-                var requiredBuildProbe = await BranchRequiresRequiredBuildAsync(repoId, workBranch, ct);
-                if (requiredBuildProbe is null)
-                {
-                    throw new RequiredBuildVerificationUnavailableException(
-                        $"could not verify required build: failed to inspect branch '{workBranch}' for .NET build markers");
-                }
-                requiredBuildApplies = requiredBuildProbe.Value;
+                requiredBuildApplies = await RequiredBuildAppliesAsync(item, project, repoId, workBranch, ct);
             }
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
@@ -3217,7 +3221,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        for (var iteration = 1; iteration <= project.Audit.MaxIterations; iteration++)
+        var maxIterations = Math.Max(1, project.Audit.MaxIterations);
+        for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
@@ -3241,6 +3246,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             IReadOnlyList<AuditFinding> findings;
             AgentKind? activeAuditAgentKind;
+            AuditFinding? requiredBuildFinding;
             try
             {
                 var revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
@@ -3263,14 +3269,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 (findings, activeAuditAgentKind) = await collectTask;
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
+
+                requiredBuildFinding = await RunRequiredBuildForAuditAsync(
+                    item, project, repoId, workBranch, iteration, auditPhase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
                 throw auditPhase.Wrap(oce);
             }
 
-            var requiredBuildFinding = await RunRequiredBuildForAuditAsync(
-                item, project, repoId, workBranch, iteration, auditPhase.Token);
             if (requiredBuildFinding is not null)
                 findings = [.. findings, requiredBuildFinding];
 
@@ -3282,7 +3289,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
 
-            AuditLog.AuditIterationComplete(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking);
+            AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
                 new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
@@ -3295,7 +3302,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 WorkItem = await _store.GetAsync(item.Id, ct) ?? item,
                 Project = project,
                 Details = new AuditIterationDetails(
-                    iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking,
+                    iteration, maxIterations, blocking.Count, nonBlocking,
                     activeAuditAgentKind?.Value),
                 Usage = iterUsage?.Iteration,
                 UsageTotal = iterUsage?.Total,
@@ -3314,9 +3321,9 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
-                iteration, project.Audit.MaxIterations, blocking.Count, item.Id);
+                iteration, maxIterations, blocking.Count, item.Id);
 
-            if (iteration == project.Audit.MaxIterations)
+            if (iteration == maxIterations)
             {
                 AuditLog.AuditFailed(iteration, blocking.Count);
                 CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
@@ -3367,7 +3374,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
+            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
             using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
             reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
@@ -3408,39 +3415,32 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private const string RequiredBuildAuditorName = "process:required-build";
     private const string RequiredBuildDisplayCommand = "dotnet build";
-    private const int RequiredBuildOutputMaxBytes = 16 * 1024;
 
-    private const string RequiredDotnetBuildScript = """
-        set -eu
+    private async Task<bool> RequiredBuildAppliesAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string workBranch,
+        CancellationToken ct)
+    {
+        var probe = await _requiredBuildVerifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = project.Id,
+            RepositoryId = repoId,
+            WorkBranch = workBranch,
+        }, ct);
 
-        if ! command -v dotnet >/dev/null 2>&1; then
-          echo "dotnet is not available in the sandbox PATH" >&2
-          exit 127
-        fi
-
-        targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
-        cleanup() { rm -f "$targets_file"; }
-        trap cleanup EXIT INT TERM
-
-        find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
-        if [ ! -s "$targets_file" ]; then
-          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f \( -name '*.slnx' -o -name '*.sln' \) -print \) | sort > "$targets_file"
-        fi
-        if [ ! -s "$targets_file" ]; then
-          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f -name '*.csproj' -print \) | sort > "$targets_file"
-        fi
-
-        if [ ! -s "$targets_file" ]; then
-          echo "No .NET solution or project file was found after marker detection." >&2
-          exit 125
-        fi
-
-        while IFS= read -r target; do
-          [ -n "$target" ] || continue
-          echo "CodeyBox required build: dotnet build $target"
-          dotnet build "$target"
-        done < "$targets_file"
-        """;
+        return probe.Status switch
+        {
+            RequiredBuildProbeStatus.Applies => true,
+            RequiredBuildProbeStatus.NotApplicable => false,
+            RequiredBuildProbeStatus.Unavailable => throw new RequiredBuildVerificationUnavailableException(
+                $"could not verify required build: {probe.Reason ?? "build marker inspection failed"}"),
+            _ => throw new RequiredBuildVerificationUnavailableException(
+                $"could not verify required build: unknown probe status {probe.Status}"),
+        };
+    }
 
     private async Task EnforceRequiredBuildForWorkPhaseAsync(
         WorkItem item,
@@ -3491,190 +3491,32 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         int? iteration = null)
     {
-        var required = await BranchRequiresRequiredBuildAsync(repoId, workBranch, ct);
-        if (required is null)
-            throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: failed to inspect branch '{workBranch}' for .NET build markers");
-        if (!required.Value)
-            return RequiredBuildVerificationResult.Skipped;
-
-        var startedAt = DateTimeOffset.UtcNow;
-        var sw = Stopwatch.StartNew();
-        try
+        var sandboxTarget = SandboxTargetResolver.ResolveAudit(
+            project.NetworkProfiles.AuditTool,
+            AuditCapabilities.None);
+        var result = await _requiredBuildVerifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
-            var access = _gitHost.GetSandboxAccess(repoId);
-            var sandboxTarget = SandboxTargetResolver.ResolveAudit(
-                project.NetworkProfiles.AuditTool,
-                AuditCapabilities.None);
-            var spec = BuildSandboxSpec(
-                access,
-                includeAgentCredential: null,
-                allowAgentNetwork: false,
-                hostNetworkProfile: sandboxTarget.NetworkProfile,
-                timingWorkItemId: item.Id,
-                timingPhase: phase,
-                flavor: sandboxTarget.Flavor,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
-                    project,
-                    sandboxTarget,
-                    item.BaselineImageRef));
+            WorkItemId = item.Id,
+            ProjectId = project.Id,
+            RepositoryId = repoId,
+            WorkBranch = workBranch,
+            Phase = phase,
+            Iteration = iteration,
+            NetworkProfile = sandboxTarget.NetworkProfile,
+            Flavor = sandboxTarget.Flavor,
+            BaselineImageRef = SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                sandboxTarget,
+                item.BaselineImageRef),
+        }, ct);
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
-
-            var build = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", RequiredDotnetBuildScript],
-                WorkingDirectory = SandboxConventions.WorkDir,
-            }, ct);
-            sw.Stop();
-
-            var rawOutput = CombinedOutput(build);
-            var redactedOutput = TruncateRequiredBuildOutput(rawOutput);
-            await PersistRequiredBuildReportAsync(
-                item.Id,
-                iteration: iteration ?? 0,
-                startedAt,
-                sw.Elapsed,
-                build.Success,
-                redactedOutput,
-                build.ExitCode,
-                ct);
-
-            if (build.Success)
-                return new RequiredBuildVerificationResult(
-                    RequiredBuildVerificationStatus.Passed,
-                    build.ExitCode,
-                    redactedOutput);
-
-            if (build.ExitCode == 127
-                && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new RequiredBuildVerificationUnavailableException(
-                    "could not verify required build: dotnet is not available in the audit-tool sandbox");
-            }
-
-            if (build.ExitCode == 125)
-            {
-                throw new RequiredBuildVerificationUnavailableException(
-                    "could not verify required build: no .NET solution or project file was found after marker detection");
-            }
-
-            return new RequiredBuildVerificationResult(
-                RequiredBuildVerificationStatus.Failed,
-                build.ExitCode,
-                redactedOutput);
-        }
-        catch (RequiredBuildVerificationUnavailableException)
-        {
-            throw;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
+        if (result.Status == RequiredBuildVerificationStatus.Unavailable)
         {
             throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: {SingleLineSummary(ex.Message)}",
-                ex);
-        }
-    }
-
-    private async Task<bool?> BranchRequiresRequiredBuildAsync(
-        string repoId,
-        string workBranch,
-        CancellationToken ct)
-    {
-        Validation.ValidateBranchName(workBranch, nameof(workBranch));
-        var repoPath = _gitHost.GetRepoPath(repoId);
-        var (stdout, _, exitCode) = await RunHostGitCaptureNoThrowAsync(
-            repoPath,
-            ct,
-            "ls-tree",
-            "-r",
-            "--name-only",
-            workBranch);
-        if (exitCode != 0)
-            return null;
-
-        return stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(IsRequiredDotnetBuildMarkerPath);
-    }
-
-    private static bool IsRequiredDotnetBuildMarkerPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return false;
-
-        var segments = path.Replace('\\', '/')
-            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (segments.Length == 0)
-            return false;
-
-        if (segments.Any(static s =>
-                s.Equals(".git", StringComparison.OrdinalIgnoreCase)
-                || s.Equals("bin", StringComparison.OrdinalIgnoreCase)
-                || s.Equals("obj", StringComparison.OrdinalIgnoreCase)
-                || s.Equals("node_modules", StringComparison.OrdinalIgnoreCase)))
-        {
-            return false;
+                result.Reason ?? "could not verify required build: verifier unavailable");
         }
 
-        var fileName = segments[^1];
-        return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private async Task PersistRequiredBuildReportAsync(
-        WorkItemId workItemId,
-        int? iteration,
-        DateTimeOffset startedAt,
-        TimeSpan elapsed,
-        bool success,
-        string rawOutput,
-        int exitCode,
-        CancellationToken ct)
-    {
-        if (_auditReports is null)
-            return;
-
-        try
-        {
-            var findings = success
-                ? []
-                : new List<AuditReportFinding>
-                {
-                    new(
-                        FindingIdComputer.Compute(RequiredBuildAuditorName, "required build failed", []),
-                        AuditSeverity.Error.ToString(),
-                        $"required build failed: {RequiredBuildDisplayCommand}",
-                        $"Required build exited with code {exitCode}.",
-                        [],
-                        []),
-                };
-            await _auditReports.CreateAsync(new AuditReport
-            {
-                Id = Guid.NewGuid().ToString(),
-                WorkItemId = workItemId.ToString(),
-                Iteration = iteration ?? 0,
-                AuditorName = RequiredBuildAuditorName,
-                AuditorKind = "shell",
-                WorstSeverity = success ? "none" : AuditSeverity.Error.ToString(),
-                StartedAt = startedAt,
-                EndedAt = startedAt + elapsed,
-                DurationMs = (long)elapsed.TotalMilliseconds,
-                Findings = findings,
-                RawOutput = rawOutput,
-            }, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.LogWarning(ex, "Failed to persist required build report for work item {WorkItemId}", workItemId);
-        }
+        return result;
     }
 
     private static string BuildRequiredBuildFailureSummary(RequiredBuildVerificationResult result)
@@ -3684,18 +3526,6 @@ public sealed class PipelineRunner : IPipelineRunner
             : result.Output.Trim();
         return $"required build failed (exit {result.ExitCode}): {detail}";
     }
-
-    private static string CombinedOutput(SandboxExecResult result)
-        => string.IsNullOrWhiteSpace(result.Stderr)
-            ? result.Stdout
-            : string.IsNullOrWhiteSpace(result.Stdout)
-                ? result.Stderr
-                : result.Stdout + "\n" + result.Stderr;
-
-    private static string TruncateRequiredBuildOutput(string output)
-        => RawOutputRedactor.TruncateToBytes(
-            RawOutputRedactor.Redact(output),
-            RequiredBuildOutputMaxBytes);
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
         WorkItem item,
@@ -9341,22 +9171,6 @@ Original merge-phase failure (for context):
 internal sealed class AuditFailedException : Exception
 {
     public AuditFailedException(string message) : base(message) { }
-}
-
-internal enum RequiredBuildVerificationStatus
-{
-    Skipped,
-    Passed,
-    Failed,
-}
-
-internal sealed record RequiredBuildVerificationResult(
-    RequiredBuildVerificationStatus Status,
-    int ExitCode,
-    string Output)
-{
-    public static RequiredBuildVerificationResult Skipped { get; } =
-        new(RequiredBuildVerificationStatus.Skipped, 0, string.Empty);
 }
 
 internal sealed class RequiredBuildFailedException : Exception

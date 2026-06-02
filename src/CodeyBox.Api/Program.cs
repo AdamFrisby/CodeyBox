@@ -452,6 +452,12 @@ builder.Services.AddSingleton<IGitHost>(sp => sp.GetRequiredService<LocalGitHost
 builder.Services.AddSingleton<IPreMergeVerifier>(sp => new LocalGitPreMergeVerifier(
     sp.GetRequiredService<IGitHost>(),
     sp.GetRequiredService<ILogger<LocalGitPreMergeVerifier>>()));
+builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredBuildVerifier(
+    sp.GetRequiredService<ISandboxProvider>(),
+    sp.GetRequiredService<IGitHost>(),
+    sp.GetRequiredService<PipelineOptions>(),
+    sp.GetRequiredService<IAuditReportStore>(),
+    sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>()));
 
 // --- Pull request service (in-memory by default) -----------------------------
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();
@@ -1871,7 +1877,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // Resolve through the live IOptionsMonitor so PostAgentTransitionTimeout
     // edits applied via config hot-reload take effect on the next bounded
     // transition without restart, mirroring the watchdog's own sweep accessor.
-    watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog));
+    watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
+    requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

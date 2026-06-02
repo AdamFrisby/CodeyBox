@@ -101,6 +101,7 @@ internal static class TestSupport
         AgentCostCalculator? costCalculator = null,
         string? stateDbPathOverride = null,
         IPreMergeVerifier? preMergeVerifier = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         ITaskQueue? taskQueue = null,
@@ -184,7 +185,13 @@ internal static class TestSupport
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
             involvement: involvement,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
+                sandboxes,
+                gitHost,
+                resolvedOptions,
+                auditReportStore,
+                NullLogger<SandboxRequiredBuildVerifier>.Instance));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }
