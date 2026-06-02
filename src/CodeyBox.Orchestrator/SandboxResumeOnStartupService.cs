@@ -348,31 +348,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         if (resumeSucceeded && adopted && adoptionExitCode == 0)
         {
             var refName = PreemptCheckpointRefFor(item.Id);
-            try
-            {
-                var pushed = await suspending.PushSuspendedVmCheckpointRefAsync(
-                    vmName,
-                    SandboxConventions.WorkDir,
-                    refName,
-                    $"codeybox: suspend-resume checkpoint {item.Id}",
-                    ct);
-                if (pushed)
-                {
-                    promotedCheckpointRef = refName;
-                }
-                else
-                {
-                    _log.LogWarning(
-                        "Failed to promote adopted-VM HEAD to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
-                        refName, item.Id);
-                }
-            }
-            catch (Exception promoteEx) when (promoteEx is not OperationCanceledException)
-            {
-                _log.LogWarning(promoteEx,
-                    "Promote of adopted-VM HEAD to preempt-checkpoint {RefName} threw for work item {WorkItemId}; falling through to stranded-item recovery",
-                    refName, item.Id);
-            }
+            if (await TryPromoteCheckpointAsync(suspending, item.Id, vmName, refName, ct))
+                promotedCheckpointRef = refName;
         }
 
         // Clear the suspended-bookkeeping AFTER the adoption + promotion
@@ -549,6 +526,66 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
                 vmName, itemId);
             return null;
+        }
+    }
+
+    private async Task<bool> TryPromoteCheckpointAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        string refName,
+        CancellationToken ct)
+    {
+        var timeout = CurrentOptions().ResumeTimeout;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+
+        Task<bool>? promoteTask = null;
+        try
+        {
+            promoteTask = suspending.PushSuspendedVmCheckpointRefAsync(
+                vmName,
+                SandboxConventions.WorkDir,
+                refName,
+                $"codeybox: suspend-resume checkpoint {itemId}",
+                timeoutCts.Token);
+
+            var pushed = await promoteTask.WaitAsync(timeoutCts.Token);
+            if (pushed)
+                return true;
+
+            _log.LogWarning(
+                "Failed to promote adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
+                vmName, refName, itemId);
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            if (promoteTask is not null)
+                ObserveProviderTaskException(promoteTask);
+
+            _log.LogWarning(
+                "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
+                vmName, itemId, timeout);
+            return false;
+        }
+        catch (OperationCanceledException promoteEx)
+        {
+            _log.LogWarning(promoteEx,
+                "Startup checkpoint promotion was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}); falling through to stranded-item recovery",
+                vmName, itemId);
+            return false;
+        }
+        catch (Exception promoteEx)
+        {
+            _log.LogWarning(promoteEx,
+                "Promote of adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} threw for work item {WorkItemId}; falling through to stranded-item recovery",
+                vmName, refName, itemId);
+            return false;
         }
     }
 

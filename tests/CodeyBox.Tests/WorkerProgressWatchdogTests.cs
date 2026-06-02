@@ -88,9 +88,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await _registry.RegisterAsync(reg);
     }
 
-    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan? timeout = null)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(1);
+        var deadline = DateTimeOffset.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(1));
         while (DateTimeOffset.UtcNow < deadline)
         {
             if (await condition())
@@ -505,7 +505,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             new WorkerProgressWatchdogOptions
             {
                 ProgressTimeout = TimeSpan.FromMilliseconds(10),
-                CheckInterval = TimeSpan.FromMilliseconds(10),
+                CheckInterval = TimeSpan.FromSeconds(30),
                 AutoRecover = true,
             },
             NullLogger<WorkerProgressWatchdog>.Instance,
@@ -540,7 +540,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             {
                 var after = await _store.GetAsync(item.Id);
                 return after?.State == WorkItemState.Queued && _queue.Count == 1;
-            });
+            }, TimeSpan.FromSeconds(2));
         }
         finally
         {

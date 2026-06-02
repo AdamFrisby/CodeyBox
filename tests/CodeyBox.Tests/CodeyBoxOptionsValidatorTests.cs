@@ -144,6 +144,19 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds", result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_AcceptsMaximumStartupResumeBoundaries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxResumeTimeout = SandboxStartupResumePolicy.MaximumResumeTimeout;
+        options.Shutdown.SandboxAdoptionDeadlineSeconds =
+            (int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 

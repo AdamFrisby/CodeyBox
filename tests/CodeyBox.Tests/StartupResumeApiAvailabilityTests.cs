@@ -208,9 +208,11 @@ public sealed class StartupResumeApiAvailabilityTests
         {
             if (disposing)
             {
+                base.Dispose(disposing);
                 Store.Dispose();
                 Registry.Dispose();
                 try { File.Delete(_dbPath); } catch { }
+                return;
             }
             base.Dispose(disposing);
         }

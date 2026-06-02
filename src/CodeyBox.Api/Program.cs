@@ -3043,11 +3043,13 @@ namespace CodeyBox.Api
         /// Upper bound on how long the startup resume handler waits for an
         /// adopted in-VM agent process to finish post-resume. Long enough that
         /// a real LLM call can finish, short enough that a wedged agent does
-        /// not delay the startup resume sweep indefinitely. Default 1800
-        /// (30 min). Hot-reloadable for pending adoption attempts.
+        /// not delay the startup resume sweep indefinitely. Defaults to
+        /// <see cref="SandboxStartupResumePolicy.DefaultAdoptionDeadline"/>.
+        /// Hot-reloadable for pending adoption attempts.
         /// Bound from <c>CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds</c>.
         /// </summary>
-        public int SandboxAdoptionDeadlineSeconds { get; set; } = 1800;
+        public int SandboxAdoptionDeadlineSeconds { get; set; } =
+            (int)SandboxStartupResumePolicy.DefaultAdoptionDeadline.TotalSeconds;
 
         /// <summary>
         /// How to tear down in-flight worker sandboxes during graceful shutdown.

@@ -15,6 +15,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ILogger<SqliteWorkerRegistry>? _logger;
+    private int _disposed;
 
     public SqliteWorkerRegistry(string path, ILogger<SqliteWorkerRegistry>? logger = null)
     {
@@ -232,6 +233,9 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         _conn.Dispose();
         _writeLock.Dispose();
     }

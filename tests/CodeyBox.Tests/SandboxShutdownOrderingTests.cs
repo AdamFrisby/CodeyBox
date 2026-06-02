@@ -490,6 +490,20 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupReconciler_ProviderCancellation_DoesNotPropagate_WhenHostTokenIsActive()
+    {
+        var provider = new ReconcilingFakeProvider { ReconcileThrowsProviderCancellation = true };
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        using var hostCts = new CancellationTokenSource();
+        await svc.ReconcileAllForTestAsync(hostCts.Token).WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(hostCts.IsCancellationRequested);
+        Assert.True(provider.ReconcileCalled);
+    }
+
+    [Fact]
     public async Task StartupReconciler_UnrecoverableVm_IsReturnedForOperatorAttention()
     {
         // When the provider can't recover a VM (root cleanup needed — the
@@ -889,6 +903,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public IReadOnlyList<string> UnrecoverableReturned { get; private set; } = [];
         private readonly ConcurrentDictionary<string, List<string>> _opsByVm = new();
         public string? RecoveryThrowsFor { get; set; }
+        public bool ReconcileThrowsProviderCancellation { get; set; }
+        public bool ReconcileCalled { get; private set; }
 
         public void SeedManaged(ManagedSandboxInfo info) => _managed.Add(info);
         public string Name => "fake-reconciling";
@@ -911,6 +927,10 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
             IReadOnlySet<string> liveSuspendedNames, CancellationToken ct)
         {
+            ReconcileCalled = true;
+            if (ReconcileThrowsProviderCancellation)
+                throw new OperationCanceledException("provider cancelled reconciliation");
+
             var unrecoverable = new List<string>();
             foreach (var info in _managed)
             {

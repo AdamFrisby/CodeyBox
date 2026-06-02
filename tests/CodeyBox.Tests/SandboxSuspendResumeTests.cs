@@ -1408,6 +1408,40 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushHangs_IsBoundedByResumeTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-hangs",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/h.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushHangs = true,
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
+    }
+
+    [Fact]
     public async Task StartupResume_ResumeFailure_SkipsCheckpointPromotion()
     {
         // If multipass start failed, the VM is not running and any git push
@@ -2006,6 +2040,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool AdoptionFaults { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
+        public bool CheckpointPushHangs { get; set; }
 
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
 
@@ -2073,6 +2108,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _checkpointPushCalls.Enqueue(new CheckpointPushCall(vmName, workingDir, refName, commitMessage));
             if (CheckpointPushThrows)
                 throw new InvalidOperationException("simulated in-VM git push failure");
+            if (CheckpointPushHangs)
+                return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);
         }
     }
