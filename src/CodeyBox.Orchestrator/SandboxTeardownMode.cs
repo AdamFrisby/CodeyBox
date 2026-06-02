@@ -24,11 +24,11 @@ public enum SandboxTeardownMode
     Suspend = 0,
 
     /// <summary>
-    /// Clean stop: <c>multipass stop</c> kills the in-VM agent process but
-    /// preserves the VM's disk. Far less likely to wedge multipassd than
-    /// suspend (no RAM snapshot, qemu shuts down cleanly and releases the
-    /// disk-image lock). The work item recovers via its preempt-checkpoint
-    /// the same way it would under any non-suspending provider. This is the
+    /// Clean stop after preempt checkpoint: the shutdown lifecycle service
+    /// avoids <c>multipass suspend</c> and lets PipelineRunner write the
+    /// preempt-checkpoint before its preserve step calls <c>multipass stop</c>.
+    /// Far less likely to wedge multipassd than suspend (no RAM snapshot, qemu
+    /// shuts down cleanly and releases the disk-image lock). This is the
     /// <c>ShutdownOptions</c> default.
     /// </summary>
     Stop = 1,

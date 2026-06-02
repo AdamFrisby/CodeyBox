@@ -168,25 +168,24 @@ public interface ISuspendableSandbox : ISandbox
 
     /// <summary>
     /// True once the suspend-on-shutdown handler has taken ownership of this
-    /// VM's teardown — via Suspend (RAM frozen), Stop (clean shutdown), or
-    /// Dispose (delete --purge). PipelineRunner reads this in its host-shutdown
-    /// OCE catch block to short-circuit the legacy in-VM preempt-checkpoint flow:
-    /// the git add/commit/push inside the VM would hang (Suspend), fail (Stop
-    /// — the VM is no longer running the agent), or fault (Dispose — the VM
-    /// is gone), in any case stalling or breaking the orchestrator exit while
-    /// also leaving the work item Working without a checkpoint. Suspend mode
-    /// flips this implicitly via <see cref="IsSuspended"/>; Stop and Dispose
-    /// modes call <see cref="MarkOwnedByShutdownHandler"/>.
+    /// VM's recovery path via Suspend (RAM frozen) or Dispose (delete --purge).
+    /// Stop mode deliberately leaves this false so PipelineRunner can create a
+    /// PreemptCheckpoint before calling StopAndPreserveAsync. PipelineRunner
+    /// reads this in its host-shutdown OCE catch block to short-circuit the
+    /// legacy in-VM preempt-checkpoint flow when that flow would hang (Suspend)
+    /// or fault (Dispose). Suspend mode flips this implicitly via
+    /// <see cref="IsSuspended"/>; Dispose mode calls
+    /// <see cref="MarkOwnedByShutdownHandler"/>.
     /// </summary>
     bool IsOwnedByShutdownHandler => IsSuspended;
 
     /// <summary>
     /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
-    /// <c>SandboxSuspendOnShutdownService</c> immediately before non-Suspend
-    /// teardown modes begin so PipelineRunner sees the "skip checkpoint" signal
-    /// even though the suspend path was not taken. Default no-op: fakes that
-    /// don't track teardown ownership keep <see cref="IsOwnedByShutdownHandler"/>
-    /// at the <see cref="IsSuspended"/> fallback.
+    /// <c>SandboxSuspendOnShutdownService</c> only for teardown modes that must
+    /// skip PipelineRunner's in-VM checkpoint path because the VM is already
+    /// frozen or being destroyed. Default no-op: fakes that don't track teardown
+    /// ownership keep <see cref="IsOwnedByShutdownHandler"/> at the
+    /// <see cref="IsSuspended"/> fallback.
     /// </summary>
     void MarkOwnedByShutdownHandler() { }
 

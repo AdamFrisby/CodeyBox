@@ -10,6 +10,7 @@ namespace CodeyBox.Tests;
 /// gauges that poll live store/process state. Uses a real SQLite store and the
 /// built-in MeterListener so no OTel SDK or collector is required.
 /// </summary>
+[Collection("Observable metrics")]
 public sealed class ObservableMetricsTests : IDisposable
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-obs-metrics-{Guid.NewGuid():N}.db");
@@ -98,9 +99,10 @@ public sealed class ObservableMetricsTests : IDisposable
         var store = new SqliteWorkItemStore(_dbPath);
 
         // The live counter is intentionally process-wide, and other tests may
-        // have ephemeral sandboxes alive at the same time. Use a large local
-        // contribution so this test proves the gauge is reading the counter
-        // without assuming exclusive ownership of the static value.
+        // have ephemeral sandboxes alive at the same time or leave a non-zero
+        // baseline. Use a large local contribution so this test proves the
+        // gauge is reading the counter without assuming exclusive ownership of
+        // the static value.
         const int localContribution = 1_000;
         for (var i = 0; i < localContribution; i++)
             SandboxLiveCounter.Increment();
@@ -347,4 +349,9 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => throw new NotSupportedException();
     }
+}
+
+[CollectionDefinition("Observable metrics", DisableParallelization = true)]
+public sealed class ObservableMetricsCollection
+{
 }

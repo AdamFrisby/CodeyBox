@@ -203,8 +203,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            perSuspendTimeout: TimeSpan.FromMilliseconds(50),
-            teardownMode: SandboxTeardownMode.Suspend);
+            teardownMode: SandboxTeardownMode.Suspend,
+            perSuspendTimeout: TimeSpan.FromMilliseconds(50));
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);
@@ -240,9 +240,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMilliseconds(100),
-            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000),
-            teardownMode: SandboxTeardownMode.Suspend);
+            perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000));
 
         // The budget SuspendOneAsync must apply is the scaled 12s, not the 100ms floor.
         Assert.Equal(TimeSpan.FromSeconds(12), svc.SuspendTimeoutFor(sandbox));
@@ -282,8 +282,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            perSuspendTimeout: TimeSpan.FromMinutes(5),
-            teardownMode: SandboxTeardownMode.Suspend);
+            teardownMode: SandboxTeardownMode.Suspend,
+            perSuspendTimeout: TimeSpan.FromMinutes(5));
 
         var suspendAll = svc.SuspendAllAsync();
 
@@ -314,6 +314,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             new FakeSuspendingProvider(), _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMinutes(10),
             perGiBSuspendBudget: TimeSpan.FromSeconds(150));
 
@@ -370,7 +371,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxSuspendOnShutdownService(
             new FakeSuspendingProvider(), _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
 
         const long gib = 1024L * 1024 * 1024;
 
@@ -456,7 +458,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var nonSuspending = new NonSuspendingProvider();
         var svc = new SandboxSuspendOnShutdownService(
             nonSuspending, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);

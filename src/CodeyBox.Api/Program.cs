@@ -1981,12 +1981,13 @@ builder.Services.AddHostedService(sp =>
     return watchdog;
 });
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
-// operator-selected SandboxTeardownMode. Stop is the default and recovers
-// through the existing preempt-checkpoint path; Suspend remains opt-in and
-// writes resume bookkeeping so the next process can reattach. The shutdown half
-// is lifecycle-bound (StoppingAsync). Startup resume defaults to background mode
-// so a wedged multipassd cannot keep Kestrel offline; OrchestratorService waits
-// for startup recovery input before its dead-worker startup recovery sweep.
+// operator-selected SandboxTeardownMode. Stop is the default and leaves active
+// VMs to PipelineRunner's existing preempt-checkpoint + preserve path; Suspend
+// remains opt-in and writes resume bookkeeping so the next process can reattach.
+// The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
+// to background mode so a wedged multipassd cannot keep Kestrel offline;
+// OrchestratorService waits for startup recovery input before its dead-worker
+// startup recovery sweep.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
 // as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
@@ -3060,8 +3061,9 @@ namespace CodeyBox.Api
         /// How to tear down in-flight worker sandboxes during graceful shutdown.
         /// Hot-reloadable: read by the shutdown handler when graceful shutdown
         /// begins, so an operator can switch modes without restarting first.
-        /// Default <see cref="SandboxTeardownMode.Stop"/>: cleanly stop the VM
-        /// and recover through the preempt-checkpoint flow. Operators who
+        /// Default <see cref="SandboxTeardownMode.Stop"/>: avoid RAM snapshots
+        /// and recover through the preempt-checkpoint flow, which stops and
+        /// preserves the VM after the checkpoint is written. Operators who
         /// explicitly want RAM-state preservation can opt in to
         /// <see cref="SandboxTeardownMode.Suspend"/>; it freezes RAM via
         /// <c>multipass suspend</c> and resumes on next startup, but can hit the

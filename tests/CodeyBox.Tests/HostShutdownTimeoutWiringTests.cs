@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Api;
 using CodeyBox.Core;
@@ -63,6 +64,19 @@ public sealed class HostShutdownTimeoutWiringTests
         // the host ceiling stays at the configured graceful drain window.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Stop, maxWorkers: 32, graceSeconds: 45),
+            providerSupportsSuspend: true,
+            NullLogger.Instance);
+
+        Assert.Equal(TimeSpan.FromSeconds(45), timeout);
+    }
+
+    [Fact]
+    public void DisposeMode_KeepsTheGraceWindow_ForSuspendingProvider()
+    {
+        // Dispose does not write RAM snapshots either; it must not receive the
+        // long suspend reserve that only Suspend mode needs.
+        var timeout = Program.ComputeHostShutdownTimeout(
+            Opts(SandboxTeardownMode.Dispose, maxWorkers: 32, graceSeconds: 45),
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
@@ -173,6 +187,41 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
+    public async Task SandboxSuspendOnShutdownService_FromDi_UsesConfiguredSuspendMode()
+    {
+        var fakeProvider = new FakeSuspendingProvider();
+        using var factory = new SandboxShutdownServiceWiringFactory(
+            fakeProvider,
+            teardownMode: SandboxTeardownMode.Suspend);
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var shutdownService = factory.Services.GetServices<IHostedService>()
+            .OfType<SandboxSuspendOnShutdownService>()
+            .Single();
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+        await store.CreateAsync(item);
+
+        var sandbox = new FakeSuspendableSandbox("vm-from-di");
+        fakeProvider.Register(item.Id, sandbox);
+
+        await shutdownService.StoppingAsync(CancellationToken.None);
+
+        Assert.True(sandbox.SuspendCalled);
+        var after = await store.GetAsync(item.Id);
+        Assert.Equal("vm-from-di", after!.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
     public void HostOptions_FromDi_KeepsGrace_ForNonSuspendingProvider()
     {
         using var factory = new HostOptionsWiringFactory(
@@ -251,16 +300,122 @@ public sealed class HostShutdownTimeoutWiringTests
         }
     }
 
+    private sealed class SandboxShutdownServiceWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly ISandboxProvider _provider;
+        private readonly SandboxTeardownMode _teardownMode;
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-shutdownsvc-{Guid.NewGuid():N}.db");
+
+        public SandboxShutdownServiceWiringFactory(
+            ISandboxProvider provider,
+            SandboxTeardownMode teardownMode)
+        {
+            _provider = provider;
+            _teardownMode = teardownMode;
+        }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:Shutdown:SandboxTeardownMode"] = _teardownMode.ToString(),
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                var productionHostedServices = services
+                    .Where(d => d.ServiceType == typeof(IHostedService))
+                    .ToArray();
+
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<IProjectRepository>();
+                services.RemoveAll<ISandboxProvider>();
+                services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
+                services.AddSingleton(_provider);
+                services.AddSingleton<IHostedService>(sp =>
+                    CreateHostedServiceFromProductionRegistration<SandboxSuspendOnShutdownService>(
+                        productionHostedServices,
+                        sp));
+            });
+        }
+
+        private static T CreateHostedServiceFromProductionRegistration<T>(
+            IReadOnlyList<ServiceDescriptor> descriptors,
+            IServiceProvider sp) where T : class, IHostedService
+        {
+            foreach (var descriptor in descriptors)
+            {
+                var hosted = CreateHostedService(descriptor, sp);
+                if (hosted is T match)
+                    return match;
+            }
+
+            throw new InvalidOperationException(
+                $"Program did not register hosted service {typeof(T).Name}");
+        }
+
+        private static IHostedService CreateHostedService(
+            ServiceDescriptor descriptor,
+            IServiceProvider sp)
+        {
+            if (descriptor.ImplementationInstance is IHostedService instance)
+                return instance;
+            if (descriptor.ImplementationFactory is { } factory)
+                return (IHostedService)factory(sp)!;
+            if (descriptor.ImplementationType is { } type)
+                return (IHostedService)ActivatorUtilities.CreateInstance(sp, type);
+
+            throw new InvalidOperationException("Unsupported hosted service descriptor");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class FakeSuspendingProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
+        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
+
         public string Name => "fake-suspending";
+        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => throw new NotImplementedException();
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() =>
+            _active.Select(kv => (kv.Key, kv.Value)).ToList();
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox
+    {
+        public string Id { get; } = id;
+        public bool SuspendCalled { get; private set; }
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task SuspendAsync(CancellationToken ct = default)
+        {
+            SuspendCalled = true;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class FakeNonSuspendingProvider : ISandboxProvider
