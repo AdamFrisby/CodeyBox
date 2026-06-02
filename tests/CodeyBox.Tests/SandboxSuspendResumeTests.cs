@@ -483,6 +483,33 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_ResumeTimeout_MarksWorkingItemFailedAndClearsBookkeeping()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-hung-start",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            resumeTimeout: TimeSpan.FromMilliseconds(50));
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("timed out", after.LastError);
+    }
+
+    [Fact]
     public async Task StartupResume_NoSuspendedItems_DoesNothing()
     {
         var item = MakeItem();
@@ -1311,6 +1338,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
+        public bool ResumeHangs { get; set; }
         public int? AdoptionExitCodeToReturn { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
@@ -1335,6 +1363,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         {
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
+            if (ResumeHangs)
+                return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.CompletedTask;
         }
 

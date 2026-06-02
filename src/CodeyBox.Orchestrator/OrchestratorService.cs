@@ -74,6 +74,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IWorkerRegistry? _workerRegistry;
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
+    private readonly IStartupSandboxResumeBarrier? _startupResumeBarrier;
     private readonly ReleaseService? _releaseService;
     // B1 baseline-pinning: stamps the work/headless baseline ref at pickup time
     // so matching work-profile sandboxes keep using that baseline even after an
@@ -182,7 +183,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IBaselineImageResolver? baselineResolver = null,
         OrchestratorProgressClock? progressClock = null,
         QuotaRouterOptions? quotaRouterOptions = null,
-        BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null)
+        BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
+        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
     {
         _queue = queue;
         _store = store;
@@ -197,6 +199,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _workerRegistry = workerRegistry;
         _deadWorkerOpts = deadWorkerOpts;
         _reaper = reaper;
+        _startupResumeBarrier = startupResumeBarrier;
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
@@ -470,11 +473,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // R8-core suspend/resume: SandboxResumeOnStartupService.StartingAsync
-        // (an IHostedLifecycleService) runs BEFORE BackgroundService.ExecuteAsync,
-        // so by the time we reach this method any suspended VMs have already
-        // been multipass-started and adopted (or fallen through to recovery).
-        // The orchestrator no longer needs to inline the resume itself.
+        // R8-core suspend/resume: SandboxResumeOnStartupService now runs in the
+        // background by default so Kestrel can bind first. Keep the old recovery
+        // ordering by waiting here before the dead-worker startup sweep touches
+        // any items that still carry SuspendedVmName.
+        if (_startupResumeBarrier is not null)
+            await _startupResumeBarrier.Completion.WaitAsync(stoppingToken);
 
         // Run the reaper once at startup before replaying pending items.
         // This transitions any items that were mid-flight when the previous

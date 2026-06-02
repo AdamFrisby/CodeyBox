@@ -44,6 +44,10 @@ Hot-reloadable today:
   before the swap; rejected reloads keep the prior pricing.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
+- `Shutdown.SandboxResumeMode`, `Shutdown.SandboxResumeTimeout`, and
+  `Shutdown.SandboxAdoptionDeadlineSeconds` — re-read by the startup resume
+  service. In the default background mode, the API listener is not held offline
+  while suspended sandboxes resume.
 - `MultipassExtraRuncmd` / `MultipassExtraCloudInit` / `SandboxNetworkProfiles` /
   `MultipassUseBaselineImages` / `MultipassSandbox.CloudInitReadyRetryAttempts` /
   `MultipassSandbox.VmStartTimeout` / `MultipassSandbox.VmStopTimeout`
@@ -145,6 +149,31 @@ Controls worker concurrency and spawn pacing.
 |-----|---------|-------------|
 | `MaxConcurrentWorkers` | `1` | Hard cap on simultaneously active pipelines. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
+
+---
+
+## `Shutdown`
+
+Controls graceful shutdown drains and the startup resume path for sandboxes
+that were suspended by the previous process.
+
+```json
+"Shutdown": {
+  "GraceSeconds": 60,
+  "SandboxResumeMode": "Background",
+  "SandboxResumeTimeout": "00:10:00",
+  "SandboxAdoptionDeadlineSeconds": 1800,
+  "SandboxTeardownMode": "Suspend"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `GraceSeconds` | `60` | Host shutdown drain for in-flight phases. |
+| `SandboxResumeMode` | `Background` | `Background` starts the HTTP listener before resuming suspended sandboxes. `Blocking` preserves startup-blocking behavior but still applies `SandboxResumeTimeout` per VM. |
+| `SandboxResumeTimeout` | `00:10:00` | Caller-side cap for each persisted VM resume call. On timeout, suspend bookkeeping is cleared and normal recovery/leak handling proceeds. |
+| `SandboxAdoptionDeadlineSeconds` | `1800` | Max wait for an adopted in-VM agent to finish after its VM resumes. |
+| `SandboxTeardownMode` | `Suspend` | `Suspend`, `Stop`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. |
 
 ---
 

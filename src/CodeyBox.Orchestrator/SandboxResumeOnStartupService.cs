@@ -5,6 +5,34 @@ using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
+public enum SandboxStartupResumeMode
+{
+    Background = 0,
+    Blocking = 1,
+}
+
+public sealed record SandboxStartupResumeOptions
+{
+    public int MaxParallelResumes { get; init; } = SandboxResumeOnStartupService.DefaultMaxParallelResumes;
+    public TimeSpan ResumeTimeout { get; init; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
+    public TimeSpan AdoptionDeadline { get; init; } = SandboxResumeOnStartupService.DefaultAdoptionDeadline;
+    public SandboxStartupResumeMode Mode { get; init; } = SandboxStartupResumeMode.Background;
+}
+
+public interface IStartupSandboxResumeBarrier
+{
+    Task Completion { get; }
+}
+
+public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier
+{
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task Completion => _completion.Task;
+
+    internal void MarkCompleted() => _completion.TrySetResult();
+}
+
 /// <summary>
 /// R8-core startup half: for every work item the previous process suspended
 /// (<see cref="WorkItem.SuspendedVmName"/> non-null), <c>multipass start</c>
@@ -15,12 +43,14 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>Implemented as <see cref="IHostedLifecycleService.StartingAsync"/>
 /// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
-/// so it runs BEFORE <see cref="OrchestratorService.ExecuteAsync"/> kicks
-/// off the dispatch loop, the dead-worker reaper, and
-/// <c>ReplayPendingAsync</c>. Sequencing matters: the leak reaper sees a
-/// consistent picture (the VM is back to Running, the work item still
-/// carries SuspendedVmName until adoption completes) and recovery doesn't
-/// race the resume.</para>
+/// only when configured for blocking mode. The default background mode starts
+/// the resume sweep from <see cref="StartAsync"/> and signals
+/// <see cref="StartupSandboxResumeBarrier"/> when done, so the HTTP listener can
+/// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
+/// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
+/// consistent picture (the VM is back to Running, the work item still carries
+/// SuspendedVmName until adoption completes) and recovery doesn't race the
+/// resume.</para>
 ///
 /// <para>Adoption flow per item:</para>
 /// <list type="number">
@@ -59,41 +89,165 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     /// </summary>
     public static readonly TimeSpan DefaultAdoptionDeadline = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// Default caller-side cap for a single persisted VM resume. The Multipass
+    /// provider has its own launch/readiness limits, but the orchestrator also
+    /// needs an outer guard for daemon/provider calls that ignore cancellation.
+    /// </summary>
+    public static readonly TimeSpan DefaultResumeTimeout = SuspendTimeoutPolicy.DefaultFloor;
+
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
-    private readonly int _maxParallel;
-    private readonly TimeSpan _adoptionDeadline;
+    private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
+    private readonly StartupSandboxResumeBarrier _barrier;
+    private CancellationTokenSource? _backgroundCts;
+    private Task? _resumeTask;
+    private int _resumeStarted;
 
     public SandboxResumeOnStartupService(
         ISandboxProvider? provider,
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
         int? maxParallel = null,
-        TimeSpan? adoptionDeadline = null)
+        TimeSpan? adoptionDeadline = null,
+        TimeSpan? resumeTimeout = null,
+        SandboxStartupResumeMode? mode = null,
+        StartupSandboxResumeBarrier? barrier = null)
+        : this(
+            provider,
+            store,
+            log,
+            () => new SandboxStartupResumeOptions
+            {
+                MaxParallelResumes = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelResumes,
+                AdoptionDeadline = adoptionDeadline is { } d && d > TimeSpan.Zero
+                    ? d
+                    : DefaultAdoptionDeadline,
+                ResumeTimeout = resumeTimeout is { } r && r > TimeSpan.Zero
+                    ? r
+                    : DefaultResumeTimeout,
+                Mode = mode ?? SandboxStartupResumeMode.Background,
+            },
+            barrier)
+    {
+    }
+
+    public SandboxResumeOnStartupService(
+        ISandboxProvider? provider,
+        IWorkItemStore store,
+        ILogger<SandboxResumeOnStartupService> log,
+        Func<SandboxStartupResumeOptions> optionsAccessor,
+        StartupSandboxResumeBarrier? barrier = null)
     {
         _provider = provider;
         _store = store;
         _log = log;
-        _maxParallel = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelResumes;
-        _adoptionDeadline = adoptionDeadline is { } d && d > TimeSpan.Zero
-            ? d
-            : DefaultAdoptionDeadline;
+        _optionsAccessor = optionsAccessor;
+        _barrier = barrier ?? new StartupSandboxResumeBarrier();
     }
 
-    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
-    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StartAsync(CancellationToken ct)
+    {
+        var options = CurrentOptions();
+        if (options.Mode != SandboxStartupResumeMode.Background)
+            return Task.CompletedTask;
+
+        return StartResumeOnceAsync(background: true, ct);
+    }
+
+    public async Task StopAsync(CancellationToken ct)
+    {
+        _backgroundCts?.Cancel();
+        var task = _resumeTask;
+        if (task is null)
+            return;
+
+        try { await task.WaitAsync(ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    }
+
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppedAsync(CancellationToken ct) => Task.CompletedTask;
 
-    public Task StartingAsync(CancellationToken ct) => ResumeAllAsync(ct);
+    public Task StartingAsync(CancellationToken ct)
+    {
+        var options = CurrentOptions();
+        if (options.Mode != SandboxStartupResumeMode.Blocking)
+            return Task.CompletedTask;
+
+        return StartResumeOnceAsync(background: false, ct);
+    }
 
     /// <summary>
     /// Exposed for test fixtures that drive the resume cycle directly without
     /// spinning the full host lifecycle.
     /// </summary>
     internal Task ResumeAllForTestAsync(CancellationToken ct) => ResumeAllAsync(ct);
+
+    private Task StartResumeOnceAsync(bool background, CancellationToken ct)
+    {
+        if (Interlocked.Exchange(ref _resumeStarted, 1) != 0)
+            return background ? Task.CompletedTask : _resumeTask ?? Task.CompletedTask;
+
+        if (background)
+        {
+            _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _resumeTask = Task.Run(
+                () => ResumeAllAndSignalAsync(_backgroundCts.Token),
+                CancellationToken.None);
+            return Task.CompletedTask;
+        }
+
+        _resumeTask = ResumeAllAndSignalAsync(ct);
+        return _resumeTask;
+    }
+
+    private async Task ResumeAllAndSignalAsync(CancellationToken ct)
+    {
+        try
+        {
+            await ResumeAllAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _log.LogInformation("Startup resume cancelled before all suspended sandboxes were processed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Startup resume sweep threw; continuing host startup");
+        }
+        finally
+        {
+            _barrier.MarkCompleted();
+        }
+    }
+
+    private SandboxStartupResumeOptions CurrentOptions()
+    {
+        var raw = _optionsAccessor();
+        var maxParallel = raw.MaxParallelResumes > 0
+            ? raw.MaxParallelResumes
+            : DefaultMaxParallelResumes;
+        var resumeTimeout = raw.ResumeTimeout > TimeSpan.Zero
+            ? raw.ResumeTimeout
+            : DefaultResumeTimeout;
+        var adoptionDeadline = raw.AdoptionDeadline > TimeSpan.Zero
+            ? raw.AdoptionDeadline
+            : DefaultAdoptionDeadline;
+        var mode = Enum.IsDefined(raw.Mode)
+            ? raw.Mode
+            : SandboxStartupResumeMode.Background;
+
+        return raw with
+        {
+            MaxParallelResumes = maxParallel,
+            ResumeTimeout = resumeTimeout,
+            AdoptionDeadline = adoptionDeadline,
+            Mode = mode,
+        };
+    }
 
     internal async Task ResumeAllAsync(CancellationToken ct)
     {
@@ -112,7 +266,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         _log.LogInformation("Startup resume: {Count} suspended sandbox(es) to start", suspended.Count);
 
-        using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
+        var options = CurrentOptions();
+        using var gate = new SemaphoreSlim(options.MaxParallelResumes, options.MaxParallelResumes);
         var tasks = new List<Task>(suspended.Count);
         foreach (var item in suspended)
         {
@@ -136,22 +291,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         var vmName = item.SuspendedVmName!;
         var agentLogPath = item.AgentLogPath;
-        var resumeSucceeded = true;
-        string? resumeError = null;
+        var (resumeSucceeded, resumeError) = await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
         int? adoptionExitCode = null;
         var adopted = false;
-        try
-        {
-            await suspending.ResumeSandboxAsync(vmName, ct);
-        }
-        catch (Exception ex)
-        {
-            resumeSucceeded = false;
-            resumeError = ex.Message;
-            _log.LogWarning(ex,
-                "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
-                vmName, item.Id);
-        }
 
         if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
         {
@@ -161,6 +303,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             // output the host stream lost when the previous process exited.
             try
             {
+                var adoptionDeadline = CurrentOptions().AdoptionDeadline;
                 adoptionExitCode = await suspending.WaitForAdoptedAgentCompletionAsync(
                     vmName,
                     agentLogPath!,
@@ -169,14 +312,14 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                         if (!string.IsNullOrEmpty(chunk))
                             _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
                     },
-                    _adoptionDeadline,
+                    adoptionDeadline,
                     ct);
                 adopted = adoptionExitCode is not null;
                 if (!adopted)
                 {
                     _log.LogWarning(
                         "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
-                        vmName, item.Id, _adoptionDeadline);
+                        vmName, item.Id, adoptionDeadline);
                 }
             }
             catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
@@ -249,6 +392,23 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             AgentLogPath = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         };
+        if (!resumeSucceeded
+            && fresh.State == WorkItemState.Working
+            && string.IsNullOrWhiteSpace(fresh.PreemptCheckpoint))
+        {
+            updatedItem = updatedItem with
+            {
+                State = WorkItemState.Failed,
+                LastError = $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
+                RecoveryAttempts = fresh.RecoveryAttempts + 1,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+            };
+            _log.LogWarning(
+                "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
+                item.Id, vmName, resumeError ?? "unknown error");
+        }
         if (promotedCheckpointRef is not null)
         {
             updatedItem = updatedItem with
@@ -259,6 +419,69 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         await _store.UpdateAsync(updatedItem, ct);
         AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
+    }
+
+    private async Task<(bool Succeeded, string? Error)> TryResumeSandboxAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        CancellationToken ct)
+    {
+        var timeout = CurrentOptions().ResumeTimeout;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+
+        var resumeTask = Task.Run(async () =>
+        {
+            await suspending.ResumeSandboxAsync(vmName, timeoutCts.Token);
+        }, CancellationToken.None);
+
+        try
+        {
+            await resumeTask.WaitAsync(timeout, ct);
+            return (true, null);
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            ObserveTimedOutResumeTask(resumeTask, itemId, vmName);
+            var error = $"timed out after {timeout}";
+            _log.LogWarning(
+                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId, timeout);
+            return (false, error);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+        {
+            var error = $"timed out after {timeout}";
+            _log.LogWarning(
+                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId, timeout);
+            return (false, error);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId);
+            return (false, ex.Message);
+        }
+    }
+
+    private void ObserveTimedOutResumeTask(Task resumeTask, WorkItemId itemId, string vmName)
+    {
+        if (resumeTask.IsCompleted)
+            return;
+
+        resumeTask.ContinueWith(
+            t => _log.LogWarning(
+                t.Exception,
+                "Timed-out startup resume task later faulted for sandbox {VmName} (work item {WorkItemId})",
+                vmName,
+                itemId),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>

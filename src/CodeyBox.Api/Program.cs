@@ -1930,6 +1930,9 @@ builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IUpstreamRemoteFactory>(),
     sp.GetRequiredService<ILogger<ReleaseMainSyncService>>()));
 
+builder.Services.AddSingleton<StartupSandboxResumeBarrier>();
+builder.Services.AddSingleton<IStartupSandboxResumeBarrier>(
+    sp => sp.GetRequiredService<StartupSandboxResumeBarrier>());
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -1950,7 +1953,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IBaselineImageResolver>(),
     sp.GetRequiredService<OrchestratorProgressClock>(),
     sp.GetRequiredService<QuotaRouterOptions>(),
-    sp.GetRequiredService<BudgetDeferralRecheckSnapshot>()));
+    sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
+    sp.GetRequiredService<IStartupSandboxResumeBarrier>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -1968,11 +1972,10 @@ builder.Services.AddHostedService(sp =>
     return watchdog;
 });
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
-// can resume them. Both halves of the cycle are IHostedLifecycleService so the
-// host awaits StoppingAsync (suspend) and StartingAsync (resume) natively
-// rather than blocking a thread-pool callback. The resume runs BEFORE
-// OrchestratorService.ExecuteAsync (and before the dead-worker reaper) so
-// adopted in-VM agents are observed before the standard recovery sweep fires.
+// can resume them. The shutdown half is lifecycle-bound (StoppingAsync). Startup
+// resume defaults to background mode so a wedged multipassd cannot keep Kestrel
+// offline; OrchestratorService waits on StartupSandboxResumeBarrier before its
+// dead-worker startup recovery sweep.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
 // as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
@@ -2003,8 +2006,17 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     sp.GetService<ISandboxProvider>(),
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>(),
-    adoptionDeadline: TimeSpan.FromSeconds(
-        Math.Max(1, sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.Shutdown.SandboxAdoptionDeadlineSeconds))));
+    () =>
+    {
+        var shutdown = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Shutdown;
+        return new SandboxStartupResumeOptions
+        {
+            Mode = shutdown.SandboxResumeMode,
+            ResumeTimeout = shutdown.SandboxResumeTimeout,
+            AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
+        };
+    },
+    sp.GetRequiredService<StartupSandboxResumeBarrier>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the
@@ -2578,7 +2590,10 @@ namespace CodeyBox.Api
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
     ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>DeadWorker</c>
-    ///   (per-sweep), <c>SandboxLeak</c> (thresholds, per-sweep),
+    ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
+    ///   <c>Shutdown.SandboxResumeTimeout</c>,
+    ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
+    ///   (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
     ///   sandbox launch fields (<c>Multipass*</c>, <c>SandboxNetworkProfiles</c>,
     ///   per-launch), and <c>Shutdown.SandboxTeardownMode</c> (next graceful
@@ -2996,11 +3011,30 @@ namespace CodeyBox.Api
         public int GraceSeconds { get; set; } = 60;
 
         /// <summary>
+        /// Whether startup sandbox resume runs in the background after host
+        /// startup begins, or blocks startup while still applying
+        /// <see cref="SandboxResumeTimeout"/> per VM. Default Background keeps
+        /// the HTTP control plane available even when a prior VM is wedged.
+        /// Hot-reloadable for the next resume sweep.
+        /// Bound from <c>CodeyBox:Shutdown:SandboxResumeMode</c>.
+        /// </summary>
+        public SandboxStartupResumeMode SandboxResumeMode { get; set; } = SandboxStartupResumeMode.Background;
+
+        /// <summary>
+        /// Caller-side cap for each persisted VM's startup resume call. This is
+        /// distinct from the provider's own VM start/readiness timeout: it also
+        /// protects the orchestrator from providers or daemons that do not
+        /// observe cancellation. Hot-reloadable for pending resume attempts.
+        /// Bound from <c>CodeyBox:Shutdown:SandboxResumeTimeout</c>.
+        /// </summary>
+        public TimeSpan SandboxResumeTimeout { get; set; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
+
+        /// <summary>
         /// Upper bound on how long the startup resume handler waits for an
         /// adopted in-VM agent process to finish post-resume. Long enough that
         /// a real LLM call can finish, short enough that a wedged agent does
-        /// not block the orchestrator boot indefinitely. Default 1800 (30 min).
-        /// Only sampled at construction (startup) — changes do not hot-reload.
+        /// not delay the startup resume sweep indefinitely. Default 1800
+        /// (30 min). Hot-reloadable for pending adoption attempts.
         /// Bound from <c>CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds</c>.
         /// </summary>
         public int SandboxAdoptionDeadlineSeconds { get; set; } = 1800;

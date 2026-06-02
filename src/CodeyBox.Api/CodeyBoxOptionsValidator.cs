@@ -21,6 +21,21 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxTemplateChecks must be between 1 and {CodeyBoxOptions.MaximumMaxTemplateChecks}");
         }
 
+        if (!Enum.IsDefined(options.Shutdown.SandboxResumeMode))
+        {
+            failures.Add("CodeyBox:Shutdown:SandboxResumeMode must be Background or Blocking");
+        }
+
+        if (options.Shutdown.SandboxResumeTimeout <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:Shutdown:SandboxResumeTimeout must be a positive TimeSpan");
+        }
+
+        if (options.Shutdown.SandboxAdoptionDeadlineSeconds <= 0)
+        {
+            failures.Add("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds must be > 0");
+        }
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0
