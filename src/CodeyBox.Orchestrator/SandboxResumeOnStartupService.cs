@@ -106,10 +106,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
     private readonly IStartupSandboxResumeCompletionSink _barrier;
-    private readonly object _startupModeGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
-    private SandboxStartupResumeMode? _startupMode;
     private int _resumeStarted;
 
     public SandboxResumeOnStartupService(
@@ -156,11 +154,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     public Task StartAsync(CancellationToken ct)
     {
-        var mode = CaptureStartupMode();
-        if (mode != SandboxStartupResumeMode.Background)
-            return Task.CompletedTask;
+        var mode = CurrentOptions().Mode;
+        if (mode == SandboxStartupResumeMode.Background)
+            return StartResumeOnceAsync(background: true, ct);
 
-        return StartResumeOnceAsync(background: true, ct);
+        // If configuration reloads from Background to Blocking between
+        // StartingAsync and StartAsync, honor the latest value by running the
+        // one-shot sweep here. The Interlocked gate keeps the normal Blocking
+        // path from executing twice.
+        return StartResumeOnceAsync(background: false, ct);
     }
 
     public async Task StopAsync(CancellationToken ct)
@@ -180,7 +182,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     public Task StartingAsync(CancellationToken ct)
     {
-        var mode = CaptureStartupMode();
+        var mode = CurrentOptions().Mode;
         if (mode != SandboxStartupResumeMode.Blocking)
             return Task.CompletedTask;
 
@@ -209,15 +211,6 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         _resumeTask = ResumeAllAndSignalAsync(ct);
         return _resumeTask;
-    }
-
-    private SandboxStartupResumeMode CaptureStartupMode()
-    {
-        lock (_startupModeGate)
-        {
-            _startupMode ??= CurrentOptions().Mode;
-            return _startupMode.Value;
-        }
     }
 
     private async Task ResumeAllAndSignalAsync(CancellationToken ct)
@@ -317,33 +310,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             // .exit marker appears (or the deadline elapses). Streaming what
             // the agent emits post-resume to the orchestrator log captures
             // output the host stream lost when the previous process exited.
-            try
-            {
-                var adoptionDeadline = CurrentOptions().AdoptionDeadline;
-                adoptionExitCode = await suspending.WaitForAdoptedAgentCompletionAsync(
-                    vmName,
-                    agentLogPath!,
-                    chunk =>
-                    {
-                        if (!string.IsNullOrEmpty(chunk))
-                            _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
-                    },
-                    adoptionDeadline,
-                    ct);
-                adopted = adoptionExitCode is not null;
-                if (!adopted)
-                {
-                    _log.LogWarning(
-                        "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
-                        vmName, item.Id, adoptionDeadline);
-                }
-            }
-            catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
-            {
-                _log.LogWarning(adoptionEx,
-                    "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
-                    vmName, item.Id);
-            }
+            adoptionExitCode = await TryWaitForAdoptionAsync(
+                suspending, item.Id, vmName, agentLogPath!, ct);
+            adopted = adoptionExitCode is not null;
         }
 
         // Promote whatever the adopted agent committed inside the VM into a
@@ -409,7 +378,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             UpdatedAt = DateTimeOffset.UtcNow,
         };
         if (!resumeSucceeded
-            && DeadWorkerReaper.TryBuildWorkingWithoutPreemptFailure(
+            && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
                 updatedItem,
                 $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
                 out var failedItem))
@@ -441,10 +410,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
+        Task? resumeTask = null;
         try
         {
-            await suspending.ResumeSandboxAsync(vmName, timeoutCts.Token)
-                .WaitAsync(timeoutCts.Token);
+            resumeTask = suspending.ResumeSandboxAsync(vmName, timeoutCts.Token);
+            await resumeTask.WaitAsync(timeoutCts.Token);
             return (true, null);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -453,6 +423,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -474,6 +446,100 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 vmName, itemId);
             return (false, ex.Message);
         }
+    }
+
+    private async Task<int?> TryWaitForAdoptionAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        string agentLogPath,
+        CancellationToken ct)
+    {
+        var adoptionDeadline = CurrentOptions().AdoptionDeadline;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(adoptionDeadline);
+
+        Task<int?> adoptionTask;
+        try
+        {
+            adoptionTask = suspending.WaitForAdoptedAgentCompletionAsync(
+                vmName,
+                agentLogPath,
+                chunk =>
+                {
+                    if (!string.IsNullOrEmpty(chunk))
+                        _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
+                },
+                adoptionDeadline,
+                timeoutCts.Token);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                vmName, itemId, error);
+            return null;
+        }
+        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+        {
+            _log.LogWarning(adoptionEx,
+                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                vmName, itemId);
+            return null;
+        }
+
+        try
+        {
+            var adoptionExitCode = await adoptionTask.WaitAsync(timeoutCts.Token);
+            if (adoptionExitCode is null)
+            {
+                _log.LogWarning(
+                    "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
+                    vmName, itemId, adoptionDeadline);
+            }
+            return adoptionExitCode;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            ObserveProviderTaskException(adoptionTask);
+            _log.LogWarning(
+                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                vmName, itemId, adoptionDeadline);
+            return null;
+        }
+        catch (OperationCanceledException ex)
+        {
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                vmName, itemId, error);
+            return null;
+        }
+        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+        {
+            _log.LogWarning(adoptionEx,
+                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                vmName, itemId);
+            return null;
+        }
+    }
+
+    private static void ObserveProviderTaskException(Task task)
+    {
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>

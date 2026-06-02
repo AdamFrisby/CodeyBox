@@ -19,7 +19,7 @@ public sealed class StartupResumeApiAvailabilityTests
     [InlineData("throw")]
     public async Task StartupResumeFailure_DoesNotBlockQuotaEndpoint_AndMarksItemFailed(string behavior)
     {
-        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var configuredTimeout = TimeSpan.FromSeconds(3);
         using var factory = new StartupResumeFullHostFactory(behavior, configuredTimeout);
         var item = new WorkItem
         {
@@ -44,15 +44,27 @@ public sealed class StartupResumeApiAvailabilityTests
             CurrentWorkItemId = item.Id.ToString(),
         });
 
-        var client = factory.CreateClient();
         var sw = Stopwatch.StartNew();
-        using var response = await client.GetAsync("/quota")
-            .WaitAsync(TimeSpan.FromSeconds(2));
-        sw.Stop();
+        HttpClient? client = null;
+        HttpResponseMessage? response = null;
+        try
+        {
+            response = await Task.Run(async () =>
+            {
+                client = factory.CreateClient();
+                return await client.GetAsync("/quota");
+            }).WaitAsync(configuredTimeout);
+            sw.Stop();
 
-        response.EnsureSuccessStatusCode();
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2),
-            $"GET /quota was not served promptly while startup resume was running; elapsed {sw.Elapsed}");
+            response.EnsureSuccessStatusCode();
+            Assert.True(sw.Elapsed < configuredTimeout,
+                $"GET /quota was not served before configured startup resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+        }
+        finally
+        {
+            response?.Dispose();
+            client?.Dispose();
+        }
 
         var failed = await WaitForStateAsync(factory.Store, item.Id, WorkItemState.Failed);
         Assert.Null(failed.SuspendedVmName);

@@ -235,7 +235,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
-        if (TryBuildWorkingWithoutPreemptFailure(item, noPreemptFailedReason, out var failed))
+        if (WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(item, noPreemptFailedReason, out var failed))
         {
             await _store.UpdateAsync(failed, ct);
             MarkRecoveredItem(itemId);
@@ -327,31 +327,6 @@ public sealed class DeadWorkerReaper : BackgroundService
 
     private void MarkRecoveredItem(WorkItemId itemId)
         => _recoveredItemsThisProcess[itemId] = 0;
-
-    internal static bool TryBuildWorkingWithoutPreemptFailure(
-        WorkItem item,
-        string lastError,
-        out WorkItem failed)
-    {
-        if (item.State != WorkItemState.Working
-            || !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
-        {
-            failed = item;
-            return false;
-        }
-
-        failed = item with
-        {
-            State = WorkItemState.Failed,
-            LastError = lastError,
-            RecoveryAttempts = item.RecoveryAttempts + 1,
-            StartedAt = null,
-            PreemptedAt = null,
-            PreemptCheckpoint = null,
-            UpdatedAt = DateTimeOffset.UtcNow,
-        };
-        return true;
-    }
 
     private void ReleaseRecoveredWorkerSlot(string workerId, WorkItemId? itemId, string reason)
     {

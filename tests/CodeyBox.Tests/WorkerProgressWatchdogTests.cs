@@ -88,6 +88,20 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await _registry.RegisterAsync(reg);
     }
 
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(1);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+                return;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.True(await condition(), "condition was not met before the timeout elapsed");
+    }
+
     // ── (a) agent-completed-but-no-transition ────────────────────────────────
 
     [Fact]
@@ -478,6 +492,54 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, after!.State);
         Assert.Empty(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_PeriodicSweep_WaitsForStartupResumeBarrier()
+    {
+        var barrier = new StartupSandboxResumeBarrier();
+        var watchdog = new WorkerProgressWatchdog(
+            _registry,
+            _store,
+            _queue,
+            new WorkerProgressWatchdogOptions
+            {
+                ProgressTimeout = TimeSpan.FromMilliseconds(10),
+                CheckInterval = TimeSpan.FromMilliseconds(10),
+                AutoRecover = true,
+            },
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams,
+            _webhooks,
+            _slotReleaser,
+            startupResumeBarrier: barrier);
+
+        var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow.AddMinutes(-5));
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync("startup-resume-worker", item.Id);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(80));
+
+            var beforeRelease = await _store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, beforeRelease!.State);
+            Assert.Single(await _registry.ListAsync(CancellationToken.None));
+            Assert.Equal(0, _queue.Count);
+
+            barrier.MarkCompleted();
+            await WaitUntilAsync(async () =>
+            {
+                var after = await _store.GetAsync(item.Id);
+                return after?.State == WorkItemState.Queued && _queue.Count == 1;
+            });
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            await watchdog.StopAsync(stopCts.Token);
+        }
     }
 
     // ── Multi-worker collateral survival (regression test) ───────────────────
