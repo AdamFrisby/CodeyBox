@@ -79,8 +79,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             {
                 "skipped:max-retries",
                 self => self.BuildScheduler(BuildRouter(availablePct: 100), BuildProjects()),
-                () => CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with { QuotaRetryAttempts = 3 },
-                "WaitingForQuotaReset",
+                () => CreateQuotaItem(WorkItemState.Failed) with { QuotaRetryAttempts = 3 },
+                "Failed",
                 _ => "attempts=3; max=3"
             },
             {
@@ -133,6 +133,29 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
                 item => $"cannot retry from 'audit': bare repo for work item {item.Id} no longer exists"
             },
         };
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WaitingItemAtMaxRetriesLeavesQuotaWaitWhenQuotaUsable()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryAttempts = 3,
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("quota", stored.FailureKind);
+        Assert.Null(stored.NextQuotaRetryAt);
+        Assert.Equal(3, stored.QuotaRetryAttempts);
+
+        var evt = AssertQuotaAttempt(item, "periodic", "skipped:max-retries", "WaitingForQuotaReset");
+        Assert.Equal("attempts=3; max=3", GetScalar<string>(evt, "Reason"));
     }
 
     [Fact]
@@ -196,7 +219,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
-    public async Task TargetedTimer_RequeuesWaitingForQuotaResetItemAfterStartupRearm()
+    public async Task RearmTimers_RequeuesWaitingForQuotaResetItemWithoutWaitingForTargetedTimer()
     {
         var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
         var probe = new MutableQuotaProbe(availablePct: 0);
@@ -209,18 +232,12 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         await RearmTimersAsync(fixture.Scheduler);
 
-        var stillParked = await fixture.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
-        Assert.Equal(0, stillParked.QuotaRetryAttempts);
-        var timer = Assert.Single(time.Timers);
-
-        probe.AvailablePct = 100;
-        timer.Fire();
-
-        var evt = await WaitForQuotaAttemptAsync(item, "targeted", "retried");
         var retried = await fixture.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Empty(time.Timers);
+
+        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
         Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
         Assert.Equal("from=work", GetScalar<string>(evt, "Reason"));
     }
