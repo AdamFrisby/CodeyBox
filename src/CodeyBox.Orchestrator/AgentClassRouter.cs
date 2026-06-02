@@ -226,7 +226,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null)
             return new AgentRoutingDecision { Reason = "no agent class configured" };
-        var smokeTarget = ResolveWorkSmokeTarget(project).WithBaselineRef(item.BaselineImageRef);
+        var smokeTarget = ResolveWorkSmokeTarget(project, item.BaselineImageRef);
 
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
         {
@@ -733,8 +733,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
         if (classId is null || !cfg.Catalog.TryGetValue(classId, out var agentClass))
             return [];
-        var target = (smokeTarget ?? ResolveWorkSmokeTarget(project))
-            .WithBaselineRef(item.BaselineImageRef);
+        var target = smokeTarget ?? ResolveWorkSmokeTarget(project, item.BaselineImageRef);
 
         var nowUtc = _time.GetUtcNow();
         // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
@@ -792,17 +791,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     /// directly. Returns null only when neither is wired (no availability
     /// tracking → legacy behaviour, every candidate is routable). Centralised
     /// so primary routing and fallback selection cannot drift in gate semantics.
-    /// <see cref="InVmSmokeSandboxTarget.BaselineRef"/> is the work item's pinned
-    /// baseline so the gate probes the image the dispatch will clone (B1
-    /// pinning), not just the active baseline.
+    /// <see cref="InVmSmokeSandboxTarget.BaselineRef"/> is set only when the
+    /// requested target matches the work item's pinned work/headless baseline,
+    /// so non-work or graphical targets resolve their own active baseline.
     /// </summary>
-    private InVmSmokeSandboxTarget ResolveWorkSmokeTarget(Project? project)
+    private InVmSmokeSandboxTarget ResolveWorkSmokeTarget(Project? project, string? workBaselineRef = null)
     {
         if (project is null)
             return _configuredSmokeTarget ?? default;
 
         return SandboxTargetResolver.ToInVmSmokeTarget(
-            SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work));
+            project,
+            SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
+            workBaselineRef);
     }
 
     private async Task<AgentAvailability?> GetGatedAvailabilityAsync(

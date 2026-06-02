@@ -270,6 +270,24 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureAvailableAsync_ResolverThrows_DefaultFailClosed_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A") { ThrowOnResolve = true };
+        var prober = Build(provider, registry, NewCache(), resolver);
+
+        var availability = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor,
+            WorkTarget,
+            CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline warm-up failed", availability.Reason);
+    }
+
+    [Fact]
     public async Task EnsureBaselineReturnsNull_OnDispatchGate_BenchesWithoutProvisioning()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
@@ -1805,11 +1823,16 @@ public sealed class InVmSmokeProberTests
     {
         public string? Ref { get; set; }
         public bool CanEnsure { get; set; } = true;
+        public bool ThrowOnResolve { get; set; }
         public bool ThrowOnEnsure { get; set; }
         public List<(string Profile, SandboxProfileFlavor Flavor, string? PinnedRef)> EnsureCalls { get; } = [];
         public FakeBaselineResolver(string? r) => Ref = r;
 
-        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor) => Ref;
+        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+        {
+            if (ThrowOnResolve) throw new InvalidOperationException("baseline resolver failed");
+            return Ref;
+        }
 
         public Task<string?> EnsureBaselineImageAsync(
             string profileName,

@@ -107,6 +107,21 @@ public sealed class InVmSmokeGateTests
         Assert.Equal("base-PINNED", target.BaselineRef);
     }
 
+    [Fact]
+    public async Task ResolveAsync_GraphicalProject_DoesNotForwardHeadlessWorkPin()
+    {
+        var gate = new RecordingGate();
+        var router = BuildRouter(NewRegistry(), gate);
+        var project = MakeProject() with { GraphicalSandbox = true };
+
+        await router.ResolveAsync(MakeItem(baselineImageRef: "base-HEADLESS-WORK"), project, CancellationToken.None);
+
+        var target = Assert.Single(gate.SeenTargets);
+        Assert.Equal(SandboxConventions.GraphicalNetworkProfile, target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Graphical, target.Flavor);
+        Assert.Null(target.BaselineRef);
+    }
+
     /// <summary>
     /// Records the baselineRef forwarded by the router and reports every agent as
     /// available so routing proceeds normally.

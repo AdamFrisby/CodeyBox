@@ -1151,6 +1151,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
                 ?? project.NetworkProfiles.AuditTool;
+            var rebaseTarget = new SandboxTarget(rebaseProfile, SandboxProfileFlavor.Headless);
             var spec = BuildSandboxSpec(
                 access,
                 includeAgentCredential: credential,
@@ -1158,7 +1159,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
-                baselineImageRef: baselineImageRef);
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, rebaseTarget, baselineImageRef));
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             if (credential is not null && credential.Files.Count > 0)
@@ -1964,7 +1965,11 @@ public sealed class PipelineRunner : IPipelineRunner
         };
         var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
             hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: agentPhase,
-            flavor: sandboxFlavor, extraEnvironment: extraEnv, baselineImageRef: item.BaselineImageRef);
+            flavor: sandboxFlavor, extraEnvironment: extraEnv,
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(networkProfile, sandboxFlavor),
+                item.BaselineImageRef));
 
         var sandboxStartSw = Stopwatch.StartNew();
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -2506,7 +2511,10 @@ public sealed class PipelineRunner : IPipelineRunner
             timingPhase: "check",
             flavor: SandboxProfileFlavor.Headless,
             extraEnvironment: null,
-            baselineImageRef: item.BaselineImageRef);
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
+                item.BaselineImageRef));
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
@@ -2843,7 +2851,10 @@ public sealed class PipelineRunner : IPipelineRunner
             timingPhase: "post-act-recheck",
             flavor: SandboxProfileFlavor.Headless,
             extraEnvironment: null,
-            baselineImageRef: item.BaselineImageRef);
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
+                item.BaselineImageRef));
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
@@ -3423,7 +3434,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 group.Key.Caps);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                 hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
-                flavor: sandboxTarget.Flavor, baselineImageRef: item.BaselineImageRef);
+                flavor: sandboxTarget.Flavor,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
             spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
 
             // Within each capability group, split by Kind so tool auditors stay
@@ -3471,7 +3483,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         timingWorkItemId: ctx.WorkItemId,
                         timingPhase: "audit",
                         flavor: sandboxTarget.Flavor,
-                        baselineImageRef: item.BaselineImageRef);
+                        baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
                     return candidateSpec with
                     {
                         Mounts =
@@ -3559,7 +3571,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         // must not also record one per attempt — that would
                         // double-count and collapse the retry into a single row.
                         recordInvolvement: false,
-                        smokeTarget: SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget, item.BaselineImageRef));
+                        smokeTarget: SandboxTargetResolver.ToInVmSmokeTarget(project, sandboxTarget, item.BaselineImageRef));
                 }
 
                 var llmTasks = llmPairs.Select(async pair =>
@@ -3927,6 +3939,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // OrderedFallbackCandidatesAsync, so without this the preferred fast path
         // was the one hole left open.
         var auditSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
+            project,
             SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditAgent, required),
             item.BaselineImageRef);
         var preferredAvailability = await EnsureAgentSmokeAvailableAsync(
@@ -4172,7 +4185,7 @@ public sealed class PipelineRunner : IPipelineRunner
             _ => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work),
         };
 
-        return SandboxTargetResolver.ToInVmSmokeTarget(sandboxTarget, baselineRef);
+        return SandboxTargetResolver.ToInVmSmokeTarget(project, sandboxTarget, baselineRef);
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
@@ -4335,8 +4348,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 ModelId = initialMemberOverride?.ModelId ?? item.ModelId,
                 ReasoningMode = initialMemberOverride?.ReasoningMode ?? item.ReasoningMode,
             };
-        var fallbackSmokeTarget = (smokeTarget ?? ResolvePhaseSmokeTarget(project, phase))
-            .WithBaselineRef(item.BaselineImageRef);
+        var fallbackSmokeTarget = smokeTarget ?? ResolvePhaseSmokeTarget(project, phase, item.BaselineImageRef);
 
         // Single-attempt path when fallback is not wired (no class, no router).
         // The behaviour matches the legacy code: TerminalQuotaError bubbles out.
@@ -5012,7 +5024,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
             var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: true,
                 hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
-                baselineImageRef: item.BaselineImageRef);
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                    project,
+                    new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
+                    item.BaselineImageRef));
             var mergeSandboxStartSw = Stopwatch.StartNew();
             await using var sandbox = isolatedMergeRepoPath is null
                 ? await _sandboxes.CreateAsync(spec, ct)
@@ -6756,10 +6771,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
                 : await _credentials.GetAsync(runner.Kind, ct);
             var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
+            var conflictReworkTarget = new SandboxTarget(
+                project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
+                SandboxProfileFlavor.Headless);
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
-                hostNetworkProfile: project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
+                hostNetworkProfile: conflictReworkTarget.NetworkProfile,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
-                baselineImageRef: item.BaselineImageRef);
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef));
 
             await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
             if (credential is not null && credential.Files.Count > 0)

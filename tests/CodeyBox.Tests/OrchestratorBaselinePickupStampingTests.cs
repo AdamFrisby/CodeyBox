@@ -10,8 +10,8 @@ namespace CodeyBox.Tests;
 /// <see cref="IBaselineImageResolver"/> when an item is first picked up (the
 /// same SQL UPDATE that records <c>StartedAt</c>) and persist whatever
 /// non-null value the resolver returned to
-/// <see cref="WorkItem.BaselineImageRef"/>. Subsequent phases must see the
-/// stamped ref on the in-memory item passed into <see cref="IPipelineRunner"/>.
+/// <see cref="WorkItem.BaselineImageRef"/>. The in-memory item passed into
+/// <see cref="IPipelineRunner"/> must carry that same persisted ref.
 /// </summary>
 public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
 {
@@ -242,6 +242,13 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
             NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("p"),
+                DisplayName = "Test",
+                RepositoryUrl = "https://example/repo",
+                NetworkProfiles = new ProjectNetworkProfiles { Work = "work" },
+            }),
             router: router,
             baselineResolver: resolver);
 

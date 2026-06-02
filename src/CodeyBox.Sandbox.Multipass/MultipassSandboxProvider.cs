@@ -70,6 +70,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     private readonly ConcurrentDictionary<string, BaselineTarget> _baselineTargets = new(StringComparer.Ordinal);
 
     private readonly record struct BaselineTarget(string ProfileName, SandboxProfileFlavor Flavor);
+    private sealed record BaselineTargetMetadata(string ProfileName, string Flavor);
 
     // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
@@ -1096,10 +1097,11 @@ git push origin HEAD:{refName}";
                 $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]");
 
         // B1 pins are VM names, but Multipass clones inherit the source VM's
-        // network attachment. Only accept a pin that this provider resolved for
-        // the same requested profile/flavor, or a pin that still equals the live
-        // ref for this target after a restart. Unknown stale pins fail closed
-        // instead of cloning a work-profile baseline into an audit/rework phase.
+        // network attachment. ResolveBaselineRef persists the profile/flavor that
+        // produced each ref so a restarted provider can still accept a same-target
+        // stale pin after baseline-contributing config drift. Unknown stale pins
+        // fail closed instead of cloning a work-profile baseline into an
+        // audit/rework phase.
         var liveBaselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
         var baselineName = liveBaselineName;
         if (!string.IsNullOrWhiteSpace(pinnedBaselineRef))
@@ -1141,6 +1143,16 @@ git push origin HEAD:{refName}";
                 $"but this sandbox requested network profile '{profileName}' / flavor '{flavor}'. Refusing to clone a baseline with a different network attachment.");
         }
 
+        if (TryReadPersistedBaselineTarget(pinnedBaselineRef, out pinnedTarget))
+        {
+            if (pinnedTarget == requested)
+                return;
+
+            throw new InvalidOperationException(
+                $"Pinned baseline '{pinnedBaselineRef}' was persisted for network profile '{pinnedTarget.ProfileName}' / flavor '{pinnedTarget.Flavor}', " +
+                $"but this sandbox requested network profile '{profileName}' / flavor '{flavor}'. Refusing to clone a baseline with a different network attachment.");
+        }
+
         if (string.Equals(pinnedBaselineRef, liveBaselineName, StringComparison.Ordinal))
             return;
 
@@ -1154,6 +1166,69 @@ git push origin HEAD:{refName}";
         if (string.IsNullOrWhiteSpace(baselineName))
             return;
         _baselineTargets.TryAdd(baselineName, new BaselineTarget(profileName, flavor));
+        TryPersistBaselineTarget(baselineName, profileName, flavor);
+    }
+
+    private bool TryGetBaselineTargetMetadataPath(string baselineName, out string path)
+    {
+        path = string.Empty;
+        if (!IsValidSandboxName(baselineName))
+            return false;
+
+        var dir = Path.Combine(_stagingRoot, "_baseline-targets");
+        path = Path.Combine(dir, baselineName + ".json");
+        return true;
+    }
+
+    private void TryPersistBaselineTarget(string baselineName, string profileName, SandboxProfileFlavor flavor)
+    {
+        if (!TryGetBaselineTargetMetadataPath(baselineName, out var path))
+            return;
+
+        try
+        {
+            var dir = Path.GetDirectoryName(path)!;
+            Directory.CreateDirectory(dir);
+            TryChmod0700(dir);
+            var temp = Path.Combine(dir, "." + baselineName + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            var metadata = new BaselineTargetMetadata(profileName, flavor.ToString());
+            File.WriteAllText(temp, JsonSerializer.Serialize(metadata));
+            File.Move(temp, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Could not persist baseline target metadata for {Baseline}; future restarts may reject stale pinned refs",
+                baselineName);
+        }
+    }
+
+    private bool TryReadPersistedBaselineTarget(string baselineName, out BaselineTarget target)
+    {
+        target = default;
+        if (!TryGetBaselineTargetMetadataPath(baselineName, out var path))
+            return false;
+
+        try
+        {
+            if (!File.Exists(path))
+                return false;
+
+            var metadata = JsonSerializer.Deserialize<BaselineTargetMetadata>(File.ReadAllText(path));
+            if (metadata is null
+                || string.IsNullOrWhiteSpace(metadata.ProfileName)
+                || !Enum.TryParse<SandboxProfileFlavor>(metadata.Flavor, ignoreCase: false, out var flavor))
+                return false;
+
+            target = new BaselineTarget(metadata.ProfileName, flavor);
+            _baselineTargets.TryAdd(baselineName, target);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Could not read baseline target metadata for {Baseline}", baselineName);
+            return false;
+        }
     }
 
     private SemaphoreSlim GetBaselineLock(string baselineName)

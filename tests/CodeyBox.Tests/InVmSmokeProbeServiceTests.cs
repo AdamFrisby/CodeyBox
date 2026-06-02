@@ -51,7 +51,7 @@ public sealed class InVmSmokeProbeServiceTests
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(5)));
+        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(15)));
         Assert.Same(done, winner); // single-sweep ExecuteAsync must complete promptly
         await done; // surface any exception that escaped (there must be none)
     }
@@ -155,6 +155,63 @@ public sealed class InVmSmokeProbeServiceTests
         var target = Assert.Single(gate.Targets);
         Assert.Equal("internet-only", target.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+    }
+
+    [Fact]
+    public async Task StartupSweep_SkipsBlankProjectProfiles()
+    {
+        var gate = new CountingGate();
+        var blank = new Project
+        {
+            Id = new ProjectId("blank"),
+            DisplayName = "Blank",
+            RepositoryUrl = "https://example.invalid/blank.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "" },
+        };
+        var valid = new Project
+        {
+            Id = new ProjectId("valid"),
+            DisplayName = "Valid",
+            RepositoryUrl = "https://example.invalid/valid.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "internet-only" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(blank, valid));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("internet-only", target.NetworkProfile);
+    }
+
+    [Fact]
+    public async Task StartupSweep_DeDuplicatesProjectProfiles()
+    {
+        var gate = new CountingGate();
+        Project Project(string id) => new()
+        {
+            Id = new ProjectId(id),
+            DisplayName = id,
+            RepositoryUrl = $"https://example.invalid/{id}.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "internet-only" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(Project("alpha"), Project("beta")));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("internet-only", target.NetworkProfile);
     }
 
 

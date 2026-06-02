@@ -177,9 +177,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// one call. Returns the agent's prior availability untouched when the gate
     /// is disabled; otherwise probes and returns the reconciled availability. A
     /// cache hit is free.
-    /// <paramref name="baselineRef"/> is the work item's pinned baseline (or null
-    /// for unpinned work → active baseline); the probe runs against the image the
-    /// dispatch will actually clone, not just whatever baseline is active now.
+    /// <paramref name="target"/> carries the sandbox profile/flavor and optional
+    /// pinned baseline ref; the probe runs against the image the dispatch will
+    /// actually clone, not just whatever baseline is active now.
     ///
     /// <para>When the agent is already excluded we normally short-circuit — no
     /// point probing a binary the router will skip regardless. But in-VM verdicts

@@ -466,7 +466,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         Assert.Equal(AgentKind.Claude, call.Kind);
         Assert.Equal("audit-agent-profile", call.Target.NetworkProfile);
         Assert.Equal(SandboxProfileFlavor.Headless, call.Target.Flavor);
-        Assert.Equal("cb-baseline-pin", call.Target.BaselineRef);
+        Assert.Null(call.Target.BaselineRef);
     }
 
     // ── Fixture and helpers ────────────────────────────────────────────────

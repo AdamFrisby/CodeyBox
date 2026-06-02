@@ -75,11 +75,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
     private readonly ReleaseService? _releaseService;
-    // B1 baseline-pinning: stamps WorkItem.BaselineImageRef at pickup time so
-    // subsequent phases reuse the same baseline even after an operator edits
-    // config. For providers that don't model baselines (process / bubblewrap)
-    // the DI factory hands in NullBaselineImageResolver which returns null
-    // for every resolve — pickup proceeds without a stamp.
+    // B1 baseline-pinning: stamps the work/headless baseline ref at pickup time
+    // so matching work-profile sandboxes keep using that baseline even after an
+    // operator edits config. Later phases with different profiles or graphical
+    // flavor resolve their own target baselines rather than reusing this pin.
+    // For providers that don't model baselines (process / bubblewrap) the DI
+    // factory hands in NullBaselineImageResolver which returns null for every
+    // resolve — pickup proceeds without a stamp.
     private readonly IBaselineImageResolver _baselineResolver;
     private readonly OrchestratorProgressClock _progressClock;
     // Shared swappable holder. Both this service AND PipelineRunner (the
@@ -1124,15 +1126,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
 
-            // Pin the baseline image ref BEFORE routing so the in-VM smoke gate
-            // probes (and caches against) the exact image this dispatch will
-            // clone, not whatever baseline happens to be active now. Without
-            // this, the router gates on a null ref → the gate's active-baseline
-            // fallback, while pickup below stamps the project work-phase baseline
-            // hash that PipelineRunner later re-gates on; a mismatch can route to
-            // an agent that passed the wrong image and then fail the whole item
-            // (AC#1). The persisted StartedAt/BaselineImageRef write still happens
-            // under the budget lock below; this only settles the in-memory ref.
+            // Pin the work/headless baseline image ref BEFORE routing so the
+            // in-VM smoke gate probes (and caches against) the exact image a
+            // matching work-profile dispatch will clone, not whatever baseline
+            // happens to be active now. Without this, the router gates on a null
+            // ref → the gate's active-baseline fallback, while pickup below
+            // stamps the project work-phase baseline hash that PipelineRunner
+            // later re-gates on for matching work targets; a mismatch can route
+            // to an agent that passed the wrong image and then fail the item
+            // (AC#1). The persisted StartedAt/BaselineImageRef write still
+            // happens under the budget lock below; this only settles the
+            // in-memory ref.
             if (item.BaselineImageRef is null)
             {
                 var pinnedRef = ResolveBaselineRefForPickup(item, project);
@@ -1496,21 +1500,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// when the project's work-phase network profile is unset, or when the
     /// resolver returns null (provider says "no baseline for this combo" —
     /// e.g. <c>UseBaselineImages=false</c>). The dispatcher stamps the result
-    /// on the work item right alongside the StartedAt write so subsequent
-    /// phases pick it up via <see cref="WorkItem.BaselineImageRef"/>. Never
-    /// throws — a resolver that throws would have to fail open: pinning is an
-    /// optimisation, not a correctness primitive.
+    /// on the work item right alongside the StartedAt write; downstream sandbox
+    /// target resolution uses it only when the requested profile/flavor matches
+    /// this work/headless target. Never throws — a resolver that throws would
+    /// have to fail open: pinning is an optimisation, not a correctness primitive.
     /// </summary>
     private string? ResolveBaselineRefForPickup(WorkItem item, Project? project)
     {
         // Default to the project's work-phase profile. Later phases may use
-        // different profiles; the Multipass provider validates the pinned VM
-        // against the requested profile/flavor and fails closed rather than
-        // cloning a baseline with the wrong network attachment.
+        // different profiles; PipelineRunner/AgentClassRouter only forward this
+        // pin to matching work/headless targets.
         var profile = project?.NetworkProfiles.Work;
-        // Default to Headless; the few callers using Graphical flavors resolve
-        // it in the pipeline. For B1 pinning the headless default is fine —
-        // graphical-only pipelines can extend this later if the cost matters.
+        // Default to Headless; graphical targets resolve their own baseline in
+        // the pipeline instead of reusing this work pin.
         try
         {
             return _baselineResolver.ResolveBaselineRef(profile, SandboxProfileFlavor.Headless);
