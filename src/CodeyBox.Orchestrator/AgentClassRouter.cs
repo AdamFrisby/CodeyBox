@@ -682,6 +682,37 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         return null;
     }
 
+    /// <summary>
+    /// Returns the set of agent kinds in <paramref name="classId"/> that
+    /// declare <paramref name="capability"/> in their
+    /// <see cref="AgentMembership.Capabilities"/> list, or <c>null</c> when
+    /// the class is unknown OR no member carries the tag (the
+    /// "opt-out / legacy" signal — no member opted in, so callers should
+    /// fall back to their pre-capability routing). Returns a non-empty set
+    /// only when at least one member is tagged, so callers can treat a
+    /// non-null result as "the pool is active and restrictive".
+    /// <para>
+    /// Used by <c>PipelineRunner.ResolveAuditAgentRunnerAsync</c> to gate the
+    /// audit phase to <see cref="WellKnownCapabilities.Audit"/>-tagged
+    /// members without hardcoding agent IDs in code. Capability comparison
+    /// is ordinal, case-insensitive — matches
+    /// <see cref="AgentMembershipExtensions.HasCapability"/>.
+    /// </para>
+    /// </summary>
+    public IReadOnlySet<AgentKind>? GetCapabilityPool(string? classId, string capability)
+    {
+        if (string.IsNullOrEmpty(classId) || string.IsNullOrEmpty(capability)) return null;
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
+        var pool = new HashSet<AgentKind>();
+        foreach (var member in agentClass.Members)
+        {
+            if (member.HasCapability(capability))
+                pool.Add(member.Agent);
+        }
+        return pool.Count == 0 ? null : pool;
+    }
+
     /// <inheritdoc />
     public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
     {
