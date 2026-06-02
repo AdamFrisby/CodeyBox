@@ -38,7 +38,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
-    private readonly IStartupSandboxResumeBarrier? _startupResumeBarrier;
+    private readonly IStartupRecoveryBarrier? _startupRecoveryBarrier;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -57,7 +57,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
+        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _registry = registry;
         _store = store;
@@ -67,7 +67,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _streams = streams;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
-        _startupResumeBarrier = startupResumeBarrier;
+        _startupRecoveryBarrier = startupRecoveryBarrier;
     }
 
     public WorkerProgressWatchdog(
@@ -79,8 +79,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupResumeBarrier) { }
+        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -96,12 +96,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (_startupResumeBarrier is not null)
+        if (_startupRecoveryBarrier is not null)
         {
-            // Keep startup recovery ordered behind suspended-VM resume/adoption
-            // so the watchdog does not recycle items that still carry
-            // SuspendedVmName while the resume service is reattaching them.
-            await _startupResumeBarrier.Completion.WaitAsync(stoppingToken);
+            // Keep the first watchdog pass behind the orchestrator's startup
+            // recovery sweep. The watchdog ignores heartbeat freshness, so it
+            // must not claim stale rows left for the startup reaper path.
+            await _startupRecoveryBarrier.InitialRecoveryCompleted.WaitAsync(stoppingToken);
         }
 
         await RunOnceAsync(stoppingToken);

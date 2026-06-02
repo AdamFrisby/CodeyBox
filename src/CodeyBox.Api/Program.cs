@@ -1643,7 +1643,7 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         () => monitor.CurrentValue.DeadWorker,
         sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
-        startupResumeBarrier: sp.GetRequiredService<IStartupSandboxResumeBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupRecoveryBarrier>());
 });
 
 // --- Worker progress watchdog -----------------------------------------------
@@ -1671,7 +1671,7 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         sp.GetRequiredService<ILogger<WorkerProgressWatchdog>>(),
         sp.GetService<IAgentStreamStore>(),
         sp.GetService<IWebhookDispatcher>(),
-        startupResumeBarrier: sp.GetRequiredService<IStartupSandboxResumeBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupRecoveryBarrier>());
 });
 
 // --- Agent cost extractors + calculator ------------------------------------
@@ -1932,11 +1932,11 @@ builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IUpstreamRemoteFactory>(),
     sp.GetRequiredService<ILogger<ReleaseMainSyncService>>()));
 
-builder.Services.AddSingleton<StartupSandboxResumeBarrier>();
-builder.Services.AddSingleton<IStartupSandboxResumeBarrier>(
-    sp => sp.GetRequiredService<StartupSandboxResumeBarrier>());
-builder.Services.AddSingleton<IStartupSandboxResumeCompletionSink>(
-    sp => sp.GetRequiredService<StartupSandboxResumeBarrier>());
+builder.Services.AddSingleton<StartupRecoveryBarrier>();
+builder.Services.AddSingleton<IStartupRecoveryBarrier>(
+    sp => sp.GetRequiredService<StartupRecoveryBarrier>());
+builder.Services.AddSingleton<IStartupRecoveryCompletionSink>(
+    sp => sp.GetRequiredService<StartupRecoveryBarrier>());
 builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService(
     sp.GetRequiredService<ITaskQueue>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -1958,7 +1958,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<OrchestratorProgressClock>(),
     sp.GetRequiredService<QuotaRouterOptions>(),
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
-    sp.GetRequiredService<IStartupSandboxResumeBarrier>()));
+    sp.GetRequiredService<IStartupRecoveryBarrier>(),
+    sp.GetRequiredService<IStartupRecoveryCompletionSink>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
@@ -1978,7 +1979,7 @@ builder.Services.AddHostedService(sp =>
 // R8-core: suspend in-flight sandboxes on graceful shutdown so the next process
 // can resume them. The shutdown half is lifecycle-bound (StoppingAsync). Startup
 // resume defaults to background mode so a wedged multipassd cannot keep Kestrel
-// offline; OrchestratorService waits on IStartupSandboxResumeBarrier before its
+// offline; OrchestratorService waits for startup recovery input before its
 // dead-worker startup recovery sweep.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
@@ -2021,7 +2022,7 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
     },
-    sp.GetRequiredService<IStartupSandboxResumeCompletionSink>()));
+    sp.GetRequiredService<IStartupRecoveryCompletionSink>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the

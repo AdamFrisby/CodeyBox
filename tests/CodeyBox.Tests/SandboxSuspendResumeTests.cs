@@ -599,6 +599,35 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal(0, after.RecoveryAttempts);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.ReworkingForConflict)]
+    public async Task StartupResume_ResumeFailure_ForNonWorkingSuspendedItems_ClearsBookkeepingWithoutFailing(
+        WorkItemState state)
+    {
+        var item = MakeItem(state);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = $"vm-{state}",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrows = true };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(state, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.LastError);
+        Assert.Equal(0, after.RecoveryAttempts);
+    }
+
     [Fact]
     public async Task StartupResume_BlockingMode_RunsFromStartingAsyncAndHonorsTimeout()
     {
@@ -642,7 +671,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         });
 
         var provider = new FakeSuspendingProvider { ResumeHangs = true };
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var options = new SandboxStartupResumeOptions
         {
             Mode = SandboxStartupResumeMode.Background,
@@ -663,7 +692,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.False(startTask.IsCompleted);
         await startTask.WaitAsync(TimeSpan.FromSeconds(1));
 
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
         Assert.Null(after!.SuspendedVmName);
@@ -699,16 +728,22 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_ReloadedOptions_AreReadForLaterResumeAndAdoption()
     {
+        var gate = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(gate with
+        {
+            SuspendedVmName = "vm-0-hot-gate",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
         var hung = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(hung with
         {
-            SuspendedVmName = "vm-hot-timeout",
+            SuspendedVmName = "vm-1-hot-timeout",
             SuspendedAt = DateTimeOffset.UtcNow,
         });
         var adopted = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(adopted with
         {
-            SuspendedVmName = "vm-hot-adoption",
+            SuspendedVmName = "vm-2-hot-adoption",
             SuspendedAt = DateTimeOffset.UtcNow,
             AgentLogPath = "/work/.codeybox/agent-logs/hot.log",
         });
@@ -720,9 +755,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             ResumeTimeout = TimeSpan.FromSeconds(30),
             AdoptionDeadline = TimeSpan.FromMinutes(30),
         };
+        var gateRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var provider = new FakeSuspendingProvider
         {
-            ResumeNamesToHang = new HashSet<string>(StringComparer.Ordinal) { "vm-hot-timeout" },
+            ResumeReleaseSources = new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal)
+            {
+                ["vm-0-hot-gate"] = gateRelease,
+            },
+            ResumeNamesToHang = new HashSet<string>(StringComparer.Ordinal) { "vm-1-hot-timeout" },
             AdoptionExitCodeToReturn = 0,
         };
         var svc = new SandboxResumeOnStartupService(
@@ -731,21 +771,25 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             NullLogger<SandboxResumeOnStartupService>.Instance,
             () => options);
 
+        var resumeTask = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-0-hot-gate"));
+
         var hotDeadline = TimeSpan.FromSeconds(7);
         options = options with
         {
             ResumeTimeout = TimeSpan.FromMilliseconds(50),
             AdoptionDeadline = hotDeadline,
         };
+        gateRelease.SetResult();
 
-        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
 
         var timedOut = await _store.GetAsync(hung.Id);
         Assert.Equal(WorkItemState.Failed, timedOut!.State);
         Assert.Contains("timed out", timedOut.LastError);
 
         var adoption = Assert.Single(provider.AdoptionCalls);
-        Assert.Equal("vm-hot-adoption", adoption.VmName);
+        Assert.Equal("vm-2-hot-adoption", adoption.VmName);
         Assert.Equal(hotDeadline, adoption.Deadline);
     }
 
@@ -766,7 +810,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_NoSuspendedItems_CompletesBackgroundBarrier()
     {
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var svc = new SandboxResumeOnStartupService(
             new FakeSuspendingProvider(),
             _store,
@@ -775,7 +819,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -790,7 +834,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         });
 
         var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var svc = new SandboxResumeOnStartupService(
             provider,
             _store,
@@ -804,7 +848,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
         await svc.StopAsync(stopCts.Token);
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.True(provider.ResumeCancellationObserved);
 
@@ -839,7 +883,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_NonSuspendingProvider_CompletesBackgroundBarrier()
     {
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var item = MakeItem();
         await _store.CreateAsync(item with
         {
@@ -854,7 +898,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -885,7 +929,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_NullProvider_CompletesBackgroundBarrier()
     {
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var item = MakeItem();
         await _store.CreateAsync(item with
         {
@@ -900,14 +944,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
     public async Task StartupResume_BackgroundSweepException_CompletesBarrier()
     {
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var svc = new SandboxResumeOnStartupService(
             new FakeSuspendingProvider(),
             new StubWorkItemStore(),
@@ -916,7 +960,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -1439,7 +1483,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             CurrentWorkItemId = item.Id.ToString(),
         });
 
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var queue = new InMemoryTaskQueue();
         var provider = new FakeSuspendingProvider
         {
@@ -1464,7 +1508,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             },
             NullLogger<DeadWorkerReaper>.Instance,
             new NullWebhookDispatcher(),
-            startupResumeBarrier: barrier);
+            startupRecoveryBarrier: barrier);
 
         await reaper.StartAsync(CancellationToken.None);
         try
@@ -1481,7 +1525,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             Assert.Single(await registry.ListAsync(CancellationToken.None));
 
             provider.AdoptionResultSource!.SetResult(0);
-            await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+            await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+            barrier.MarkInitialRecoveryCompleted();
             await WaitUntilAsync(async () =>
             {
                 var after = await _store.GetAsync(item.Id);
@@ -1879,6 +1924,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool ResumeThrowsCancellation { get; set; }
         public bool ResumeHangs { get; set; }
         public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
+        public IDictionary<string, TaskCompletionSource> ResumeReleaseSources { get; set; } =
+            new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal);
         public bool ResumeObservesCancellation { get; set; }
         public bool ResumeCancellationObserved { get; private set; }
         public int? AdoptionExitCodeToReturn { get; set; }
@@ -1911,6 +1958,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             if (ResumeThrowsCancellation) throw new OperationCanceledException("provider cancelled resume");
+            if (ResumeReleaseSources.TryGetValue(name, out var resumeRelease))
+                return resumeRelease.Task;
             if (ResumeHangs || ResumeNamesToHang.Contains(name))
                 return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             if (ResumeObservesCancellation)

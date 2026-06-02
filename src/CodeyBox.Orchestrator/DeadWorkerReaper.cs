@@ -25,7 +25,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<DeadWorkerOptions> _optsAccessor;
     private readonly ILogger<DeadWorkerReaper> _log;
-    private readonly IStartupSandboxResumeBarrier? _startupResumeBarrier;
+    private readonly IStartupRecoveryBarrier? _startupRecoveryBarrier;
     private readonly ConcurrentDictionary<WorkItemId, byte> _recoveredItemsThisProcess = new();
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
@@ -46,8 +46,8 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
-        : this(registry, store, queue, () => opts, log, webhooks, slotReleaser, startupResumeBarrier) { }
+        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
+        : this(registry, store, queue, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier) { }
 
     public DeadWorkerReaper(
         IWorkerRegistry registry,
@@ -57,7 +57,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
+        IStartupRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _registry = registry;
         _store = store;
@@ -66,7 +66,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         _log = log;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
-        _startupResumeBarrier = startupResumeBarrier;
+        _startupRecoveryBarrier = startupRecoveryBarrier;
     }
 
     internal void AttachWorkerPoolSlotReleaser(IWorkerPoolRecoverySlotReleaser slotReleaser)
@@ -163,8 +163,8 @@ public sealed class DeadWorkerReaper : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (_startupResumeBarrier is not null)
-            await _startupResumeBarrier.Completion.WaitAsync(stoppingToken);
+        if (_startupRecoveryBarrier is not null)
+            await _startupRecoveryBarrier.InitialRecoveryCompleted.WaitAsync(stoppingToken);
 
         using var timer = new PeriodicTimer(_opts.CheckInterval);
         while (await timer.WaitForNextTickAsync(stoppingToken))

@@ -19,25 +19,6 @@ public sealed record SandboxStartupResumeOptions
     public SandboxStartupResumeMode Mode { get; init; } = SandboxStartupResumeMode.Background;
 }
 
-public interface IStartupSandboxResumeBarrier
-{
-    Task Completion { get; }
-}
-
-public interface IStartupSandboxResumeCompletionSink
-{
-    void MarkCompleted();
-}
-
-public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier, IStartupSandboxResumeCompletionSink
-{
-    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    public Task Completion => _completion.Task;
-
-    public void MarkCompleted() => _completion.TrySetResult();
-}
-
 /// <summary>
 /// R8-core startup half: for every work item the previous process suspended
 /// (<see cref="WorkItem.SuspendedVmName"/> non-null), <c>multipass start</c>
@@ -50,7 +31,7 @@ public sealed class StartupSandboxResumeBarrier : IStartupSandboxResumeBarrier, 
 /// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
 /// only when configured for blocking mode. The default background mode starts
 /// the resume sweep from <see cref="StartAsync"/> and signals
-/// <see cref="IStartupSandboxResumeCompletionSink"/> when done, so the HTTP listener can
+/// <see cref="IStartupRecoveryCompletionSink"/> when done, so the HTTP listener can
 /// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
 /// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
 /// consistent picture (the VM is back to Running, the work item still carries
@@ -92,27 +73,31 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     /// minutes), short enough that a wedged agent does not block the
     /// orchestrator boot indefinitely. Configurable via constructor.
     /// </summary>
-    public static readonly TimeSpan DefaultAdoptionDeadline = TimeSpan.FromMinutes(30);
+    public static readonly TimeSpan DefaultAdoptionDeadline =
+        SandboxStartupResumePolicy.DefaultAdoptionDeadline;
 
     /// <summary>
     /// Default caller-side cap for a single persisted VM resume. The Multipass
     /// provider has its own launch/readiness limits, but the orchestrator also
     /// needs an outer guard for daemon/provider calls that ignore cancellation.
     /// </summary>
-    public static readonly TimeSpan DefaultResumeTimeout = SuspendTimeoutPolicy.DefaultFloor;
+    public static readonly TimeSpan DefaultResumeTimeout =
+        SandboxStartupResumePolicy.DefaultResumeTimeout;
 
     /// <summary>
     /// Hard ceiling for startup resume/adoption waits. The operator-facing
     /// values are configurable, but startup recovery must stay bounded.
     /// </summary>
-    public static readonly TimeSpan MaximumResumeTimeout = TimeSpan.FromHours(2);
-    public static readonly TimeSpan MaximumAdoptionDeadline = TimeSpan.FromHours(2);
+    public static readonly TimeSpan MaximumResumeTimeout =
+        SandboxStartupResumePolicy.MaximumResumeTimeout;
+    public static readonly TimeSpan MaximumAdoptionDeadline =
+        SandboxStartupResumePolicy.MaximumAdoptionDeadline;
 
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
-    private readonly IStartupSandboxResumeCompletionSink _barrier;
+    private readonly IStartupRecoveryCompletionSink _startupRecovery;
     private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
@@ -126,7 +111,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         TimeSpan? adoptionDeadline = null,
         TimeSpan? resumeTimeout = null,
         SandboxStartupResumeMode? mode = null,
-        IStartupSandboxResumeCompletionSink? barrier = null)
+        IStartupRecoveryCompletionSink? barrier = null)
         : this(
             provider,
             store,
@@ -151,13 +136,13 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
         Func<SandboxStartupResumeOptions> optionsAccessor,
-        IStartupSandboxResumeCompletionSink? barrier = null)
+        IStartupRecoveryCompletionSink? barrier = null)
     {
         _provider = provider;
         _store = store;
         _log = log;
         _optionsAccessor = optionsAccessor;
-        _barrier = barrier ?? new StartupSandboxResumeBarrier();
+        _startupRecovery = barrier ?? new StartupRecoveryBarrier();
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -174,38 +159,26 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         return StartResumeOnceAsync(background: false, ct);
     }
 
-    public async Task StopAsync(CancellationToken ct)
-    {
-        CancellationTokenSource? cts;
-        Task? task;
-        lock (_resumeStartGate)
-        {
-            cts = _backgroundCts;
-            task = _resumeTask;
-        }
-
-        try { cts?.Cancel(); }
-        catch (ObjectDisposedException) { }
-        if (task is not null)
-        {
-            try { await task.WaitAsync(ct); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-        }
-
-        if (task is null || task.IsCompleted)
-        {
-            CancellationTokenSource? dispose = null;
-            lock (_resumeStartGate)
+    public Task StopAsync(CancellationToken ct) =>
+        HostedLifecycleTask.StopAsync(
+            () =>
             {
-                if (ReferenceEquals(_backgroundCts, cts))
+                lock (_resumeStartGate)
+                    return (_backgroundCts, _resumeTask);
+            },
+            expected =>
+            {
+                lock (_resumeStartGate)
                 {
-                    dispose = _backgroundCts;
+                    if (!ReferenceEquals(_backgroundCts, expected))
+                        return null;
+
+                    var dispose = _backgroundCts;
                     _backgroundCts = null;
+                    return dispose;
                 }
-            }
-            dispose?.Dispose();
-        }
-    }
+            },
+            ct);
 
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
@@ -264,7 +237,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         finally
         {
-            _barrier.MarkCompleted();
+            _startupRecovery.MarkRecoveryInputReady();
         }
     }
 

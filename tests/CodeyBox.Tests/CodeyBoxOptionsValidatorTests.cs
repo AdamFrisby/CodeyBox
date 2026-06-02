@@ -1,5 +1,5 @@
 using CodeyBox.Api;
-using CodeyBox.Orchestrator;
+using CodeyBox.Core;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
@@ -108,7 +108,7 @@ public sealed class CodeyBoxOptionsValidatorTests
     {
         var options = ValidCodeyBoxOptions();
         options.Shutdown.SandboxResumeTimeout =
-            SandboxResumeOnStartupService.MaximumResumeTimeout + TimeSpan.FromTicks(1);
+            SandboxStartupResumePolicy.MaximumResumeTimeout + TimeSpan.FromTicks(1);
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
 
@@ -135,7 +135,7 @@ public sealed class CodeyBoxOptionsValidatorTests
     {
         var options = ValidCodeyBoxOptions();
         options.Shutdown.SandboxAdoptionDeadlineSeconds =
-            (int)SandboxResumeOnStartupService.MaximumAdoptionDeadline.TotalSeconds + 1;
+            (int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds + 1;
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
 

@@ -391,12 +391,12 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
-    public async Task OrchestratorStartup_WaitsForResumeBarrierBeforeStartupReaperAndReplay()
+    public async Task OrchestratorStartup_WaitsForRecoveryInputBeforeStartupReaperAndReplay()
     {
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item);
 
-        var barrier = new TestStartupResumeBarrier();
+        var barrier = new TestStartupRecoveryBarrier();
         var pipeline = new ImmediateDonePipeline(_store);
         var cancellations = new CancellationRegistry(CancellationToken.None);
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1, MaxRecoveryAttempts = 5 };
@@ -407,7 +407,8 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
             workerRegistry: _registry,
             deadWorkerOpts: _opts,
             reaper: _reaper,
-            startupResumeBarrier: barrier);
+            startupRecoveryBarrier: barrier,
+            startupRecoveryCompletion: barrier);
 
         await svc.StartAsync(CancellationToken.None);
         await barrier.WaitObserved.WaitAsync(TimeSpan.FromSeconds(5));
@@ -417,7 +418,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Equal(WorkItemState.Working, beforeSignal!.State);
         Assert.DoesNotContain(item.Id, pipeline.Executed);
 
-        barrier.MarkCompleted();
+        barrier.MarkRecoveryInputReady();
 
         var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
         WorkItem? final = null;
@@ -435,24 +436,30 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.DoesNotContain(item.Id, pipeline.Executed);
     }
 
-    private sealed class TestStartupResumeBarrier : IStartupSandboxResumeBarrier
+    private sealed class TestStartupRecoveryBarrier : IStartupRecoveryBarrier, IStartupRecoveryCompletionSink
     {
-        private readonly TaskCompletionSource _completion =
+        private readonly TaskCompletionSource _recoveryInputReady =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _initialRecoveryCompleted =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _waitObserved =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task WaitObserved => _waitObserved.Task;
 
-        public Task Completion
+        public Task RecoveryInputReady
         {
             get
             {
                 _waitObserved.TrySetResult();
-                return _completion.Task;
+                return _recoveryInputReady.Task;
             }
         }
 
-        public void MarkCompleted() => _completion.TrySetResult();
+        public Task InitialRecoveryCompleted => _initialRecoveryCompleted.Task;
+
+        public void MarkRecoveryInputReady() => _recoveryInputReady.TrySetResult();
+
+        public void MarkInitialRecoveryCompleted() => _initialRecoveryCompleted.TrySetResult();
     }
 }

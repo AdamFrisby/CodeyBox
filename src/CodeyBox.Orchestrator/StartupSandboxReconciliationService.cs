@@ -59,38 +59,26 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
         return Task.CompletedTask;
     }
 
-    public async Task StopAsync(CancellationToken ct)
-    {
-        CancellationTokenSource? cts;
-        Task? task;
-        lock (_lifecycleGate)
-        {
-            cts = _backgroundCts;
-            task = _reconcileTask;
-        }
-
-        try { cts?.Cancel(); }
-        catch (ObjectDisposedException) { }
-        if (task is not null)
-        {
-            try { await task.WaitAsync(ct); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-        }
-
-        if (task is null || task.IsCompleted)
-        {
-            CancellationTokenSource? dispose = null;
-            lock (_lifecycleGate)
+    public Task StopAsync(CancellationToken ct) =>
+        HostedLifecycleTask.StopAsync(
+            () =>
             {
-                if (ReferenceEquals(_backgroundCts, cts))
+                lock (_lifecycleGate)
+                    return (_backgroundCts, _reconcileTask);
+            },
+            expected =>
+            {
+                lock (_lifecycleGate)
                 {
-                    dispose = _backgroundCts;
+                    if (!ReferenceEquals(_backgroundCts, expected))
+                        return null;
+
+                    var dispose = _backgroundCts;
                     _backgroundCts = null;
+                    return dispose;
                 }
-            }
-            dispose?.Dispose();
-        }
-    }
+            },
+            ct);
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppedAsync(CancellationToken ct) => Task.CompletedTask;
@@ -147,7 +135,11 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
             foreach (var name in unrecoverable)
                 AuditLog.SandboxStartupReconcileFailed(name, "wedged after stop+purge recovery — root cleanup likely required");
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (OperationCanceledException ex)
+        {
+            _log.LogWarning(ex, "Startup sandbox reconciliation was cancelled by the provider; resume handler and leak reaper will handle the residual state");
+        }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Startup sandbox reconciliation threw; resume handler and leak reaper will handle the residual state");

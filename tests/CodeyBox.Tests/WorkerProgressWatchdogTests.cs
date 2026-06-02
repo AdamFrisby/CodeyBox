@@ -495,9 +495,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_PeriodicSweep_WaitsForStartupResumeBarrier()
+    public async Task Watchdog_PeriodicSweep_WaitsForStartupRecoveryCompletion()
     {
-        var barrier = new StartupSandboxResumeBarrier();
+        var barrier = new StartupRecoveryBarrier();
         var watchdog = new WorkerProgressWatchdog(
             _registry,
             _store,
@@ -512,7 +512,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             _streams,
             _webhooks,
             _slotReleaser,
-            startupResumeBarrier: barrier);
+            startupRecoveryBarrier: barrier);
 
         var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow.AddMinutes(-5));
         await _store.CreateAsync(item);
@@ -528,7 +528,14 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             Assert.Single(await _registry.ListAsync(CancellationToken.None));
             Assert.Equal(0, _queue.Count);
 
-            barrier.MarkCompleted();
+            barrier.MarkRecoveryInputReady();
+            await Task.Delay(TimeSpan.FromMilliseconds(80));
+            var afterInputReady = await _store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, afterInputReady!.State);
+            Assert.Single(await _registry.ListAsync(CancellationToken.None));
+            Assert.Equal(0, _queue.Count);
+
+            barrier.MarkInitialRecoveryCompleted();
             await WaitUntilAsync(async () =>
             {
                 var after = await _store.GetAsync(item.Id);

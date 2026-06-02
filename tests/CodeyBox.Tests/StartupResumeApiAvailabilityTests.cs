@@ -20,6 +20,7 @@ public sealed class StartupResumeApiAvailabilityTests
     [InlineData("hang", SandboxResumeMode.Background)]
     [InlineData("throw", SandboxResumeMode.Background)]
     [InlineData("hang", SandboxResumeMode.Blocking)]
+    [InlineData("throw", SandboxResumeMode.Blocking)]
     public async Task StartupResumeFailure_DoesNotBlockQuotaEndpoint_AndMarksItemFailed(
         string behavior,
         SandboxResumeMode mode)
@@ -78,8 +79,11 @@ public sealed class StartupResumeApiAvailabilityTests
             }
             else
             {
-                Assert.True(sw.Elapsed >= configuredTimeout,
-                    $"Blocking startup resume did not honor configured mode; GET /quota was served before resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+                if (behavior == "hang")
+                {
+                    Assert.True(sw.Elapsed >= configuredTimeout,
+                        $"Blocking startup resume did not honor configured mode; GET /quota was served before resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+                }
                 Assert.True(sw.Elapsed < availabilityDeadline,
                     $"GET /quota was not served after configured blocking resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
             }
