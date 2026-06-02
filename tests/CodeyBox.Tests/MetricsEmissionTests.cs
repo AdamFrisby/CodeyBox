@@ -194,4 +194,19 @@ public sealed class MetricsEmissionTests
                 measurement.Value == 200L && measurement.TagValue == "clone");
         }
     }
+
+    // NOTE: codeybox.dispatch.count, codeybox.agent.invocations,
+    // codeybox.agent.fallbacks, codeybox.phase.duration_ms, codeybox.agent.tokens,
+    // codeybox.agent.cost_usd, and codeybox.webhook.deliveries are intentionally
+    // NOT asserted here by calling the static instrument directly — that would
+    // only verify MeterListener plumbing. They are instead covered by
+    // operation-driven tests that drive the real production call sites:
+    //   - OrchestratorPerAgentConcurrencyTests.Dispatch_EmitsDispatchCountMeasurement
+    //   - PipelineRunnerTimingTests.SuccessfulRun_EmitsPipelineSpansAndInvocationMetrics
+    //   - PipelineRunnerQuotaFallbackTests.Codex_HitsQuota_FallsBackToClaude_EmitsFallbackAndInvocationMetrics
+    //   - PipelineRunnerQuotaFallbackTests.AuditDrivenRework_EmitsReworkPhaseSpanAndDuration
+    //   - PipelineRunnerCostCaptureTests.SuccessfulRun_EmitsTokenAndCostCounters
+    //   - WebhookDispatcherTests.SuccessfulDelivery_EmitsDeliveredMeasurement / GivingUpAfterMaxAttempts_EmitsFailedMeasurement
+    // The instrument-shape tests retained above cover instruments whose emission
+    // is already asserted through their own subsystem suites.
 }

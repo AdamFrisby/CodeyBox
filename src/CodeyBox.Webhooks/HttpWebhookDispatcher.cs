@@ -107,6 +107,10 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                 if (response.IsSuccessStatusCode)
                 {
                     AuditLog.WebhookDelivered(ep.Name, evt.Event, (int)response.StatusCode, attempt);
+                    CodeyBoxMeters.WebhookDeliveries.Add(1,
+                        new KeyValuePair<string, object?>("endpoint", ep.Name),
+                        new KeyValuePair<string, object?>("event", evt.Event),
+                        new KeyValuePair<string, object?>("outcome", "delivered"));
                     return;
                 }
 
@@ -135,6 +139,10 @@ public sealed class HttpWebhookDispatcher : IWebhookDispatcher, IAsyncDisposable
                     "Webhook {Endpoint} gave up after {Max} attempts for event {Event} delivery {DeliveryId}; last failure: {LastFailure}",
                     ep.Name, ep.MaxAttempts, evt.Event, evt.DeliveryId, lastFailure);
                 AuditLog.WebhookDeliveryFailed(ep.Name, evt.Event, lastFailure, ep.MaxAttempts);
+                CodeyBoxMeters.WebhookDeliveries.Add(1,
+                    new KeyValuePair<string, object?>("endpoint", ep.Name),
+                    new KeyValuePair<string, object?>("event", evt.Event),
+                    new KeyValuePair<string, object?>("outcome", "failed"));
             }
 
             backoff = TimeSpan.FromTicks(backoff.Ticks * 2);

@@ -280,6 +280,18 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         using var workItemScope = AuditLog.WorkItemScope(item.Id);
 
+        // Root span for the whole pipeline run. Becomes the parent of every phase,
+        // agent-invocation, and sandbox span started within this async flow.
+        using var rootSpan = CodeyBoxActivities.Pipeline.StartActivity("pipeline.run", ActivityKind.Internal);
+        if (rootSpan is not null)
+        {
+            rootSpan.SetTag("codeybox.work_item_id", item.Id.ToString());
+            rootSpan.SetTag("codeybox.project_id", item.ProjectId.Value);
+            rootSpan.SetTag("codeybox.agent", item.Agent?.Value ?? "(default)");
+            rootSpan.SetTag("codeybox.model", item.ModelId ?? "(default)");
+            rootSpan.SetTag("codeybox.state", item.State.ToString());
+        }
+
         Project project;
         try
         {
@@ -446,14 +458,17 @@ public sealed class PipelineRunner : IPipelineRunner
             // the fail-quiet "Agent produced no changes to commit" symptom.
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
-            if (entry is WorkItemState.Queued
-                && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+            using (BeginPhaseScope(item, "pickup"))
             {
-                await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
-            }
-            else if (!skipWork || !skipAudit || !skipMerge)
-            {
-                await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+                if (entry is WorkItemState.Queued
+                    && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+                {
+                    await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
+                }
+                else if (!skipWork || !skipAudit || !skipMerge)
+                {
+                    await RebaseExistingWorkBranchOntoFreshBaseAsync(item, agentRunner, repoId, baseBranch, workBranch, project, ct);
+                }
             }
 
             // Compose auditors up-front: the work-phase prompt advises the
@@ -466,6 +481,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // -------- Phase 1: Work --------
             if (!skipWork)
             {
+                using var workPhaseScope = BeginPhaseScope(item, "work");
                 await PublishIterationStartedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber, ct);
                 var workIterationStart = DateTimeOffset.UtcNow;
                 await _store.RecordIterationDispatchAsync(
@@ -521,6 +537,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             else if (resumingPreempt && entry is WorkItemState.Reworking)
             {
+                using var reworkPhaseScope = BeginPhaseScope(item, "rework");
                 await PublishIterationStartedAsync(item, project, IterationPhase.Rework, iteration: 1, ct);
                 var resumeReworkStart = DateTimeOffset.UtcNow;
                 await Transition(item, WorkItemState.Reworking, ct, project);
@@ -661,6 +678,7 @@ public sealed class PipelineRunner : IPipelineRunner
             string? agentStdout = null;
             if (!skipMerge)
             {
+                using var mergePhaseScope = BeginPhaseScope(item, "merge");
                 await PublishMergeStartedAsync(item, project, baseBranch, workBranch, ct);
                 await Transition(item, WorkItemState.Merging, ct, project);
 
@@ -3126,6 +3144,13 @@ public sealed class PipelineRunner : IPipelineRunner
             if (iteration > 1)
                 await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
 
+            // Per-iteration audit phase scope. Disposed explicitly before the
+            // rework scope (below) so codeybox.phase.duration_ms{phase=audit}
+            // measures only the auditing work — not nested rework or later
+            // iterations. The `using` still guarantees disposal on the pass
+            // (return) and exhausted (throw) paths.
+            using var auditPhaseScope = BeginPhaseScope(item, "audit");
+
             await PublishAuditStartedAsync(item, project, iteration, auditors, ct);
             var auditPhaseStart = DateTimeOffset.UtcNow;
             await Transition(item, WorkItemState.Auditing, ct, project);
@@ -3215,6 +3240,9 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "reworking"));
+            // Close the audit phase scope before the incremental rebase and
+            // rework begins; neither should contribute to audit duration.
+            auditPhaseScope.Dispose();
 
             // Keep the work branch close to base BETWEEN audit/rework
             // iterations so the merge-time rebase has less to consolidate
@@ -3231,6 +3259,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // Rework following audit iteration N is the input that will be
             // evaluated by audit iteration N+1, so emit it as iteration N+1.
             var reworkIterationNumber = iteration + 1;
+            // Audit-driven rework is the primary rework path; open a phase.rework
+            // span and record codeybox.phase.duration_ms{phase=rework} so rework
+            // telemetry matches the documented trace tree (the resume-preempt
+            // path opens its own scope independently).
+            using var reworkPhaseScope = BeginPhaseScope(item, "rework");
             await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
             var reworkStart = DateTimeOffset.UtcNow;
             // Snapshot the prompt and revision now, before the rework agent runs.
@@ -3585,7 +3618,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
-            log: _log);
+            log: _log,
+            activitySource: CodeyBoxActivities.Audit);
         // Record one involvement row per auditor sandbox run. ExecAuditorAsync is
         // the single chokepoint for every auditor (tool + LLM, including the LLM
         // transient retry), so recording here gives a 1:1 mapping between the
@@ -3613,6 +3647,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         sw.Stop();
         await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
+        CodeyBoxMeters.AuditorDuration.Record(
+            (long)sw.Elapsed.TotalMilliseconds,
+            new KeyValuePair<string, object?>("auditor.name", auditor.Name),
+            new KeyValuePair<string, object?>("auditor.kind", auditor.Kind),
+            new KeyValuePair<string, object?>("iteration", ctx.Iteration.ToString()));
         return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
     }
 
@@ -4132,6 +4171,8 @@ public sealed class PipelineRunner : IPipelineRunner
         await PersistAgentLogPathAsync(item.Id, agentLogPath, ct);
         using var logScope = AgentInvocationLogContext.BeginScope(agentLogPath);
 
+        var agentClassTag = item.AgentClassId ?? project.DefaultAgentClass ?? "(none)";
+
         async Task<TResult> InvokeAttemptAsync(IAgentRunner runner, WorkItem trialItem)
         {
             // Append a per-phase involvement row for the agent about to run, so the
@@ -4152,10 +4193,23 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? phaseCancellation.BeginAttemptTimeout(perAttempt)
                 : null;
             var attemptCt = attempt?.Token ?? phaseCancellation?.Token ?? ct;
+            var modelTag = trialItem.ModelId ?? "(default)";
+            using var invSpan = CodeyBoxActivities.Pipeline.StartActivity("agent.invoke", ActivityKind.Internal);
+            if (invSpan is not null)
+            {
+                invSpan.SetTag("codeybox.work_item_id", item.Id.ToString());
+                invSpan.SetTag("codeybox.phase", phase);
+                invSpan.SetTag("codeybox.agent", runner.Kind.Value);
+                invSpan.SetTag("codeybox.model", modelTag);
+                invSpan.SetTag("codeybox.agent_class", agentClassTag);
+                if (iteration is not null) invSpan.SetTag("codeybox.iteration", iteration.Value.ToString());
+            }
+            var outcome = "error";
             try
             {
                 var result = await invoker(runner, trialItem, attemptCt);
                 await FinalizeInvolvementAsync(involvementId, "success");
+                outcome = "success";
                 return result;
             }
             catch (OperationCanceledException oce) when (
@@ -4164,6 +4218,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 && oce is not PhaseCancellationException)
             {
                 await FinalizeInvolvementAsync(involvementId, "failure:timeout");
+                outcome = "canceled";
                 if (phaseCancellation.Token.IsCancellationRequested
                     || phaseCancellation.Source is not null)
                     throw phaseCancellation.Wrap(oce);
@@ -4174,10 +4229,26 @@ public sealed class PipelineRunner : IPipelineRunner
                     attemptTimeout!.Value,
                     oce);
             }
+            catch (OperationCanceledException ex)
+            {
+                await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+                outcome = "canceled";
+                throw;
+            }
             catch (Exception ex)
             {
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
                 throw;
+            }
+            finally
+            {
+                invSpan?.SetTag("codeybox.outcome", outcome);
+                CodeyBoxMeters.AgentInvocations.Add(1,
+                    new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                    new KeyValuePair<string, object?>("model", modelTag),
+                    new KeyValuePair<string, object?>("agent_class", agentClassTag),
+                    new KeyValuePair<string, object?>("phase", phase),
+                    new KeyValuePair<string, object?>("outcome", outcome));
             }
         }
 
@@ -4338,6 +4409,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (quotaExhausted)
                 {
                     AuditLog.AgentQuotaAllExhausted(item.Id, classId, phase, triedCount);
+                    CodeyBoxMeters.AgentFallbacks.Add(1,
+                        new KeyValuePair<string, object?>("from_agent", currentMember.Agent.Value),
+                        new KeyValuePair<string, object?>("to_agent", "(none)"),
+                        new KeyValuePair<string, object?>("kind", "quota"),
+                        new KeyValuePair<string, object?>("phase", phase));
                     if (_fallbackHistory is not null)
                     {
                         try
@@ -4390,6 +4466,11 @@ public sealed class PipelineRunner : IPipelineRunner
                     toAgent: nextMember.Agent, toModel: nextMember.ModelId,
                     reason: safeReason);
             }
+            CodeyBoxMeters.AgentFallbacks.Add(1,
+                new KeyValuePair<string, object?>("from_agent", currentMember.Agent.Value),
+                new KeyValuePair<string, object?>("to_agent", nextMember.Agent.Value),
+                new KeyValuePair<string, object?>("kind", quotaExhausted ? "quota" : "timeout"),
+                new KeyValuePair<string, object?>("phase", phase));
 
             // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
             // consumers that read WorkItem.Agent see the agent actually being run.
@@ -5758,6 +5839,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
+        using var upstreamPhaseScope = BeginPhaseScope(item, "upstream");
         using var upstreamPhase = new PhaseCancellation("upstream", ct, _opts.TimeProvider);
         upstreamPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
         ct = upstreamPhase.Token;
@@ -7818,6 +7900,52 @@ Original merge-phase failure (for context):
         }
     }
 
+    /// <summary>
+    /// Opens a per-phase trace span and records the phase wall-clock duration to
+    /// <see cref="CodeyBoxMeters.PhaseDuration"/> on disposal. When no listener is
+    /// registered no span is started; the histogram <c>Record</c> still runs on
+    /// every phase exit but the SDK discards it cheaply (a tag-array build plus a
+    /// no-op store), so the disabled path stays near-free rather than literally
+    /// zero work.
+    /// </summary>
+    private static PhaseScope BeginPhaseScope(WorkItem item, string phase) => new(item, phase);
+
+    private struct PhaseScope : IDisposable
+    {
+        private readonly Activity? _activity;
+        private readonly long _startTs;
+        private readonly string _phase;
+        private bool _disposed;
+
+        public PhaseScope(WorkItem item, string phase)
+        {
+            _phase = phase;
+            _startTs = Stopwatch.GetTimestamp();
+            _disposed = false;
+            _activity = CodeyBoxActivities.Pipeline.StartActivity($"phase.{phase}", ActivityKind.Internal);
+            if (_activity is not null)
+            {
+                _activity.SetTag("codeybox.work_item_id", item.Id.ToString());
+                _activity.SetTag("codeybox.phase", phase);
+                _activity.SetTag("codeybox.agent", (item.Agent?.Value) ?? "(default)");
+            }
+        }
+
+        // Idempotent. The audit loop disposes its audit scope early — before the
+        // rework scope opens — so phase.audit duration excludes nested rework;
+        // the enclosing `using` then disposes again at iteration end. Recording
+        // the histogram / stopping the span exactly once keeps both correct.
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            CodeyBoxMeters.PhaseDuration.Record(
+                (long)Stopwatch.GetElapsedTime(_startTs).TotalMilliseconds,
+                new KeyValuePair<string, object?>("phase", _phase));
+            _activity?.Dispose();
+        }
+    }
+
     private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct, Project? project = null)
     {
         var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -8278,6 +8406,19 @@ Original merge-phase failure (for context):
                 StartedAt = startedAt,
                 EndedAt = endedAt,
             }, CancellationToken.None);
+
+            // Emit the same accounting as OTel counters so dashboards align with
+            // the per-work-item cost rows (no double-counting — one emit per row).
+            var model = snapshot.ModelId ?? "(default)";
+            var agentTag = new KeyValuePair<string, object?>("agent.kind", agentKind.Value);
+            var modelTag = new KeyValuePair<string, object?>("model", model);
+            CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, modelTag,
+                new KeyValuePair<string, object?>("token_type", "input"));
+            CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, modelTag,
+                new KeyValuePair<string, object?>("token_type", "cached_input"));
+            CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, modelTag,
+                new KeyValuePair<string, object?>("token_type", "output"));
+            CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, modelTag);
         }
         catch (Exception ex)
         {

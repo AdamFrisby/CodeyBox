@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -62,6 +62,14 @@ public sealed class AgentClassRouter
     // the suppression expires. Survives only the current process lifetime —
     // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), DateTimeOffset> _exhausted
+        = new();
+
+    // Last quota-availability percentage observed per (agent, model) during
+    // routing. Read by the OpenTelemetry observable gauge so dashboards can
+    // chart subscription headroom without issuing fresh probe round-trips on
+    // the metrics-collection thread. -1 means "unknown" (the probe could not
+    // determine availability). Updated on every ProbeAsync result.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
         = new();
 
     public AgentClassRouter(
@@ -423,6 +431,7 @@ public sealed class AgentClassRouter
                     earliestBudgetReset = r;
             }
 
+            _lastAvailablePct[(member.Agent, member.ModelId ?? string.Empty)] = quota.AvailablePct;
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
@@ -671,6 +680,15 @@ public sealed class AgentClassRouter
                 return m;
         }
         return null;
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability()
+    {
+        var snap = new List<(AgentKind, string?, double)>(_lastAvailablePct.Count);
+        foreach (var kv in _lastAvailablePct)
+            snap.Add((kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
+        return snap;
     }
 
     /// <summary>

@@ -1,8 +1,8 @@
 # Observability: OpenTelemetry export
 
-CodeyBox emits traces and metrics via the [OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/). This is **off by default** — operators opt in by setting `CodeyBox:Otel:Enabled=true`.
+CodeyBox emits **traces, metrics, and logs** via the [OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/). This is **off by default** — operators opt in by setting `CodeyBox:Otel:Enabled=true`.
 
-When disabled (the default), zero OTel types are registered and there is no runtime overhead.
+When disabled (the default), zero OTel types are registered and there is no runtime overhead: the `Meter`/`ActivitySource` instruments are always allocated but the SDK discards measurements and never starts spans when no provider is listening, the observable gauges are not registered, and logging stays on the Serilog-only path.
 
 Structured agent event streams are stored separately from OTel under
 `CodeyBox:AgentStreams`; see [`agent-streams.md`](agent-streams.md). OTel spans
@@ -23,13 +23,36 @@ All options live under the `CodeyBox:Otel` section.
 | `OtlpEndpoint` | string | *(required if enabled)* | OTLP collector endpoint, e.g. `http://localhost:4317`. |
 | `OtlpHeaders` | string? | `null` | CSV of extra headers forwarded to the collector, e.g. `x-honeycomb-team=abc,x-dataset=prod`. |
 | `ExportProtocol` | `"grpc"` \| `"httpprotobuf"` | `"grpc"` | OTLP wire format. |
-| `ResourceAttributes` | `{ key: value }` | `{}` | Extra OTel resource attributes merged into every span and metric point. |
+| `ResourceAttributes` | `{ key: value }` | `{}` | Extra OTel resource attributes merged into every span, metric point, and log record. Applied last, so they override the auto-derived attributes on key collision. |
+
+### Standard `OTEL_*` environment variables
+
+CodeyBox honors the conventional OpenTelemetry environment variables so a deployment can be configured with the standard env-only bootstrap (the same contract the paired JobTrack service follows). **Environment variables override the `CodeyBox:Otel` appsettings values** on collision:
+
+| Env var | Overrides | Notes |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `OtlpEndpoint` | When set, telemetry can be enabled without an appsettings endpoint (`Enabled=true` alone suffices). The OTel SDK reads it directly, including the `httpprotobuf` path-append semantics. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `ExportProtocol` | When set, the SDK's own protocol selection is left in place (`grpc` / `http/protobuf`) rather than forcing the appsettings `ExportProtocol`, so an env-only deployment to an HTTP/protobuf collector exports correctly without also setting appsettings. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `OtlpHeaders` | Same `key=value,key2=value2` format as the appsettings CSV. |
+| `OTEL_SERVICE_NAME` | `ServiceName` | Sets the `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | `ResourceAttributes` | `key=value,key2=value2` pairs; applied last so env pairs win over appsettings on key collision. |
+
+### Resource attributes
+
+Every signal (trace, metric, log) carries a shared resource so the three correlate on identical service identity:
+
+| Attribute | Source |
+|---|---|
+| `service.name` | `CodeyBox:Otel:ServiceName` (default `codeybox`). |
+| `service.version` | `CodeyBox:Otel:ServiceVersion`, falling back to the API assembly version. |
+| `service.instance.id` | `<machine-name>:<process-id>`. |
+| `deployment.environment` | The ASP.NET Core environment name (`Development` / `Production` / …) when available. |
 
 ### Startup validation
 
 If `Enabled=true` and the configuration is invalid, the process refuses to start with a clear error message:
 
-- `OtlpEndpoint` must be set and parse as an absolute URL.
+- `OtlpEndpoint` must be set (in appsettings **or** via `OTEL_EXPORTER_OTLP_ENDPOINT`); the appsettings value, when present, must parse as an absolute http/https URL.
 - `ExportProtocol` must be exactly `"grpc"` or `"httpprotobuf"`.
 
 ---
@@ -51,23 +74,28 @@ Four `ActivitySource` instances produce spans:
 
 | Source name | What it traces |
 |---|---|
-| `CodeyBox.Pipeline` | Agent execution (`agent.exec` per phase) |
-| `CodeyBox.Sandbox` | Sandbox lifecycle — `git.clone_into_sandbox`, `git.commit`, `git.push_back_to_bare_repo` |
-| `CodeyBox.Audit` | Per-auditor invocation (`auditor.<name>` per iteration) |
-| `CodeyBox.Upstream` | *(Reserved for upstream remote spans in a future release)* |
+| `CodeyBox.Pipeline` | The work-item pipeline tree: a root `pipeline.run` span per work item → `phase.<name>` spans (pickup / work / rework / audit / merge / upstream) → `agent.invoke` spans per agent attempt → `agent.exec` / clone steps. |
+| `CodeyBox.Sandbox` | Sandbox lifecycle — `git.clone_into_sandbox`, `git.commit`, `git.push_back_to_bare_repo`, sandbox start. |
+| `CodeyBox.Audit` | Per-auditor invocation (`auditor.<name>` per iteration). |
+| `CodeyBox.Upstream` | Upstream remote spans (reserved; upstream timing is currently captured by the `codeybox.upstream.*` metric and the `phase.upstream` span). |
 
-HTTP server spans (incoming API requests) and outbound HTTP spans (GitHub API, agent quota probes, webhooks) are captured automatically via `AspNetCore` and `Http` instrumentation.
+Within one pipeline run the spans nest: `pipeline.run` is the root, each `phase.*` span is a child, and `agent.invoke` (plus the sandbox/exec spans) nest under the active phase. HTTP server spans (incoming API requests) and outbound HTTP spans (GitHub API, agent quota probes, webhooks) are captured automatically via `AspNetCore` and `Http` instrumentation.
 
 ### Span attributes
 
-All CodeyBox-produced spans carry these attributes (where applicable):
+CodeyBox-produced spans carry these attributes (where applicable):
 
 | Attribute | Description |
 |---|---|
 | `codeybox.work_item_id` | UUID of the work item |
-| `codeybox.phase` | Pipeline phase: `work`, `rework`, `audit`, `merge`, `upstream` |
-| `codeybox.iteration` | Audit iteration number (audit/rework spans only) |
+| `codeybox.project_id` | Project id (root span) |
+| `codeybox.phase` | Pipeline phase: `pickup`, `work`, `rework`, `audit`, `merge`, `upstream` |
+| `codeybox.iteration` | Audit iteration number (audit/rework/invoke spans only) |
 | `codeybox.agent` | Agent kind value, e.g. `claude`, `codex` |
+| `codeybox.model` | Model id for the invocation (`(default)` when unset) |
+| `codeybox.agent_class` | Agent class id driving routing (`(none)` when not class-routed) |
+| `codeybox.state` | Work-item state at pipeline entry (root span) |
+| `codeybox.outcome` | Agent-invocation outcome: `success` \| `error` \| `canceled` |
 
 **PII and credential policy**: prompt bodies, agent stdout/stderr, and raw audit findings are never set as span attributes. Span attributes are limited to IDs and metadata (work_item_id, phase, agent.kind, etc.). Credential values are never included.
 
@@ -84,7 +112,13 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | Instrument | Unit | Tags | Description |
 |---|---|---|---|
 | `codeybox.work_item.transitions` | `{transition}` | `to_state` | Incremented on every work-item state transition. |
+| `codeybox.dispatch.count` | `{dispatch}` | — | Incremented when a work item is dispatched to a worker. |
+| `codeybox.agent.invocations` | `{invocation}` | `agent.kind`, `model`, `agent_class`, `phase`, `outcome` (`success` \| `error` \| `canceled`) | One per agent invocation attempt. |
+| `codeybox.agent.fallbacks` | `{fallback}` | `from_agent`, `to_agent` (`(none)` on class exhaustion), `kind` (`quota` \| `timeout`), `phase` | One per agent fallback / class-exhaustion event. |
+| `codeybox.agent.tokens` | `{token}` | `agent.kind`, `model`, `token_type` (`input` \| `cached_input` \| `output`) | Tokens consumed, summed as cost rows are recorded. |
+| `codeybox.agent.cost_usd` | `USD` | `agent.kind`, `model` | Estimated agent cost, summed as cost rows are recorded (aligned with the per-work-item cost rows — no double counting). |
 | `codeybox.audit.iterations` | `{iteration}` | `outcome` (`passed` \| `reworking` \| `failed`) | Incremented once per completed audit iteration. |
+| `codeybox.webhook.deliveries` | `{delivery}` | `endpoint`, `event`, `outcome` (`delivered` \| `failed`) | One per terminal webhook delivery outcome. |
 
 ### Histograms
 
@@ -93,9 +127,31 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.audit.findings.blocking` | `{finding}` | `iteration` | Blocking-finding count per audit iteration. |
 | `codeybox.auditor.duration_ms` | `ms` | `auditor.name`, `auditor.kind`, `iteration` | Wall-clock time per auditor invocation. |
 | `codeybox.agent.duration_ms` | `ms` | `agent.kind`, `phase` | Agent execution time per phase. |
+| `codeybox.phase.duration_ms` | `ms` | `phase` (`pickup` \| `work` \| `rework` \| `audit` \| `merge` \| `upstream`) | Whole-phase wall-clock duration. |
 | `codeybox.sandbox.lifecycle.duration_ms` | `ms` | `step` (`start` \| `clone`) | Sandbox step durations. |
+| `codeybox.upstream.api_call.duration_ms` | `ms` | `endpoint`, `status_code` | Upstream forge API call durations. |
+
+### Observable gauges
+
+Polled at collection time; registered only when OTel is enabled.
+
+| Instrument | Unit | Tags | Description |
+|---|---|---|---|
+| `codeybox.work_item.active` | `{work_item}` | `state` | Work items currently persisted in each state (refreshed on a 15 s background cadence so the collection thread never blocks on SQLite). |
+| `codeybox.workers.in_use` | `{worker}` | — | Worker slots currently occupied by an in-flight pipeline run. |
+| `codeybox.workers.max` | `{worker}` | — | Configured `MaxConcurrentWorkers` ceiling. |
+| `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking. Suspend-capable providers (e.g. Multipass) report from `ISuspendingSandboxProvider.SnapshotSuspendableActive()`; ephemeral providers (process, bubblewrap) report in-flight created-but-not-disposed sandboxes via the process-wide `SandboxLiveCounter`. |
+| `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.
+
+---
+
+## Log model
+
+When OTel is enabled, the existing `ILogger` output is **also** routed through the OpenTelemetry logging provider — the Serilog console/file sinks are unchanged. Serilog forwards each event to the OTel provider (`writeToProviders`), which exports `LogRecord`s over OTLP stamped with the active span's `TraceId`/`SpanId` for log↔trace correlation. Scopes, formatted messages, and structured state values are all included. No logging call sites change; the OTel provider is purely additive and is not registered when OTel is disabled.
+
+The same credential/PII redaction enricher that protects the file logs runs before events reach the OTel provider.
 
 ---
 

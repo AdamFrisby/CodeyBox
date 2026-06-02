@@ -385,6 +385,13 @@ public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
         };
         await tp.Store.CreateAsync(item);
 
+        // The upstream push phase opens a phase.upstream span and records a
+        // phase=upstream duration on exit (even when the push fails). Standard
+        // pipeline fixtures use a noop upstream + PushUpstream=false, so this is
+        // the one path that exercises the new upstream-phase instrumentation.
+        using var spans = new SpanCapture("CodeyBox.Pipeline");
+        using var metrics = new MetricCapture("codeybox.phase.duration_ms");
+
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
@@ -392,6 +399,11 @@ public sealed class PipelineRunnerSandboxIdentityTests : IDisposable
         Assert.Equal(1, final.UpstreamPushAttempts);
         Assert.Contains("upstream rebase conflict on main; manual resolution required", final.LastError);
         Assert.Equal(1, upstreamFactory.Remote.Attempts);
+
+        Assert.True(spans.Any("phase.upstream", ("codeybox.phase", "upstream")),
+            "expected a phase.upstream span for the upstream push phase");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "upstream")),
+            "expected a codeybox.phase.duration_ms{phase=upstream} measurement");
     }
 }
 

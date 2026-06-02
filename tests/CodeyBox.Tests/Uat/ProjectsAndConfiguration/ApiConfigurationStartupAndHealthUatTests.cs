@@ -239,6 +239,30 @@ public sealed class HealthCheckAndApiAuthUatTests
         Assert.Equal("Bearer", response.Headers.WwwAuthenticate.Single().Scheme);
     }
 
+    [Fact]
+    public async Task HealthzRespondsOkWhenOpenTelemetryExportIsEnabled()
+    {
+        // Boots the full host with OTel metrics/traces/logs enabled against an
+        // (unreachable) OTLP endpoint. The exporter is lazy, so startup must not
+        // require a live collector — the app should still serve traffic. Also
+        // exercises the OTel logging-provider wiring and the observable-metrics
+        // hosted service registered in the enabled path.
+        using var factory = new ProjectsAndConfigurationApiFactory(configuration: new Dictionary<string, string?>
+        {
+            ["CodeyBox:Otel:Enabled"] = "true",
+            ["CodeyBox:Otel:OtlpEndpoint"] = "http://127.0.0.1:4317",
+            ["CodeyBox:Otel:ExportProtocol"] = "grpc",
+            ["CodeyBox:Otel:ServiceName"] = "codeybox-test",
+        });
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/healthz");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<HealthzResponse>();
+        Assert.Equal("ok", body!.Status);
+    }
+
     private static ProjectsAndConfigurationApiFactory AuthenticatedFactory()
         => new(
             disableAuth: false,

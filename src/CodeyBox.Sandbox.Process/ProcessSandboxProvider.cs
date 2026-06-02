@@ -107,6 +107,7 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
             .ToArray();
 
         var sandbox = new ProcessSandbox(id, root, spec, mountPaths, _log);
+        SandboxLiveCounter.Increment();
         _log.LogWarning("ProcessSandbox {Id} created at {Root} (UNSAFE provider — no isolation)", id, root);
         return Task.FromResult<ISandbox>(sandbox);
     }
@@ -250,6 +251,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
     {
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
+        SandboxLiveCounter.Decrement();
         if (_preserved)
             return ValueTask.CompletedTask;
         try

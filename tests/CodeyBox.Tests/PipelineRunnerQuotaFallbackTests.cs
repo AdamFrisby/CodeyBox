@@ -31,6 +31,90 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
 
     [Fact]
+    public async Task Codex_HitsQuota_FallsBackToClaude_EmitsFallbackAndInvocationMetrics()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks", "codeybox.agent.invocations");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // The quota fallback counter must record the codex→claude swap with the
+        // quota kind on the work phase — driven by the real routing path, not a
+        // hand-rolled Add.
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+            ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "work")));
+
+        // Codex's failed attempt records an error-outcome invocation; Claude's
+        // retry records a success-outcome invocation.
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+            ("agent.kind", "codex"), ("phase", "work"), ("outcome", "error")));
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+            ("agent.kind", "claude"), ("phase", "work"), ("outcome", "success")));
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_EmitsReworkPhaseSpanAndDuration()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        // Initial work + rework both pull from WorkPlan (rework re-uses it once
+        // the scripted-failure queues drain), so enqueue two writes.
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+
+        using var spans = new SpanCapture("CodeyBox.Pipeline", "CodeyBox.Audit");
+        using var metrics = new MetricCapture("codeybox.phase.duration_ms", "codeybox.auditor.duration_ms");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        // The audit-driven rework path (not just the resume-preempt branch) must
+        // open a phase.rework span and record the rework phase duration.
+        Assert.True(spans.Any("phase.rework", ("codeybox.phase", "rework")),
+            "expected a phase.rework span on the audit-loop rework path");
+        Assert.True(spans.Any("agent.invoke", ("codeybox.phase", "rework")),
+            "expected the rework agent.invoke span nested under phase.rework");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "rework")),
+            "expected a codeybox.phase.duration_ms{phase=rework} measurement");
+
+        // Each audit iteration opens its own phase.audit span and records a
+        // phase=audit duration sample, scoped to the auditing work only (the
+        // scope is disposed before the rework scope opens). A regression that
+        // dropped or mis-tagged the audit scope — or let it absorb nested
+        // rework time — would slip past the rework-only assertions above.
+        Assert.True(spans.Any("phase.audit", ("codeybox.phase", "audit")),
+            "expected a phase.audit span on the audit loop");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "audit")),
+            "expected a codeybox.phase.duration_ms{phase=audit} measurement");
+
+        // Each auditor invocation emits a CodeyBox.Audit `auditor.<name>` span
+        // and a codeybox.auditor.duration_ms sample tagged with the auditor's
+        // name + kind. These fire only from the real audit loop — the spec
+        // declared both signals but production never emitted them before.
+        Assert.True(spans.Any("auditor.once-failing-fallback", ("codeybox.phase", "audit")),
+            "expected a CodeyBox.Audit auditor.<name> span for the tool auditor");
+        Assert.True(metrics.Any("codeybox.auditor.duration_ms",
+                ("auditor.name", "once-failing-fallback"), ("auditor.kind", "tool")),
+            "expected a codeybox.auditor.duration_ms measurement tagged with the auditor name + kind");
+    }
+
+    [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_SameIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -453,6 +537,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         fix.Codex.ScriptedFailures.Enqueue(quotaErr);
         fix.Claude.ScriptedFailures.Enqueue(quotaErr);
 
+        // Two fallback measurements are expected from the real exhaustion path:
+        // the codex→claude swap, then the all-exhausted park event with
+        // to_agent=(none). Without this listener, dropping the (none) Add or
+        // mis-tagging it would pass every behavioural assertion below.
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
         var item = NewItem(initialAgent: AgentKind.Codex);
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
@@ -490,6 +580,16 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(2, history.Count);
         Assert.Equal(AgentKind.Claude, history[0].ToAgent);
         Assert.Null(history[1].ToAgent);
+
+        // The class-exhausted park emits a fallbacks counter with to_agent=(none)
+        // and kind=quota, alongside the earlier codex→claude swap. Both must be
+        // present and correctly tagged.
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "work")),
+            "expected the codex→claude quota fallback measurement");
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "claude"), ("to_agent", "(none)"), ("kind", "quota"), ("phase", "work")),
+            "expected the all-exhausted codeybox.agent.fallbacks{to_agent=(none)} measurement");
     }
 
     [Fact]
@@ -689,6 +789,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         fix.Codex.WorkDelays.Enqueue(TimeSpan.FromSeconds(11));
         fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed by fallback"));
 
+        // Capture the OTel signals emitted at the real timeout-fallback site:
+        // the fallback counter must record kind=timeout (not quota), and the
+        // timed-out Codex attempt must record outcome=canceled. Both must be
+        // live before RunAsync so the MeterListener observes the measurements.
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks", "codeybox.agent.invocations");
+
         var item = NewItem(initialAgent: AgentKind.Codex) with
         {
             WorkTimeout = TimeSpan.FromSeconds(10),
@@ -735,6 +841,22 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal("codex", details.FromAgent);
         Assert.Equal("claude", details.ToAgent);
         Assert.Contains("per-attempt timeout", details.Reason);
+
+        // The fallback counter distinguishes a timeout-driven swap from a quota
+        // swap via the kind tag; inverting the two would go undetected without
+        // this assertion since the history/webhook only carry a free-text reason.
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "timeout"), ("phase", "work")),
+            "expected a codeybox.agent.fallbacks{kind=timeout} measurement for the work-phase timeout swap");
+
+        // Codex's timed-out attempt records outcome=canceled (distinct from the
+        // error/success outcomes covered elsewhere); Claude's retry succeeds.
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+                ("agent.kind", "codex"), ("phase", "work"), ("outcome", "canceled")),
+            "expected a codeybox.agent.invocations{outcome=canceled} measurement for the timed-out Codex attempt");
+        Assert.True(metrics.Any("codeybox.agent.invocations",
+                ("agent.kind", "claude"), ("phase", "work"), ("outcome", "success")),
+            "expected a codeybox.agent.invocations{outcome=success} measurement for the Claude fallback");
     }
 
     [Fact]

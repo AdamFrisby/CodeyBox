@@ -106,6 +106,61 @@ public sealed class PipelineRunnerTimingTests : IDisposable
         Assert.All(timings.CompletedRows, r => Assert.Equal(item.Id, r.WorkItemId));
     }
 
+    [Fact]
+    public async Task SuccessfulRun_EmitsPipelineSpansAndInvocationMetrics()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var timings = new RecordingTimingStore();
+        using var tp = BuildPipelineWithTimings(_workspace, seed, timings);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("otel.txt", "otel\n"));
+
+        // Captures must be live before RunAsync — an ActivitySource emits no
+        // Activity unless a listener is sampling, and the MeterListener only sees
+        // measurements recorded after Start.
+        using var spans = new SpanCapture("CodeyBox.Pipeline");
+        using var metrics = new MetricCapture("codeybox.agent.invocations", "codeybox.phase.duration_ms");
+
+        var item = NewItem("feature/otel-spans");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        // Root span + work-phase span + at least one agent.invoke span, tagged.
+        Assert.True(spans.Any("pipeline.run", ("codeybox.work_item_id", item.Id.ToString())),
+            "expected a pipeline.run root span for the work item");
+        Assert.True(spans.Any("phase.work", ("codeybox.phase", "work")),
+            "expected a phase.work span");
+        Assert.True(spans.Any("agent.invoke", ("codeybox.phase", "work"), ("codeybox.outcome", "success")),
+            "expected a successful agent.invoke span in the work phase");
+
+        // The pickup phase wraps the pre-work rebase/reset that every fresh
+        // Queued run executes. Asserting it here prevents a regression that
+        // dropped or renamed the BeginPhaseScope(item, "pickup") wrapper from
+        // silently passing the rest of this suite.
+        Assert.True(spans.Any("phase.pickup", ("codeybox.phase", "pickup")),
+            "expected a phase.pickup span on a fresh Queued pipeline entry");
+
+        // Invocation counter + phase-duration histogram fired on the real run.
+        Assert.True(metrics.Any("codeybox.agent.invocations", ("phase", "work"), ("outcome", "success")),
+            "expected a codeybox.agent.invocations measurement for the successful work invocation");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "work")),
+            "expected a codeybox.phase.duration_ms{phase=work} measurement");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "pickup")),
+            "expected a codeybox.phase.duration_ms{phase=pickup} measurement");
+
+        // The merge phase (RealMerge, non-empty merge path) opens its own
+        // phase.merge span and records a phase=merge duration sample. Asserting
+        // only phase.work would let a regression that dropped or mis-tagged the
+        // merge scope pass unnoticed on this full Done pipeline.
+        Assert.True(spans.Any("phase.merge", ("codeybox.phase", "merge")),
+            "expected a phase.merge span on the full Done pipeline");
+        Assert.True(metrics.Any("codeybox.phase.duration_ms", ("phase", "merge")),
+            "expected a codeybox.phase.duration_ms{phase=merge} measurement");
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static WorkItem NewItem(string branch) => new()

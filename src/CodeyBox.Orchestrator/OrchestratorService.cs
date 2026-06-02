@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
 {
     // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -286,6 +286,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             "AgentConcurrency caps resolved ({Reason}): {Caps} (agents not listed are uncapped within global pool of {GlobalCap})",
             reason, summary, _opts.MaxConcurrentWorkers);
     }
+
+    /// <inheritdoc />
+    public int CurrentlyRunningTotal => Volatile.Read(ref _currentlyRunning);
 
     /// <summary>
     /// Snapshot of concurrency state for the <c>/concurrency</c> endpoint:
@@ -629,6 +632,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var workerIndex = Interlocked.Increment(ref _nextWorkerId);
 
             var capturedId = id.Value;
+            CodeyBoxMeters.Dispatches.Add(1);
             // Increment before Task.Run so the counter is never transiently negative
             // if the task's finally block executes before we reach the increment.
             Interlocked.Increment(ref _currentlyRunning);

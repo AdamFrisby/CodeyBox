@@ -235,6 +235,35 @@ public sealed class WebhookDispatcherTests
         Assert.Null(ex);
     }
 
+    // ── Delivery metrics (operation-driven) ──────────────────────────────────
+
+    [Fact]
+    public async Task SuccessfulDelivery_EmitsDeliveredMeasurement()
+    {
+        using var metrics = new MetricCapture("codeybox.webhook.deliveries");
+        var (dispatcher, _, _) = BuildDispatcher(HttpStatusCode.OK, Endpoint());
+
+        await dispatcher.PublishAsync(MakeEvent("work_item.done"), CancellationToken.None);
+        await dispatcher.DisposeAsync();
+
+        Assert.True(metrics.Any("codeybox.webhook.deliveries",
+            ("outcome", "delivered"), ("endpoint", "test"), ("event", "work_item.done")));
+    }
+
+    [Fact]
+    public async Task GivingUpAfterMaxAttempts_EmitsFailedMeasurement()
+    {
+        using var metrics = new MetricCapture("codeybox.webhook.deliveries");
+        var (dispatcher, _, _) = BuildDispatcher(HttpStatusCode.InternalServerError, Endpoint(maxAttempts: 2));
+
+        await dispatcher.PublishAsync(MakeEvent("work_item.working"), CancellationToken.None);
+        await dispatcher.DisposeAsync();
+
+        Assert.True(metrics.Any("codeybox.webhook.deliveries",
+            ("outcome", "failed"), ("endpoint", "test")));
+        Assert.False(metrics.Any("codeybox.webhook.deliveries", ("outcome", "delivered")));
+    }
+
     // ── NullWebhookDispatcher ────────────────────────────────────────────────
 
     [Fact]
