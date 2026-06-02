@@ -535,6 +535,54 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_ProviderCancellation_MarksWorkingItemFailedAndClearsBookkeeping()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-provider-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrowsCancellation = true };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("provider cancelled resume", after.LastError);
+    }
+
+    [Fact]
+    public async Task StartupResume_ResumeFailure_WithPreemptCheckpoint_RemainsRecoverable()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        var checkpoint = $"refs/heads/codeybox/preempt/{item.Id}";
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-failed-with-checkpoint",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = checkpoint,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrows = true };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(checkpoint, after.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(0, after.RecoveryAttempts);
+    }
+
+    [Fact]
     public async Task StartupResume_BlockingMode_RunsFromStartingAsyncOnlyAndHonorsTimeout()
     {
         var configuredTimeout = TimeSpan.FromMilliseconds(50);
@@ -697,6 +745,22 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_NoSuspendedItems_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupSandboxResumeBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            new FakeSuspendingProvider(),
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupResume_NonSuspendingProvider_IsNoOpEvenWithSuspendedRows()
     {
         // Regression guard for the early-return when the provider does not
@@ -721,6 +785,28 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_NonSuspendingProvider_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupSandboxResumeBarrier();
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-no-provider-barrier",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            new NonSuspendingProvider(), _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupResume_NullProvider_IsNoOp()
     {
         // No sandbox provider registered at all (host doesn't run sandboxes).
@@ -742,6 +828,28 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // bookkeeping was inherited from a different configuration.
         var after = await _store.GetAsync(item.Id);
         Assert.Equal("vm-old", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_NullProvider_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupSandboxResumeBarrier();
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-null-provider-barrier",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            provider: null, _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -1612,6 +1720,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
+        public bool ResumeThrowsCancellation { get; set; }
         public bool ResumeHangs { get; set; }
         public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
         public bool ResumeObservesCancellation { get; set; }
@@ -1641,6 +1750,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         {
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
+            if (ResumeThrowsCancellation) throw new OperationCanceledException("provider cancelled resume");
             if (ResumeHangs || ResumeNamesToHang.Contains(name))
                 return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             if (ResumeObservesCancellation)

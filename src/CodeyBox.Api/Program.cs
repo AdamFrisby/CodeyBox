@@ -1670,7 +1670,8 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         () => monitor.CurrentValue.WorkerProgressWatchdog,
         sp.GetRequiredService<ILogger<WorkerProgressWatchdog>>(),
         sp.GetService<IAgentStreamStore>(),
-        sp.GetService<IWebhookDispatcher>());
+        sp.GetService<IWebhookDispatcher>(),
+        startupResumeBarrier: sp.GetRequiredService<IStartupSandboxResumeBarrier>());
 });
 
 // --- Agent cost extractors + calculator ------------------------------------

@@ -1,14 +1,14 @@
+using System.Diagnostics;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
+using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
@@ -19,7 +19,8 @@ public sealed class StartupResumeApiAvailabilityTests
     [InlineData("throw")]
     public async Task StartupResumeFailure_DoesNotBlockQuotaEndpoint_AndMarksItemFailed(string behavior)
     {
-        using var baseFactory = new WorkItemApiFactory();
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        using var factory = new StartupResumeFullHostFactory(behavior, configuredTimeout);
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -28,56 +29,35 @@ public sealed class StartupResumeApiAvailabilityTests
             Prompt = "p",
             State = WorkItemState.Working,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
             SuspendedVmName = $"vm-{behavior}",
             SuspendedAt = DateTimeOffset.UtcNow,
         };
-        await baseFactory.Store.CreateAsync(item);
-
-        var provider = new StartupResumeProvider(behavior);
-        using var factory = baseFactory.WithWebHostBuilder(builder =>
+        await factory.Store.CreateAsync(item);
+        await factory.Registry.RegisterAsync(new WorkerRegistration
         {
-            builder.ConfigureAppConfiguration((_, cfg) =>
-            {
-                cfg.AddInMemoryCollection(new Dictionary<string, string?>
-                {
-                    ["CodeyBox:Shutdown:SandboxResumeMode"] = nameof(SandboxStartupResumeMode.Background),
-                    ["CodeyBox:Shutdown:SandboxResumeTimeout"] = "00:00:00.050",
-                });
-            });
-            builder.ConfigureTestServices(services =>
-            {
-                services.RemoveAll<ISandboxProvider>();
-                services.AddSingleton<ISandboxProvider>(provider);
-                services.AddHostedService(sp =>
-                {
-                    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
-                    return new SandboxResumeOnStartupService(
-                        sp.GetRequiredService<ISandboxProvider>(),
-                        sp.GetRequiredService<IWorkItemStore>(),
-                        sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>(),
-                        optionsAccessor: () =>
-                        {
-                            var shutdown = monitor.CurrentValue.Shutdown;
-                            return new SandboxStartupResumeOptions
-                            {
-                                Mode = shutdown.SandboxResumeMode,
-                                ResumeTimeout = shutdown.SandboxResumeTimeout,
-                                AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
-                            };
-                        },
-                        barrier: sp.GetRequiredService<IStartupSandboxResumeCompletionSink>());
-                });
-            });
+            WorkerId = $"worker-{behavior}",
+            HostName = "host",
+            ProcessId = 123,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            LastHeartbeatAt = DateTimeOffset.UtcNow,
+            CurrentWorkItemId = item.Id.ToString(),
         });
 
-        var client = await Task.Run(() => factory.CreateClient()).WaitAsync(TimeSpan.FromSeconds(10));
-        using var response = await client.GetAsync("/quota").WaitAsync(TimeSpan.FromSeconds(15));
+        var client = factory.CreateClient();
+        var sw = Stopwatch.StartNew();
+        using var response = await client.GetAsync("/quota")
+            .WaitAsync(TimeSpan.FromSeconds(2));
+        sw.Stop();
 
         response.EnsureSuccessStatusCode();
-        var failed = await WaitForStateAsync(baseFactory.Store, item.Id, WorkItemState.Failed);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2),
+            $"GET /quota was not served promptly while startup resume was running; elapsed {sw.Elapsed}");
+
+        var failed = await WaitForStateAsync(factory.Store, item.Id, WorkItemState.Failed);
         Assert.Null(failed.SuspendedVmName);
         Assert.Contains(behavior == "hang" ? "timed out" : "simulated resume failure", failed.LastError);
-        Assert.Contains(item.SuspendedVmName!, provider.ResumedNames);
+        Assert.Contains(item.SuspendedVmName!, factory.Provider.ResumedNames);
     }
 
     private static async Task<WorkItem> WaitForStateAsync(
@@ -99,6 +79,89 @@ public sealed class StartupResumeApiAvailabilityTests
         latest = await store.GetAsync(id);
         Assert.Equal(expected, latest!.State);
         return latest;
+    }
+
+    private sealed class StartupResumeFullHostFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _behavior;
+        private readonly TimeSpan _resumeTimeout;
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-startup-resume-api-{Guid.NewGuid():N}.db");
+
+        public SqliteWorkItemStore Store { get; }
+        public SqliteWorkerRegistry Registry { get; }
+        public StartupResumeProvider Provider { get; }
+
+        public StartupResumeFullHostFactory(string behavior, TimeSpan resumeTimeout)
+        {
+            _behavior = behavior;
+            _resumeTimeout = resumeTimeout;
+            Store = new SqliteWorkItemStore(_dbPath);
+            Registry = new SqliteWorkerRegistry(_dbPath);
+            Provider = new StartupResumeProvider(_behavior);
+        }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:Smoke:Enabled"] = "false",
+                    ["CodeyBox:Smoke:InVm:Enabled"] = "false",
+                    ["CodeyBox:Shutdown:SandboxResumeMode"] = nameof(SandboxStartupResumeMode.Background),
+                    ["CodeyBox:Shutdown:SandboxResumeTimeout"] = _resumeTimeout.ToString(),
+                    ["CodeyBox:WorkerProgressWatchdog:CheckInterval"] = "00:00:00.010",
+                    ["CodeyBox:WorkerProgressWatchdog:ProgressTimeout"] = "00:00:00.010",
+                    ["CodeyBox:WorkerProgressWatchdog:AutoRecover"] = "true",
+                    ["CodeyBox:DeadWorker:HeartbeatInterval"] = "00:00:00.005",
+                    ["CodeyBox:DeadWorker:DeadWorkerThreshold"] = "00:00:00.015",
+                    ["CodeyBox:DeadWorker:CheckInterval"] = "00:00:00.010",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IWorkItemStore>();
+                services.AddSingleton<IWorkItemStore>(Store);
+
+                services.RemoveAll<IWorkerRegistry>();
+                services.AddSingleton<IWorkerRegistry>(Registry);
+
+                services.RemoveAll<ISandboxProvider>();
+                services.AddSingleton<ISandboxProvider>(Provider);
+
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new NullQuotaProbe());
+
+                services.RemoveAll<IProjectRepository>();
+                services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
+                    new Project
+                    {
+                        Id = new ProjectId("test-project"),
+                        DisplayName = "Test Project",
+                        RepositoryUrl = "https://github.com/test/repo",
+                    }));
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Store.Dispose();
+                Registry.Dispose();
+                try { File.Delete(_dbPath); } catch { }
+            }
+            base.Dispose(disposing);
+        }
     }
 
     private sealed class StartupResumeProvider : ISandboxProvider, ISuspendingSandboxProvider

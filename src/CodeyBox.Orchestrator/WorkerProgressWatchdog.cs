@@ -38,6 +38,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
+    private readonly IStartupSandboxResumeBarrier? _startupResumeBarrier;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -55,7 +56,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         ILogger<WorkerProgressWatchdog> log,
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
-        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
+        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
     {
         _registry = registry;
         _store = store;
@@ -65,6 +67,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _streams = streams;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
+        _startupResumeBarrier = startupResumeBarrier;
     }
 
     public WorkerProgressWatchdog(
@@ -75,8 +78,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         ILogger<WorkerProgressWatchdog> log,
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
-        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser) { }
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
+        IStartupSandboxResumeBarrier? startupResumeBarrier = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupResumeBarrier) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -92,6 +96,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (_startupResumeBarrier is not null)
+            await _startupResumeBarrier.Completion.WaitAsync(stoppingToken);
+
         // Snapshot the configured interval at startup; matching DeadWorkerReaper,
         // changes to CheckInterval take effect on the next process restart while
         // ProgressTimeout / AutoRecover / PostAgentTransitionTimeout are resolved

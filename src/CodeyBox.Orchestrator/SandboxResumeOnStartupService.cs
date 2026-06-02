@@ -409,18 +409,12 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             UpdatedAt = DateTimeOffset.UtcNow,
         };
         if (!resumeSucceeded
-            && fresh.State == WorkItemState.Working
-            && string.IsNullOrWhiteSpace(fresh.PreemptCheckpoint))
+            && DeadWorkerReaper.TryBuildWorkingWithoutPreemptFailure(
+                updatedItem,
+                $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
+                out var failedItem))
         {
-            updatedItem = updatedItem with
-            {
-                State = WorkItemState.Failed,
-                LastError = $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
-                RecoveryAttempts = fresh.RecoveryAttempts + 1,
-                StartedAt = null,
-                PreemptedAt = null,
-                PreemptCheckpoint = null,
-            };
+            updatedItem = failedItem;
             _log.LogWarning(
                 "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
                 item.Id, vmName, resumeError ?? "unknown error");
@@ -447,32 +441,30 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
-        var resumeTask = Task.Run(async () =>
-        {
-            await suspending.ResumeSandboxAsync(vmName, timeoutCts.Token);
-        }, CancellationToken.None);
-
         try
         {
-            await resumeTask.WaitAsync(timeout, ct);
+            await suspending.ResumeSandboxAsync(vmName, timeoutCts.Token)
+                .WaitAsync(timeoutCts.Token);
             return (true, null);
         }
-        catch (TimeoutException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            timeoutCts.Cancel();
-            ObserveTimedOutResumeTask(resumeTask, itemId, vmName);
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
                 vmName, itemId, timeout);
             return (false, error);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+        catch (OperationCanceledException ex)
         {
-            var error = $"timed out after {timeout}";
-            _log.LogWarning(
-                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
-                vmName, itemId, timeout);
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled resume" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup resume was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId);
             return (false, error);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -482,22 +474,6 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 vmName, itemId);
             return (false, ex.Message);
         }
-    }
-
-    private void ObserveTimedOutResumeTask(Task resumeTask, WorkItemId itemId, string vmName)
-    {
-        if (resumeTask.IsCompleted)
-            return;
-
-        resumeTask.ContinueWith(
-            t => _log.LogWarning(
-                t.Exception,
-                "Timed-out startup resume task later faulted for sandbox {VmName} (work item {WorkItemId})",
-                vmName,
-                itemId),
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
     }
 
     /// <summary>
