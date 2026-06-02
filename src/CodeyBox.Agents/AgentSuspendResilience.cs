@@ -29,6 +29,16 @@ public static class AgentSuspendResilience
     private static readonly HashSet<int> SuspendRelatedExitCodes = [1, 52, 56, 92];
 
     /// <summary>
+    /// Returns true when <paramref name="exitCode"/> matches the set of exit
+    /// shapes the suspend-resilience retry treats as transient. Exposed so
+    /// the CLI-native session-resume path can apply the same allowlist (resume
+    /// is recovery for the same family of transient blips), keeping the two
+    /// recovery policies aligned.
+    /// </summary>
+    public static bool IsSuspendRelatedExitCode(int exitCode) =>
+        SuspendRelatedExitCodes.Contains(exitCode);
+
+    /// <summary>
     /// All built-in agent CLIs routed through <see cref="CliAgentRunnerBase"/>.
     /// </summary>
     private static readonly HashSet<string> SupportedAgents = new(StringComparer.Ordinal)

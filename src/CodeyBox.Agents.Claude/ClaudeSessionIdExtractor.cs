@@ -20,24 +20,71 @@ namespace CodeyBox.Agents.Claude;
 /// allocation-cheap (one <see cref="JsonDocument"/> per JSON line, disposed
 /// eagerly).
 /// </para>
+///
+/// <para>
+/// Inspection is bounded: only the first <see cref="MaxScannedBytes"/> of
+/// stdout and <see cref="MaxScannedLines"/> JSON-looking lines are inspected.
+/// The init event is emitted on the CLI's very first stream-json line so a
+/// small prefix is more than enough; the caps protect failure handling from
+/// pathological prompts that induce massive structured output before crashing.
+/// </para>
 /// </summary>
 internal static class ClaudeSessionIdExtractor
 {
+    /// <summary>
+    /// Cap on the stdout prefix scanned for the init event. The Claude CLI
+    /// emits the init event as its FIRST stream-json line; a 64 KiB prefix
+    /// covers it many times over while bounding allocation on a crashed run
+    /// with arbitrary captured output.
+    /// </summary>
+    internal const int MaxScannedBytes = 64 * 1024;
+
+    /// <summary>
+    /// Cap on the number of JSON-looking lines parsed inside the scanned
+    /// prefix. Belt-and-braces backstop for a prefix densely packed with
+    /// short JSON fragments.
+    /// </summary>
+    internal const int MaxScannedLines = 128;
+
     public static string? Extract(string? stdout)
     {
         if (string.IsNullOrEmpty(stdout))
             return null;
 
-        foreach (var rawLine in stdout.Split('\n'))
+        var scannedSlice = stdout.Length <= MaxScannedBytes
+            ? stdout.AsSpan()
+            : stdout.AsSpan(0, MaxScannedBytes);
+
+        var jsonLinesParsed = 0;
+        var remaining = scannedSlice;
+        while (!remaining.IsEmpty)
         {
+            var newlineIndex = remaining.IndexOf('\n');
+            ReadOnlySpan<char> rawLine;
+            if (newlineIndex < 0)
+            {
+                rawLine = remaining;
+                remaining = default;
+            }
+            else
+            {
+                rawLine = remaining[..newlineIndex];
+                remaining = remaining[(newlineIndex + 1)..];
+            }
+
+            // TrimEnd \r then Trim whitespace; equivalent to the original
+            // .TrimEnd('\r').Trim() pair on the string overload.
             var line = rawLine.TrimEnd('\r').Trim();
             if (line.Length == 0 || line[0] != '{')
                 continue;
 
+            if (++jsonLinesParsed > MaxScannedLines)
+                break;
+
             JsonDocument? doc = null;
             try
             {
-                doc = JsonDocument.Parse(line);
+                doc = JsonDocument.Parse(line.ToString());
                 if (doc.RootElement.ValueKind != JsonValueKind.Object)
                     continue;
                 if (!IsInitEvent(doc.RootElement))

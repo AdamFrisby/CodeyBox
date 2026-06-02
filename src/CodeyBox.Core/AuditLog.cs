@@ -1146,6 +1146,20 @@ public static class AuditLog
                 "Claude ACP transport degraded to print for session {SessionId}: {Reason}",
                 sessionId, reason);
 
+    /// <summary>
+    /// Emitted when the CLI-native session-resume liveness probe threw an
+    /// unexpected exception against the sandbox (a sandbox/provider bug, not
+    /// the agent itself). Surfaces the infrastructure problem rather than
+    /// hiding it as an ordinary non-resumable agent exit. The work item still
+    /// fails / re-drives, but operators can correlate the failure with the
+    /// underlying sandbox fault.
+    /// </summary>
+    public static void SessionResumeLivenessProbeFailed(AgentKind agent, string exceptionType, string message) =>
+        Audit("agent.session_resume_liveness_probe_failed")
+            .Warning(
+                "Session-resume liveness probe failed unexpectedly for {Agent}: {ExceptionType}: {Message}",
+                agent.Value, exceptionType, message);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>

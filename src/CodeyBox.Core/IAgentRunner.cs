@@ -137,6 +137,20 @@ public sealed record AgentResumeContext(
     string CheckpointRef,
     string ScratchpadArchivePath = ".codeybox/preempt-scratchpad.tgz");
 
+/// <summary>
+/// Optional capability marker for runners that drive a CLI with a native
+/// session-resume mode (e.g. <c>claude --resume &lt;id&gt;</c>) and need the
+/// CLI's id-bearing structured output enabled to capture the session id
+/// emitted on its init event. Distinct from <see cref="IResumableAgentRunner"/>,
+/// which handles scratchpad-archive-based preempt resume. Orchestrator-side
+/// callers use this marker to enable the id-bearing output mode independently
+/// of persistent stream logging (<c>AgentStreams</c>), so a transient CLI
+/// crash is recoverable even when stream persistence is disabled.
+/// </summary>
+public interface ICliSessionResumableAgentRunner : IAgentRunner
+{
+}
+
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

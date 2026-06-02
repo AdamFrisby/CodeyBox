@@ -475,18 +475,19 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // (the top-scoring member, picked first) and the other two
             // spilled to Claude. Without spill, items 2&3 would have stayed
             // Queued and their Agent field would be null. The reservation
-            // counter increments inside the router just before the worker
-            // persists the chosen Agent, so wait for the store stamps too.
-            AgentKind?[] agents = [];
-            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
-            while (DateTimeOffset.UtcNow < stampDeadline)
+            // counter increments inside the router BEFORE the per-item
+            // StartedAt/Agent store write, so observedTotal==3 only proves
+            // the slots are pinned — we still have to wait for the store
+            // stamps to land before reading them.
+            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
+            AgentKind?[] agents;
+            while (true)
             {
                 var snap1 = await _store.GetAsync(i1.Id);
                 var snap2 = await _store.GetAsync(i2.Id);
                 var snap3 = await _store.GetAsync(i3.Id);
                 agents = [snap1?.Agent, snap2?.Agent, snap3?.Agent];
-                if (agents.Count(a => a == Codex) == 1
-                    && agents.Count(a => a == Claude) == 2)
+                if (agents.All(a => a is not null) || DateTimeOffset.UtcNow >= stampDeadline)
                     break;
                 await Task.Delay(25);
             }

@@ -137,6 +137,54 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task SoleMember_ExhaustsSessionResume_FailsCleanlyWithoutFallback()
+    {
+        // Companion guard for the nextMember == null path in
+        // MoveToNextMemberOrThrowAsync's ResumeExhausted branch. The sibling
+        // Codex_ExhaustsSessionResume_FallsBackToClaude_… test exercises the
+        // "fallback candidate exists → use it" branch; this test pins the
+        // "no candidate left" branch: the AgentSessionResumeExhaustedException
+        // must surface (NOT be silently swallowed, parked as quota, or
+        // re-tried against the same exhausted agent), and the item must reach
+        // a clean Failed terminal rather than spinning or stranding.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, singleMemberClass: true);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        // Clean Failed terminal — not Done (no successful recovery), not
+        // WaitingForQuotaReset (resume-exhausted is not a quota event), not
+        // stuck in a non-terminal state.
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        // failureKind comes from the catch (Exception) default branch — the
+        // resume-exhausted exception is not classified as quota or timeout.
+        Assert.NotEqual("quota", finalItem.FailureKind);
+        Assert.NotEqual("timeout", finalItem.FailureKind);
+
+        // Codex was the only member; no fallback attempt against any other
+        // agent could have occurred. The class chain MUST NOT have re-tried
+        // the same exhausted agent in a loop either.
+        Assert.Equal(1, fix.Codex.CallCount);
+
+        // No swap recorded because no candidate was available.
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.DoesNotContain(history, h => h.Phase == "work" && h.ToAgent is not null);
+
+        // No misleading "agent.fallback" webhook either: that event implies a
+        // successor agent took over; here the run terminated.
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.fallback");
+    }
+
+    [Fact]
     public async Task AuditDrivenRework_EmitsReworkPhaseSpanAndDuration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1542,7 +1590,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         int stuckThresholdMinutes = -1,
         Func<InMemoryAgentInvolvementStore, IAgentInvolvementStore>? wrapInvolvement = null,
         ProjectNetworkProfiles? networkProfiles = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        bool singleMemberClass = false)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1561,12 +1610,17 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         {
             Id = "frontier",
             DisplayName = "Frontier",
-            Members =
-            [
-                // Codex first by config-order tiebreak (same effective score).
-                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
-                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
-            ],
+            Members = singleMemberClass
+                ?
+                [
+                    new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ]
+                :
+                [
+                    // Codex first by config-order tiebreak (same effective score).
+                    new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
         };
 
         var auditorList = auditors ?? [];

@@ -322,8 +322,13 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_RateLimitWithCapturedSessionId_DoesNotResumeHammer()
+    public async Task ClaudeRunner_SoftRateLimitWithCapturedSessionId_ResumesInSameSandbox()
     {
+        // Soft 429s ("API Error: 429 rate_limit_exceeded") are transient blips
+        // per the task spec — the resume gate allows them through so the
+        // runner backs off and tries again in the same session rather than
+        // throwing away conversation state. Hard quota exhaustion is still
+        // blocked by the gate (see *HardQuota* tests).
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
         var sandbox = new ResumeRecordingSandbox(call => call == 1
@@ -335,23 +340,27 @@ public sealed class AgentSessionResumeTests : IDisposable
         var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
-        Assert.False(result.Success);
-        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
     }
 
     [Fact]
-    public async Task ClaudeRunner_SoftRateLimitWithResetWindow_DoesNotResumeHammer()
+    public async Task ClaudeRunner_SoftRateLimitPersistent_BoundsRetriesAndThrowsExhausted()
     {
+        // Soft 429s consume the resume budget; once exhausted, surface the
+        // dedicated exception so the orchestrator's class-fallback chain
+        // engages instead of resume-hammering forever.
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
 
-        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
-            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
-
-        Assert.False(result.Success);
-        Assert.Single(sandbox.ClaudeInvocations);
+        await Assert.ThrowsAsync<AgentSessionResumeExhaustedException>(() =>
+            ClaudeRunnerWithQuotaClassifier().RunAsync(
+                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
+        // initial call + MaxResumeAttempts resumes
+        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
     }
 
     [Fact]

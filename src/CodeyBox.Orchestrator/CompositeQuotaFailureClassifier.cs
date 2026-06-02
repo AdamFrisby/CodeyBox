@@ -6,7 +6,7 @@ namespace CodeyBox.Orchestrator;
 /// Dispatches quota-failure detection to the per-provider detectors registered
 /// by the composition root.
 /// </summary>
-public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier
+public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier, IQuotaFailureAuditEmitter
 {
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaFailureDetector> _detectors;
 

@@ -25,7 +25,7 @@ namespace CodeyBox.Agents.Claude;
 /// failure leaves the requested id untouched (best-effort, so we never
 /// degrade a working call).</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
@@ -400,9 +400,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// resume retry path. After a transient crash whose stdout carried a
     /// session id, the loop rebuilds the next attempt via
     /// <see cref="BuildSessionResumeInvocation"/> instead of restarting the
-    /// run from scratch. The caller-visible stdout format is preserved: session
-    /// ids are captured only from output modes the caller already requested or
-    /// from a CLI that emits an id in plain output.
+    /// run from scratch. Session-id extraction requires Claude's
+    /// <c>--output-format stream-json --verbose</c> mode (the init event is
+    /// emitted on that channel); the orchestrator enables it via the
+    /// <see cref="ICliSessionResumableAgentRunner"/> marker independently of
+    /// optional persistent stream logging. Call sites that intentionally drive
+    /// claude in plain-text mode (e.g. verdict-parser shortcuts) keep their
+    /// plain-text contract and forgo resume.
     /// </summary>
     protected override bool SupportsSessionResume => true;
 

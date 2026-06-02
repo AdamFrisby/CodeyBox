@@ -140,6 +140,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
+    private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
@@ -248,11 +249,18 @@ public sealed class PipelineRunner : IPipelineRunner
             log.LogWarning(
                 "PipelineRunner constructed without an IQuotaFailureClassifier; " +
                 "quota-failure detection is disabled. Wire CompositeQuotaFailureClassifier in DI.");
-            _quotaClassifier = new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+            var fallback = new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+            _quotaClassifier = fallback;
+            _quotaAuditEmitter = fallback;
         }
         else
         {
             _quotaClassifier = quotaClassifier;
+            // The orchestrator's composite implements both contracts; fall back
+            // to a no-op emitter when an alternative classifier was wired that
+            // only handles classification (test/fake setups).
+            _quotaAuditEmitter = quotaClassifier as IQuotaFailureAuditEmitter
+                ?? NullQuotaFailureAuditEmitter.Instance;
         }
         _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
@@ -2638,6 +2646,14 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        // The runner's CLI-native session resume capability is independent of
+        // optional stream persistence: a transient agent crash should still be
+        // recoverable in the same sandbox even when AgentStreams is disabled.
+        // Force-enable the id-bearing output mode whenever the runner declares
+        // CLI session resume, so the captured init session_id lets the resume
+        // gate take over.
+        var needsStreamForResume = runner is ICliSessionResumableAgentRunner;
+        var captureStructuredStream = streamCapture is not null || needsStreamForResume;
 
         AgentResult agentResult;
         using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -2655,7 +2671,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         stdoutChunkCallback: stdoutCallback)
                     : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                         stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: streamCapture is not null);
+                        captureStructuredStream: captureStructuredStream);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
@@ -2822,7 +2838,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // Per-provider detector (registered as IQuotaFailureClassifier) inspects
             // stderr/stdout and structured stream events. Per-CLI classification +
             // reset-window parsing now live in the per-provider library.
-            _quotaClassifier.EmitAdvisoryAuditEvents(
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                 runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
             var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
@@ -4874,6 +4890,10 @@ public sealed class PipelineRunner : IPipelineRunner
         var stdoutCallback = auditor.Kind == "llm"
             ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
             : null;
+        // Force id-bearing structured output for resumable LLM auditors so a
+        // transient mid-audit crash can recover via CLI-native session resume
+        // independently of AgentStream persistence (see work-phase comment).
+        var auditNeedsStreamForResume = auditor.Kind == "llm" && runner is ICliSessionResumableAgentRunner;
         // The work item's ModelId came from the AgentMembership picked for the
         // work agent kind. If audit cross-review picked a different kind, that
         // model id is vendor-specific and won't be valid for the audit runner —
@@ -4894,7 +4914,7 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditRunner = promptRunner,
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
-            CaptureStructuredStream = streamCapture is not null,
+            CaptureStructuredStream = streamCapture is not null || auditNeedsStreamForResume,
             ModelId = crossKind ? null : ctx.ModelId,
             ReasoningMode = ctx.ReasoningMode,
         };
@@ -5005,7 +5025,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
             return;
 
-        _quotaClassifier.EmitAdvisoryAuditEvents(
+        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
             run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
         var quotaDetection = _quotaClassifier.Detect(
             run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
@@ -6799,6 +6819,9 @@ public sealed class PipelineRunner : IPipelineRunner
                     : null;
                 mergeStructuredStreamCaptured = mergeStreamCapture is not null;
                 var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
+                // Decouple from AgentStreams: resumable CLIs always need stream-json
+                // for the init session_id (see work-phase comment).
+                var mergeNeedsStreamForResume = runner is ICliSessionResumableAgentRunner;
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 try
                 {
@@ -6806,7 +6829,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                             stdoutChunkCallback: mergeStdoutCallback,
-                            captureStructuredStream: mergeStreamCapture is not null);
+                            captureStructuredStream: mergeStreamCapture is not null || mergeNeedsStreamForResume);
                         var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
                         {
@@ -6876,7 +6899,7 @@ public sealed class PipelineRunner : IPipelineRunner
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
             if (!agentResult.Success)
             {
-                _quotaClassifier.EmitAdvisoryAuditEvents(
+                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
                 var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
                 if (detection is not null)
