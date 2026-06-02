@@ -1982,12 +1982,13 @@ builder.Services.AddHostedService(sp =>
 });
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
 // operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
-// bookkeeping so the next process can reattach; Stop is the default and
-// cleanly stops active VMs without writing RAM snapshots.
+// bookkeeping so the next process can reattach; Stop is the default and leaves
+// active VMs to PipelineRunner's existing preempt-checkpoint + preserve path.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
 // to background mode so a wedged multipassd cannot keep Kestrel offline;
 // OrchestratorService waits for startup recovery input before its dead-worker
-// startup recovery sweep.
+// startup recovery sweep. Blocking resume mode still runs through
+// IHostedLifecycleService.StartingAsync, so the host awaits it natively.
 //
 // R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
 // as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
@@ -1995,15 +1996,17 @@ builder.Services.AddHostedService(sp =>
 // new sandboxes that race the snapshot. Teardown mode is operator-tunable via
 // CodeyBox:Shutdown:SandboxTeardownMode (Stop / Suspend / Dispose); default
 // Stop to avoid multipass suspend/qemu-lock wedges unless an operator opts in.
-// Resolve it through IOptionsMonitor at shutdown time so a hot config edit
-// affects the next graceful shutdown.
+// Resolve teardown mode through IOptionsMonitor at shutdown time so a hot config
+// edit affects the next graceful shutdown.
 builder.Services.AddHostedService(sp =>
 {
     var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var shutdown = optionsMonitor.CurrentValue.Shutdown;
     return new SandboxSuspendOnShutdownService(
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<IWorkItemStore>(),
         sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>(),
+        nonSuspendTeardownTimeout: TimeSpan.FromSeconds(Math.Max(1, shutdown.GraceSeconds)),
         dispatchGate: sp.GetService<IShutdownDispatchGate>(),
         teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);
 });
@@ -3062,9 +3065,9 @@ namespace CodeyBox.Api
         /// Hot-reloadable: read by the shutdown handler when graceful shutdown
         /// begins, so an operator can switch modes without restarting first.
         /// Default <see cref="SandboxTeardownMode.Stop"/>: avoid RAM snapshots
-        /// and preserve the VM disk through a clean stop during the shutdown
-        /// lifecycle sweep. Operators who explicitly want RAM-state
-        /// preservation can opt in to
+        /// and recover through the preempt-checkpoint flow, which stops and
+        /// preserves the VM after the checkpoint is written. Operators who
+        /// explicitly want RAM-state preservation can opt in to
         /// <see cref="SandboxTeardownMode.Suspend"/>; it freezes RAM via
         /// <c>multipass suspend</c> and resumes on next startup, but can hit the
         /// qemu disk-image write-lock wedge that caused the 2026-05-29 incident.

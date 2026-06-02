@@ -1697,15 +1697,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
         Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler,
-        int? maxScreenshotPngBytes = null)
+        int? maxScreenshotPngBytes = null,
+        TimeSpan? vmStopTimeout = null)
     {
-        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes);
+        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes, vmStopTimeout);
     }
 
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
         RecordingMultipassRunner runner,
-        int? maxScreenshotPngBytes = null)
+        int? maxScreenshotPngBytes = null,
+        TimeSpan? vmStopTimeout = null)
     {
         return new MultipassSandbox(
             "codeybox-test",
@@ -1716,7 +1718,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Flavor = flavor,
                 WorkingDirectory = "/work",
             },
-            new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/true",
+                VmStopTimeout = vmStopTimeout ?? MultipassSandboxOptions.DefaultVmStopTimeout,
+            },
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: runner,
             maxScreenshotPngBytes: maxScreenshotPngBytes);
@@ -2036,6 +2042,78 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (Directory.Exists(workspace2))
                 Directory.Delete(workspace2, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_RunsStopAndVerifiesStopped()
+    {
+        var stopCalls = 0;
+        var infoCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+            {
+                infoCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "Stopped", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+
+        Assert.Equal(1, stopCalls);
+        Assert.True(infoCalls >= 1);
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_NonZeroStopExit_Throws()
+    {
+        var stopCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                return Task.FromResult(new ProcessRunResult(3, "", "multipassd: stop failed"));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.True(stopCalls >= 1);
+        Assert.Contains("multipass stop codeybox-test failed", ex.Message);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_NotStoppedAfterSuccessfulStop_Throws()
+    {
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+                return Task.FromResult(new ProcessRunResult(0, "Running", ""));
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(
+            SandboxProfileFlavor.Headless,
+            runner,
+            vmStopTimeout: TimeSpan.FromMilliseconds(1));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.Contains("did not reach Stopped state", ex.Message);
     }
 
     [Fact]

@@ -255,12 +255,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     // ── Stop / Dispose teardown modes ────────────────────────────────────────
 
     [Fact]
-    public async Task ShutdownHandler_StopMode_CallsStopAndPreserve_NotSuspend()
+    public async Task ShutdownHandler_StopMode_DefersToPipelinePreemptCheckpoint_NotSuspend()
     {
-        // The R8.1 default teardown mode the post-incident review recommended:
-        // multipass stop is faster and far less likely to wedge multipassd than
-        // suspend, and the lifecycle service must apply it to every active
-        // suspendable sandbox in its shutdown snapshot.
+        // The R8.1 alternative teardown mode the post-incident review
+        // recommended: multipass stop is faster and far less likely to wedge
+        // multipassd than suspend. The lifecycle service must leave the VM live
+        // for PipelineRunner's host-shutdown catch so it can write a
+        // PreemptCheckpoint before StopAndPreserveAsync runs.
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -276,15 +277,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Stop mode must not call SuspendAsync");
-        Assert.True(sandbox.StopAndPreserveCalled,
-            "Stop mode must stop and preserve every active suspendable sandbox");
-        Assert.False(sandbox.DisposeCalled, "Stop mode must not dispose preemptible sandboxes");
-        Assert.True(sandbox.OwnedByShutdownHandler,
-            "Stop mode must suppress PipelineRunner's in-VM preempt-checkpoint path against the stopped VM");
-        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.StopAndPreserveOrder,
-            "Stop mode must mark shutdown ownership before stopping the sandbox");
+        Assert.False(sandbox.StopAndPreserveCalled,
+            "Stop mode must leave StopAndPreserveAsync to PipelineRunner after preempt checkpoint");
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path");
         // Stop mode does not persist SuspendedVmName: the work item recovers via
-        // the standard stopped-sandbox recovery path, not suspend-resume.
+        // its preempt-checkpoint, same as a non-suspending provider would.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
     }

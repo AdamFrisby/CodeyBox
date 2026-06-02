@@ -250,7 +250,47 @@ public sealed class HostShutdownTimeoutWiringTests
         await shutdownService.StoppingAsync(CancellationToken.None);
 
         Assert.False(sandbox.SuspendCalled);
-        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.StopAndPreserveCalled);
+        var after = await store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task SandboxSuspendOnShutdownService_FromDi_UsesConfiguredDisposeMode()
+    {
+        var fakeProvider = new FakeSuspendingProvider();
+        using var factory = new SandboxShutdownServiceWiringFactory(
+            fakeProvider,
+            teardownMode: SandboxTeardownMode.Dispose,
+            graceSeconds: 7);
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var shutdownService = factory.Services.GetServices<IHostedService>()
+            .OfType<SandboxSuspendOnShutdownService>()
+            .Single();
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+        await store.CreateAsync(item);
+
+        var sandbox = new FakeSuspendableSandbox("vm-dispose-from-di");
+        fakeProvider.Register(item.Id, sandbox);
+
+        Assert.Equal(TimeSpan.FromSeconds(7), shutdownService.NonSuspendTeardownTimeout);
+
+        await shutdownService.StoppingAsync(CancellationToken.None);
+
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.StopAndPreserveCalled);
+        Assert.True(sandbox.DisposeCalled);
         var after = await store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
@@ -339,15 +379,18 @@ public sealed class HostShutdownTimeoutWiringTests
     {
         private readonly ISandboxProvider _provider;
         private readonly SandboxTeardownMode? _teardownMode;
+        private readonly int? _graceSeconds;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-shutdownsvc-{Guid.NewGuid():N}.db");
 
         public SandboxShutdownServiceWiringFactory(
             ISandboxProvider provider,
-            SandboxTeardownMode? teardownMode = null)
+            SandboxTeardownMode? teardownMode = null,
+            int? graceSeconds = null)
         {
             _provider = provider;
             _teardownMode = teardownMode;
+            _graceSeconds = graceSeconds;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -368,6 +411,8 @@ public sealed class HostShutdownTimeoutWiringTests
                 };
                 if (_teardownMode is { } teardownMode)
                     values["CodeyBox:Shutdown:SandboxTeardownMode"] = teardownMode.ToString();
+                if (_graceSeconds is { } graceSeconds)
+                    values["CodeyBox:Shutdown:GraceSeconds"] = graceSeconds.ToString();
                 cfg.AddInMemoryCollection(values);
             });
             builder.ConfigureTestServices(services =>
@@ -446,9 +491,14 @@ public sealed class HostShutdownTimeoutWiringTests
         public string Id { get; } = id;
         public bool SuspendCalled { get; private set; }
         public bool StopAndPreserveCalled { get; private set; }
+        public bool DisposeCalled { get; private set; }
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => throw new NotSupportedException();
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalled = true;
+            return ValueTask.CompletedTask;
+        }
         public Task SuspendAsync(CancellationToken ct = default)
         {
             SuspendCalled = true;

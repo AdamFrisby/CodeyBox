@@ -3209,13 +3209,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// <see cref="IsSuspended"/>; set explicitly by
     /// <see cref="MarkOwnedByShutdownHandler"/> for teardown modes whose
     /// recovery path does not go through SuspendAsync but still cannot run the
-    /// in-VM checkpoint flow against a stopped or deleted VM.
+    /// in-VM checkpoint flow. Stop mode deliberately leaves this false so
+    /// PipelineRunner can write a PreemptCheckpoint before stopping the VM.
     /// </summary>
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
 
     /// <summary>
-    /// Called by <c>SandboxSuspendOnShutdownService</c> before Stop or Dispose
-    /// teardown begins so PipelineRunner's shutdown catch sees the
+    /// Called by <c>SandboxSuspendOnShutdownService</c> before destructive
+    /// teardown modes begin so PipelineRunner's shutdown catch sees the
     /// "skip in-VM checkpoint" signal even though the suspend path was not
     /// taken. Idempotent; safe to call multiple times.
     /// </summary>
@@ -3668,27 +3669,42 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             _log.LogWarning(ex, "Failed to write preempt marker for multipass VM {Name}", _name);
         }
 
-        try
+        var stop = await RunMultipassAsync(
+            [_opts.MultipassBinary, "stop", _name],
+            stdin: null,
+            ct: ct);
+        if (stop.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"multipass stop {_name} failed (exit {stop.ExitCode}): {stop.Stderr}");
+
+        await WaitForStoppedAfterPreserveAsync(ct);
+    }
+
+    private async Task WaitForStoppedAfterPreserveAsync(CancellationToken ct)
+    {
+        var stopTimeout = _opts.VmStopTimeout > TimeSpan.Zero
+            ? _opts.VmStopTimeout
+            : MultipassSandboxOptions.DefaultVmStopTimeout;
+        var deadline = DateTime.UtcNow + stopTimeout;
+        while (DateTime.UtcNow < deadline)
         {
-            using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = _opts.MultipassBinary,
-                ArgumentList = { "stop", _name },
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            });
-            if (p is not null)
-            {
-                _ = await p.StandardOutput.ReadToEndAsync(ct);
-                _ = await p.StandardError.ReadToEndAsync(ct);
-                await p.WaitForExitAsync(ct);
-            }
+            ct.ThrowIfCancellationRequested();
+            var info = await RunMultipassAsync(
+                [_opts.MultipassBinary, "info", _name, "--format=csv"],
+                stdin: null,
+                ct: ct);
+            if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
+                return;
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                break;
+            await Task.Delay(
+                remaining < TimeSpan.FromMilliseconds(500) ? remaining : TimeSpan.FromMilliseconds(500),
+                ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.LogWarning(ex, "Failed to stop multipass VM {Name} for preemption", _name);
-        }
+
+        throw new InvalidOperationException(
+            $"multipass VM {_name} did not reach Stopped state within {stopTimeout}");
     }
 
     /// <summary>
