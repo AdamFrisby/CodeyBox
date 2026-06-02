@@ -176,20 +176,34 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     public async Task StopAsync(CancellationToken ct)
     {
-        var cts = _backgroundCts;
-        cts?.Cancel();
-        var task = _resumeTask;
-        try
+        CancellationTokenSource? cts;
+        Task? task;
+        lock (_resumeStartGate)
         {
-            if (task is not null)
-            {
-                try { await task.WaitAsync(ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-            }
+            cts = _backgroundCts;
+            task = _resumeTask;
         }
-        finally
+
+        try { cts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+        if (task is not null)
         {
-            cts?.Dispose();
+            try { await task.WaitAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        }
+
+        if (task is null || task.IsCompleted)
+        {
+            CancellationTokenSource? dispose = null;
+            lock (_resumeStartGate)
+            {
+                if (ReferenceEquals(_backgroundCts, cts))
+                {
+                    dispose = _backgroundCts;
+                    _backgroundCts = null;
+                }
+            }
+            dispose?.Dispose();
         }
     }
 
@@ -302,22 +316,29 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         var options = CurrentOptions();
         using var gate = new SemaphoreSlim(options.MaxParallelResumes, options.MaxParallelResumes);
         var tasks = new List<Task>(suspended.Count);
-        foreach (var item in suspended)
+        try
         {
-            await gate.WaitAsync(ct);
-            tasks.Add(Task.Run(async () =>
+            foreach (var item in suspended)
             {
-                try
+                await gate.WaitAsync(ct);
+                tasks.Add(Task.Run(async () =>
                 {
-                    await ResumeOneAsync(suspending, item, ct);
-                }
-                finally
-                {
-                    gate.Release();
-                }
-            }, ct));
+                    try
+                    {
+                        await ResumeOneAsync(suspending, item, ct);
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                }, ct));
+            }
         }
-        await Task.WhenAll(tasks);
+        finally
+        {
+            if (tasks.Count > 0)
+                await Task.WhenAll(tasks);
+        }
     }
 
     private async Task ResumeOneAsync(ISuspendingSandboxProvider suspending, WorkItem item, CancellationToken ct)

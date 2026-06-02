@@ -30,6 +30,7 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<StartupSandboxReconciliationService> _log;
+    private readonly Lock _lifecycleGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _reconcileTask;
 
@@ -45,29 +46,49 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
 
     public Task StartAsync(CancellationToken ct)
     {
-        _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _reconcileTask = Task.Run(
-            () => ReconcileAllSafelyAsync(_backgroundCts.Token),
-            CancellationToken.None);
+        lock (_lifecycleGate)
+        {
+            if (_reconcileTask is not null)
+                return Task.CompletedTask;
+
+            _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _reconcileTask = Task.Run(
+                () => ReconcileAllSafelyAsync(_backgroundCts.Token),
+                CancellationToken.None);
+        }
         return Task.CompletedTask;
     }
 
     public async Task StopAsync(CancellationToken ct)
     {
-        var cts = _backgroundCts;
-        cts?.Cancel();
-        var task = _reconcileTask;
-        try
+        CancellationTokenSource? cts;
+        Task? task;
+        lock (_lifecycleGate)
         {
-            if (task is not null)
-            {
-                try { await task.WaitAsync(ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
-            }
+            cts = _backgroundCts;
+            task = _reconcileTask;
         }
-        finally
+
+        try { cts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+        if (task is not null)
         {
-            cts?.Dispose();
+            try { await task.WaitAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        }
+
+        if (task is null || task.IsCompleted)
+        {
+            CancellationTokenSource? dispose = null;
+            lock (_lifecycleGate)
+            {
+                if (ReferenceEquals(_backgroundCts, cts))
+                {
+                    dispose = _backgroundCts;
+                    _backgroundCts = null;
+                }
+            }
+            dispose?.Dispose();
         }
     }
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;

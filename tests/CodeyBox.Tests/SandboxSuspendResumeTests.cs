@@ -780,6 +780,39 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_StopAsync_CancelsBackgroundResume_AndIsIdempotent()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-stop-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
+        var barrier = new StartupSandboxResumeBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            resumeTimeout: TimeSpan.FromHours(1),
+            mode: SandboxStartupResumeMode.Background,
+            barrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-stop-cancel"));
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(stopCts.Token);
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(provider.ResumeCancellationObserved);
+
+        // Host/factory disposal paths may call StopAsync more than once.
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupResume_NonSuspendingProvider_IsNoOpEvenWithSuspendedRows()
     {
         // Regression guard for the early-return when the provider does not

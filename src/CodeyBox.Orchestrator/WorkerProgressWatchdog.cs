@@ -97,7 +97,14 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (_startupResumeBarrier is not null)
+        {
+            // Keep startup recovery ordered behind suspended-VM resume/adoption
+            // so the watchdog does not recycle items that still carry
+            // SuspendedVmName while the resume service is reattaching them.
             await _startupResumeBarrier.Completion.WaitAsync(stoppingToken);
+        }
+
+        await RunOnceAsync(stoppingToken);
 
         // Snapshot the configured interval at startup; matching DeadWorkerReaper,
         // changes to CheckInterval take effect on the next process restart while

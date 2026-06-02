@@ -471,6 +471,25 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupReconciler_StopAsync_CancelsBackgroundRecovery_AndIsIdempotent()
+    {
+        var provider = new BlockingReconcilingProvider();
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        await provider.ReconcileEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(stopCts.Token);
+
+        Assert.True(provider.ReconcileCancellationObserved);
+
+        // Host/factory disposal paths may call StopAsync more than once.
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupReconciler_UnrecoverableVm_IsReturnedForOperatorAttention()
     {
         // When the provider can't recover a VM (root cleanup needed — the
@@ -934,13 +953,22 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
-        public Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
+        public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
             IReadOnlySet<string> liveSuspendedNames, CancellationToken ct)
         {
             ReconcileEntered.TrySetResult();
-            return _release.Task;
+            try
+            {
+                return await _release.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                ReconcileCancellationObserved = true;
+                throw;
+            }
         }
 
+        public bool ReconcileCancellationObserved { get; private set; }
         public void Release() => _release.TrySetResult([]);
     }
 
