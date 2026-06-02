@@ -516,8 +516,7 @@ public sealed class ClaudeSessionSanitizerTests
         // retry and succeed.
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
         Assert.True(result.Success);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.True(claudeCount >= 2, $"Expected >=2 claude calls (retry fired), got {claudeCount}");
     }
 
@@ -539,8 +538,7 @@ public sealed class ClaudeSessionSanitizerTests
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
         Assert.False(result.Success);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
     }
 
@@ -577,7 +575,7 @@ public sealed class ClaudeSessionSanitizerTests
             {
                 sanitizerIdx = i;
             }
-            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "claude")
+            if (IsClaudeAgentInvocation(execs[i]))
             {
                 if (firstClaudeIdx < 0) firstClaudeIdx = i;
                 lastClaudeIdx = i;
@@ -607,8 +605,7 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.False(result.Success);
         Assert.Contains("thinking", result.Stderr, StringComparison.OrdinalIgnoreCase);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
         Assert.DoesNotContain(sandbox.AllExecs, e =>
             e.Argv.Count > 0
@@ -647,7 +644,7 @@ public sealed class ClaudeSessionSanitizerTests
             {
                 sanitizerIdx = i;
             }
-            if (execs[i].Argv.Count > 0 && execs[i].Argv[0] == "claude")
+            if (IsClaudeAgentInvocation(execs[i]))
             {
                 if (firstClaudeIdx < 0) firstClaudeIdx = i;
                 lastClaudeIdx = i;
@@ -677,8 +674,7 @@ public sealed class ClaudeSessionSanitizerTests
 
         Assert.False(result.Success);
         Assert.Contains("generic failure", result.Stderr, StringComparison.OrdinalIgnoreCase);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
     }
 
@@ -699,8 +695,7 @@ public sealed class ClaudeSessionSanitizerTests
             resume: new AgentResumeContext("refs/heads/codeybox/preempt/test"));
 
         Assert.False(result.Success);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
     }
 
@@ -719,8 +714,7 @@ public sealed class ClaudeSessionSanitizerTests
             sandbox, "/work", "prompt", credential: null);
 
         Assert.False(result.Success);
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
     }
 
@@ -803,10 +797,14 @@ public sealed class ClaudeSessionSanitizerTests
         Assert.False(result.Success);
         Assert.Contains("sanitiser failed", result.Summary, StringComparison.Ordinal);
 
-        var claudeCount = sandbox.AllExecs.Count(e =>
-            e.Argv.Count > 0 && e.Argv[0] == "claude");
+        var claudeCount = sandbox.AllExecs.Count(IsClaudeAgentInvocation);
         Assert.Equal(1, claudeCount);
     }
+
+    private static bool IsClaudeAgentInvocation(SandboxExec exec) =>
+        exec.Argv.Count > 0
+        && exec.Argv[0] == "claude"
+        && !exec.Argv.Contains("--help");
 }
 
 /// <summary>
@@ -901,6 +899,13 @@ internal sealed class ThinkingBlockRetrySandbox : ISandbox
 
             // Other bash calls (scratchpad restore, etc.) succeed
             return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        }
+
+        if (exec.Argv.Count > 0
+            && exec.Argv[0] == "claude"
+            && exec.Argv.Contains("--help"))
+        {
+            return Task.FromResult(new SandboxExecResult(0, "--output-format stream-json --verbose", string.Empty));
         }
 
         // Claude calls

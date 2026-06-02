@@ -127,10 +127,16 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
         if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
-            return new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: HardQuotaReason);
+            return new AgentFailureClassification(
+                AgentFailureKind.QuotaExhausted,
+                Reason: HardQuotaReason,
+                QuotaFailure: AgentQuotaFailureKind.HardQuota);
 
         if (ContainsAny(stderr, SoftRateLimitPatterns) || ContainsAny(stdout, SoftRateLimitPatterns))
-            return new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: SoftRateLimitReason);
+            return new AgentFailureClassification(
+                AgentFailureKind.QuotaExhausted,
+                Reason: SoftRateLimitReason,
+                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");

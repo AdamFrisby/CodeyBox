@@ -13,19 +13,36 @@ namespace CodeyBox.Tests;
 public sealed class AgentFailureClassifierTests
 {
     [Theory]
-    [InlineData("API Error: rate_limit_exceeded")]
-    [InlineData("rate limit exceeded")]
     [InlineData("[error] usage_limit reached: weekly cap")]
     [InlineData("hit your usage limit")]
+    [InlineData("hit your limit")]
     [InlineData("RESOURCE_EXHAUSTED")]
     [InlineData("quota exceeded for project")]
     [InlineData("[API Error: You have exhausted your capacity on this model.]")]
-    [InlineData("status 429 too many requests")]
-    [InlineData("HTTP 529")]
-    public void QuotaPatterns_Classified_AsQuotaExhausted(string snippet)
+    public void HardQuotaPatterns_Classified_AsHardQuota(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.HardQuota, c.QuotaFailure);
+        Assert.Equal(AgentFailureClassifier.HardQuotaReason, c.Reason);
+    }
+
+    [Theory]
+    [InlineData("API Error: rate_limit_exceeded")]
+    [InlineData("rate limit exceeded")]
+    [InlineData("status 429 too many requests")]
+    [InlineData("HTTP 529")]
+    [InlineData("HTTP 429")]
+    [InlineData("API Error: 429")]
+    [InlineData("status 529")]
+    [InlineData("overloaded_error")]
+    [InlineData("exceeded the rate limit")]
+    public void SoftRateLimitPatterns_Classified_AsSoftRateLimit(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.SoftRateLimit, c.QuotaFailure);
+        Assert.Equal(AgentFailureClassifier.SoftRateLimitReason, c.Reason);
     }
 
     [Theory]
@@ -78,10 +95,12 @@ public sealed class AgentFailureClassifierTests
         var hard = AgentFailureClassifier.Classify(stderr: "usage_limit reached");
         Assert.Equal(AgentFailureKind.QuotaExhausted, hard.Kind);
         Assert.Equal(AgentFailureClassifier.HardQuotaReason, hard.Reason);
+        Assert.Equal(AgentQuotaFailureKind.HardQuota, hard.QuotaFailure);
 
         var soft = AgentFailureClassifier.Classify(stderr: "API Error: 429 rate_limit_exceeded");
         Assert.Equal(AgentFailureKind.QuotaExhausted, soft.Kind);
         Assert.Equal(AgentFailureClassifier.SoftRateLimitReason, soft.Reason);
+        Assert.Equal(AgentQuotaFailureKind.SoftRateLimit, soft.QuotaFailure);
     }
 
     [Fact]

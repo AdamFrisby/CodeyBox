@@ -26,13 +26,8 @@ namespace CodeyBox.Agents;
 /// quota/auth failures are filtered out by <see cref="IsResumeEligible"/>
 /// so they defer via the quota path instead of consuming the resume budget.
 /// Soft 429/rate-limit blips may spend the bounded resume budget unless the
-/// output carries an explicit reset window. A genuine deterministic work
-/// failure (failed tests, declined task, malformed output) also classifies as
-/// Normal and so is resume-eligible — that is an intentional tradeoff: the
-/// alternative is trying to discriminate "process crashed mid-run" from
-/// "process ran to completion but produced a bad result" from outside the CLI,
-/// which is not reliably possible. MaxResumeAttempts=2 caps the wasted cost on
-/// such cases.
+/// output carries an explicit reset window. Deterministic work failures
+/// (<see cref="AgentFailureKind.Normal"/>) are not resume-eligible.
 /// </para>
 /// </summary>
 public static class SessionResumeOptions
@@ -79,8 +74,9 @@ public static class SessionResumeOptions
         classification.Kind switch
         {
             AgentFailureKind.QuotaExhausted => IsSoftRateLimitWithoutReset(classification, stderr, stdout),
-            AgentFailureKind.AuthError => false,
-            _ => true,
+            AgentFailureKind.TransientNetwork => true,
+            AgentFailureKind.Unknown => true,
+            _ => false,
         };
 
     private static bool IsSoftRateLimitWithoutReset(
@@ -88,7 +84,7 @@ public static class SessionResumeOptions
         string? stderr,
         string? stdout)
     {
-        if (!string.Equals(classification.Reason, AgentFailureClassifier.SoftRateLimitReason, StringComparison.Ordinal))
+        if (classification.QuotaFailure != AgentQuotaFailureKind.SoftRateLimit)
             return false;
         if (classification.QuotaResetAt is not null)
             return false;

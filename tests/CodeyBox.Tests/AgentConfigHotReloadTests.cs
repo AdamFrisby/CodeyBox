@@ -2203,6 +2203,89 @@ public sealed class AgentConfigHotReloadTests
         }
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningDetectsOnlySessionResumeAttemptChange()
+    {
+        var initialTuning = new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+            QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
+            MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
+            MergeSandboxStagingRestoreAttempts = 2,
+            MaxQuestionsPerWorkItem = 10,
+            AgentSuspendMaxRetries = 1,
+            AgentSessionResumeMaxAttempts = 4,
+            AutoMergeRaceRecoveryMaxAttempts = 3,
+        };
+        var initial = new CodeyBoxOptions { PipelineTuning = initialTuning };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = initialTuning.DefaultQuotaFailurePause,
+            QuotaExhaustionFallbackTtl = initialTuning.QuotaExhaustionFallbackTtl,
+            MaxParsedQuotaResetWindow = initialTuning.MaxParsedQuotaResetWindow,
+            MergeSandboxStagingRestoreAttempts = initialTuning.MergeSandboxStagingRestoreAttempts,
+            MaxQuestionsPerWorkItem = initialTuning.MaxQuestionsPerWorkItem,
+            AgentSuspendMaxRetries = initialTuning.AgentSuspendMaxRetries,
+            AgentSessionResumeMaxAttempts = initialTuning.AgentSessionResumeMaxAttempts,
+            AutoMergeRaceRecoveryMaxAttempts = initialTuning.AutoMergeRaceRecoveryMaxAttempts,
+        });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var originalMaxRetries = AgentSuspendResilience.MaxRetries;
+        var originalMaxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
+        AgentConfigHotReload? coordinator = null;
+
+        try
+        {
+            coordinator = new AgentConfigHotReload(
+                monitor, orchFixture.Orchestrator, router, burnEstimator,
+                NullLogger<AgentConfigHotReload>.Instance,
+                pipelineTuning: snapshot);
+            await coordinator.StartAsync(CancellationToken.None);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                PipelineTuning = new PipelineTuningOptions
+                {
+                    DefaultQuotaFailurePause = initialTuning.DefaultQuotaFailurePause,
+                    QuotaExhaustionFallbackTtl = initialTuning.QuotaExhaustionFallbackTtl,
+                    MaxParsedQuotaResetWindow = initialTuning.MaxParsedQuotaResetWindow,
+                    MergeSandboxStagingRestoreAttempts = initialTuning.MergeSandboxStagingRestoreAttempts,
+                    MaxQuestionsPerWorkItem = initialTuning.MaxQuestionsPerWorkItem,
+                    AgentSuspendMaxRetries = initialTuning.AgentSuspendMaxRetries,
+                    AgentSessionResumeMaxAttempts = 6,
+                    AutoMergeRaceRecoveryMaxAttempts = initialTuning.AutoMergeRaceRecoveryMaxAttempts,
+                },
+            });
+
+            Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
+            Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
+            Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(1, AgentSuspendResilience.MaxRetries);
+            Assert.Equal(6, SessionResumeOptions.MaxResumeAttempts);
+
+            await coordinator.StopAsync(CancellationToken.None);
+            coordinator = null;
+        }
+        finally
+        {
+            if (coordinator is not null)
+                await coordinator.StopAsync(CancellationToken.None);
+            AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
+            SessionResumeOptions.SetMaxResumeAttempts(originalMaxResumeAttempts);
+        }
+    }
+
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>
     {
         private T _value;

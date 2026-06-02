@@ -248,9 +248,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
-        var warning = $"Warning: Claude CLI at '{Binary}' does not support --output-format stream-json --verbose; structured stream capture was disabled.";
-        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
-        return result with { Stderr = stderr };
+        return WithStructuredStreamDisabledWarning(result);
     }
 
     public override async Task<AgentResult> RunResumedAsync(
@@ -265,7 +263,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         Action<string>? stdoutChunkCallback = null)
     {
         using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
-        var result = await base.RunResumedAsync(
+        var structuredStreamSupported = await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+        var result = await RunResumedCoreAsync(
             sandbox,
             workingDirectory,
             prompt,
@@ -274,15 +273,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             modelId,
             reasoningMode,
             ct,
-            stdoutChunkCallback).ConfigureAwait(false);
+            stdoutChunkCallback,
+            captureStructuredStream: structuredStreamSupported).ConfigureAwait(false);
 
         result = await TryReactiveRetryAsync(
             sandbox, workingDirectory, prompt, credential, modelId, reasoningMode,
-            ct, stdoutChunkCallback, captureStructuredStream: false,
+            ct, stdoutChunkCallback, structuredStreamSupported,
             result,
             resumeContext: resume).ConfigureAwait(false);
 
-        return result;
+        return structuredStreamSupported
+            ? result
+            : WithStructuredStreamDisabledWarning(result);
     }
 
     /// <summary>
@@ -315,7 +317,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 // Sanitiser succeeded — retry the underlying invocation.
                 if (resumeContext is not null)
                 {
-                    result = await base.RunResumedAsync(
+                    result = await RunResumedCoreAsync(
                         sandbox,
                         workingDirectory,
                         prompt,
@@ -324,7 +326,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                         modelId,
                         reasoningMode,
                         ct,
-                        stdoutChunkCallback).ConfigureAwait(false);
+                        stdoutChunkCallback,
+                        captureStructuredStream).ConfigureAwait(false);
                 }
                 else
                 {
@@ -353,6 +356,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         }
 
         return result;
+    }
+
+    private AgentResult WithStructuredStreamDisabledWarning(AgentResult result)
+    {
+        var warning = $"Warning: Claude CLI at '{Binary}' does not support --output-format stream-json --verbose; structured stream capture was disabled.";
+        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
+        return result with { Stderr = stderr };
     }
 
     protected override AgentInvocation BuildInvocation(

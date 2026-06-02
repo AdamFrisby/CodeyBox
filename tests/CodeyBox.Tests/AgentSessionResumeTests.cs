@@ -89,12 +89,18 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.True(SessionResumeOptions.IsResumeEligible(
             new AgentFailureClassification(AgentFailureKind.Unknown)));
         Assert.True(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.Normal)));
-        Assert.True(SessionResumeOptions.IsResumeEligible(
             new AgentFailureClassification(
                 AgentFailureKind.QuotaExhausted,
-                Reason: AgentFailureClassifier.SoftRateLimitReason),
+                Reason: AgentFailureClassifier.SoftRateLimitReason,
+                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
             stderr: "API Error: 429 rate_limit_exceeded"));
+    }
+
+    [Fact]
+    public void IsResumeEligible_FalseForNormalFailure()
+    {
+        Assert.False(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.Normal)));
     }
 
     [Fact]
@@ -103,8 +109,21 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.False(SessionResumeOptions.IsResumeEligible(
             new AgentFailureClassification(
                 AgentFailureKind.QuotaExhausted,
-                Reason: AgentFailureClassifier.SoftRateLimitReason),
+                Reason: AgentFailureClassifier.SoftRateLimitReason,
+                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
             stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
+    }
+
+    [Fact]
+    public void IsResumeEligible_FalseForSoftRateLimitWithClassificationResetAt()
+    {
+        Assert.False(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(
+                AgentFailureKind.QuotaExhausted,
+                QuotaResetAt: DateTimeOffset.UtcNow.AddMinutes(15),
+                Reason: AgentFailureClassifier.SoftRateLimitReason,
+                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
+            stderr: "API Error: 429 rate_limit_exceeded"));
     }
 
     [Fact]
@@ -180,7 +199,7 @@ public sealed class AgentSessionResumeTests : IDisposable
                 Stdout: $$"""
                     {"type":"system","subtype":"init","session_id":"{{sessionId}}","tools":[]}
                     """,
-                Stderr: "")
+                Stderr: "ECONNRESET")
             : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
@@ -222,6 +241,22 @@ public sealed class AgentSessionResumeTests : IDisposable
 
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: false);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_NormalFailureWithCapturedSessionId_DoesNotResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: "test failures: 3/100 assertions failed"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
         Assert.Single(sandbox.ClaudeInvocations);
@@ -310,7 +345,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         var sandbox = new ResumeRecordingSandbox(
             _ => new SandboxExecResult(1,
                 Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-                Stderr: ""),
+                Stderr: "ECONNRESET"),
             exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
                 ? new SandboxExecResult(1, "", "missing workdir")
                 : new SandboxExecResult(0, "", ""));
@@ -330,7 +365,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         var sandbox = new ResumeRecordingSandbox(
             _ => new SandboxExecResult(1,
                 Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-                Stderr: ""),
+                Stderr: "ECONNRESET"),
             exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
                 ? throw new InvalidOperationException("sandbox died")
                 : new SandboxExecResult(0, "", ""));
@@ -347,14 +382,12 @@ public sealed class AgentSessionResumeTests : IDisposable
     public async Task ClaudeRunner_BoundedByMaxResumeAttempts_FailsCleanlyAfterN()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
-        // Empty stderr → classification = Normal → ShouldRetry returns false
-        // regardless of MaxRetries; resume budget is the only retry path here.
 
         var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
             // Every attempt crashes with the init line on stdout, simulating
             // a process that consistently dies mid-stream.
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-            Stderr: ""));
+            Stderr: "ECONNRESET"));
 
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
@@ -420,7 +453,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         var sandbox = new ResumeRecordingSandbox(call => call == 1
             ? new SandboxExecResult(1,
                 Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
-                Stderr: "")
+                Stderr: "ECONNRESET")
             : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunResumedAsync(
@@ -443,6 +476,30 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.True(resumeIdx >= 0, "checkpoint-restored crash must retry with --resume");
         Assert.Equal(sessionId, second[resumeIdx + 1]);
         Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_RunResumedAsync_WhenStructuredStreamUnsupported_DoesNotForceFlags()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(
+            _ => new SandboxExecResult(0, "ok", ""),
+            structuredStreamHelpResult: new SandboxExecResult(0, "Usage: claude", ""));
+
+        var result = await new ClaudeAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test"));
+
+        Assert.True(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        var first = sandbox.ClaudeInvocations[0];
+        Assert.DoesNotContain("--output-format", first);
+        Assert.DoesNotContain("stream-json", first);
+        Assert.DoesNotContain("--verbose", first);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
     }
 
     [Fact]
@@ -476,16 +533,14 @@ public sealed class AgentSessionResumeTests : IDisposable
         // (e.g. the resumed CLI died before its own init replay) must still
         // use the session id captured on attempt 1 for the third attempt.
         SessionResumeOptions.SetMaxResumeAttempts(3);
-        // Stderr is empty (classification = Normal) so the legacy retry path
-        // is never engaged — resume is the only retry mechanism in scope.
 
         var sessionId = "c8e8171a-5c61-42e6-a633-936d2362886a";
         var sandbox = new ResumeRecordingSandbox(call => call switch
         {
             1 => new SandboxExecResult(1,
                 $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
-                ""),
-            2 => new SandboxExecResult(1, "no init this time", ""),
+                "ECONNRESET"),
+            2 => new SandboxExecResult(1, "no init this time", "ECONNRESET"),
             _ => new SandboxExecResult(0, "ok", ""),
         });
 
@@ -520,7 +575,8 @@ public sealed class AgentSessionResumeTests : IDisposable
 
     private sealed class ResumeRecordingSandbox(
         Func<int, SandboxExecResult> onClaudeCall,
-        Func<SandboxExec, SandboxExecResult>? onOtherExec = null) : ISandbox
+        Func<SandboxExec, SandboxExecResult>? onOtherExec = null,
+        SandboxExecResult? structuredStreamHelpResult = null) : ISandbox
     {
         public string Id => "codeybox-resume-test";
 
@@ -541,7 +597,7 @@ public sealed class AgentSessionResumeTests : IDisposable
                 && exec.Argv[0] == ClaudeAgentRunner.DefaultBinary
                 && exec.Argv.Contains("--help"))
             {
-                return Task.FromResult(new SandboxExecResult(0, "--output-format stream-json --verbose", ""));
+                return Task.FromResult(structuredStreamHelpResult ?? new SandboxExecResult(0, "--output-format stream-json --verbose", ""));
             }
 
             if (exec.Argv.Count > 0

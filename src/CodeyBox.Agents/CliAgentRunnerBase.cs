@@ -136,6 +136,29 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string? reasoningMode = null,
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
+        => await RunResumedCoreAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback,
+            captureStructuredStream: SupportsSessionResume).ConfigureAwait(false);
+
+    protected async Task<AgentResult> RunResumedCoreAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream)
     {
         await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
@@ -143,7 +166,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return preparation;
 
-        var captureStructuredStream = SupportsSessionResume;
         var invocation = BuildResumeInvocation(
             prompt,
             credential,
