@@ -1,4 +1,12 @@
 using System.Collections.Concurrent;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using CodeyBox.Api;
@@ -896,5 +904,257 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     {
         public Task RunAsync(WorkItem item, CancellationToken workItemToken, CancellationToken hostToken)
             => Task.CompletedTask;
+    }
+}
+
+[Collection("GlobalSerilog")]
+public sealed class SandboxShutdownProgramWiringTests
+{
+    [Fact]
+    public async Task ProgramHostedServiceRegistration_UsesHotReloadedTeardownModeAtShutdown()
+    {
+        using var factory = new SandboxShutdownProgramFactory();
+        var item = MakeItem();
+        await factory.Store.CreateAsync(item);
+
+        var sandbox = new ProgramWiringSandbox("vm-program-hot-reload");
+        factory.Provider.Register(item.Id, sandbox);
+
+        // Force WebApplicationFactory to build the real Program.cs service
+        // collection while the monitor still says Suspend. If Program.cs
+        // regresses to capturing CurrentValue in its AddHostedService factory,
+        // the service created here will keep Suspend even after Set(Stop).
+        var service = Assert.Single(
+            factory.Services.GetServices<IHostedService>()
+                .OfType<SandboxSuspendOnShutdownService>());
+
+        factory.Monitor.Set(OptionsWithTeardownMode(SandboxTeardownMode.Stop));
+
+        await service.StoppingAsync(CancellationToken.None);
+
+        Assert.False(sandbox.SuspendCalled,
+            "Program.cs must not capture the startup SandboxTeardownMode in the hosted-service registration");
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Program.cs must wire the shutdown service to read the current IOptionsMonitor value at teardown time");
+    }
+
+    private static WorkItem MakeItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test"),
+        Title = "t",
+        Prompt = "p",
+        State = WorkItemState.Working,
+        StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+    };
+
+    private static CodeyBoxOptions OptionsWithTeardownMode(SandboxTeardownMode mode)
+    {
+        var options = new CodeyBoxOptions();
+        options.Shutdown.SandboxTeardownMode = mode;
+        return options;
+    }
+
+    private sealed class SandboxShutdownProgramFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-shutdown-program-{Guid.NewGuid():N}.db");
+
+        public SandboxShutdownProgramFactory() => Store = new SqliteWorkItemStore(_dbPath);
+
+        public ProgramWiringProvider Provider { get; } = new();
+        public ProgramWiringDispatchGate DispatchGate { get; } = new();
+        public MutableOptionsMonitor<CodeyBoxOptions> Monitor { get; } = new(
+            OptionsWithTeardownMode(SandboxTeardownMode.Suspend));
+        public SqliteWorkItemStore Store { get; }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:Shutdown:SandboxTeardownMode"] = nameof(SandboxTeardownMode.Suspend),
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                var suspendDescriptor = FindSandboxSuspendHostedServiceDescriptor(
+                    services,
+                    new SandboxSuspendDescriptorProbeProvider(
+                        Provider, Store, DispatchGate, Monitor));
+
+                services.RemoveAll<IHostedService>();
+                services.Add(suspendDescriptor);
+
+                services.RemoveAll<IWorkItemStore>();
+                services.AddSingleton<IWorkItemStore>(Store);
+                services.RemoveAll<ISandboxProvider>();
+                services.AddSingleton<ISandboxProvider>(Provider);
+                services.RemoveAll<IShutdownDispatchGate>();
+                services.AddSingleton<IShutdownDispatchGate>(DispatchGate);
+                services.AddSingleton<IOptionsMonitor<CodeyBoxOptions>>(Monitor);
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            try
+            {
+                base.Dispose(disposing);
+            }
+            finally
+            {
+                if (disposing)
+                {
+                    Store.Dispose();
+                    try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                }
+            }
+        }
+
+        private static ServiceDescriptor FindSandboxSuspendHostedServiceDescriptor(
+            IServiceCollection services,
+            IServiceProvider probeProvider)
+        {
+            var matches = services
+                .Where(d => d.ServiceType == typeof(IHostedService) && d.ImplementationFactory is not null)
+                .Where(d =>
+                {
+                    try
+                    {
+                        return d.ImplementationFactory!(probeProvider) is SandboxSuspendOnShutdownService;
+                    }
+                    catch
+                    {
+                        return false;
+                    }
+                })
+                .ToList();
+
+            return Assert.Single(matches);
+        }
+    }
+
+    private sealed class SandboxSuspendDescriptorProbeProvider : IServiceProvider
+    {
+        private readonly ProgramWiringProvider _provider;
+        private readonly IWorkItemStore _store;
+        private readonly ProgramWiringDispatchGate _dispatchGate;
+        private readonly IOptionsMonitor<CodeyBoxOptions> _monitor;
+
+        public SandboxSuspendDescriptorProbeProvider(
+            ProgramWiringProvider provider,
+            IWorkItemStore store,
+            ProgramWiringDispatchGate dispatchGate,
+            IOptionsMonitor<CodeyBoxOptions> monitor)
+        {
+            _provider = provider;
+            _store = store;
+            _dispatchGate = dispatchGate;
+            _monitor = monitor;
+        }
+
+        public object? GetService(Type serviceType)
+        {
+            if (serviceType == typeof(ISandboxProvider))
+                return _provider;
+            if (serviceType == typeof(IWorkItemStore))
+                return _store;
+            if (serviceType == typeof(IShutdownDispatchGate))
+                return _dispatchGate;
+            if (serviceType == typeof(IOptionsMonitor<CodeyBoxOptions>))
+                return _monitor;
+            if (serviceType == typeof(ILogger<SandboxSuspendOnShutdownService>))
+                return NullLogger<SandboxSuspendOnShutdownService>.Instance;
+
+            return null;
+        }
+    }
+
+    private sealed class MutableOptionsMonitor<T> : IOptionsMonitor<T>
+    {
+        private T _value;
+
+        public MutableOptionsMonitor(T initial) { _value = initial; }
+        public T CurrentValue => _value;
+        public T Get(string? name) => _value;
+        public void Set(T next) => _value = next;
+        public IDisposable OnChange(Action<T, string?> listener) => NullSubscription.Instance;
+
+        private sealed class NullSubscription : IDisposable
+        {
+            public static readonly NullSubscription Instance = new();
+            public void Dispose() { }
+        }
+    }
+
+    private sealed class ProgramWiringDispatchGate : IShutdownDispatchGate
+    {
+        public bool IsDispatchPaused { get; private set; }
+        public void PauseDispatch() => IsDispatchPaused = true;
+    }
+
+    private sealed class ProgramWiringProvider : ISandboxProvider, ISuspendingSandboxProvider
+    {
+        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
+
+        public string Name => "program-wiring";
+
+        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotImplementedException();
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+        {
+            var list = new List<(WorkItemId, ISuspendableSandbox)>();
+            foreach (var kv in _active)
+                if (_active.TryRemove(kv.Key, out var sandbox))
+                    list.Add((kv.Key, sandbox));
+            return list;
+        }
+
+        public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class ProgramWiringSandbox : IPreemptibleSandbox, ISuspendableSandbox
+    {
+        public ProgramWiringSandbox(string id) { Id = id; }
+
+        public string Id { get; }
+        public bool SuspendCalled { get; private set; }
+        public bool StopAndPreserveCalled { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public Task SuspendAsync(CancellationToken ct = default)
+        {
+            SuspendCalled = true;
+            return Task.CompletedTask;
+        }
+
+        public Task StopAndPreserveAsync(CancellationToken ct = default)
+        {
+            StopAndPreserveCalled = true;
+            return Task.CompletedTask;
+        }
     }
 }
