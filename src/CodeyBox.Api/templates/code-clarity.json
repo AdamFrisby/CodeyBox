@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are there long functions/methods doing multiple steps, abstraction levels, responsibilities, or lengthy branching (long function/method)? (COD-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix long function (COD-001): extract cohesive subroutines",
+        "prompt": "Problem: Long functions are hard to read, test, and change safely.\n\nFind all instances: Search for overly long functions handling multiple steps/responsibilities/abstraction levels.\n\nFix correctly: Extract cohesive, well-named subroutines; keep each function at one abstraction level.\n\nConstraints: Preserve behavior; refactor with tests covering the original behavior.\n\nAcceptance: Functions are shorter and cohesive. Ensure existing tests still pass."
+      }
+    },
+    {
+      "question": "Is there deeply nested conditional/loop/callback/error-branch logic (deep nesting)? (COD-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix deep nesting (COD-002): use guard clauses and early returns",
+        "prompt": "Problem: Deep nesting obscures control flow and the happy path.\n\nFind all instances: Search for deeply nested conditionals/loops/callbacks/error branches.\n\nFix correctly: Use guard clauses, early returns, extraction, or state machines to flatten nesting.\n\nConstraints: Preserve behavior.\n\nAcceptance: Nesting is reduced and flow is clear. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are there long boolean expressions, repeated negations, mixed AND/OR chains, or unclear predicates (complex boolean expression)? (COD-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix complex boolean (COD-003): name predicates and simplify",
+        "prompt": "Problem: Complex boolean expressions are error-prone and hard to understand.\n\nFind all instances: Search for long/negated/mixed boolean expressions and unclear predicates.\n\nFix correctly: Extract named intermediate predicates and simplify the logic.\n\nConstraints: Preserve truth-value semantics exactly.\n\nAcceptance: Conditions are readable and equivalent. Add/keep tests for the predicate behavior."
+      }
+    },
+    {
+      "question": "Are there functions with many parameters, repeated argument groups, or call sites with unclear positional values (excessive parameter list)? (COD-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix excessive parameters (COD-004): introduce parameter objects",
+        "prompt": "Problem: Long parameter lists are easy to misorder and hard to read.\n\nFind all instances: Search for functions with many parameters or recurring argument groups.\n\nFix correctly: Introduce parameter objects/options structs or cohesive domain types; group related fields.\n\nConstraints: Preserve behavior; update all call sites.\n\nAcceptance: Parameter lists are reduced/cohesive. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are there unexplained literals used in business rules, limits, statuses, formats, paths, or protocols (magic number/string)? (COD-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix magic numbers/strings (COD-005): use named constants",
+        "prompt": "Problem: Unexplained literals hide intent and are error-prone to change.\n\nFind all instances: Search for magic numbers/strings in business rules, limits, statuses, formats, paths, protocols.\n\nFix correctly: Replace with named constants or domain value objects; move operational values to config (config over hardcoding).\n\nConstraints: Preserve values exactly. Operational thresholds should be configurable, not just constants.\n\nAcceptance: Literals are named/configured. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are there vague names like data, value, item, thing, flag, temp, manager, helper, or util hiding intent (ambiguous naming)? (COD-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix ambiguous naming (COD-006): rename to domain meaning",
+        "prompt": "Problem: Vague names obscure intent and slow comprehension.\n\nFind all instances: Search for vague identifiers (data/value/item/thing/flag/temp/manager/helper/util) used where a specific name fits.\n\nFix correctly: Rename using domain meaning and concrete responsibility.\n\nConstraints: Preserve behavior; update all references. Keep public API names stable or version them.\n\nAcceptance: Names convey intent. Ensure tests pass after renames."
+      }
+    },
+    {
+      "question": "Is there dead/unreachable code: branches, functions, files, variables, feature flags, or dependencies no longer reachable (dead/unreachable code)? (COD-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix dead code (COD-007): delete or restore reachability",
+        "prompt": "Problem: Dead code misleads readers and adds maintenance burden.\n\nFind all instances: Search for unreachable branches, unused functions/files/variables, stale flags, and unused dependencies.\n\nFix correctly: Delete genuinely dead code (rely on version control for history), or restore intended reachability if it was a bug.\n\nConstraints: Confirm code is truly unused (check reflection/dynamic refs) before deleting. Remove unused deps (BLD-003).\n\nAcceptance: Dead code is removed. Ensure tests/build pass."
+      }
+    },
+    {
+      "question": "Are there blocks of commented-out code left in source (commented-out code)? (COD-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix commented-out code (COD-008): remove it",
+        "prompt": "Problem: Commented-out code clutters source and confuses readers about intent.\n\nFind all instances: Search for blocks of disabled/commented-out code.\n\nFix correctly: Remove commented-out code; rely on version control for history.\n\nConstraints: Keep genuine explanatory comments; remove only disabled code.\n\nAcceptance: No commented-out code blocks remain. Ensure tests/build pass."
+      }
+    },
+    {
+      "question": "Are there comments that contradict the code, describe old behavior, or explain what code no longer does (stale/misleading comment)? (COD-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix stale comments (COD-009): update or remove",
+        "prompt": "Problem: Misleading comments are worse than none; they cause incorrect assumptions.\n\nFind all instances: Search for comments contradicting current code or describing removed behavior.\n\nFix correctly: Update comments to match reality, delete them, or encode the intent directly in code/names.\n\nConstraints: Keep accurate, useful comments.\n\nAcceptance: Comments match the code. No behavior change required."
+      }
+    },
+    {
+      "question": "Is there inconsistent casing, naming patterns, formatting, or terminology within the same module (inconsistent naming/style within module)? (COD-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent style (COD-010): normalize to local convention",
+        "prompt": "Problem: Inconsistent style within a module increases cognitive load.\n\nFind all instances: Search a module for inconsistent casing/naming/formatting/terminology.\n\nFix correctly: Normalize to the local/project convention; run the project's formatter/linter.\n\nConstraints: Preserve behavior; keep public names stable or version them.\n\nAcceptance: Style is consistent. Ensure tests/build pass."
+      }
+    },
+    {
+      "question": "Is there repeated logic, similar branches, copy-pasted functions, or duplicated transformations (duplicate code block)? (COD-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix duplicate code (COD-011): extract shared behavior",
+        "prompt": "Problem: Duplicated code drifts and must be fixed in many places.\n\nFind all instances: Search for repeated logic/copy-pasted functions/duplicated transformations.\n\nFix correctly: Extract shared behavior or parameterize the variation into one implementation.\n\nConstraints: Only unify genuine duplicates (avoid coupling incidental similarity). Preserve behavior.\n\nAcceptance: Duplication is removed. Add/keep tests for the shared implementation."
+      }
+    },
+    {
+      "question": "Are there boolean/enum parameters that cause a function to perform different behaviors (flag argument)? (COD-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix flag argument (COD-012): split into named methods/strategies",
+        "prompt": "Problem: Flag arguments hide that a function does two different things, harming clarity.\n\nFind all instances: Search for boolean/enum parameters that switch behavior inside a function.\n\nFix correctly: Split into separate named methods or use strategy variants.\n\nConstraints: Preserve behavior; update call sites.\n\nAcceptance: Behavior selection is explicit at call sites. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are there call sites passing raw true/false where the meaning is unclear (boolean trap at call site)? (COD-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix boolean trap (COD-013): use named options/enums",
+        "prompt": "Problem: Bare booleans at call sites (e.g. doThing(true, false)) are unreadable and easy to get wrong.\n\nFind all instances: Search for calls passing literal true/false with unclear meaning.\n\nFix correctly: Replace with named options, enums, or explicit methods so call sites read clearly.\n\nConstraints: Preserve behavior; update call sites.\n\nAcceptance: Call sites are self-explanatory. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are raw strings/numbers repeatedly used to represent domain concepts (email, money, tenant, status, ID) instead of types (primitive obsession)? (COD-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix primitive obsession (COD-014): introduce value objects",
+        "prompt": "Problem: Representing domain concepts as bare primitives spreads validation and invites mix-ups.\n\nFind all instances: Search for raw strings/numbers standing in for domain concepts (email/money/tenant/status/ID).\n\nFix correctly: Introduce domain-specific value objects/types that carry validation and meaning.\n\nConstraints: Preserve behavior; migrate incrementally. Coordinate with money types (DAT-005) and units (DAT-007).\n\nAcceptance: Key domain concepts use value objects. Add tests for the value-object invariants."
+      }
+    },
+    {
+      "question": "Is the same group of fields passed or stored together repeatedly (data clump)? (COD-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix data clump (COD-015): group related fields into a type",
+        "prompt": "Problem: Repeated field groups indicate a missing cohesive type and invite inconsistency.\n\nFind all instances: Search for the same set of fields passed/stored together across the code.\n\nFix correctly: Group the related fields into one cohesive type and pass that.\n\nConstraints: Preserve behavior; update call sites.\n\nAcceptance: Related fields travel as a single type. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Are there repeated switch/if chains over a type/kind/status/mode/category field (conditional over type code)? (COD-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix type-code conditionals (COD-016): use polymorphism or dispatch",
+        "prompt": "Problem: Repeated switches over a type code must all change when a new case is added and are easy to get inconsistent.\n\nFind all instances: Search for repeated switch/if chains keyed on the same type/kind/status field.\n\nFix correctly: Use polymorphism, strategy, pattern matching, or a dispatch table where appropriate.\n\nConstraints: Preserve behavior. Don't over-engineer single-use cases (ARC-016).\n\nAcceptance: Type-based branching is consolidated. Ensure tests pass; add a case to confirm extension is localized."
+      }
+    },
+    {
+      "question": "Are there double negatives, negated complex predicates, or inverted control flow hiding the main case (negative condition obscures happy path)? (COD-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix negative conditions (COD-017): invert logic and name predicates",
+        "prompt": "Problem: Double negatives and inverted flow obscure the happy path and cause logic errors.\n\nFind all instances: Search for double negatives, negated complex predicates, and inverted control flow.\n\nFix correctly: Invert logic to express the positive case, name predicates, and use guard clauses.\n\nConstraints: Preserve truth-value semantics exactly.\n\nAcceptance: The happy path is clear. Add/keep tests for the conditional behavior."
+      }
+    },
+    {
+      "question": "Do functions combine high-level orchestration with low-level parsing/formatting/SQL/protocol/loop details (mixed abstraction levels in one function)? (COD-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix mixed abstraction levels (COD-018): extract low-level details",
+        "prompt": "Problem: Mixing abstraction levels makes functions hard to read and reuse.\n\nFind all instances: Search for functions mixing orchestration with low-level parsing/formatting/SQL/protocol/loops.\n\nFix correctly: Extract low-level details behind named operations so each function stays at one level.\n\nConstraints: Preserve behavior; refactor with tests.\n\nAcceptance: Functions operate at a single abstraction level. Ensure tests pass."
+      }
+    },
+    {
+      "question": "Do methods named like getters/validators/formatters/helpers mutate state, perform I/O, or trigger actions (hidden side effect in helper/getter)? (COD-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hidden side effects (COD-019): make mutation explicit or remove it",
+        "prompt": "Problem: Side effects hidden behind innocuous names (get/validate/format) cause surprising bugs.\n\nFind all instances: Search for getters/validators/formatters/helpers that mutate state, do I/O, or trigger actions.\n\nFix correctly: Make the side effect explicit in the name/API, or remove the side effect from the query method.\n\nConstraints: Preserve needed behavior; separate commands from queries.\n\nAcceptance: Side effects are explicit (or removed). Add/keep tests covering the behavior."
+      }
+    },
+    {
+      "question": "Are there console prints, trace dumps, temporary logging, debugger statements, or TODO debug output left in production code (debug print left in production)? (COD-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix debug output (COD-020): remove or use structured logging",
+        "prompt": "Problem: Leftover debug output pollutes logs/output, may leak data, and isn't level-controlled.\n\nFind all instances: Search for console prints, trace dumps, debugger statements, and temporary debug logging in non-test code.\n\nFix correctly: Remove debug output or replace with structured logging at the correct level. Never log secrets/PII (CSP-002/CSP-017).\n\nConstraints: Keep intentional, level-appropriate logging.\n\nAcceptance: No stray debug output remains. Ensure tests/build pass."
+      }
+    }
+  ]
+}

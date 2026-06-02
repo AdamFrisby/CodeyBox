@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are caught errors ignored, logged without action, or replaced with null/empty/default values, silently swallowing failures (swallowed exception/error)? (ERR-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix swallowed errors (ERR-001): handle, propagate, or log with context",
+        "prompt": "Problem: Swallowed exceptions hide failures, producing silent data loss and undebuggable behavior.\n\nFind all instances: Search for empty catch blocks, catches that only log and continue inappropriately, and error handlers that substitute null/empty/default while the operation actually failed.\n\nFix correctly: Handle the error meaningfully, propagate it, or log with enough context AND preserve failure semantics (don't pretend success). Only suppress an error when there is a deliberate, documented reason.\n\nConstraints: Do not weaken behavior to make code 'not throw'. Preserve failure state.\n\nAcceptance: Errors are handled or propagated, not silently dropped. Add a test asserting the failure surfaces (exception/result) rather than a fake success."
+      }
+    },
+    {
+      "question": "Are broad catch-all blocks handling unrelated failures identically without classifying by type/recoverability (catch-all without classification)? (ERR-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix catch-all without classification (ERR-002): catch specific failures",
+        "prompt": "Problem: Catching everything the same way masks bugs (e.g. treating a programming error like a transient network blip).\n\nFind all instances: Search for broad catches (catch Exception/Throwable/catch-all) that handle distinct failures identically.\n\nFix correctly: Catch specific exception types and branch by recoverability (retryable vs permanent vs programmer error). Let truly unexpected errors propagate.\n\nConstraints: Don't catch errors you can't handle. Preserve stack/cause when rethrowing.\n\nAcceptance: Error handling distinguishes failure categories. Add tests asserting different failure types take the correct branch."
+      }
+    },
+    {
+      "question": "Do error paths return success status, empty results, default data, or completed tasks/promises, converting a failure into a silent success? (ERR-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix failure-as-success (ERR-003): preserve failure state",
+        "prompt": "Problem: Returning success on failure corrupts downstream logic and hides outages.\n\nFind all instances: Search error branches that return OK/empty/default or resolve a task as if successful.\n\nFix correctly: Preserve and surface failure state (error result/exception/appropriate status). Expose partial-success explicitly where relevant.\n\nConstraints: Don't fabricate data on failure. Map to correct status codes (API-007).\n\nAcceptance: Failures are reported, not disguised. Add a test asserting a failed operation returns a failure, not success."
+      }
+    },
+    {
+      "question": "Are resources, locks, transactions, files, temp state, or metrics not cleaned up when errors occur (missing cleanup on failure)? (ERR-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing cleanup on failure (ERR-004): use finally/scope guards",
+        "prompt": "Problem: Leaking resources/locks on the error path causes exhaustion, deadlocks, and corruption.\n\nFind all instances: Search error paths for resources/locks/transactions/files/temp state acquired but not released when exceptions occur.\n\nFix correctly: Use finally/using/defer/scope guards or transactions so cleanup runs on every path. Roll back transactions on failure.\n\nConstraints: Ensure cleanup itself can't mask the original error.\n\nAcceptance: Cleanup runs on success and failure. Add a test that forces an error mid-operation and asserts resources are released/rolled back."
+      }
+    },
+    {
+      "question": "Are retries applied around validation failures, auth failures, permanent errors, duplicate requests, or malformed input (retrying non-retryable failure)? (ERR-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix retrying non-retryable failures (ERR-005): retry only transient errors",
+        "prompt": "Problem: Retrying permanent failures wastes resources and can cause duplicate side effects.\n\nFind all instances: Search retry logic that wraps validation/auth/4xx/permanent errors.\n\nFix correctly: Classify failures and retry only transient ones (timeouts, 5xx, connection resets). Fail fast on permanent errors.\n\nConstraints: Combine with idempotency (CON-016) to make any retry safe.\n\nAcceptance: Only transient failures are retried. Add tests asserting permanent failures are not retried and transient ones are."
+      }
+    },
+    {
+      "question": "Do calls to external dependencies fail immediately on transient errors with no retry/backoff policy (missing retry/backoff for transient failure)? (ERR-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing retry/backoff (ERR-006): add bounded backoff with jitter",
+        "prompt": "Problem: Without retries, brief transient failures cause unnecessary user-visible errors.\n\nFind all instances: Search external dependency calls (HTTP/DB/queue/RPC) that surface transient failures without any retry policy.\n\nFix correctly: Add bounded exponential backoff with jitter and deadline awareness for transient failures only, ensuring the operation is idempotent or guarded.\n\nConstraints: Bound attempts and total time (ERR-007). Retry only transient errors (ERR-005).\n\nAcceptance: Transient failures are retried with bounded backoff. Add a test asserting a transient failure is retried and eventually succeeds/fails within bounds."
+      }
+    },
+    {
+      "question": "Are there retry loops without a max-attempt cap, total deadline, cancellation, or escalation (unbounded retry loop)? (ERR-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unbounded retry loop (ERR-007): cap attempts and deadlines",
+        "prompt": "Problem: Unbounded retries can hammer dependencies, hang requests, and amplify outages.\n\nFind all instances: Search retry loops lacking max attempts, total deadline, cancellation handling, or fail-fast escalation.\n\nFix correctly: Add max attempts, an overall deadline, jitter, cancellation support, and escalation/fail-fast when exhausted.\n\nConstraints: Respect upstream deadlines (ERR-009). Config over hardcoding for limits.\n\nAcceptance: Retries are bounded and cancellable. Add a test asserting the loop stops after max attempts/deadline."
+      }
+    },
+    {
+      "question": "Are network, database, subprocess, queue, RPC, or file operations issued without an explicit timeout, allowing indefinite blocking (missing timeout on external call)? (ERR-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing timeouts (ERR-008): set explicit per-call and end-to-end timeouts",
+        "prompt": "Problem: Calls without timeouts can hang forever, exhausting threads/connections and freezing the service.\n\nFind all instances: Search external/blocking operations (HTTP/DB/RPC/queue/subprocess/file) for missing timeouts.\n\nFix correctly: Set explicit per-call timeouts and an end-to-end deadline; fail fast and clean up on timeout.\n\nConstraints: Config over hardcoding for timeout values. Propagate deadlines (ERR-009).\n\nAcceptance: All external calls have timeouts. Add a test simulating a hang proving the call times out rather than blocking indefinitely."
+      }
+    },
+    {
+      "question": "Are top-level timeouts applied that do not propagate into subqueries, retries, streams, locks, or nested calls (timeout applied at wrong layer only)? (ERR-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-propagating timeouts (ERR-009): thread deadlines through the chain",
+        "prompt": "Problem: A top-level timeout that doesn't reach inner calls lets inner operations run past the deadline, leaking work and resources.\n\nFind all instances: Search for outer timeouts/cancellation tokens not passed into nested calls, retries, streams, or lock acquisitions.\n\nFix correctly: Propagate the cancellation token/deadline through every blocking operation in the call chain.\n\nConstraints: Don't replace or drop the token mid-chain (CON-007).\n\nAcceptance: Deadlines propagate end-to-end. Add a test asserting an outer cancellation aborts inner work promptly."
+      }
+    },
+    {
+      "question": "Are high-volume calls to fragile dependencies made without failure isolation (no circuit breaker, bounded pool, or bulkhead)? (ERR-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing circuit breaker/bulkhead (ERR-010): isolate failing dependencies",
+        "prompt": "Problem: Without isolation, a failing dependency can exhaust resources and cascade into a full outage.\n\nFind all instances: Search high-volume calls to fragile dependencies lacking circuit breakers, bounded pools, or bulkheads.\n\nFix correctly: Add circuit breakers, bounded concurrency/pools, queues, or bulkheads to contain dependency failures.\n\nConstraints: Pair with fallback/degradation (ERR-011). Config over hardcoding for thresholds.\n\nAcceptance: Dependency failures are isolated. Add a test asserting the breaker opens/limits load under sustained failure."
+      }
+    },
+    {
+      "question": "Do non-critical dependencies cause total request/service failure when unavailable, lacking a degradation path? (ERR-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing degradation path (ERR-011): degrade gracefully for non-critical deps",
+        "prompt": "Problem: Letting an optional dependency fail the whole request reduces availability unnecessarily.\n\nFind all instances: Search for non-critical dependency calls whose failure aborts the entire operation.\n\nFix correctly: Provide a fallback, cached data, queueing, or an explicit degraded response when non-critical dependencies are unavailable.\n\nConstraints: Distinguish critical from non-critical correctly; degrade only what is safe.\n\nAcceptance: Non-critical failures degrade gracefully. Add a test asserting the core operation still succeeds when an optional dependency fails."
+      }
+    },
+    {
+      "question": "Do reusable libraries call process exit, panic, abort, fatal log, or hard termination instead of returning errors to the host (fatal exit in reusable library)? (ERR-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix fatal exit in library (ERR-012): return errors, let the host decide",
+        "prompt": "Problem: A library that kills the process removes the host's ability to handle failures gracefully.\n\nFind all instances: Search library/shared code for process exit, abort, panic, or fatal-log calls in non-main paths.\n\nFix correctly: Return errors (typed results/exceptions) and let the host application decide whether to terminate.\n\nConstraints: Reserve hard exit for application entry points, not libraries.\n\nAcceptance: Libraries surface errors instead of exiting. Add a test asserting an error condition returns an error rather than terminating the process."
+      }
+    },
+    {
+      "question": "Are errors represented only as strings, booleans, nulls, magic codes, or generic exceptions, making them hard to handle programmatically (ambiguous error value)? (ERR-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix ambiguous error values (ERR-013): use typed/structured errors",
+        "prompt": "Problem: Stringly-typed/generic errors can't be reliably matched, leading to fragile handling.\n\nFind all instances: Search for errors signaled via bare strings/booleans/null/magic codes/generic exceptions where callers must branch on them.\n\nFix correctly: Use typed errors or structured error codes carrying category and context.\n\nConstraints: Keep a consistent error model per boundary (ERR-017).\n\nAcceptance: Errors are typed/structured. Add tests matching on error type/code rather than message text."
+      }
+    },
+    {
+      "question": "Do error responses leak internal details (stack traces, SQL, filesystem paths, tokens, config, internal identifiers) to users (internal details leaked in error)? (ERR-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix internal details in errors (ERR-014): safe messages, private logs",
+        "prompt": "Problem: Detailed error output aids attackers and may leak secrets/PII.\n\nFind all instances: Search error responses for stack traces, SQL, paths, tokens, config, or internal IDs returned to clients.\n\nFix correctly: Return safe, generic user-facing messages with a correlation ID; log the sensitive details privately. Disable verbose error pages in production.\n\nConstraints: Don't leak secrets (CSP-002). Keep diagnostics in private logs.\n\nAcceptance: Client errors are sanitized; details go to logs. Add a test asserting an internal failure returns a safe message without stack/secret content."
+      }
+    },
+    {
+      "question": "Are recoverable and unrecoverable error branches lacking tests (error path untested)? (ERR-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix untested error paths (ERR-015): add failure-behavior tests",
+        "prompt": "Problem: Untested error paths frequently hide bugs that only appear during incidents.\n\nFind all instances: Search for error branches (cleanup, propagation, fallback, user-visible errors) without tests.\n\nFix correctly: Add tests covering failure behavior: correct error surfaced, cleanup performed, propagation, and user-visible error shape.\n\nConstraints: Don't weaken behavior to make tests pass; test the real failure handling.\n\nAcceptance: Important error paths are tested. Add tests exercising representative recoverable and unrecoverable failures."
+      }
+    },
+    {
+      "question": "Do multi-step writes leave inconsistent state when a later step fails, without compensation (partial write without compensation)? (ERR-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix partial writes (ERR-016): use transactions or compensation",
+        "prompt": "Problem: A failure after some writes but before others leaves the system inconsistent.\n\nFind all instances: Search multi-step persistence sequences where a later failure leaves earlier writes committed.\n\nFix correctly: Wrap the change in a transaction, or use rollback/outbox/saga/reconciliation to compensate on failure.\n\nConstraints: For cross-service steps use saga/outbox (CON-014). Make steps idempotent (CON-016).\n\nAcceptance: Partial failures don't leave inconsistent state. Add a test forcing a mid-sequence failure and asserting consistent (rolled-back or compensated) state."
+      }
+    },
+    {
+      "question": "Are mixed exception/result/status/null error conventions used within the same boundary or module (inconsistent error model)? (ERR-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent error model (ERR-017): standardize error representation",
+        "prompt": "Problem: Mixed error conventions confuse callers and cause mishandled failures.\n\nFind all instances: Search a module/boundary for mixed conventions (some throw, some return null, some return result/status).\n\nFix correctly: Standardize on one error representation per boundary and convert consistently at boundaries.\n\nConstraints: Convert at the boundary; keep internal consistency. Preserve cause/context.\n\nAcceptance: Error handling is consistent within the boundary. Add tests verifying the standardized error shape across representative operations."
+      }
+    },
+    {
+      "question": "Are promises/tasks/futures/coroutines/goroutines/background jobs launched without awaiting or supervision, so their failures go unobserved (unobserved async failure)? (ERR-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unobserved async failures (ERR-018): await or supervise background work",
+        "prompt": "Problem: Fire-and-forget async work can fail silently, losing data and hiding errors.\n\nFind all instances: Search for async work started without await/join/supervision (un-awaited tasks, detached goroutines, fire-and-forget jobs).\n\nFix correctly: Await, collect results, or supervise async work with error handling/logging and lifecycle ownership.\n\nConstraints: Tie lifecycle to the parent (CON-005/CON-006). Don't swallow the resulting errors (ERR-001).\n\nAcceptance: Async failures are observed. Add a test asserting a failing background task's error is surfaced/logged."
+      }
+    },
+    {
+      "question": "Is missing required configuration silently replaced with defaults in production paths, hiding startup misconfiguration (startup failure hidden by fallback config)? (ERR-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hidden startup misconfig (ERR-019): fail fast on missing required config",
+        "prompt": "Problem: Silently defaulting required config can run the app in an insecure/incorrect state.\n\nFind all instances: Search startup/config loading for required values that fall back to defaults when absent.\n\nFix correctly: Validate required configuration at startup and fail fast with a clear error when it is missing/invalid.\n\nConstraints: Distinguish truly-required from optional config. Config over hardcoding (OPS-009).\n\nAcceptance: Missing required config aborts startup. Add a test asserting startup fails clearly when a required value is absent."
+      }
+    },
+    {
+      "question": "Do shutdown paths ignore failures when flushing, closing, draining, syncing, or acknowledging work (shutdown errors ignored)? (ERR-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix ignored shutdown errors (ERR-020): report and handle shutdown failures",
+        "prompt": "Problem: Ignoring shutdown errors loses unflushed data and leaves resources improperly closed.\n\nFind all instances: Search shutdown handlers for ignored failures while flushing buffers, closing connections, draining queues, syncing files, or acking work.\n\nFix correctly: Report shutdown failures and ensure resources close safely; surface non-clean shutdown to operators.\n\nConstraints: Combine with graceful shutdown (RES-018). Don't swallow errors (ERR-001).\n\nAcceptance: Shutdown failures are handled/reported. Add a test asserting a flush/close failure during shutdown is surfaced rather than ignored."
+      }
+    }
+  ]
+}

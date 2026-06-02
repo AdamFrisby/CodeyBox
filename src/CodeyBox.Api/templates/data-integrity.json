@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are nullable/optional values dereferenced without an explicit presence check, risking null/undefined dereference crashes? (DAT-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix null dereference (DAT-001): handle absence explicitly before use",
+        "prompt": "Problem: Dereferencing possibly-absent values causes crashes and inconsistent state.\n\nFind all instances: Search for accesses to nullable/optional values (DB lookups, map gets, API fields, optional config) without a presence check. Lean on the compiler's nullability analysis where available.\n\nFix correctly: Explicitly handle the absent case (early return, default, error) before dereferencing. Use the language's null-safety features (optionals, null checks, non-null types).\n\nConstraints: Do not mask real missing-data bugs with silent defaults (see DAT-016). Preserve intended behavior.\n\nAcceptance: Possibly-absent values are checked before use. Add a test covering the null/absent case for the affected paths."
+      }
+    },
+    {
+      "question": "Does code access collections (first/last item, aggregations, averages, pagination) assuming at least one element, without handling the empty case (empty collection not handled)? (DAT-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix empty-collection handling (DAT-002): define zero-result behavior",
+        "prompt": "Problem: Assuming non-empty collections causes crashes (index errors, divide-by-zero in averages) on empty inputs.\n\nFind all instances: Search for first/last access, indexing, averages/divisions by count, and pagination that assume at least one item.\n\nFix correctly: Define and implement correct behavior for zero results (return empty, default, or explicit 'no data' state). Guard divisions by count.\n\nConstraints: Preserve intended semantics for non-empty cases.\n\nAcceptance: Empty inputs are handled. Add tests for the zero-item case on the affected operations."
+      }
+    },
+    {
+      "question": "Do loops, slicing, pagination, ranges, date intervals, or limits use boundary semantics with suspicious inclusive/exclusive handling (off-by-one boundary error)? (DAT-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix off-by-one boundary (DAT-003): make boundary semantics explicit and tested",
+        "prompt": "Problem: Off-by-one errors drop/duplicate items, mis-page results, or mis-bound ranges.\n\nFind all instances: Search loops, slices, pagination math, range and date-interval logic, and limit handling for inclusive/exclusive ambiguity.\n\nFix correctly: Make boundary semantics explicit (document and code half-open vs closed ranges consistently); fix off-by-one errors.\n\nConstraints: Preserve correct behavior elsewhere; change only the buggy bounds.\n\nAcceptance: Boundaries are correct and explicit. Add tests for min, max, empty, single-item, and boundary-crossing cases."
+      }
+    },
+    {
+      "question": "Is arithmetic over sizes, indexes, prices, counters, durations, IDs, or allocations performed without overflow/underflow handling (integer overflow/underflow)? (DAT-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix integer overflow (DAT-004): use checked arithmetic or wider types",
+        "prompt": "Problem: Overflow/underflow produces wrong values, security bypasses, and corrupt allocations.\n\nFind all instances: Search arithmetic on sizes/indexes/prices/counters/durations/IDs/allocations for unchecked operations on bounded integer types, especially with untrusted operands.\n\nFix correctly: Use checked arithmetic, wider types, or domain-safe numeric wrappers; validate operands' ranges before arithmetic.\n\nConstraints: Preserve correct results within range. Bound untrusted inputs (VAL-005).\n\nAcceptance: Arithmetic cannot silently overflow. Add tests at type limits proving overflow is detected/avoided."
+      }
+    },
+    {
+      "question": "Is money, tax, billing, inventory, or business-rule arithmetic implemented with binary floating-point types instead of decimal/fixed-point/integer-minor-units (floating-point money)? (DAT-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix floating-point money (DAT-005): use decimal/fixed-point money types",
+        "prompt": "Problem: Binary floating point cannot represent decimal amounts exactly, causing rounding errors in money/business math.\n\nFind all instances: Search money/tax/billing/inventory/business calculations using float/double.\n\nFix correctly: Use a decimal type, fixed-point, integer minor units (cents), or a domain Money type for all monetary/business arithmetic.\n\nConstraints: Centralize rounding (DAT-006). Migrate stored/serialized values carefully (DAT-014).\n\nAcceptance: Money/business math uses exact decimal types. Add tests for amounts known to misbehave in float (e.g. 0.1+0.2) proving exact results."
+      }
+    },
+    {
+      "question": "Is rounding in billing/finance/discounts/tax/reporting/quotas duplicated or implicit rather than centralized with an explicit rounding mode (inconsistent rounding mode)? (DAT-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent rounding (DAT-006): centralize rounding rules",
+        "prompt": "Problem: Scattered/implicit rounding yields inconsistent totals and reconciliation errors.\n\nFind all instances: Search for rounding/truncation in finance/billing/discount/tax/reporting/quota code; flag duplicated or implicit rounding.\n\nFix correctly: Centralize rounding rules in one place with an explicit, configurable rounding mode and scale; call it everywhere.\n\nConstraints: Preserve required financial semantics; config over hardcoding for mode/scale where rules vary.\n\nAcceptance: Rounding is centralized and explicit. Add tests for half-way cases proving the correct rounding mode is applied consistently."
+      }
+    },
+    {
+      "question": "Do values cross boundaries without explicit units (time, distance, memory, currency, percentages, rates), risking unit mismatch? (DAT-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unit mismatch (DAT-007): encode units in names/types and convert explicitly",
+        "prompt": "Problem: Mixing units (seconds vs ms, dollars vs cents, percent vs fraction) causes serious calculation bugs.\n\nFind all instances: Search for numeric values crossing function/module/API boundaries without unit-bearing names or types.\n\nFix correctly: Encode units in names (e.g. timeoutMs) and/or types (duration/quantity types) and convert explicitly at boundaries.\n\nConstraints: Preserve existing correct conversions; change ambiguous ones.\n\nAcceptance: Units are explicit and conversions intentional. Add tests proving correct conversion across the affected boundaries."
+      }
+    },
+    {
+      "question": "Are local/naive datetimes used in storage, comparisons, expiry, scheduling, or cross-region workflows (time-zone-naive datetime)? (DAT-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix timezone-naive datetimes (DAT-008): store instants consistently",
+        "prompt": "Problem: Naive datetimes produce wrong comparisons/expiry/scheduling across time zones and DST.\n\nFind all instances: Search for naive/local datetime use in persistence, comparisons, expiry, and scheduling.\n\nFix correctly: Store and compare instants in a consistent timezone-aware form (e.g. UTC); localize only at presentation/domain boundaries.\n\nConstraints: Migrate existing stored values carefully. Use timezone-aware APIs.\n\nAcceptance: Time logic uses timezone-aware instants. Add tests crossing time zones/DST proving correct comparisons and expiry."
+      }
+    },
+    {
+      "question": "Does date arithmetic use fixed hour/day offsets where calendar semantics matter (DST, leap years, month-end), causing calendar edge-case bugs? (DAT-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix calendar edge cases (DAT-009): use calendar-aware date operations",
+        "prompt": "Problem: Adding fixed durations (e.g. +24h) instead of calendar units breaks across DST, leap days, and month ends.\n\nFind all instances: Search date arithmetic adding fixed hour/day offsets where 'one day/month' semantics are intended.\n\nFix correctly: Use calendar-aware date operations (add days/months in the calendar, not fixed seconds) for human-calendar intent.\n\nConstraints: Keep instant arithmetic where a fixed duration is genuinely intended.\n\nAcceptance: Calendar arithmetic is correct. Add tests for DST transitions, leap days, and month-end boundaries."
+      }
+    },
+    {
+      "question": "Are persisted/protocol/security values parsed using locale-dependent date, number, or casing behavior instead of invariant parsing (locale-sensitive parsing in logic)? (DAT-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix locale-sensitive parsing (DAT-010): use invariant parsing for machine data",
+        "prompt": "Problem: Locale-dependent parsing of machine data (e.g. decimal separators, Turkish-I casing) causes data corruption and security bugs.\n\nFind all instances: Search parsing/formatting/casing of persisted, protocol, or security values that uses the ambient locale.\n\nFix correctly: Use invariant/culture-insensitive parsing and formatting for machine data; reserve locale-aware handling for UI input/display.\n\nConstraints: Do not change user-facing display behavior unnecessarily.\n\nAcceptance: Machine data uses invariant parsing/casing. Add a test under a non-default locale proving stable behavior."
+      }
+    },
+    {
+      "question": "Are usernames, emails, slugs, tags, keys, or identifiers compared inconsistently with respect to case (case-sensitivity inconsistency)? (DAT-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix case-sensitivity inconsistency (DAT-011): normalize per identity rules",
+        "prompt": "Problem: Inconsistent case handling causes duplicate accounts, failed lookups, and authorization gaps.\n\nFind all instances: Search comparisons/lookups/uniqueness over usernames/emails/slugs/tags/keys for inconsistent case treatment.\n\nFix correctly: Define the domain identity rule (e.g. emails case-insensitive) and normalize consistently before compare/store/lookup using invariant casing.\n\nConstraints: Combine with Unicode normalization (VAL-007). Apply the same rule everywhere.\n\nAcceptance: Identity comparisons are case-consistent. Add tests with differing case proving consistent matching/uniqueness."
+      }
+    },
+    {
+      "question": "Is identity/equality for users, tenants, resources, products, or domain entities implemented with repeated ad hoc checks instead of centralized equality semantics (duplicate identity comparison logic)? (DAT-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix duplicate identity logic (DAT-012): centralize equality semantics",
+        "prompt": "Problem: Scattered equality checks drift and disagree, causing identity bugs.\n\nFind all instances: Search for repeated ad hoc equality/identity comparisons for the same domain entities.\n\nFix correctly: Centralize equality/identity in one place (entity equality method/value object) and reuse it.\n\nConstraints: Preserve correct identity semantics; just unify them.\n\nAcceptance: Identity comparisons go through one implementation. Add tests for representative equal/unequal cases via the shared logic."
+      }
+    },
+    {
+      "question": "Does sorting or pagination by non-unique fields lack a deterministic tie-breaker, causing unstable ordering and pagination glitches (unstable sorting/pagination under ties)? (DAT-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unstable ordering (DAT-013): add deterministic tie-breakers",
+        "prompt": "Problem: Ordering by non-unique fields without a tie-breaker yields nondeterministic results and skipped/duplicated rows across pages.\n\nFind all instances: Search sort/pagination by non-unique fields lacking a stable secondary key.\n\nFix correctly: Add a stable secondary sort key (e.g. a unique ID) and use deterministic cursor ordering for pagination.\n\nConstraints: Coordinate with cursor pagination (API-008, PER-017).\n\nAcceptance: Ordering is deterministic. Add a test with tied values proving stable, repeatable order across pages."
+      }
+    },
+    {
+      "question": "Are numeric, datetime, ID, or binary values serialized through lossy formats or unsafe conversions, losing precision during serialization? (DAT-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix precision loss in serialization (DAT-014): preserve exact representations",
+        "prompt": "Problem: Lossy serialization (e.g. large integers as JS floats, truncated datetimes) corrupts data and breaks round-tripping.\n\nFind all instances: Search serialization/deserialization of large integers/IDs, decimals, high-precision datetimes, and binary for lossy formats or unsafe casts.\n\nFix correctly: Use representations that preserve exact values (e.g. string-encode large IDs/decimals, ISO-8601 with full precision, proper binary encodings).\n\nConstraints: Maintain compatibility or version the format (API-001).\n\nAcceptance: Values round-trip exactly. Add a round-trip test for boundary values proving no precision is lost."
+      }
+    },
+    {
+      "question": "Are magic sentinel values (-1, 0, empty string, 'unknown', max date) used to mean missing/special state instead of explicit option/result/status types (sentinel value confused with real value)? (DAT-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix sentinel confusion (DAT-015): use explicit option/status types",
+        "prompt": "Problem: Sentinels collide with real values and get processed as data, causing subtle bugs.\n\nFind all instances: Search for magic sentinels standing in for missing/special states (-1, 0, '', 'unknown', max date).\n\nFix correctly: Replace sentinels with explicit option/result/status types or nullable values that clearly signal absence/special state.\n\nConstraints: Migrate stored sentinels carefully; preserve behavior.\n\nAcceptance: Special states are explicit, not sentinels. Add tests proving real values matching old sentinels are no longer misinterpreted."
+      }
+    },
+    {
+      "question": "Does defaulting logic make absent input indistinguishable from explicitly supplied values, so missing data is silently masked (default value masks missing data)? (DAT-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix default masking missing data (DAT-016): distinguish absent from supplied",
+        "prompt": "Problem: Collapsing 'not provided' into a default hides missing-required-data bugs and prevents partial updates.\n\nFind all instances: Search input handling that applies defaults so absent and explicitly-set values become indistinguishable (especially partial updates/PATCH).\n\nFix correctly: Preserve the distinction between absent, defaulted, and user-supplied (e.g. optional/nullable wrappers, presence flags). Apply defaults only where intended.\n\nConstraints: For PATCH semantics, only update provided fields.\n\nAcceptance: Absent vs supplied is distinguishable. Add tests for omitted vs explicitly-null vs set fields proving correct behavior."
+      }
+    },
+    {
+      "question": "Do functions mutate their arguments unexpectedly (arrays, maps, DTOs, config, shared state) without documenting or copying (unexpected mutation of input)? (DAT-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unexpected input mutation (DAT-017): copy or make values immutable",
+        "prompt": "Problem: Silently mutating caller-owned data causes spooky action-at-a-distance bugs.\n\nFind all instances: Search functions that modify passed-in collections/DTOs/config/shared state without clear intent.\n\nFix correctly: Copy input before mutating, make values immutable, or clearly document and name the mutation.\n\nConstraints: Preserve behavior for callers that rely on intended mutation; document it.\n\nAcceptance: Inputs are not mutated unexpectedly. Add a test asserting the caller's object is unchanged after the call."
+      }
+    },
+    {
+      "question": "Are shallow copies used where deep copies are required, so later mutation of nested data affects the original (shallow copy where deep copy required)? (DAT-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix shallow-vs-deep copy (DAT-018): deep-copy or redesign ownership",
+        "prompt": "Problem: Shared nested references after a shallow copy let one mutation corrupt the other copy.\n\nFind all instances: Search copies of nested mutable structures where later mutation could affect the source.\n\nFix correctly: Deep-copy intentionally where independence is required, or redesign to avoid shared mutable state (immutability/ownership).\n\nConstraints: Avoid unnecessary deep copies in hot paths (PER); copy only where correctness needs it.\n\nAcceptance: Copies are independent where required. Add a test mutating the copy and asserting the original is unchanged."
+      }
+    },
+    {
+      "question": "Are business invariants checked only in UI/read paths or scattered logic rather than enforced before persistence at the write boundary (business invariant not enforced at write boundary)? (DAT-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix invariant enforcement (DAT-019): validate transactionally at write boundary",
+        "prompt": "Problem: Invariants enforced only in UI/read paths can be violated by other code paths, corrupting data.\n\nFind all instances: Search for business invariants (limits, state machines, uniqueness, relationships) checked only in UI/read code or inconsistently before writes.\n\nFix correctly: Enforce invariants at the write boundary transactionally, and back them with storage constraints (unique indexes, foreign keys, check constraints) where possible.\n\nConstraints: Keep invariant logic centralized (ARC-013). Use transactions (CON-013).\n\nAcceptance: Invariants hold at the write boundary regardless of caller. Add tests writing invariant-violating data through alternate paths proving rejection."
+      }
+    },
+    {
+      "question": "Are derived fields, counters, summaries, denormalized data, or caches not updated/invalidated transactionally on writes, leaving them stale (derived field/cache not updated)? (DAT-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix stale derived state (DAT-020): update/invalidate transactionally",
+        "prompt": "Problem: Derived/denormalized data and caches that drift from the source of truth show wrong values.\n\nFind all instances: Search for counters, summaries, denormalized fields, and caches that are not recomputed/invalidated when underlying data changes.\n\nFix correctly: Recompute, invalidate, or update derived state transactionally with the source write, or eliminate redundant derived state. Define cache invalidation triggers (PER-015).\n\nConstraints: Keep updates atomic with the source change (CON-013).\n\nAcceptance: Derived state stays consistent with the source. Add a test mutating the source and asserting derived/cached values update."
+      }
+    }
+  ]
+}

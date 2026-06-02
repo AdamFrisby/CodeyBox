@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Does server-side code assume that browser/mobile/client validation has already enforced correctness, skipping its own validation at the trusted service boundary (client-side validation trusted as authority)? (VAL-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix client-trusted validation (VAL-001): re-validate at the service boundary",
+        "prompt": "Problem: Client validation is easily bypassed; trusting it lets attackers send invalid/malicious data straight to the server.\n\nFind all instances: Search server handlers that accept input but lack validation, especially where comments or design imply 'the client already checked this'.\n\nFix correctly: Repeat all correctness and security validation at the trusted service boundary regardless of client checks.\n\nConstraints: Validate at the boundary; prefer allowlists. Keep client validation for UX, but never rely on it for security.\n\nAcceptance: Server validates all untrusted input independently. Add a test sending input that bypasses client rules proving the server rejects it."
+      }
+    },
+    {
+      "question": "Are untrusted payloads accepted without validating their shape, types, required fields, and rejection/handling of unknown fields (missing schema validation)? (VAL-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing schema validation (VAL-002): validate payloads before business logic",
+        "prompt": "Problem: Processing unvalidated payloads leads to type confusion, missing-field crashes, and injection of unexpected data.\n\nFind all instances: Search request/message/file intake for code that reads fields off untrusted payloads without a schema/shape/type/required-field check.\n\nFix correctly: Validate untrusted payloads against an explicit schema (types, required fields, formats, bounds) before any business logic. Decide and document handling of unknown fields per the contract.\n\nConstraints: Validate at the boundary; prefer allowlists of permitted fields/values. Reject ambiguous input.\n\nAcceptance: All untrusted payloads are schema-validated before use. Add tests for missing required fields, wrong types, and malformed payloads proving rejection."
+      }
+    },
+    {
+      "question": "Does validation only block known-bad strings/characters/extensions/values (denylist-only) rather than allowlisting permitted values for constrained inputs? (VAL-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix denylist-only validation (VAL-003): prefer allowlists for constrained inputs",
+        "prompt": "Problem: Denylists miss novel/encoded bypasses; allowlists are far more robust for constrained inputs.\n\nFind all instances: Search validation for denylist patterns (blocking specific bad characters/extensions/values) on inputs that have a known finite set of valid values (identifiers, commands, paths, types, formats).\n\nFix correctly: Replace denylists with allowlists of permitted values/patterns for constrained inputs. Reject anything not on the allowlist.\n\nConstraints: Keep allowlists strict and minimal. Some free-text fields legitimately can't be allowlisted; focus on constrained identifiers.\n\nAcceptance: Constrained inputs use allowlists. Add tests proving an unlisted-but-not-explicitly-denied value is rejected."
+      }
+    },
+    {
+      "question": "Does the codebase rely on implicit/loose type coercion where strings, booleans, numbers, nulls, or arrays may coerce unexpectedly (e.g. loose equality, implicit parsing) instead of explicit parsing (unsafe loose type coercion)? (VAL-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe type coercion (VAL-004): parse explicitly and reject ambiguity",
+        "prompt": "Problem: Implicit coercion produces surprising results and security bypasses (e.g. \"0\"==false, array-vs-scalar confusion).\n\nFind all instances: Search for loose equality, implicit numeric/boolean parsing of untrusted input, and code that treats a value as a type without checking.\n\nFix correctly: Parse inputs explicitly to the expected type and reject ambiguous or unexpected shapes. Use strict equality/typed comparisons.\n\nConstraints: Validate at the boundary; reject rather than coerce ambiguous values.\n\nAcceptance: Inputs are explicitly parsed/typed. Add tests for ambiguous values (e.g. type mismatch, null/array where scalar expected) proving rejection."
+      }
+    },
+    {
+      "question": "Are numeric inputs used as quantities, offsets, limits, prices, sizes, IDs, or loop bounds without min/max range checks (missing numeric bounds)? (VAL-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing numeric bounds (VAL-005): enforce domain min/max",
+        "prompt": "Problem: Unbounded numeric inputs cause overflows, huge allocations, negative quantities, and abusive pagination.\n\nFind all instances: Search for numeric inputs flowing into quantities/offsets/limits/prices/sizes/IDs/loops without bounds checks.\n\nFix correctly: Enforce domain-specific lower and upper bounds at the boundary; reject out-of-range values. Cap page sizes and limits.\n\nConstraints: Config over hardcoding for limits where they may need tuning. Validate at the boundary.\n\nAcceptance: Numeric inputs are bounds-checked. Add tests for below-min, above-max, negative, and zero values proving correct rejection/clamping."
+      }
+    },
+    {
+      "question": "Are strings, arrays, maps, uploads, nesting depth, or batch sizes accepted from untrusted input without bounds on length/count/depth/total size (missing string/collection size limits)? (VAL-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing size limits (VAL-006): bound length, count, depth, and payload size",
+        "prompt": "Problem: Unbounded sizes enable memory exhaustion and denial of service.\n\nFind all instances: Search untrusted input handling for unbounded string lengths, collection/array/map sizes, upload sizes, nesting depth, and batch sizes.\n\nFix correctly: Enforce limits on length, element count, nesting depth, and total payload size at the boundary; reject oversized input.\n\nConstraints: Config over hardcoding for limits. Validate before allocating based on input.\n\nAcceptance: Untrusted collections/strings/payloads are size-bounded. Add tests for over-limit length/count/depth proving rejection."
+      }
+    },
+    {
+      "question": "Are identity, authorization, uniqueness, slug, filename, or security comparisons performed over non-normalized Unicode strings, allowing visually/logically equivalent strings to compare unequal (Unicode normalization bug)? (VAL-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix Unicode normalization (VAL-007): normalize before security comparisons",
+        "prompt": "Problem: Without normalization, equivalent Unicode strings can bypass uniqueness/authorization checks or create spoofed identifiers.\n\nFind all instances: Search identity/authorization/uniqueness/slug/filename/security comparisons over user strings for missing normalization.\n\nFix correctly: Normalize strings (e.g. NFC, with case folding where appropriate) before comparison, storage, authorization, and uniqueness checks. Apply the same normalization consistently on both sides.\n\nConstraints: Apply consistent normalization everywhere the value is compared/stored. Be careful with homoglyph/confusable risks for security identifiers.\n\nAcceptance: Security-relevant string comparisons normalize first. Add a test with equivalent non-normalized forms proving they compare equal/are deduplicated."
+      }
+    },
+    {
+      "question": "Are values decoded multiple times, or compared before canonicalization, causing encoding/double-decoding confusion that bypasses checks? (VAL-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix double-decoding confusion (VAL-008): decode once, compare canonical forms",
+        "prompt": "Problem: Double-decoding (e.g. %252e -> %2e -> .) lets attackers smuggle dangerous values past validators that check the wrong form.\n\nFind all instances: Search for values decoded more than once, or validated before canonicalization (URL/percent decoding, HTML entity decoding, base64).\n\nFix correctly: Decode exactly once at the boundary, canonicalize, then validate/compare canonical forms. Reject input that requires further decoding after validation.\n\nConstraints: Validate after canonicalization, not before. Prefer allowlists on the canonical form.\n\nAcceptance: Values are decoded once and validated canonically. Add a test with double-encoded payloads proving they cannot bypass validation."
+      }
+    },
+    {
+      "question": "Are file paths built from user input, archive entries, route params, or filenames without canonicalizing and confining the final path to an approved root (path traversal)? (VAL-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix path traversal (VAL-009): canonicalize and confine to approved roots",
+        "prompt": "Problem: User-controlled path components (../, absolute paths) let attackers read/write files outside the intended directory.\n\nFind all instances: Search file operations where the path derives from user input, filenames, route params, or archive entries.\n\nFix correctly: Canonicalize/resolve the final path and verify it stays within an approved base directory before any file operation. Reject paths that escape the root. Prefer generated names over user-supplied ones.\n\nConstraints: Prefer allowlists; reject rather than 'clean' suspicious paths. Validate at the boundary.\n\nAcceptance: All file paths are confined to approved roots. Add tests with ../ and absolute-path payloads proving they are rejected."
+      }
+    },
+    {
+      "question": "Are file operations vulnerable to symlink/hardlink redirection because the final target is not resolved and verified before sensitive access (symlink/hardlink traversal)? (VAL-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix symlink/hardlink traversal (VAL-010): resolve and verify the real target",
+        "prompt": "Problem: Symlinks/hardlinks can redirect a seemingly safe path to a sensitive location (TOCTOU file races).\n\nFind all instances: Search file operations in user-writable or shared directories that follow paths without verifying the resolved target.\n\nFix correctly: Resolve the final target (follow links) and verify it is within the approved root and of the expected type before sensitive operations. Prefer operating on an opened handle (open then fstat) rather than re-resolving by path.\n\nConstraints: Avoid check-then-act gaps (see CON-011). Use no-follow/secure-open APIs where available.\n\nAcceptance: File ops verify the real resolved target. Add a test where a symlink points outside the root proving the operation is refused."
+      }
+    },
+    {
+      "question": "Are uploads accepted without validating size, content, extension, storage path, malware risk, or execution policy (unsafe file upload validation)? (VAL-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe file upload (VAL-011): validate type/size and store safely",
+        "prompt": "Problem: Unvalidated uploads enable malware, oversized payloads, and execution of attacker files.\n\nFind all instances: Search upload handlers for missing size limits, content/type validation, extension checks, and unsafe storage locations.\n\nFix correctly: Validate file size and actual content type (not just declared extension/MIME), allowlist permitted types, store outside any executable/web-served path, assign safe generated names, and apply malware scanning where appropriate.\n\nConstraints: Prefer allowlists. Generate storage names (see VAL-018). Confine paths (see VAL-009).\n\nAcceptance: Uploads are type/size validated and stored safely with generated names. Add tests for disallowed type, oversized file, and a mismatched declared-vs-actual type."
+      }
+    },
+    {
+      "question": "Does archive (ZIP/tar) extraction write entries without validating that the normalized output path stays inside the target directory (archive extraction traversal / zip-slip)? (VAL-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix zip-slip (VAL-012): reject archive entries escaping the target dir",
+        "prompt": "Problem: Archive entries with ../ or absolute paths can overwrite arbitrary files during extraction (zip-slip).\n\nFind all instances: Search archive/zip/tar extraction code for entry paths written without validating the resolved destination.\n\nFix correctly: For each entry, resolve the destination path and verify it remains within the target directory; reject entries that escape. Also guard against symlink entries and excessive sizes/counts.\n\nConstraints: Prefer rejecting over sanitizing. Combine with decompression-bomb limits (VAL-013).\n\nAcceptance: Extraction rejects out-of-root entries. Add a test extracting an archive with a ../ entry proving it is refused."
+      }
+    },
+    {
+      "question": "Does the codebase decompress untrusted archives, images, or payloads without limits on compressed size, expanded size, file count, nesting, or expansion ratio (decompression bomb risk)? (VAL-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix decompression bomb risk (VAL-013): enforce expansion limits",
+        "prompt": "Problem: A small malicious archive can expand to exhaust memory/disk (zip/gzip bombs).\n\nFind all instances: Search decompression of untrusted input for missing limits on output size, file count, nesting depth, and compression ratio.\n\nFix correctly: Enforce limits on compressed and expanded size, file count, nesting depth, and expansion ratio; abort when exceeded.\n\nConstraints: Config over hardcoding for limits. Stream and check incrementally rather than fully expanding first.\n\nAcceptance: Decompression aborts on bomb-like input. Add a test with a high-ratio payload proving extraction is aborted at the limit."
+      }
+    },
+    {
+      "question": "Do parsers handling untrusted input lack limits on depth, entities, recursion, memory, or time (parser resource limits absent)? (VAL-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing parser resource limits (VAL-014): bound depth, size, and time",
+        "prompt": "Problem: Unbounded parsing of untrusted input allows resource-exhaustion DoS.\n\nFind all instances: Search parsers (JSON/XML/YAML/protocol/custom) handling untrusted input for missing depth/recursion/entity/size/time limits.\n\nFix correctly: Configure parser limits (max depth, max document/element size, recursion limits, time budget) and reject overly complex input.\n\nConstraints: Config over hardcoding for limits. Combine with XXE hardening (INJ-012) for XML.\n\nAcceptance: Parsers enforce resource limits. Add a test with deeply nested/oversized input proving it is rejected."
+      }
+    },
+    {
+      "question": "Are YAML/XML/JSON/binary parsers configured to instantiate arbitrary objects or execute constructors (unsafe object-loading parser mode), instead of safe modes mapping into explicit DTOs? (VAL-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe parser mode (VAL-015): use safe modes and explicit DTO mapping",
+        "prompt": "Problem: Object-loading parser modes can instantiate arbitrary types from untrusted input, leading to RCE (related to unsafe deserialization).\n\nFind all instances: Search for parser configurations that allow object/tag instantiation (e.g. unsafe YAML loaders, type-resolving deserializers) on untrusted input.\n\nFix correctly: Use safe parser modes that produce plain data, then map into explicit known DTOs. Disable type/tag-driven instantiation.\n\nConstraints: See INJ-013 for deserialization specifics. Prefer allowlists for any permitted polymorphism.\n\nAcceptance: Parsers use safe modes with DTO mapping. Add a test with an object-instantiation payload proving it does not construct arbitrary types."
+      }
+    },
+    {
+      "question": "Does the codebase trust a declared content type, extension, or MIME header without verifying it against actual content where relevant (missing content-type validation)? (VAL-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing content-type validation (VAL-016): verify claimed vs actual type",
+        "prompt": "Problem: Trusting a declared type lets attackers disguise malicious content (e.g. a script labeled as an image).\n\nFind all instances: Search where declared content type/extension/MIME drives handling decisions without inspecting actual content.\n\nFix correctly: Validate the claimed type against the actual content (magic bytes / sniffing) and the expected context; reject mismatches. Allowlist permitted types.\n\nConstraints: Prefer allowlists. Do not serve user content with attacker-controlled content types.\n\nAcceptance: Claimed type is validated against content. Add a test where declared type mismatches actual bytes proving rejection."
+      }
+    },
+    {
+      "question": "Are temporary files created with predictable names, in shared paths, with broad permissions, or without exclusive creation (insecure temporary file creation)? (VAL-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix insecure temp file creation (VAL-017): use exclusive secure temp APIs",
+        "prompt": "Problem: Predictable/shared temp files enable race conditions, symlink attacks, and info disclosure.\n\nFind all instances: Search temp-file creation for predictable names, world-writable/shared directories, broad permissions, or non-exclusive creation.\n\nFix correctly: Use the platform's secure temp-file API with exclusive creation (O_CREAT|O_EXCL semantics) and restrictive permissions in a private directory.\n\nConstraints: Clean up temp files (RES-008). Avoid TOCTOU (CON-011).\n\nAcceptance: Temp files use secure exclusive creation with tight permissions. Add a test asserting unpredictable names and restrictive permissions."
+      }
+    },
+    {
+      "question": "Are uploaded or generated files stored using user-provided filenames or predictable names, risking collision, overwrite, or reuse (filename collision/reuse risk)? (VAL-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix filename collision/reuse (VAL-018): generate unique storage names",
+        "prompt": "Problem: Using user-provided or predictable filenames risks overwriting other users' files and path/extension attacks.\n\nFind all instances: Search file storage code that uses the user-supplied filename or a predictable name as the storage key/path.\n\nFix correctly: Generate unique storage identifiers (e.g. random UUIDs) independent of the user filename; keep the original name only as display metadata.\n\nConstraints: Combine with path confinement (VAL-009) and upload validation (VAL-011).\n\nAcceptance: Storage names are uniquely generated. Add a test uploading two files with the same user filename proving neither overwrites the other."
+      }
+    },
+    {
+      "question": "Does URL validation check only a prefix/string pattern while ignoring scheme, host, port, redirects, embedded credentials, or IP range (incomplete URL validation)? (VAL-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix incomplete URL validation (VAL-019): parse and validate all components",
+        "prompt": "Problem: Prefix/substring URL checks are easily bypassed (e.g. https://trusted@evil.com, scheme tricks), enabling SSRF/open-redirect.\n\nFind all instances: Search URL validation for startsWith/contains/regex checks that don't parse the URL structurally.\n\nFix correctly: Parse URLs with a real URL parser and validate scheme (allowlist), host (allowlist), port, absence of embedded credentials, and resolved IP range. Re-validate after redirects.\n\nConstraints: Prefer allowlists. Coordinate with SSRF (INJ-014) and open-redirect (INJ-015) guidance.\n\nAcceptance: URL validation is structural and covers all security-relevant parts. Add tests for userinfo tricks, disallowed scheme/host, and redirect-to-internal proving rejection."
+      }
+    },
+    {
+      "question": "Does the codebase trust forwarded headers (X-Forwarded-For/Host/Proto, client-cert, auth, or geo headers) from arbitrary clients rather than only from configured trusted proxies (untrusted proxy/header use)? (VAL-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix untrusted forwarding headers (VAL-020): trust only configured proxies",
+        "prompt": "Problem: Trusting forwarding headers from any client lets attackers spoof their IP, host, scheme, or identity, bypassing IP allowlists and auth.\n\nFind all instances: Search for use of X-Forwarded-* / Forwarded / client-cert / geo headers in security or routing decisions without restricting trust to known proxies.\n\nFix correctly: Configure the framework's forwarded-headers handling to accept these headers only from a known set of trusted proxy addresses, and strip untrusted instances. Derive client IP via the trusted-proxy chain.\n\nConstraints: Config over hardcoding for the trusted proxy list. Default to not trusting forwarded headers.\n\nAcceptance: Forwarding headers are honored only from trusted proxies. Add a test spoofing X-Forwarded-For from a non-proxy source proving it is ignored."
+      }
+    }
+  ]
+}

@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are there classes/modules with excessive responsibilities, many unrelated methods, broad dependencies, or frequent unrelated changes (god object/module)? (ARC-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix god object (ARC-001): split by cohesive responsibility",
+        "prompt": "Problem: God objects concentrate too many responsibilities, becoming hard to change, test, and reason about.\n\nFind all instances: Search for very large classes/modules with many unrelated methods, broad dependency fan-out, or high change frequency for unrelated reasons.\n\nFix correctly: Split into cohesive units organized by responsibility and reason-to-change; extract collaborators behind clear interfaces.\n\nConstraints: Preserve behavior; refactor incrementally with tests. Don't create speculative abstractions (ARC-016).\n\nAcceptance: Responsibilities are separated cohesively. Ensure existing tests pass and add tests for extracted units."
+      }
+    },
+    {
+      "question": "Are there functions that mostly inspect or manipulate another object's data instead of their own module's state (feature envy)? (ARC-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix feature envy (ARC-002): move behavior to the data it uses",
+        "prompt": "Problem: Functions that operate mainly on another object's data indicate misplaced behavior and tight coupling.\n\nFind all instances: Search for methods that primarily read/manipulate another object's fields.\n\nFix correctly: Move the behavior onto the object that owns the data, or introduce a method there.\n\nConstraints: Preserve behavior; keep encapsulation intact.\n\nAcceptance: Behavior lives with its data. Ensure tests pass after the move."
+      }
+    },
+    {
+      "question": "Does a single conceptual change require edits across many files or duplicated conditional sites (shotgun surgery)? (ARC-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix shotgun surgery (ARC-003): consolidate behind one abstraction",
+        "prompt": "Problem: When one change ripples across many files, the responsibility is scattered and error-prone.\n\nFind all instances: Search for logic/decisions duplicated across many sites that must change together.\n\nFix correctly: Consolidate the responsibility behind a single abstraction or extension point so one change is localized.\n\nConstraints: Preserve behavior. Don't over-abstract beyond the real variation (ARC-016).\n\nAcceptance: The change is localized to one place. Add/keep tests covering the consolidated behavior."
+      }
+    },
+    {
+      "question": "Do modules/packages import each other directly or indirectly (circular module dependency)? (ARC-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix circular dependency (ARC-004): break the cycle via inversion",
+        "prompt": "Problem: Cyclic dependencies couple modules tightly, hampering builds, testing, and reuse.\n\nFind all instances: Search the module/package dependency graph for direct or indirect cycles.\n\nFix correctly: Break cycles using interfaces, dependency inversion, events, or by extracting a shared module both depend on.\n\nConstraints: Preserve behavior; verify the build/dependency graph is acyclic after.\n\nAcceptance: No dependency cycles remain. Add a build/architecture check if available; ensure tests pass."
+      }
+    },
+    {
+      "question": "Do lower layers depend on higher layers, does UI reach into persistence, or does domain logic call infrastructure directly (layer violation)? (ARC-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix layer violation (ARC-005): route through intended boundaries",
+        "prompt": "Problem: Layering violations couple concerns that should be isolated, eroding maintainability and testability.\n\nFind all instances: Search for lower layers referencing higher layers, UI accessing persistence directly, or domain code invoking infrastructure.\n\nFix correctly: Route access through the intended abstractions (e.g. domain depends on interfaces; infrastructure implements them).\n\nConstraints: Preserve behavior; introduce interfaces/adapters as needed (ARC-007/ARC-020).\n\nAcceptance: Dependencies respect layer boundaries. Add an architecture test/check where feasible; ensure tests pass."
+      }
+    },
+    {
+      "question": "Are domain decisions, invariants, pricing, authorization, or workflows implemented in controllers/UI handlers (business logic in controller/UI handler)? (ARC-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix business logic in controllers (ARC-006): move to domain/application services",
+        "prompt": "Problem: Business logic in controllers/UI is hard to test/reuse and gets duplicated across entry points.\n\nFind all instances: Search controllers/handlers for domain rules, invariants, pricing, authorization, or workflow logic.\n\nFix correctly: Move business behavior into application/domain services; keep controllers thin (parse, delegate, format).\n\nConstraints: Preserve behavior. Centralize duplicated rules (ARC-013).\n\nAcceptance: Controllers are thin; logic lives in services. Add/keep service-level tests for the moved logic."
+      }
+    },
+    {
+      "question": "Do domain entities or rules directly perform SQL, HTTP, filesystem, or storage operations (persistence logic mixed into domain logic)? (ARC-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix persistence in domain (ARC-007): separate via repositories/adapters",
+        "prompt": "Problem: Mixing persistence/infrastructure into domain logic couples the domain to storage/IO, hurting testability.\n\nFind all instances: Search domain entities/rules for direct SQL/HTTP/filesystem/storage calls.\n\nFix correctly: Move storage concerns behind repositories/gateways/adapters; keep the domain pure and dependency-inverted.\n\nConstraints: Preserve behavior. Coordinate with layer boundaries (ARC-005).\n\nAcceptance: Domain logic is storage-agnostic. Add unit tests for the domain without infrastructure."
+      }
+    },
+    {
+      "question": "Are there global mutable variables, static registries, ambient config, or implicit context affecting behavior (hidden global state)? (ARC-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hidden global state (ARC-008): inject dependencies, make state explicit",
+        "prompt": "Problem: Hidden global state creates implicit coupling, order-dependence, and concurrency bugs.\n\nFind all instances: Search for global mutable variables, static registries/singletons, ambient config, and implicit context.\n\nFix correctly: Inject dependencies explicitly and make state explicit (scoped services, passed context).\n\nConstraints: Preserve behavior. Combine with parallel-state isolation (CON-008) and service-locator fix (ARC-009).\n\nAcceptance: State/dependencies are explicit. Add tests that no longer rely on global mutation."
+      }
+    },
+    {
+      "question": "Are dependencies obtained via implicit global lookups (singletons/service locators) that hide dependencies and make tests order-dependent (singleton/service locator abuse)? (ARC-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix service-locator abuse (ARC-009): use explicit dependency injection",
+        "prompt": "Problem: Service-locator/singleton lookups hide real dependencies and cause fragile, order-dependent tests.\n\nFind all instances: Search for static/global service lookups inside business logic.\n\nFix correctly: Inject dependencies explicitly via constructor/parameters instead of locating them globally.\n\nConstraints: Preserve behavior. Coordinate with hidden-global-state (ARC-008).\n\nAcceptance: Dependencies are injected, not located. Add tests that supply dependencies explicitly."
+      }
+    },
+    {
+      "question": "Must APIs be called in a specific order but the order is not encoded or validated (undocumented temporal coupling)? (ARC-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix temporal coupling (ARC-010): encode required ordering",
+        "prompt": "Problem: Hidden call-order requirements cause misuse bugs that compile fine but fail at runtime.\n\nFind all instances: Search for APIs requiring a specific call sequence (init-then-use, open-then-write) without enforcement.\n\nFix correctly: Encode ordering in types/state machines/builders or add explicit precondition checks that fail clearly when misused.\n\nConstraints: Preserve behavior for correct sequences.\n\nAcceptance: Misordered use is prevented or clearly rejected. Add a test calling APIs out of order asserting a clear failure."
+      }
+    },
+    {
+      "question": "Are config keys, environment reads, constants, defaults, and parsing scattered across modules (configuration scattered across code)? (ARC-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix scattered configuration (ARC-011): centralize typed config with validation",
+        "prompt": "Problem: Scattered config reads cause drift, duplicate defaults, and inconsistent validation.\n\nFind all instances: Search for repeated config-key reads, env reads, constants, and parsing across modules.\n\nFix correctly: Centralize configuration into typed, validated config objects loaded at startup; inject where needed.\n\nConstraints: Config over hardcoding; values hot-reloadable where the project expects it. Validate at startup (OPS-009).\n\nAcceptance: Config is centralized and validated. Add a test for config validation; ensure modules read from the central config."
+      }
+    },
+    {
+      "question": "Are production/staging/dev values, regions, paths, credentials, hostnames, ports, or feature assumptions hard-coded (hard-coded environment assumption)? (ARC-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix hard-coded environment assumptions (ARC-012): externalize and validate",
+        "prompt": "Problem: Hard-coded environment values break across deployments and can leak credentials.\n\nFind all instances: Search for hard-coded environment-specific values (URLs, regions, paths, hostnames, ports, env-specific flags) and credentials.\n\nFix correctly: Externalize environment-specific values to configuration and validate them at startup. Move secrets to managed storage (CSP-001).\n\nConstraints: Config over hardcoding. Never commit secrets.\n\nAcceptance: Environment values come from config and are validated. Add a startup validation test; confirm no hard-coded env values remain."
+      }
+    },
+    {
+      "question": "Is the same pricing, eligibility, permission, validation, or state-transition rule implemented in multiple places (duplicate business rule)? (ARC-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix duplicate business rule (ARC-013): single authoritative implementation",
+        "prompt": "Problem: Duplicated business rules drift and produce inconsistent results.\n\nFind all instances: Search for the same rule (pricing/eligibility/permission/validation/state-transition) implemented in more than one place.\n\nFix correctly: Create one authoritative implementation and call it everywhere; remove the duplicates.\n\nConstraints: Preserve the correct rule semantics; reconcile any differences deliberately.\n\nAcceptance: The rule has a single implementation. Add tests for the rule and confirm all call sites use it."
+      }
+    },
+    {
+      "question": "Are modules changed for unrelated reasons (formatting, auth, storage, business logic, presentation), indicating mixed responsibilities causing divergent change (ARC-014)? (ARC-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix mixed responsibilities (ARC-014): split by reason to change",
+        "prompt": "Problem: Modules mixing unrelated responsibilities change for many reasons, increasing risk and merge conflicts.\n\nFind all instances: Search for modules combining unrelated concerns (e.g. auth + storage + presentation).\n\nFix correctly: Split modules by responsibility and reason-to-change.\n\nConstraints: Preserve behavior; refactor incrementally with tests. Avoid speculative splits (ARC-016).\n\nAcceptance: Modules have single, cohesive responsibilities. Ensure tests pass after the split."
+      }
+    },
+    {
+      "question": "Are there domain objects with only fields while invariants/behavior live in procedural services (anemic domain behavior)? (ARC-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix anemic domain (ARC-015): move invariant behavior into domain objects",
+        "prompt": "Problem: Anemic models scatter invariants in services, letting objects exist in invalid states.\n\nFind all instances: Search for data-only domain objects whose invariants/behavior live in external procedural code.\n\nFix correctly: Move invariant-preserving behavior into the domain objects (or cohesive domain services) so invalid states are unrepresentable.\n\nConstraints: Preserve behavior. Keep persistence concerns out of the domain (ARC-007).\n\nAcceptance: Domain objects enforce their invariants. Add unit tests asserting invalid state is rejected by the object."
+      }
+    },
+    {
+      "question": "Are there abstractions, extension points, generic frameworks, or options with only one real use case (speculative generality)? (ARC-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix speculative generality (ARC-016): remove unused abstraction",
+        "prompt": "Problem: Abstractions built for imagined future needs add complexity without value.\n\nFind all instances: Search for generic interfaces/frameworks/options/extension points with a single concrete implementation/use.\n\nFix correctly: Remove the unused abstraction and inline the single case until real variation exists.\n\nConstraints: Don't remove abstractions with genuine multiple uses or external contracts.\n\nAcceptance: Unjustified abstractions are removed. Ensure tests pass and the code is simpler."
+      }
+    },
+    {
+      "question": "Must callers know internal storage, protocol, vendor, cache, or implementation details to use a component (leaky abstraction)? (ARC-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix leaky abstraction (ARC-017): hide details behind a stable contract",
+        "prompt": "Problem: Leaky abstractions force callers to depend on internals, coupling them to implementation.\n\nFind all instances: Search for components whose callers must know storage/protocol/vendor/cache details.\n\nFix correctly: Hide implementation details behind a stable contract/interface; expose intent, not mechanism.\n\nConstraints: Preserve behavior. Coordinate with vendor isolation (ARC-020).\n\nAcceptance: Callers depend only on the contract. Add tests against the interface; confirm internals aren't exposed."
+      }
+    },
+    {
+      "question": "Are inheritance hierarchies used mainly for behavior reuse or optional feature combinations where composition fits better (inheritance where composition fits better)? (ARC-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inheritance misuse (ARC-018): prefer composition/strategy",
+        "prompt": "Problem: Inheritance for reuse creates rigid hierarchies and fragile base classes.\n\nFind all instances: Search for inheritance used for code reuse or to mix optional features rather than true is-a relationships.\n\nFix correctly: Prefer composition, strategy, or delegation for behavior variation.\n\nConstraints: Preserve behavior. Keep genuine is-a relationships as inheritance.\n\nAcceptance: Reuse uses composition where appropriate. Ensure tests pass after refactor."
+      }
+    },
+    {
+      "question": "Do interfaces force clients to implement or depend on methods they do not use (fat interface)? (ARC-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix fat interface (ARC-019): split by client need",
+        "prompt": "Problem: Fat interfaces couple clients to methods they don't need (violating interface segregation).\n\nFind all instances: Search for large interfaces whose implementers/clients use only a subset.\n\nFix correctly: Split interfaces by client need/responsibility into smaller cohesive contracts.\n\nConstraints: Preserve behavior. Maintain backward compatibility for public interfaces (API-001).\n\nAcceptance: Interfaces are cohesive and client-focused. Ensure tests pass after the split."
+      }
+    },
+    {
+      "question": "Does core domain logic depend directly on vendor SDKs, cloud APIs, framework types, or platform services (vendor/platform lock-in in core logic)? (ARC-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix vendor lock-in in core (ARC-020): isolate behind adapters",
+        "prompt": "Problem: Core logic coupled to vendor/platform specifics is hard to test and migrate.\n\nFind all instances: Search core/domain code for direct dependencies on vendor SDKs/cloud APIs/framework types/platform services.\n\nFix correctly: Isolate vendor/platform details behind adapter interfaces owned by the core; depend on those interfaces.\n\nConstraints: Preserve behavior. Coordinate with layer boundaries (ARC-005).\n\nAcceptance: Core logic is vendor-agnostic behind adapters. Add unit tests for the core using fakes instead of the vendor SDK."
+      }
+    }
+  ]
+}

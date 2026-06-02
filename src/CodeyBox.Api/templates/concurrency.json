@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Is shared mutable state accessed by multiple threads/tasks/requests without synchronization or ownership boundaries (data race on shared mutable state)? (CON-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix data race (CON-001): synchronize, isolate, or make state immutable",
+        "prompt": "Problem: Concurrent unsynchronized access to shared mutable state causes torn reads/writes, corruption, and nondeterministic bugs.\n\nFind all instances: Search for mutable fields/collections/statics accessed from multiple threads/tasks/request handlers without locks, atomics, or confinement.\n\nFix correctly: Synchronize access (locks/atomics), confine state to a single owner, or make it immutable. Prefer immutable data and message passing where practical.\n\nConstraints: Avoid holding locks during blocking calls (CON-003). Keep critical sections small.\n\nAcceptance: Shared state is race-free. Add a concurrency test exercising parallel access and asserting consistency."
+      }
+    },
+    {
+      "question": "Are read-modify-write operations split across multiple statements without locking, atomics, or a transaction (non-atomic compound operation)? (CON-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix non-atomic compound op (CON-002): make read-modify-write atomic",
+        "prompt": "Problem: Splitting read-modify-write across statements lets concurrent operations interleave and lose updates.\n\nFind all instances: Search for check/increment/update sequences (counters, balances, state transitions) done in multiple steps without atomicity.\n\nFix correctly: Use atomic operations, compare-and-swap, locks, or transactions to make the compound operation atomic.\n\nConstraints: Prefer atomic primitives or DB atomic updates over coarse locks. Combine with lost-update protection (CON-012).\n\nAcceptance: Compound operations are atomic. Add a concurrency test asserting no lost updates under parallel execution."
+      }
+    },
+    {
+      "question": "Are locks held while performing network calls, database calls, file I/O, sleeps, waits, or callbacks (lock held during blocking/external call)? (CON-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix lock during blocking call (CON-003): move slow work outside the lock",
+        "prompt": "Problem: Holding a lock during slow/blocking work serializes throughput and risks deadlocks/re-entrancy issues.\n\nFind all instances: Search critical sections for I/O, external calls, sleeps, waits, or callbacks executed while a lock is held.\n\nFix correctly: Move blocking/external work outside the critical section; hold the lock only for the in-memory state change.\n\nConstraints: Preserve correctness of the protected invariant; capture needed data inside the lock, act outside.\n\nAcceptance: Locks no longer wrap blocking work. Add a test/benchmark or review confirming the critical section excludes I/O."
+      }
+    },
+    {
+      "question": "Are multiple locks acquired in inconsistent order across different code paths, creating deadlock potential (deadlock-prone lock ordering)? (CON-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix deadlock-prone lock ordering (CON-004): enforce a global lock order",
+        "prompt": "Problem: Acquiring locks in different orders on different paths can deadlock.\n\nFind all instances: Search for code paths acquiring two or more locks; compare acquisition order across paths.\n\nFix correctly: Establish and document a single global lock-acquisition order and enforce it everywhere; or redesign to need fewer locks.\n\nConstraints: Consider lock-free structures or finer ownership to reduce lock count.\n\nAcceptance: Lock ordering is consistent. Add a test/review demonstrating no inconsistent ordering remains."
+      }
+    },
+    {
+      "question": "Are workers, threads, tasks, timers, watchers, or loops created without lifecycle ownership (cancellation/shutdown), causing thread/task leaks? (CON-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix thread/task leak (CON-005): own lifecycle with cancellation/shutdown",
+        "prompt": "Problem: Unowned background work accumulates, leaking threads/timers and preventing clean shutdown.\n\nFind all instances: Search for threads/tasks/timers/watchers/loops started without a clear owner, cancellation, or shutdown hook.\n\nFix correctly: Use bounded executors, attach cancellation tokens, register shutdown hooks, and define ownership/lifetime for all background work.\n\nConstraints: Tie lifetime to the parent scope/service. Combine with cancellation propagation (CON-007).\n\nAcceptance: Background work has owned lifecycle and stops on shutdown. Add a test asserting started work is cancelled/joined on teardown."
+      }
+    },
+    {
+      "question": "Does spawned async work continue running after the request, parent task, or service shuts down (coroutine/goroutine not cancelled)? (CON-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix uncancelled async work (CON-006): propagate cancellation on shutdown",
+        "prompt": "Problem: Async work that ignores cancellation wastes resources and may act after its context is gone.\n\nFind all instances: Search spawned coroutines/goroutines/tasks for cancellation handling tied to request/parent/service lifecycle.\n\nFix correctly: Propagate cancellation and stop work when the parent context is cancelled; close channels/streams.\n\nConstraints: Honor cancellation tokens throughout (CON-007).\n\nAcceptance: Async work stops on cancellation. Add a test cancelling the parent and asserting the child stops promptly."
+      }
+    },
+    {
+      "question": "Are cancellation/deadline tokens dropped or replaced along a call chain instead of threaded through every blocking operation (missing cancellation propagation)? (CON-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix cancellation propagation (CON-007): thread tokens through the chain",
+        "prompt": "Problem: Dropping the cancellation/deadline token lets inner operations ignore cancellation/timeouts.\n\nFind all instances: Search call chains where a cancellation token/deadline is not passed into nested blocking calls, or is replaced with a fresh/none token.\n\nFix correctly: Thread the same cancellation token/deadline through every blocking operation in the chain.\n\nConstraints: Don't substitute CancellationToken.None or create detached contexts. Combine with ERR-009.\n\nAcceptance: Cancellation reaches all blocking calls. Add a test asserting an outer cancel aborts inner work."
+      }
+    },
+    {
+      "question": "Do tests, requests, jobs, or workers mutate global config, caches, environment, or singletons in a parallel runtime, causing cross-execution interference (parallel runtime uses shared global state)? (CON-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix shared global mutation (CON-008): isolate state per execution context",
+        "prompt": "Problem: Mutating globals under parallelism causes flaky behavior and cross-contamination between requests/tests.\n\nFind all instances: Search for mutation of global config/caches/env/singletons from request/job/test paths.\n\nFix correctly: Isolate mutable state per execution context (scoped services, per-request/per-test instances) or remove global mutation.\n\nConstraints: Combine with hidden-global-state cleanup (ARC-008) and test isolation (TST-018).\n\nAcceptance: No cross-execution global mutation remains. Add a test running operations in parallel asserting no interference."
+      }
+    },
+    {
+      "question": "Are non-thread-safe objects (clients, parsers, formatters, buffers, connections) shared and used concurrently (non-thread-safe object reused concurrently)? (CON-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unsafe object sharing (CON-009): confine, clone, or synchronize",
+        "prompt": "Problem: Sharing non-thread-safe objects across threads corrupts their internal state.\n\nFind all instances: Search for shared instances of known non-thread-safe types (certain date formatters, parsers, buffers, DB connections) used concurrently.\n\nFix correctly: Confine each instance to one thread/task, create per-use instances, or synchronize access. Use thread-safe alternatives where available.\n\nConstraints: Prefer per-use instances over locking hot paths.\n\nAcceptance: Non-thread-safe objects aren't shared concurrently. Add a test exercising concurrent use asserting correct results."
+      }
+    },
+    {
+      "question": "Are existence/permission/state checks followed by a separate action that assumes the check is still valid, creating a check-then-act race (CON-010)? (CON-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix check-then-act race (CON-010): combine check and action atomically",
+        "prompt": "Problem: State can change between the check and the action, voiding the check (race condition).\n\nFind all instances: Search for 'if exists/allowed/state then act' patterns where the act is a separate non-atomic step.\n\nFix correctly: Combine check and action atomically (atomic DB upsert/conditional update, locking, or compare-and-swap) so the action only proceeds if the condition still holds.\n\nConstraints: Prefer DB-level atomic operations/constraints over app-level locks.\n\nAcceptance: Check and act are atomic. Add a concurrency test interleaving two callers proving only one succeeds where appropriate."
+      }
+    },
+    {
+      "question": "Are file/security checks done before opening or modifying a resource by path, creating a TOCTOU race (CON-011)? (CON-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix TOCTOU file race (CON-011): operate on the resolved handle",
+        "prompt": "Problem: Checking a file by path then operating by path lets an attacker swap the target in between (TOCTOU), enabling symlink/file-race attacks.\n\nFind all instances: Search for security/existence checks on a path followed by a separate open/modify by the same path.\n\nFix correctly: Open the resource once and operate on the resulting handle (check via the handle, e.g. fstat), or use transactional/atomic resource APIs. Use no-follow/secure-open where applicable.\n\nConstraints: Combine with symlink protection (VAL-010).\n\nAcceptance: No path-based check-then-use gap remains. Add a test demonstrating the operation acts on the verified handle."
+      }
+    },
+    {
+      "question": "Do updates read current state, modify locally, and write back without version checks, allowing concurrent writers to overwrite each other (lost update)? (CON-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix lost update (CON-012): use optimistic locking or atomic updates",
+        "prompt": "Problem: Read-modify-write without concurrency control lets one writer silently clobber another's changes.\n\nFind all instances: Search for load-entity, mutate-in-memory, save-entity patterns without a version/etag check or atomic DB update.\n\nFix correctly: Use optimistic locking (version column/etag), atomic DB updates, or serializable transactions to detect/prevent lost updates.\n\nConstraints: Surface conflicts to the caller (e.g. 409). Combine with CON-002.\n\nAcceptance: Concurrent writes don't silently overwrite. Add a concurrency test asserting the second stale write is rejected/merged."
+      }
+    },
+    {
+      "question": "Are logically atomic persistence changes split across multiple writes without a transaction (missing transaction for multi-step change)? (CON-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing transaction (CON-013): wrap multi-step changes atomically",
+        "prompt": "Problem: Multi-step writes without a transaction can leave the DB partially updated on failure.\n\nFind all instances: Search for sequences of related writes that must all succeed or all fail, executed without a transaction.\n\nFix correctly: Wrap the full state change in a single transaction (or an equivalent atomic workflow) so it commits or rolls back as a unit.\n\nConstraints: Don't span external calls inside the transaction (CON-014). Keep transactions short.\n\nAcceptance: Multi-step changes are atomic. Add a test forcing a mid-sequence failure asserting full rollback."
+      }
+    },
+    {
+      "question": "Are database transactions held open while calling external services, queues, APIs, or slow I/O (transaction spans external call)? (CON-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix transaction spanning external call (CON-014): split persistence and side effects",
+        "prompt": "Problem: Holding a DB transaction during external calls causes long-held locks, connection exhaustion, and inconsistent state if the external call fails.\n\nFind all instances: Search for external/network calls executed inside an open DB transaction.\n\nFix correctly: Commit persistence first, then perform side effects via outbox, saga, or post-commit hooks; keep the transaction limited to DB work.\n\nConstraints: Ensure side effects are idempotent (CON-016). Maintain consistency via outbox/reconciliation.\n\nAcceptance: Transactions no longer wrap external calls. Add a test/review confirming side effects run after commit."
+      }
+    },
+    {
+      "question": "Do invariants depending on absence/count/sum across rows run under a transaction isolation level too weak to guarantee them (isolation level too weak for invariant)? (CON-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix weak isolation (CON-015): use stronger isolation, locks, or constraints",
+        "prompt": "Problem: Under weak isolation, phantom/concurrent rows can violate count/sum/uniqueness invariants (e.g. double-booking).\n\nFind all instances: Search for invariants checked across multiple rows (no overlap, capacity limits, unique business key) under read-committed or weaker isolation.\n\nFix correctly: Use stronger isolation (serializable), explicit locking, or DB constraints/atomic operations (unique indexes, exclusion constraints) to enforce the invariant.\n\nConstraints: Prefer DB constraints where possible. Handle serialization conflicts with retry (ERR-006).\n\nAcceptance: Cross-row invariants hold under concurrency. Add a concurrency test attempting to violate the invariant proving it is prevented."
+      }
+    },
+    {
+      "question": "Do retried payment, order, creation, provisioning, webhook, or external mutation flows lack an idempotency key, so retries cause duplicate effects (missing idempotency key)? (CON-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing idempotency (CON-016): add idempotency keys and safe replay",
+        "prompt": "Problem: Without idempotency, retries create duplicate charges/orders/resources.\n\nFind all instances: Search retried mutation flows (payments, orders, provisioning, webhooks) for idempotency-key handling.\n\nFix correctly: Add idempotency keys persisted with the result; on replay, return the prior result instead of re-executing. Make handlers idempotent.\n\nConstraints: Store keys atomically with the effect. Combine with duplicate-event handling (CON-017).\n\nAcceptance: Retries don't duplicate effects. Add a test replaying the same request asserting a single effect."
+      }
+    },
+    {
+      "question": "Do event or message handlers assume exactly-once delivery, failing on duplicates (duplicate message/event not handled)? (CON-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix duplicate event handling (CON-017): deduplicate or make handlers idempotent",
+        "prompt": "Problem: Most messaging is at-least-once; assuming exactly-once causes double processing.\n\nFind all instances: Search message/event handlers for dedup or idempotency against redelivery.\n\nFix correctly: Deduplicate by message/event ID or make handlers idempotent so reprocessing is safe.\n\nConstraints: Combine with idempotency keys (CON-016) and ordering (CON-018).\n\nAcceptance: Duplicate deliveries are safe. Add a test delivering the same event twice asserting a single effect."
+      }
+    },
+    {
+      "question": "Do event handlers assume chronological/ordered delivery without sequence/version checks, so out-of-order events corrupt state (out-of-order event breaks state)? (CON-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix out-of-order events (CON-018): add versioning/sequence checks",
+        "prompt": "Problem: Out-of-order delivery can apply a stale update over a newer one, corrupting state.\n\nFind all instances: Search event handlers that apply updates assuming ordered delivery.\n\nFix correctly: Add sequence numbers/versions and reject or buffer out-of-order events; or design commutative/idempotent updates that tolerate reordering.\n\nConstraints: Combine with dedup (CON-017). Use authoritative ordering (CON-019).\n\nAcceptance: Reordered events don't corrupt state. Add a test delivering events out of order asserting correct final state."
+      }
+    },
+    {
+      "question": "Are distributed workflows ordered by wall-clock timestamps from different machines (clock-order assumption in distributed flow)? (CON-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix clock-order assumption (CON-019): use logical clocks/versions",
+        "prompt": "Problem: Wall clocks on different machines drift; ordering by them produces incorrect results.\n\nFind all instances: Search distributed logic that orders or compares events by timestamps from different sources.\n\nFix correctly: Use logical clocks, monotonic sequence numbers, versions, or an authoritative ordering source instead of wall-clock comparison.\n\nConstraints: Reserve wall-clock for display, not ordering decisions.\n\nAcceptance: Ordering no longer relies on cross-machine clocks. Add a test with skewed timestamps proving correct ordering."
+      }
+    },
+    {
+      "question": "Are there busy-wait/spin loops repeatedly checking state without blocking, sleep, backoff, or event notification (busy wait/spin loop)? (CON-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix busy wait (CON-020): use blocking waits or event notification",
+        "prompt": "Problem: Spin loops burn CPU and degrade the whole system while waiting.\n\nFind all instances: Search for loops that repeatedly poll a condition with no blocking/sleep/backoff.\n\nFix correctly: Replace with blocking waits, condition variables/events, subscriptions, or bounded backoff with jitter.\n\nConstraints: Prefer event-driven waits; if polling is unavoidable, use bounded backoff (PER-009).\n\nAcceptance: No CPU-burning spin loops remain. Add a test/review confirming the wait blocks or backs off."
+      }
+    }
+  ]
+}

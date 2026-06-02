@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "question": "Are public endpoints, message schemas, exported functions, fields, enums, or behaviors changed in a breaking way without versioning or a backward-compatibility plan (breaking public API change without versioning)? (API-001)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unversioned breaking API change (API-001): version or preserve compatibility",
+        "prompt": "Problem: Breaking a public contract without versioning breaks existing clients.\n\nFind all instances: Search recent/changed public endpoints, schemas, exported signatures, fields, and enums for breaking changes lacking versioning or compatibility handling.\n\nFix correctly: Version the API (new version/endpoint) or preserve backward compatibility (additive changes, deprecate-then-remove). Provide a migration path.\n\nConstraints: Don't break existing consumers. Follow the project's versioning conventions.\n\nAcceptance: Public changes are versioned or backward-compatible. Add a contract test asserting old clients still work."
+      }
+    },
+    {
+      "question": "Are schemas or DTOs duplicated across client, server, tests, and docs in a way that can drift (client/server schema mismatch)? (API-002)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix schema drift (API-002): generate/validate from one contract",
+        "prompt": "Problem: Duplicated, hand-maintained schemas drift apart, causing integration failures.\n\nFind all instances: Search for duplicated request/response schemas/DTOs maintained separately on client, server, tests, and docs.\n\nFix correctly: Generate or validate all sides from a single source of truth (shared schema/IDL/contract).\n\nConstraints: Add a drift check in CI (BLD-014).\n\nAcceptance: Schemas derive from one contract. Add a test/check failing on client/server schema divergence."
+      }
+    },
+    {
+      "question": "Does the implementation accept input values that the documented contract says are invalid (implementation accepts invalid documented input)? (API-003)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix contract-vs-validation gap (API-003): align validation with the contract",
+        "prompt": "Problem: Accepting input the contract forbids creates undefined behavior and security gaps.\n\nFind all instances: Search endpoints where runtime validation is looser than the documented contract (formats, ranges, required fields).\n\nFix correctly: Align runtime validation with the public contract; reject documented-invalid input.\n\nConstraints: Validate at the boundary; prefer allowlists. Keep the contract authoritative.\n\nAcceptance: Runtime validation matches the contract. Add tests sending documented-invalid input proving rejection."
+      }
+    },
+    {
+      "question": "Are fields documented as required returned as null/missing, or documented nullable but handled as required (response nullability mismatch)? (API-004)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix nullability mismatch (API-004): match response shape to docs",
+        "prompt": "Problem: Nullability mismatches crash clients or cause silent data gaps.\n\nFind all instances: Search responses where required fields can be null/missing or nullable fields are assumed present (on both produce and consume sides).\n\nFix correctly: Make the runtime response match documented nullability; handle nullable fields defensively on the consuming side.\n\nConstraints: Keep the contract authoritative; update docs if the real shape differs intentionally (with versioning).\n\nAcceptance: Response nullability matches the contract. Add tests asserting required fields are always present and nullable fields are handled."
+      }
+    },
+    {
+      "question": "Do APIs return different error shapes, field names, or code conventions across endpoints (inconsistent error response format)? (API-005)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent error format (API-005): use one error envelope",
+        "prompt": "Problem: Inconsistent error formats force clients to special-case each endpoint and cause mishandling.\n\nFind all instances: Search error responses across endpoints for differing shapes/field names/code conventions.\n\nFix correctly: Adopt a single machine-readable error envelope (consistent fields: code, message, details) and apply it everywhere.\n\nConstraints: Don't leak internals (ERR-014). Keep codes stable.\n\nAcceptance: Errors use a consistent envelope. Add tests asserting representative endpoints return the standard error shape."
+      }
+    },
+    {
+      "question": "Do GET/HEAD methods mutate state, or are unsafe methods used for safe reads (HTTP method semantics violated)? (API-006)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix HTTP method semantics (API-006): keep safe methods side-effect-free",
+        "prompt": "Problem: State-changing GETs break caching/CSRF assumptions and can be triggered accidentally (prefetch, crawlers).\n\nFind all instances: Search for GET/HEAD handlers with side effects and mutations using safe methods.\n\nFix correctly: Use POST/PUT/PATCH/DELETE for mutations; keep GET/HEAD safe and idempotent.\n\nConstraints: Coordinate with CSRF (IAM-017) and idempotency (API-011).\n\nAcceptance: Method semantics are correct. Add a test asserting GET/HEAD cause no state change."
+      }
+    },
+    {
+      "question": "Do responses use HTTP/gRPC/status codes that don't match the actual outcome (status code misuse)? (API-007)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix status code misuse (API-007): return accurate status codes",
+        "prompt": "Problem: Wrong status codes (e.g. 200 on error) break client error handling, retries, and monitoring.\n\nFind all instances: Search responses where the status code doesn't reflect the outcome (success/client-error/server-error/auth/conflict).\n\nFix correctly: Return codes that accurately represent the outcome; map domain errors to correct codes consistently.\n\nConstraints: Pair with consistent error envelope (API-005) and not-fabricating-success (ERR-003).\n\nAcceptance: Status codes match outcomes. Add tests asserting correct codes for success, validation error, auth failure, not-found, and conflict."
+      }
+    },
+    {
+      "question": "Do paginated APIs use unstable ordering, offset-only pagination, or cursors without a deterministic sort (unstable pagination cursor/sort)? (API-008)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unstable pagination (API-008): deterministic ordering and opaque cursors",
+        "prompt": "Problem: Unstable ordering causes skipped/duplicated items across pages.\n\nFind all instances: Search paginated endpoints for non-deterministic ordering or cursors lacking a stable sort.\n\nFix correctly: Use deterministic ordering with a unique tie-breaker and opaque cursor semantics; prefer keyset pagination.\n\nConstraints: Coordinate with DAT-013 and PER-017.\n\nAcceptance: Pagination is stable. Add a test paging through changing data asserting no skips/duplicates."
+      }
+    },
+    {
+      "question": "Can page counts, cursors, totals, next/previous links, or has-more flags disagree (inconsistent pagination metadata)? (API-009)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix inconsistent pagination metadata (API-009): compute from one snapshot",
+        "prompt": "Problem: Pagination metadata computed from different queries/snapshots can contradict the returned items.\n\nFind all instances: Search pagination responses where totals/cursors/has-more/links derive from separate queries or timing.\n\nFix correctly: Compute all pagination metadata consistently from the same query/snapshot as the returned items.\n\nConstraints: Keep ordering stable (API-008).\n\nAcceptance: Metadata agrees with results. Add a test asserting has-more/next-cursor/total are consistent with the page contents."
+      }
+    },
+    {
+      "question": "Does client code ignore rate-limit responses, Retry-After headers, or quota errors (rate limit not handled)? (API-010)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix rate limit handling (API-010): respect Retry-After and backoff",
+        "prompt": "Problem: Ignoring rate limits causes cascading failures and bans.\n\nFind all instances: Search outbound API clients for handling of 429/quota responses and Retry-After.\n\nFix correctly: Respect Retry-After, apply backoff with jitter, and honor quota semantics; surface persistent limiting.\n\nConstraints: Bound retries (ERR-007). Retry only when appropriate (ERR-005).\n\nAcceptance: Clients honor rate limits. Add a test simulating 429+Retry-After asserting correct backoff."
+      }
+    },
+    {
+      "question": "Do APIs that clients may retry fail to define idempotency behavior (idempotency contract absent)? (API-011)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix missing idempotency contract (API-011): define idempotent retries",
+        "prompt": "Problem: Without a defined idempotency contract, client retries cause duplicate effects.\n\nFind all instances: Search mutating endpoints that clients may retry for idempotency-key support and documented behavior.\n\nFix correctly: Define and enforce idempotency (accept an idempotency key; return the prior result on replay). Document the behavior.\n\nConstraints: Implement server-side dedup (CON-016).\n\nAcceptance: Retried mutations are idempotent. Add a test replaying with the same idempotency key asserting a single effect."
+      }
+    },
+    {
+      "question": "Do clients crash or reject responses when receiving unknown future enum values (backward-incompatible enum handling)? (API-012)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix enum forward-compat (API-012): tolerate unknown enum values",
+        "prompt": "Problem: Strict enum parsing breaks clients when the server adds new enum values.\n\nFind all instances: Search client deserialization of enums for hard failures on unknown values.\n\nFix correctly: Tolerate unknown enum values (map to an 'unknown/other' case) where forward compatibility is required.\n\nConstraints: Still validate where an unknown value is genuinely invalid; this applies to forward-compatible reads.\n\nAcceptance: Unknown enum values don't crash clients. Add a test deserializing an unknown enum value asserting graceful handling."
+      }
+    },
+    {
+      "question": "Do APIs or clients reject unknown fields despite needing forward compatibility (unknown fields rejected unexpectedly)? (API-013)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unknown-field rejection (API-013): preserve/ignore unknown fields per contract",
+        "prompt": "Problem: Rejecting unknown fields breaks forward compatibility when new fields are added.\n\nFind all instances: Search deserialization configured to reject unknown/extra fields where forward compatibility is needed.\n\nFix correctly: Ignore (and preserve where round-tripping) unknown fields according to the contract's compatibility expectations.\n\nConstraints: Where strictness is a deliberate security control (e.g. mass-assignment defense), keep it; this targets forward-compat reads, not authority fields (IAM-004).\n\nAcceptance: Unknown fields are tolerated per contract. Add a test sending an extra field asserting it's ignored, not rejected."
+      }
+    },
+    {
+      "question": "Do API responses serialize full internal models exposing secrets, PII, internal flags, or permissions (sensitive field exposed in API response)? (API-014)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix sensitive field exposure (API-014): use explicit response DTOs",
+        "prompt": "Problem: Serializing whole internal entities leaks secrets/PII/internal fields to clients.\n\nFind all instances: Search response serialization that returns internal/domain models directly rather than curated DTOs.\n\nFix correctly: Define explicit response DTOs/views containing only approved fields; never serialize internal models directly.\n\nConstraints: Prefer allowlists of exposed fields. Coordinate with CSP-002/CSP-017.\n\nAcceptance: Responses expose only approved fields. Add a test asserting sensitive/internal fields are absent from responses."
+      }
+    },
+    {
+      "question": "Does code make one remote API call per item in a loop where batch/bulk APIs are available (N+1 remote API call pattern)? (API-015)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix N+1 remote calls (API-015): batch, prefetch, or cache",
+        "prompt": "Problem: Per-item remote calls multiply latency and risk rate limits.\n\nFind all instances: Search loops issuing one remote API/RPC call per element where bulk/batch endpoints exist.\n\nFix correctly: Batch, prefetch, cache, or reshape integration calls to reduce round trips.\n\nConstraints: Bound batch size and concurrency (PER-007).\n\nAcceptance: Per-item remote fan-out is eliminated. Add a test/check asserting a bounded number of calls for N items."
+      }
+    },
+    {
+      "question": "Do diagnostic/health endpoints expose config, environment, dependency details, stack traces, or secrets (debug/health endpoint leaks internals)? (API-016)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix debug endpoint leakage (API-016): restrict and protect diagnostics",
+        "prompt": "Problem: Verbose diagnostic/health endpoints leak internal/sensitive details to attackers.\n\nFind all instances: Search health/debug/diagnostic endpoints for exposure of config/env/dependency details/stack traces/secrets and for missing access control.\n\nFix correctly: Restrict detail in public endpoints, protect sensitive diagnostics behind auth, and separate liveness from detailed diagnostics.\n\nConstraints: Don't leak secrets (CSP-002). Separate liveness/readiness (OPS-007).\n\nAcceptance: Diagnostics don't leak internals and are access-controlled. Add a test asserting the public health endpoint exposes no sensitive detail."
+      }
+    },
+    {
+      "question": "Do webhook handlers accept events without validating signature, timestamp, and source (webhook signature not verified)? (API-017)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix unverified webhooks (API-017): verify signature, timestamp, and source",
+        "prompt": "Problem: Unverified webhooks let anyone forge events, triggering unauthorized actions.\n\nFind all instances: Search webhook handlers for signature verification, timestamp freshness, source validation, and body-integrity checks.\n\nFix correctly: Verify the signature over the raw body using a constant-time comparison, check timestamp freshness, validate the event source, and reject otherwise.\n\nConstraints: Never hand-roll crypto; use the provider's vetted verification. Combine with replay protection (IAM-019).\n\nAcceptance: Unsigned/forged webhooks are rejected. Add a test with an invalid signature proving rejection and a valid one accepted."
+      }
+    },
+    {
+      "question": "Do webhook handlers assume one delivery, ordered delivery, or no retries (webhook retry/order/dedup missing)? (API-018)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix webhook delivery assumptions (API-018): idempotent, dedup, reorder-safe",
+        "prompt": "Problem: Webhooks are typically at-least-once and unordered; assuming otherwise causes duplicates/corruption.\n\nFind all instances: Search webhook handlers for dedup, idempotency, and ordering handling.\n\nFix correctly: Make handlers idempotent, deduplicate by event ID, and tolerate reordering (sequence/version checks).\n\nConstraints: Combine with CON-016/CON-017/CON-018.\n\nAcceptance: Duplicate/out-of-order webhooks are safe. Add a test delivering duplicate and out-of-order events asserting correct final state."
+      }
+    },
+    {
+      "question": "Do integrations collapse all third-party failures into generic errors without preserving actionable category/code/retryability (third-party error detail discarded)? (API-019)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix discarded third-party error detail (API-019): preserve safe cause/category",
+        "prompt": "Problem: Collapsing third-party errors loses information needed to retry correctly and debug.\n\nFind all instances: Search integration error handling that maps all failures to one generic error.\n\nFix correctly: Preserve a safe, machine-readable cause/category and retryability from the third party; map to your error model accordingly.\n\nConstraints: Don't leak sensitive third-party details to end users (ERR-014). Use the info to drive retry decisions (ERR-005).\n\nAcceptance: Third-party error category/retryability is preserved. Add a test asserting distinct upstream failures map to distinct, actionable categories."
+      }
+    },
+    {
+      "question": "Does code assume optional third-party features, versions, limits, regions, or permissions exist without feature-detection or capability negotiation (unsupported dependency capability assumed)? (API-020)",
+      "actionableAnswer": true,
+      "onYes": {
+        "title": "Fix assumed dependency capability (API-020): feature-detect or fail clearly",
+        "prompt": "Problem: Assuming a dependency capability that may be absent causes runtime failures in some environments.\n\nFind all instances: Search for use of optional third-party features/versions/limits/regions/permissions without checking availability.\n\nFix correctly: Feature-detect or negotiate capability, or fail fast with a clear configuration error when unavailable.\n\nConstraints: Config over hardcoding for capability assumptions. Fail closed where security-relevant.\n\nAcceptance: Missing capabilities are detected or clearly reported. Add a test simulating an unsupported capability asserting graceful detection/error."
+      }
+    }
+  ]
+}
