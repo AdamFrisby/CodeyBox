@@ -56,6 +56,9 @@ Hot-reloadable today:
   `AuditReportRetentionService` sweep. The Serilog rolling-file sink pins
   retention at startup though, so log-file retention continues to require a
   restart.
+- `Shutdown.SandboxTeardownMode` — re-read when graceful shutdown teardown
+  begins. Operators can switch from `Suspend` to `Stop` or `Dispose` before
+  stopping the process, and that shutdown uses the updated mode.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 

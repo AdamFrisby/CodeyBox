@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
@@ -54,6 +55,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         State = state,
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
+
+    private static CodeyBoxOptions OptionsWithTeardownMode(SandboxTeardownMode mode)
+    {
+        var options = new CodeyBoxOptions();
+        options.Shutdown.SandboxTeardownMode = mode;
+        return options;
+    }
 
     // ── Shutdown sequencing: dispatch is paused BEFORE the first VM teardown ──
 
@@ -262,6 +270,38 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         // its preempt-checkpoint, same as a non-suspending provider would.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_TeardownModeAccessor_UsesHotReloadedValueAtShutdown()
+    {
+        // Regression for the 2026-06-02 incident: the hosted service used to
+        // capture SandboxTeardownMode at construction. If an operator changed
+        // Suspend -> Stop in the hot-reloaded config, the already-running
+        // process still used Suspend on its way down, recreating the wedge the
+        // operator was trying to avoid.
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-hot-reload");
+        provider.Register(item.Id, sandbox);
+
+        var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(
+            OptionsWithTeardownMode(SandboxTeardownMode.Suspend));
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownModeAccessor: () => monitor.CurrentValue.Shutdown.SandboxTeardownMode);
+
+        monitor.Set(OptionsWithTeardownMode(SandboxTeardownMode.Stop));
+
+        await svc.StoppingAsync(CancellationToken.None);
+
+        Assert.False(sandbox.SuspendCalled,
+            "shutdown must not use the startup SandboxTeardownMode after a hot reload");
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "shutdown must use the current SandboxTeardownMode from IOptionsMonitor");
     }
 
     [Fact]
@@ -716,6 +756,23 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private sealed class MutableOptionsMonitor<T> : IOptionsMonitor<T>
+    {
+        private T _value;
+
+        public MutableOptionsMonitor(T initial) { _value = initial; }
+        public T CurrentValue => _value;
+        public T Get(string? name) => _value;
+        public void Set(T next) => _value = next;
+        public IDisposable OnChange(Action<T, string?> listener) => NullSubscription.Instance;
+
+        private sealed class NullSubscription : IDisposable
+        {
+            public static readonly NullSubscription Instance = new();
+            public void Dispose() { }
+        }
+    }
 
     private sealed class TestShutdownDispatchGate : IShutdownDispatchGate
     {
