@@ -84,7 +84,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         try
         {
             var (exit, _, stderr) = await RunProcessAsync(
-                "/bin/sh", [wrapperPath, workDir, "--env-file", badEnvPath, "true"]);
+                wrapperPath, [workDir, "--env-file", badEnvPath, "true"]);
 
             Assert.Equal(126, exit);
             Assert.Contains("failed to source env file", stderr, StringComparison.Ordinal);
@@ -113,7 +113,7 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         try
         {
             var (exit, _, stderr) = await RunProcessAsync(
-                "/bin/sh", [wrapperPath, missingDir, "true"]);
+                wrapperPath, [missingDir, "true"]);
 
             Assert.Equal(127, exit);
             Assert.Contains("failed to cd to", stderr, StringComparison.Ordinal);
@@ -144,8 +144,8 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         try
         {
             var (exit, stdout, stderr) = await RunProcessAsync(
-                "/bin/sh",
-                [wrapperPath, workDir, "--env-file", envPath, "sh", "-c", "printf %s \"$CODEYBOX_TEST_VALUE\""]);
+                wrapperPath,
+                [workDir, "--env-file", envPath, "sh", "-c", "printf %s \"$CODEYBOX_TEST_VALUE\""]);
 
             Assert.Equal(0, exit);
             Assert.Equal("", stderr);

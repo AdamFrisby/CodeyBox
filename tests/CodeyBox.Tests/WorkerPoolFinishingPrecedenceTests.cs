@@ -95,6 +95,144 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task FullPool_Ms95ProjectDefaultClassRoutesAuditPassedToIdleClaudeBeforeQueuedBacklog()
+    {
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("p"),
+            DisplayName = "p",
+            RepositoryUrl = "https://github.com/test/repo",
+            DefaultAgentClass = "frontier",
+        });
+
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Gemini, Billing = AgentBilling.Subscription, QualityScore = 95 },
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 95 },
+            ],
+        };
+        var lowTier = new AgentClass
+        {
+            Id = "low-tier",
+            DisplayName = "Low tier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Cursor, Billing = AgentBilling.Subscription, QualityScore = 80 },
+                new AgentMembership { Agent = AgentKind.Opencode, Billing = AgentBilling.Subscription, QualityScore = 80 },
+            ],
+        };
+
+        var router = new AgentClassRouter(
+            [frontier, lowTier],
+            [
+                new FakeProbe(AgentKind.Codex, 0.0),
+                new FakeProbe(AgentKind.Gemini, 0.0),
+                new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 68.0,
+                    Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 94.0 }],
+                }),
+                new FakeProbe(AgentKind.Cursor, 90.0),
+                new FakeProbe(AgentKind.Opencode, 90.0),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members =
+            {
+                ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 },
+                ["cursor"] = new AgentConcurrencyEntry { MaxConcurrent = 2 },
+                ["opencode"] = new AgentConcurrencyEntry { MaxConcurrent = 2 },
+            },
+        };
+
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new FinishingPrecedencePipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            projects: projectRepo,
+            agentConcurrency: concurrency);
+
+        var reworks = Enumerable.Range(0, 4)
+            .Select(_ => Item(WorkItemState.Reworking) with { AgentClassId = "low-tier" })
+            .ToList();
+        foreach (var rework in reworks)
+        {
+            await _store.CreateAsync(rework);
+            await queue.EnqueueAsync(rework.Id);
+        }
+
+        await svc.StartAsync(CancellationToken.None);
+
+        foreach (var rework in reworks)
+            Assert.True(await pipeline.WaitForEnteredAsync(rework.Id, TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(0, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
+
+        var highPriorityQueued = Item(WorkItemState.Queued, priority: 100) with { MinModelScore = 95 };
+        var auditPassed = Item(WorkItemState.AuditPassed, priority: 0) with { MinModelScore = 95 };
+        await _store.CreateAsync(highPriorityQueued);
+        await _store.CreateAsync(auditPassed);
+
+        // Queue the high-priority starting work first. When a slot frees, the
+        // DB phase bucket must still choose the already-audited item, and the
+        // project default class must route that ms>=95 item to idle Claude while
+        // Codex/Gemini are quota-exhausted.
+        await queue.EnqueueAsync(highPriorityQueued.Id);
+        await queue.EnqueueAsync(auditPassed.Id);
+
+        pipeline.Release(reworks[0].Id);
+
+        Assert.True(await pipeline.WaitForStateAsync(auditPassed.Id, WorkItemState.Merging, TimeSpan.FromSeconds(5)));
+        Assert.False(pipeline.HasEntered(highPriorityQueued.Id));
+        Assert.Equal(auditPassed.Id, pipeline.NthEntered(5));
+        Assert.Equal(1, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
+
+        var stored = await _store.GetAsync(auditPassed.Id);
+        Assert.Equal(AgentKind.Claude, stored?.Agent);
+
+        pipeline.Release(highPriorityQueued.Id);
+        pipeline.Release(auditPassed.Id);
+        foreach (var rework in reworks.Skip(1))
+            pipeline.Release(rework.Id);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task DispatchEligible_FinishingBucketOrdersByPriorityThenCreatedAt()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var queued = Item(WorkItemState.Queued, priority: 100) with { CreatedAt = now.AddSeconds(-10) };
+        var lowPriorityFinishing = Item(WorkItemState.AuditPassed, priority: 0) with { CreatedAt = now.AddSeconds(-5) };
+        var samePriorityNewer = Item(WorkItemState.Merging, priority: 50) with { CreatedAt = now.AddSeconds(2) };
+        var samePriorityOlder = Item(WorkItemState.Merged, priority: 50) with { CreatedAt = now.AddSeconds(1) };
+        var midPriorityFinishing = Item(WorkItemState.UpstreamPushing, priority: 25) with { CreatedAt = now };
+
+        foreach (var item in new[] { queued, lowPriorityFinishing, samePriorityNewer, samePriorityOlder, midPriorityFinishing })
+            await _store.CreateAsync(item);
+
+        var ordered = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+            ordered.Add(item.Id);
+
+        Assert.Equal(
+            [samePriorityOlder.Id, samePriorityNewer.Id, midPriorityFinishing.Id, lowPriorityFinishing.Id, queued.Id],
+            ordered);
+    }
+
     private static WorkItem Item(WorkItemState state, int priority = 0) => new()
     {
         Id = WorkItemId.New(),
@@ -118,7 +256,13 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         public FinishingPrecedencePipeline(IWorkItemStore store) => _store = store;
 
         public WorkItemId? ThirdEntered
-            => _entryOrder.ToArray() is { Length: >= 3 } entries ? entries[2] : null;
+            => NthEntered(3);
+
+        public WorkItemId? NthEntered(int n)
+        {
+            var entries = _entryOrder.ToArray();
+            return entries.Length >= n ? entries[n - 1] : null;
+        }
 
         public bool HasEntered(WorkItemId id) => _entered.ContainsKey(id);
 
