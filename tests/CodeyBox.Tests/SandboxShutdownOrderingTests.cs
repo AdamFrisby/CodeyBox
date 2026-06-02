@@ -799,7 +799,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
         public string Name => "fake-ordering";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new OrderingFakeSandbox("fake-ordering-created"));
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
@@ -857,7 +857,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public void SeedManaged(ManagedSandboxInfo info) => _managed.Add(info);
         public string Name => "fake-reconciling";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new OrderingFakeSandbox("fake-reconciling-created"));
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_managed);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
@@ -1026,22 +1026,33 @@ public sealed class SandboxShutdownProgramWiringTests
             IServiceCollection services,
             IServiceProvider probeProvider)
         {
+            var missingProbeServices = new List<Type>();
             var matches = services
                 .Where(d => d.ServiceType == typeof(IHostedService) && d.ImplementationFactory is not null)
-                .Where(d =>
-                {
-                    try
-                    {
-                        return d.ImplementationFactory!(probeProvider) is SandboxSuspendOnShutdownService;
-                    }
-                    catch
-                    {
-                        return false;
-                    }
-                })
+                .Where(d => IsSandboxSuspendDescriptor(d, probeProvider, missingProbeServices))
                 .ToList();
 
+            Assert.True(matches.Count > 0,
+                "Could not locate the SandboxSuspendOnShutdownService hosted-service descriptor. " +
+                "Descriptor probe skipped factories requiring: " +
+                string.Join(", ", missingProbeServices.Select(t => t.FullName).Distinct().OrderBy(n => n)));
             return Assert.Single(matches);
+        }
+
+        private static bool IsSandboxSuspendDescriptor(
+            ServiceDescriptor descriptor,
+            IServiceProvider probeProvider,
+            ICollection<Type> missingProbeServices)
+        {
+            try
+            {
+                return descriptor.ImplementationFactory!(probeProvider) is SandboxSuspendOnShutdownService;
+            }
+            catch (ProbeServiceUnavailableException ex)
+            {
+                missingProbeServices.Add(ex.ServiceType);
+                return false;
+            }
         }
     }
 
@@ -1077,7 +1088,18 @@ public sealed class SandboxShutdownProgramWiringTests
             if (serviceType == typeof(ILogger<SandboxSuspendOnShutdownService>))
                 return NullLogger<SandboxSuspendOnShutdownService>.Instance;
 
-            return null;
+            throw new ProbeServiceUnavailableException(serviceType);
+        }
+    }
+
+    private sealed class ProbeServiceUnavailableException : Exception
+    {
+        public Type ServiceType { get; }
+
+        public ProbeServiceUnavailableException(Type serviceType)
+            : base($"The sandbox-shutdown descriptor probe does not provide {serviceType.FullName}.")
+        {
+            ServiceType = serviceType;
         }
     }
 
@@ -1113,7 +1135,7 @@ public sealed class SandboxShutdownProgramWiringTests
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new ProgramWiringSandbox("program-wiring-created"));
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
