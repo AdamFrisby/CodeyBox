@@ -23,8 +23,8 @@ namespace CodeyBox.Agents;
 /// <c>CodeyBox:PipelineTuning</c> hot-reload coordinator). Defaults to 2 — one
 /// retry covers the typical OOM / SIGPIPE / network-hiccup blip, the second
 /// exists so a single mid-resume blip does not collapse the work item. Quota
-/// gating is handled by the runner's provider-specific
-/// <see cref="IAgentQuotaFailureDetector"/> via <c>SessionResumeQuotaGate</c>.
+    /// gating is handled through the shared <see cref="IQuotaFailureClassifier"/>
+    /// via <c>SessionResumeQuotaGate</c>.
 /// </para>
 /// </summary>
 public static class SessionResumeOptions

@@ -74,14 +74,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual string? TryExtractSessionId(string? stdout) => null;
 
     /// <summary>
-    /// Provider-specific detector used to keep hard quota/rate failures out of
-    /// the CLI-native session resume path. Runners that opt into
-    /// <see cref="SupportsSessionResume"/> should return their normal
-    /// <see cref="IAgentQuotaFailureDetector"/> so structured-stream scoping,
-    /// reset-window parsing, and terminal non-quota crash hooks stay aligned
-    /// with the orchestrator quota path.
+    /// Shared quota classifier used to keep hard quota/rate failures and
+    /// terminal non-quota API crashes out of the CLI-native session resume path.
+    /// Runners that opt into <see cref="SupportsSessionResume"/> should receive
+    /// the same classifier the orchestrator uses for quota fallback so scoping,
+    /// reset-window parsing, and terminal crash handling cannot drift.
     /// </summary>
-    protected virtual IAgentQuotaFailureDetector? SessionResumeQuotaFailureDetector => null;
+    protected virtual IQuotaFailureClassifier? SessionResumeQuotaClassifier => null;
 
     /// <summary>
     /// Build the argv used to resume the in-flight CLI session identified by
@@ -232,7 +231,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
                 && SessionResumeQuotaGate.AllowsResume(
-                    SessionResumeQuotaFailureDetector,
+                    SessionResumeQuotaClassifier,
+                    Kind,
                     last.Stderr,
                     last.Stdout))
             {
@@ -305,7 +305,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 WorkingDirectory = "/",
             }, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (ObjectDisposedException)
         {
             return false;
         }

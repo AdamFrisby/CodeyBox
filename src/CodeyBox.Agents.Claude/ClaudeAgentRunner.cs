@@ -43,11 +43,11 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
     private readonly HttpClient _textOnlyHttp;
-    private readonly IAgentQuotaFailureDetector _sessionResumeQuotaDetector;
+    private readonly IQuotaFailureClassifier _sessionResumeQuotaClassifier;
 
-    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, quotaFailureDetectors: null) { }
+    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, quotaFailureClassifier: null) { }
 
-    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null, quotaFailureDetectors: null) { }
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null, quotaFailureClassifier: null) { }
 
     /// <summary>
     /// Primary constructor.
@@ -68,22 +68,21 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// (e.g. when the hot-reload infrastructure isn't wired) defaults to
     /// enabled — see <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
     /// </param>
-    /// <param name="quotaFailureDetectors">
-    /// Registered provider quota detectors. The runner selects the Claude
-    /// detector for session-resume quota gating so recovery policy stays aligned
-    /// with the orchestrator's detector wiring.
+    /// <param name="quotaFailureClassifier">
+    /// Shared quota classifier used for session-resume quota gating so recovery
+    /// policy stays aligned with the orchestrator's quota fallback handling.
     /// </param>
     public ClaudeAgentRunner(
         AgentDefaultsSnapshot? defaults,
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null,
-        IEnumerable<IAgentQuotaFailureDetector>? quotaFailureDetectors = null)
+        IQuotaFailureClassifier? quotaFailureClassifier = null)
         : this(
             defaults: defaults,
             rotationPusher: rotationPusher,
             sanitizerConfig: sanitizerConfig,
             textOnlyHttp: null,
-            quotaFailureDetectors: quotaFailureDetectors)
+            quotaFailureClassifier: quotaFailureClassifier)
     {
     }
 
@@ -98,14 +97,14 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
         HttpClient? textOnlyHttp,
-        IEnumerable<IAgentQuotaFailureDetector>? quotaFailureDetectors = null)
+        IQuotaFailureClassifier? quotaFailureClassifier = null)
     {
         _defaults = defaults;
         _rotationPusher = rotationPusher;
         _sanitizerConfig = sanitizerConfig;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
-        _sessionResumeQuotaDetector = quotaFailureDetectors?.FirstOrDefault(d => d.Kind == AgentKind.Claude)
-            ?? new ClaudeQuotaFailureDetector();
+        _sessionResumeQuotaClassifier = quotaFailureClassifier
+            ?? new CompositeQuotaFailureClassifier([new ClaudeQuotaFailureDetector()]);
     }
 
     public override AgentKind Kind => AgentKind.Claude;
@@ -239,10 +238,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     {
         using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
 
-        var shouldUseStructuredStream = captureStructuredStream || SessionResumeOptions.MaxResumeAttempts > 0;
-        var structuredStreamSupported = !shouldUseStructuredStream
+        var structuredStreamSupported = !captureStructuredStream
             || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
-        var effectiveUseStructuredStream = shouldUseStructuredStream && structuredStreamSupported;
+        var effectiveUseStructuredStream = captureStructuredStream && structuredStreamSupported;
 
         var result = await base.RunAsync(
             sandbox,
@@ -403,13 +401,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// resume retry path. After a transient crash whose stdout carried a
     /// session id, the loop rebuilds the next attempt via
     /// <see cref="BuildSessionResumeInvocation"/> instead of restarting the
-    /// run from scratch. The runner requests the minimal stream-json output
-    /// needed to capture that id when resume is enabled, independent of optional
-    /// AgentStreams persistence.
+    /// run from scratch. The caller-visible stdout format is preserved: session
+    /// ids are captured only from output modes the caller already requested or
+    /// from a CLI that emits an id in plain output.
     /// </summary>
     protected override bool SupportsSessionResume => true;
 
-    protected override IAgentQuotaFailureDetector? SessionResumeQuotaFailureDetector => _sessionResumeQuotaDetector;
+    protected override IQuotaFailureClassifier? SessionResumeQuotaClassifier => _sessionResumeQuotaClassifier;
 
     /// <summary>
     /// The Claude CLI prints a structured init event on its first stream-json

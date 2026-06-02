@@ -132,11 +132,13 @@ public sealed class AgentSessionResumeTests : IDisposable
     [InlineData("terminal")]
     [InlineData("scope")]
     [InlineData("detect")]
-    public void QuotaGate_DetectorExceptions_BlockResume(string throwAt)
+    public void QuotaGate_DetectorExceptions_AreNotSwallowed(string throwAt)
     {
         var detector = new ThrowingQuotaDetector(throwAt);
+        var classifier = new CompositeQuotaFailureClassifier([detector]);
 
-        Assert.False(SessionResumeQuotaGate.AllowsResume(detector, stderr: "stderr", stdout: "stdout"));
+        Assert.Throws<InvalidOperationException>(() =>
+            SessionResumeQuotaGate.AllowsResume(classifier, AgentKind.Claude, stderr: "stderr", stdout: "stdout"));
     }
 
     // ── Integration with ClaudeAgentRunner ────────────────────────────────────
@@ -190,10 +192,12 @@ public sealed class AgentSessionResumeTests : IDisposable
             e.Argv.Count > 0 && e.Argv[0] == "sh" && e.Argv.Contains("codeybox-resume-liveness"));
         Assert.Contains(".git", liveness.Argv[2], StringComparison.Ordinal);
         Assert.Contains("git -C", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Equal("/work", liveness.Argv[4]);
+        Assert.Equal("/", liveness.WorkingDirectory);
     }
 
     [Fact]
-    public async Task ClaudeRunner_CrashWithCapturedSessionId_RetriesWhenStreamCaptureNotRequested()
+    public async Task ClaudeRunner_PlainStdoutRun_DoesNotForceStreamJsonForResumeCapture()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
@@ -208,11 +212,15 @@ public sealed class AgentSessionResumeTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Equal(2, sandbox.ClaudeInvocations.Count);
-        AssertFlagValue(sandbox.ClaudeInvocations[0], "--output-format", "stream-json");
-        Assert.Contains("--verbose", sandbox.ClaudeInvocations[0]);
+        Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[0]);
+        Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[0]);
+        Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[0]);
         var resumeIdx = IndexOf(sandbox.ClaudeInvocations[1], "--resume");
-        Assert.True(resumeIdx >= 0, "production resume path must not depend on optional AgentStreams capture");
+        Assert.True(resumeIdx >= 0, "resume can use a session id already present in the caller-visible stdout");
         Assert.Equal(sessionId, sandbox.ClaudeInvocations[1][resumeIdx + 1]);
+        Assert.DoesNotContain("--output-format", sandbox.ClaudeInvocations[1]);
+        Assert.DoesNotContain("stream-json", sandbox.ClaudeInvocations[1]);
+        Assert.DoesNotContain("--verbose", sandbox.ClaudeInvocations[1]);
     }
 
     [Fact]
@@ -277,6 +285,27 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaudeRunner_UsesInjectedQuotaClassifierForResumeGate()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var classifier = new CompositeQuotaFailureClassifier([new InjectedClaudeQuotaDetector()]);
+        var runner = new ClaudeAgentRunner(
+            defaults: null,
+            rotationPusher: null,
+            sanitizerConfig: null,
+            quotaFailureClassifier: classifier);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: "custom injected quota"));
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
     public async Task ClaudeRunner_SoftRateLimitWithCapturedSessionId_RetriesWithResumeFlag()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
@@ -311,6 +340,24 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaudeRunner_TerminalNonQuotaFailure_DoesNotResumeBeforeSanitizerRetry()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1,
+                Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+                Stderr: "API Error: 400: `thinking` blocks in the latest assistant message cannot be modified.")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[1]);
+    }
+
+    [Fact]
     public async Task ClaudeRunner_MissingWorkdirBeforeResume_DoesNotLaunchResume()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
@@ -339,7 +386,7 @@ public sealed class AgentSessionResumeTests : IDisposable
                 Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
                 Stderr: "ECONNRESET"),
             exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
-                ? throw new InvalidOperationException("sandbox died")
+                ? throw new ObjectDisposedException("sandbox died")
                 : new SandboxExecResult(0, "", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
@@ -347,6 +394,25 @@ public sealed class AgentSessionResumeTests : IDisposable
 
         Assert.False(result.Success);
         Assert.Equal("agent exited 1", result.Summary);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_LivenessProbeUnexpectedFailure_Propagates()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(
+            _ => new SandboxExecResult(1,
+                Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+                Stderr: "ECONNRESET"),
+            exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
+                ? throw new InvalidOperationException("liveness implementation failed")
+                : new SandboxExecResult(0, "", ""));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new ClaudeAgentRunner().RunAsync(
+                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
+
         Assert.Single(sandbox.ClaudeInvocations);
     }
 
@@ -627,5 +693,15 @@ public sealed class AgentSessionResumeTests : IDisposable
 
         public QuotaDetection? Detect(string? stderr, string? stdout) =>
             throwAt == "detect" ? throw new InvalidOperationException("detect hook failed") : null;
+    }
+
+    private sealed class InjectedClaudeQuotaDetector : IAgentQuotaFailureDetector
+    {
+        public AgentKind Kind => AgentKind.Claude;
+
+        public QuotaDetection? Detect(string? stderr, string? stdout) =>
+            string.Concat(stderr, "\n", stdout).Contains("custom injected quota", StringComparison.OrdinalIgnoreCase)
+                ? new QuotaDetection(QuotaFailureKind.LimitReached)
+                : null;
     }
 }

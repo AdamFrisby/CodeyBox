@@ -117,7 +117,7 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("agent exited 1: …<truncated tail>")]
     public void IsAgentExited1Summary_AcceptsBaseAndEnrichedForms(string summary)
     {
-        Assert.True(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+        Assert.True(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));
     }
 
     [Theory]
@@ -129,7 +129,7 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("failed to materialise gemini auth: exit 1")]
     public void IsAgentExited1Summary_RejectsOtherShapes(string? summary)
     {
-        Assert.False(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+        Assert.False(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));
     }
 
     private sealed record AdvisoryCall(string? Stderr, string? Stdout, string Phase, string? SandboxName);

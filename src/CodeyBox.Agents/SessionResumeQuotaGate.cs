@@ -11,26 +11,22 @@ namespace CodeyBox.Agents;
 internal static class SessionResumeQuotaGate
 {
     public static bool AllowsResume(
-        IAgentQuotaFailureDetector? detector,
+        IQuotaFailureClassifier? classifier,
+        AgentKind agent,
         string? stderr,
         string? stdout)
     {
-        if (detector is null)
+        if (classifier is null)
             return true;
 
-        try
+        var classification = classifier.Classify(agent, stderr, stdout);
+        return classification.Kind switch
         {
-            if (detector.IsTerminalNonQuotaCrash(stderr, stdout))
-                return true;
-
-            var scopedStdout = detector.ScopeStdoutForQuotaDetection(stdout);
-            var detection = detector.Detect(stderr, scopedStdout);
-            return detection is null || IsTransientRateLimitWithoutReset(detection);
-        }
-        catch (Exception)
-        {
-            return false;
-        }
+            QuotaFailureClassificationKind.None => true,
+            QuotaFailureClassificationKind.TerminalNonQuota => false,
+            QuotaFailureClassificationKind.Quota => IsTransientRateLimitWithoutReset(classification.Detection!),
+            _ => false,
+        };
     }
 
     private static bool IsTransientRateLimitWithoutReset(QuotaDetection detection) =>
