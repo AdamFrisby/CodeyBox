@@ -22,12 +22,9 @@ namespace CodeyBox.Agents;
 /// Hot-reloadable via <see cref="SetMaxResumeAttempts"/> (called from the
 /// <c>CodeyBox:PipelineTuning</c> hot-reload coordinator). Defaults to 2 — one
 /// retry covers the typical OOM / SIGPIPE / network-hiccup blip, the second
-/// exists so a single mid-resume blip does not collapse the work item. Hard
-/// quota/auth failures are filtered out by <see cref="IsResumeEligible"/>
-/// so they defer via the quota path instead of consuming the resume budget.
-/// Soft 429/rate-limit blips may spend the bounded resume budget unless the
-/// output carries an explicit reset window. Deterministic work failures
-/// (<see cref="AgentFailureKind.Normal"/>) are not resume-eligible.
+/// exists so a single mid-resume blip does not collapse the work item. Quota
+/// gating is handled by the runner's provider-specific
+/// <see cref="IAgentQuotaFailureDetector"/> via <c>SessionResumeQuotaGate</c>.
 /// </para>
 /// </summary>
 public static class SessionResumeOptions
@@ -57,37 +54,5 @@ public static class SessionResumeOptions
         if (value < 0) value = 0;
         if (value > MaxAllowedResumeAttempts) value = MaxAllowedResumeAttempts;
         Volatile.Write(ref _maxResumeAttempts, value);
-    }
-
-    /// <summary>
-    /// Returns true when a failed run's <paramref name="classification"/> is
-    /// transient enough that re-running with <c>--resume</c> has a realistic
-    /// chance of completing. Hard quota / auth failures would immediately
-    /// re-fail on resume, so they defer / fall back per the normal quota path
-    /// instead of resume-hammering. Soft rate-limit classifications can resume
-    /// only when no reset window was parsed from the failure streams.
-    /// </summary>
-    public static bool IsResumeEligible(
-        AgentFailureClassification classification,
-        string? stderr = null,
-        string? stdout = null) =>
-        classification.Kind switch
-        {
-            AgentFailureKind.QuotaExhausted => IsSoftRateLimitWithoutReset(classification, stderr, stdout),
-            AgentFailureKind.TransientNetwork => true,
-            AgentFailureKind.Unknown => true,
-            _ => false,
-        };
-
-    private static bool IsSoftRateLimitWithoutReset(
-        AgentFailureClassification classification,
-        string? stderr,
-        string? stdout)
-    {
-        if (classification.QuotaFailure != AgentQuotaFailureKind.SoftRateLimit)
-            return false;
-        if (classification.QuotaResetAt is not null)
-            return false;
-        return QuotaResetParser.TryParseResetAt([stderr, stdout]) is null;
     }
 }

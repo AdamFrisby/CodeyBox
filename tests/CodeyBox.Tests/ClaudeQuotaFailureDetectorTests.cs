@@ -39,6 +39,15 @@ public sealed class ClaudeQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_UsageLimitSignal_ClassifiesLimitReached()
+    {
+        var detection = _detector.Detect(stderr: "usage_limit reached: weekly cap", stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.LimitReached, detection!.Kind);
+    }
+
+    [Fact]
     public void Detect_SuccessfulStreamJson_ReturnsNull()
     {
         var stdout = """

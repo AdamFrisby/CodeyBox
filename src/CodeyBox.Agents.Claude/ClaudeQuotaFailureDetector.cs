@@ -9,7 +9,7 @@ namespace CodeyBox.Agents.Claude;
 ///
 /// Sources scanned:
 /// <list type="bullet">
-///   <item>stderr / stdout text (e.g. <c>rate_limit_exceeded</c>).</item>
+///   <item>stderr / stdout text (e.g. <c>rate_limit_exceeded</c>, <c>usage_limit</c>).</item>
 ///   <item>Stream-json error events: <c>{"type":"result","is_error":true,"result":"..."}</c>
 ///         (with optional <c>subtype:"error"</c>).</item>
 ///   <item>Stream-json rate-limit events: <c>{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":...,"rateLimitType":"five_hour"|"seven_day"|"weekly"}}</c>.
@@ -61,6 +61,9 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
     private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
     [
         ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
+        ("usage_limit", QuotaFailureKind.LimitReached),
+        ("hit your usage limit", QuotaFailureKind.LimitReached),
+        ("hit your limit", QuotaFailureKind.LimitReached),
     ];
 
     /// <summary>

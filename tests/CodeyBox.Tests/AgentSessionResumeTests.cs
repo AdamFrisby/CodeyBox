@@ -64,67 +64,10 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","session_id":""}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
         Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":"not-a-uuid"}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","subtype":"init","session_id":123}"""));
     }
 
-    // ── Resume eligibility ────────────────────────────────────────────────────
-
-    [Fact]
-    public void IsResumeEligible_FalseForQuotaAndAuth()
-    {
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.QuotaExhausted)));
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(
-                AgentFailureKind.QuotaExhausted,
-                Reason: AgentFailureClassifier.HardQuotaReason)));
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.AuthError)));
-    }
-
-    [Fact]
-    public void IsResumeEligible_TrueForTransientUnknownAndSoftRateLimitWithoutReset()
-    {
-        Assert.True(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.TransientNetwork)));
-        Assert.True(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.Unknown)));
-        Assert.True(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(
-                AgentFailureKind.QuotaExhausted,
-                Reason: AgentFailureClassifier.SoftRateLimitReason,
-                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
-            stderr: "API Error: 429 rate_limit_exceeded"));
-    }
-
-    [Fact]
-    public void IsResumeEligible_FalseForNormalFailure()
-    {
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(AgentFailureKind.Normal)));
-    }
-
-    [Fact]
-    public void IsResumeEligible_FalseForSoftRateLimitWithResetWindow()
-    {
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(
-                AgentFailureKind.QuotaExhausted,
-                Reason: AgentFailureClassifier.SoftRateLimitReason,
-                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
-            stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
-    }
-
-    [Fact]
-    public void IsResumeEligible_FalseForSoftRateLimitWithClassificationResetAt()
-    {
-        Assert.False(SessionResumeOptions.IsResumeEligible(
-            new AgentFailureClassification(
-                AgentFailureKind.QuotaExhausted,
-                QuotaResetAt: DateTimeOffset.UtcNow.AddMinutes(15),
-                Reason: AgentFailureClassifier.SoftRateLimitReason,
-                QuotaFailure: AgentQuotaFailureKind.SoftRateLimit),
-            stderr: "API Error: 429 rate_limit_exceeded"));
-    }
+    // ── Resume configuration ─────────────────────────────────────────────────
 
     [Fact]
     public void SetMaxResumeAttempts_ClampsNegativeToZero()
@@ -229,6 +172,11 @@ public sealed class AgentSessionResumeTests : IDisposable
         var secondExec = sandbox.ClaudeExecs[1];
         Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, secondExec.Stdin);
         Assert.NotEqual("prompt", secondExec.Stdin);
+
+        var liveness = Assert.Single(sandbox.AllExecs, e =>
+            e.Argv.Count > 0 && e.Argv[0] == "sh" && e.Argv.Contains("codeybox-resume-liveness"));
+        Assert.Contains(".git", liveness.Argv[2], StringComparison.Ordinal);
+        Assert.Contains("git -C", liveness.Argv[2], StringComparison.Ordinal);
     }
 
     [Fact]
@@ -248,19 +196,23 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_NormalFailureWithCapturedSessionId_DoesNotResume()
+    public async Task ClaudeRunner_GenericCrashWithCapturedSessionId_RetriesWithResumeFlag()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
-        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
-            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-            Stderr: "test failures: 3/100 assertions failed"));
+        var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1,
+                Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                Stderr: "Killed")
+            : new SandboxExecResult(0, "ok", ""));
 
         var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
-        Assert.False(result.Success);
-        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
     }
 
     [Fact]
@@ -359,7 +311,7 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_SandboxDeathBeforeResume_BubblesOut()
+    public async Task ClaudeRunner_SandboxDeathBeforeResume_ReturnsFailedResultForRedrive()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(
@@ -370,11 +322,11 @@ public sealed class AgentSessionResumeTests : IDisposable
                 ? throw new InvalidOperationException("sandbox died")
                 : new SandboxExecResult(0, "", ""));
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new ClaudeAgentRunner().RunAsync(
-                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
-        Assert.Contains("sandbox died", ex.Message);
+        Assert.False(result.Success);
+        Assert.Equal("agent exited 1", result.Summary);
         Assert.Single(sandbox.ClaudeInvocations);
     }
 

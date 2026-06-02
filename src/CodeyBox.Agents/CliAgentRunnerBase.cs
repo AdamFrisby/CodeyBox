@@ -73,6 +73,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual string? TryExtractSessionId(string? stdout) => null;
 
     /// <summary>
+    /// Provider-specific detector used to keep hard quota/rate failures out of
+    /// the CLI-native session resume path. Runners that opt into
+    /// <see cref="SupportsSessionResume"/> should return their normal
+    /// <see cref="IAgentQuotaFailureDetector"/> so structured-stream scoping,
+    /// reset-window parsing, and terminal non-quota crash hooks stay aligned
+    /// with the orchestrator quota path.
+    /// </summary>
+    protected virtual IAgentQuotaFailureDetector? SessionResumeQuotaFailureDetector => null;
+
+    /// <summary>
     /// Build the argv used to resume the in-flight CLI session identified by
     /// <paramref name="sessionId"/> in the same sandbox after a transient
     /// crash. Default throws — only runners that opt into <see cref="SupportsSessionResume"/>
@@ -213,17 +223,17 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 capturedSessionId = freshId;
             }
 
-            var classification = ((IAgentRunner)this).ClassifyFailure(last);
-            var exitCode = ParseExitCodeFromSummary(last.Summary);
-
             // Prefer a CLI-native session resume when this runner opted in,
-            // a session id was captured, and the failure shape is eligible
-            // for in-place continuation. Hard quota/auth failures are filtered
-            // out by SessionResumeOptions; soft rate-limit blips may spend the
-            // bounded resume budget.
+            // a session id was captured, and the provider quota detector did
+            // not identify a hard quota/rate failure. Generic CLI crashes are
+            // resumable; quota/rate/reset parsing remains in the provider
+            // detector stack rather than the shared runner.
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
-                && SessionResumeOptions.IsResumeEligible(classification, last.Stderr, last.Stdout))
+                && SessionResumeQuotaGate.AllowsResume(
+                    SessionResumeQuotaFailureDetector,
+                    last.Stderr,
+                    last.Stdout))
             {
                 var maxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
                 if (resumeAttempts < maxResumeAttempts)
@@ -246,6 +256,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                     return last;
             }
 
+            var classification = ((IAgentRunner)this).ClassifyFailure(last);
+            var exitCode = ParseExitCodeFromSummary(last.Summary);
+
             if (attempt >= AgentSuspendResilience.MaxRetries)
                 return last;
             if (!AgentSuspendResilience.ShouldRetry(Kind, classification, exitCode))
@@ -266,18 +279,35 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         CancellationToken ct)
     {
-        var result = await sandbox.ExecAsync(new SandboxExec
+        SandboxExecResult result;
+        try
         {
-            Argv =
-            [
-                "sh",
-                "-c",
-                "target=$1; [ -n \"$target\" ] && [ -d \"$target\" ] && [ -x \"$target\" ] && [ -w \"$target\" ]",
-                "codeybox-resume-liveness",
-                workingDirectory,
-            ],
-            WorkingDirectory = "/",
-        }, ct).ConfigureAwait(false);
+            result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    """
+                    target=$1
+                    [ -n "$target" ] || exit 1
+                    [ -d "$target" ] || exit 1
+                    [ -x "$target" ] || exit 1
+                    [ -w "$target" ] || exit 1
+                    [ -e "$target/.git" ] || exit 1
+                    git -C "$target" rev-parse --git-dir >/dev/null 2>&1 || exit 1
+                    git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+                    """,
+                    "codeybox-resume-liveness",
+                    workingDirectory,
+                ],
+                WorkingDirectory = "/",
+            }, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
 
         return result.Success;
     }

@@ -43,6 +43,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
     private readonly HttpClient _textOnlyHttp;
+    private static readonly ClaudeQuotaFailureDetector SessionResumeQuotaDetector = new();
 
     public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null) { }
 
@@ -394,6 +395,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// the legacy retry path.
     /// </summary>
     protected override bool SupportsSessionResume => true;
+
+    protected override IAgentQuotaFailureDetector? SessionResumeQuotaFailureDetector => SessionResumeQuotaDetector;
 
     /// <summary>
     /// The Claude CLI prints a structured init event on its first stream-json
