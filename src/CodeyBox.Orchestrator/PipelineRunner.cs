@@ -4041,12 +4041,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Walks the routed class chain looking for the first audit-capable member
-    /// that is registered, credentialed, available (smoke gate), and quota OK.
-    /// Used when the operator gave no explicit audit preference AND the work
-    /// agent itself is not tagged audit-capable — falling back to the work
-    /// agent would breach the AC ("a non-audit-capable agent must NEVER be
-    /// selected for auditing"). Returns null when no audit-capable candidate
-    /// is available; the caller then skips the auditor for this iteration.
+    /// that is registered, credentialed, and quota OK. Smoke availability is
+    /// handled upstream by <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>,
+    /// which only yields members that pass the work-phase availability gates;
+    /// this method does not re-run the smoke probe. Used when the operator gave
+    /// no explicit audit preference AND the work agent itself is not tagged
+    /// audit-capable — falling back to the work agent would breach the AC
+    /// ("a non-audit-capable agent must NEVER be selected for auditing").
+    /// Returns null when no audit-capable candidate is available; the caller
+    /// then skips the auditor for this iteration.
     /// </summary>
     private async Task<IAgentRunner?> SelectFromAuditCapablePoolAsync(
         WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)

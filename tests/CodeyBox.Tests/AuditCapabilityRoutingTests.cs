@@ -57,7 +57,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             ],
             quotas: new()
             {
-                [AgentKind.Codex]  = 1.0,    // exhausted
+                [AgentKind.Codex] = 1.0,    // exhausted
                 [AgentKind.Claude] = 80.0,   // healthy
                 [AgentKind.Gemini] = 80.0,   // healthy but not audit-capable
             },
@@ -92,7 +92,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             ],
             quotas: new()
             {
-                [AgentKind.Codex]  = 1.0,    // exhausted
+                [AgentKind.Codex] = 1.0,    // exhausted
                 [AgentKind.Claude] = 2.0,    // exhausted
                 [AgentKind.Gemini] = 80.0,   // healthy — but excluded from audit pool
             },
@@ -126,7 +126,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             ],
             quotas: new()
             {
-                [AgentKind.Codex]  = 80.0,
+                [AgentKind.Codex] = 80.0,
                 [AgentKind.Claude] = 80.0,
             },
             preferredAuditAgent: AgentKind.Codex);
@@ -160,7 +160,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             ],
             quotas: new()
             {
-                [AgentKind.Codex]  = 80.0,
+                [AgentKind.Codex] = 80.0,
                 [AgentKind.Claude] = 80.0,
                 [AgentKind.Gemini] = 80.0,
             },
@@ -201,7 +201,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             {
                 [AgentKind.Gemini] = 80.0,
                 [AgentKind.Claude] = 80.0,
-                [AgentKind.Codex]  = 80.0,
+                [AgentKind.Codex] = 80.0,
             },
             preferredAuditAgent: null,
             defaultAgent: AgentKind.Gemini);
@@ -235,7 +235,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             ],
             quotas: new()
             {
-                [AgentKind.Codex]  = 80.0,
+                [AgentKind.Codex] = 80.0,
                 [AgentKind.Gemini] = 80.0,
             },
             preferredAuditAgent: AgentKind.Gemini);
