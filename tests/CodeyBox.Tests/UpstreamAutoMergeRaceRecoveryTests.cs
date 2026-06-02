@@ -202,18 +202,18 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
         // The race-recovery cap fires inside the loop when AutoMergeRaceRecoveryMaxAttempts
-        // is exhausted, parking with the "main is being hammered" message.
+        // is exhausted (raceRecoveryCount reaches the cap), parking with the
+        // "main is being hammered" message.
         Assert.Contains("baseBranch likely being mutated by another writer", final.LastError);
         // CompleteAsync is called once per attempt up to the point the cap fires.
-        // With raceRecoveryMax=1: attempt 1 races+recovers (success), attempt 2
-        // races+recovers then hits cap → parks → break. So CompleteCalls = 2.
-        Assert.Equal(raceRecoveryMax + 1, remote.CompleteCalls);
+        // With raceRecoveryMax=1: attempt 1 races, recovers, count becomes 1,
+        // 1>=1 fires the cap → parks → break. So CompleteCalls = 1.
+        Assert.Equal(raceRecoveryMax, remote.CompleteCalls);
         // FetchBaseBranchAsync: pre-merge canonical-base refresh (1) + one per
-        // race-recovery iteration attempted (2 in this case, since attempt 3
-        // never starts after cap fires at attempt 2).
-        Assert.Equal(raceRecoveryMax + 2, remote.FetchCalls);
+        // race-recovery iteration (1, since cap fires after the first recovery).
+        Assert.Equal(raceRecoveryMax + 1, remote.FetchCalls);
         // UpstreamPushAttempts reflects the attempt number when cap fired.
-        Assert.Equal(raceRecoveryMax + 1, final.UpstreamPushAttempts);
+        Assert.Equal(raceRecoveryMax, final.UpstreamPushAttempts);
     }
 
     [Fact]
@@ -459,10 +459,10 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         // Simulate hot-reload: bump the cap mid-flight (or, in test terms,
         // assert that the cap was respected, not the UpstreamPushMaxAttempts).
         // With raceRecoveryCap=1 and UpstreamPushMaxAttempts=5, the loop
-        // should park after 2 recovery iterations (raceRecoveryCount exceeds
-        // 1), not after 5 total attempts. CompleteCalls=2 confirms the
+        // should park after 1 recovery iteration (raceRecoveryCount reaches
+        // the cap), not after 5 total attempts. CompleteCalls=1 confirms the
         // hot-reloadable cap took precedence.
-        Assert.Equal(2, remote.CompleteCalls);
+        Assert.Equal(1, remote.CompleteCalls);
     }
 
     [Fact]

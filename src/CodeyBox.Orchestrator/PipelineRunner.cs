@@ -6080,7 +6080,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         // Race recovery succeeded — update local state.
                         raceRecoveryCount++;
                         var maxRaceRecovery = _pipelineTuning.Current.AutoMergeRaceRecoveryMaxAttempts;
-                        if (raceRecoveryCount > maxRaceRecovery)
+                        if (raceRecoveryCount >= maxRaceRecovery)
                         {
                             _log.LogWarning(
                                 "Work item {Id} auto-merge race recovery cap ({Cap}) exhausted after {Count} recoveries; baseBranch likely being mutated by another writer",
@@ -6244,13 +6244,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 NewAgentStdout: null);
         }
 
-        // Step 1: capture the upstream base sha at merge time. We can't read
-        // the current local base ref because the local merge phase already
-        // advanced it to mergeSha (the merge commit). The merge commit's first
-        // parent IS the upstream base sha we just merged against — so we
-        // compare that against the post-fetch upstream tip to decide whether
-        // upstream actually moved (real race) or didn't (likely branch
-        // protection / a different conflict we can't fix by re-merging).
+        // Step 1: capture the upstream base sha at merge time for diagnostic
+        // logging. We can't read the current local base ref because the local
+        // merge phase already advanced it to mergeSha (the merge commit). The
+        // merge commit's first parent IS the upstream base sha we just merged
+        // against — we compare that against the post-fetch upstream tip for
+        // informational purposes (logged in Step 3). The comparison no longer
+        // gates retry; we always re-run the merge phase after refetching.
         string? preMergeBaseSha = null;
         var currentItem = await _store.GetAsync(item.Id, ct) ?? item;
         var localMergeSha = currentItem.MergeSha;
@@ -6279,11 +6279,8 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _log.LogWarning(ex, "Auto-merge race recovery: could not resolve local base sha before refetch");
-                return new AutoMergeRaceRecovery(
-                    ParkReason: $"could not inspect local base branch '{baseBranch}' before refetch: {ex.Message}",
-                    NewMergeSha: string.Empty,
-                    NewAgentStdout: null);
+                _log.LogWarning(ex, "Auto-merge race recovery: could not resolve local base sha before refetch; proceeding anyway");
+                preMergeBaseSha = null;
             }
         }
 
@@ -6333,12 +6330,6 @@ public sealed class PipelineRunner : IPipelineRunner
                     "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
                     attempt, baseBranch, preMergeBaseSha, postFetchBaseSha);
             }
-        }
-        else
-        {
-            _log.LogInformation(
-                "Auto-merge race recovery (attempt {Attempt}): could not determine pre-race base sha; re-running merge phase blindly",
-                attempt);
         }
 
         // Step 4: re-run the merge phase against the freshly-fetched base. The
