@@ -1,6 +1,4 @@
-using CodeyBox.Core;
-
-namespace CodeyBox.Agents;
+namespace CodeyBox.Core;
 
 /// <summary>
 /// Raised when a runner used every configured CLI-native session-resume attempt

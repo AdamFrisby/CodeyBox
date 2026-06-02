@@ -8,12 +8,12 @@ namespace CodeyBox.Agents;
 ///
 /// <para>
 /// Hard quota exhaustion (account caps, RESOURCE_EXHAUSTED, "usage limit
-/// reached") and deterministic terminal API crashes (e.g. Claude 400
-/// thinking-block modification) block resume — a same-session relaunch would
-/// immediately re-fail. Soft rate-limit shapes (429 rate_limit_exceeded, 529
-/// overloaded) are <em>transient</em> blips per the original task spec; resume
-/// is the intended recovery path for those, paired with the bounded resume
-/// budget in <see cref="SessionResumeOptions"/>.
+/// reached"), provider rate limits with a parsed reset/retry window, and
+/// deterministic terminal API crashes (e.g. Claude 400 thinking-block
+/// modification) block resume because a same-session relaunch would
+/// immediately re-fail. Rate-limit/overload shapes with no reset window are
+/// treated as transient blips and may resume within the bounded budget in
+/// <see cref="SessionResumeOptions"/>.
 /// </para>
 /// </summary>
 internal static class SessionResumeQuotaGate
@@ -33,11 +33,11 @@ internal static class SessionResumeQuotaGate
             QuotaFailureClassificationKind.None => true,
             QuotaFailureClassificationKind.TerminalNonQuota => false,
             QuotaFailureClassificationKind.Quota =>
-                // Soft rate-limit / overload responses (HTTP 429, 529) are the
-                // transient blips the resume path was designed to recover. Hard
-                // quota exhaustion (LimitReached, Unauthorized) would re-fail
-                // immediately, so block those.
-                classification.Detection?.Kind == QuotaFailureKind.RateLimitExceeded,
+                // Rate-limit / overload responses (HTTP 429, 529) are resumable
+                // only when the provider did not give a retry/reset window. A
+                // parsed window means the normal quota defer/fallback path should
+                // handle the failure instead of relaunching the same session.
+                classification.Detection is { Kind: QuotaFailureKind.RateLimitExceeded, ResetAt: null },
             _ => false,
         };
     }

@@ -231,6 +231,47 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         Assert.False(Directory.Exists(streamStore.Options.Path));
     }
 
+    [Fact]
+    public async Task PipelineRunner_WhenAgentStreamsDisabled_ResumableRunnerStillForcesStructuredCapture()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Enabled = false, Path = Path.Combine(_workspace, "streams-disabled-marker") },
+            NullLogger<AgentStreamStore>.Instance);
+        var auditor = new CaptureRecordingLlmAuditor();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            agentStreams: streamStore,
+            cliSessionResumableAgent: true);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("streamed.txt", "work\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("streamed.txt", "rework\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "marker capture integration",
+            Prompt = "write and revise a file",
+            WorkBranch = "feature/marker-capture",
+            State = WorkItemState.Queued,
+            WorkTimeout = TimeSpan.FromMinutes(5),
+            MergeTimeout = TimeSpan.FromMinutes(5),
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([true, true, true], tp.Agent.CaptureStructuredStreamCalls);
+        Assert.Equal([true, true], auditor.CaptureStructuredStreamCalls);
+        Assert.Equal(0, tp.Agent.StructuredStreamSupportProbeCount);
+        Assert.False(Directory.Exists(streamStore.Options.Path));
+    }
+
     private sealed class StreamingLlmAuditor : IAuditor
     {
         private readonly bool _failFirstIteration;
@@ -261,6 +302,37 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
             }
 
             return Task.FromResult(new AuditResult(true, [], RawOutput: $"audit {Name} passed"));
+        }
+    }
+
+    private sealed class CaptureRecordingLlmAuditor : IAuditor
+    {
+        private int _calls;
+
+        public string Name => "capture-recording";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public List<bool> CaptureStructuredStreamCalls { get; } = new();
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            CaptureStructuredStreamCalls.Add(context.CaptureStructuredStream);
+            _calls++;
+            if (_calls == 1)
+            {
+                return Task.FromResult(new AuditResult(false, [
+                    new AuditFinding(Name, AuditSeverity.Error, "needs rework", "first pass fails"),
+                ]));
+            }
+
+            return Task.FromResult(new AuditResult(true, []));
         }
     }
 

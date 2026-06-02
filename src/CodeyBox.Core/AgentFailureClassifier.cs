@@ -38,11 +38,10 @@ public static class AgentFailureClassifier
 
     /// <summary>
     /// Short-window rate / overload shapes. Classify as quota for the
-    /// orchestrator fallback chain; the in-VM CLI session resume gate currently
-    /// treats every quota classification as blocking via
-    /// <c>SessionResumeQuotaGate</c>, so soft vs hard is recorded on
-    /// <see cref="AgentFailureClassification.QuotaFailure"/> for diagnostics
-    /// but does not change resume policy today.
+    /// orchestrator fallback chain; the in-VM CLI session resume gate may still
+    /// resume provider-confirmed rate-limit blips that have no parsed reset
+    /// window, while reset-window-bearing failures follow the normal
+    /// quota defer/fallback path.
     /// </summary>
     public static readonly IReadOnlyList<string> SoftRateLimitPatterns = new[]
     {

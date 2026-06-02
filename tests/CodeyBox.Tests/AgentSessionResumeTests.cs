@@ -13,6 +13,7 @@ namespace CodeyBox.Tests;
 /// <c>--resume &lt;session-id&gt;</c> in the SAME sandbox — instead of failing
 /// the whole work item and re-driving from scratch.
 /// </summary>
+[Collection("Session resume options")]
 public sealed class AgentSessionResumeTests : IDisposable
 {
     // Only the session-resume static is mutated here — leaving
@@ -346,21 +347,21 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_SoftRateLimitPersistent_BoundsRetriesAndThrowsExhausted()
+    public async Task ClaudeRunner_RateLimitWithResetWindow_DoesNotResumeHammer()
     {
-        // Soft 429s consume the resume budget; once exhausted, surface the
-        // dedicated exception so the orchestrator's class-fallback chain
-        // engages instead of resume-hammering forever.
+        // A 429 with an explicit retry/reset window is a quota deferral, not a
+        // transient blip. The normal quota path must handle it instead of
+        // relaunching the same CLI session until the resume budget is gone.
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
             Stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
 
-        await Assert.ThrowsAsync<AgentSessionResumeExhaustedException>(() =>
-            ClaudeRunnerWithQuotaClassifier().RunAsync(
-                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
-        // initial call + MaxResumeAttempts resumes
-        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
+        var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
     }
 
     [Fact]
@@ -738,4 +739,9 @@ public sealed class AgentSessionResumeTests : IDisposable
                 ? new QuotaDetection(QuotaFailureKind.LimitReached)
                 : null;
     }
+}
+
+[CollectionDefinition("Session resume options", DisableParallelization = true)]
+public sealed class SessionResumeOptionsCollection
+{
 }

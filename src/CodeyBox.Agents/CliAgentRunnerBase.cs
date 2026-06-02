@@ -296,9 +296,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// <item><see cref="AgentFailureKind.AuthError"/> — revoked/expired credentials
     /// would re-fail the same way on resume; the orchestrator's auth recovery
     /// path is the right escalation, not a same-session relaunch.</item>
-    /// <item>Hard quota exhaustion (account caps, RESOURCE_EXHAUSTED) — handled
-    /// upstream by <see cref="SessionResumeQuotaGate"/> which blocks these even
-    /// when this method allows the QuotaExhausted classification through.</item>
+    /// <item>Hard quota exhaustion (account caps, RESOURCE_EXHAUSTED), and
+    /// rate limits with parsed reset windows — handled upstream by
+    /// <see cref="SessionResumeQuotaGate"/> which blocks these even when this
+    /// method allows the QuotaExhausted classification through.</item>
     /// <item>Terminal non-quota API crashes (e.g. Claude 400 thinking-block) —
     /// also blocked by the gate via the provider detector.</item>
     /// </list>
