@@ -106,8 +106,10 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
     private readonly IStartupSandboxResumeCompletionSink _barrier;
+    private readonly object _startupModeGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
+    private SandboxStartupResumeMode? _startupMode;
     private int _resumeStarted;
 
     public SandboxResumeOnStartupService(
@@ -154,8 +156,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     public Task StartAsync(CancellationToken ct)
     {
-        var options = CurrentOptions();
-        if (options.Mode != SandboxStartupResumeMode.Background)
+        var mode = CaptureStartupMode();
+        if (mode != SandboxStartupResumeMode.Background)
             return Task.CompletedTask;
 
         return StartResumeOnceAsync(background: true, ct);
@@ -178,8 +180,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
     public Task StartingAsync(CancellationToken ct)
     {
-        var options = CurrentOptions();
-        if (options.Mode != SandboxStartupResumeMode.Blocking)
+        var mode = CaptureStartupMode();
+        if (mode != SandboxStartupResumeMode.Blocking)
             return Task.CompletedTask;
 
         return StartResumeOnceAsync(background: false, ct);
@@ -207,6 +209,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         _resumeTask = ResumeAllAndSignalAsync(ct);
         return _resumeTask;
+    }
+
+    private SandboxStartupResumeMode CaptureStartupMode()
+    {
+        lock (_startupModeGate)
+        {
+            _startupMode ??= CurrentOptions().Mode;
+            return _startupMode.Value;
+        }
     }
 
     private async Task ResumeAllAndSignalAsync(CancellationToken ct)

@@ -32,9 +32,9 @@ namespace CodeyBox.Tests;
 ///   BEFORE per-VM teardown, so no new sandboxes race the snapshot;</item>
 ///   <item>operator-tunable <see cref="SandboxTeardownMode"/> picks between
 ///   Suspend (legacy), Stop (multipass stop, lock-safe), Dispose (purge);</item>
-    ///   <item>startup reconciler runs in the background and tries to recover
-    ///   orphaned suspend-lifecycle VMs (stop, then purge) without blocking the
-    ///   API listener.</item>
+///   <item>startup reconciler runs in the background and tries to recover
+///   orphaned suspend-lifecycle VMs (stop, then purge) without blocking the
+///   API listener.</item>
 /// </list>
 /// </summary>
 public sealed class SandboxShutdownOrderingTests : IDisposable

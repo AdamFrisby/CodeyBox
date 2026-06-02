@@ -41,6 +41,25 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
 
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        await WaitUntilAsync(() => Task.FromResult(condition()));
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(1);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+                return;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.True(await condition(), "condition was not met before the timeout elapsed");
+    }
+
     // ── Schema round-trip ────────────────────────────────────────────────────
 
     [Fact]
@@ -551,6 +570,40 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_ModeReloadBetweenLifecycleCallbacks_StillStartsBackgroundSweep()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-mode-race",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider();
+        var barrier = new StartupSandboxResumeBarrier();
+        var options = new SandboxStartupResumeOptions
+        {
+            Mode = SandboxStartupResumeMode.Background,
+            ResumeTimeout = TimeSpan.FromMilliseconds(50),
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            () => options,
+            barrier);
+
+        await svc.StartingAsync(CancellationToken.None);
+        options = options with { Mode = SandboxStartupResumeMode.Blocking };
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Contains("vm-mode-race", provider.ResumedNames);
+    }
+
+    [Fact]
     public async Task StartupResume_CancellationObservingTimeout_MarksFailedInsteadOfHostCancellation()
     {
         var item = MakeItem(WorkItemState.Working);
@@ -574,6 +627,59 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedVmName);
         Assert.True(provider.ResumeCancellationObserved);
         Assert.Contains("timed out", after.LastError);
+    }
+
+    [Fact]
+    public async Task StartupResume_ReloadedOptions_AreReadForLaterResumeAndAdoption()
+    {
+        var hung = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(hung with
+        {
+            SuspendedVmName = "vm-hot-timeout",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+        var adopted = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(adopted with
+        {
+            SuspendedVmName = "vm-hot-adoption",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/hot.log",
+        });
+
+        var options = new SandboxStartupResumeOptions
+        {
+            Mode = SandboxStartupResumeMode.Background,
+            MaxParallelResumes = 1,
+            ResumeTimeout = TimeSpan.FromSeconds(30),
+            AdoptionDeadline = TimeSpan.FromMinutes(30),
+        };
+        var provider = new FakeSuspendingProvider
+        {
+            ResumeNamesToHang = new HashSet<string>(StringComparer.Ordinal) { "vm-hot-timeout" },
+            AdoptionExitCodeToReturn = 0,
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            () => options);
+
+        var hotDeadline = TimeSpan.FromSeconds(7);
+        options = options with
+        {
+            ResumeTimeout = TimeSpan.FromMilliseconds(50),
+            AdoptionDeadline = hotDeadline,
+        };
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+
+        var timedOut = await _store.GetAsync(hung.Id);
+        Assert.Equal(WorkItemState.Failed, timedOut!.State);
+        Assert.Contains("timed out", timedOut.LastError);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-hot-adoption", adoption.VmName);
+        Assert.Equal(hotDeadline, adoption.Deadline);
     }
 
     [Fact]
@@ -636,6 +742,22 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // bookkeeping was inherited from a different configuration.
         var after = await _store.GetAsync(item.Id);
         Assert.Equal("vm-old", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundSweepException_CompletesBarrier()
+    {
+        var barrier = new StartupSandboxResumeBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            new FakeSuspendingProvider(),
+            new StubWorkItemStore(),
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -1031,6 +1153,91 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", afterSweep.PreemptCheckpoint);
     }
 
+    [Fact]
+    public async Task DeadWorkerReaper_PeriodicSweep_WaitsForSlowStartupAdoption()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-slow-adopt",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/slow.log",
+        });
+
+        using var registry = new SqliteWorkerRegistry(_dbPath);
+        await registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "stale-worker",
+            HostName = "host",
+            ProcessId = 123,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            LastHeartbeatAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var barrier = new StartupSandboxResumeBarrier();
+        var queue = new InMemoryTaskQueue();
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionResultSource = new TaskCompletionSource<int?>(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var resume = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier: barrier);
+        var reaper = new DeadWorkerReaper(
+            registry,
+            _store,
+            queue,
+            new DeadWorkerOptions
+            {
+                HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+                DeadWorkerThreshold = TimeSpan.FromMilliseconds(20),
+                CheckInterval = TimeSpan.FromMilliseconds(20),
+                MaxRecoveryAttempts = 2,
+            },
+            NullLogger<DeadWorkerReaper>.Instance,
+            new NullWebhookDispatcher(),
+            startupResumeBarrier: barrier);
+
+        await reaper.StartAsync(CancellationToken.None);
+        try
+        {
+            await resume.StartAsync(CancellationToken.None);
+            await WaitUntilAsync(() => provider.AdoptionCalls.Count == 1);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(120));
+            var duringAdoption = await _store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, duringAdoption!.State);
+            Assert.Equal("vm-slow-adopt", duringAdoption.SuspendedVmName);
+            Assert.Null(duringAdoption.PreemptCheckpoint);
+            Assert.Equal(0, queue.Count);
+            Assert.Single(await registry.ListAsync(CancellationToken.None));
+
+            provider.AdoptionResultSource!.SetResult(0);
+            await barrier.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+            await WaitUntilAsync(async () =>
+            {
+                var after = await _store.GetAsync(item.Id);
+                return queue.Count == 1
+                    && after?.PreemptCheckpoint == $"refs/heads/codeybox/preempt/{item.Id}"
+                    && after.StartedAt is null;
+            });
+
+            var recovered = await _store.GetAsync(item.Id);
+            Assert.NotEqual(WorkItemState.Failed, recovered!.State);
+            Assert.Null(recovered.SuspendedVmName);
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await reaper.StopAsync(stopCts.Token);
+            await resume.StopAsync(CancellationToken.None);
+        }
+    }
+
     // ── Leak reaper integration ──────────────────────────────────────────────
 
     [Fact]
@@ -1406,9 +1613,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
         public bool ResumeHangs { get; set; }
+        public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
         public bool ResumeObservesCancellation { get; set; }
         public bool ResumeCancellationObserved { get; private set; }
         public int? AdoptionExitCodeToReturn { get; set; }
+        public TaskCompletionSource<int?>? AdoptionResultSource { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
 
@@ -1432,7 +1641,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         {
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
-            if (ResumeHangs)
+            if (ResumeHangs || ResumeNamesToHang.Contains(name))
                 return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             if (ResumeObservesCancellation)
             {
@@ -1452,6 +1661,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             CancellationToken ct)
         {
             _adoptionCalls.Enqueue(new AdoptionCall(vmName, agentLogPath, deadline));
+            if (AdoptionResultSource is not null)
+                return AdoptionResultSource.Task;
             return Task.FromResult(AdoptionExitCodeToReturn);
         }
 

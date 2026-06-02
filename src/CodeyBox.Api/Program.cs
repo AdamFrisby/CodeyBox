@@ -1642,7 +1642,8 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         sp.GetRequiredService<ITaskQueue>(),
         () => monitor.CurrentValue.DeadWorker,
         sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
-        sp.GetRequiredService<IWebhookDispatcher>());
+        sp.GetRequiredService<IWebhookDispatcher>(),
+        startupResumeBarrier: sp.GetRequiredService<IStartupSandboxResumeBarrier>());
 });
 
 // --- Worker progress watchdog -----------------------------------------------
