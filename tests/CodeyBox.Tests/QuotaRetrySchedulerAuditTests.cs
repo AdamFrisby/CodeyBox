@@ -196,6 +196,36 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task TargetedTimer_RequeuesWaitingForQuotaResetItemAfterStartupRearm()
+    {
+        var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
+        var probe = new MutableQuotaProbe(availablePct: 0);
+        using var fixture = BuildScheduler(BuildRouter(probe), BuildProjects(), timeProvider: time);
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            NextQuotaRetryAt = time.Now.AddMinutes(5),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var stillParked = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+        Assert.Equal(0, stillParked.QuotaRetryAttempts);
+        var timer = Assert.Single(time.Timers);
+
+        probe.AvailablePct = 100;
+        timer.Fire();
+
+        var evt = await WaitForQuotaAttemptAsync(item, "targeted", "retried");
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
+        Assert.Equal("from=work", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public async Task PeriodicSweep_WebhookFailureDoesNotOverrideRetryAudit()
     {
         using var fixture = BuildScheduler(
@@ -383,7 +413,19 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
     }
 
+    private sealed class MutableQuotaProbe : IAgentQuotaProbe
+    {
+        public MutableQuotaProbe(double availablePct) => AvailablePct = availablePct;
+        public AgentKind Kind => AgentKind.Claude;
+        public double AvailablePct { get; set; }
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = AvailablePct });
+    }
+
     private static AgentClassRouter BuildRouter(double availablePct, int memberQualityScore = 100)
+        => BuildRouter(new StaticQuotaProbe(availablePct), memberQualityScore);
+
+    private static AgentClassRouter BuildRouter(IAgentQuotaProbe probe, int memberQualityScore = 100)
         => new(
             [
                 new AgentClass
@@ -401,7 +443,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
                     ],
                 },
             ],
-            [new StaticQuotaProbe(availablePct)],
+            [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance);
 
