@@ -141,11 +141,13 @@ public interface IWorkItemStore
     /// <summary>
     /// Returns dispatch-eligible items (Queued plus the mid-pipeline resumable states
     /// produced by recovery: Working with a preempt checkpoint, WorkComplete,
-    /// AuditPassed, Merged, etc.) ordered by <c>priority DESC, created_at ASC</c>,
-    /// skipping any IDs in <paramref name="skipIds"/> (active or deferred work the
-    /// caller is tracking). The dispatch loop streams this enumerator until it finds
-    /// an item whose dependencies are satisfied, so it stops reading early in the
-    /// common case. Terminal states and <c>NeedsOperatorInput</c> are excluded.
+    /// AuditPassed, Merged, etc.) ordered with post-audit finishing phases before
+    /// fresh queued work, then by <c>priority DESC, created_at ASC</c> within each
+    /// phase bucket. Skips any IDs in <paramref name="skipIds"/> (active or deferred
+    /// work the caller is tracking). Implementations may buffer candidates to hydrate
+    /// related data before yielding; callers must not rely on partial reads avoiding
+    /// the cost of finding the eligible set. Terminal states plus parked
+    /// <c>NeedsOperatorInput</c> and <c>WaitingForQuotaReset</c> rows are excluded.
     /// </summary>
     IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
 

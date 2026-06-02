@@ -730,10 +730,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         var rows = new List<WorkItem>();
         using (var cmd = _conn.CreateCommand())
         {
-            // Exclude terminal states and parked NeedsOperatorInput. The remaining set
-            // mirrors what the FIFO dispatcher used to process via the channel:
-            // Queued plus the mid-pipeline resumable states (Working, WorkComplete,
-            // Auditing, Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+            // Exclude terminal states and parked states. The remaining set mirrors
+            // what the FIFO dispatcher used to process via the channel: Queued plus
+            // the mid-pipeline resumable states (Working, WorkComplete, Auditing,
+            // Reworking, AuditPassed, Merging, Merged, UpstreamPushing).
+            //
+            // Post-audit finishing phases get a phase-precedence bucket ahead of
+            // fresh Queued work regardless of item priority. These items have already
+            // spent agent/audit time and only need merge/push completion to drain,
+            // so they must not sit behind a high-priority starting backlog.
             cmd.CommandText = $"""
                 SELECT * FROM work_items
                 WHERE state NOT IN (
@@ -743,9 +748,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     {(int)WorkItemState.AuditFailed},
                     {(int)WorkItemState.MergeConflictResolutionFailed},
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                    {(int)WorkItemState.NeedsOperatorInput}
+                    {(int)WorkItemState.NeedsOperatorInput},
+                    {(int)WorkItemState.WaitingForQuotaReset}
                 )
-                ORDER BY priority DESC, created_at ASC;
+                ORDER BY
+                    CASE
+                        WHEN state IN (
+                            {(int)WorkItemState.AuditPassed},
+                            {(int)WorkItemState.Merging},
+                            {(int)WorkItemState.Merged},
+                            {(int)WorkItemState.UpstreamPushing}
+                        ) THEN 0
+                        ELSE 1
+                    END ASC,
+                    priority DESC,
+                    created_at ASC;
                 """;
             using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))

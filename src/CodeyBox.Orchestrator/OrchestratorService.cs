@@ -198,7 +198,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _releaseService = releaseService;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _progressClock = progressClock ?? new OrchestratorProgressClock();
-        _reaper?.AttachWorkerPoolSlotReaser(this);
+        _reaper?.AttachWorkerPoolSlotReleaser(this);
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
         // Prefer the shared snapshot when DI provides one (production path —
@@ -660,20 +660,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <summary>
-    /// Streams dispatch-eligible non-terminal items by priority order and
-    /// returns the first one that is not already in <c>_activeItems</c> or
+    /// Walks dispatch-eligible non-terminal items by priority order and returns
+    /// the first one that is not already in <c>_activeItems</c> or
     /// <c>_deferredItems</c> and whose <see cref="WorkItem.DependsOn"/> gate
     /// is satisfied per <see cref="WorkItemDependencies.SatisfyingStates"/>
     /// (currently: every dep is in <see cref="WorkItemState.Done"/>). Returns
     /// null when no eligible item exists or every candidate is blocked.
     ///
     /// <para>
-    /// Dependency satisfaction is checked in C# against a freshly-built
-    /// state map (one ListAsync snapshot per pickup) — never a cached
+    /// Dependency satisfaction is checked in C# against a freshly-built state
+    /// map (one ListAsync snapshot per pickup) — never a cached
     /// <see cref="WorkItem.DependsOnSatisfied"/>-style boolean, so a dep
     /// transition that landed after the channel kick is honored on the very
-    /// next tick. For typical queue depths the enumerator stops on the first
-    /// match and never reads the whole table.
+    /// next tick.
     /// </para>
     ///
     /// <para>

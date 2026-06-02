@@ -271,10 +271,9 @@ public sealed class BudgetEnforcementTests : IDisposable
     // ── BudgetDeferralRecheckSnapshot consumer hot-reload ───────────────────
 
     /// <summary>
-    /// Pipeline stub that blocks on a per-invocation gate so we can trigger
-    /// deterministic second-cycle deferrals. Gates[0] blocks the first item
-    /// picked up, Gates[1] the second, etc. Items beyond the last gate run
-    /// immediately.
+    /// Pipeline stub that blocks on a per-invocation gate. Gates[0] blocks the
+    /// first item picked up, Gates[1] the second, etc. Items beyond the last
+    /// gate run immediately.
     /// </summary>
     private sealed class GatedPipelineRunner(TaskCompletionSource[] gates, IWorkItemStore store) : IPipelineRunner
     {
@@ -294,16 +293,11 @@ public sealed class BudgetEnforcementTests : IDisposable
     {
         // Consumer-side test: prove that OrchestratorService reads
         // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
-        // value cached at construction time.
-        //
-        // Strategy: block the first TWO items so a third successor hits the
-        // concurrent cap twice — once on initial pickup (reading the
-        // original snapshot value) and once after a hot-reload Replace (which
-        // must be read on the second deferral).  We use a short initial
-        // ConcurrentLimitRecheck to keep the test fast and swap to a long
-        // value afterwards; the assertion that the item is still deferred
-        // after the unblock proves the long hot-reloaded value was read
-        // (otherwise the short initial value would have re-enqueued it).
+        // value cached at construction time. Keep one item pinned in-flight,
+        // hot-reload the deferral interval, then enqueue a second item that
+        // hits the concurrent cap. If the service kept the constructor-time
+        // interval, the deferred item would be retried and spawn another worker
+        // inside the assertion window.
         var pid = new ProjectId("budget-recheck-conc");
         var projectRepo = new InMemoryProjectRepository(new Project
         {
@@ -314,10 +308,14 @@ public sealed class BudgetEnforcementTests : IDisposable
         });
 
         var gate1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var gate2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = new GatedPipelineRunner([gate1, gate2], _store);
+        var pipeline = new GatedPipelineRunner([gate1], _store);
         var queue = new InMemoryTaskQueue();
-        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 3 };
+        var spawnCount = 0;
+        var opts = new OrchestratorOptions
+        {
+            MaxConcurrentWorkers = 2,
+            OnWorkerSpawned = () => Interlocked.Increment(ref spawnCount),
+        };
         var reg = new CancellationRegistry(CancellationToken.None);
 
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
@@ -331,71 +329,62 @@ public sealed class BudgetEnforcementTests : IDisposable
             projects: projectRepo,
             budgetDeferralRecheck: snapshot);
 
-        var ids = new List<WorkItemId>();
-        for (var i = 0; i < 3; i++)
-        {
-            var item = MakeQueued("budget-recheck-conc");
-            await _store.CreateAsync(item);
-            ids.Add(item.Id);
-            await queue.EnqueueAsync(item.Id);
-        }
+        var running = MakeQueued("budget-recheck-conc");
+        await _store.CreateAsync(running);
+        await queue.EnqueueAsync(running.Id);
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Poll until at least one of items [1] or [2] is deferred.
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (!(svc.IsDeferredForTest(ids[1]) || svc.IsDeferredForTest(ids[2]))
-               && DateTimeOffset.UtcNow < deferDeadline)
+        var runningDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < runningDeadline)
         {
-            await Task.Delay(50);
+            var stored = await _store.GetAsync(running.Id);
+            if (stored?.StartedAt is not null) break;
+            await Task.Delay(25);
         }
 
-        var firstDeferredIdx = svc.IsDeferredForTest(ids[1]) ? 1 : 2;
         Assert.True(
-            svc.IsDeferredForTest(ids[firstDeferredIdx]),
-            "one of the items queued after the first must be deferred by the concurrent cap");
+            (await _store.GetAsync(running.Id))?.StartedAt is not null,
+            "the first item must be in-flight so the concurrent cap is binding");
 
-        // Hot-reload to a long recheck interval. The next deferral cycle
-        // (after items are re-enqueued and hit the cap again) must read this
-        // new value from the snapshot.
+        // Hot-reload to a long recheck interval. The next budget-cap deferral
+        // must read this new value from the snapshot.
         snapshot.Replace(new BudgetDeferralRecheckOptions
         {
             ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
         });
 
-        // Unblock the first item so the deferred items can be re-enqueued
-        // when their 200 ms deferral expires.
-        gate1.TrySetResult();
+        var deferred = MakeQueued("budget-recheck-conc");
+        await _store.CreateAsync(deferred);
+        await queue.EnqueueAsync(deferred.Id);
 
-        // Wait for the initial 200 ms deferral to expire and the dispatch
-        // loop to process both items again. One will grab the freed slot
-        // and block on gate2; the other hits the concurrent cap and is
-        // deferred again — this time reading the hot-reloaded 10 s interval.
-        await Task.Delay(600);
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (!svc.IsDeferredForTest(deferred.Id)
+               && DateTimeOffset.UtcNow < deferDeadline)
+        {
+            await Task.Delay(25);
+        }
 
-        // Identify the item that was deferred in the second cycle.
-        // It should be one of ids[1] or ids[2]; the other is running
-        // (blocking on gate2) and therefore not in the deferred set.
-        int? secondDeferredIdx = null;
-        if (svc.IsDeferredForTest(ids[1])) secondDeferredIdx = 1;
-        else if (svc.IsDeferredForTest(ids[2])) secondDeferredIdx = 2;
-
-        Assert.NotNull(secondDeferredIdx);
+        Assert.True(
+            svc.IsDeferredForTest(deferred.Id),
+            "the second item must be deferred by the concurrent cap");
+        Assert.Equal(2, Volatile.Read(ref spawnCount));
 
         // Now the item is deferred with the hot-reloaded 10 s interval.
         // If the old 200 ms value was cached, it would have re-enqueued the
-        // item within 500 ms. Wait past the old window and verify the item
-        // is still deferred.
+        // item and spawned another worker within 500 ms. Wait past the old
+        // window and verify no retry happened.
         await Task.Delay(500);
 
         Assert.True(
-            svc.IsDeferredForTest(ids[secondDeferredIdx.Value]),
+            svc.IsDeferredForTest(deferred.Id),
             "the deferred item must still be deferred after hot-reload " +
             "(the long hot-reloaded ConcurrentLimitRecheck was consumed, " +
             "not the short initial value)");
+        Assert.Equal(2, Volatile.Read(ref spawnCount));
 
         // Release the blocked item so StopAsync can drain cleanly.
-        gate2.TrySetResult();
+        gate1.TrySetResult();
 
         await svc.StopAsync(CancellationToken.None);
     }
