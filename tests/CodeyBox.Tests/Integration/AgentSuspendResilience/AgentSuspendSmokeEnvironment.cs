@@ -113,7 +113,7 @@ internal static class AgentSuspendSmokeEnvironment
         "codex" => "gpt-4o-mini",
         "gemini" => "gemini-2.0-flash",
         "cursor" => "composer-2.5",
-        "opencode" => "deepseek/deepseek-coder",
+        "opencode" => "opencode-go/deepseek-v4-flash",
         _ => throw new ArgumentOutOfRangeException(nameof(agent)),
     };
 

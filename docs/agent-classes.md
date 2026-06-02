@@ -152,7 +152,7 @@ or OpenAI-via-opencode). Suggested starting scores:
 {
   "Agent": "opencode",
   "Billing": "Subscription",
-  "ModelId": "deepseek/deepseek-coder",
+  "ModelId": "opencode-go/deepseek-v4-flash",
   "QualityScore": 90
 }
 ```

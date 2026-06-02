@@ -3058,7 +3058,7 @@ namespace CodeyBox.Api
         public const int MaximumMaxTemplateChecks = 1000;
         public int MaxTemplateChecks { get; set; } = DefaultMaxTemplateChecks;
         public string SandboxImageReference { get; set; } = "";
-        public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com"];
+        public string[] AgentAllowedHosts { get; set; } = ["api.anthropic.com", "api.openai.com", "api.githubcopilot.com", "generativelanguage.googleapis.com", "opencode.ai"];
         public string[] AuditToolAllowedHosts { get; set; } =
         [
             "api.nuget.org",
