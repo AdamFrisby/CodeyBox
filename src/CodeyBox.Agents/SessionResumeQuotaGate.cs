@@ -25,7 +25,7 @@ internal static class SessionResumeQuotaGate
         string? stdout)
     {
         if (classifier is null)
-            return true;
+            return false;
 
         var classification = classifier.Classify(agent, stderr, stdout);
         return classification.Kind switch

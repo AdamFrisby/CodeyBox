@@ -57,6 +57,28 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_ClaudeSessionIdJsonProperty_IsReplaced()
+    {
+        const string SessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var result = RawOutputRedactor.Redact(
+            $$"""{"type":"system","subtype":"init","session_id":"{{SessionId}}"}""");
+
+        Assert.DoesNotContain(SessionId, result);
+        Assert.Contains("\"session_id\":\"***\"", result);
+    }
+
+    [Fact]
+    public void Redact_ClaudeCamelCaseSessionIdJsonProperty_IsReplaced()
+    {
+        const string SessionId = "c8e8171a-5c61-42e6-a633-936d2362886a";
+        var result = RawOutputRedactor.Redact(
+            $$"""{"type":"system","subtype":"init","sessionId":"{{SessionId}}"}""");
+
+        Assert.DoesNotContain(SessionId, result);
+        Assert.Contains("\"sessionId\":\"***\"", result);
+    }
+
+    [Fact]
     public void Redact_NoSecrets_ReturnsOriginal()
     {
         var input = "Build successful. 0 errors, 2 warnings.";

@@ -20,7 +20,8 @@ public static partial class RawOutputRedactor
     /// Replaces any detected secret token in <paramref name="text"/> with <c>***</c>.
     /// Returns the original string unchanged when no secrets are found.
     /// </summary>
-    public static string Redact(string text) => SecretPattern().Replace(text, "***");
+    public static string Redact(string text) =>
+        SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(SecretPattern().Replace(text, "***"));
 
     /// <summary>
     /// Truncates <paramref name="text"/> to at most <paramref name="maxBytes"/> UTF-8 bytes,

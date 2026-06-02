@@ -61,6 +61,10 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
     private static readonly (string Pattern, QuotaFailureKind Kind)[] Patterns =
     [
         ("rate_limit_exceeded", QuotaFailureKind.RateLimitExceeded),
+        ("HTTP 429", QuotaFailureKind.RateLimitExceeded),
+        ("status 429", QuotaFailureKind.RateLimitExceeded),
+        ("API Error: 429", QuotaFailureKind.RateLimitExceeded),
+        ("429 Too Many Requests", QuotaFailureKind.RateLimitExceeded),
         ("usage_limit", QuotaFailureKind.LimitReached),
         ("hit your usage limit", QuotaFailureKind.LimitReached),
         ("hit your limit", QuotaFailureKind.LimitReached),

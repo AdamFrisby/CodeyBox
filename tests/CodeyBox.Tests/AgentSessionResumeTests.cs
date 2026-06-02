@@ -110,24 +110,35 @@ public sealed class AgentSessionResumeTests : IDisposable
         // Defensive guard: an extractor that mistakenly hands back an empty
         // string would otherwise produce an invocation with `--resume ""` and
         // the CLI would fail with an unhelpful argparse error. Reject up-front.
-        var runner = new ClaudeAgentRunner();
-        Assert.Throws<ArgumentException>(() => InvokeBuildResume(runner, sessionId: ""));
-        Assert.Throws<ArgumentException>(() => InvokeBuildResume(runner, sessionId: "   "));
+        var runner = (ICliSessionResumableAgentRunner)new ClaudeAgentRunner();
+        Assert.Throws<ArgumentException>(() => runner.BuildSessionResumeInvocation(
+            sessionId: "",
+            prompt: "prompt",
+            credential: null));
+        Assert.Throws<ArgumentException>(() => runner.BuildSessionResumeInvocation(
+            sessionId: "   ",
+            prompt: "prompt",
+            credential: null));
     }
 
-    private static object InvokeBuildResume(ClaudeAgentRunner runner, string sessionId)
+    [Fact]
+    public void ClaudeRunner_DeclaresSessionResumeContract()
     {
-        var method = typeof(CliAgentRunnerBase).GetMethod(
-            "BuildSessionResumeInvocation",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        try
-        {
-            return method.Invoke(runner, [sessionId, "prompt", null, null, null, false])!;
-        }
-        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
-        {
-            throw ex.InnerException;
-        }
+        var runner = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(new ClaudeAgentRunner());
+
+        Assert.True(runner.RequiresStructuredStreamForSessionId);
+        Assert.NotNull(runner.SessionResumeQuotaClassifier);
+
+        var invocation = runner.BuildSessionResumeInvocation(
+            "e61b65a0-0f1e-4469-94f0-0be82d71b909",
+            "prompt",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.Contains("--resume", invocation.Argv);
+        AssertFlagValue(invocation.Argv, "--resume", "e61b65a0-0f1e-4469-94f0-0be82d71b909");
+        AssertFlagValue(invocation.Argv, "--output-format", "stream-json");
+        Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, invocation.Stdin);
     }
 
     [Theory]
@@ -141,6 +152,16 @@ public sealed class AgentSessionResumeTests : IDisposable
 
         Assert.Throws<InvalidOperationException>(() =>
             SessionResumeQuotaGate.AllowsResume(classifier, AgentKind.Claude, stderr: "stderr", stdout: "stdout"));
+    }
+
+    [Fact]
+    public void QuotaGate_MissingClassifier_FailsClosed()
+    {
+        Assert.False(SessionResumeQuotaGate.AllowsResume(
+            classifier: null,
+            AgentKind.Claude,
+            stderr: "usage_limit reached",
+            stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
     }
 
     // ── Integration with ClaudeAgentRunner ────────────────────────────────────
@@ -224,12 +245,12 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task ClaudeRunner_GenericCrashWithCapturedSessionId_RetriesWithResumeFlag()
+    public async Task ClaudeRunner_OomSigkillCrashWithCapturedSessionId_RetriesWithResumeFlag()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
         var sandbox = new ResumeRecordingSandbox(call => call == 1
-            ? new SandboxExecResult(1,
+            ? new SandboxExecResult(137,
                 Stdout: $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
                 Stderr: "Killed")
             : new SandboxExecResult(0, "ok", ""));
@@ -263,6 +284,22 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaudeRunner_AuthFailureWithCapturedSessionId_DoesNotResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+    }
+
+    [Fact]
     public async Task ClaudeRunner_HardQuotaFailure_DoesNotResumeHammer()
     {
         SessionResumeOptions.SetMaxResumeAttempts(3);
@@ -278,6 +315,21 @@ public sealed class AgentSessionResumeTests : IDisposable
             Stderr: "usage_limit reached: weekly cap"));
 
         var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_DefaultConstructor_HardQuotaFailure_DoesNotResumeHammer()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+            Stderr: "usage_limit reached: weekly cap"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
@@ -355,7 +407,7 @@ public sealed class AgentSessionResumeTests : IDisposable
         SessionResumeOptions.SetMaxResumeAttempts(2);
         var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
             Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
-            Stderr: "API Error: 429 rate_limit_exceeded; retry after 2h"));
+            Stderr: "API Error: 429; retry after 2h"));
 
         var result = await ClaudeRunnerWithQuotaClassifier().RunAsync(
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
@@ -580,9 +632,9 @@ public sealed class AgentSessionResumeTests : IDisposable
                 "ECONNRESET")
             : new SandboxExecResult(0, "ok", ""));
 
-        // FakeRunner.SupportsSessionResume is false, so the captured session
-        // id MUST be ignored and the legacy single-shot re-invocation path
-        // takes over as before — argv unchanged on retry.
+        // FakeRunner does not implement ICliSessionResumableAgentRunner, so the
+        // captured session id MUST be ignored and the legacy single-shot
+        // re-invocation path takes over as before — argv unchanged on retry.
         var runner = new NonResumableTestRunner();
         var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
@@ -607,6 +659,32 @@ public sealed class AgentSessionResumeTests : IDisposable
                 $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
                 "ECONNRESET"),
             2 => new SandboxExecResult(1, "no init this time", "ECONNRESET"),
+            _ => new SandboxExecResult(0, "ok", ""),
+        });
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
+        var second = sandbox.ClaudeInvocations[1];
+        var third = sandbox.ClaudeInvocations[2];
+        Assert.Equal(sessionId, second[IndexOf(second, "--resume") + 1]);
+        Assert.Equal(sessionId, third[IndexOf(third, "--resume") + 1]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_PreviouslyCapturedSessionId_IsReusedWhenResumeCrashesWithoutOutput()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+
+        var sessionId = "c8e8171a-5c61-42e6-a633-936d2362886a";
+        var sandbox = new ResumeRecordingSandbox(call => call switch
+        {
+            1 => new SandboxExecResult(1,
+                $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                "ECONNRESET"),
+            2 => new SandboxExecResult(137, "", ""),
             _ => new SandboxExecResult(0, "ok", ""),
         });
 

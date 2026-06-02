@@ -54,50 +54,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
 
     /// <summary>
-    /// When true, this runner's CLI exposes a native session-resume mode
-    /// (e.g. <c>claude --resume &lt;id&gt;</c>) and the suspend-resilience loop
-    /// will rebuild the next attempt with <see cref="BuildSessionResumeInvocation"/>
-    /// after a transient crash that captured a session id in stdout. Default
-    /// false; CLIs that don't expose a resume flag keep the legacy
-    /// re-invocation-from-scratch retry path.
-    /// </summary>
-    protected virtual bool SupportsSessionResume => false;
-
-    /// <summary>
-    /// Inspects a (typically structured-stream) stdout payload for the agent
-    /// CLI's session identifier. Returns <c>null</c> when no id was captured —
-    /// e.g. the runner could not enable its id-bearing output mode, or the crash
-    /// happened before the CLI emitted its init event. Without a captured id,
-    /// session resume is impossible and the loop falls back to the legacy retry
-    /// path.
-    /// </summary>
-    protected virtual string? TryExtractSessionId(string? stdout) => null;
-
-    /// <summary>
-    /// Shared quota classifier used to keep hard quota/rate failures and
-    /// terminal non-quota API crashes out of the CLI-native session resume path.
-    /// Runners that opt into <see cref="SupportsSessionResume"/> should receive
-    /// the same classifier the orchestrator uses for quota fallback so scoping,
-    /// reset-window parsing, and terminal crash handling cannot drift.
-    /// </summary>
-    protected virtual IQuotaFailureClassifier? SessionResumeQuotaClassifier => null;
-
-    /// <summary>
-    /// Build the argv used to resume the in-flight CLI session identified by
-    /// <paramref name="sessionId"/> in the same sandbox after a transient
-    /// crash. Default throws — only runners that opt into <see cref="SupportsSessionResume"/>
-    /// must implement this.
-    /// </summary>
-    protected virtual AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        bool captureStructuredStream = false)
-        => throw new NotSupportedException($"{Kind.Value} runner did not opt into CLI session resume");
-
-    /// <summary>
     /// Gives subclasses a chance to materialise non-argv CLI prerequisites
     /// immediately before invoking the binary. Returning a result short-circuits
     /// the run with that failure.
@@ -131,9 +87,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
             sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
-            sessionResumeContext: SupportsSessionResume
-                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, captureStructuredStream)
-                : null);
+            sessionResumeContext: CreateSessionResumeContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream));
     }
 
     public virtual async Task<AgentResult> RunResumedAsync(
@@ -156,7 +115,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             reasoningMode,
             ct,
             stdoutChunkCallback,
-            captureStructuredStream: SupportsSessionResume).ConfigureAwait(false);
+            captureStructuredStream: this is ICliSessionResumableAgentRunner
+            {
+                RequiresStructuredStreamForSessionId: true,
+            }).ConfigureAwait(false);
 
     protected async Task<AgentResult> RunResumedCoreAsync(
         ISandbox sandbox,
@@ -185,9 +147,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
             sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
-            sessionResumeContext: SupportsSessionResume
-                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, captureStructuredStream)
-                : null);
+            sessionResumeContext: CreateSessionResumeContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream));
     }
 
     private async Task<AgentResult> ExecuteWithSuspendResilienceAsync(
@@ -224,8 +189,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // sites (verdict-parser shortcuts) intentionally forgo resume to
             // keep their stdout contract intact.
             if (sessionResumeContext is not null
-                && sessionResumeContext.CaptureStructuredStream
-                && TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
+                && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
+                    || sessionResumeContext.CaptureStructuredStream)
+                && sessionResumeContext.Capability.TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
             {
                 capturedSessionId = freshId;
             }
@@ -233,16 +199,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
             var exitCode = ParseExitCodeFromSummary(last.Summary);
 
-            // Classify FIRST and only resume on transient crash shapes: a
-            // captured session id is not by itself a license to relaunch.
-            // Non-transient failures (auth, normal work failures, terminal
-            // API crashes) would re-fail and burn the resume budget on a
-            // deterministic error.
+            // Classify FIRST: a captured session id is not by itself a license
+            // to relaunch. Deterministic auth failures and terminal API crashes
+            // are excluded here / by the quota gate, while otherwise-unmatched
+            // non-zero exits are treated as resumable CLI crashes within the
+            // bounded budget.
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
                 && IsResumeEligibleFailure(classification, exitCode)
                 && SessionResumeQuotaGate.AllowsResume(
-                    SessionResumeQuotaClassifier,
+                    sessionResumeContext.Capability.SessionResumeQuotaClassifier,
                     Kind,
                     last.Stderr,
                     last.Stdout))
@@ -256,7 +222,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         return WithLivenessProbeNote(last, livenessProbe);
 
                     resumeAttempts++;
-                    current = BuildSessionResumeInvocation(
+                    current = sessionResumeContext.Capability.BuildSessionResumeInvocation(
                         capturedSessionId,
                         sessionResumeContext.Prompt,
                         sessionResumeContext.Credential,
@@ -305,23 +271,23 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// </list>
     /// </para>
     /// <para>
-    /// Normal classification + suspend-related exit code is included because
+    /// Normal classification + non-zero exit code is included because
     /// the shared <see cref="AgentFailureClassifier"/> defaults to
     /// <see cref="AgentFailureKind.Normal"/> for any non-matched pattern,
     /// which conflates "agent reported a work refusal" with "process was
-    /// killed and emitted no recognised diagnostic." The exit-code allowlist
-    /// (same as <see cref="AgentSuspendResilience"/>) is the strongest signal
-    /// that the process died transiently rather than completing a refusal;
-    /// the bounded resume budget keeps the cost of a misclassified refusal
-    /// to a couple of retries before the orchestrator fails over.
+    /// killed and emitted no recognised diagnostic." The task requires native
+    /// resume for generic CLI crashes, OOM/SIGKILL (usually exit 137), and
+    /// non-zero CLI bugs when a session id was captured; the bounded resume
+    /// budget keeps the cost of a misclassified refusal to a couple of retries
+    /// before the orchestrator fails over.
     /// </para>
     /// </summary>
     private static bool IsResumeEligibleFailure(AgentFailureClassification classification, int exitCode)
         => classification.Kind switch
         {
             AgentFailureKind.TransientNetwork => true,
-            AgentFailureKind.Unknown => AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode),
-            AgentFailureKind.Normal => AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode),
+            AgentFailureKind.Unknown => exitCode != 0,
+            AgentFailureKind.Normal => exitCode != 0,
             // Soft rate-limit/overload comes through as QuotaExhausted; the
             // session-resume quota gate is the authoritative decision for
             // that shape (it inspects the provider detector). Returning true
@@ -414,6 +380,22 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     private readonly record struct ResumeLivenessProbeResult(bool IsAlive, string? FailureKind, string? FailureDetail);
 
+    private SessionResumeRebuildContext? CreateSessionResumeContext(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        bool captureStructuredStream)
+        => this is ICliSessionResumableAgentRunner capability
+            ? new SessionResumeRebuildContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream,
+                capability)
+            : null;
+
     /// <summary>
     /// Inputs the suspend-resilience loop needs to rebuild a failed invocation
     /// as a CLI-native session resume. The credential/model/reasoning are the
@@ -426,7 +408,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         AgentCredential? Credential,
         string? ModelId,
         string? ReasoningMode,
-        bool CaptureStructuredStream);
+        bool CaptureStructuredStream,
+        ICliSessionResumableAgentRunner Capability);
 
     private async Task<AgentResult> ExecuteInvocationOnceAsync(
         ISandbox sandbox,
@@ -1077,8 +1060,4 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             .Remove(new KeyValuePair<string, string>(runKey, runId));
     }
 
-    protected sealed record AgentInvocation(
-        IReadOnlyList<string> Argv,
-        IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
-        string? Stdin = null);
 }

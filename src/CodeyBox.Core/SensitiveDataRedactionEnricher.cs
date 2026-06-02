@@ -25,6 +25,7 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
     private static readonly HashSet<string> SensitiveKeyFragments = new(StringComparer.OrdinalIgnoreCase)
     {
         "Token", "Secret", "Password", "Authorization", "ApiKey", "AuthJson", "Credential",
+        "SessionId",
     };
 
     internal const string SecretValuePatternSource =
@@ -67,10 +68,11 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
             }
 
             if (logEvent.Properties.TryGetValue(key, out var prop) &&
-                prop is ScalarValue { Value: string strVal } &&
-                SecretValuePattern.IsMatch(strVal))
+                prop is ScalarValue { Value: string strVal })
             {
-                logEvent.AddOrUpdateProperty(propertyFactory.CreateProperty(key, "***"));
+                var redacted = RedactText(strVal);
+                if (!string.Equals(redacted, strVal, StringComparison.Ordinal))
+                    logEvent.AddOrUpdateProperty(propertyFactory.CreateProperty(key, redacted));
             }
         }
     }
@@ -80,11 +82,7 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         if (string.IsNullOrEmpty(value))
             return value;
 
-        var redacted = JsonStringPropertyPattern.Replace(value, match =>
-        {
-            var key = UnescapeJsonString(match.Groups["key"].Value);
-            return IsSensitiveKey(key) ? match.Groups["prefix"].Value + "\"***\"" : match.Value;
-        });
+        var redacted = RedactJsonSensitiveProperties(value);
 
         if (!LooksLikeJson(redacted))
         {
@@ -95,6 +93,18 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         }
 
         return SecretValuePattern.Replace(redacted, "***");
+    }
+
+    public static string RedactJsonSensitiveProperties(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        return JsonStringPropertyPattern.Replace(value, match =>
+        {
+            var key = UnescapeJsonString(match.Groups["key"].Value);
+            return IsSensitiveKey(key) ? match.Groups["prefix"].Value + "\"***\"" : match.Value;
+        });
     }
 
     private static bool IsSensitiveKey(string key) =>

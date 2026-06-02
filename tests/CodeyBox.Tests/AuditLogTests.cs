@@ -230,6 +230,22 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void RedactionEnricher_redacts_session_id_inside_string_property()
+    {
+        const string SessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        Log.Logger
+            .ForContext(
+                "StdoutTail",
+                $$"""{"type":"system","subtype":"init","session_id":"{{SessionId}}"}""")
+            .Information("test");
+
+        var evt = Assert.Single(_sink.Events);
+        var tail = GetScalar<string>(evt, "StdoutTail");
+        Assert.DoesNotContain(SessionId, tail);
+        Assert.Contains("\"session_id\":\"***\"", tail);
+    }
+
+    [Fact]
     public void RedactionEnricher_does_not_redact_normal_string_properties()
     {
         Log.Logger

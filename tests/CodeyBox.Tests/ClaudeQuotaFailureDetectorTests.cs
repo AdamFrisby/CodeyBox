@@ -38,6 +38,23 @@ public sealed class ClaudeQuotaFailureDetectorTests
         Assert.NotNull(detection.ResetAt);
     }
 
+    [Theory]
+    [InlineData("HTTP 429; retry after 2h")]
+    [InlineData("status 429; retry after 2h")]
+    [InlineData("API Error: 429; retry after 2h")]
+    [InlineData("429 Too Many Requests; retry after 2h")]
+    public void Detect_Bare429ResetWindow_ClassifiesRateLimit(string stderr)
+    {
+        var detection = _detector.Detect(stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalHours, 1.9, 2.1);
+    }
+
     [Fact]
     public void Detect_UsageLimitSignal_ClassifiesLimitReached()
     {

@@ -2649,10 +2649,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // The runner's CLI-native session resume capability is independent of
         // optional stream persistence: a transient agent crash should still be
         // recoverable in the same sandbox even when AgentStreams is disabled.
-        // Force-enable the id-bearing output mode whenever the runner declares
-        // CLI session resume, so the captured init session_id lets the resume
-        // gate take over.
-        var needsStreamForResume = runner is ICliSessionResumableAgentRunner;
+        // Force-enable the id-bearing output mode only when the runner's public
+        // resume contract says its session-id extractor needs structured output.
+        var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
         var captureStructuredStream = streamCapture is not null || needsStreamForResume;
 
         AgentResult agentResult;
@@ -3809,6 +3808,12 @@ public sealed class PipelineRunner : IPipelineRunner
             kind.Value, result.Success, result.Summary, Display(Tail(result.Stdout)), Display(Tail(result.Stderr)));
     }
 
+    private static bool NeedsStructuredStreamForSessionResume(IAgentRunner runner)
+        => runner is ICliSessionResumableAgentRunner
+        {
+            RequiresStructuredStreamForSessionId: true,
+        };
+
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
         string phase,
@@ -4890,10 +4895,10 @@ public sealed class PipelineRunner : IPipelineRunner
         var stdoutCallback = auditor.Kind == "llm"
             ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
             : null;
-        // Force id-bearing structured output for resumable LLM auditors so a
-        // transient mid-audit crash can recover via CLI-native session resume
-        // independently of AgentStream persistence (see work-phase comment).
-        var auditNeedsStreamForResume = auditor.Kind == "llm" && runner is ICliSessionResumableAgentRunner;
+        // Force id-bearing structured output for resumable LLM auditors only
+        // when the runner's session-resume contract requires it (see work-phase
+        // comment).
+        var auditNeedsStreamForResume = auditor.Kind == "llm" && NeedsStructuredStreamForSessionResume(runner);
         // The work item's ModelId came from the AgentMembership picked for the
         // work agent kind. If audit cross-review picked a different kind, that
         // model id is vendor-specific and won't be valid for the audit runner —
@@ -6819,9 +6824,9 @@ public sealed class PipelineRunner : IPipelineRunner
                     : null;
                 mergeStructuredStreamCaptured = mergeStreamCapture is not null;
                 var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
-                // Decouple from AgentStreams: resumable CLIs always need stream-json
-                // for the init session_id (see work-phase comment).
-                var mergeNeedsStreamForResume = runner is ICliSessionResumableAgentRunner;
+                // Decouple from AgentStreams when the runner's session-id
+                // extractor needs structured output (see work-phase comment).
+                var mergeNeedsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 try
                 {

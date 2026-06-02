@@ -735,6 +735,32 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
 internal sealed class CliSessionResumableScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
     : ScriptedAgent(mergeStrategies), ICliSessionResumableAgentRunner
 {
+    public bool RequiresStructuredStreamForSessionId => true;
+
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier { get; } = new NoQuotaFailureClassifier();
+
+    public string? TryExtractSessionId(string? stdout)
+        => stdout is null || !stdout.Contains("scripted-session", StringComparison.Ordinal)
+            ? null
+            : "scripted-session";
+
+    public AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => new(["scripted-agent", "--resume", sessionId], Stdin: prompt);
+
+    private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
+    {
+        public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+            => QuotaFailureClassification.None;
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => null;
+    }
 }
 
 /// <summary>

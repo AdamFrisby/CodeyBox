@@ -15,5 +15,6 @@ public static class RawChunkRedactor
         SensitiveDataRedactionEnricher.SecretValuePatternSource,
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    public static string Redact(string chunk) => SecretPattern.Replace(chunk, "***");
+    public static string Redact(string chunk) =>
+        SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(SecretPattern.Replace(chunk, "***"));
 }
