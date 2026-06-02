@@ -53,6 +53,40 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => BuildInvocation(prompt, credential, modelId, reasoningMode);
 
     /// <summary>
+    /// When true, this runner's CLI exposes a native session-resume mode
+    /// (e.g. <c>claude --resume &lt;id&gt;</c>) and the suspend-resilience loop
+    /// will rebuild the next attempt with <see cref="BuildSessionResumeInvocation"/>
+    /// after a transient crash that captured a session id in stdout. Default
+    /// false; CLIs that don't expose a resume flag keep the legacy
+    /// re-invocation-from-scratch retry path.
+    /// </summary>
+    protected virtual bool SupportsSessionResume => false;
+
+    /// <summary>
+    /// Inspects a (typically structured-stream) stdout payload for the agent
+    /// CLI's session identifier. Returns <c>null</c> when no id was captured —
+    /// e.g. structured stream capture was disabled, or the crash happened
+    /// before the CLI emitted its init event. Without a captured id, session
+    /// resume is impossible and the loop falls back to the legacy retry path.
+    /// </summary>
+    protected virtual string? TryExtractSessionId(string? stdout) => null;
+
+    /// <summary>
+    /// Build the argv used to resume the in-flight CLI session identified by
+    /// <paramref name="sessionId"/> in the same sandbox after a transient
+    /// crash. Default throws — only runners that opt into <see cref="SupportsSessionResume"/>
+    /// must implement this.
+    /// </summary>
+    protected virtual AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => throw new NotSupportedException($"{Kind.Value} runner did not opt into CLI session resume");
+
+    /// <summary>
     /// Gives subclasses a chance to materialise non-argv CLI prerequisites
     /// immediately before invoking the binary. Returning a result short-circuits
     /// the run with that failure.
@@ -85,7 +119,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sessionResumeContext: SupportsSessionResume
+                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, captureStructuredStream)
+                : null);
     }
 
     public virtual async Task<AgentResult> RunResumedAsync(
@@ -107,7 +144,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sessionResumeContext: SupportsSessionResume
+                ? new SessionResumeRebuildContext(prompt, credential, modelId, reasoningMode, CaptureStructuredStream: false)
+                : null);
     }
 
     private async Task<AgentResult> ExecuteWithSuspendResilienceAsync(
@@ -115,27 +155,84 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
-        CancellationToken ct)
+        CancellationToken ct,
+        SessionResumeRebuildContext? sessionResumeContext = null)
     {
         var attempt = 0;
+        var resumeAttempts = 0;
+        var current = invocation;
         AgentResult? last = null;
-        while (attempt <= AgentSuspendResilience.MaxRetries)
+        // Tracked across the retry loop so a session id captured on attempt N
+        // can drive the rebuild on attempt N+1 even if attempt N+1 itself
+        // crashes before re-emitting the init event.
+        string? capturedSessionId = null;
+        while (true)
         {
             last = await ExecuteInvocationOnceAsync(
-                sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
-            if (last.Success || attempt >= AgentSuspendResilience.MaxRetries)
+                sandbox, workingDirectory, current, stdoutChunkCallback, ct);
+            if (last.Success)
                 return last;
+
+            // Capture / refresh the session id from whatever this attempt
+            // managed to emit on stdout before crashing. Best-effort: a parse
+            // failure or absent id leaves the previously-captured id (if any)
+            // in place.
+            if (sessionResumeContext is not null
+                && TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
+            {
+                capturedSessionId = freshId;
+            }
 
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
             var exitCode = ParseExitCodeFromSummary(last.Summary);
+
+            // Prefer a CLI-native session resume when this runner opted in,
+            // a session id was captured, and the failure shape looks transient
+            // (NOT quota/auth — those would just re-fail on resume). When all
+            // three hold, the resume budget is consumed; otherwise we fall
+            // through to the legacy suspend-resilience retry below.
+            if (sessionResumeContext is not null
+                && capturedSessionId is not null
+                && SessionResumeOptions.IsResumeEligible(classification)
+                && resumeAttempts < SessionResumeOptions.MaxResumeAttempts)
+            {
+                resumeAttempts++;
+                current = BuildSessionResumeInvocation(
+                    capturedSessionId,
+                    sessionResumeContext.Prompt,
+                    sessionResumeContext.Credential,
+                    sessionResumeContext.ModelId,
+                    sessionResumeContext.ReasoningMode,
+                    sessionResumeContext.CaptureStructuredStream);
+                continue;
+            }
+
+            if (attempt >= AgentSuspendResilience.MaxRetries)
+                return last;
             if (!AgentSuspendResilience.ShouldRetry(Kind, classification, exitCode))
                 return last;
 
             attempt++;
+            // Legacy retry re-uses the original (non-resume) invocation; the
+            // single-shot re-invocation path was what shipped before resume
+            // support existed.
+            current = invocation;
         }
-
-        return last!;
     }
+
+    /// <summary>
+    /// Inputs the suspend-resilience loop needs to rebuild a failed invocation
+    /// as a CLI-native session resume. The credential/model/reasoning are the
+    /// same the caller supplied to <see cref="RunAsync"/> / <see cref="RunResumedAsync"/>;
+    /// re-using them keeps the resumed call's auth / model identical to the
+    /// crashed run.
+    /// </summary>
+    private sealed record SessionResumeRebuildContext(
+        string Prompt,
+        AgentCredential? Credential,
+        string? ModelId,
+        string? ReasoningMode,
+        bool CaptureStructuredStream);
 
     private async Task<AgentResult> ExecuteInvocationOnceAsync(
         ISandbox sandbox,

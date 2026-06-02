@@ -361,7 +361,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: false, captureStructuredStream);
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
 
     protected override AgentInvocation BuildResumeInvocation(
         string prompt,
@@ -369,13 +369,36 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentResumeContext resume,
         string? modelId = null,
         string? reasoningMode = null)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream: false);
 
-    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
+    /// <summary>
+    /// The Claude CLI prints a structured init event on its first stream-json
+    /// line: <c>{"type":"system","subtype":"init","session_id":"...", ...}</c>.
+    /// We pull the id from that line so a crashed run can be resumed in place
+    /// via <c>claude --resume &lt;id&gt;</c>. Robust to ordering / extra
+    /// whitespace and tolerant of <c>sessionId</c> camelCase that some CLI
+    /// builds use; returns <c>null</c> when no recognisable id is present.
+    /// </summary>
+    protected override bool SupportsSessionResume => true;
+
+    protected override string? TryExtractSessionId(string? stdout)
+        => ClaudeSessionIdExtractor.Extract(stdout);
+
+    protected override AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
-        _ = resume;
-        return BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: null, captureStructuredStream);
+        if (string.IsNullOrWhiteSpace(sessionId))
+            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
+        return BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
     }
+
+    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, string? sessionIdForResume, bool captureStructuredStream)
+        => BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: sessionIdForResume, captureStructuredStream);
 
     /// <summary>
     /// Builds the claude CLI argv used by <see cref="ClaudeSessionWorker"/> for
@@ -391,16 +414,16 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         bool captureStructuredStream)
     {
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
+        {
+            argv.Add("--resume");
+            argv.Add(cliResumeSessionId);
+        }
         if (captureStructuredStream)
         {
             argv.Add("--output-format");
             argv.Add("stream-json");
             argv.Add("--verbose");
-        }
-        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
-        {
-            argv.Add("--resume");
-            argv.Add(cliResumeSessionId);
         }
         var effectiveModel = modelId ?? DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))

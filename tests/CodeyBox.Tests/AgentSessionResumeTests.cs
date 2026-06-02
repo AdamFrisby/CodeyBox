@@ -1,0 +1,331 @@
+using CodeyBox.Agents;
+using CodeyBox.Agents.Claude;
+using CodeyBox.Core;
+using CodeyBox.Sandbox;
+
+namespace CodeyBox.Tests;
+
+/// <summary>
+/// Unit tests for CLI-native session resume in <see cref="CliAgentRunnerBase"/>.
+/// A transient agent process crash (non-zero exit, sandbox alive, session id
+/// captured on stdout) should be recovered by re-launching the same CLI with
+/// <c>--resume &lt;session-id&gt;</c> in the SAME sandbox — instead of failing
+/// the whole work item and re-driving from scratch.
+/// </summary>
+public sealed class AgentSessionResumeTests : IDisposable
+{
+    // Only the session-resume static is mutated here — leaving
+    // AgentSuspendResilience.MaxRetries at its default lets AgentSuspendResilienceRetryTests
+    // run safely in parallel with this class (it depends on the default).
+    private readonly int _originalSessionResume = SessionResumeOptions.MaxResumeAttempts;
+
+    public void Dispose()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(_originalSessionResume);
+    }
+
+    // ── Extractor unit tests ──────────────────────────────────────────────────
+
+    [Fact]
+    public void Extractor_FindsSessionIdInInitLine()
+    {
+        var stdout = """
+            {"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909","tools":[]}
+            {"type":"assistant","message":{"role":"assistant","content":[]}}
+            """;
+        Assert.Equal("e61b65a0-0f1e-4469-94f0-0be82d71b909",
+            ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
+    [Fact]
+    public void Extractor_AcceptsCamelCaseSessionId()
+    {
+        var stdout = """{"type":"system","subtype":"init","sessionId":"abc-123","tools":[]}""";
+        Assert.Equal("abc-123", ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
+    [Fact]
+    public void Extractor_IgnoresMalformedAndTruncatedLines()
+    {
+        var stdout = """
+            not json at all
+            {"broken json
+            {"type":"system","subtype":"init","session_id":"good"}
+            """;
+        Assert.Equal("good", ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
+    [Fact]
+    public void Extractor_ReturnsNullWhenAbsent()
+    {
+        Assert.Null(ClaudeSessionIdExtractor.Extract(null));
+        Assert.Null(ClaudeSessionIdExtractor.Extract(""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"assistant"}"""));
+        Assert.Null(ClaudeSessionIdExtractor.Extract("""{"type":"system","session_id":""}"""));
+    }
+
+    // ── Resume eligibility ────────────────────────────────────────────────────
+
+    [Fact]
+    public void IsResumeEligible_FalseForQuotaAndAuth()
+    {
+        Assert.False(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.QuotaExhausted)));
+        Assert.False(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.AuthError)));
+    }
+
+    [Fact]
+    public void IsResumeEligible_TrueForTransientAndUnknown()
+    {
+        Assert.True(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.TransientNetwork)));
+        Assert.True(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.Unknown)));
+        Assert.True(SessionResumeOptions.IsResumeEligible(
+            new AgentFailureClassification(AgentFailureKind.Normal)));
+    }
+
+    // ── Integration with ClaudeAgentRunner ────────────────────────────────────
+
+    [Fact]
+    public async Task ClaudeRunner_CrashWithCapturedSessionId_RetriesWithResumeFlag()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        // No legacy MaxRetries mutation — resume runs BEFORE the legacy retry
+        // check, so on success at attempt 2 the legacy branch is never reached.
+
+        var sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            // First call: agent crashed mid-run but emitted its init line.
+            ? new SandboxExecResult(1,
+                Stdout: $$"""
+                    {"type":"system","subtype":"init","session_id":"{{sessionId}}","tools":[]}
+                    """,
+                Stderr: "")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+
+        var first = sandbox.ClaudeInvocations[0];
+        Assert.DoesNotContain("--resume", first);
+
+        var second = sandbox.ClaudeInvocations[1];
+        var resumeIdx = IndexOf(second, "--resume");
+        Assert.True(resumeIdx >= 0, "resume retry must pass --resume flag");
+        Assert.Equal(sessionId, second[resumeIdx + 1]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_CrashWithoutCapturedSessionId_DoesNotResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        // The failure shape below ("no init line was emitted", exit 1) is
+        // classified as Normal — neither TransientNetwork nor Unknown — so
+        // AgentSuspendResilience.ShouldRetry returns false regardless of
+        // MaxRetries. No legacy mutation needed to assert only one call.
+        var sandbox = new ResumeRecordingSandbox(_ =>
+            new SandboxExecResult(1, "no init line was emitted", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_QuotaFailure_DoesNotResumeHammer()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        // Quota classification short-circuits BOTH the resume eligibility check
+        // AND AgentSuspendResilience.ShouldRetry, so no legacy mutation is
+        // needed to assert only one call.
+
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            // The init line was emitted, so a session id IS available — but
+            // the failure shape is a hard 429 quota event. A resume would
+            // immediately re-fail; we must NOT consume the resume budget.
+            Stdout: """{"type":"system","subtype":"init","session_id":"sid"}""",
+            Stderr: "API Error: 429 rate_limit_exceeded"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_BoundedByMaxResumeAttempts_FailsCleanlyAfterN()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        // Empty stderr → classification = Normal → ShouldRetry returns false
+        // regardless of MaxRetries; resume budget is the only retry path here.
+
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            // Every attempt crashes with the init line on stdout, simulating
+            // a process that consistently dies mid-stream.
+            Stdout: """{"type":"system","subtype":"init","session_id":"sid"}""",
+            Stderr: ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.False(result.Success);
+        // 1 original + 2 resume attempts = 3 claude invocations.
+        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[1]);
+        Assert.Contains("--resume", sandbox.ClaudeInvocations[2]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_MaxResumeZero_FallsBackToLegacyRetryOnly()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(0);
+        // AgentSuspendResilience.MaxRetries is left at its default of 1; the
+        // ECONNRESET shape below classifies as TransientNetwork and triggers
+        // exactly one legacy retry, which is the behaviour this test pins.
+
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1, """{"type":"system","subtype":"init","session_id":"sid"}""",
+                "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success);
+        // No --resume because the resume budget is 0; the legacy
+        // suspend-resilience path takes over on the transient-network shape.
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[1]);
+    }
+
+    [Fact]
+    public async Task NonResumableRunner_KeepsLegacyRetryBehaviour()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        // Legacy MaxRetries left at its default of 1.
+
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1,
+                """{"type":"system","subtype":"init","session_id":"sid"}""",
+                "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""));
+
+        // FakeRunner.SupportsSessionResume is false, so the captured session
+        // id MUST be ignored and the legacy single-shot re-invocation path
+        // takes over as before — argv unchanged on retry.
+        var runner = new NonResumableTestRunner();
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.AllExecs.Count);
+        Assert.DoesNotContain("--resume", sandbox.AllExecs[0].Argv);
+        Assert.DoesNotContain("--resume", sandbox.AllExecs[1].Argv);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_SessionIdCapturedOnFirstAttempt_IsReusedAcrossLaterCrashes()
+    {
+        // A second attempt that crashes WITHOUT emitting a fresh init line
+        // (e.g. the resumed CLI died before its own init replay) must still
+        // use the session id captured on attempt 1 for the third attempt.
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        // Stderr is empty (classification = Normal) so the legacy retry path
+        // is never engaged — resume is the only retry mechanism in scope.
+
+        var sessionId = "carry-over-id";
+        var sandbox = new ResumeRecordingSandbox(call => call switch
+        {
+            1 => new SandboxExecResult(1,
+                $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                ""),
+            2 => new SandboxExecResult(1, "no init this time", ""),
+            _ => new SandboxExecResult(0, "ok", ""),
+        });
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success);
+        Assert.Equal(3, sandbox.ClaudeInvocations.Count);
+        var second = sandbox.ClaudeInvocations[1];
+        var third = sandbox.ClaudeInvocations[2];
+        Assert.Equal(sessionId, second[IndexOf(second, "--resume") + 1]);
+        Assert.Equal(sessionId, third[IndexOf(third, "--resume") + 1]);
+    }
+
+    private static int IndexOf(IReadOnlyList<string> argv, string token)
+    {
+        for (var i = 0; i < argv.Count; i++)
+            if (string.Equals(argv[i], token, StringComparison.Ordinal))
+                return i;
+        return -1;
+    }
+
+    // ── Test harness ──────────────────────────────────────────────────────────
+
+    private sealed class ResumeRecordingSandbox(Func<int, SandboxExecResult> onClaudeCall) : ISandbox
+    {
+        public string Id => "codeybox-resume-test";
+
+        public List<SandboxExec> AllExecs { get; } = new();
+
+        /// <summary>argv lists captured from each claude / agent-binary invocation, in order.</summary>
+        public List<IReadOnlyList<string>> ClaudeInvocations { get; } = new();
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            // The base runner runs auxiliary execs (auth materialisation,
+            // preempt hooks etc); only count actual agent-binary calls so the
+            // ClaudeInvocations count is meaningful regardless of base-class
+            // bookkeeping.
+            if (exec.Argv.Count > 0
+                && (exec.Argv[0] == ClaudeAgentRunner.DefaultBinary || exec.Argv[0] == "fake-agent"))
+            {
+                ClaudeInvocations.Add(exec.Argv);
+                return Task.FromResult(onClaudeCall(ClaudeInvocations.Count));
+            }
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// CLI-base subclass that does NOT opt into session resume — used to prove
+    /// the legacy retry path is preserved for runners whose CLI has no
+    /// <c>--resume</c> mode. Reuses an AgentKind that the legacy
+    /// <see cref="AgentSuspendResilience"/> already opted into so the
+    /// transient-network retry path engages and we can observe argv stability
+    /// across attempts.
+    /// </summary>
+    private sealed class NonResumableTestRunner : CliAgentRunnerBase
+    {
+        public override AgentKind Kind { get; } = new("opencode");
+
+        protected override AgentInvocation BuildInvocation(
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            bool captureStructuredStream = false)
+            => new(["fake-agent", "run"], Stdin: prompt);
+    }
+}
