@@ -23,8 +23,56 @@ public interface IAgentSmokeProbe
     Task<AgentSmokeResult> SmokeTestAsync(AgentCredential credential, CancellationToken ct);
 }
 
-/// <summary>Result of a single credential smoke test run.</summary>
-public sealed record AgentSmokeResult(bool Ok, string? FailureReason, TimeSpan Duration);
+/// <summary>
+/// Classification of a smoke-test failure for routing decisions and operator
+/// alerting. A persistent failure is one the orchestrator cannot recover from
+/// on its own — auth/credential rejection, missing binary, malformed bundle —
+/// and benching the agent until an operator acts is correct. A transient
+/// failure is a network blip, 5xx, or timeout where retrying later is the
+/// right move. <c>None</c> is set when the probe passed; <c>Unknown</c> is
+/// the default for failures whose nature cannot be determined (e.g. an HTTP
+/// status outside the buckets we classify) so consumers can still treat them
+/// as the more conservative "retry later".
+///
+/// <para>The distinction matters because a persistent failure dressed up as
+/// transient leaves the agent benched indefinitely with no operator-visible
+/// signal — the periodic sweep keeps retrying, the router keeps falling
+/// through, and the throughput collapse is silent. The webhook /
+/// <c>AuditLog.AgentSmokePersistentlyFailed</c> path raises the alarm only
+/// when the category is <see cref="Persistent"/>, so the noise floor stays low.</para>
+/// </summary>
+public enum SmokeFailureCategory
+{
+    /// <summary>Probe passed — no failure to classify.</summary>
+    None = 0,
+    /// <summary>Network blip, timeout, 5xx, or other server-side error worth retrying.</summary>
+    Transient = 1,
+    /// <summary>
+    /// Auth/credential rejection, missing binary, malformed credential bundle,
+    /// or any failure that will keep failing until an operator re-authorizes
+    /// the agent. Surfaces to operators via <c>agent.smoke_failed</c> with
+    /// <c>Category=persistent</c> so dashboards and runbooks can distinguish
+    /// "fix this now" from "wait it out".
+    /// </summary>
+    Persistent = 2,
+    /// <summary>Failure shape we cannot confidently bucket — treated as transient by retries.</summary>
+    Unknown = 3,
+}
+
+/// <summary>
+/// Result of a single credential smoke test run. <see cref="Category"/>
+/// distinguishes transient (worth retrying) from persistent (operator action
+/// required) failures so the orchestrator does not silently bench a healthy-
+/// quota agent because of a credential expiry. The default of
+/// <see cref="SmokeFailureCategory.None"/> is correct for the <c>Ok=true</c>
+/// path; producers must set <see cref="SmokeFailureCategory.Transient"/> or
+/// <see cref="SmokeFailureCategory.Persistent"/> on failure.
+/// </summary>
+public sealed record AgentSmokeResult(
+    bool Ok,
+    string? FailureReason,
+    TimeSpan Duration,
+    SmokeFailureCategory Category = SmokeFailureCategory.None);
 
 /// <summary>
 /// Runs a single host-side credential smoke probe on demand. This is the

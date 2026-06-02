@@ -35,11 +35,22 @@ public sealed record SandboxLeakDetails
 /// fast-fail trips (which contain the phrase
 /// <c>"fast-fail circuit breaker"</c>); <see cref="Reason"/> is null on the
 /// <c>agent.smoke_recovered</c> variant.
+///
+/// <para><see cref="Category"/> distinguishes transient failures (network
+/// blip, 5xx, timeout — keep retrying) from persistent ones (auth /
+/// credential expiry / missing binary — operator must re-authorize). Routing
+/// to a separate "operator action required" channel is the only way to
+/// prevent a healthy-quota agent (e.g. gemini at 100%) from being
+/// indefinitely benched by a credential failure that the retry loop will
+/// never resolve. Defaults to <see cref="SmokeFailureCategory.Unknown"/> on
+/// the recovered variant so receivers don't have to special-case "Reason is
+/// null implies category" — the field is always meaningful.</para>
 /// </summary>
 public sealed record AgentSmokeFailedDetails
 {
     public required string AgentKind { get; init; }
     public string? Reason { get; init; }
+    public SmokeFailureCategory Category { get; init; } = SmokeFailureCategory.Unknown;
     public DateTimeOffset OccurredAt { get; init; } = DateTimeOffset.UtcNow;
 }
 

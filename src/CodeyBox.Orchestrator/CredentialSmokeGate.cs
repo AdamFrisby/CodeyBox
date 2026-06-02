@@ -87,12 +87,13 @@ public sealed class CredentialSmokeGate
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            return new AgentSmokeResult(false, "timeout", TimeSpan.Zero);
+            return new AgentSmokeResult(false, "timeout", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Smoke probe for {Agent} threw unexpectedly", probe.Kind.Value);
-            return new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero);
+            return new AgentSmokeResult(
+                false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
     }
 }

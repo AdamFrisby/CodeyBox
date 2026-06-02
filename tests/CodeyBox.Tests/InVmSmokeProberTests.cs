@@ -866,6 +866,113 @@ public sealed class InVmSmokeProberTests
         Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
     }
 
+    // ── Category classification on the in-VM probe path ──────────────────
+    //
+    // The Gemini bench-loop production incident traced to "transient: try
+    // later" being applied to every smoke failure, so a persistent
+    // credential / missing-binary fault looked indistinguishable from a
+    // network blip and the agent stayed benched indefinitely. The fix routes
+    // every in-VM verdict through SmokeFailureCategory so persistent failures
+    // raise an operator alert and transient ones continue to retry. These
+    // tests pin the load-bearing classification at the in-VM source: swapping
+    // Persistent ↔ Transient, defaulting to None on a failure, or returning
+    // Unknown on the wrong path would reintroduce the silent-bench bug.
+
+    [Fact]
+    public async Task RunSmokeSteps_NonZeroExit_IsClassifiedPersistent()
+    {
+        // The load-bearing branch the production incident traced to: any
+        // non-zero exit from an in-VM smoke step (binary missing on PATH, auth
+        // rejection, --version returning 1) must be tagged Persistent so the
+        // operator-alert / persistent-webhook path fires. Tagging Transient
+        // would reproduce the indefinite-bench bug; tagging None would leave
+        // the agent Available despite the failure.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "command not found"));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
+
+        var result = await prober.ProbeAgentAsync(
+            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.False(result!.Ok);
+        Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
+        // The registry encodes the category in the reason tag, so the router
+        // log / /concurrency surface it alongside the message.
+        Assert.Contains("[persistent]", registry.GetAvailability(AgentKind.Cursor).Reason);
+    }
+
+    [Fact]
+    public async Task RunSmokeSteps_AllStepsZeroExit_IsClassifiedNone()
+    {
+        // Contrast for the above: a passing probe must carry None (not
+        // Unknown or Transient), so a recovered-variant webhook does not
+        // inherit a leftover failure category from an earlier emission.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var prober = Build(provider, NewRegistry(), NewCache(), new FakeBaselineResolver("base-A"));
+
+        var result = await prober.ProbeAgentAsync(
+            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result!.Ok);
+        Assert.Equal(SmokeFailureCategory.None, result.Category);
+    }
+
+    [Fact]
+    public async Task BenchTransientFault_StepTimeout_IsClassifiedTransient()
+    {
+        // The transient-fault arm of the classification: a step timeout is
+        // infra flakiness, NOT operator-actionable. The fail-closed dispatch
+        // gate still benches the agent (so an unverified CLI is not routable)
+        // but the verdict must carry Transient so the periodic sweep clears it
+        // on recovery rather than paging the operator.
+        var provider = new HangingSandboxProvider();
+        var registry = NewRegistry();
+        var prober = new InVmSmokeProber(
+            provider,
+            new FakeBaselineResolver("base-A"),
+            new ConstantCredentialProvider(CursorCred),
+            [new CursorInVmSmokeProbe()],
+            registry,
+            NewCache(),
+            new NullWebhookDispatcher(),
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                SweepIntervalSeconds = 0,
+                StepTimeoutSeconds = 0, // immediate-timeout for deterministic test
+                FailClosedOnProbeFault = true,
+            },
+            NullLogger<InVmSmokeProber>.Instance);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("[transient]", av.Reason);
+    }
+
+    [Fact]
+    public async Task BenchTransientFault_CredentialResolutionFault_IsClassifiedTransient()
+    {
+        // Companion to the timeout case for the other transient-fault catch in
+        // ProbeAgentAsync (credential resolution): a credential-store fault is
+        // not an agent fault, so the bench (under fail-closed) must be tagged
+        // Transient so it clears on recovery rather than paging the operator.
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: new ThrowingCredentialProvider());
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("[transient]", av.Reason);
+    }
+
     [Fact]
     public async Task EnsureProbedAsync_UnexpectedException_DefaultFailClosed_NeverThrows_AndBenches()
     {

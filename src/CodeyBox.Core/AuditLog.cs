@@ -580,9 +580,31 @@ public static class AuditLog
                 agent.Value, (long)duration.TotalMilliseconds);
 
     public static void AgentSmokeFailed(AgentKind agent, string? reason, TimeSpan duration) =>
-        Audit("agent.smoke_failed")
-            .Warning("Agent {Agent} credential smoke test failed in {DurationMs}ms: {Reason}",
-                agent.Value, (long)duration.TotalMilliseconds, reason);
+        AgentSmokeFailed(agent, reason, duration, SmokeFailureCategory.Unknown);
+
+    public static void AgentSmokeFailed(
+        AgentKind agent, string? reason, TimeSpan duration, SmokeFailureCategory category)
+    {
+        // Persistent failures must be loud at the WRN level even when the
+        // probe has already been benched for hours, because the only signal an
+        // operator gets is the log line — silent retry-on-transient is the
+        // bug this classification exists to fix. Transient/Unknown stay at WRN
+        // (existing contract) but carry the category for downstream filters.
+        if (category == SmokeFailureCategory.Persistent)
+        {
+            Audit("agent.smoke_failed")
+                .Warning(
+                    "Agent {Agent} credential smoke test failed PERSISTENTLY in {DurationMs}ms " +
+                    "(operator action required — re-authorize {Agent}): {Reason}",
+                    agent.Value, (long)duration.TotalMilliseconds, agent.Value, reason);
+        }
+        else
+        {
+            Audit("agent.smoke_failed")
+                .Warning("Agent {Agent} credential smoke test failed in {DurationMs}ms ({Category}): {Reason}",
+                    agent.Value, (long)duration.TotalMilliseconds, category, reason);
+        }
+    }
 
     /// <summary>
     /// Emitted when a Claude CLI invocation surfaced a 401 Unauthorized from

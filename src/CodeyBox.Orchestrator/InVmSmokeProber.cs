@@ -334,7 +334,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private AgentSmokeResult? BenchTransientFaultIfRequested(AgentKind kind, string reason, bool bench)
     {
         if (!bench) return null;
-        var result = new AgentSmokeResult(false, $"in-VM probe inconclusive: {reason}", TimeSpan.Zero);
+        var result = new AgentSmokeResult(
+            false, $"in-VM probe inconclusive: {reason}", TimeSpan.Zero, SmokeFailureCategory.Transient);
         _availability.MarkSmokeResult(kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
         _log.LogWarning(
             "In-VM smoke gate (fail-closed): benched {Agent} on inconclusive probe ({Reason}); will re-probe next sweep/dispatch",
@@ -367,12 +368,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             {
                 sw.Stop();
                 var hint = step.FailureHint ?? (step.Argv.Count > 0 ? step.Argv[0] : "step");
-                return new AgentSmokeResult(false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed);
+                // exit 127 = binary not found (operator must install / fix PATH);
+                // any other nonzero exit from a smoke step (e.g. --version
+                // returning 1 due to auth failure) is also operator-actionable —
+                // the binary IS launching, so the bench is not a network blip.
+                return new AgentSmokeResult(
+                    false, $"{hint} (exit {exec.ExitCode})", sw.Elapsed, SmokeFailureCategory.Persistent);
             }
         }
 
         sw.Stop();
-        return new AgentSmokeResult(true, null, sw.Elapsed);
+        return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
     }
 
     private SandboxSpec BuildSpec(AgentCredential? credential, string baselineRef)
@@ -407,7 +413,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         if (result.Ok)
             AuditLog.AgentSmokeSucceeded(kind, result.Duration);
         else
-            AuditLog.AgentSmokeFailed(kind, result.FailureReason, result.Duration);
+            AuditLog.AgentSmokeFailed(kind, result.FailureReason, result.Duration, result.Category);
 
         await EmitTransitionWebhookAsync(kind, result, transition);
     }
@@ -433,6 +439,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                     {
                         AgentKind = kind.Value,
                         Reason = result.FailureReason,
+                        Category = result.Category,
                     },
                 }, CancellationToken.None);
             }
@@ -445,6 +452,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                     {
                         AgentKind = kind.Value,
                         Reason = null,
+                        Category = SmokeFailureCategory.None,
                     },
                 }, CancellationToken.None);
             }
