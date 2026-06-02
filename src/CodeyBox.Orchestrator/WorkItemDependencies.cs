@@ -221,4 +221,89 @@ public static class WorkItemDependencies
     /// </summary>
     public static Dictionary<WorkItemId, WorkItemState> BuildStateMap(IReadOnlyList<WorkItem> items)
         => items.ToDictionary(i => i.Id, i => i.State);
+
+    /// <summary>
+    /// Returns every Cancelled item that was cascade-cancelled SOLELY because
+    /// of <paramref name="recoveredId"/> (directly or transitively through
+    /// other ParentCascaded items in the same chain). These are descendants
+    /// the watchdog / recovery path should restore to Queued when the
+    /// chain-head is recovered — otherwise they remain silently stranded.
+    ///
+    /// <para>
+    /// "Solely because of <paramref name="recoveredId"/>" means: every entry
+    /// in the item's <see cref="WorkItem.DependsOn"/> either equals
+    /// <paramref name="recoveredId"/>, or is itself in this returned set, or
+    /// is in a satisfying state (<see cref="SatisfyingStates"/>). If ANY
+    /// dependency is in a terminal-but-not-satisfying state (e.g. Failed,
+    /// AuditFailed, MergeConflictResolutionFailed) the item is not restored —
+    /// it has a real blocker beyond the recovered parent.
+    /// </para>
+    ///
+    /// <para>
+    /// Items whose <see cref="WorkItem.CancellationReason"/> is not
+    /// <see cref="WorkItemCancellationReason.ParentCascaded"/> are excluded:
+    /// operator-cancelled items must not be quietly resurrected.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<WorkItem> FindDescendantsToRestore(
+        WorkItemId recoveredId,
+        IReadOnlyList<WorkItem> allItems)
+    {
+        var byId = allItems.ToDictionary(i => i.Id);
+        var toRestore = new Dictionary<WorkItemId, WorkItem>();
+
+        // Repeatedly scan for ParentCascaded items whose every dependency is
+        // either the recovered head, an item already queued for restoration,
+        // or a satisfying state. Iterate to a fixed point so a chain (A → B → C)
+        // restores B once A is in the set, then restores C once B is.
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var item in allItems)
+            {
+                if (toRestore.ContainsKey(item.Id)) continue;
+                if (item.State != WorkItemState.Cancelled) continue;
+                if (item.CancellationReason != WorkItemCancellationReason.ParentCascaded) continue;
+                if (item.DependsOn.Count == 0) continue;
+
+                bool linksToRecovered = false;
+                bool allDepsRestorable = true;
+                foreach (var depId in item.DependsOn)
+                {
+                    if (depId == recoveredId)
+                    {
+                        linksToRecovered = true;
+                        continue;
+                    }
+                    if (toRestore.ContainsKey(depId))
+                    {
+                        linksToRecovered = true;
+                        continue;
+                    }
+                    if (!byId.TryGetValue(depId, out var dep))
+                    {
+                        allDepsRestorable = false;
+                        break;
+                    }
+                    if (SatisfyingStates.Contains(dep.State)) continue;
+
+                    // Any other state — Failed, AuditFailed, MergeConflictResolutionFailed,
+                    // Cancelled (OperatorRequested), AbandonedAfterRecoveryAttempts, an
+                    // unrelated still-running item, etc. — means this descendant has a
+                    // blocker beyond the recovered head; leave it parked.
+                    allDepsRestorable = false;
+                    break;
+                }
+
+                if (linksToRecovered && allDepsRestorable)
+                {
+                    toRestore[item.Id] = item;
+                    changed = true;
+                }
+            }
+        } while (changed);
+
+        return toRestore.Values.ToList();
+    }
 }

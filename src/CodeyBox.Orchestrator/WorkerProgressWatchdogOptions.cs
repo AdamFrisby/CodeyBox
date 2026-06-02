@@ -1,0 +1,73 @@
+namespace CodeyBox.Orchestrator;
+
+/// <summary>
+/// Tuning knobs for the worker-progress watchdog — a lifecycle-wide progress
+/// enforcer that supplements <see cref="DeadWorkerOptions"/> + <c>WorkTimeout</c>.
+/// Bind under <c>CodeyBox:WorkerProgressWatchdog</c>. Hot-reloadable: every
+/// sweep resolves the current value via the registered accessor.
+///
+/// <para>
+/// Failure mode covered: a worker keeps heartbeating yet its work item makes
+/// no progress (item.updatedAt frozen AND no new agent-stream activity). The
+/// dead-worker reaper only catches workers whose heartbeat went stale, and
+/// <c>WorkTimeout</c> only fences the agent subprocess — neither covers the
+/// post-agent commit/transition step, nor the pre-agent provisioning step.
+/// </para>
+/// </summary>
+public sealed class WorkerProgressWatchdogOptions
+{
+    /// <summary>
+    /// Wall-clock window without observed progress (item.updatedAt advancing
+    /// OR the newest agent-stream <c>*.jsonl</c> mtime advancing) before a
+    /// bound worker is considered wedged. Heartbeat does NOT count as
+    /// progress. Default 30 min. Set to <see cref="TimeSpan.Zero"/> to
+    /// disable the watchdog entirely.
+    /// </summary>
+    public TimeSpan ProgressTimeout { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>How often the watchdog sweep runs. Default 60 s.</summary>
+    public TimeSpan CheckInterval { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// When true, a wedged worker is automatically disposed and its item
+    /// re-queued from the appropriate recoverable resume state. When false,
+    /// the item is parked at <see cref="CodeyBox.Core.WorkItemState.NeedsOperatorInput"/>
+    /// with a diagnostic <c>LastError</c> so an operator can triage. Default
+    /// true — autonomous-delivery posture; the dispatch queue keeps moving.
+    /// </summary>
+    public bool AutoRecover { get; set; } = true;
+
+    /// <summary>
+    /// Bounded timeout for the post-agent commit/branch-push/state-transition
+    /// step. The agent subprocess already lives inside <c>WorkTimeout</c>;
+    /// this fences the work the pipeline does AFTER the agent exits so a hang
+    /// in <c>git commit</c> / <c>git push</c> / <c>store.UpdateAsync</c> fails
+    /// the item within bounded time instead of holding the pool slot
+    /// indefinitely. Default 10 min.
+    /// </summary>
+    public TimeSpan PostAgentTransitionTimeout { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Validates the configured values. Throws
+    /// <see cref="InvalidOperationException"/> on misconfiguration.
+    /// </summary>
+    public void Validate()
+    {
+        if (ProgressTimeout < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ProgressTimeout ({ProgressTimeout}) must be >= 0.");
+
+        if (CheckInterval <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:CheckInterval ({CheckInterval}) must be > 0.");
+
+        if (PostAgentTransitionTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:PostAgentTransitionTimeout ({PostAgentTransitionTimeout}) must be > 0.");
+
+        if (ProgressTimeout > TimeSpan.Zero && ProgressTimeout < CheckInterval)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ProgressTimeout ({ProgressTimeout.TotalSeconds}s) must be >= CheckInterval ({CheckInterval.TotalSeconds}s) " +
+                "so a tick can observe at least one full progress window before tripping.");
+    }
+}

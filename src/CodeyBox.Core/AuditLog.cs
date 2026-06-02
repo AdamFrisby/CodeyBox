@@ -714,6 +714,77 @@ public static class AuditLog
             .Warning("Dead worker {WorkerId}: work item {WorkItemId} exceeded MaxRecoveryAttempts at attempt {Attempt}; transitioned to Failed",
                 workerId, itemId.ToString(), attempt);
 
+    /// <summary>
+    /// Emitted when the progress watchdog detects a bound worker whose item
+    /// has made no progress (item.updatedAt frozen, no new stream activity)
+    /// for the configured window, despite a fresh heartbeat. Diagnoses the
+    /// "agent completed but pipeline never transitioned" wedge and the
+    /// "pre-agent setup hung before any stream was written" wedge.
+    /// </summary>
+    public static void WorkItemWatchdogStuck(
+        WorkItemId itemId,
+        string workerId,
+        WorkItemState state,
+        long sinceProgressSeconds,
+        string? lastStreamEvent) =>
+        Audit("work_item.watchdog_stuck")
+            .Warning(
+                "Watchdog: work item {WorkItemId} (worker {WorkerId}, state {State}) made no progress for {SinceProgressSeconds}s; last stream event: {LastStreamEvent}",
+                itemId.ToString(), workerId, state.ToString(), sinceProgressSeconds, lastStreamEvent ?? "<none>");
+
+    /// <summary>
+    /// Emitted when the watchdog auto-recovers a wedged item: pool slot
+    /// released, item re-queued from its recoverable resume state, and any
+    /// dependents that were cascade-cancelled because of this parent are
+    /// restored.
+    /// </summary>
+    public static void WorkItemWatchdogRecovered(
+        WorkItemId itemId,
+        string workerId,
+        WorkItemState fromState,
+        WorkItemState toState,
+        int dependentsRestored) =>
+        Audit("work_item.watchdog_recovered")
+            .Warning(
+                "Watchdog: recovered work item {WorkItemId} from worker {WorkerId} {FromState} → {ToState}; restored {DependentsRestored} cascade-cancelled dependent(s)",
+                itemId.ToString(), workerId, fromState.ToString(), toState.ToString(), dependentsRestored);
+
+    /// <summary>
+    /// Emitted when the watchdog detects a wedge but <c>AutoRecover=false</c>:
+    /// the item is parked at NeedsOperatorInput with a diagnostic LastError.
+    /// </summary>
+    public static void WorkItemWatchdogParked(
+        WorkItemId itemId,
+        string workerId,
+        WorkItemState fromState) =>
+        Audit("work_item.watchdog_parked")
+            .Warning(
+                "Watchdog: parked work item {WorkItemId} (worker {WorkerId}, state {FromState}) for operator triage; auto-recover disabled",
+                itemId.ToString(), workerId, fromState.ToString());
+
+    /// <summary>
+    /// Emitted when the watchdog restores a dependent that had been
+    /// cascade-cancelled because <paramref name="parentId"/> was previously
+    /// cancelled. Inverse of <see cref="WorkItemDependentCancelled"/>.
+    /// </summary>
+    public static void WorkItemDependentRestored(WorkItemId id, WorkItemId parentId) =>
+        Audit("work_item.dependent_restored")
+            .Information(
+                "Work item {WorkItemId} restored to Queued: parent {ParentWorkItemId} recovered, every dependency now satisfiable",
+                id.ToString(), parentId.ToString());
+
+    /// <summary>
+    /// Emitted when the pipeline's post-agent commit/branch-push/state-
+    /// transition step exceeds <c>PostAgentTransitionTimeout</c>. The item is
+    /// failed within bounded time so the pool slot is released rather than
+    /// held indefinitely behind a hung git operation.
+    /// </summary>
+    public static void WorkItemPostAgentTimeout(WorkItemId itemId, string phase, long timeoutSeconds) =>
+        Audit("work_item.post_agent_timeout")
+            .Warning(
+                "Work item {WorkItemId} post-agent step '{Phase}' exceeded {TimeoutSeconds}s; failing item to release pool slot",
+                itemId.ToString(), phase, timeoutSeconds);
+
     // ── Budget caps ──────────────────────────────────────────────────────────
 
     public static void BudgetDeferred(WorkItemId id, ProjectId projectId, string reason) =>

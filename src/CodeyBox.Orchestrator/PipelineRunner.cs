@@ -72,6 +72,15 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
+    // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
+    // hang in store.UpdateAsync (sqlite write contention) or
+    // webhooks.PublishAsync (slow remote sink) fails the item within bounded
+    // time instead of holding the pool slot indefinitely. Resolved on every
+    // call so hot-reload edits to PostAgentTransitionTimeout take effect on
+    // the next transition without restarting the pipeline. Null when DI does
+    // not wire the watchdog (legacy / minimal test fixtures) — in that case
+    // transitions run unbounded as before.
+    private readonly Func<WorkerProgressWatchdogOptions>? _watchdogOptionsAccessor;
     // Hot-reloadable feature flag for the between-iteration incremental
     // rebase. Optional: when null the feature is disabled regardless of
     // config — tests and embeddings that don't wire the snapshot keep the
@@ -194,7 +203,8 @@ public sealed class PipelineRunner : IPipelineRunner
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -274,6 +284,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 credentialFileMaterialiser: MaterialiseCredentialFilesAsync);
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
+        _watchdogOptionsAccessor = watchdogOptionsAccessor;
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
@@ -7948,29 +7959,43 @@ Original merge-phase failure (for context):
 
     private async Task Transition(WorkItem item, WorkItemState state, CancellationToken ct, Project? project = null)
     {
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var next = current.With(state);
-        await _store.UpdateAsync(next, ct);
-        _log.LogInformation("Work item {Id} → {State}", item.Id, state);
-        AuditLog.WorkItemTransitioned(item.Id, state.ToString());
-        CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
-        if (project is not null)
+        await RunBoundedPostAgentAsync(item.Id, $"transition-to-{state}", ct, async transitionCt =>
         {
-            var usage = await TryGetUsageSummaryAsync(item.Id);
-            var revision = await BuildTerminalRevisionAsync(next, ct);
-            await _webhooks.PublishAsync(new WebhookEvent
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var next = current.With(state);
+            await _store.UpdateAsync(next, transitionCt);
+            _log.LogInformation("Work item {Id} → {State}", item.Id, state);
+            AuditLog.WorkItemTransitioned(item.Id, state.ToString());
+            CodeyBoxMeters.PipelineTransitions.Add(1, new KeyValuePair<string, object?>("to_state", state.ToString()));
+            if (project is not null)
             {
-                Event = StateToEventName(state),
-                WorkItem = next,
-                Project = project,
-                Usage = usage?.Iteration,
-                UsageTotal = usage?.Total,
-                PromptRevision = revision?.PromptRevision,
-                RevisionAtCompletion = revision?.RevisionAtCompletion,
-                RevisionMatches = revision?.RevisionMatches,
-            }, CancellationToken.None);
-        }
+                var usage = await TryGetUsageSummaryAsync(item.Id);
+                var revision = await BuildTerminalRevisionAsync(next, transitionCt);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = StateToEventName(state),
+                    WorkItem = next,
+                    Project = project,
+                    Usage = usage?.Iteration,
+                    UsageTotal = usage?.Total,
+                    PromptRevision = revision?.PromptRevision,
+                    RevisionAtCompletion = revision?.RevisionAtCompletion,
+                    RevisionMatches = revision?.RevisionMatches,
+                }, CancellationToken.None);
+            }
+        });
     }
+
+    /// <summary>
+    /// Wraps a post-agent step (state transition, branch push, commit import)
+    /// in <see cref="WorkerProgressWatchdogOptions.PostAgentTransitionTimeout"/>
+    /// so a hang in any of <c>store.UpdateAsync</c> / <c>webhooks.PublishAsync</c>
+    /// / git host calls fails the item within bounded time instead of holding
+    /// the worker-pool slot indefinitely.
+    /// </summary>
+    internal Task RunBoundedPostAgentAsync(
+        WorkItemId itemId, string stepName, CancellationToken ct, Func<CancellationToken, Task> body)
+        => PostAgentTransitionBound.RunAsync(_watchdogOptionsAccessor, itemId, stepName, ct, body);
 
     /// <summary>
     /// Adds revision-attribution fields to webhook payloads on terminal-state
@@ -8024,58 +8049,61 @@ Original merge-phase failure (for context):
 
     private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
     {
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        WorkItem next;
-        if (failureKind == "quota")
+        await RunBoundedPostAgentAsync(item.Id, "transition-failed", ct, async transitionCt =>
         {
-            var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, ct);
-            next = current.With(WorkItemState.Failed, error,
-                failureKind: failureKind,
-                quotaResetAt: effectiveResetAt,
-                cancellationSource: cancellationSource) with
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            WorkItem next;
+            if (failureKind == "quota")
             {
-                NextQuotaRetryAt = effectiveResetAt,
+                var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, transitionCt);
+                next = current.With(WorkItemState.Failed, error,
+                    failureKind: failureKind,
+                    quotaResetAt: effectiveResetAt,
+                    cancellationSource: cancellationSource) with
+                {
+                    NextQuotaRetryAt = effectiveResetAt,
+                };
+            }
+            else
+            {
+                next = current.With(WorkItemState.Failed, error,
+                    failureKind: failureKind,
+                    quotaResetAt: quotaResetAt,
+                    cancellationSource: cancellationSource);
+            }
+
+            // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
+            var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
+                return;
+            }
+
+            if (failureKind == "quota" && _retryScheduler is not null)
+            {
+                await _retryScheduler.NotifyQuotaFailureAsync(next);
+            }
+
+            _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
+            AuditLog.WorkItemFailed(item.Id, error);
+            var effectiveProject = project ?? new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = item.ProjectId.Value,
+                RepositoryUrl = string.Empty,
             };
-        }
-        else
-        {
-            next = current.With(WorkItemState.Failed, error,
-                failureKind: failureKind,
-                quotaResetAt: quotaResetAt,
-                cancellationSource: cancellationSource);
-        }
-
-        // Use TryUpdateIfStateAsync to avoid overwriting a state change that happened concurrently (e.g. cancellation via API).
-        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
-        if (!updated)
-        {
-            _log.LogInformation("Work item {Id} state changed concurrently; skipping Failed transition", item.Id);
-            return;
-        }
-
-        if (failureKind == "quota" && _retryScheduler is not null)
-        {
-            await _retryScheduler.NotifyQuotaFailureAsync(next);
-        }
-
-        _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
-        AuditLog.WorkItemFailed(item.Id, error);
-        var effectiveProject = project ?? new Project
-        {
-            Id = item.ProjectId,
-            DisplayName = item.ProjectId.Value,
-            RepositoryUrl = string.Empty,
-        };
-        var failedRevision = await BuildTerminalRevisionAsync(next, CancellationToken.None);
-        await _webhooks.PublishAsync(new WebhookEvent
-        {
-            Event = "work_item.failed",
-            WorkItem = next,
-            Project = effectiveProject,
-            PromptRevision = failedRevision?.PromptRevision,
-            RevisionAtCompletion = failedRevision?.RevisionAtCompletion,
-            RevisionMatches = failedRevision?.RevisionMatches,
-        }, CancellationToken.None);
+            var failedRevision = await BuildTerminalRevisionAsync(next, CancellationToken.None);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.failed",
+                WorkItem = next,
+                Project = effectiveProject,
+                PromptRevision = failedRevision?.PromptRevision,
+                RevisionAtCompletion = failedRevision?.RevisionAtCompletion,
+                RevisionMatches = failedRevision?.RevisionMatches,
+            }, CancellationToken.None);
+        });
     }
 
     /// <summary>
