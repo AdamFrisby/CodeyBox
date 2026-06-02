@@ -10,6 +10,8 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -21,7 +23,7 @@ namespace CodeyBox.Tests;
 /// item Failed. The 3-member exhaustion case parks the item in
 /// <see cref="WorkItemState.WaitingForQuotaReset"/>.
 /// </summary>
-[Collection("Pipeline integration")]
+[Collection("GlobalSerilog")]
 public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 {
     private readonly string _workspace;
@@ -62,6 +64,76 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             ("agent.kind", "codex"), ("phase", "work"), ("outcome", "error")));
         Assert.True(metrics.Any("codeybox.agent.invocations",
             ("agent.kind", "claude"), ("phase", "work"), ("outcome", "success")));
+    }
+
+    [Fact]
+    public async Task Codex_ExhaustsSessionResume_FallsBackToClaude_EmitsAuditHistoryAndMetric()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+            using var fix = BuildPipeline(seed);
+
+            fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+                AgentKind.Codex,
+                maxResumeAttempts: 2,
+                new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+            fix.Claude.WorkPlan.Enqueue(new FileWrite("resume.txt", "recovered by fallback"));
+
+            using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+            var item = NewItem(initialAgent: AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+            Assert.True(fix.Codex.CallCount >= 1);
+            Assert.Equal(1, fix.Claude.CallCount);
+
+            var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+            var fallback = Assert.Single(history, h => h.Phase == "work");
+            Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+            Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+            Assert.Contains("exhausted 2 session resume", fallback.Reason);
+
+            var webhook = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.fallback");
+            var details = Assert.IsType<AgentFallbackDetails>(webhook.Details);
+            Assert.Equal("work", details.Phase);
+            Assert.Equal("codex", details.FromAgent);
+            Assert.Equal("claude", details.ToAgent);
+            Assert.Contains("exhausted 2 session resume", details.Reason);
+
+            Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                    ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "resume_exhausted"), ("phase", "work")),
+                "expected a codeybox.agent.fallbacks{kind=resume_exhausted} measurement for the resume-exhausted swap");
+
+            var audit = Assert.Single(sink.Events,
+                e => GetScalar<string>(e, "EventName") == "agent.resume_exhausted_fallback");
+            Assert.True(GetScalar<bool>(audit, "Audit"));
+            Assert.Equal(LogEventLevel.Warning, audit.Level);
+            Assert.Equal(item.Id.ToString(), GetScalar<string>(audit, "WorkItemId"));
+            Assert.Equal("work", GetScalar<string>(audit, "Phase"));
+            Assert.Null(GetScalar<int?>(audit, "Iteration"));
+            Assert.Equal("codex", GetScalar<string>(audit, "FromAgent"));
+            Assert.Equal("(default)", GetScalar<string>(audit, "FromModel"));
+            Assert.Equal("claude", GetScalar<string>(audit, "ToAgent"));
+            Assert.Equal("(default)", GetScalar<string>(audit, "ToModel"));
+            Assert.Contains("exhausted 2 session resume", GetScalar<string>(audit, "Reason"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
     }
 
     [Fact]
@@ -643,6 +715,19 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(phase, r.Phase);
         Assert.Equal(iteration, r.Iteration);
         Assert.Equal(outcome, r.Outcome);
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int?) && sv.Value is int i)
+            return (T)(object)(int?)i;
+        if (typeof(T) == typeof(int?) && sv.Value is null)
+            return default;
+        return default;
     }
 
     [Fact]
@@ -1979,6 +2064,9 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Queue<AgentResult> ScriptedFailures { get; } = new();
     public Queue<AgentResult> ReworkScriptedFailures { get; } = new();
     public Queue<AgentResult> MergeScriptedFailures { get; } = new();
+    public Queue<Exception> ScriptedExceptions { get; } = new();
+    public Queue<Exception> ReworkScriptedExceptions { get; } = new();
+    public Queue<Exception> MergeScriptedExceptions { get; } = new();
     public Queue<TimeSpan> WorkDelays { get; } = new();
     public Queue<TimeSpan> ReworkDelays { get; } = new();
     public Queue<TimeSpan> MergeDelays { get; } = new();
@@ -2016,6 +2104,8 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         {
             if (MergeDelays.Count > 0)
                 await Task.Delay(MergeDelays.Dequeue(), _timeProvider, ct);
+            if (MergeScriptedExceptions.Count > 0)
+                throw MergeScriptedExceptions.Dequeue();
             if (MergeScriptedFailures.Count > 0)
                 return MergeScriptedFailures.Dequeue();
 
@@ -2037,6 +2127,10 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         if (delays.Count > 0)
             await Task.Delay(delays.Dequeue(), _timeProvider, ct);
 
+        if (isRework && ReworkScriptedExceptions.Count > 0)
+            throw ReworkScriptedExceptions.Dequeue();
+        if (!isRework && ScriptedExceptions.Count > 0)
+            throw ScriptedExceptions.Dequeue();
         if (isRework && ReworkScriptedFailures.Count > 0)
             return ReworkScriptedFailures.Dequeue();
         if (!isRework && ScriptedFailures.Count > 0)
