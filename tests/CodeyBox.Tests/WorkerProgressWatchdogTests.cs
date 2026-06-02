@@ -60,17 +60,17 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         IReadOnlyList<WorkItemId>? dependsOn = null,
         WorkItemCancellationReason? cancellationReason = null,
         string? lastError = null) => new()
-    {
-        Id = WorkItemId.New(),
-        ProjectId = new ProjectId("test"),
-        Title = "t",
-        Prompt = "p",
-        State = state,
-        UpdatedAt = updatedAt,
-        DependsOn = dependsOn ?? [],
-        CancellationReason = cancellationReason,
-        LastError = lastError,
-    };
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            Title = "t",
+            Prompt = "p",
+            State = state,
+            UpdatedAt = updatedAt,
+            DependsOn = dependsOn ?? [],
+            CancellationReason = cancellationReason,
+            LastError = lastError,
+        };
 
     private async Task PlantHeartbeatingWorkerAsync(string workerId, WorkItemId itemId)
     {
@@ -221,7 +221,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     public async Task Watchdog_StuckWorkingWithPreemptCheckpoint_ResumesFromCheckpoint()
     {
         var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45))
-            with { PreemptCheckpoint = "preempt-ref/abc123" };
+            with
+        { PreemptCheckpoint = "preempt-ref/abc123" };
         await _store.CreateAsync(item);
         await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
 
@@ -451,7 +452,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         // (e.g. requeued from an old run) must not be recovered before it has
         // had a chance to make progress.
         var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromHours(2))
-            with { StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1) };
+            with
+        { StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1) };
         await _store.CreateAsync(item);
         await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
 
@@ -476,6 +478,141 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, after!.State);
         Assert.Empty(_slotReleaser.Releases);
+    }
+
+    // ── Multi-worker collateral survival (regression test) ───────────────────
+
+    [Fact]
+    public async Task Watchdog_RecoveringOneWedgedWorker_PreservesHealthyPeerRegistryRows()
+    {
+        // Regression: an earlier version of the watchdog claimed wedged workers
+        // by calling ClaimDeadWorkersAsync(now), which deletes EVERY row whose
+        // heartbeat is in the past (i.e. all healthy peers). The per-id claim
+        // must only remove the targeted wedged row.
+        var wedgedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var wedgedItem = MakeItem(WorkItemState.Working, wedgedAt);
+        await _store.CreateAsync(wedgedItem);
+
+        var healthyItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow.AddMinutes(-1));
+        await _store.CreateAsync(healthyItem);
+
+        var wedgedWorkerId = Guid.NewGuid().ToString();
+        var healthyWorkerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(wedgedWorkerId, wedgedItem.Id);
+        await PlantHeartbeatingWorkerAsync(healthyWorkerId, healthyItem.Id);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        // Only the wedged row is gone; the healthy peer's row is preserved.
+        var remaining = await _registry.ListAsync();
+        var survivor = Assert.Single(remaining);
+        Assert.Equal(healthyWorkerId, survivor.WorkerId);
+
+        // The healthy peer's item is untouched.
+        var healthyAfter = await _store.GetAsync(healthyItem.Id);
+        Assert.Equal(WorkItemState.Working, healthyAfter!.State);
+        Assert.Equal(0, healthyAfter.RecoveryAttempts);
+
+        // Only the wedged worker's slot was released.
+        var release = Assert.Single(_slotReleaser.Releases);
+        Assert.Equal(wedgedWorkerId, release.WorkerId);
+    }
+
+    [Fact]
+    public async Task Watchdog_ParkPath_PreservesHealthyPeerRegistryRows()
+    {
+        // Same regression as above, repeated for the AutoRecover=false (park)
+        // path which also used ClaimDeadWorkersAsync(now).
+        var parkOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = false,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, parkOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var wedgedItem = MakeItem(WorkItemState.Auditing, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45));
+        await _store.CreateAsync(wedgedItem);
+        var healthyItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow.AddMinutes(-1));
+        await _store.CreateAsync(healthyItem);
+        var wedgedWorkerId = Guid.NewGuid().ToString();
+        var healthyWorkerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(wedgedWorkerId, wedgedItem.Id);
+        await PlantHeartbeatingWorkerAsync(healthyWorkerId, healthyItem.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var remaining = await _registry.ListAsync();
+        var survivor = Assert.Single(remaining);
+        Assert.Equal(healthyWorkerId, survivor.WorkerId);
+    }
+
+    // ── MaxRecoveryAttempts ceiling (mirrors DeadWorkerReaper) ────────────────
+
+    [Fact]
+    public async Task Watchdog_ExceedsMaxRecoveryAttempts_TransitionsToFailed()
+    {
+        var lowCeilingOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            MaxRecoveryAttempts = 2,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, lowCeilingOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        // Already at the ceiling; the next watchdog hit will increment to 3 (> 2) and Fail.
+        var item = MakeItem(WorkItemState.Auditing, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45))
+            with
+        { RecoveryAttempts = 2 };
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(workerId, item.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(3, after.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        // Slot still released and registry row still claimed even on terminal Fail.
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
+        // Not re-enqueued — Failed items don't go back on the queue.
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_MaxRecoveryAttemptsZero_TreatsAsUnlimited()
+    {
+        var unlimitedOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            MaxRecoveryAttempts = 0,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, unlimitedOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var item = MakeItem(WorkItemState.Auditing, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45))
+            with
+        { RecoveryAttempts = 999 };
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        // 0 = unlimited → still recovers normally instead of Failing.
+        Assert.Equal(WorkItemState.WorkComplete, after!.State);
+        Assert.Equal(1000, after.RecoveryAttempts);
     }
 
     // ── Test doubles ─────────────────────────────────────────────────────────

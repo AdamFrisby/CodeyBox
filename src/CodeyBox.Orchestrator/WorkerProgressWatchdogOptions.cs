@@ -48,6 +48,19 @@ public sealed class WorkerProgressWatchdogOptions
     public TimeSpan PostAgentTransitionTimeout { get; set; } = TimeSpan.FromMinutes(10);
 
     /// <summary>
+    /// Maximum number of automatic recovery transitions before the watchdog
+    /// gives up and transitions an item to <c>Failed</c>. Mirrors
+    /// <see cref="DeadWorkerOptions.MaxRecoveryAttempts"/> so a chronically
+    /// wedging item cannot loop Working → Queued → Working forever consuming
+    /// a slot on every iteration. Watchdog recoveries share the same
+    /// <c>RecoveryAttempts</c> budget as reaper recoveries — they both
+    /// represent a forced state transition driven by a stuck worker, just
+    /// detected via different signals (stale heartbeat vs. stalled progress).
+    /// Default 10.
+    /// </summary>
+    public int MaxRecoveryAttempts { get; set; } = 10;
+
+    /// <summary>
     /// Validates the configured values. Throws
     /// <see cref="InvalidOperationException"/> on misconfiguration.
     /// </summary>
@@ -69,5 +82,9 @@ public sealed class WorkerProgressWatchdogOptions
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerProgressWatchdog:ProgressTimeout ({ProgressTimeout.TotalSeconds}s) must be >= CheckInterval ({CheckInterval.TotalSeconds}s) " +
                 "so a tick can observe at least one full progress window before tripping.");
+
+        if (MaxRecoveryAttempts < 0)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:MaxRecoveryAttempts ({MaxRecoveryAttempts}) must be >= 0 (0 = unlimited).");
     }
 }

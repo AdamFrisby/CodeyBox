@@ -191,14 +191,17 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private async Task RecoverStuckWorkerAsync(
         WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, CancellationToken ct)
     {
-        // Atomically pull the wedged worker out of the registry first so a
-        // concurrent reaper or watchdog tick cannot try to recover the same
-        // worker twice. Past-stamp the cutoff to "now" so ClaimDeadWorkersAsync
-        // claims every stale row including this one.
-        IReadOnlyList<WorkerRegistration> claimed;
+        // Atomically pull THIS wedged worker (and only this one) out of the
+        // registry so a concurrent reaper or watchdog tick cannot recover the
+        // same worker twice. A cutoff-based ClaimDeadWorkersAsync would also
+        // delete every healthy peer whose heartbeat is older than the chosen
+        // instant — i.e. all of them, since heartbeats are by definition in
+        // the past — silently disabling the dead-worker safety net for those
+        // peers. Per-id claim is the only correct shape here.
+        WorkerRegistration? claimed;
         try
         {
-            claimed = await _registry.ClaimDeadWorkersAsync(DateTimeOffset.UtcNow, ct);
+            claimed = await _registry.TryClaimWorkerAsync(worker.WorkerId, ct);
         }
         catch (Exception ex)
         {
@@ -208,11 +211,10 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             return;
         }
 
-        var rowClaimed = claimed.Any(w => string.Equals(w.WorkerId, worker.WorkerId, StringComparison.Ordinal));
-        if (!rowClaimed)
+        if (claimed is null)
         {
             _log.LogDebug(
-                "Watchdog: wedged worker {WorkerId} was not in the claimed set (another sweep handled it); skipping",
+                "Watchdog: wedged worker {WorkerId} row was already gone (another sweep handled it); skipping",
                 worker.WorkerId);
             return;
         }
@@ -254,6 +256,57 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // work even if the heartbeat path didn't fire.
         var attempts = item.RecoveryAttempts + 1;
         var fromState = item.State;
+        var opts = _opts;
+        // MaxRecoveryAttempts <= 0 means unlimited. Only enforce when > 0.
+        // Mirrors the DeadWorkerReaper / OrchestratorService budget check so
+        // an item that wedges on every pickup eventually Fails rather than
+        // looping Working → Queued → Working forever and burning a slot per
+        // iteration. The preempt-checkpoint branch is exempt: that's a clean
+        // resume from a captured ref, not a counted recovery transition.
+        if (opts.MaxRecoveryAttempts > 0
+            && attempts > opts.MaxRecoveryAttempts
+            && !(target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)))
+        {
+            var failed = item with
+            {
+                State = WorkItemState.Failed,
+                LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
+                RecoveryAttempts = attempts,
+                StartedAt = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            await _store.UpdateAsync(failed, ct);
+            _recoveredWorkers[worker.WorkerId] = 0;
+            AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.Failed, dependentsRestored: 0);
+            _log.LogWarning(
+                "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                item.Id, worker.WorkerId, opts.MaxRecoveryAttempts);
+
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = failed,
+                    Details = new
+                    {
+                        workItemId = item.Id.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = fromState.ToString(),
+                        toState = failed.State.ToString(),
+                        reason = "watchdog progress timeout (exceeded MaxRecoveryAttempts)",
+                        sinceProgressSeconds,
+                        recoveryAttempt = attempts,
+                        maxRecoveryAttempts = opts.MaxRecoveryAttempts,
+                    },
+                }, CancellationToken.None);
+            }
+
+            return;
+        }
+
         WorkItem updated;
         if (target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
         {
@@ -360,10 +413,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private async Task ParkStuckItemAsync(
         WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, CancellationToken ct)
     {
-        IReadOnlyList<WorkerRegistration> claimed;
+        // Same per-id claim shape as the recover path — see the comment there
+        // for why a cutoff-based claim would wipe healthy peers.
+        WorkerRegistration? claimed;
         try
         {
-            claimed = await _registry.ClaimDeadWorkersAsync(DateTimeOffset.UtcNow, ct);
+            claimed = await _registry.TryClaimWorkerAsync(worker.WorkerId, ct);
         }
         catch (Exception ex)
         {
@@ -372,7 +427,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 worker.WorkerId);
             return;
         }
-        if (!claimed.Any(w => string.Equals(w.WorkerId, worker.WorkerId, StringComparison.Ordinal)))
+        if (claimed is null)
             return;
 
         _slotReleaser?.TryReleaseRecoveredWorkerSlot(
