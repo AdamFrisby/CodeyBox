@@ -90,12 +90,13 @@ public sealed class StartupSmokeProbeService : IHostedService
         }
         catch (OperationCanceledException)
         {
-            result = new AgentSmokeResult(false, "timeout", TimeSpan.Zero);
+            result = new AgentSmokeResult(false, "timeout", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Startup smoke probe for {Agent} threw", probe.Kind.Value);
-            result = new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero);
+            result = new AgentSmokeResult(
+                false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
 
         _availability?.MarkSmokeResult(probe.Kind, result);
@@ -107,9 +108,9 @@ public sealed class StartupSmokeProbeService : IHostedService
         else
         {
             _log.LogWarning(
-                "Startup smoke: agent {Agent} credential check failed: {Reason}",
-                probe.Kind.Value, result.FailureReason);
-            AuditLog.AgentSmokeFailed(probe.Kind, result.FailureReason, result.Duration);
+                "Startup smoke: agent {Agent} credential check failed ({Category}): {Reason}",
+                probe.Kind.Value, result.Category, result.FailureReason);
+            AuditLog.AgentSmokeFailed(probe.Kind, result.FailureReason, result.Duration, result.Category);
 
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -118,6 +119,7 @@ public sealed class StartupSmokeProbeService : IHostedService
                 {
                     AgentKind = probe.Kind.Value,
                     Reason = result.FailureReason,
+                    Category = result.Category,
                 },
             }, CancellationToken.None);
         }

@@ -359,7 +359,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (smokeResult is { Ok: false })
             {
-                AuditLog.AgentSmokeFailed(agentKind, smokeResult.FailureReason, smokeResult.Duration);
+                AuditLog.AgentSmokeFailed(agentKind, smokeResult.FailureReason, smokeResult.Duration, smokeResult.Category);
                 await _webhooks.PublishAsync(new WebhookEvent
                 {
                     Event = "agent.smoke_failed",
@@ -369,6 +369,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         AgentKind = agentKind.Value,
                         Reason = smokeResult.FailureReason,
+                        Category = smokeResult.Category,
                     },
                 }, CancellationToken.None);
                 await TransitionFailed(item,
@@ -402,7 +403,13 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!smokeAvailability.Available)
         {
             var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
-            AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero);
+            // The exclusion category isn't carried by the availability snapshot
+            // (the registry collapses sources into a single reason string), so
+            // we default to Unknown here. The underlying probe still recorded
+            // the correct category at the source (InVmSmokeProber /
+            // PeriodicSmokeProbeService); this branch is just the dispatch-time
+            // re-rejection of an already-recorded exclusion.
+            AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero, SmokeFailureCategory.Unknown);
             await _webhooks.PublishAsync(new WebhookEvent
             {
                 Event = "agent.smoke_failed",
@@ -2173,6 +2180,9 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         AgentKind = runner.Kind.Value,
                         Reason = transition.Reason,
+                        // Fast-fail circuit-breaker exclusions are persistent
+                        // by construction (see merge-phase branch above).
+                        Category = SmokeFailureCategory.Persistent,
                     },
                 }, CancellationToken.None);
             }
@@ -5087,6 +5097,12 @@ public sealed class PipelineRunner : IPipelineRunner
                         {
                             AgentKind = chosenMergeRunner.Kind.Value,
                             Reason = transition.Reason,
+                            // Fast-fail circuit-breaker exclusions are
+                            // persistent by construction: the binary launched,
+                            // exited non-zero fast, and did so repeatedly. A
+                            // retry without operator intervention will produce
+                            // the same outcome.
+                            Category = SmokeFailureCategory.Persistent,
                         },
                     }, CancellationToken.None);
                 }

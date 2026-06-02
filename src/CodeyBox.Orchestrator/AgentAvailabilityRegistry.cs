@@ -124,11 +124,39 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             }
 
             entry.LastSmokeFailedAt = now;
-            entry.Exclusions[source] = $"smoke probe failed: {result.FailureReason ?? "unknown"}";
+            // Encode category in the reason string so downstream consumers
+            // (router log, /concurrency, audit log) can distinguish persistent
+            // (operator must re-authorize) from transient (will recover on
+            // retry) without threading a second field through every layer.
+            // Persistent is the load-bearing case: a silent "transient: try
+            // later" loop is what benched gemini for hours despite 100% quota.
+            var categoryTag = result.Category switch
+            {
+                SmokeFailureCategory.Persistent => "persistent",
+                SmokeFailureCategory.Transient => "transient",
+                SmokeFailureCategory.Unknown => "unknown",
+                _ => "unknown",
+            };
+            entry.Exclusions[source] = $"smoke probe failed [{categoryTag}]: {result.FailureReason ?? "unknown"}";
             if (!wasExcluded)
-                _log.LogWarning(
-                    "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
-                    kind.Value, now, source, entry.Exclusions[source]);
+            {
+                // Persistent smoke failures are the operator-actionable case:
+                // re-authorization (or fixing PATH / installing the binary)
+                // unblocks dispatch. Log louder so the bench is not lost in
+                // routine noise.
+                if (result.Category == SmokeFailureCategory.Persistent)
+                {
+                    _log.LogError(
+                        "Agent {Agent} smoke PERSISTENTLY FAILED at {At} (source {Source}) — operator action required: {Reason}",
+                        kind.Value, now, source, entry.Exclusions[source]);
+                }
+                else
+                {
+                    _log.LogWarning(
+                        "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
+                        kind.Value, now, source, entry.Exclusions[source]);
+                }
+            }
             return new AvailabilityTransition(
                 PreviouslyExcluded: wasExcluded,
                 NowExcluded: true,

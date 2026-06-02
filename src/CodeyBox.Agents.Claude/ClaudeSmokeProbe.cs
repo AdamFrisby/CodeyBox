@@ -51,7 +51,7 @@ public sealed class ClaudeSmokeProbe : IAgentSmokeProbe
 
             var hasAnyToken = !string.IsNullOrEmpty(oauthToken) || !string.IsNullOrEmpty(apiKey);
             if (!hasAnyToken)
-                return Fail("no token in credential bundle", sw);
+                return Fail("no token in credential bundle", sw, SmokeFailureCategory.Persistent);
 
             var client = _httpClientFactory.CreateClient("agent-smoke");
             HttpRequestMessage request;
@@ -83,31 +83,32 @@ public sealed class ClaudeSmokeProbe : IAgentSmokeProbe
                 sw.Stop();
 
                 if (response.IsSuccessStatusCode)
-                    return new AgentSmokeResult(true, null, sw.Elapsed);
+                    return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
 
                 if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                    return new AgentSmokeResult(false, "auth", sw.Elapsed);
+                    return new AgentSmokeResult(false, "auth", sw.Elapsed, SmokeFailureCategory.Persistent);
 
                 if ((int)response.StatusCode >= 500)
-                    return new AgentSmokeResult(false, "transient: try later", sw.Elapsed);
+                    return new AgentSmokeResult(false, "transient: try later", sw.Elapsed, SmokeFailureCategory.Transient);
 
-                return new AgentSmokeResult(false, $"HTTP {(int)response.StatusCode}", sw.Elapsed);
+                return new AgentSmokeResult(
+                    false, $"HTTP {(int)response.StatusCode}", sw.Elapsed, SmokeFailureCategory.Unknown);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            return Fail("timeout", sw);
+            return Fail("timeout", sw, SmokeFailureCategory.Transient);
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Claude smoke probe threw; treating as transient");
-            return Fail("transient: try later", sw);
+            return Fail("transient: try later", sw, SmokeFailureCategory.Transient);
         }
     }
 
-    private static AgentSmokeResult Fail(string reason, Stopwatch sw)
+    private static AgentSmokeResult Fail(string reason, Stopwatch sw, SmokeFailureCategory category)
     {
         sw.Stop();
-        return new AgentSmokeResult(false, reason, sw.Elapsed);
+        return new AgentSmokeResult(false, reason, sw.Elapsed, category);
     }
 }

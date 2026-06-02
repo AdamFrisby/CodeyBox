@@ -1115,9 +1115,17 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
         sp.GetRequiredService<IHttpClientFactory>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CodexSmokeProbe>()));
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    // Pass the IGeminiQuotaTokenSource (which also implements
+    // IGeminiOAuthTokenSource — same refresher instance) so the smoke probe
+    // hits Google with a freshly-refreshed access_token instead of the stale
+    // on-disk one. Without this hookup the probe parses ~/.gemini/oauth_creds.json's
+    // last-written access_token, which the gemini CLI rotates ~hourly, and the
+    // probe eventually 401s — benching a fully-usable agent because the smoke
+    // path bypassed the refresh logic the quota path already uses.
     new GeminiSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiSmokeProbe>()));
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<GeminiSmokeProbe>(),
+        sp.GetService<IGeminiQuotaTokenSource>() as IGeminiOAuthTokenSource));
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CursorSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CursorSmokeProbe>()));

@@ -50,18 +50,20 @@ public sealed class CursorSmokeProbe : IAgentSmokeProbe
             var hasAuthJson = credential.EnvironmentVariables.ContainsKey("CODEYBOX_CURSOR_AUTH_JSON");
             sw.Stop();
             if (hasAuthJson)
-                return Task.FromResult(new AgentSmokeResult(true, null, sw.Elapsed));
+                return Task.FromResult(new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None));
 
             return Task.FromResult(new AgentSmokeResult(
                 false,
                 "no Cursor credential configured (set CODEYBOX_CURSOR_AUTH_FILE or CODEYBOX_CURSOR_AUTH_JSON)",
-                sw.Elapsed));
+                sw.Elapsed,
+                SmokeFailureCategory.Persistent));
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Cursor smoke probe threw; treating as transient");
             sw.Stop();
-            return Task.FromResult(new AgentSmokeResult(false, "transient: try later", sw.Elapsed));
+            return Task.FromResult(new AgentSmokeResult(
+                false, "transient: try later", sw.Elapsed, SmokeFailureCategory.Transient));
         }
     }
 }

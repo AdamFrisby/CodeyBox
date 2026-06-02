@@ -115,12 +115,13 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            result = new AgentSmokeResult(false, "timeout", TimeSpan.Zero);
+            result = new AgentSmokeResult(false, "timeout", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Periodic smoke probe for {Agent} threw", probe.Kind.Value);
-            result = new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero);
+            result = new AgentSmokeResult(
+                false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient);
         }
 
         var transition = _availability.MarkSmokeResult(probe.Kind, result);
@@ -134,10 +135,13 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
         if (result.Ok)
             AuditLog.AgentSmokeSucceeded(kind, result.Duration);
         else
-            AuditLog.AgentSmokeFailed(kind, result.FailureReason, result.Duration);
+            AuditLog.AgentSmokeFailed(kind, result.FailureReason, result.Duration, result.Category);
 
         // Only emit webhook on edge transitions so repeated steady-state probes
-        // don't flood the bus.
+        // don't flood the bus. Persistent vs transient classification rides on
+        // the details payload (Category) — subscribers route on that, and the
+        // audit log entry escalates wording for persistent so operators see the
+        // distinction at the log layer too.
         if (!transition.PreviouslyExcluded && transition.NowExcluded)
         {
             await _webhooks.PublishAsync(new WebhookEvent
@@ -147,6 +151,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
                 {
                     AgentKind = kind.Value,
                     Reason = result.FailureReason,
+                    Category = result.Category,
                 },
             }, CancellationToken.None);
         }
@@ -159,6 +164,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
                 {
                     AgentKind = kind.Value,
                     Reason = null,
+                    Category = SmokeFailureCategory.None,
                 },
             }, CancellationToken.None);
         }

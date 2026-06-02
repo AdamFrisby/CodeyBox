@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents.Gemini;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging;
 
@@ -352,7 +353,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
 /// </list>
 /// </summary>
 public sealed class GeminiOauthCredentialFileRefresher
-    : OauthCredentialFileRefresher, IGeminiQuotaTokenSource
+    : OauthCredentialFileRefresher, IGeminiQuotaTokenSource, IGeminiOAuthTokenSource
 {
     internal const string DefaultRefreshEndpoint = "https://oauth2.googleapis.com/token";
     internal const string HttpClientName = "agent-quota";

@@ -39,8 +39,9 @@ public sealed class OpencodeSmokeProbe : IAgentSmokeProbe
         if (!hasAuthJson)
         {
             _log?.LogDebug("Opencode smoke probe found no OPENCODE_AUTH_JSON in credential bundle");
-            return Task.FromResult(new AgentSmokeResult(false, "no token in credential bundle", TimeSpan.Zero));
+            return Task.FromResult(new AgentSmokeResult(
+                false, "no token in credential bundle", TimeSpan.Zero, SmokeFailureCategory.Persistent));
         }
-        return Task.FromResult(new AgentSmokeResult(true, null, TimeSpan.Zero));
+        return Task.FromResult(new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
     }
 }
