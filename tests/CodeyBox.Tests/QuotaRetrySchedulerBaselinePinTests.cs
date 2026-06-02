@@ -108,6 +108,7 @@ public sealed class QuotaRetrySchedulerBaselinePinTests : IDisposable
                 DisplayName = "Test",
                 RepositoryUrl = "https://example.invalid/repo.git",
                 DefaultAgentClass = "frontier",
+                NetworkProfiles = new ProjectNetworkProfiles { Work = "work-profile" },
             }),
             queueController: null,
             webhooks: null,

@@ -271,9 +271,10 @@ public sealed class BudgetEnforcementTests : IDisposable
     // ── BudgetDeferralRecheckSnapshot consumer hot-reload ───────────────────
 
     /// <summary>
-    /// Pipeline stub that blocks on a per-invocation gate. Gates[0] blocks the
-    /// first item picked up, Gates[1] the second, etc. Items beyond the last
-    /// gate run immediately.
+    /// Pipeline stub that blocks on a per-invocation gate so we can trigger
+    /// deterministic second-cycle deferrals. Gates[0] blocks the first item
+    /// picked up, Gates[1] the second, etc. Items beyond the last gate run
+    /// immediately.
     /// </summary>
     private sealed class GatedPipelineRunner(TaskCompletionSource[] gates, IWorkItemStore store) : IPipelineRunner
     {
@@ -295,12 +296,13 @@ public sealed class BudgetEnforcementTests : IDisposable
         // _budgetDeferralRecheck.Current on each budget-cap deferral, not a
         // value cached at construction time.
         //
-        // Strategy: construct the service with a short interval, wait until one
-        // item is actually running, hot-reload to a long interval, then enqueue
-        // one more item. That item's first budget deferral must use the current
-        // snapshot value, not the value captured at service construction. If
-        // the service kept the constructor-time interval, the deferred item
-        // would be retried and spawn another worker inside the assertion window.
+        // Strategy: block the first item, enqueue several successors so they
+        // all defer under the initial short interval, then hot-reload to a long
+        // interval before the short deferrals expire. When the first item is
+        // released, one successor grabs the freed slot and blocks on gate2;
+        // the others defer again. The second-cycle deferral must read the
+        // hot-reloaded snapshot value, not a value cached at construction time
+        // or on the first deferral.
         var pid = new ProjectId("budget-recheck-conc");
         var projectRepo = new InMemoryProjectRepository(new Project
         {
@@ -311,12 +313,13 @@ public sealed class BudgetEnforcementTests : IDisposable
         });
 
         var gate1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = new GatedPipelineRunner([gate1], _store);
+        var gate2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new GatedPipelineRunner([gate1, gate2], _store);
         var queue = new InMemoryTaskQueue();
         var spawnCount = 0;
         var opts = new OrchestratorOptions
         {
-            MaxConcurrentWorkers = 2,
+            MaxConcurrentWorkers = 3,
             OnWorkerSpawned = () => Interlocked.Increment(ref spawnCount),
         };
         var reg = new CancellationRegistry(CancellationToken.None);
@@ -348,43 +351,94 @@ public sealed class BudgetEnforcementTests : IDisposable
             IsRunning(await _store.GetAsync(first.Id)),
             "the first item must be running before the budget deferral is exercised");
 
-        // Hot-reload to a long recheck interval. The following deferral must
-        // read this new value from the snapshot.
-        snapshot.Replace(new BudgetDeferralRecheckOptions
+        var ids = new List<WorkItemId> { first.Id };
+        for (var i = 0; i < 3; i++)
         {
-            ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
-        });
+            var item = MakeQueued("budget-recheck-conc");
+            await _store.CreateAsync(item);
+            ids.Add(item.Id);
+            await queue.EnqueueAsync(item.Id);
+        }
 
-        var second = MakeQueued("budget-recheck-conc");
-        await _store.CreateAsync(second);
-        await queue.EnqueueAsync(second.Id);
+        var successors = ids.Skip(1).ToArray();
 
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
-        while (!svc.IsDeferredForTest(second.Id) && DateTimeOffset.UtcNow < deferDeadline)
+        // Poll until every successor has been deferred under the initial
+        // 200 ms snapshot value while the first item is still running.
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (!successors.All(svc.IsDeferredForTest)
+               && DateTimeOffset.UtcNow < deferDeadline)
         {
             await Task.Delay(50);
         }
 
         Assert.True(
-            svc.IsDeferredForTest(second.Id),
-            "the second item must be deferred by the concurrent cap after hot-reload");
-        Assert.Equal(2, Volatile.Read(ref spawnCount));
+            successors.All(svc.IsDeferredForTest),
+            "all successor items must be deferred by the concurrent cap before hot-reload");
+
+        // Hot-reload to a long recheck interval. The next deferral cycle
+        // (after items are re-enqueued and hit the cap again) must read this
+        // new value from the snapshot.
+        snapshot.Replace(new BudgetDeferralRecheckOptions
+        {
+            ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
+        });
+
+        // Unblock the first item so the deferred items can be re-enqueued
+        // when their 200 ms deferral expires.
+        gate1.TrySetResult();
+
+        // Wait for the initial 200 ms deferral to expire and the dispatch
+        // loop to process the deferred items again. One will grab the freed slot
+        // and block on gate2; at least one other hits the concurrent cap and is
+        // deferred again — this time reading the hot-reloaded 10 s interval.
+        await Task.Delay(600);
+
+        int? secondDeferredIdx = null;
+        var secondDeferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (secondDeferredIdx is null && DateTimeOffset.UtcNow < secondDeferDeadline)
+        {
+            // Identify an item deferred in the second cycle. With several
+            // successors queued, one can grab the freed slot and block on gate2
+            // while another is deferred under the cap. On a loaded test
+            // host, the worker that consumes the expired 200 ms deferral can lag
+            // behind the fixed 600 ms sleep above, so poll like the first-cycle
+            // assertion instead of baking in a scheduler timing assumption.
+            var successorStates = new Dictionary<WorkItemId, WorkItem?>();
+            foreach (var id in successors)
+                successorStates[id] = await _store.GetAsync(id);
+
+            var activeOrDeferred = successors.Count(id =>
+                svc.IsDeferredForTest(id) || IsRunning(successorStates[id]));
+
+            secondDeferredIdx = Enumerable.Range(1, ids.Count - 1)
+                .Cast<int?>()
+                .FirstOrDefault(i => svc.IsDeferredForTest(ids[i!.Value]));
+
+            if (secondDeferredIdx is not null && activeOrDeferred != successors.Length)
+                secondDeferredIdx = null;
+
+            if (secondDeferredIdx is null)
+                await Task.Delay(50);
+        }
+
+        Assert.NotNull(secondDeferredIdx);
 
         // Now the item is deferred with the hot-reloaded 10 s interval.
         // If the old 200 ms value was cached, it would have re-enqueued the
         // item and spawned another worker within 500 ms. Wait past the old
         // window and verify no retry happened.
+        var spawnCountAfterHotReloadDeferral = Volatile.Read(ref spawnCount);
         await Task.Delay(500);
 
         Assert.True(
-            svc.IsDeferredForTest(second.Id),
+            svc.IsDeferredForTest(ids[secondDeferredIdx.Value]),
             "the deferred item must still be deferred after hot-reload " +
             "(the long hot-reloaded ConcurrentLimitRecheck was consumed, " +
             "not the short initial value)");
-        Assert.Equal(2, Volatile.Read(ref spawnCount));
+        Assert.Equal(spawnCountAfterHotReloadDeferral, Volatile.Read(ref spawnCount));
 
         // Release the blocked item so StopAsync can drain cleanly.
-        gate1.TrySetResult();
+        gate2.TrySetResult();
 
         await svc.StopAsync(CancellationToken.None);
 

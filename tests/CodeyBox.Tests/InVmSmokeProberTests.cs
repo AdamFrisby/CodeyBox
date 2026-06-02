@@ -16,6 +16,9 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class InVmSmokeProberTests
 {
+    private static readonly InVmSmokeSandboxTarget WorkTarget =
+        new("work-profile", SandboxProfileFlavor.Headless);
+
     private static readonly AgentCredential CursorCred = new(
         AgentKind.Cursor,
         new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
@@ -26,24 +29,40 @@ public sealed class InVmSmokeProberTests
         new Dictionary<string, string> { ["OPENCODE_AUTH_JSON"] = "{\"token\":\"t\"}" },
         new Dictionary<string, string>());
 
+    // ISandboxProvider (not FakeSandboxProvider) so timeout tests that swap in a
+    // hanging-create / non-cooperative provider reuse the same construction site
+    // — keeps future option-list edits to one place rather than 4+ inline
+    // InVmSmokeProber constructions.
     private static InVmSmokeProber Build(
-        FakeSandboxProvider provider,
+        ISandboxProvider provider,
         AgentAvailabilityRegistry registry,
         InVmSmokeCache cache,
         FakeBaselineResolver resolver,
         InVmSmokeOptions? opts = null,
         ICredentialProvider? credentials = null,
-        IEnumerable<IInVmSmokeProbe>? probes = null)
+        IEnumerable<IInVmSmokeProbe>? probes = null,
+        bool fillDefaultNetworkProfile = true)
     {
+        var effectiveOpts = opts ?? new InVmSmokeOptions
+        {
+            Enabled = true,
+            ImageReference = "img",
+            NetworkProfile = WorkTarget.NetworkProfile,
+            SweepIntervalSeconds = 0,
+        };
+        if (fillDefaultNetworkProfile && string.IsNullOrWhiteSpace(effectiveOpts.NetworkProfile))
+            effectiveOpts = effectiveOpts with { NetworkProfile = WorkTarget.NetworkProfile };
+
         return new InVmSmokeProber(
             provider,
+            resolver,
             resolver,
             credentials ?? new ConstantCredentialProvider(CursorCred),
             probes ?? [new CursorInVmSmokeProbe()],
             registry,
             cache,
             new NullWebhookDispatcher(),
-            opts ?? new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            effectiveOpts,
             NullLogger<InVmSmokeProber>.Instance);
     }
 
@@ -109,12 +128,35 @@ public sealed class InVmSmokeProberTests
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
         var cache = new InVmSmokeCache(TimeSpan.FromMinutes(60));
-        var prober = Build(provider, NewRegistry(), cache, new FakeBaselineResolver("base-A"));
+        var resolver = new FakeBaselineResolver("base-A");
+        var prober = Build(provider, NewRegistry(), cache, resolver);
 
         await prober.ProbeAllAsync(CancellationToken.None);
         await prober.ProbeAllAsync(CancellationToken.None);
 
         Assert.Equal(1, provider.CreateCount);
+        Assert.Single(resolver.EnsureCalls);
+    }
+
+    [Fact]
+    public async Task CacheHit_WithPinnedBaseline_DoesNotWarmBaselineOrProvision()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var cache = NewCache();
+        cache.Set(AgentKind.Cursor, "base-A",
+            new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
+        var resolver = new FakeBaselineResolver("base-A") { CanEnsure = false };
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, resolver);
+
+        await prober.EnsureProbedAsync(
+            AgentKind.Cursor,
+            WorkTarget.WithBaselineRef("base-A"),
+            CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Empty(resolver.EnsureCalls);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
     [Fact]
@@ -138,6 +180,48 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task ProbeAllAsync_UsesResolvedProfileAndBaselineCloneTarget()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var resolver = new FakeBaselineResolver("base-A");
+        var prober = Build(provider, NewRegistry(), NewCache(), resolver);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
+        Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-A", ensureCall.PinnedRef);
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_WithDispatchTarget_UsesTargetProfile_NotConfiguredOption()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var resolver = new FakeBaselineResolver("base-A");
+        var dispatchTarget = new InVmSmokeSandboxTarget("dispatch-profile", SandboxProfileFlavor.Headless);
+        var prober = Build(provider, NewRegistry(), NewCache(), resolver,
+            opts: new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "configured-smoke-profile",
+                SweepIntervalSeconds = 0,
+            });
+
+        await prober.ProbeAllAsync(dispatchTarget, CancellationToken.None);
+
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal("dispatch-profile", provider.LastProfileName);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal("dispatch-profile", ensureCall.Profile);
+        Assert.Equal(dispatchTarget.Flavor, ensureCall.Flavor);
+    }
+
+    [Fact]
     public async Task ProvisioningFailure_DoesNotExcludeAndIsNotCached()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
@@ -157,7 +241,7 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
-    public async Task NullBaselineRef_FallsBackToLiveSentinel_AndStillProbes()
+    public async Task NullBaselineRef_OnSweep_DoesNotLaunchLiveSandbox()
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
         var registry = NewRegistry();
@@ -166,9 +250,79 @@ public sealed class InVmSmokeProberTests
 
         await prober.ProbeAllAsync(CancellationToken.None);
 
-        Assert.Equal(1, provider.CreateCount);
-        Assert.Null(provider.LastBaselineRef); // spec pins null, not the sentinel string
-        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task NullBaselineRef_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver(null));
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("no clonable baseline", availability.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureAvailableAsync_ResolverThrows_DefaultFailClosed_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A") { ThrowOnResolve = true };
+        var prober = Build(provider, registry, NewCache(), resolver);
+
+        var availability = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor,
+            WorkTarget,
+            CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline warm-up failed", availability.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureBaselineReturnsNull_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A") { CanEnsure = false };
+        var prober = Build(provider, registry, NewCache(), resolver);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("no clonable baseline", availability.Reason);
+        var ensureCall = Assert.Single(resolver.EnsureCalls);
+        Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
+        Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
+        Assert.Equal("base-A", ensureCall.PinnedRef);
+    }
+
+    [Fact]
+    public async Task BaselineWarmupThrows_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var resolver = new FakeBaselineResolver("base-A") { ThrowOnEnsure = true };
+        var prober = Build(provider, registry, cache, resolver);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline warm-up failed", availability.Reason);
     }
 
     [Fact]
@@ -422,9 +576,11 @@ public sealed class InVmSmokeProberTests
         var provider = new HangingSandboxProvider();
         var cache = NewCache();
         var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -434,6 +590,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0,
             },
@@ -460,9 +617,11 @@ public sealed class InVmSmokeProberTests
         var registry = NewRegistry();
         // Build() uses the default InVmSmokeOptions → FailClosedOnProbeFault = true;
         // StepTimeoutSeconds=0 trips the timeout path immediately.
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -472,6 +631,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0,
             },
@@ -533,6 +693,26 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task CallerCancellationDuringCredentialLookup_PropagatesAndDoesNotBench()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var credentials = new BlockingCredentialProvider();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            credentials: credentials);
+
+        using var cts = new CancellationTokenSource();
+        var probeTask = prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, cts.Token);
+
+        await credentials.Started.Task;
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
     public async Task EnsureAvailableAsync_AlreadyExcluded_SkipsProbe_NoProvision()
     {
         // The gate short-circuits when the registry already marks the agent
@@ -549,7 +729,8 @@ public sealed class InVmSmokeProberTests
 
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, WorkTarget, CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount); // no redundant provision for an already-skipped agent
@@ -575,7 +756,8 @@ public sealed class InVmSmokeProberTests
         cache.Set(AgentKind.Cursor, "base-PINNED", new AgentSmokeResult(true, null, TimeSpan.Zero));
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-PINNED", CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, WorkTarget.WithBaselineRef("base-PINNED"), CancellationToken.None);
 
         Assert.True(av.Available); // pinned-image verdict, not the active-image bench
         Assert.Equal(0, provider.CreateCount); // cache hit → no VM provisioned
@@ -595,7 +777,8 @@ public sealed class InVmSmokeProberTests
             new AgentSmokeResult(false, "exit 127 on base-ACTIVE", TimeSpan.Zero), SmokeExclusionSource.InVmSmoke);
         var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-ACTIVE"));
 
-        var av = await prober.EnsureAvailableAsync(AgentKind.Cursor, baselineRef: "base-OTHER", CancellationToken.None);
+        var av = await prober.EnsureAvailableAsync(
+            AgentKind.Cursor, WorkTarget.WithBaselineRef("base-OTHER"), CancellationToken.None);
 
         Assert.False(av.Available);
         Assert.Equal(0, provider.CreateCount);
@@ -740,6 +923,54 @@ public sealed class InVmSmokeProberTests
 
         Assert.Null(result);
         Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
+    public async Task ForceProbeAsync_NoConfiguredProfile_ReturnsNull_NoProvision()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        var result = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_NoConfiguredProfile_SkipsWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_NoConfiguredProfile_FailClosedBenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            opts: new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            fillDefaultNetworkProfile: false);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline target has no network profile", availability.Reason);
     }
 
     [Fact]
@@ -892,11 +1123,14 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"));
 
         var result = await prober.ProbeAgentAsync(
-            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+            new CursorInVmSmokeProbe(), WorkTarget, "base-A", CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.False(result!.Ok);
         Assert.Equal(SmokeFailureCategory.Persistent, result.Category);
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
         // The registry encodes the category in the reason tag, so the router
         // log / /concurrency surface it alongside the message.
         Assert.Contains("[persistent]", registry.GetAvailability(AgentKind.Cursor).Reason);
@@ -912,11 +1146,14 @@ public sealed class InVmSmokeProberTests
         var prober = Build(provider, NewRegistry(), NewCache(), new FakeBaselineResolver("base-A"));
 
         var result = await prober.ProbeAgentAsync(
-            new CursorInVmSmokeProbe(), "base-A", CancellationToken.None);
+            new CursorInVmSmokeProbe(), WorkTarget, "base-A", CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.True(result!.Ok);
         Assert.Equal(SmokeFailureCategory.None, result.Category);
+        Assert.Equal("base-A", provider.LastBaselineRef);
+        Assert.Equal(WorkTarget.NetworkProfile, provider.LastProfileName);
+        Assert.Equal(WorkTarget.Flavor, provider.LastFlavor);
     }
 
     [Fact]
@@ -929,9 +1166,11 @@ public sealed class InVmSmokeProberTests
         // on recovery rather than paging the operator.
         var provider = new HangingSandboxProvider();
         var registry = NewRegistry();
+        var resolver = new FakeBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             provider,
-            new FakeBaselineResolver("base-A"),
+            resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
@@ -941,6 +1180,7 @@ public sealed class InVmSmokeProberTests
             {
                 Enabled = true,
                 ImageReference = "img",
+                NetworkProfile = WorkTarget.NetworkProfile,
                 SweepIntervalSeconds = 0,
                 StepTimeoutSeconds = 0, // immediate-timeout for deterministic test
                 FailClosedOnProbeFault = true,
@@ -952,6 +1192,8 @@ public sealed class InVmSmokeProberTests
         var av = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(av.Available);
         Assert.Contains("[transient]", av.Reason);
+        Assert.Contains("probe step timed out", av.Reason);
+        Assert.Equal(1, provider.CreateCount);
     }
 
     [Fact]
@@ -1027,6 +1269,314 @@ public sealed class InVmSmokeProberTests
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
+    private static InVmSmokeOptions TimeoutOpts(
+        int provisionTimeoutSeconds,
+        int gateDeadlineSeconds,
+        bool failClosed = true) =>
+        new()
+        {
+            Enabled = true,
+            ImageReference = "img",
+            NetworkProfile = WorkTarget.NetworkProfile,
+            SweepIntervalSeconds = 0,
+            ProvisionTimeoutSeconds = provisionTimeoutSeconds,
+            GateDeadlineSeconds = gateDeadlineSeconds,
+            FailClosedOnProbeFault = failClosed,
+        };
+
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_DefaultFailClosed_BenchesWithinProvisionTimeout()
+    {
+        // Production hang observed 2026-06-01: ISandboxProvider.CreateAsync (VM
+        // clone + "Launching multipass VM") never returns; per-step exec timeouts
+        // can't fire because no sandbox exists to exec into. Without a hard
+        // provisioning timeout the entire dispatch gate hangs and the worker pool
+        // wedges. ProvisionTimeoutSeconds=1 makes the prober bench-and-continue
+        // rather than wait forever for the inner CreateAsync. Gate deadline well
+        // above the provisioning timeout so we exercise the provisioning catch
+        // rather than the outer deadline net.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A")); // fault never cached → self-heals
+    }
+
+    [Fact]
+    public async Task ProbeAllAsync_ProvisioningHang_FailsOpen_DoesNotBench_DoesNotHang()
+    {
+        // Companion to the dispatch-gate case: the background sweep always fails
+        // open, so a stuck CreateAsync must NOT bench a possibly-working agent —
+        // but it also must NOT wedge the sweep loop forever. The provisioning
+        // timeout still fires (transient fault); ProbeAllAsync swallows it
+        // without mutating availability.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.ProbeAllAsync(CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"sweep took {sw.Elapsed}; provisioning timeout did not fire");
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available); // sweep fails open
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_FailOpenOptOut_DoesNotBench_DoesNotHang()
+    {
+        // Even on the gate path under fail-open, a stuck CreateAsync must not
+        // wedge the worker — the provisioning timeout fires, the agent stays
+        // available (fail-open), and the gate returns.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30, failClosed: false));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_NonCooperativeProvisioningHang_StillBenchesWithinProvisionTimeout()
+    {
+        // The production failure mode the provisioning timeout exists for: a
+        // wedged ISandboxProvider.CreateAsync that IGNORES its cancellation token
+        // (multipass daemon stuck mid-clone). A cooperative-cancellation-only
+        // implementation — i.e. just passing a linked CT into CreateAsync and
+        // awaiting it — would still hang forever here. The provisioning timeout
+        // must be a hard wall-clock bound, so we model the non-cooperative
+        // provider explicitly and assert the gate still returns a transient
+        // verdict within the provisioning bound. Without this test, a regression
+        // back to the cooperative-only approach would not be caught.
+        var provider = new NonCooperativeHangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 60));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // Provisioning timeout (1s) fires via the wall-clock race well before
+        // the gate deadline (60s) would even fire — i.e. it's the provisioning
+        // bound, not the outer deadline, that caught this.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; non-cooperative provisioning hang was not bounded");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.DoesNotContain("probe deadline exceeded", av.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_GateDeadline_BenchesWithinBound_EvenIfInnerNeverReturns()
+    {
+        // Defect-in-depth: with the inner provisioning timeout disabled
+        // (ProvisionTimeoutSeconds=0) the outer GateDeadlineSeconds is the only
+        // bound left. A wedged CreateAsync must still not be allowed to stall
+        // the worker forever — the gate deadline is the safety net for any inner
+        // step the per-operation timeouts don't cover (e.g. a stuck sandbox
+        // DisposeAsync in some future code path).
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 0, gateDeadlineSeconds: 1));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; deadline did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("in-VM probe inconclusive", av.Reason);
+        Assert.Contains("probe deadline exceeded", av.Reason);
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_GateDeadline_FailOpenOptOut_ReturnsWithoutBenching()
+    {
+        // The outer gate-deadline branch (Task.WhenAny picks the deadline before
+        // the inner probeTask completes) has distinct fail-open behavior from
+        // every other fault path: under FailClosedOnProbeFault=false the gate
+        // must RETURN without benching when the deadline elapses, leaving the
+        // agent routable. The fail-open coverage elsewhere targets the inner
+        // provisioning catch; a regression that always benched on the deadline
+        // branch — but still observed the fail-open flag for provisioning —
+        // would pass every other test, so pin this branch specifically.
+        //
+        // ProvisionTimeoutSeconds=0 disables the inner bound so we exercise the
+        // outer gate-deadline net unambiguously.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 0, gateDeadlineSeconds: 1, failClosed: false));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; deadline did not fire under fail-open");
+        // Fail-open: deadline expiry does NOT bench the agent.
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_ProvisioningHang_LateSuccess_OrphanObserverDisposesSandbox()
+    {
+        // The orphan observer's reason for existing: if CreateAsync eventually
+        // succeeds AFTER the provisioning wall-clock timeout has fired, the
+        // late-arriving sandbox must be disposed so we don't leak a real VM the
+        // gate already walked away from. The hanging / non-cooperative tests
+        // exercise the bench-and-bail path but cannot catch a regression that
+        // removes (or breaks) the late-success cleanup, because their
+        // CreateAsync never produces a sandbox.
+        var sandbox = new RecordedDisposeSandbox();
+        var provider = new DelayedSuccessSandboxProvider(sandbox);
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 30));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // The gate already returned on the provisioning timeout.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; provisioning timeout did not fire");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.False(sandbox.Disposed); // CreateAsync hasn't completed yet
+
+        // Now let CreateAsync complete with a real sandbox. The orphan observer
+        // must dispose it — otherwise we'd leak a live VM for every wedged
+        // provisioning that eventually recovers.
+        provider.Complete();
+        Assert.True(await sandbox.WaitForDisposeAsync(TimeSpan.FromSeconds(10)),
+            "orphan observer did not dispose the late-arriving sandbox");
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_CallerCancelledMidProvisioning_PropagatesCancellation_DoesNotBench_AndOrphanDisposesLateSandbox()
+    {
+        // Distinct caller-cancellation branch of CreateSandboxWithProvisionTimeoutAsync
+        // (worker / shutdown token fired before CreateAsync returns). The branch
+        // MUST: (1) hand the orphaned create task off so a sandbox the provider
+        // eventually yields is disposed; (2) rethrow cancellation instead of
+        // converting it into a TimeoutException / transient bench, because
+        // worker shutdown is not evidence the CLI is broken; (3) leave the agent
+        // routable so a later worker (with a non-cancelled token) is not refused
+        // by a phantom bench. All timeout / hanging-provider tests above pass
+        // CancellationToken.None, so a regression that benches on shutdown
+        // cancellation, swallows the OCE, or skips the orphan handoff would not
+        // be caught — this pins the three behaviours together.
+        var sandbox = new RecordedDisposeSandbox();
+        var provider = new DelayedSuccessSandboxProvider(sandbox);
+        var cache = NewCache();
+        var registry = NewRegistry();
+        // ProvisionTimeout / GateDeadline are well above the cancellation we
+        // drive manually, so any failure of the assertions below points at the
+        // caller-cancellation path, not at the wall-clock timer winning a race.
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 60, gateDeadlineSeconds: 120));
+
+        using var cts = new CancellationTokenSource();
+        var probeTask = prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, cts.Token);
+
+        // Wait long enough for the probe to enter the wrapper's WhenAny on
+        // CreateAsync (DelayedSuccessSandboxProvider returns a Task that only
+        // completes when Complete() is called). Then cancel — this drives the
+        // wrapper's "winner != createTask" / ct-cancelled branch.
+        await Task.Delay(50);
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+
+        // Shutdown cancellation must not bench the agent: a later worker (with a
+        // non-cancelled token) would otherwise see a CLI that was never actually
+        // smoke-checked falsely marked broken. The cache likewise stays empty.
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+
+        // Orphan handoff: the gate already walked away, but CreateAsync will
+        // eventually return a sandbox. Without the orphan observer disposing
+        // it, every cancelled probe would leak a live multipass VM until
+        // process exit. Drive the provider to completion and assert the
+        // late-arriving sandbox is disposed.
+        provider.Complete();
+        Assert.True(await sandbox.WaitForDisposeAsync(TimeSpan.FromSeconds(10)),
+            "orphan observer did not dispose the late-arriving sandbox after caller cancellation");
+    }
+
+    [Fact]
+    public async Task EnsureProbedAsync_GateDeadlineDisabled_DoesNotFireAsImmediateTimeout_InnerTimeoutStillBoundsHang()
+    {
+        // GateDeadlineSeconds <= 0 disables the outer wall-clock deadline (for
+        // tests on synthetic clocks, or operators tuning policy). The disabled
+        // branch is structurally separate, so this pins two things together:
+        //   1. Zero is NOT treated as an immediate-timeout (a regression that
+        //      flipped the comparison would bench every probe in 0s with a
+        //      "deadline exceeded" reason).
+        //   2. The inner provisioning bound is still in force, so a wedged
+        //      CreateAsync still produces a transient verdict — the prober
+        //      doesn't silently lose all defence-in-depth when the outer
+        //      deadline is off.
+        var provider = new HangingCreateSandboxProvider();
+        var cache = NewCache();
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"),
+            opts: TimeoutOpts(provisionTimeoutSeconds: 1, gateDeadlineSeconds: 0));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+        sw.Stop();
+
+        // The provisioning bound (1s) fires; the disabled deadline did NOT
+        // immediate-timeout (would have returned in ~0s with a deadline-exceeded
+        // reason instead).
+        Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(500),
+            $"gate returned in {sw.Elapsed}; GateDeadlineSeconds=0 was wrongly treated as immediate");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"gate took {sw.Elapsed}; inner provisioning bound failed to fire under disabled deadline");
+        var av = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(av.Available);
+        Assert.Contains("probe provisioning timed out", av.Reason);
+        Assert.DoesNotContain("probe deadline exceeded", av.Reason);
+    }
+
     private static bool IsAgent(SandboxExec exec, string sub) =>
         exec.Argv.Count >= 2 && exec.Argv[0] == CursorAgentRunner.DefaultBinary && exec.Argv[1] == sub;
 
@@ -1037,6 +1587,8 @@ public sealed class InVmSmokeProberTests
         private readonly Func<SandboxExec, SandboxExecResult> _onExec;
         public int CreateCount { get; private set; }
         public string? LastBaselineRef { get; private set; }
+        public string? LastProfileName { get; private set; }
+        public SandboxProfileFlavor? LastFlavor { get; private set; }
         public Exception? ThrowOnCreate { get; set; }
         // Every argv exec'd across all sandboxes this provider created, in order.
         public List<IReadOnlyList<string>> ExecutedArgv { get; } = new();
@@ -1049,6 +1601,8 @@ public sealed class InVmSmokeProberTests
         {
             CreateCount++;
             LastBaselineRef = spec.BaselineImageRef;
+            LastProfileName = spec.Network.ProfileName;
+            LastFlavor = spec.Flavor;
             if (ThrowOnCreate is not null) throw ThrowOnCreate;
             return Task.FromResult<ISandbox>(new FakeSandbox(exec =>
             {
@@ -1102,6 +1656,21 @@ public sealed class InVmSmokeProberTests
             throw new InvalidOperationException("credential store unavailable");
     }
 
+    /// <summary>Credential provider that blocks until caller cancellation fires.</summary>
+    private sealed class BlockingCredentialProvider : ICredentialProvider
+    {
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            _ = agent;
+            Started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return null;
+        }
+    }
+
     /// <summary>
     /// Provider whose sandbox exec only completes when its cancellation token
     /// fires — so a zero step-timeout reliably trips the prober's timeout path
@@ -1138,6 +1707,110 @@ public sealed class InVmSmokeProberTests
         }
     }
 
+    /// <summary>
+    /// Sandbox provider whose CreateAsync hangs until its cancellation token
+    /// fires. Models a COOPERATIVE wedge (the linked CT eventually unblocks the
+    /// provider) so tests can drive both the inner provisioning timeout and the
+    /// outer gate deadline through the same fake.
+    /// </summary>
+    private sealed class HangingCreateSandboxProvider : ISandboxProvider
+    {
+        public string Name => "hanging-create";
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct); // completes only on cancellation
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox that records when DisposeAsync is invoked, so a test can assert
+    /// the orphan-observer cleanup path actually disposes a late-arriving VM
+    /// rather than leaking it.
+    /// </summary>
+    private sealed class RecordedDisposeSandbox : ISandbox
+    {
+        private readonly TaskCompletionSource _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public string Id => "recorded-dispose";
+
+        public bool Disposed => _disposed.Task.IsCompletedSuccessfully;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync()
+        {
+            _disposed.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+
+        public async Task<bool> WaitForDisposeAsync(TimeSpan timeout)
+        {
+            var winner = await Task.WhenAny(_disposed.Task, Task.Delay(timeout));
+            return winner == _disposed.Task;
+        }
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync only completes when the test invokes
+    /// <see cref="Complete"/>. Models the failure mode the orphan observer
+    /// exists to handle: a provider that the gate timed out on, but whose
+    /// CreateAsync eventually returns a usable sandbox after the gate already
+    /// walked away. The orphan observer must dispose that late-arriving VM
+    /// rather than leak it.
+    /// </summary>
+    private sealed class DelayedSuccessSandboxProvider : ISandboxProvider
+    {
+        private readonly TaskCompletionSource<ISandbox> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ISandbox _sandbox;
+
+        public DelayedSuccessSandboxProvider(ISandbox sandbox) => _sandbox = sandbox;
+
+        public string Name => "delayed-success";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => _tcs.Task;
+
+        public void Complete() => _tcs.TrySetResult(_sandbox);
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Sandbox provider whose CreateAsync NEVER returns — it ignores its
+    /// cancellation token entirely. Models the production failure that motivated
+    /// the wall-clock provisioning timeout: a wedged multipass daemon stuck mid
+    /// clone whose CreateAsync call observes no cancellation signal. A
+    /// cooperative-cancellation-only implementation (just passing a linked CT
+    /// into CreateAsync and awaiting it) would still hang forever against this
+    /// fake; the test guards the wall-clock race against that regression.
+    /// </summary>
+    private sealed class NonCooperativeHangingCreateSandboxProvider : ISandboxProvider
+    {
+        // A TaskCompletionSource that is never completed by anything — and is
+        // never tied to ct in any way — so the returned Task is exactly the
+        // "completion never observable" shape we need.
+        private readonly TaskCompletionSource<ISandbox> _never = new();
+
+        public string Name => "non-cooperative-hanging-create";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            _never.Task;
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
     private sealed class MutableClock : TimeProvider
     {
         private DateTimeOffset _now;
@@ -1146,12 +1819,31 @@ public sealed class InVmSmokeProberTests
         public void Advance(TimeSpan by) => _now += by;
     }
 
-    private sealed class FakeBaselineResolver : IBaselineImageResolver
+    private sealed class FakeBaselineResolver : IBaselineImageResolver, IBaselineImageProvisioner
     {
         public string? Ref { get; set; }
+        public bool CanEnsure { get; set; } = true;
+        public bool ThrowOnResolve { get; set; }
+        public bool ThrowOnEnsure { get; set; }
+        public List<(string Profile, SandboxProfileFlavor Flavor, string? PinnedRef)> EnsureCalls { get; } = [];
         public FakeBaselineResolver(string? r) => Ref = r;
 
-        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor) => Ref;
+        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+        {
+            if (ThrowOnResolve) throw new InvalidOperationException("baseline resolver failed");
+            return Ref;
+        }
+
+        public Task<string?> EnsureBaselineImageAsync(
+            string profileName,
+            SandboxProfileFlavor flavor,
+            string? pinnedBaselineRef,
+            CancellationToken ct)
+        {
+            if (ThrowOnEnsure) throw new InvalidOperationException("baseline provisioner failed");
+            EnsureCalls.Add((profileName, flavor, pinnedBaselineRef));
+            return Task.FromResult(CanEnsure ? pinnedBaselineRef ?? Ref : null);
+        }
 
         public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);

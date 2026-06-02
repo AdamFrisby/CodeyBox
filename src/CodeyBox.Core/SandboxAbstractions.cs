@@ -522,6 +522,51 @@ public interface IBaselineImageResolver
 }
 
 /// <summary>
+/// Optional provider capability: eagerly ensures a clonable baseline image
+/// exists for a profile/flavor before a dispatch gate asks for a sandbox. This
+/// keeps callers off the provider's slow live cloud-init launch path.
+/// </summary>
+public interface IBaselineImageProvisioner
+{
+    /// <summary>
+    /// Ensures the baseline image named by <paramref name="pinnedBaselineRef"/>
+    /// (or the provider's active ref when null) exists for
+    /// <paramref name="profileName"/> and <paramref name="flavor"/>. Returns the
+    /// clonable baseline ref/name, or null when the provider cannot clone this
+    /// target (for example baseline images are disabled).
+    /// </summary>
+    Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct);
+}
+
+/// <summary>
+/// Null Object provisioner for sandbox providers that cannot eagerly prepare
+/// clonable baseline images.
+/// </summary>
+public sealed class NullBaselineImageProvisioner : IBaselineImageProvisioner
+{
+    public static readonly NullBaselineImageProvisioner Instance = new();
+
+    private NullBaselineImageProvisioner() { }
+
+    public Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct)
+    {
+        _ = profileName;
+        _ = flavor;
+        _ = pinnedBaselineRef;
+        _ = ct;
+        return Task.FromResult<string?>(null);
+    }
+}
+
+/// <summary>
 /// Snapshot of one baseline image on the host, returned by
 /// <see cref="IBaselineImageResolver.ListBaselineImagesAsync"/>.
 /// </summary>
@@ -573,10 +618,13 @@ public sealed record SandboxSpec
     /// <summary>
     /// Content-hashed identifier of the sandbox baseline image to pin this
     /// sandbox to. Stamped on the work item at pickup time and threaded back
-    /// through every subsequent <see cref="ISandboxProvider.CreateAsync"/> so
-    /// audit / rework iterations keep using the same baseline as the work
-    /// phase even when the operator edits baseline-contributing config
-    /// (ExtraRuncmd, ExtraCloudInit, cloud-init contents) mid-flight.
+    /// through subsequent <see cref="ISandboxProvider.CreateAsync"/> calls so
+    /// matching target profiles keep using the pinned baseline even when the
+    /// operator edits baseline-contributing config (ExtraRuncmd,
+    /// ExtraCloudInit, cloud-init contents) mid-flight. Providers whose clone
+    /// source carries target-specific attachments, such as Multipass network
+    /// bridges, must reject or recompute pins that do not match the requested
+    /// profile/flavor.
     /// Null = provider falls back to computing the ref from live config
     /// (backward-compatible for items created before the stamping logic
     /// landed, and for providers that don't model baselines).

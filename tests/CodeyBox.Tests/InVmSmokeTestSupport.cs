@@ -46,22 +46,28 @@ internal sealed class ScriptedSandboxProvider : ISandboxProvider
 internal sealed class RecordingInVmSmokeGate : IInVmSmokeGate
 {
     public List<string?> SeenBaselineRefs { get; } = [];
+    public List<InVmSmokeSandboxTarget> SeenTargets { get; } = [];
     public bool Enabled => true;
 
-    public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    public Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
     {
-        SeenBaselineRefs.Add(baselineRef);
+        SeenBaselineRefs.Add(target.BaselineRef);
+        SeenTargets.Add(target);
         return Task.FromResult(new AgentAvailability(true, null, null));
     }
 
     public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
 
     public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
         Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 }
 
 /// <summary>Baseline resolver returning a fixed ref; can be made to throw.</summary>
-internal sealed class StubBaselineResolver : IBaselineImageResolver
+internal sealed class StubBaselineResolver : IBaselineImageResolver, IBaselineImageProvisioner
 {
     public string? Ref { get; set; }
     public bool ThrowOnResolve { get; set; }
@@ -72,6 +78,16 @@ internal sealed class StubBaselineResolver : IBaselineImageResolver
     {
         if (ThrowOnResolve) throw new InvalidOperationException("baseline resolve failed");
         return Ref;
+    }
+
+    public Task<string?> EnsureBaselineImageAsync(
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string? pinnedBaselineRef,
+        CancellationToken ct)
+    {
+        if (ThrowOnResolve) throw new InvalidOperationException("baseline resolve failed");
+        return Task.FromResult(pinnedBaselineRef ?? Ref);
     }
 
     public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct) =>

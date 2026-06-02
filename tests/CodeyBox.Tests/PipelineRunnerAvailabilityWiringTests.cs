@@ -244,15 +244,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             AgentKind.Cursor,
             new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
             new Dictionary<string, string>());
+        var baselineResolver = new StubBaselineResolver("base-A");
         var prober = new InVmSmokeProber(
             probeProvider,
-            new StubBaselineResolver("base-A"),
+            baselineResolver,
+            baselineResolver,
             new ConstantCredentialProvider(cursorCred),
             [new CursorInVmSmokeProbe()],
             availability,
             new InVmSmokeCache(TimeSpan.FromMinutes(60)),
             new NullWebhookDispatcher(),
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
 
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -270,6 +272,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             RepositoryUrl = seed,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Cursor,
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "work-profile" },
             // No DefaultAgentClass — this is the direct-agent path the gate must
             // still cover. SkipCredentialSmokeTest stays false; even if it were
             // true the in-VM gate is now decoupled from it.
@@ -304,9 +307,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("in-VM smoke gate", final.LastError);
+        Assert.Contains("agent binary not runnable", final.LastError);
         Assert.Equal(0, cursorAgent.CallCount);
 
         // The prober benched cursor on the exit-127 version step.
+        Assert.Equal(1, probeProvider.CreateCount);
         Assert.False(availability.GetAvailability(AgentKind.Cursor).Available);
 
         // PipelineRunner published the agent.smoke_failed transition for the item.

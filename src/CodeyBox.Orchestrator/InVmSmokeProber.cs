@@ -47,10 +47,9 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class InVmSmokeProber : IInVmSmokeGate
 {
-    private const string LiveRefSentinel = "live";
-
     private readonly ISandboxProvider _provider;
     private readonly IBaselineImageResolver _resolver;
+    private readonly IBaselineImageProvisioner _baselineProvisioner;
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
     private readonly ISmokeAvailabilityRegistry _availability;
@@ -62,6 +61,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     public InVmSmokeProber(
         ISandboxProvider provider,
         IBaselineImageResolver resolver,
+        IBaselineImageProvisioner baselineProvisioner,
         ICredentialProvider credentials,
         IEnumerable<IInVmSmokeProbe> probes,
         ISmokeAvailabilityRegistry availability,
@@ -72,6 +72,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     {
         _provider = provider;
         _resolver = resolver;
+        _baselineProvisioner = baselineProvisioner;
         _credentials = credentials;
         _probes = probes.ToList();
         _availability = availability;
@@ -89,16 +90,32 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// </summary>
     public async Task ProbeAllAsync(CancellationToken ct)
     {
-        if (!Enabled) return;
+        if (!TryGetConfiguredTarget(out var target))
+        {
+            if (Enabled)
+                _log.LogWarning(
+                    "In-VM smoke sweep skipped: no explicit Smoke:InVm:NetworkProfile is configured and no project target was supplied");
+            return;
+        }
 
-        var baselineRef = ResolveBaselineRef();
+        await ProbeAllAsync(target, ct);
+    }
+
+    /// <summary>
+    /// Probes every registered agent against the active baseline for the
+    /// resolved dispatch target. Sequential so the sweep never holds more than
+    /// one probe VM at a time. Never throws.
+    /// </summary>
+    public async Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct)
+    {
+        if (!Enabled) return;
 
         foreach (var probe in _probes)
         {
             if (ct.IsCancellationRequested) return;
             try
             {
-                await ProbeAgentAsync(probe, baselineRef, ct);
+                await ProbeAgentAsync(probe, target, baselineRef: null, ct);
             }
             catch (Exception ex)
             {
@@ -113,8 +130,17 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         }
     }
 
-    private string ResolveBaselineRef() =>
-        _resolver.ResolveBaselineRef(_opts.NetworkProfile, SandboxProfileFlavor.Headless) ?? LiveRefSentinel;
+    private bool TryGetConfiguredTarget(out InVmSmokeSandboxTarget target)
+    {
+        if (!string.IsNullOrWhiteSpace(_opts.NetworkProfile))
+        {
+            target = new InVmSmokeSandboxTarget(_opts.NetworkProfile, SandboxProfileFlavor.Headless);
+            return true;
+        }
+
+        target = default;
+        return false;
+    }
 
     /// <summary>
     /// <see cref="IInVmSmokeGate.ForceProbeAsync"/>. Operator recovery path: force
@@ -133,7 +159,15 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     {
         if (!Enabled) return null;
         if (_probes.All(p => p.Kind != kind)) return null;
-        await EnsureProbedAsync(kind, baselineRef: null, ct, bypassCache: true);
+        if (!TryGetConfiguredTarget(out var target))
+        {
+            _log.LogWarning(
+                "In-VM smoke force-probe for {Agent} skipped: no explicit Smoke:InVm:NetworkProfile is configured",
+                kind.Value);
+            return null;
+        }
+
+        await EnsureProbedAsync(kind, target, ct, bypassCache: true);
         return _availability.GetAvailability(kind);
     }
 
@@ -143,9 +177,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// one call. Returns the agent's prior availability untouched when the gate
     /// is disabled; otherwise probes and returns the reconciled availability. A
     /// cache hit is free.
-    /// <paramref name="baselineRef"/> is the work item's pinned baseline (or null
-    /// for unpinned work → active baseline); the probe runs against the image the
-    /// dispatch will actually clone, not just whatever baseline is active now.
+    /// <paramref name="target"/> carries the sandbox profile/flavor and optional
+    /// pinned baseline ref; the probe runs against the image the dispatch will
+    /// actually clone, not just whatever baseline is active now.
     ///
     /// <para>When the agent is already excluded we normally short-circuit — no
     /// point probing a binary the router will skip regardless. But in-VM verdicts
@@ -161,15 +195,19 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// would defeat the short-circuit and risk exhausting sandbox slots on the hot
     /// path, and a never-probed pinned image is no evidence the CLI works there.</para>
     /// </summary>
-    public async Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+    public async Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
     {
         var current = _availability.GetAvailability(kind);
         if (!Enabled)
             return current;
+        var cacheBaselineRef = target.BaselineRef ?? TryResolveBaselineRef(target);
         if (!current.Available &&
-            _cache.TryGet(kind, baselineRef ?? ResolveBaselineRef()) is null)
+            (cacheBaselineRef is null || _cache.TryGet(kind, cacheBaselineRef) is null))
             return current;
-        await EnsureProbedAsync(kind, baselineRef, ct);
+        await EnsureProbedAsync(kind, target, ct);
         return _availability.GetAvailability(kind);
     }
 
@@ -187,7 +225,26 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// on the pinned image, not on a freshly rebaked active baseline. Null falls
     /// back to the active baseline for unpinned work.
     /// </summary>
-    internal async Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct, bool bypassCache = false)
+    internal Task EnsureProbedAsync(AgentKind kind, string? baselineRef, CancellationToken ct, bool bypassCache = false)
+    {
+        if (!Enabled) return Task.CompletedTask;
+        if (!TryGetConfiguredTarget(out var target))
+        {
+            BenchTransientFaultIfRequested(
+                kind,
+                "baseline target has no network profile",
+                _opts.FailClosedOnProbeFault);
+            return Task.CompletedTask;
+        }
+
+        return EnsureProbedAsync(kind, target.WithBaselineRef(baselineRef), ct, bypassCache);
+    }
+
+    internal async Task EnsureProbedAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct,
+        bool bypassCache = false)
     {
         if (!Enabled) return;
         var probe = _probes.FirstOrDefault(p => p.Kind == kind);
@@ -200,7 +257,53 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // to a verdict (see InVmSmokeOptions.FailClosedOnProbeFault). Probe
             // the pinned baseline when supplied so the verdict matches the image
             // the dispatch will clone; otherwise fall back to the active baseline.
-            await ProbeAgentAsync(probe, baselineRef ?? ResolveBaselineRef(), ct, benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
+            var probeTask = ProbeAgentAsync(
+                probe, target, target.BaselineRef, ct,
+                benchOnTransientFault: _opts.FailClosedOnProbeFault, bypassCache: bypassCache);
+
+            // The provisioning/exec/step timeouts inside ProbeAgentAsync cover the
+            // expected hangs, but a defect-in-depth deadline guarantees the gate
+            // returns a verdict (or fail-closed bench) within a bounded wall-clock
+            // even if some inner step those timeouts don't cover (a stuck sandbox
+            // DisposeAsync, an unanticipated synchronous hang in a custom probe)
+            // would otherwise leave the worker waiting forever. Non-positive
+            // disables it (tests with synthetic clocks).
+            if (_opts.GateDeadlineSeconds <= 0)
+            {
+                await probeTask;
+                return;
+            }
+
+            var gateDeadline = TimeSpan.FromSeconds(_opts.GateDeadlineSeconds);
+            var winner = await Task.WhenAny(probeTask, Task.Delay(gateDeadline, ct));
+            ct.ThrowIfCancellationRequested();
+
+            if (winner != probeTask)
+            {
+                // Gate deadline elapsed before the probe produced a verdict.
+                // Under fail-closed we bench so the router does not dispatch to
+                // an unverified CLI; under fail-open we leave availability
+                // unchanged. Either way we return so the worker can continue —
+                // NEVER block longer than the deadline, even if the inner probe
+                // never returns. The in-flight probeTask is left running and
+                // observed for its eventual exception via ContinueWith; its
+                // later verdict reconciles via the registry/cache on the next
+                // gate call. Log mirrors the actual policy so operators do not
+                // see "benching" on a probe the prober deliberately left routable.
+                ObserveOrphanedProbe(kind, probeTask);
+                _log.LogWarning(
+                    "In-VM smoke gate: probe for {Agent} exceeded deadline {Deadline}s; {Action}",
+                    kind.Value, _opts.GateDeadlineSeconds,
+                    _opts.FailClosedOnProbeFault ? "benching" : "leaving availability unchanged (fail-open)");
+                BenchTransientFaultIfRequested(
+                    kind, $"probe deadline exceeded ({_opts.GateDeadlineSeconds}s)",
+                    _opts.FailClosedOnProbeFault);
+                return;
+            }
+
+            // Probe finished within the deadline; surface its outcome / exception
+            // via the existing catches.
+            await probeTask;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -227,17 +330,75 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     }
 
     /// <summary>
+    /// Attaches a continuation so a probe task we walked away from (gate deadline
+    /// exceeded) doesn't surface as an UnobservedTaskException if it later faults,
+    /// and so its eventual verdict is visible in logs for post-hoc diagnosis. The
+    /// task itself may still mutate the availability registry on completion;
+    /// that's the desired reconciliation path.
+    /// </summary>
+    private void ObserveOrphanedProbe(AgentKind kind, Task probeTask)
+    {
+        _ = probeTask.ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                _log.LogDebug(
+                    t.Exception,
+                    "In-VM smoke gate: orphaned probe for {Agent} faulted after deadline",
+                    kind.Value);
+            else
+                _log.LogDebug(
+                    "In-VM smoke gate: orphaned probe for {Agent} eventually completed after deadline",
+                    kind.Value);
+        }, TaskScheduler.Default);
+    }
+
+    /// <summary>
     /// Probes one agent. Returns the result that was applied, or null when a
     /// transient failure (provisioning / exec / timeout) means availability must
     /// not change. A cache hit re-applies the cached <em>passing</em> verdict to
     /// the registry (reconciliation) and returns it without provisioning a VM.
     /// </summary>
     internal async Task<AgentSmokeResult?> ProbeAgentAsync(
-        IInVmSmokeProbe probe, string baselineRef, CancellationToken ct,
+        IInVmSmokeProbe probe,
+        InVmSmokeSandboxTarget target,
+        string? baselineRef,
+        CancellationToken ct,
         bool benchOnTransientFault = false,
         bool bypassCache = false)
     {
-        if (!bypassCache && _cache.TryGet(probe.Kind, baselineRef) is { } cached)
+        string resolvedBaselineRef;
+        try
+        {
+            var targetBaselineRef = ResolveTargetBaselineRef(target, baselineRef);
+            if (targetBaselineRef is null)
+            {
+                _log.LogWarning(
+                    "In-VM smoke for {Agent}: no clonable baseline for profile {Profile} / flavor {Flavor}; treating as transient",
+                    probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+                return BenchTransientFaultIfRequested(
+                    probe.Kind,
+                    "no clonable baseline for smoke target",
+                    benchOnTransientFault);
+            }
+
+            resolvedBaselineRef = targetBaselineRef;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "In-VM smoke for {Agent}: baseline warm-up failed for profile {Profile} / flavor {Flavor}; treating as transient",
+                probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+            return BenchTransientFaultIfRequested(
+                probe.Kind,
+                "baseline warm-up failed",
+                benchOnTransientFault);
+        }
+
+        if (!bypassCache && _cache.TryGet(probe.Kind, resolvedBaselineRef) is { } cached)
         {
             // Only passing verdicts are cached, so this re-asserts availability.
             // Re-applying keeps the registry reconciled with the cache even after
@@ -248,17 +409,50 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // clearsFastFail:false — a cache hit re-executed no CLI, so it must
             // not lift a fast-fail bench earned from real dispatch failures. It
             // only reconciles this source's (InVmSmoke) exclusion.
-            _log.LogDebug("In-VM smoke: cache hit for {Agent} @ {Ref}", probe.Kind.Value, baselineRef);
+            _log.LogDebug("In-VM smoke: cache hit for {Agent} @ {Ref}", probe.Kind.Value, resolvedBaselineRef);
             var hitTransition = _availability.MarkSmokeResult(
                 probe.Kind, cached, SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
             await EmitTransitionWebhookAsync(probe.Kind, cached, hitTransition);
             return cached;
         }
 
+        try
+        {
+            var readyBaselineRef = await EnsureReadyBaselineRefAsync(target, resolvedBaselineRef, ct);
+            if (readyBaselineRef is null)
+            {
+                _log.LogWarning(
+                    "In-VM smoke for {Agent}: no clonable baseline for profile {Profile} / flavor {Flavor}; treating as transient",
+                    probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+                return BenchTransientFaultIfRequested(
+                    probe.Kind,
+                    "no clonable baseline for smoke target",
+                    benchOnTransientFault);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "In-VM smoke for {Agent}: baseline warm-up failed for profile {Profile} / flavor {Flavor}; treating as transient",
+                probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+            return BenchTransientFaultIfRequested(
+                probe.Kind,
+                "baseline warm-up failed",
+                benchOnTransientFault);
+        }
+
         AgentCredential? credential;
         try
         {
             credential = await _credentials.GetAsync(probe.Kind, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -282,7 +476,28 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         AgentSmokeResult result;
         try
         {
-            result = await RunStepsInSandboxAsync(credential, baselineRef, steps, sw, ct);
+            result = await RunStepsInSandboxAsync(credential, target, resolvedBaselineRef, steps, sw, ct);
+        }
+        catch (TimeoutException ex)
+        {
+            // Provisioning ran past ProvisionTimeoutSeconds — typed exception so
+            // the operator signal in audit/logs distinguishes a stuck VM clone
+            // from a per-step exec timeout (both are transient infra, but the
+            // root cause and remediation differ — clone hangs point at the
+            // sandbox host / multipass daemon; per-step hangs point at the CLI).
+            _log.LogWarning(ex, "In-VM smoke for {Agent}: provisioning timed out; treating as transient", probe.Kind.Value);
+            return BenchTransientFaultIfRequested(probe.Kind, "probe provisioning timed out", benchOnTransientFault);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Caller-driven cancellation (worker / shutdown token fired) is NOT
+            // evidence the CLI is broken — propagate so the wrapper's distinct
+            // caller-cancellation branch surfaces a real shutdown rather than
+            // being swallowed by the catch-all below and converted into a
+            // "broken binary" bench. EnsureProbedAsync's outer filter on
+            // ct.IsCancellationRequested re-throws to the router so dispatch
+            // unwinds cleanly.
+            throw;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -308,9 +523,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         // without re-execing the CLI. Scoped to this ref so a known-good pinned
         // baseline's entry survives (B1 pinning).
         if (result.Ok)
-            _cache.Set(probe.Kind, baselineRef, result);
+            _cache.Set(probe.Kind, resolvedBaselineRef, result);
         else
-            _cache.Invalidate(probe.Kind, baselineRef);
+            _cache.Invalidate(probe.Kind, resolvedBaselineRef);
         // clearsFastFail:true — this verdict comes from a freshly executed in-VM
         // probe that actually ran the binary in a sandbox, so a pass is valid
         // evidence the CLI launches and may lift the fast-fail circuit breaker.
@@ -345,13 +560,14 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
     private async Task<AgentSmokeResult> RunStepsInSandboxAsync(
         AgentCredential? credential,
+        InVmSmokeSandboxTarget target,
         string baselineRef,
         IReadOnlyList<InVmSmokeStep> steps,
         Stopwatch sw,
         CancellationToken ct)
     {
-        var spec = BuildSpec(credential, baselineRef);
-        await using var sandbox = await _provider.CreateAsync(spec, ct);
+        var spec = BuildSpec(credential, target, baselineRef);
+        await using var sandbox = await CreateSandboxWithProvisionTimeoutAsync(spec, ct);
 
         foreach (var step in steps)
         {
@@ -381,7 +597,187 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         return new AgentSmokeResult(true, null, sw.Elapsed, SmokeFailureCategory.None);
     }
 
-    private SandboxSpec BuildSpec(AgentCredential? credential, string baselineRef)
+    /// <summary>
+    /// Provisions a sandbox under a hard provisioning timeout
+    /// (<see cref="InVmSmokeOptions.ProvisionTimeoutSeconds"/>). The per-step
+    /// exec timeout cannot bound this — provisioning has to produce a sandbox
+    /// before any step runs — so a wedged baseline clone / "multipass launch"
+    /// (observed 2026-06-01) would otherwise hang the gate forever. On overrun
+    /// we surface a <see cref="TimeoutException"/> rather than the raw OCE so
+    /// the caller's transient-fault catch can tag it with a clear reason
+    /// ("probe provisioning timed out") distinct from per-step exec timeouts.
+    /// Non-positive disables the timeout (tests with synthetic clocks).
+    ///
+    /// <para>The timeout is a wall-clock bound on the <em>returned Task</em>,
+    /// not a cooperative-cancel signal: once <see cref="ISandboxProvider.CreateAsync"/>
+    /// has handed back a Task, a wedged multipass daemon (the production hang
+    /// this method exists for) cannot stall this method beyond
+    /// <paramref name="provisionTimeout"/> — the <see cref="Task.WhenAny(Task[])"/>
+    /// race against a wall-clock delay still fires. This does NOT guard against
+    /// a provider that blocks synchronously <em>before</em> returning a Task
+    /// (we'd be inside the <c>_provider.CreateAsync</c> call and have not yet
+    /// armed the timer); the production <c>MultipassSandboxProvider</c> returns
+    /// a Task around its CLI waits, so this is not a real boundary, but the
+    /// wrapper alone cannot bound a synchronously-blocking provider. The orphaned create task is handed to
+    /// <see cref="ObserveOrphanedSandboxCreateAsync"/>, which disposes any
+    /// sandbox the provider eventually yields so a late-arriving VM does not
+    /// leak. The linked / provisioning CTS pair is disposed before we walk away
+    /// from a non-cooperative create — the token's cancelled state is preserved
+    /// after dispose (so a cooperative provider still observes the cancel) and
+    /// disposing unregisters the linked source from the parent worker token, so
+    /// repeated timed-out probes cannot accumulate registrations against
+    /// <paramref name="ct"/> for the process lifetime.</para>
+    /// </summary>
+    private async Task<ISandbox> CreateSandboxWithProvisionTimeoutAsync(
+        SandboxSpec spec, CancellationToken ct)
+    {
+        if (_opts.ProvisionTimeoutSeconds <= 0)
+            return await _provider.CreateAsync(spec, ct);
+
+        var provisionTimeout = TimeSpan.FromSeconds(_opts.ProvisionTimeoutSeconds);
+        var provisionCts = new CancellationTokenSource(provisionTimeout);
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, provisionCts.Token);
+
+        // ISandboxProvider.CreateAsync is not required to be an async state
+        // machine — it can throw synchronously before returning a Task. Without
+        // this guard those throws would leak both CTSes (the try/finally below
+        // is only reached once a Task exists), so wrap construction and dispose
+        // on a synchronous boundary failure.
+        Task<ISandbox> createTask;
+        try
+        {
+            createTask = _provider.CreateAsync(spec, linked.Token);
+        }
+        catch
+        {
+            linked.Dispose();
+            provisionCts.Dispose();
+            throw;
+        }
+
+        var winner = await Task.WhenAny(createTask, Task.Delay(provisionTimeout, ct));
+        if (winner == createTask)
+        {
+            try
+            {
+                return await createTask;
+            }
+            catch (OperationCanceledException) when (provisionCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
+            }
+            finally
+            {
+                linked.Dispose();
+                provisionCts.Dispose();
+            }
+        }
+
+        // Either the wall-clock timeout or the caller's ct fired before
+        // CreateAsync returned. In BOTH cases the in-flight task is left
+        // running: ownership passes to the orphan observer (it disposes any
+        // sandbox the provider eventually yields) and the CTS pair is disposed
+        // immediately so we don't keep registrations on the parent worker
+        // token alive for a non-cooperative create that may never settle. The
+        // CancellationToken state is preserved after dispose, so a cooperative
+        // provider still observes cancellation; disposing only unregisters the
+        // linked-source callback from ct. We always hand off / dispose BEFORE
+        // propagating either cancellation or the timeout exception, so a
+        // caller-cancelled provisioning never falls through unobserved.
+        provisionCts.Cancel();
+        _ = ObserveOrphanedSandboxCreateAsync(createTask);
+        linked.Dispose();
+        provisionCts.Dispose();
+
+        // Propagate caller cancellation first so a real shutdown is
+        // distinguishable from a provisioning hang.
+        ct.ThrowIfCancellationRequested();
+        throw new TimeoutException(
+            $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
+    }
+
+    /// <summary>
+    /// Owns the post-timeout cleanup for a sandbox-create task we walked away
+    /// from: disposes the sandbox if the provider eventually returns one (so a
+    /// late-arriving VM does not leak) and logs any eventual fault for
+    /// diagnosis. The linked / provision CTS pair is owned by the caller and
+    /// disposed before this observer is started — we deliberately do NOT keep
+    /// CTS references here, since a non-cooperative create may never settle and
+    /// holding them would leak registrations on the parent worker token.
+    /// </summary>
+    private async Task ObserveOrphanedSandboxCreateAsync(Task<ISandbox> createTask)
+    {
+        try
+        {
+            var sandbox = await createTask.ConfigureAwait(false);
+            try { await sandbox.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex,
+                    "In-VM smoke: failed to dispose post-timeout orphaned sandbox");
+            }
+        }
+        catch (OperationCanceledException) { /* expected — we cancelled it */ }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "In-VM smoke: post-timeout orphaned provisioning eventually faulted");
+        }
+    }
+
+    private string? TryResolveBaselineRef(InVmSmokeSandboxTarget target)
+    {
+        if (string.IsNullOrWhiteSpace(target.NetworkProfile))
+            return null;
+
+        try
+        {
+            return _resolver.ResolveBaselineRef(target.NetworkProfile, target.Flavor);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "In-VM smoke: baseline resolver failed for profile {Profile} / flavor {Flavor}",
+                target.NetworkProfile, target.Flavor);
+            return null;
+        }
+    }
+
+    private string? ResolveTargetBaselineRef(
+        InVmSmokeSandboxTarget target,
+        string? pinnedBaselineRef)
+    {
+        if (string.IsNullOrWhiteSpace(target.NetworkProfile))
+            return null;
+
+        var baselineRef = string.IsNullOrWhiteSpace(pinnedBaselineRef)
+            ? _resolver.ResolveBaselineRef(target.NetworkProfile, target.Flavor)
+            : pinnedBaselineRef;
+        if (string.IsNullOrWhiteSpace(baselineRef))
+            return null;
+
+        return baselineRef;
+    }
+
+    private async Task<string?> EnsureReadyBaselineRefAsync(
+        InVmSmokeSandboxTarget target,
+        string baselineRef,
+        CancellationToken ct)
+    {
+        var ensured = await _baselineProvisioner.EnsureBaselineImageAsync(
+            target.NetworkProfile!,
+            target.Flavor,
+            baselineRef,
+            ct);
+
+        return string.IsNullOrWhiteSpace(ensured) ? null : baselineRef;
+    }
+
+    private SandboxSpec BuildSpec(
+        AgentCredential? credential,
+        InVmSmokeSandboxTarget target,
+        string baselineRef)
     {
         var mounts = new List<SandboxMount>(credential?.Mounts ?? [])
         {
@@ -398,12 +794,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             Network = new SandboxNetworkPolicy
             {
                 AllowedHosts = _opts.AllowedHosts,
-                ProfileName = _opts.NetworkProfile,
+                ProfileName = target.NetworkProfile,
             },
-            Flavor = SandboxProfileFlavor.Headless,
+            Flavor = target.Flavor,
             WorkingDirectory = SandboxConventions.WorkDir,
             TimingPhase = "in-vm-smoke",
-            BaselineImageRef = baselineRef == LiveRefSentinel ? null : baselineRef,
+            BaselineImageRef = baselineRef,
         };
     }
 

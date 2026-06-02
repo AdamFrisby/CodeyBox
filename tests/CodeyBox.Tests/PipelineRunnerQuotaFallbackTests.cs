@@ -115,6 +115,42 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task ReworkFirstAttemptSmokeRejection_FallsBackBeforeInvokingRejectedRunner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeGate = new RejectingTargetInVmSmokeGate(AgentKind.Codex, "rework-profile");
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Rework = "rework-profile",
+                Merge = "merge-profile",
+            },
+            inVmSmokeGate: smokeGate);
+
+        var codexPhases = new List<string>();
+        var claudePhases = new List<string>();
+        fix.Codex.PhaseInvocationStarted += (_, phase) => codexPhases.Add(phase);
+        fix.Claude.PhaseInvocationStarted += (_, phase) => claudePhases.Add(phase);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.Contains("work", codexPhases);
+        Assert.DoesNotContain("rework", codexPhases);
+        Assert.Contains("rework", claudePhases);
+        Assert.Contains(smokeGate.Calls, c =>
+            c.Kind == AgentKind.Codex && c.Target.NetworkProfile == "rework-profile");
+    }
+
+    [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_SameIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1289,7 +1325,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         double phaseAbsoluteTimeoutMultiplier = 3.0,
         bool useClassRouter = true,
         int stuckThresholdMinutes = -1,
-        Func<InMemoryAgentInvolvementStore, IAgentInvolvementStore>? wrapInvolvement = null)
+        Func<InMemoryAgentInvolvementStore, IAgentInvolvementStore>? wrapInvolvement = null,
+        ProjectNetworkProfiles? networkProfiles = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1325,6 +1363,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Codex,
             DefaultAgentClass = useClassRouter ? "frontier" : null,
+            NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Audit = new ProjectAudit
             {
                 MaxIterations = maxAuditIterations,
@@ -1367,6 +1406,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
+            inVmSmokeGate: inVmSmokeGate,
             involvement: involvementForPipeline);
 
         return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
@@ -2049,4 +2089,40 @@ internal sealed class RecordingProbe : IAgentQuotaProbe
         MarkedExhausted.Add(member.Agent);
         return Task.CompletedTask;
     }
+}
+
+internal sealed class RejectingTargetInVmSmokeGate : IInVmSmokeGate
+{
+    private readonly AgentKind _rejectKind;
+    private readonly string _rejectProfile;
+
+    public RejectingTargetInVmSmokeGate(AgentKind rejectKind, string rejectProfile)
+    {
+        _rejectKind = rejectKind;
+        _rejectProfile = rejectProfile;
+    }
+
+    public bool Enabled => true;
+    public List<(AgentKind Kind, InVmSmokeSandboxTarget Target)> Calls { get; } = [];
+
+    public Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        Calls.Add((kind, target));
+        var reject = kind == _rejectKind
+            && string.Equals(target.NetworkProfile, _rejectProfile, StringComparison.Ordinal);
+        return Task.FromResult(reject
+            ? new AgentAvailability(false, "in-VM smoke gate rejected test target", null)
+            : new AgentAvailability(true, null, null));
+    }
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+        Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 }

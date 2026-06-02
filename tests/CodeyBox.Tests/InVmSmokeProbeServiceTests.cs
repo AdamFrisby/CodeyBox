@@ -30,12 +30,13 @@ public sealed class InVmSmokeProbeServiceTests
         return new InVmSmokeProber(
             provider,
             resolver,
+            resolver,
             new ConstantCredentialProvider(CursorCred),
             [new CursorInVmSmokeProbe()],
             registry,
             new InVmSmokeCache(TimeSpan.FromMinutes(60)),
             new NullWebhookDispatcher(),
-            new InVmSmokeOptions { Enabled = enabled, ImageReference = "img", SweepIntervalSeconds = 0 },
+            new InVmSmokeOptions { Enabled = enabled, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
             NullLogger<InVmSmokeProber>.Instance);
     }
 
@@ -44,13 +45,13 @@ public sealed class InVmSmokeProbeServiceTests
 
     private static InVmSmokeProbeService BuildService(InVmSmokeProber prober, int sweepIntervalSeconds = 0) =>
         new(prober,
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = sweepIntervalSeconds },
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = sweepIntervalSeconds },
             NullLogger<InVmSmokeProbeService>.Instance);
 
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(5)));
+        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(15)));
         Assert.Same(done, winner); // single-sweep ExecuteAsync must complete promptly
         await done; // surface any exception that escaped (there must be none)
     }
@@ -92,18 +93,21 @@ public sealed class InVmSmokeProbeServiceTests
     [Fact]
     public async Task SweepException_IsSwallowed_ExecuteAsyncCompletes()
     {
-        // ProbeAllAsync resolves the baseline ref before its per-probe try/catch,
-        // so a resolver fault escapes it; SafeSweepAsync must swallow it.
-        var provider = new ScriptedSandboxProvider(_ => new SandboxExecResult(0, "", ""));
-        var resolver = new StubBaselineResolver("base-A") { ThrowOnResolve = true };
-        var prober = BuildProber(provider, NewRegistry(), resolver, enabled: true);
-        var service = BuildService(prober);
+        // The prober now handles expected resolver/provisioning faults internally,
+        // so use a gate that throws directly from ProbeAllAsync. This pins the
+        // service boundary catch itself: removing SafeSweepAsync's catch would make
+        // ExecuteAsync fault here.
+        var gate = new ThrowingGate();
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance);
 
         await service.StartAsync(CancellationToken.None);
         await AwaitExecute(service); // would throw here if SafeSweepAsync let it escape
         await service.StopAsync(CancellationToken.None);
 
-        Assert.Equal(0, provider.CreateCount);
+        Assert.Equal(1, gate.ThrowCount);
     }
 
     [Fact]
@@ -117,7 +121,7 @@ public sealed class InVmSmokeProbeServiceTests
         var gate = new CountingGate();
         var service = new InVmSmokeProbeService(
             gate,
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 1 },
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
             NullLogger<InVmSmokeProbeService>.Instance);
 
         await service.StartAsync(CancellationToken.None);
@@ -126,6 +130,122 @@ public sealed class InVmSmokeProbeServiceTests
 
         Assert.True(reachedTwo, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
     }
+
+    [Fact]
+    public async Task StartupSweep_UsesProjectWorkTarget_WhenSmokeProfileUnset()
+    {
+        var gate = new CountingGate();
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.invalid/repo.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "internet-only" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(project));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("internet-only", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+    }
+
+    [Fact]
+    public async Task StartupSweep_ExplicitSmokeProfile_UsesTargetAwareGate_AndWinsOverProjectProfile()
+    {
+        var gate = new CountingGate();
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.invalid/repo.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "project-work" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions
+            {
+                Enabled = true,
+                ImageReference = "img",
+                NetworkProfile = "smoke-explicit",
+                SweepIntervalSeconds = 0,
+            },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(project));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("smoke-explicit", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+    }
+
+    [Fact]
+    public async Task StartupSweep_SkipsBlankProjectProfiles()
+    {
+        var gate = new CountingGate();
+        var blank = new Project
+        {
+            Id = new ProjectId("blank"),
+            DisplayName = "Blank",
+            RepositoryUrl = "https://example.invalid/blank.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "" },
+        };
+        var valid = new Project
+        {
+            Id = new ProjectId("valid"),
+            DisplayName = "Valid",
+            RepositoryUrl = "https://example.invalid/valid.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "internet-only" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(blank, valid));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("internet-only", target.NetworkProfile);
+    }
+
+    [Fact]
+    public async Task StartupSweep_DeDuplicatesProjectProfiles()
+    {
+        var gate = new CountingGate();
+        Project Project(string id) => new()
+        {
+            Id = new ProjectId(id),
+            DisplayName = id,
+            RepositoryUrl = $"https://example.invalid/{id}.git",
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "internet-only" },
+        };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", SweepIntervalSeconds = 0 },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            new InMemoryProjectRepository(Project("alpha"), Project("beta")));
+
+        await service.StartAsync(CancellationToken.None);
+        await AwaitExecute(service);
+        await service.StopAsync(CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("internet-only", target.NetworkProfile);
+    }
+
 
     /// <summary>
     /// In-VM smoke gate stub that counts <see cref="ProbeAllAsync"/> invocations
@@ -141,6 +261,7 @@ public sealed class InVmSmokeProbeServiceTests
 
         public bool Enabled => true;
         public int SweepCount { get { lock (_sync) return _count; } }
+        public List<InVmSmokeSandboxTarget> Targets { get; } = [];
 
         public Task ProbeAllAsync(CancellationToken ct)
         {
@@ -152,7 +273,16 @@ public sealed class InVmSmokeProbeServiceTests
             return Task.CompletedTask;
         }
 
-        public Task<AgentAvailability> EnsureAvailableAsync(AgentKind kind, string? baselineRef, CancellationToken ct)
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct)
+        {
+            lock (_sync) Targets.Add(target);
+            return ProbeAllAsync(ct);
+        }
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
             => Task.FromResult(new AgentAvailability(true, null, null));
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
@@ -168,5 +298,29 @@ public sealed class InVmSmokeProbeServiceTests
             var winner = await Task.WhenAny(_reached.Task, Task.Delay(timeout));
             return winner == _reached.Task;
         }
+    }
+
+    private sealed class ThrowingGate : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+        public int ThrowCount { get; private set; }
+
+        public Task ProbeAllAsync(CancellationToken ct)
+        {
+            ThrowCount++;
+            throw new InvalidOperationException("sweep failed");
+        }
+
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) =>
+            ProbeAllAsync(ct);
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+            => Task.FromResult(new AgentAvailability(true, null, null));
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+            => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 }

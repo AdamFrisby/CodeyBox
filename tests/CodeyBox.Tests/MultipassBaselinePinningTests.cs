@@ -39,43 +39,51 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     [Fact]
     public async Task CreateAsync_WithPinnedBaselineRef_ReusesPinnedNameDespiteLiveConfigDrift()
     {
-        const string PinnedName = "cb-baseline-pinned123";
+        var initialOpts = MakeOptions(extraRuncmd: ["touch /opt/codeybox-initial"]);
+        var optsRef = initialOpts;
+        var provider = new MultipassSandboxProvider(() => optsRef, NullLogger<MultipassSandboxProvider>.Instance, null,
+            NewRecordingRunner(
+                new ConcurrentDictionary<string, string>(StringComparer.Ordinal),
+                new ConcurrentQueue<string>(),
+                new ConcurrentQueue<string>(),
+                new ConcurrentQueue<string>()));
+        var pinnedName = provider.ResolveBaselineRef("claude", SandboxProfileFlavor.Headless)!;
 
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         // Seed the pinned baseline so BaselineVmExistsAsync sees it as already
         // baked — the provider must not call launch/install for the baseline.
-        states[PinnedName] = "Running";
+        states[pinnedName] = "Running";
 
         var infoQueries = new ConcurrentQueue<string>();
         var launchNames = new ConcurrentQueue<string>();
         var cloneSources = new ConcurrentQueue<string>();
 
         var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources);
+        provider = new MultipassSandboxProvider(() => optsRef, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
 
         // Live config carries an ExtraRuncmd value that would yield a different
         // content hash than the pinned name — so if pinning is not respected,
         // the launch/clone source would not be PinnedName.
-        var opts = MakeOptions(extraRuncmd: ["touch /opt/codeybox-LIVE-drift"]);
-        var provider = new MultipassSandboxProvider(opts, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
+        optsRef = MakeOptions(extraRuncmd: ["touch /opt/codeybox-LIVE-drift"]);
 
         // Sanity: live config would not produce PinnedName by itself — without
         // the pin, the provider would bake a different baseline name.
         var liveComposed = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
-            opts, "claude", SandboxProfileFlavor.Headless);
-        Assert.NotEqual(PinnedName, liveComposed);
+            optsRef, "claude", SandboxProfileFlavor.Headless);
+        Assert.NotEqual(pinnedName, liveComposed);
 
         var spec = new SandboxSpec
         {
             ImageReference = "ignored",
             Network = new SandboxNetworkPolicy { ProfileName = "claude" },
             WorkingDirectory = "/work",
-            BaselineImageRef = PinnedName,
+            BaselineImageRef = pinnedName,
         };
 
         await using var _ = await provider.CreateAsync(spec, CancellationToken.None);
 
         // The provider asked about the PINNED name — not the live-config hash.
-        Assert.Contains(PinnedName, infoQueries);
+        Assert.Contains(pinnedName, infoQueries);
         Assert.DoesNotContain(liveComposed, infoQueries);
 
         // No baseline launch — the seeded baseline was reused as-is.
@@ -84,7 +92,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         // Clone source is the pinned name — the per-item sandbox cloned from
         // the existing baseline rather than from a fresh live-config bake.
         var cloneSource = Assert.Single(cloneSources);
-        Assert.Equal(PinnedName, cloneSource);
+        Assert.Equal(pinnedName, cloneSource);
     }
 
     /// <summary>
@@ -125,11 +133,118 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         Assert.Equal(expectedFallbackName, cloneSource);
     }
 
+    [Fact]
+    public async Task EnsureBaselineImageAsync_WithPinnedBaselineRef_BakesPinnedName()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources);
+        var initialOpts = MakeOptions(extraRuncmd: ["touch /opt/codeybox-initial"]);
+        var optsRef = initialOpts;
+        var provider = new MultipassSandboxProvider(() => optsRef, NullLogger<MultipassSandboxProvider>.Instance, null, runner);
+        var pinnedName = provider.ResolveBaselineRef("claude", SandboxProfileFlavor.Headless)!;
+        optsRef = MakeOptions(extraRuncmd: ["touch /opt/codeybox-LIVE-drift"]);
+
+        var liveComposed = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            optsRef, "claude", SandboxProfileFlavor.Headless);
+        Assert.NotEqual(pinnedName, liveComposed);
+
+        var ensured = await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "claude",
+            SandboxProfileFlavor.Headless,
+            pinnedName,
+            CancellationToken.None);
+
+        Assert.Equal(pinnedName, ensured);
+        Assert.Contains(pinnedName, infoQueries);
+        Assert.DoesNotContain(liveComposed, infoQueries);
+        Assert.Contains(pinnedName, launchNames);
+        Assert.DoesNotContain(liveComposed, launchNames);
+        Assert.Empty(cloneSources);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithPinnedBaselineForDifferentProfile_FailsClosedBeforeClone()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var opts = MakeOptions(extraRuncmd: ["touch /opt/codeybox-profile-bind"]);
+        var metadataProvider = new MultipassSandboxProvider(
+            opts,
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            NewRecordingRunner(states, infoQueries, launchNames, cloneSources));
+        var workProfilePin = metadataProvider.ResolveBaselineRef("claude", SandboxProfileFlavor.Headless)!;
+
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources);
+        var provider = new MultipassSandboxProvider(
+            opts,
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+        states[workProfilePin] = "Running";
+
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "audit" },
+            WorkingDirectory = "/work",
+            BaselineImageRef = workProfilePin,
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("different network attachment", ex.Message);
+        Assert.Empty(cloneSources);
+        Assert.Empty(infoQueries);
+        Assert.Empty(launchNames);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithUnpersistedStalePinnedBaseline_FailsClosedBeforeClone()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(extraRuncmd: ["touch /opt/codeybox-unknown-pin"]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var unknownPinnedRef = "cb-baseline-stale";
+        states[unknownPinnedRef] = "Running";
+
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "audit" },
+            WorkingDirectory = "/work",
+            BaselineImageRef = unknownPinnedRef,
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("unknown network attachment", ex.Message);
+        Assert.Empty(cloneSources);
+        Assert.Empty(infoQueries);
+        Assert.Empty(launchNames);
+    }
+
     private MultipassSandboxOptions MakeOptions(IReadOnlyList<string> extraRuncmd) => new()
     {
         MultipassBinary = "/bin/false",
         StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
-        NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude" },
+        NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
         UseBaselineImages = true,
         ExtraRuncmd = extraRuncmd,
     };

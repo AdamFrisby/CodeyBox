@@ -296,12 +296,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             _log.LogInformation("Quota router unavailable; skipping auto-retry for work item {Id}", item.Id);
             return new QuotaRetryAttemptResult("skipped:router-unavailable");
         }
-        // Pin the baseline ref before the router gates, mirroring the dispatch
-        // pickup path: the in-VM smoke gate must probe the image this item will
-        // actually be cloned from, not the active baseline. Retried items are
-        // normally already stamped from their first pickup; this only fills a
-        // null ref (e.g. an item that never ran) so the gate never probes/caches
-        // under the wrong image.
+        // Pin the work/headless baseline ref before the router gates, mirroring
+        // the dispatch pickup path: the in-VM smoke gate must probe the image a
+        // matching work-profile retry will clone, not the active baseline.
+        // Retried items are normally already stamped from their first pickup;
+        // this only fills a null ref (e.g. an item that never ran) so the gate
+        // never probes/caches a matching work target under the wrong image.
         if (item.BaselineImageRef is null)
         {
             var pinnedRef = ResolveBaselineRefForRetry(item, project);

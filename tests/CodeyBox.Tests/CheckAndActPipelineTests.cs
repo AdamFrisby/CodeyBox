@@ -413,6 +413,47 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task CheckAndAct_GraphicalProject_SmokeGateUsesHeadlessWorkProfile()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new RecordingInVmSmokeGate();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            graphicalSandbox: true,
+            networkProfiles: new ProjectNetworkProfiles { Work = "headless-work" },
+            inVmSmokeGate: gate);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "clean", "high"));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check graphical target",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-smoke-target",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            BaselineImageRef = "headless-work-baseline",
+            Check = new CheckAndActSpec
+            {
+                Question = "Is remediation required?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var target = Assert.Single(gate.Targets);
+        Assert.Equal("headless-work", target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, target.Flavor);
+        Assert.Equal("headless-work-baseline", target.BaselineRef);
+    }
+
+    [Fact]
     public async Task YesVerdict_FollowupInheritsBoundaryPriorityAndMinModelScore()
     {
         // EnqueueOnYesFollowupAsync clamps priority to [-1000, 1000] and
@@ -967,5 +1008,26 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var ans = answer ? "true" : "false";
         var confSegment = confidence is null ? "" : $", \"confidence\": \"{confidence}\"";
         return $"some preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\"{confSegment}}}\n{CheckAndActPipeline.EndSentinel}\n";
+    }
+
+    private sealed class RecordingInVmSmokeGate : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+        public List<InVmSmokeSandboxTarget> Targets { get; } = [];
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            Targets.Add(target);
+            return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
     }
 }
