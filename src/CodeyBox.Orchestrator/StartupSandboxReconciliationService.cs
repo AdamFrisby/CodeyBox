@@ -54,13 +54,21 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
 
     public async Task StopAsync(CancellationToken ct)
     {
-        _backgroundCts?.Cancel();
+        var cts = _backgroundCts;
+        cts?.Cancel();
         var task = _reconcileTask;
-        if (task is null)
-            return;
-
-        try { await task.WaitAsync(ct); }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        try
+        {
+            if (task is not null)
+            {
+                try { await task.WaitAsync(ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            }
+        }
+        finally
+        {
+            cts?.Dispose();
+        }
     }
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
