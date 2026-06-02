@@ -62,6 +62,20 @@ public sealed class CodeyBoxOptionsValidatorTests
         }
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(CodeyBoxOptions.MaximumMaxTemplateChecks + 1)]
+    public void Validate_RejectsInvalidMaxTemplateChecks(int maxTemplateChecks)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MaxTemplateChecks = maxTemplateChecks;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:MaxTemplateChecks", result.FailureMessage);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 

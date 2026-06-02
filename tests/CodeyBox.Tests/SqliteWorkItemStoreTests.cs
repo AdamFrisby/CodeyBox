@@ -178,6 +178,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             Check = spec,
             Verdict = verdict,
             OriginCheckWorkItemId = originId,
+            TemplateName = "security",
+            TemplateEntryIndex = 3,
         };
         await _store.CreateAsync(item);
 
@@ -185,6 +187,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.NotNull(read);
         Assert.Equal(JobType.CheckAndAct, read!.JobType);
         Assert.Equal(originId, read.OriginCheckWorkItemId);
+        Assert.Equal("security", read.TemplateName);
+        Assert.Equal(3, read.TemplateEntryIndex);
 
         Assert.NotNull(read.Check);
         Assert.Equal(spec.Question, read.Check!.Question);
@@ -202,6 +206,36 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.True(read.Verdict!.Answer);
         Assert.Contains("Foo.cs", read.Verdict.Evidence);
         Assert.Equal("medium", read.Verdict.Confidence);
+    }
+
+    [Fact]
+    public async Task TemplateProvenance_SurvivesStateUpdates()
+    {
+        var item = Sample() with
+        {
+            TemplateName = "security",
+            TemplateEntryIndex = 2,
+        };
+        await _store.CreateAsync(item);
+
+        await _store.UpdateAsync(item.With(WorkItemState.Working));
+
+        var afterUpdate = await _store.GetAsync(item.Id);
+        Assert.NotNull(afterUpdate);
+        Assert.Equal(WorkItemState.Working, afterUpdate!.State);
+        Assert.Equal("security", afterUpdate.TemplateName);
+        Assert.Equal(2, afterUpdate.TemplateEntryIndex);
+
+        var updated = await _store.TryUpdateIfStateAsync(
+            afterUpdate.With(WorkItemState.Done),
+            WorkItemState.Working);
+        Assert.True(updated);
+
+        var afterConditionalUpdate = await _store.GetAsync(item.Id);
+        Assert.NotNull(afterConditionalUpdate);
+        Assert.Equal(WorkItemState.Done, afterConditionalUpdate!.State);
+        Assert.Equal("security", afterConditionalUpdate.TemplateName);
+        Assert.Equal(2, afterConditionalUpdate.TemplateEntryIndex);
     }
 
     [Fact]

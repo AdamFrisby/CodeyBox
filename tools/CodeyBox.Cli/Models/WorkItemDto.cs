@@ -26,6 +26,8 @@ internal sealed class WorkItemDto
     public bool DependsOnSatisfied { get; set; }
     public Dictionary<string, string?> DependsOnExternalIds { get; set; } = [];
     public long QueuePosition { get; set; }
+    public string? TemplateName { get; set; }
+    public int? TemplateEntryIndex { get; set; }
 
     /// <summary>
     /// Matches orchestrator <c>WorkItemDependencies.TerminalStates</c> (Merged is not terminal).

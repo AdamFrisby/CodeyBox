@@ -88,6 +88,69 @@ Queue a new work item.
 
 Response: `201 Created` with the work item record.
 
+### Task templates
+
+Task templates are JSON files under `CodeyBox:TemplateDirectory` (default
+`templates`). Files are read and validated on each request, so dropping
+`templates/<name>.json` is enough to make a template available.
+
+Template files contain a `checks` array. Each entry creates one independent
+`CheckAndAct` work item:
+
+```json
+{
+  "checks": [
+    {
+      "question": "Is user input interpolated into SQL?",
+      "onYes": {
+        "title": "Fix SQL injection",
+        "prompt": "Replace unsafe SQL construction with parameterised queries."
+      }
+    }
+  ]
+}
+```
+
+Optional entry fields: `title`, `prompt`, and `actionableAnswer`. When omitted,
+the API generates a check title from the question, uses the question as the
+prompt, and defaults `actionableAnswer` to `true`.
+
+### `GET /templates`
+
+Lists discovered `*.json` templates. Bad templates are included with an `error`
+field so operators can see validation failures without trying to queue them.
+
+### `POST /templates/queue`
+
+Expands a template into queued work items against a project.
+
+```json
+{
+  "template": "templates/security",
+  "projectId": "my-app",
+  "priority": 25
+}
+```
+
+Returns `201 Created`:
+
+```json
+{
+  "template": "security",
+  "enqueued": 3,
+  "workItems": [ { "...": "..." } ]
+}
+```
+
+Bad or missing templates fail before any work item is created. Each created
+work item records `templateName` and zero-based `templateEntryIndex`.
+
+### `POST /templates/{name}/queue`
+
+Equivalent to `POST /templates/queue`, but the template name comes from the
+route. The request body may omit `template`; if it supplies `template`, it must
+refer to the same template as `{name}`.
+
 ### `GET /workitems`
 
 List all work items, newest first.

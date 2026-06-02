@@ -20,6 +20,9 @@ Hot-reloadable today:
   the repository keeps its own last-good snapshot because rejected options do
   not invoke its reload callback. The operator sees an `OptionsValidationException`
   naming the project, and knows to cancel / wait for the in-flight items first.
+- `TemplateDirectory` — task-template files are read fresh from this directory
+  on each list or queue request. Adding, editing, or removing `*.json` files
+  requires no restart.
 - `Projects[].Audit.PerIterationTimeoutMinutes` — the resolved `Project`
   record is captured once at work-item pickup, so a change mid-iteration
   does not move the goalposts for an item already running.
@@ -107,6 +110,7 @@ startup); we add explicit guards as we tighten the contract.
 |-----|------|---------|-------------|
 | `GitRootDirectory` | string | `/var/lib/codeybox/repos` | Root for bare host git repos. |
 | `StateDatabasePath` | string | `/var/lib/codeybox/state.db` | SQLite database path. |
+| `TemplateDirectory` | string | `templates` | Directory containing task-template JSON files. Relative paths resolve under the API content root. Files are discovered and validated on demand. |
 | `SandboxImageReference` | string | `codeybox/agent:latest` | OCI image reference for agent sandboxes. |
 | `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. |
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
