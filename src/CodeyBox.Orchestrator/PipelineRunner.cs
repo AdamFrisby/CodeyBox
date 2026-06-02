@@ -609,7 +609,18 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
-            if (auditors.Count > 0 && !skipAudit)
+            var requiredBuildApplies = false;
+            if (!skipAudit)
+            {
+                var requiredBuildProbe = await BranchRequiresRequiredBuildAsync(repoId, workBranch, ct);
+                if (requiredBuildProbe is null)
+                {
+                    throw new RequiredBuildVerificationUnavailableException(
+                        $"could not verify required build: failed to inspect branch '{workBranch}' for .NET build markers");
+                }
+                requiredBuildApplies = requiredBuildProbe.Value;
+            }
+            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
@@ -917,6 +928,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 "Work item {Id} parking in WaitingForQuotaReset: {Reason}",
                 item.Id, ex.Message);
             await TransitionWaitingForQuotaResetAsync(item, ex, project);
+        }
+        catch (RequiredBuildFailedException ex)
+        {
+            _log.LogWarning("Work item {Id} failed required build gate: {Error}", item.Id, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "build");
+        }
+        catch (RequiredBuildVerificationUnavailableException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (TerminalQuotaError ex)
         {
@@ -1988,23 +2009,31 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        var checkedOutExistingBranch = false;
         if (resumingPreempt)
         {
             var preemptCheckpoint = item.PreemptCheckpoint!;
             var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
+            checkedOutExistingBranch = true;
             prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
         {
             if (await OriginBranchExistsAsync(sandbox, branch, ct))
+            {
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                checkedOutExistingBranch = true;
+            }
             else
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
         }
         else
+        {
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+            checkedOutExistingBranch = true;
+        }
         var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
@@ -2346,8 +2375,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (isInitial && suggestionsJson is not null)
                     await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
+                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
                 return agentResult.Stdout;
             }
+
+            if (checkedOutExistingBranch)
+                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
 
             var msg = isInitial
                 ? "Agent produced no changes to commit"
@@ -2364,6 +2397,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
         if (isInitial && suggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+        await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
 
         return agentResult.Stdout;
     }
@@ -3234,6 +3269,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw auditPhase.Wrap(oce);
             }
 
+            var requiredBuildFinding = await RunRequiredBuildForAuditAsync(
+                item, project, repoId, workBranch, iteration, auditPhase.Token);
+            if (requiredBuildFinding is not null)
+                findings = [.. findings, requiredBuildFinding];
+
             // Emit cross-review event once per iteration when at least one LLM
             // auditor actually ran with a different agent than the work agent.
             if (activeAuditAgentKind is not null)
@@ -3365,6 +3405,297 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         return false;
     }
+
+    private const string RequiredBuildAuditorName = "process:required-build";
+    private const string RequiredBuildDisplayCommand = "dotnet build";
+    private const int RequiredBuildOutputMaxBytes = 16 * 1024;
+
+    private const string RequiredDotnetBuildScript = """
+        set -eu
+
+        if ! command -v dotnet >/dev/null 2>&1; then
+          echo "dotnet is not available in the sandbox PATH" >&2
+          exit 127
+        fi
+
+        targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
+        cleanup() { rm -f "$targets_file"; }
+        trap cleanup EXIT INT TERM
+
+        find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
+        if [ ! -s "$targets_file" ]; then
+          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f \( -name '*.slnx' -o -name '*.sln' \) -print \) | sort > "$targets_file"
+        fi
+        if [ ! -s "$targets_file" ]; then
+          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f -name '*.csproj' -print \) | sort > "$targets_file"
+        fi
+
+        if [ ! -s "$targets_file" ]; then
+          echo "No .NET solution or project file was found after marker detection." >&2
+          exit 125
+        fi
+
+        while IFS= read -r target; do
+          [ -n "$target" ] || continue
+          echo "CodeyBox required build: dotnet build $target"
+          dotnet build "$target"
+        done < "$targets_file"
+        """;
+
+    private async Task EnforceRequiredBuildForWorkPhaseAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string workBranch,
+        string agentPhase,
+        CancellationToken ct)
+    {
+        var result = await VerifyRequiredBuildOnBranchAsync(
+            item, project, repoId, workBranch, phase: agentPhase, ct: ct);
+        if (result.Status == RequiredBuildVerificationStatus.Failed)
+        {
+            var phaseLabel = agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase)
+                ? "rework"
+                : "work";
+            throw new RequiredBuildFailedException(
+                $"{phaseLabel} left the branch non-compiling: {BuildRequiredBuildFailureSummary(result)}");
+        }
+    }
+
+    private async Task<AuditFinding?> RunRequiredBuildForAuditAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string workBranch,
+        int iteration,
+        CancellationToken ct)
+    {
+        var result = await VerifyRequiredBuildOnBranchAsync(
+            item, project, repoId, workBranch, phase: "audit", ct: ct, iteration: iteration);
+        if (result.Status != RequiredBuildVerificationStatus.Failed)
+            return null;
+
+        return new AuditFinding(
+            AuditorName: RequiredBuildAuditorName,
+            Severity: AuditSeverity.Error,
+            Title: $"required build failed: {RequiredBuildDisplayCommand}",
+            Description: BuildRequiredBuildFailureSummary(result));
+    }
+
+    private async Task<RequiredBuildVerificationResult> VerifyRequiredBuildOnBranchAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string workBranch,
+        string phase,
+        CancellationToken ct,
+        int? iteration = null)
+    {
+        var required = await BranchRequiresRequiredBuildAsync(repoId, workBranch, ct);
+        if (required is null)
+            throw new RequiredBuildVerificationUnavailableException(
+                $"could not verify required build: failed to inspect branch '{workBranch}' for .NET build markers");
+        if (!required.Value)
+            return RequiredBuildVerificationResult.Skipped;
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var access = _gitHost.GetSandboxAccess(repoId);
+            var sandboxTarget = SandboxTargetResolver.ResolveAudit(
+                project.NetworkProfiles.AuditTool,
+                AuditCapabilities.None);
+            var spec = BuildSandboxSpec(
+                access,
+                includeAgentCredential: null,
+                allowAgentNetwork: false,
+                hostNetworkProfile: sandboxTarget.NetworkProfile,
+                timingWorkItemId: item.Id,
+                timingPhase: phase,
+                flavor: sandboxTarget.Flavor,
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                    project,
+                    sandboxTarget,
+                    item.BaselineImageRef));
+
+            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            await RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
+
+            var build = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", RequiredDotnetBuildScript],
+                WorkingDirectory = SandboxConventions.WorkDir,
+            }, ct);
+            sw.Stop();
+
+            var rawOutput = CombinedOutput(build);
+            var redactedOutput = TruncateRequiredBuildOutput(rawOutput);
+            await PersistRequiredBuildReportAsync(
+                item.Id,
+                iteration: iteration ?? 0,
+                startedAt,
+                sw.Elapsed,
+                build.Success,
+                redactedOutput,
+                build.ExitCode,
+                ct);
+
+            if (build.Success)
+                return new RequiredBuildVerificationResult(
+                    RequiredBuildVerificationStatus.Passed,
+                    build.ExitCode,
+                    redactedOutput);
+
+            if (build.ExitCode == 127
+                && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new RequiredBuildVerificationUnavailableException(
+                    "could not verify required build: dotnet is not available in the audit-tool sandbox");
+            }
+
+            if (build.ExitCode == 125)
+            {
+                throw new RequiredBuildVerificationUnavailableException(
+                    "could not verify required build: no .NET solution or project file was found after marker detection");
+            }
+
+            return new RequiredBuildVerificationResult(
+                RequiredBuildVerificationStatus.Failed,
+                build.ExitCode,
+                redactedOutput);
+        }
+        catch (RequiredBuildVerificationUnavailableException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new RequiredBuildVerificationUnavailableException(
+                $"could not verify required build: {SingleLineSummary(ex.Message)}",
+                ex);
+        }
+    }
+
+    private async Task<bool?> BranchRequiresRequiredBuildAsync(
+        string repoId,
+        string workBranch,
+        CancellationToken ct)
+    {
+        Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        var repoPath = _gitHost.GetRepoPath(repoId);
+        var (stdout, _, exitCode) = await RunHostGitCaptureNoThrowAsync(
+            repoPath,
+            ct,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            workBranch);
+        if (exitCode != 0)
+            return null;
+
+        return stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsRequiredDotnetBuildMarkerPath);
+    }
+
+    private static bool IsRequiredDotnetBuildMarkerPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var segments = path.Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length == 0)
+            return false;
+
+        if (segments.Any(static s =>
+                s.Equals(".git", StringComparison.OrdinalIgnoreCase)
+                || s.Equals("bin", StringComparison.OrdinalIgnoreCase)
+                || s.Equals("obj", StringComparison.OrdinalIgnoreCase)
+                || s.Equals("node_modules", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var fileName = segments[^1];
+        return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task PersistRequiredBuildReportAsync(
+        WorkItemId workItemId,
+        int? iteration,
+        DateTimeOffset startedAt,
+        TimeSpan elapsed,
+        bool success,
+        string rawOutput,
+        int exitCode,
+        CancellationToken ct)
+    {
+        if (_auditReports is null)
+            return;
+
+        try
+        {
+            var findings = success
+                ? []
+                : new List<AuditReportFinding>
+                {
+                    new(
+                        FindingIdComputer.Compute(RequiredBuildAuditorName, "required build failed", []),
+                        AuditSeverity.Error.ToString(),
+                        $"required build failed: {RequiredBuildDisplayCommand}",
+                        $"Required build exited with code {exitCode}.",
+                        [],
+                        []),
+                };
+            await _auditReports.CreateAsync(new AuditReport
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = workItemId.ToString(),
+                Iteration = iteration ?? 0,
+                AuditorName = RequiredBuildAuditorName,
+                AuditorKind = "shell",
+                WorstSeverity = success ? "none" : AuditSeverity.Error.ToString(),
+                StartedAt = startedAt,
+                EndedAt = startedAt + elapsed,
+                DurationMs = (long)elapsed.TotalMilliseconds,
+                Findings = findings,
+                RawOutput = rawOutput,
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to persist required build report for work item {WorkItemId}", workItemId);
+        }
+    }
+
+    private static string BuildRequiredBuildFailureSummary(RequiredBuildVerificationResult result)
+    {
+        var detail = string.IsNullOrWhiteSpace(result.Output)
+            ? "(no build output captured)"
+            : result.Output.Trim();
+        return $"required build failed (exit {result.ExitCode}): {detail}";
+    }
+
+    private static string CombinedOutput(SandboxExecResult result)
+        => string.IsNullOrWhiteSpace(result.Stderr)
+            ? result.Stdout
+            : string.IsNullOrWhiteSpace(result.Stdout)
+                ? result.Stderr
+                : result.Stdout + "\n" + result.Stderr;
+
+    private static string TruncateRequiredBuildOutput(string output)
+        => RawOutputRedactor.TruncateToBytes(
+            RawOutputRedactor.Redact(output),
+            RequiredBuildOutputMaxBytes);
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
         WorkItem item,
@@ -9010,6 +9341,34 @@ Original merge-phase failure (for context):
 internal sealed class AuditFailedException : Exception
 {
     public AuditFailedException(string message) : base(message) { }
+}
+
+internal enum RequiredBuildVerificationStatus
+{
+    Skipped,
+    Passed,
+    Failed,
+}
+
+internal sealed record RequiredBuildVerificationResult(
+    RequiredBuildVerificationStatus Status,
+    int ExitCode,
+    string Output)
+{
+    public static RequiredBuildVerificationResult Skipped { get; } =
+        new(RequiredBuildVerificationStatus.Skipped, 0, string.Empty);
+}
+
+internal sealed class RequiredBuildFailedException : Exception
+{
+    public RequiredBuildFailedException(string message) : base(message) { }
+}
+
+internal sealed class RequiredBuildVerificationUnavailableException : Exception
+{
+    public RequiredBuildVerificationUnavailableException(string message) : base(message) { }
+    public RequiredBuildVerificationUnavailableException(string message, Exception innerException)
+        : base(message, innerException) { }
 }
 
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
