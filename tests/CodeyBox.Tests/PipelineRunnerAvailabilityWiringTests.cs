@@ -86,6 +86,13 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(transitionEvents[0].Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Contains("fast-fail circuit breaker", details.Reason);
+        // The work-phase fast-fail call site hard-codes Category=Persistent
+        // (PipelineRunner.cs ~2185): the binary launched, exited non-zero fast,
+        // and did so repeatedly — retrying without operator intervention will
+        // keep failing. A regression that forgot to set Category, or copied
+        // the wrong constant, would silently default back to Unknown and the
+        // operator-alert routing on persistent failures would not fire.
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
@@ -197,6 +204,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var details = Assert.IsType<AgentSmokeFailedDetails>(transition.Details);
         Assert.Equal("codex", details.AgentKind);
         Assert.Contains("fast-fail circuit breaker", details.Reason);
+        // Same Category=Persistent pin as the work-phase site above. The two
+        // call sites (PipelineRunner.cs ~2185 work-phase, ~5105 merge-phase)
+        // each hard-code the constant; drift between them or a copy-paste
+        // omission would let only one path raise the persistent alert.
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
         Assert.NotNull(transition.WorkItem);
         Assert.Equal(item.Id, transition.WorkItem.Id);
         Assert.NotNull(transition.Project);
