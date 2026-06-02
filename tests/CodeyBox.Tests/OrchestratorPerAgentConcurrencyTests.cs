@@ -809,8 +809,9 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // deadline. The 10s budget is well under the 60s quota window
             // but several orders of magnitude over the 200ms cap-retry
             // interval, leaving room for the audit-runtime CI scheduler
-            // (many parallel test classes) without weakening the
-            // not-the-quota-interval claim.
+            // (many parallel test classes) and absorbing GC pauses /
+            // scheduling jitter on a loaded CI host without weakening the
+            // cap-retry vs quota-interval contrast the test is asserting.
             var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
             int observedCodex = 0;
             while (DateTimeOffset.UtcNow < deadline)

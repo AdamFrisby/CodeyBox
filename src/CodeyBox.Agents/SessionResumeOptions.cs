@@ -21,8 +21,18 @@ namespace CodeyBox.Agents;
 /// <para>
 /// Hot-reloadable via <see cref="SetMaxResumeAttempts"/> (called from the
 /// <c>CodeyBox:PipelineTuning</c> hot-reload coordinator). Defaults to 2 — one
-/// retry covers the typical 429 / OOM / SIGPIPE blip, the second exists so a
-/// single mid-resume blip does not collapse the work item.
+/// retry covers the typical OOM / SIGPIPE / network-hiccup blip, the second
+/// exists so a single mid-resume blip does not collapse the work item. Hard
+/// 429s classify as <see cref="AgentFailureKind.QuotaExhausted"/> and are
+/// filtered out by <see cref="IsResumeEligible"/> so they defer via the
+/// quota path instead of consuming the resume budget; only soft transient
+/// failures (Normal / Unknown / TransientNetwork) reach the resume branch,
+/// which is the intended scope. A genuine deterministic work failure (failed
+/// tests, declined task, malformed output) also classifies as Normal and so
+/// is resume-eligible — that is an intentional tradeoff: the alternative is
+/// trying to discriminate "process crashed mid-run" from "process ran to
+/// completion but produced a bad result" from outside the CLI, which is not
+/// reliably possible. MaxResumeAttempts=2 caps the wasted cost on such cases.
 /// </para>
 /// </summary>
 public static class SessionResumeOptions
@@ -34,10 +44,16 @@ public static class SessionResumeOptions
     /// <summary>
     /// Maximum CLI-native session-resume retries per agent run. A value of 0
     /// disables session resume entirely (the base runner falls back to the
-    /// legacy single-shot re-invocation path).
+    /// legacy single-shot re-invocation path). Negative values supplied via
+    /// hot-reload are clamped to 0 — see <see cref="SetMaxResumeAttempts"/>.
     /// </summary>
     public static int MaxResumeAttempts => Volatile.Read(ref _maxResumeAttempts);
 
+    /// <summary>
+    /// Update the resume-attempt budget. Negative values are clamped to 0
+    /// (disables resume) so an operator typo via the hot-reload config does
+    /// not produce nonsensical behaviour.
+    /// </summary>
     public static void SetMaxResumeAttempts(int value)
     {
         if (value < 0) value = 0;
@@ -47,9 +63,12 @@ public static class SessionResumeOptions
     /// <summary>
     /// Returns true when a failed run's <paramref name="classification"/> is
     /// transient enough that re-running with <c>--resume</c> has a realistic
-    /// chance of completing. Quota / auth failures would immediately re-fail
-    /// on resume, so they defer / fall back per the normal quota path instead
-    /// of resume-hammering.
+    /// chance of completing. Hard quota / auth failures (<see cref="AgentFailureKind.QuotaExhausted"/>,
+    /// <see cref="AgentFailureKind.AuthError"/>) would immediately re-fail on
+    /// resume, so they defer / fall back per the normal quota path instead of
+    /// resume-hammering. Normal / Unknown / TransientNetwork classifications
+    /// all pass — see the class-level remarks for the deterministic-work-failure
+    /// tradeoff.
     /// </summary>
     public static bool IsResumeEligible(AgentFailureClassification classification) =>
         classification.Kind switch

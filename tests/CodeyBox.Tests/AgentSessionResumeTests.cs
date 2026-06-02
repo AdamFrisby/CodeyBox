@@ -86,6 +86,49 @@ public sealed class AgentSessionResumeTests : IDisposable
             new AgentFailureClassification(AgentFailureKind.Normal)));
     }
 
+    [Fact]
+    public void SetMaxResumeAttempts_ClampsNegativeToZero()
+    {
+        // Operator typo via hot-reload must not produce nonsensical behaviour
+        // (negative budget would be indistinguishable from "disabled" today
+        // but could regress if the comparison ever became signed-aware).
+        try
+        {
+            SessionResumeOptions.SetMaxResumeAttempts(-7);
+            Assert.Equal(0, SessionResumeOptions.MaxResumeAttempts);
+        }
+        finally
+        {
+            SessionResumeOptions.SetMaxResumeAttempts(_originalSessionResume);
+        }
+    }
+
+    [Fact]
+    public void ClaudeRunner_BuildSessionResumeInvocation_RejectsEmptySessionId()
+    {
+        // Defensive guard: an extractor that mistakenly hands back an empty
+        // string would otherwise produce an invocation with `--resume ""` and
+        // the CLI would fail with an unhelpful argparse error. Reject up-front.
+        var runner = new ClaudeAgentRunner();
+        Assert.Throws<ArgumentException>(() => InvokeBuildResume(runner, sessionId: ""));
+        Assert.Throws<ArgumentException>(() => InvokeBuildResume(runner, sessionId: "   "));
+    }
+
+    private static object InvokeBuildResume(ClaudeAgentRunner runner, string sessionId)
+    {
+        var method = typeof(CliAgentRunnerBase).GetMethod(
+            "BuildSessionResumeInvocation",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        try
+        {
+            return method.Invoke(runner, [sessionId, "prompt", null, null, null, false])!;
+        }
+        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw ex.InnerException;
+        }
+    }
+
     // ── Integration with ClaudeAgentRunner ────────────────────────────────────
 
     [Fact]

@@ -372,6 +372,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream: false);
 
     /// <summary>
+    /// Opt this runner into the suspend-resilience loop's CLI-native session
+    /// resume retry path. After a transient crash whose stdout carried a
+    /// session id, the loop rebuilds the next attempt via
+    /// <see cref="BuildSessionResumeInvocation"/> instead of restarting the
+    /// run from scratch. Effective resume coverage additionally requires the
+    /// caller to enable structured stream capture (the session id only lands
+    /// in stdout when <c>--output-format stream-json --verbose</c> is set);
+    /// without it the extractor returns null and the loop falls through to
+    /// the legacy retry path.
+    /// </summary>
+    protected override bool SupportsSessionResume => true;
+
+    /// <summary>
     /// The Claude CLI prints a structured init event on its first stream-json
     /// line: <c>{"type":"system","subtype":"init","session_id":"...", ...}</c>.
     /// We pull the id from that line so a crashed run can be resumed in place
@@ -379,11 +392,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// whitespace and tolerant of <c>sessionId</c> camelCase that some CLI
     /// builds use; returns <c>null</c> when no recognisable id is present.
     /// </summary>
-    protected override bool SupportsSessionResume => true;
-
     protected override string? TryExtractSessionId(string? stdout)
         => ClaudeSessionIdExtractor.Extract(stdout);
 
+    /// <summary>
+    /// Builds the argv for a CLI-native session resume after a transient crash.
+    /// Note: <c>claude --resume &lt;id&gt; --print</c> appends the supplied
+    /// prompt as a NEW user turn on top of the restored conversation, so the
+    /// agent observes the original instruction twice (once in the restored
+    /// transcript, once as a fresh stdin user message). This is acceptable
+    /// because an empty resume prompt errors out on the CLI side; the duplicate
+    /// turn typically reads as a "continue from where you crashed" nudge and
+    /// the in-progress work is preserved by the restored conversation history.
+    /// </summary>
     protected override AgentInvocation BuildSessionResumeInvocation(
         string sessionId,
         string prompt,

@@ -143,6 +143,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return preparation;
 
         var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
+        // CaptureStructuredStream: false here mirrors what BuildResumeInvocation
+        // produces by default (no --output-format stream-json). The CLI's
+        // session id only appears on the structured stream, so in practice the
+        // resume branch is dormant on this path and a transient crash during a
+        // restore-from-checkpoint run falls through to the legacy retry. That
+        // matches the motivating bug (the work phase that suffered the mid-run
+        // crash uses RunAsync with captureStructuredStream=true), and keeps
+        // this path's behaviour identical to its pre-resume shape.
         return await ExecuteWithSuspendResilienceAsync(
             sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
             sessionResumeContext: SupportsSessionResume
@@ -158,6 +166,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         CancellationToken ct,
         SessionResumeRebuildContext? sessionResumeContext = null)
     {
+        // VM-liveness check is intentionally implicit: if the sandbox itself
+        // has died, the very next sandbox.ExecAsync call inside
+        // ExecuteInvocationOnceAsync surfaces the failure and propagates out
+        // of this loop, bubbling up to the caller who re-drives the work item
+        // in a fresh sandbox. We do not need an explicit pre-flight ping —
+        // session resume is gated on the next exec succeeding well enough to
+        // emit a CLI exit code, so VM-death naturally short-circuits the
+        // resume branch rather than papering over it.
         var attempt = 0;
         var resumeAttempts = 0;
         var current = invocation;
@@ -213,9 +229,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 return last;
 
             attempt++;
-            // Legacy retry re-uses the original (non-resume) invocation; the
-            // single-shot re-invocation path was what shipped before resume
-            // support existed.
+            // Fall through to the pre-resume single-shot retry shape: the
+            // resume budget was either unavailable (no captured id /
+            // QuotaExhausted / AuthError) or exhausted, so restart the run
+            // from the original argv rather than re-resuming a session that
+            // can no longer recover here.
             current = invocation;
         }
     }
