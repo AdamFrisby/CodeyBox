@@ -51,9 +51,7 @@ internal static class ClaudeSessionIdExtractor
         if (string.IsNullOrEmpty(stdout))
             return null;
 
-        var scannedSlice = stdout.Length <= MaxScannedBytes
-            ? stdout.AsSpan()
-            : stdout.AsSpan(0, MaxScannedBytes);
+        var scannedSlice = stdout.AsSpan(0, Utf8PrefixCharCount(stdout, MaxScannedBytes));
 
         var jsonLinesParsed = 0;
         var remaining = scannedSlice;
@@ -105,6 +103,45 @@ internal static class ClaudeSessionIdExtractor
         }
 
         return null;
+    }
+
+    private static int Utf8PrefixCharCount(string value, int maxBytes)
+    {
+        var bytes = 0;
+        for (var i = 0; i < value.Length;)
+        {
+            var c = value[i];
+            var charCount = 1;
+            int charBytes;
+
+            if (char.IsHighSurrogate(c)
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1]))
+            {
+                charBytes = 4;
+                charCount = 2;
+            }
+            else if (c <= 0x7F)
+            {
+                charBytes = 1;
+            }
+            else if (c <= 0x7FF)
+            {
+                charBytes = 2;
+            }
+            else
+            {
+                charBytes = 3;
+            }
+
+            if (bytes + charBytes > maxBytes)
+                return i;
+
+            bytes += charBytes;
+            i += charCount;
+        }
+
+        return value.Length;
     }
 
     private static bool IsInitEvent(JsonElement root)

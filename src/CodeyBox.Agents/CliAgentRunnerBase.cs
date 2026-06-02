@@ -16,6 +16,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public abstract AgentKind Kind { get; }
 
     /// <summary>
+    /// Sandbox CLI invocation built by concrete agent runners. This stays
+    /// protected so argv/environment/stdin details do not leak into Core's
+    /// domain/plugin-facing API.
+    /// </summary>
+    protected sealed record AgentInvocation(
+        IReadOnlyList<string> Argv,
+        IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
+        string? Stdin = null);
+
+    /// <summary>
     /// Build the argv to execute inside the sandbox for a given prompt. The
     /// prompt may be passed via argv, stdin, or a file; subclasses choose.
     /// </summary>
@@ -301,7 +311,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         => classification.Kind switch
         {
             AgentFailureKind.TransientNetwork => true,
-            AgentFailureKind.Unknown => exitCode != 0,
+            AgentFailureKind.Unknown => AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode),
             AgentFailureKind.Normal => exitCode != 0,
             // Soft rate-limit/overload comes through as QuotaExhausted; the
             // session-resume quota gate is the authoritative decision for

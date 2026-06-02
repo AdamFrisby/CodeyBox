@@ -24,9 +24,10 @@ public static class AgentSuspendResilience
 
     /// <summary>
     /// Exit codes commonly observed when an HTTP client gives up after a long
-    /// frozen TCP connection post-resume (curl 52/56, generic 1, npm-style 92).
+    /// frozen TCP connection post-resume (curl 52/56, generic 1, npm-style 92)
+    /// or when the sandbox kills an agent process mid-run (SIGKILL/OOM 137).
     /// </summary>
-    private static readonly HashSet<int> SuspendRelatedExitCodes = [1, 52, 56, 92];
+    private static readonly HashSet<int> SuspendRelatedExitCodes = [1, 52, 56, 92, 137];
 
     /// <summary>
     /// Returns true when <paramref name="exitCode"/> matches the set of exit

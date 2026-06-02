@@ -104,6 +104,25 @@ public sealed class CompositeQuotaFailureClassifierTests
         Assert.Empty(claude.Calls);
     }
 
+    [Fact]
+    public async Task RecordIfQuotaFailureAsync_NullClassifier_ThrowsArgumentNullException()
+    {
+        IQuotaFailureClassifier classifier = null!;
+
+        var ex = await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            classifier.RecordIfQuotaFailureAsync(
+                store: null,
+                agent: AgentKind.Claude,
+                modelId: null,
+                summary: "agent exited 1",
+                stderr: "rate_limit_exceeded",
+                observedAt: DateTimeOffset.UtcNow,
+                retention: TimeSpan.FromMinutes(30),
+                ct: CancellationToken.None));
+
+        Assert.Equal("classifier", ex.ParamName);
+    }
+
     // ── IsAgentExited1Summary ───────────────────────────────────────────────
     //
     // The composite classifier's persistent-store gate requires an "agent

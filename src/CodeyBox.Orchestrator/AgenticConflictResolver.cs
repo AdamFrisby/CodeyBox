@@ -251,7 +251,8 @@ public sealed class AgenticConflictResolver
                         candidate.Credential,
                         candidate.ModelId,
                         candidate.ReasoningMode,
-                        ct);
+                        ct,
+                        captureStructuredStream: NeedsStructuredStreamForResume(runner));
                 }
                 catch (OperationCanceledException)
                 {
@@ -502,4 +503,10 @@ public sealed class AgenticConflictResolver
         if (string.IsNullOrEmpty(value)) return "";
         return value.Length <= maxChars ? value : value[..maxChars] + "…";
     }
+
+    private static bool NeedsStructuredStreamForResume(IAgentRunner runner)
+        => runner is ICliSessionResumableAgentRunner
+        {
+            RequiresStructuredStreamForSessionId: true,
+        };
 }

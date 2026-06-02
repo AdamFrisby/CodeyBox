@@ -16,17 +16,23 @@ namespace CodeyBox.Agents.Codex;
 ///         <c>CODEX_AUTH_JSON</c> credential env var before invoking codex.</item>
 /// </list>
 /// </summary>
-public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly HttpClient _textOnlyHttp;
+    private readonly IQuotaFailureClassifier _sessionResumeQuotaClassifier;
 
-    public CodexAgentRunner() : this(defaults: null, textOnlyHttp: null) { }
+    public CodexAgentRunner() : this(defaults: null) { }
 
     public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, textOnlyHttp: null) { }
+
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults, IQuotaFailureClassifier? quotaFailureClassifier)
+        : this(defaults, textOnlyHttp: null, quotaFailureClassifier)
+    {
+    }
 
     /// <summary>
     /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
@@ -35,9 +41,18 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     /// Production wiring uses the process-wide shared HttpClient.
     /// </summary>
     internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, HttpClient? textOnlyHttp)
+        : this(defaults, textOnlyHttp, quotaFailureClassifier: null)
+    {
+    }
+
+    internal CodexAgentRunner(
+        AgentDefaultsSnapshot? defaults,
+        HttpClient? textOnlyHttp,
+        IQuotaFailureClassifier? quotaFailureClassifier)
     {
         _defaults = defaults;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
+        _sessionResumeQuotaClassifier = quotaFailureClassifier ?? CodexSessionResumeQuotaClassifier.Instance;
     }
 
     public override AgentKind Kind => AgentKind.Codex;
@@ -213,11 +228,60 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // (no nested user-ns + networking allowed). The Multipass VM IS the
         // sandbox boundary; codex's docs explicitly recommend this flag for
         // "environments that are externally sandboxed".
-        var argv = new List<string>
-        {
-            Binary, "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
-        };
+        return BuildCodexInvocation(
+            prompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: null,
+            captureStructuredStream);
+    }
+
+    /// <summary>
+    /// Codex emits its resumable session id only in structured <c>--json</c>
+    /// metadata, so orchestrator call sites must force structured output when
+    /// they want crash recovery independent of AgentStreams.
+    /// </summary>
+    public bool RequiresStructuredStreamForSessionId => true;
+
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier => _sessionResumeQuotaClassifier;
+
+    public string? TryExtractSessionId(string? stdout)
+        => CodexSessionIdExtractor.Extract(stdout);
+
+    protected override AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId))
+            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
+        _ = prompt;
+        return BuildCodexInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: sessionId,
+            captureStructuredStream);
+    }
+
+    internal const string SessionResumePrompt =
+        "Continue from the restored session after the interrupted run. Do not restart completed work or repeat the original instructions.";
+
+    private AgentInvocation BuildCodexInvocation(
+        string prompt,
+        string? modelId,
+        string? reasoningMode,
+        string? sessionIdForResume,
+        bool captureStructuredStream)
+    {
+        var argv = new List<string> { Binary, "exec" };
+        if (!string.IsNullOrEmpty(sessionIdForResume))
+            argv.Add("resume");
+
+        argv.Add("--dangerously-bypass-approvals-and-sandbox");
         if (captureStructuredStream)
             argv.Add(CurrentStructuredStreamFlag.Value ?? "--json");
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
@@ -241,6 +305,12 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // from stdin when no positional prompt is given (per its --help). The
         // sandbox wrapper forwards stdin automatically when SandboxExec.Stdin is
         // non-null, via its --keep-stdin path.
+        if (!string.IsNullOrEmpty(sessionIdForResume))
+        {
+            argv.Add(sessionIdForResume);
+            argv.Add("-");
+        }
+
         return new AgentInvocation(argv, Stdin: prompt);
     }
 
@@ -315,5 +385,32 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         }
 
         return string.Concat(parts);
+    }
+
+    private sealed class CodexSessionResumeQuotaClassifier : IQuotaFailureClassifier
+    {
+        public static readonly CodexSessionResumeQuotaClassifier Instance = new();
+
+        private readonly IAgentQuotaFailureDetector _detector = new CodexQuotaFailureDetector();
+
+        private CodexSessionResumeQuotaClassifier() { }
+
+        public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+        {
+            if (agent != AgentKind.Codex || (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout)))
+                return QuotaFailureClassification.None;
+
+            if (_detector.IsTerminalNonQuotaCrash(stderr, stdout))
+                return QuotaFailureClassification.TerminalNonQuota;
+
+            var scopedStdout = _detector.ScopeStdoutForQuotaDetection(stdout);
+            var detection = _detector.Detect(stderr, scopedStdout);
+            return detection is null
+                ? QuotaFailureClassification.None
+                : QuotaFailureClassification.Quota(detection);
+        }
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => Classify(agent, stderr, stdout).Detection;
     }
 }

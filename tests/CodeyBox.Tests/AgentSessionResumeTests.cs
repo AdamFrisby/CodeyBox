@@ -1,8 +1,11 @@
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
+using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -83,6 +86,17 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public void Extractor_ByteLimitCountsUtf8Bytes()
+    {
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var stdout = new string('\u00E9', ClaudeSessionIdExtractor.MaxScannedBytes / 2)
+            + "\n"
+            + $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""";
+
+        Assert.Null(ClaudeSessionIdExtractor.Extract(stdout));
+    }
+
+    [Fact]
     public void Extractor_DoesNotScanPastJsonLineLimit()
     {
         const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
@@ -139,6 +153,21 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Equal("e61b65a0-0f1e-4469-94f0-0be82d71b909",
             runner.TryExtractSessionId(
                 """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}"""));
+    }
+
+    [Fact]
+    public void CodexRunner_DeclaresSessionResumeContract()
+    {
+        var runner = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(new CodexAgentRunner());
+
+        Assert.True(runner.RequiresStructuredStreamForSessionId);
+        Assert.NotNull(runner.SessionResumeQuotaClassifier);
+        Assert.Equal("019e8a0f-4c27-7b61-940f-e344bafa43d5",
+            runner.TryExtractSessionId(
+                """{"type":"session_meta","payload":{"id":"019e8a0f-4c27-7b61-940f-e344bafa43d5"}}"""));
+        Assert.Equal("thread_abc123",
+            runner.TryExtractSessionId(
+                """{"type":"thread.started","payload":{"thread_id":"thread_abc123"}}"""));
     }
 
     [Theory]
@@ -222,6 +251,48 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Equal("/work", liveness.Argv[4]);
         Assert.Equal(SandboxConventions.RepoDir, liveness.Argv[5]);
         Assert.Equal("/", liveness.WorkingDirectory);
+    }
+
+    [Fact]
+    public async Task CodexRunner_CrashWithCapturedSessionId_RetriesWithExecResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sessionId = "019e8a0f-4c27-7b61-940f-e344bafa43d5";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1,
+                Stdout: $"{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sessionId}\"}}}}",
+                Stderr: "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""),
+            structuredStreamHelpResult: new SandboxExecResult(0, "--json", ""));
+
+        var result = await new CodexAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            modelId: "gpt-5.5",
+            reasoningMode: "high",
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+
+        var first = sandbox.ClaudeInvocations[0];
+        Assert.Equal(["codex", "exec"], first.Take(2).ToArray());
+        Assert.DoesNotContain("resume", first);
+        Assert.Contains("--json", first);
+        AssertFlagValue(first, "--model", "gpt-5.5");
+        AssertFlagValue(first, "-c", "model_reasoning_effort=high");
+
+        var second = sandbox.ClaudeInvocations[1];
+        Assert.Equal(["codex", "exec", "resume"], second.Take(3).ToArray());
+        Assert.Contains("--json", second);
+        AssertFlagValue(second, "--model", "gpt-5.5");
+        AssertFlagValue(second, "-c", "model_reasoning_effort=high");
+        Assert.Contains(sessionId, second);
+        Assert.Equal("-", second[^1]);
+        Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
+        Assert.NotEqual("prompt", sandbox.ClaudeExecs[1].Stdin);
     }
 
     [Fact]
@@ -505,6 +576,13 @@ public sealed class AgentSessionResumeTests : IDisposable
     public async Task ClaudeRunner_LivenessProbeException_PropagatesInfrastructureFailure()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .Enrich.With<SensitiveDataRedactionEnricher>()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
         var sandbox = new ResumeRecordingSandbox(
             _ => new SandboxExecResult(1,
                 Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
@@ -513,12 +591,27 @@ public sealed class AgentSessionResumeTests : IDisposable
                 ? throw new InvalidOperationException("liveness implementation failed")
                 : new SandboxExecResult(0, "", ""));
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            new ClaudeAgentRunner().RunAsync(
-                sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
+        try
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new ClaudeAgentRunner().RunAsync(
+                    sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
 
-        Assert.Contains("liveness implementation failed", ex.Message);
-        Assert.Single(sandbox.ClaudeInvocations);
+            Assert.Contains("liveness implementation failed", ex.Message);
+            Assert.Single(sandbox.ClaudeInvocations);
+
+            var evt = Assert.Single(sink.Events);
+            Assert.True(GetScalar<bool>(evt, "Audit"));
+            Assert.Equal("agent.session_resume_liveness_probe_failed", GetScalar<string>(evt, "EventName"));
+            Assert.Equal("claude", GetScalar<string>(evt, "Agent"));
+            Assert.Equal("InvalidOperationException", GetScalar<string>(evt, "ExceptionType"));
+            Assert.Equal("liveness implementation failed", GetScalar<string>(evt, "Message"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
     }
 
     [Fact]
@@ -804,7 +897,15 @@ public sealed class AgentSessionResumeTests : IDisposable
             }
 
             if (exec.Argv.Count > 0
+                && exec.Argv[0] == CodexAgentRunner.DefaultBinary
+                && exec.Argv.Contains("--help"))
+            {
+                return Task.FromResult(structuredStreamHelpResult ?? new SandboxExecResult(0, "--json", ""));
+            }
+
+            if (exec.Argv.Count > 0
                 && ((exec.Argv[0] == ClaudeAgentRunner.DefaultBinary && exec.Argv.Contains("--print"))
+                    || (exec.Argv[0] == CodexAgentRunner.DefaultBinary && exec.Argv.Count > 1 && exec.Argv[1] == "exec")
                     || exec.Argv[0] == "fake-agent"))
             {
                 ClaudeExecs.Add(exec);
@@ -910,6 +1011,17 @@ public sealed class AgentSessionResumeTests : IDisposable
             string.Concat(stderr, "\n", stdout).Contains("custom injected quota", StringComparison.OrdinalIgnoreCase)
                 ? new QuotaDetection(QuotaFailureKind.LimitReached)
                 : null;
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
     }
 }
 

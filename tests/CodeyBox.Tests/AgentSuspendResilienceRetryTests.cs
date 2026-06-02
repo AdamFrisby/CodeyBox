@@ -90,6 +90,7 @@ public sealed class AgentSuspendResilienceRetryTests
     [InlineData(52)]
     [InlineData(56)]
     [InlineData(92)]
+    [InlineData(137)]
     public void ShouldRetry_UnknownWithSuspendExitCodes_ReturnsTrueForSupportedAgents(int exitCode)
     {
         var classification = new AgentFailureClassification(AgentFailureKind.Unknown);
@@ -107,7 +108,7 @@ public sealed class AgentSuspendResilienceRetryTests
     [InlineData(57, false)]
     [InlineData(91, false)]
     [InlineData(93, false)]
-    [InlineData(137, false)]
+    [InlineData(137, true)]
     public void IsSuspendRelatedExitCode_ReturnsExpectedBoundaryValues(int exitCode, bool expected)
     {
         Assert.Equal(expected, AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode));
