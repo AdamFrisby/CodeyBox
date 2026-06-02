@@ -3916,6 +3916,11 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Audit agent '{AuditKind}' is not registered for auditor '{Auditor}'; falling back to work agent '{WorkKind}'",
                 preferredKind.Value.Value, auditorName, workRunner.Kind.Value);
+            // Capability gate: when the pool is active and the work agent is
+            // not in it, falling back to workRunner would breach the AC. Walk
+            // the audit-capable pool for a tagged substitute instead.
+            if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
+                return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
             return workRunner;
         }
 
@@ -3925,6 +3930,9 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "No credentials found for audit agent '{AuditKind}' (auditor '{Auditor}'); falling back to work agent '{WorkKind}'",
                 preferredKind.Value.Value, auditorName, workRunner.Kind.Value);
+            // Same capability gate as the unregistered-preferred branch above.
+            if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
+                return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
             return workRunner;
         }
 
@@ -4089,7 +4097,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 auditorName, member.Agent.Value);
             return memberRunner;
         }
-        AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
+        // LlmAuditorSkippedQuota names "quota" — only emit when at least one
+        // candidate was actually quota-rejected. When the pool is empty or
+        // every member is filtered for missing runner/credentials, the cause
+        // is misconfiguration, not a quota crunch; surfacing it as quota would
+        // misdirect operators investigating the skip.
+        if (quotaRejectedCount > 0)
+            AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
         _log.LogWarning(
             "LLM auditor '{Auditor}' skipped: no audit-capable member of class '{ClassId}' is available ({Rejected} quota-rejected)",
             auditorName, classId, quotaRejectedCount);

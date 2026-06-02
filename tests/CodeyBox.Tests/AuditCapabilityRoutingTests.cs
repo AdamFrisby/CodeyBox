@@ -142,6 +142,103 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
+    // ── AC: mid-iteration spill stays inside the audit-capable pool ─────────
+
+    [Fact]
+    public async Task MidIterationSpill_NonAuditCapableMember_StaysExcluded()
+    {
+        // Resolve-time gate is exercised by the other tests; this pins the
+        // mid-iteration spill gate in InvokeAgentWithQuotaFallbackAsync. Setup
+        // is "Claude looks healthy at resolve time but quota-fails when it
+        // actually runs the auditor"; the spill candidate list contains only
+        // Gemini (healthy, non-audit-capable). The requireCapability filter
+        // must drop Gemini, so the auditor is skipped instead of routing audit
+        // to a non-audit-capable member.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("cheating:llm-review",
+            agent => agent == AgentKind.Claude ? QuotaAuditResult() : new AuditResult(true, []));
+        using var fix = BuildFixture(seed, auditor,
+            members: [
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 90),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Claude] = 80.0,   // healthy at resolve time
+                [AgentKind.Gemini] = 80.0,   // healthy too, but NOT audit-capable
+            },
+            preferredAuditAgent: AgentKind.Claude);
+
+        fix.Claude!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Claude ran first (preferred audit-capable) and quota-failed.
+        // Gemini has quota but is NOT audit-capable — the mid-iter spill
+        // filter must skip it. Audit skipped, item still completes.
+        Assert.Equal([AgentKind.Claude], auditor.Invocations);
+        Assert.DoesNotContain(AgentKind.Gemini, auditor.Invocations);
+    }
+
+    // ── AC: per-auditor routing dispatches across distinct audit-capable members ─
+
+    [Fact]
+    public async Task PerAuditorAgent_RoutesAcrossDistinctAuditCapableMembers()
+    {
+        // "Concurrent across pool" no-bottleneck pin: with both Codex and
+        // Claude audit-capable and healthy and a PerAuditorAgent map sending
+        // each LLM auditor to a different audit-capable member, the audit
+        // phase dispatches across both — proving the routing is not pinned to
+        // one agent. Without this property the original audit-throughput
+        // collapse (every audit serialised through one member) could regress
+        // silently.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditorA = new RecordingLlmAuditor("cheating:llm-review");
+        var auditorB = new RecordingLlmAuditor("security:llm-review");
+        using var fix = BuildFixture(seed,
+            auditors: [auditorA, auditorB],
+            members: [
+                (AgentKind.Codex,  IsAuditCapable: true,  QualityScore: 100),
+                (AgentKind.Claude, IsAuditCapable: true,  QualityScore: 90),
+                (AgentKind.Gemini, IsAuditCapable: false, QualityScore: 95),
+            ],
+            quotas: new()
+            {
+                [AgentKind.Codex] = 80.0,
+                [AgentKind.Claude] = 80.0,
+                [AgentKind.Gemini] = 80.0,
+            },
+            preferredAuditAgent: AgentKind.Codex,
+            perAuditorAgent: new Dictionary<string, AgentKind>
+            {
+                ["cheating:llm-review"] = AgentKind.Codex,
+                ["security:llm-review"] = AgentKind.Claude,
+            },
+            maxLlmAuditorParallelism: 2);
+
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // Each auditor lands on its per-auditor pick — distinct members of
+        // the audit pool — demonstrating that audits route across the pool
+        // instead of serialising through one agent.
+        Assert.Equal([AgentKind.Codex], auditorA.Invocations);
+        Assert.Equal([AgentKind.Claude], auditorB.Invocations);
+        // Gemini is healthier (by quality score) than Claude but stays out of
+        // the audit pool entirely — neither auditor lands on it.
+        Assert.DoesNotContain(AgentKind.Gemini, auditorA.Invocations);
+        Assert.DoesNotContain(AgentKind.Gemini, auditorB.Invocations);
+    }
+
     // ── AC: AuditAgent set to non-capable agent → demoted, pool runs ────────
 
     [Fact]
@@ -175,10 +272,12 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         // Audit must NOT run on gemini — only audit-capable members are
-        // eligible. Codex (highest QS audit-capable) takes over.
-        Assert.Single(auditor.Invocations);
-        Assert.DoesNotContain(AgentKind.Gemini, auditor.Invocations);
-        Assert.Contains(auditor.Invocations[0], new[] { AgentKind.Codex, AgentKind.Claude });
+        // eligible. SelectFromAuditCapablePoolAsync walks
+        // OrderedFallbackCandidatesAsync, so the pick is deterministic: the
+        // highest-quality audit-capable member, which is Codex (QS=100) over
+        // Claude (QS=90). Asserting the exact pick (rather than a disjunction)
+        // catches regressions that route to the wrong audit-capable member.
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
     }
 
     // ── AC: no preferred AuditAgent + work agent not audit-capable → pool walk ──
@@ -388,6 +487,25 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
         Dictionary<AgentKind, double> quotas,
         AgentKind? preferredAuditAgent,
         AgentKind? defaultAgent = null)
+        => BuildFixture(
+            seedRepoUrl,
+            auditors: [auditor],
+            members,
+            quotas,
+            preferredAuditAgent,
+            defaultAgent: defaultAgent,
+            perAuditorAgent: null,
+            maxLlmAuditorParallelism: 1);
+
+    private RoutingFixture BuildFixture(
+        string seedRepoUrl,
+        IReadOnlyList<IAuditor> auditors,
+        IReadOnlyList<(AgentKind Agent, bool IsAuditCapable, int QualityScore)> members,
+        Dictionary<AgentKind, double> quotas,
+        AgentKind? preferredAuditAgent,
+        AgentKind? defaultAgent = null,
+        IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null,
+        int maxLlmAuditorParallelism = 1)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -446,7 +564,10 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 MaxIterations = 1,
                 AuditTypes = ["scripted"],
                 AuditAgent = preferredAuditAgent,
-                MaxLlmAuditorParallelism = 1,
+                PerAuditorAgent = perAuditorAgent is null
+                    ? new Dictionary<string, AgentKind>()
+                    : new Dictionary<string, AgentKind>(perAuditorAgent),
+                MaxLlmAuditorParallelism = maxLlmAuditorParallelism,
             },
         };
 
@@ -461,7 +582,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
             prs,
             projects,
             new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([auditor])),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditors)),
             store,
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
@@ -494,7 +615,13 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
 
     private sealed class RecordingLlmAuditor : IAuditor
     {
-        public RecordingLlmAuditor(string name) { Name = name; }
+        private readonly Func<AgentKind, AuditResult>? _resultBuilder;
+
+        public RecordingLlmAuditor(string name, Func<AgentKind, AuditResult>? resultBuilder = null)
+        {
+            Name = name;
+            _resultBuilder = resultBuilder;
+        }
         public string Name { get; }
         public string Kind => "llm";
         public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
@@ -502,11 +629,29 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
 
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
         {
-            var agent = context.AuditRunner?.Kind ?? AgentKind.Claude;
+            // Throw rather than silently substitute a placeholder kind — a null
+            // AuditRunner here would indicate the resolver returned no agent yet
+            // the pipeline still dispatched, which would mask the real bug. The
+            // earlier Claude-default could hide a regression behind a green test.
+            Assert.NotNull(context.AuditRunner);
+            var agent = context.AuditRunner!.Kind;
             Invocations.Add(agent);
-            return Task.FromResult(new AuditResult(true, []));
+            return Task.FromResult(_resultBuilder?.Invoke(agent) ?? new AuditResult(true, []));
         }
     }
+
+    /// <summary>
+    /// Quota-shaped LLM auditor result: <see cref="ThrowIfAuditorRunQuotaAsync"/>
+    /// detects the stdout signature and throws <c>TerminalQuotaError</c>, which
+    /// drives the mid-iteration spill path inside
+    /// <c>InvokeAgentWithQuotaFallbackAsync</c>. Uses Claude's
+    /// <c>rate_limit_exceeded</c> marker so the Claude detector classifies it.
+    /// </summary>
+    private static AuditResult QuotaAuditResult() => new(
+        Passed: false,
+        Findings: [new AuditFinding("cheating:llm-review", AuditSeverity.Error, "review agent failed to run", "quota")],
+        AgentSummary: "agent exited 1",
+        AgentStdout: "API Error: rate_limit_exceeded; please try again after 1h");
 
     private sealed class ConfigurableProbe : IAgentQuotaProbe
     {
