@@ -13,17 +13,24 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 {
-    public const string AuditorName = "process:required-build";
-    public const string DisplayCommand = "dotnet build";
+    public const string AuditorName = RequiredBuildGateIdentity.AuditorName;
+    public const string DisplayCommand = RequiredBuildGateIdentity.DisplayCommand;
 
     private const int OutputMaxBytes = 16 * 1024;
+    // POSIX shells conventionally use 127 for "command not found".
+    private const int DotnetCommandNotFoundExitCode = 127;
+    // Internal BuildScript sentinel: marker inspection said this gate applies,
+    // but no buildable .NET target was present after checkout.
+    private const int NoRequiredBuildTargetExitCode = 125;
 
     private const string BuildScript = """
         set -eu
+        dotnet_command_not_found_exit=127
+        no_required_build_target_exit=125
 
         if ! command -v dotnet >/dev/null 2>&1; then
           echo "dotnet is not available in the sandbox PATH" >&2
-          exit 127
+          exit "$dotnet_command_not_found_exit"
         fi
 
         targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
@@ -55,7 +62,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         sort -u "$targets_file" -o "$targets_file"
         if [ ! -s "$targets_file" ]; then
           echo "No .NET solution or project file was found after marker detection." >&2
-          exit 125
+          exit "$no_required_build_target_exit"
         fi
 
         while IFS= read -r target; do
@@ -90,38 +97,69 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+        var inspection = await InspectDotnetBuildMarkersAsync(request, ct);
+        return inspection.ToProbeResult();
+    }
+
+    private async Task<DotnetBuildMarkerInspection> InspectDotnetBuildMarkersAsync(
+        RequiredBuildProbeRequest request,
+        CancellationToken ct)
+    {
         try
         {
             Validation.ValidateBranchName(request.WorkBranch, nameof(request.WorkBranch));
             var repoPath = _gitHost.GetRepoPath(request.RepositoryId);
-            var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(
+
+            var workInspection = await InspectBranchForDotnetBuildMarkersAsync(
                 repoPath,
-                ct,
-                "ls-tree",
-                "-r",
-                "--name-only",
-                request.WorkBranch);
-            if (exitCode != 0)
+                request.WorkBranch,
+                ct);
+            if (!workInspection.Success)
             {
-                var detail = SingleLineSummary(string.IsNullOrWhiteSpace(stderr) ? stdout : stderr);
-                return RequiredBuildProbeResult.Unavailable(
-                    $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {detail}");
+                return DotnetBuildMarkerInspection.Unavailable(
+                    $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {workInspection.FailureDetail}");
             }
 
-            return stdout
-                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Any(IsRequiredDotnetBuildMarkerPath)
-                ? RequiredBuildProbeResult.Applies
-                : RequiredBuildProbeResult.NotApplicable;
+            if (workInspection.HasMarkers)
+                return DotnetBuildMarkerInspection.Applies(workBranchHasMarkers: true, baseBranchHasMarkers: false);
+
+            var baseBranch = request.BaseBranch;
+            if (string.IsNullOrWhiteSpace(baseBranch))
+                baseBranch = await _gitHost.GetDefaultBranchAsync(request.RepositoryId, ct);
+            Validation.ValidateBranchName(baseBranch, nameof(request.BaseBranch));
+
+            if (string.Equals(baseBranch, request.WorkBranch, StringComparison.Ordinal))
+                return DotnetBuildMarkerInspection.NotApplicable();
+
+            var baseInspection = await InspectBranchForDotnetBuildMarkersAsync(
+                repoPath,
+                baseBranch,
+                ct);
+            if (!baseInspection.Success)
+            {
+                return DotnetBuildMarkerInspection.Unavailable(
+                    $"failed to inspect base branch '{baseBranch}' for .NET build markers: {baseInspection.FailureDetail}");
+            }
+
+            if (baseInspection.HasMarkers)
+            {
+                return DotnetBuildMarkerInspection.Applies(
+                    workBranchHasMarkers: false,
+                    baseBranchHasMarkers: true,
+                    baseBranch: baseBranch,
+                    reason: $"base branch '{baseBranch}' contains .NET build markers, but work branch '{request.WorkBranch}' does not");
+            }
+
+            return DotnetBuildMarkerInspection.NotApplicable();
         }
         catch (NotSupportedException ex)
         {
-            return RequiredBuildProbeResult.Unavailable(
+            return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return RequiredBuildProbeResult.Unavailable(
+            return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
         }
     }
@@ -132,19 +170,39 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var probe = await ProbeAsync(new RequiredBuildProbeRequest
+        var inspection = await InspectDotnetBuildMarkersAsync(new RequiredBuildProbeRequest
         {
             WorkItemId = request.WorkItemId,
             ProjectId = request.ProjectId,
             RepositoryId = request.RepositoryId,
+            BaseBranch = request.BaseBranch,
             WorkBranch = request.WorkBranch,
         }, ct);
 
-        if (probe.Status == RequiredBuildProbeStatus.NotApplicable)
+        if (inspection.Status == RequiredBuildProbeStatus.NotApplicable)
             return RequiredBuildVerificationResult.Skipped;
-        if (probe.Status == RequiredBuildProbeStatus.Unavailable)
+        if (inspection.Status == RequiredBuildProbeStatus.Unavailable)
             return RequiredBuildVerificationResult.Unavailable(
-                $"could not verify required build: {probe.Reason}");
+                $"could not verify required build: {inspection.Reason}");
+
+        if (inspection.BaseBranchHasMarkers && !inspection.WorkBranchHasMarkers)
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            var output =
+                $"Required .NET build markers exist on base branch '{inspection.BaseBranch}', " +
+                $"but work branch '{request.WorkBranch}' contains no solution or project file. " +
+                "The branch deleted or moved the files required for the non-skippable build gate.";
+            await PersistReportAsync(
+                request.WorkItemId,
+                request.Iteration ?? 0,
+                startedAt,
+                TimeSpan.Zero,
+                success: false,
+                rawOutput: output,
+                exitCode: NoRequiredBuildTargetExitCode,
+                ct);
+            return RequiredBuildVerificationResult.Failed(NoRequiredBuildTargetExitCode, output);
+        }
 
         string? isolatedRepoPath = null;
         try
@@ -199,7 +257,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             if (build.Success)
                 return RequiredBuildVerificationResult.Passed(build.ExitCode, redactedOutput);
 
-            if (build.ExitCode == 127
+            if (build.ExitCode == DotnetCommandNotFoundExitCode
                 && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))
             {
                 return RequiredBuildVerificationResult.Unavailable(
@@ -208,7 +266,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     redactedOutput);
             }
 
-            if (build.ExitCode == 125)
+            if (build.ExitCode == NoRequiredBuildTargetExitCode)
             {
                 return RequiredBuildVerificationResult.Unavailable(
                     "could not verify required build: no .NET solution or project file was found after marker detection",
@@ -370,6 +428,76 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         var stderrTask = process.StandardError.ReadToEndAsync(ct);
         await process.WaitForExitAsync(ct);
         return (await stdoutTask, await stderrTask, process.ExitCode);
+    }
+
+    private static async Task<BranchDotnetMarkerInspection> InspectBranchForDotnetBuildMarkersAsync(
+        string repoPath,
+        string branch,
+        CancellationToken ct)
+    {
+        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(
+            repoPath,
+            ct,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            branch);
+        if (exitCode != 0)
+        {
+            var detail = SingleLineSummary(string.IsNullOrWhiteSpace(stderr) ? stdout : stderr);
+            return BranchDotnetMarkerInspection.Failed(
+                string.IsNullOrWhiteSpace(detail) ? $"git ls-tree exited {exitCode}" : detail);
+        }
+
+        var hasMarkers = stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(IsRequiredDotnetBuildMarkerPath);
+        return BranchDotnetMarkerInspection.Completed(hasMarkers);
+    }
+
+    private sealed record BranchDotnetMarkerInspection(
+        bool Success,
+        bool HasMarkers,
+        string? FailureDetail)
+    {
+        public static BranchDotnetMarkerInspection Completed(bool hasMarkers) =>
+            new(true, hasMarkers, null);
+
+        public static BranchDotnetMarkerInspection Failed(string failureDetail) =>
+            new(false, false, failureDetail);
+    }
+
+    private sealed record DotnetBuildMarkerInspection(
+        RequiredBuildProbeStatus Status,
+        bool WorkBranchHasMarkers,
+        bool BaseBranchHasMarkers,
+        string? BaseBranch = null,
+        string? Reason = null)
+    {
+        public static DotnetBuildMarkerInspection NotApplicable() =>
+            new(RequiredBuildProbeStatus.NotApplicable, false, false);
+
+        public static DotnetBuildMarkerInspection Applies(
+            bool workBranchHasMarkers,
+            bool baseBranchHasMarkers,
+            string? baseBranch = null,
+            string? reason = null) =>
+            new(RequiredBuildProbeStatus.Applies, workBranchHasMarkers, baseBranchHasMarkers, baseBranch, reason);
+
+        public static DotnetBuildMarkerInspection Unavailable(string reason) =>
+            new(RequiredBuildProbeStatus.Unavailable, false, false, Reason: reason);
+
+        public RequiredBuildProbeResult ToProbeResult() =>
+            Status switch
+            {
+                RequiredBuildProbeStatus.Applies => Reason is null
+                    ? RequiredBuildProbeResult.Applies
+                    : new RequiredBuildProbeResult(RequiredBuildProbeStatus.Applies, Reason),
+                RequiredBuildProbeStatus.NotApplicable => RequiredBuildProbeResult.NotApplicable,
+                RequiredBuildProbeStatus.Unavailable => RequiredBuildProbeResult.Unavailable(
+                    Reason ?? "build marker inspection failed"),
+                _ => RequiredBuildProbeResult.Unavailable($"unknown probe status {Status}"),
+            };
     }
 
     private static bool IsRequiredDotnetBuildMarkerPath(string path)

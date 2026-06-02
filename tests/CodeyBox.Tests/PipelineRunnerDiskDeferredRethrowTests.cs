@@ -75,7 +75,8 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
             store,
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = new WorkItem
         {

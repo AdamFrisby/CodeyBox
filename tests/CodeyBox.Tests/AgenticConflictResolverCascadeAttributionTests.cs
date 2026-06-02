@@ -190,7 +190,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             classRouter: router,
-            auditReports: auditReportStore);
+            auditReports: auditReportStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new CascadeFixture(pipeline, store, gitHost);
     }

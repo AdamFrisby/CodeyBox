@@ -390,7 +390,8 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

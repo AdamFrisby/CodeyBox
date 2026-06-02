@@ -129,7 +129,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             store, webhooks, new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             retryScheduler: scheduler,
-            quotaClassifier: BuildQuotaClassifier());
+            quotaClassifier: BuildQuotaClassifier(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return (pipeline, store, scheduler, webhooks);
     }

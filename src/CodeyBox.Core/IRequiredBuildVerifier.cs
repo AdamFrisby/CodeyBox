@@ -12,11 +12,18 @@ public interface IRequiredBuildVerifier
     Task<RequiredBuildVerificationResult> VerifyAsync(RequiredBuildVerificationRequest request, CancellationToken ct);
 }
 
+public static class RequiredBuildGateIdentity
+{
+    public const string AuditorName = "process:required-build";
+    public const string DisplayCommand = "dotnet build";
+}
+
 public sealed record RequiredBuildProbeRequest
 {
     public required WorkItemId WorkItemId { get; init; }
     public required ProjectId ProjectId { get; init; }
     public required string RepositoryId { get; init; }
+    public string? BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
 }
 
@@ -46,6 +53,7 @@ public sealed record RequiredBuildVerificationRequest
     public required WorkItemId WorkItemId { get; init; }
     public required ProjectId ProjectId { get; init; }
     public required string RepositoryId { get; init; }
+    public string? BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
     public required string Phase { get; init; }
     public int? Iteration { get; init; }

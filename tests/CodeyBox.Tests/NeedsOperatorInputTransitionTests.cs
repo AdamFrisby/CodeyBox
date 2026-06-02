@@ -74,7 +74,8 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             questionStore: allowQuestions ? questionStore : null,
-            agentStreams: agentStreams);
+            agentStreams: agentStreams,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestPipelineWithQuestions(pipeline, store, questionStore, agent, gitHost, gitRoot, webhooks);
     }

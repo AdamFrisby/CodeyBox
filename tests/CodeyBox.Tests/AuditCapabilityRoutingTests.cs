@@ -596,7 +596,8 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
-            ]));
+            ]),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new RoutingFixture(pipeline, store, webhooks, codex, gemini, claude);
     }

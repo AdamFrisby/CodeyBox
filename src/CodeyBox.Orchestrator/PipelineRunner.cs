@@ -276,12 +276,9 @@ public sealed class PipelineRunner : IPipelineRunner
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
         _requiredBuildVerifier = requiredBuildVerifier
-            ?? new SandboxRequiredBuildVerifier(
-                sandboxes,
-                gitHost,
-                opts,
-                auditReports,
-                NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            ?? throw new ArgumentNullException(
+                nameof(requiredBuildVerifier),
+                "PipelineRunner requires an IRequiredBuildVerifier supplied by the composition root.");
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
@@ -622,7 +619,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var requiredBuildApplies = false;
             if (!skipAudit)
             {
-                requiredBuildApplies = await RequiredBuildAppliesAsync(item, project, repoId, workBranch, ct);
+                requiredBuildApplies = await RequiredBuildAppliesAsync(item, project, repoId, baseBranch, workBranch, ct);
             }
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
@@ -2379,12 +2376,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (isInitial && suggestionsJson is not null)
                     await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
+                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
                 return agentResult.Stdout;
             }
 
             if (checkedOutExistingBranch)
-                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
+                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
             var msg = isInitial
                 ? "Agent produced no changes to commit"
@@ -2402,7 +2399,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (isInitial && suggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-        await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, branch, agentPhase, ct);
+        await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
         return agentResult.Stdout;
     }
@@ -3271,7 +3268,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
                 requiredBuildFinding = await RunRequiredBuildForAuditAsync(
-                    item, project, repoId, workBranch, iteration, auditPhase.Token);
+                    item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
@@ -3413,13 +3410,11 @@ public sealed class PipelineRunner : IPipelineRunner
         return false;
     }
 
-    private const string RequiredBuildAuditorName = "process:required-build";
-    private const string RequiredBuildDisplayCommand = "dotnet build";
-
     private async Task<bool> RequiredBuildAppliesAsync(
         WorkItem item,
         Project project,
         string repoId,
+        string baseBranch,
         string workBranch,
         CancellationToken ct)
     {
@@ -3428,6 +3423,7 @@ public sealed class PipelineRunner : IPipelineRunner
             WorkItemId = item.Id,
             ProjectId = project.Id,
             RepositoryId = repoId,
+            BaseBranch = baseBranch,
             WorkBranch = workBranch,
         }, ct);
 
@@ -3446,12 +3442,13 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         Project project,
         string repoId,
+        string baseBranch,
         string workBranch,
         string agentPhase,
         CancellationToken ct)
     {
         var result = await VerifyRequiredBuildOnBranchAsync(
-            item, project, repoId, workBranch, phase: agentPhase, ct: ct);
+            item, project, repoId, baseBranch, workBranch, phase: agentPhase, ct: ct);
         if (result.Status == RequiredBuildVerificationStatus.Failed)
         {
             var phaseLabel = agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase)
@@ -3466,19 +3463,20 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         Project project,
         string repoId,
+        string baseBranch,
         string workBranch,
         int iteration,
         CancellationToken ct)
     {
         var result = await VerifyRequiredBuildOnBranchAsync(
-            item, project, repoId, workBranch, phase: "audit", ct: ct, iteration: iteration);
+            item, project, repoId, baseBranch, workBranch, phase: "audit", ct: ct, iteration: iteration);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
             return null;
 
         return new AuditFinding(
-            AuditorName: RequiredBuildAuditorName,
+            AuditorName: RequiredBuildGateIdentity.AuditorName,
             Severity: AuditSeverity.Error,
-            Title: $"required build failed: {RequiredBuildDisplayCommand}",
+            Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
             Description: BuildRequiredBuildFailureSummary(result));
     }
 
@@ -3486,6 +3484,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         Project project,
         string repoId,
+        string baseBranch,
         string workBranch,
         string phase,
         CancellationToken ct,
@@ -3499,6 +3498,7 @@ public sealed class PipelineRunner : IPipelineRunner
             WorkItemId = item.Id,
             ProjectId = project.Id,
             RepositoryId = repoId,
+            BaseBranch = baseBranch,
             WorkBranch = workBranch,
             Phase = phase,
             Iteration = iteration,

@@ -182,6 +182,180 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task RequiredBuild_NonDotnetRepo_SkipsProbeVerifyAndPipelineAuditLoop()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            auditReports: null,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/non-dotnet") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var probe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.NotApplicable, probe.Status);
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildVerificationStatus.Skipped, result.Status);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1);
+        var pipelineItem = NewItem("feature/non-dotnet-pipeline") with { State = WorkItemState.WorkComplete };
+        var pipelineRepoId = await tp.GitHost.EnsureRepositoryAsync(pipelineItem.Id, seed, pipelineItem.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(pipelineRepoId),
+            pipelineItem.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(pipelineItem);
+        await tp.Pipeline.RunAsync(pipelineItem, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(pipelineItem.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+    }
+
+    [Fact]
+    public async Task AuditPass_CannotReachAuditPassed_WhenWorkBranchDeletesDotnetMarkers()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/deletes-dotnet-markers") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await DeleteFromBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "delete required build markers",
+            "CodeyBox.slnx",
+            "tests/CodeyBox.Tests.csproj");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("required build failed", final.LastError);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            tp.GitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            auditReports: null,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+        var verification = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, verification.Status);
+        Assert.Contains("deleted or moved", verification.Output);
+    }
+
+    [Fact]
+    public async Task AuditPass_CannotReachAuditPassed_WhenRequiredBuildProbeCannotRun()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Unavailable("git ls-tree failed"),
+            RequiredBuildVerificationResult.Unavailable("verify should not run"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            requiredBuildVerifier: verifier);
+
+        var item = NewItem("feature/probe-unavailable") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could not verify required build", final.LastError);
+        Assert.Contains("git ls-tree failed", final.LastError);
+        Assert.Equal(1, verifier.ProbeCalls);
+        Assert.Equal(0, verifier.VerifyCalls);
+    }
+
+    [Fact]
+    public async Task AuditPass_CannotReachAuditPassed_WhenTestProjectBuildFailsAfterRootSolutionPasses()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateTestProjectFailingDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/test-project-build-fails") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("required build failed", final.LastError);
+        var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
+        Assert.Contains("build ./CodeyBox.slnx", dotnetInvocations);
+        Assert.Contains("build ./tests/CodeyBox.Tests.csproj", dotnetInvocations);
+    }
+
+    [Fact]
     public async Task RequiredBuild_MaliciousBuildCannotMutateAuthoritativeBareRepository()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -210,6 +384,7 @@ public sealed class RequiredBuildGateTests : IDisposable
             WorkItemId = item.Id,
             ProjectId = item.ProjectId,
             RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
             Phase = "audit",
         }, CancellationToken.None);
@@ -322,6 +497,41 @@ public sealed class RequiredBuildGateTests : IDisposable
             new Dictionary<string, string> { ["CODEYBOX_FAKE_DOTNET_LOG"] = log });
     }
 
+    private async Task<FakeDotnet> CreateTestProjectFailingDotnetAsync()
+    {
+        var bin = Path.Combine(_workspace, "fake-dotnet-test-fail-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(bin);
+        var dotnet = Path.Combine(bin, "dotnet");
+        var log = Path.Combine(_workspace, "fake-dotnet-test-fail-" + Guid.NewGuid().ToString("N")[..8] + ".log");
+        await File.WriteAllTextAsync(dotnet, """
+            #!/bin/sh
+            printf '%s\n' "$*" >> "$CODEYBOX_FAKE_DOTNET_LOG"
+            if [ "$1" != "build" ]; then
+              echo "unexpected dotnet command: $*" >&2
+              exit 42
+            fi
+            case "$2" in
+              ./CodeyBox.slnx)
+                echo "Root solution build succeeded."
+                exit 0
+                ;;
+              ./tests/CodeyBox.Tests.csproj)
+                echo "tests/CodeyBox.Tests.csproj(1,1): error CS1061: test project compile error" >&2
+                exit 1
+                ;;
+              *)
+                echo "unexpected dotnet build target: $2" >&2
+                exit 43
+                ;;
+            esac
+            """);
+        MakeExecutable(dotnet);
+        return new FakeDotnet(
+            bin + Path.PathSeparator + "/usr/bin:/bin",
+            log,
+            new Dictionary<string, string> { ["CODEYBOX_FAKE_DOTNET_LOG"] = log });
+    }
+
     private async Task<FakeDotnet> CreateUnavailableDotnetAsync()
     {
         var bin = Path.Combine(_workspace, "fake-dotnet-unavailable-" + Guid.NewGuid().ToString("N")[..8]);
@@ -379,6 +589,24 @@ public sealed class RequiredBuildGateTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, contents);
         await TestSupport.RunGit(clone, "add", fileName);
+        await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
+    }
+
+    private async Task DeleteFromBareBranchAsync(
+        string barePath,
+        string branch,
+        string subject,
+        params string[] paths)
+    {
+        var clone = Path.Combine(_workspace, "branch-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch);
+        var rmArgs = new List<string> { "rm", "--" };
+        rmArgs.AddRange(paths);
+        await TestSupport.RunGit(clone, rmArgs.ToArray());
         await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }

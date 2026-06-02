@@ -96,7 +96,8 @@ public sealed class PickupSmokeTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            smokeGate: gate);
+            smokeGate: gate,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestResources
         {

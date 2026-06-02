@@ -227,7 +227,8 @@ public sealed class MergePhaseHostVerificationTests : IDisposable
             new SqliteWorkItemStore(stateDb),
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
     }
 
     private static async Task<(int Code, string Stdout, string Stderr)> RunGitRaw(string cwd, params string[] args)
@@ -506,7 +507,8 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            auditReports: auditStore);
+            auditReports: auditStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
     }
 
     private static async Task<(int Code, string Stdout, string Stderr)> RunGitRaw(string cwd, params string[] args)

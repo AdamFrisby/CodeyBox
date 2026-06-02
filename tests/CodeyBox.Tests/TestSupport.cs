@@ -230,6 +230,47 @@ internal sealed class StaticCredentialProvider : ICredentialProvider
         => Task.FromResult<AgentCredential?>(null);
 }
 
+internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
+{
+    public static TestRequiredBuildVerifier NotApplicable => new(
+        RequiredBuildProbeResult.NotApplicable,
+        RequiredBuildVerificationResult.Skipped);
+
+    private readonly RequiredBuildProbeResult _probeResult;
+    private readonly RequiredBuildVerificationResult _verificationResult;
+
+    public TestRequiredBuildVerifier(
+        RequiredBuildProbeResult probeResult,
+        RequiredBuildVerificationResult verificationResult)
+    {
+        _probeResult = probeResult;
+        _verificationResult = verificationResult;
+    }
+
+    public int ProbeCalls { get; private set; }
+    public int VerifyCalls { get; private set; }
+
+    public Task<RequiredBuildProbeResult> ProbeAsync(
+        RequiredBuildProbeRequest request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        ProbeCalls++;
+        return Task.FromResult(_probeResult);
+    }
+
+    public Task<RequiredBuildVerificationResult> VerifyAsync(
+        RequiredBuildVerificationRequest request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        VerifyCalls++;
+        return Task.FromResult(_verificationResult);
+    }
+}
+
 internal sealed class TestUpstreamFactory : IUpstreamRemoteFactory
 {
     public IUpstreamRemote Create(Project project) => new NoopUpstreamRemote();
