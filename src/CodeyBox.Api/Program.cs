@@ -1884,7 +1884,16 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetService<TimeProvider>(),
-    sp.GetRequiredService<IBaselineImageResolver>()));
+    sp.GetRequiredService<IBaselineImageResolver>(),
+    autoRetryOptionsAccessor: () =>
+    {
+        var current = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRetryOnQuotaFailure;
+        return OrchestratorOptionsFactory.BuildAutoRetryOptions(
+            current.Enabled,
+            current.PeriodicCheckInterval,
+            current.ClockDriftSafetyMargin,
+            current.MaxAutoRetriesPerWorkItem);
+    }));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>

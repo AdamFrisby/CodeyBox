@@ -73,6 +73,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
         = new();
 
+    /// <summary>
+    /// Raised when a routing probe observes an eligible member move from below
+    /// the effective quota floor to usable. The quota retry scheduler treats
+    /// this as an immediate wake-up signal for parked quota-reset items.
+    /// </summary>
+    public event Action? QuotaUsableThresholdCrossed;
+
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
@@ -435,10 +442,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
                     earliestBudgetReset = r;
             }
 
-            _lastAvailablePct[(member.Agent, member.ModelId ?? string.Empty)] = quota.AvailablePct;
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            RecordAvailabilityAndMaybeNotify(member, quota, gate, nowUtc);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -1018,6 +1025,25 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    private void RecordAvailabilityAndMaybeNotify(
+        AgentMembership member,
+        EffectiveQuota quota,
+        QuotaGateDecision gate,
+        DateTimeOffset nowUtc)
+    {
+        var key = (member.Agent, member.ModelId ?? string.Empty);
+        var hadPrevious = _lastAvailablePct.TryGetValue(key, out var previous);
+        _lastAvailablePct[key] = quota.AvailablePct;
+        if (!gate.Allow)
+            return;
+
+        var floor = member.Billing == AgentBilling.Subscription
+            ? ComputeEffectiveFloorPct(member.Agent, quota.ResetAt, nowUtc)
+            : _opts.MinQuotaPct;
+        if (hadPrevious && previous < floor && quota.AvailablePct >= floor)
+            QuotaUsableThresholdCrossed?.Invoke();
     }
 
     /// <summary>

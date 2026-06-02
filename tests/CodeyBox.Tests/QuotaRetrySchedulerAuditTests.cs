@@ -180,7 +180,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     {
         var time = new ManualTimeProvider(DateTimeOffset.UtcNow);
         using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects(), timeProvider: time);
-        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        var item = CreateQuotaItem(WorkItemState.Failed) with
         {
             NextQuotaRetryAt = time.Now.AddMinutes(5),
         };
@@ -191,7 +191,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         timer.Fire();
 
         var evt = await WaitForQuotaAttemptAsync(item, "targeted", "retried");
-        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
+        Assert.Equal("Failed", GetScalar<string>(evt, "State"));
         Assert.Equal("from=work", GetScalar<string>(evt, "Reason"));
     }
 
@@ -257,8 +257,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(first.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await fixture.Store.GetAsync(second.Id))!.State);
-        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(first, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
-        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(second, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(first, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(second, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
     [Fact]
@@ -334,7 +334,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Queued, laterStored!.State);
         Assert.Equal(1, laterStored.QuotaRetryAttempts);
         Assert.Equal("project lookup failed", GetScalar<string>(AssertQuotaAttempt(broken, "rearm-overdue", "error", "Failed"), "Reason"));
-        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "rearm-overdue", "retried", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
     [Fact]
