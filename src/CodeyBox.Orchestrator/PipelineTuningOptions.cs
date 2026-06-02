@@ -51,6 +51,15 @@ public sealed class PipelineTuningOptions
     /// <see cref="Agents.AgentSuspendResilience"/>. Default 1.
     /// </summary>
     public int AgentSuspendMaxRetries { get; set; } = 1;
+
+    /// <summary>
+    /// Maximum number of sequential auto-merge race recoveries the upstream-push
+    /// loop will perform before parking the item. Each recovery costs a full LLM
+    /// merge-phase re-invocation. When the upstream base is a moving target
+    /// (hammered by sibling writes / direct pushes), this cap bounds the retry
+    /// cost. Default 3 (separate from and narrower than <c>UpstreamPushMaxAttempts</c>).
+    /// </summary>
+    public int AutoMergeRaceRecoveryMaxAttempts { get; set; } = 3;
 }
 
 /// <summary>

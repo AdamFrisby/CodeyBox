@@ -5996,11 +5996,20 @@ public sealed class PipelineRunner : IPipelineRunner
             // diagnostic distinct from the normal infrastructure-failure path.
             var lastIterationRaced = false;
             // Set when race recovery already transitioned the item to a
-            // terminal state with its own park message ("base didn't move",
-            // could not advance work branch, etc.). Suppresses the post-loop
-            // "main is being hammered" message which would otherwise clobber
-            // the more specific diagnostic.
+            // terminal state with its own park message (could not refetch base,
+            // could not advance work branch, PR number missing, etc.).
+            // Suppresses the post-loop "main is being hammered" message which
+            // would otherwise clobber the more specific diagnostic.
             var raceRecoveryParked = false;
+            // Tracks how many times we've successfully performed a full
+            // auto-merge race recovery (refetch base + re-run merge phase +
+            // update work branch). Bounded by the hot-reloadable
+            // AutoMergeRaceRecoveryMaxAttempts in PipelineTuning to prevent
+            // pathological re-merge loops when the upstream base is a moving
+            // target (hammered by sibling writes / direct pushes). Distinct
+            // from UpstreamPushMaxAttempts, which caps total upstream API
+            // calls including transient infrastructure retries.
+            var raceRecoveryCount = 0;
             // Each iteration may either retry transient failures OR recover from
             // an auto-merge race (405 on PUT /pulls/N/merge). The shared cap
             // prevents pathological loops since each race-recovery iteration
@@ -6068,7 +6077,33 @@ public sealed class PipelineRunner : IPipelineRunner
                             break;
                         }
 
-                        // Race recovery succeeded — update local state and loop.
+                        // Race recovery succeeded — update local state.
+                        raceRecoveryCount++;
+                        var maxRaceRecovery = _pipelineTuning.Current.AutoMergeRaceRecoveryMaxAttempts;
+                        if (raceRecoveryCount > maxRaceRecovery)
+                        {
+                            _log.LogWarning(
+                                "Work item {Id} auto-merge race recovery cap ({Cap}) exhausted after {Count} recoveries; baseBranch likely being mutated by another writer",
+                                item.Id, maxRaceRecovery, raceRecoveryCount);
+                            var failed = await _store.GetAsync(item.Id, ct) ?? item;
+                            const string raceExhaustionMessage =
+                                "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
+                            var failedWithReason = failed.With(WorkItemState.MergeConflictResolutionFailed, raceExhaustionMessage);
+                            await _store.UpdateAsync(failedWithReason, ct);
+                            var revision = await BuildTerminalRevisionAsync(failedWithReason, ct);
+                            await _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "work_item.merge_conflict_resolution_failed",
+                                WorkItem = failedWithReason,
+                                Project = project,
+                                PromptRevision = revision?.PromptRevision,
+                                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                                RevisionMatches = revision?.RevisionMatches,
+                            }, ct);
+                            raceRecoveryParked = true;
+                            break;
+                        }
+
                         mergeSha = raceRecovery.NewMergeSha;
                         agentStdout = raceRecovery.NewAgentStdout;
                         request = request with
@@ -6108,15 +6143,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
             // If the loop exited at the cap with the most recent outcome still
             // flagged as AutoMergeRaced (i.e., we never escaped the race), park
-            // the item with the new distinct "main is being hammered" message.
+            // the item with the "main is being hammered" message.
             // Distinguish from MergeConflictResolutionFailed-from-LLM-failure
             // and from the generic infrastructure-failure path so an operator
             // inspecting lastError can tell "LLM gave up" from "main was a
             // moving target".
             //
             // raceRecoveryParked guards against clobbering a more specific
-            // park message (e.g., "base didn't move") that recovery already
-            // wrote — we should not overwrite that with the generic cap
+            // park message (e.g., refetch failure or merge-failure) that recovery
+            // already wrote — we should not overwrite that with the generic cap
             // diagnostic.
             if (completed is null && lastIterationRaced && reRunMergePhase is not null && !raceRecoveryParked)
             {
@@ -6124,8 +6159,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 const string raceExhaustionMessage =
                     "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
                 _log.LogWarning(
-                    "Work item {Id} hit auto-merge race cap ({Cap}) without resolving",
-                    item.Id, _opts.UpstreamPushMaxAttempts);
+                    "Work item {Id} hit upstream-push attempt cap ({UpstreamCap}) with {RaceRecoveryCount} auto-merge recoveries (recovery cap {RaceRecoveryCap}) without resolving",
+                    item.Id, _opts.UpstreamPushMaxAttempts, raceRecoveryCount, _pipelineTuning.Current.AutoMergeRaceRecoveryMaxAttempts);
                 var failed = lastAttemptItem.With(WorkItemState.MergeConflictResolutionFailed, raceExhaustionMessage);
                 await _store.UpdateAsync(failed, ct);
                 var revision = await BuildTerminalRevisionAsync(failed, ct);
@@ -6176,9 +6211,9 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Carrier for the auto-merge race recovery outcome. When
     /// <see cref="ParkReason"/> is non-null the caller transitions the item to
-    /// MergeConflictResolutionFailed with that message and stops retrying; the
-    /// "base didn't move" case is the canonical example (re-running the LLM
-    /// merger cannot fix a 405 that isn't actually a race). Otherwise the
+    /// MergeConflictResolutionFailed with that message and stops retrying;
+    /// example: fetch failure, no PR number returned, or the upstream does not
+    /// advertise the base branch. When <see cref="ParkReason"/> is null, the
     /// caller updates its local merge-sha and stdout fields and loops to the
     /// next CompleteAsync attempt.
     /// </summary>
@@ -6275,21 +6310,36 @@ public sealed class PipelineRunner : IPipelineRunner
                 NewAgentStdout: null);
         }
 
-        // Step 3: if upstream base sha didn't change, this isn't a race —
-        // re-running the LLM merger won't help. Park with a distinct message
-        // so the operator knows to look at branch protection or other
-        // unmergeability causes rather than chasing a phantom main-motion bug.
-        if (string.Equals(preMergeBaseSha, postFetchBaseSha, StringComparison.Ordinal))
+        // Step 3: the upstream said the PR is unmergeable. Whether or not
+        // we can detect base motion from the local pre/post sha comparison,
+        // always re-run the merge phase against the freshly-fetched base.
+        // The "base didn't move" check (which used to park here) is now a
+        // diagnostic only — premature escalation on a true race (where the
+        // local bare-repo base ref was too stale to show the movement) is
+        // the defect this change eliminates. The merge itself will reveal
+        // real semantic conflicts, which the in-VM resolver and bounded
+        // retry cap handle.
+        if (preMergeBaseSha is not null)
         {
-            return new AutoMergeRaceRecovery(
-                ParkReason: "GitHub said unmergeable but base didn't move, likely a different conflict — manual inspection needed",
-                NewMergeSha: string.Empty,
-                NewAgentStdout: null);
+            if (string.Equals(preMergeBaseSha, postFetchBaseSha, StringComparison.Ordinal))
+            {
+                _log.LogInformation(
+                    "Auto-merge race recovery (attempt {Attempt}): upstream base '{Branch}' sha ({Sha}) unchanged since merge; re-running merge phase anyway in case local base was stale",
+                    attempt, baseBranch, preMergeBaseSha);
+            }
+            else
+            {
+                _log.LogInformation(
+                    "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
+                    attempt, baseBranch, preMergeBaseSha, postFetchBaseSha);
+            }
         }
-
-        _log.LogInformation(
-            "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
-            attempt, baseBranch, preMergeBaseSha, postFetchBaseSha);
+        else
+        {
+            _log.LogInformation(
+                "Auto-merge race recovery (attempt {Attempt}): could not determine pre-race base sha; re-running merge phase blindly",
+                attempt);
+        }
 
         // Step 4: re-run the merge phase against the freshly-fetched base. The
         // merge phase reads local baseBranch via ResolveCommitAsync, which now

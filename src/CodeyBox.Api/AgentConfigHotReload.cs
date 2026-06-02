@@ -662,6 +662,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MergeSandboxStagingRestoreAttempts,
                 opts.MaxQuestionsPerWorkItem,
                 opts.AgentSuspendMaxRetries,
+                opts.AutoMergeRaceRecoveryMaxAttempts,
             },
             JsonOpts);
 
