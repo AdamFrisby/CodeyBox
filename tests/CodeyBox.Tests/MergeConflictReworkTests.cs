@@ -361,6 +361,43 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.NotNull(conflictRow.EndedAt);
     }
 
+    [Fact]
+    public async Task ConflictRework_SmokeRejection_DoesNotInvokeReworkAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var smokeGate = new RejectingTargetInVmSmokeGate(AgentKind.Claude, "rework-profile");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Merge = "merge-profile",
+                Rework = "rework-profile",
+            },
+            inVmSmokeGate: smokeGate);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(1, final.ConflictReworkAttempts);
+        Assert.Contains("in-VM smoke gate", final.LastError);
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+
+        Assert.Contains(smokeGate.Calls, c =>
+            c.Kind == AgentKind.Claude &&
+            c.Target.NetworkProfile == "rework-profile");
+    }
+
     /// <summary>
     /// Anti-abandonment guard: when the rework agent runs
     /// <c>git reset --hard origin/main</c> mid-iteration (discarding prior

@@ -67,6 +67,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     // launch the same baseline VM. Lazily populated.
     private readonly Dictionary<string, SemaphoreSlim> _baselineLocks = new();
     private readonly object _baselineLocksGuard = new();
+    private readonly ConcurrentDictionary<string, BaselineTarget> _baselineTargets = new(StringComparer.Ordinal);
+
+    private readonly record struct BaselineTarget(string ProfileName, SandboxProfileFlavor Flavor);
 
     // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
@@ -1092,12 +1095,19 @@ git push origin HEAD:{refName}";
                 $"Network profile '{profileName}' is not configured in MultipassSandboxOptions.NetworkProfiles. " +
                 $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]");
 
-        // B1: when the caller pinned a baseline ref (work item carries one from
-        // pickup), reuse it verbatim — even if live config now hashes to a
-        // different value. That's the point: an in-flight item keeps its
-        // baseline across an operator edit. When null (legacy / unsupported
-        // path), compose from live config so behaviour matches pre-B1.
-        var baselineName = pinnedBaselineRef ?? ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        // B1 pins are VM names, but Multipass clones inherit the source VM's
+        // network attachment. Only accept a pin that this provider resolved for
+        // the same requested profile/flavor, or a pin that still equals the live
+        // ref for this target after a restart. Unknown stale pins fail closed
+        // instead of cloning a work-profile baseline into an audit/rework phase.
+        var liveBaselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        var baselineName = liveBaselineName;
+        if (!string.IsNullOrWhiteSpace(pinnedBaselineRef))
+        {
+            EnsurePinnedBaselineMatchesTarget(pinnedBaselineRef, liveBaselineName, profileName, flavor);
+            baselineName = pinnedBaselineRef;
+        }
+        RememberBaselineTarget(baselineName, profileName, flavor);
 
         var sem = GetBaselineLock(baselineName);
         await sem.WaitAsync(ct);
@@ -1112,6 +1122,38 @@ git push origin HEAD:{refName}";
         {
             sem.Release();
         }
+    }
+
+    private void EnsurePinnedBaselineMatchesTarget(
+        string pinnedBaselineRef,
+        string liveBaselineName,
+        string profileName,
+        SandboxProfileFlavor flavor)
+    {
+        var requested = new BaselineTarget(profileName, flavor);
+        if (_baselineTargets.TryGetValue(pinnedBaselineRef, out var pinnedTarget))
+        {
+            if (pinnedTarget == requested)
+                return;
+
+            throw new InvalidOperationException(
+                $"Pinned baseline '{pinnedBaselineRef}' was resolved for network profile '{pinnedTarget.ProfileName}' / flavor '{pinnedTarget.Flavor}', " +
+                $"but this sandbox requested network profile '{profileName}' / flavor '{flavor}'. Refusing to clone a baseline with a different network attachment.");
+        }
+
+        if (string.Equals(pinnedBaselineRef, liveBaselineName, StringComparison.Ordinal))
+            return;
+
+        throw new InvalidOperationException(
+            $"Pinned baseline '{pinnedBaselineRef}' is not bound to requested network profile '{profileName}' / flavor '{flavor}' " +
+            $"(current ref for that target is '{liveBaselineName}'). Refusing to clone a baseline with an unknown network attachment.");
+    }
+
+    private void RememberBaselineTarget(string baselineName, string profileName, SandboxProfileFlavor flavor)
+    {
+        if (string.IsNullOrWhiteSpace(baselineName))
+            return;
+        _baselineTargets.TryAdd(baselineName, new BaselineTarget(profileName, flavor));
     }
 
     private SemaphoreSlim GetBaselineLock(string baselineName)
@@ -1202,7 +1244,9 @@ git push origin HEAD:{refName}";
         var opts = ReadOptions();
         if (!opts.UseBaselineImages) return null;
         if (!opts.NetworkProfiles.ContainsKey(profileName)) return null;
-        return ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        var baselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        RememberBaselineTarget(baselineName, profileName, flavor);
+        return baselineName;
     }
 
     /// <inheritdoc/>

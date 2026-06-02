@@ -618,10 +618,13 @@ public sealed record SandboxSpec
     /// <summary>
     /// Content-hashed identifier of the sandbox baseline image to pin this
     /// sandbox to. Stamped on the work item at pickup time and threaded back
-    /// through every subsequent <see cref="ISandboxProvider.CreateAsync"/> so
-    /// audit / rework iterations keep using the same baseline as the work
-    /// phase even when the operator edits baseline-contributing config
-    /// (ExtraRuncmd, ExtraCloudInit, cloud-init contents) mid-flight.
+    /// through subsequent <see cref="ISandboxProvider.CreateAsync"/> calls so
+    /// matching target profiles keep using the pinned baseline even when the
+    /// operator edits baseline-contributing config (ExtraRuncmd,
+    /// ExtraCloudInit, cloud-init contents) mid-flight. Providers whose clone
+    /// source carries target-specific attachments, such as Multipass network
+    /// bridges, must reject or recompute pins that do not match the requested
+    /// profile/flavor.
     /// Null = provider falls back to computing the ref from live config
     /// (backward-compatible for items created before the stamping logic
     /// landed, and for providers that don't model baselines).

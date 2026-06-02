@@ -1503,10 +1503,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     private string? ResolveBaselineRefForPickup(WorkItem item, Project? project)
     {
-        // Default to the project's work-phase profile. The audit/rework
-        // phases may use different profiles; the pin applies uniformly
-        // (the provider falls back to live-config behaviour when the pinned
-        // name doesn't make sense for a given phase's profile).
+        // Default to the project's work-phase profile. Later phases may use
+        // different profiles; the Multipass provider validates the pinned VM
+        // against the requested profile/flavor and fails closed rather than
+        // cloning a baseline with the wrong network attachment.
         var profile = project?.NetworkProfiles.Work;
         // Default to Headless; the few callers using Graphical flavors resolve
         // it in the pipeline. For B1 pinning the headless default is fine —

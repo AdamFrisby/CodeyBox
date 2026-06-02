@@ -104,7 +104,8 @@ internal static class TestSupport
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         ITaskQueue? taskQueue = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -182,7 +183,8 @@ internal static class TestSupport
             incrementalRebase: incrementalRebase,
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
-            involvement: involvement);
+            involvement: involvement,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

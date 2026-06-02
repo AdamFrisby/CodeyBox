@@ -128,12 +128,35 @@ public sealed class InVmSmokeProberTests
     {
         var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
         var cache = new InVmSmokeCache(TimeSpan.FromMinutes(60));
-        var prober = Build(provider, NewRegistry(), cache, new FakeBaselineResolver("base-A"));
+        var resolver = new FakeBaselineResolver("base-A");
+        var prober = Build(provider, NewRegistry(), cache, resolver);
 
         await prober.ProbeAllAsync(CancellationToken.None);
         await prober.ProbeAllAsync(CancellationToken.None);
 
         Assert.Equal(1, provider.CreateCount);
+        Assert.Single(resolver.EnsureCalls);
+    }
+
+    [Fact]
+    public async Task CacheHit_WithPinnedBaseline_DoesNotWarmBaselineOrProvision()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "Logged in", ""));
+        var cache = NewCache();
+        cache.Set(AgentKind.Cursor, "base-A",
+            new AgentSmokeResult(true, null, TimeSpan.Zero, SmokeFailureCategory.None));
+        var resolver = new FakeBaselineResolver("base-A") { CanEnsure = false };
+        var registry = NewRegistry();
+        var prober = Build(provider, registry, cache, resolver);
+
+        await prober.EnsureProbedAsync(
+            AgentKind.Cursor,
+            WorkTarget.WithBaselineRef("base-A"),
+            CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Empty(resolver.EnsureCalls);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
     [Fact]
@@ -264,6 +287,24 @@ public sealed class InVmSmokeProberTests
         Assert.Equal(WorkTarget.NetworkProfile, ensureCall.Profile);
         Assert.Equal(WorkTarget.Flavor, ensureCall.Flavor);
         Assert.Equal("base-A", ensureCall.PinnedRef);
+    }
+
+    [Fact]
+    public async Task BaselineWarmupThrows_OnDispatchGate_BenchesWithoutProvisioning()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var resolver = new FakeBaselineResolver("base-A") { ThrowOnEnsure = true };
+        var prober = Build(provider, registry, cache, resolver);
+
+        await prober.EnsureProbedAsync(AgentKind.Cursor, baselineRef: null, CancellationToken.None);
+
+        Assert.Equal(0, provider.CreateCount);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+        var availability = registry.GetAvailability(AgentKind.Cursor);
+        Assert.False(availability.Available);
+        Assert.Contains("baseline warm-up failed", availability.Reason);
     }
 
     [Fact]
@@ -1764,6 +1805,7 @@ public sealed class InVmSmokeProberTests
     {
         public string? Ref { get; set; }
         public bool CanEnsure { get; set; } = true;
+        public bool ThrowOnEnsure { get; set; }
         public List<(string Profile, SandboxProfileFlavor Flavor, string? PinnedRef)> EnsureCalls { get; } = [];
         public FakeBaselineResolver(string? r) => Ref = r;
 
@@ -1775,6 +1817,7 @@ public sealed class InVmSmokeProberTests
             string? pinnedBaselineRef,
             CancellationToken ct)
         {
+            if (ThrowOnEnsure) throw new InvalidOperationException("baseline provisioner failed");
             EnsureCalls.Add((profileName, flavor, pinnedBaselineRef));
             return Task.FromResult(CanEnsure ? pinnedBaselineRef ?? Ref : null);
         }

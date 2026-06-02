@@ -1617,7 +1617,8 @@ public sealed class PipelineRunner : IPipelineRunner
         var seenKinds = new HashSet<AgentKind>();
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
-        var resolverSmokeTarget = ResolvePhaseSmokeTarget(project, "merge", item.BaselineImageRef);
+        var resolverSmokePhase = operation == AgenticConflictResolverOperation.Merge ? "merge" : "rebase";
+        var resolverSmokeTarget = ResolvePhaseSmokeTarget(project, resolverSmokePhase, item.BaselineImageRef);
 
         var resolverPrimary = primaryRunner;
         var resolverPrimaryModelId = item.ModelId;
@@ -4158,6 +4159,11 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var sandboxTarget = phase switch
         {
+            "rebase" => new SandboxTarget(
+                project.NetworkProfiles.Work
+                    ?? project.NetworkProfiles.AuditAgent
+                    ?? project.NetworkProfiles.AuditTool,
+                SandboxProfileFlavor.Headless),
             "rework" => SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework),
             "merge" => new SandboxTarget(project.NetworkProfiles.Merge, SandboxProfileFlavor.Headless),
             "audit" => SandboxTargetResolver.ResolveAudit(

@@ -433,6 +433,42 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         Assert.DoesNotContain(candidates, c => c.Runner.Kind == AgentKind.Codex);
     }
 
+    [Fact]
+    public async Task RebaseSmokeGateUsesRebaseSandboxProfileFallback_AndRejectsBenchedResolver()
+    {
+        var primary = new FakeAgentRunner(AgentKind.Claude);
+        var smokeGate = new RejectingTargetInVmSmokeGate(AgentKind.Claude, "audit-agent-profile");
+
+        var fixture = BuildFixture(
+            runners: [primary],
+            members:
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = null,
+                AuditAgent = "audit-agent-profile",
+                AuditTool = "audit-tool-profile",
+                Merge = "merge-profile",
+            },
+            inVmSmokeGate: smokeGate);
+
+        var item = NewItem(AgentKind.Claude) with { BaselineImageRef = "cb-baseline-pin" };
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<AgentUnavailableException>(() =>
+            fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+                item, fixture.Project, primary, CancellationToken.None));
+
+        Assert.Contains("smoke gate", ex.CandidateReasons, StringComparison.Ordinal);
+        var call = Assert.Single(smokeGate.Calls);
+        Assert.Equal(AgentKind.Claude, call.Kind);
+        Assert.Equal("audit-agent-profile", call.Target.NetworkProfile);
+        Assert.Equal(SandboxProfileFlavor.Headless, call.Target.Flavor);
+        Assert.Equal("cb-baseline-pin", call.Target.BaselineRef);
+    }
+
     // ── Fixture and helpers ────────────────────────────────────────────────
 
     private Fixture BuildFixture(
@@ -440,7 +476,9 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         IReadOnlyList<AgentMembership> members,
         IAgentRunningCounters? runningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
-        IAgentBudgetProvider? budgetProvider = null)
+        IAgentBudgetProvider? budgetProvider = null,
+        ProjectNetworkProfiles? networkProfiles = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -471,6 +509,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             DefaultBaseBranch = "main",
             DefaultAgent = members[0].Agent,
             DefaultAgentClass = "frontier",
+            NetworkProfiles = networkProfiles ?? new ProjectNetworkProfiles(),
             Audit = new ProjectAudit { MaxIterations = 1 },
         };
         var projects = new InMemoryProjectRepository(project);
@@ -492,7 +531,8 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             agentRunningCounters: runningCounters,
             agentConcurrency: agentConcurrency,
             auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            budgetProvider: budgetProvider);
+            budgetProvider: budgetProvider,
+            inVmSmokeGate: inVmSmokeGate);
 
         return new Fixture(pipeline, store, project);
     }

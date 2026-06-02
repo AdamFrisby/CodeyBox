@@ -369,8 +369,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         string resolvedBaselineRef;
         try
         {
-            var readyBaselineRef = await ResolveReadyBaselineRefAsync(target, baselineRef, ct);
-            if (readyBaselineRef is null)
+            var targetBaselineRef = ResolveTargetBaselineRef(target, baselineRef);
+            if (targetBaselineRef is null)
             {
                 _log.LogWarning(
                     "In-VM smoke for {Agent}: no clonable baseline for profile {Profile} / flavor {Flavor}; treating as transient",
@@ -381,7 +381,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                     benchOnTransientFault);
             }
 
-            resolvedBaselineRef = readyBaselineRef;
+            resolvedBaselineRef = targetBaselineRef;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -414,6 +414,35 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
                 probe.Kind, cached, SmokeExclusionSource.InVmSmoke, clearsFastFail: false);
             await EmitTransitionWebhookAsync(probe.Kind, cached, hitTransition);
             return cached;
+        }
+
+        try
+        {
+            var readyBaselineRef = await EnsureReadyBaselineRefAsync(target, resolvedBaselineRef, ct);
+            if (readyBaselineRef is null)
+            {
+                _log.LogWarning(
+                    "In-VM smoke for {Agent}: no clonable baseline for profile {Profile} / flavor {Flavor}; treating as transient",
+                    probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+                return BenchTransientFaultIfRequested(
+                    probe.Kind,
+                    "no clonable baseline for smoke target",
+                    benchOnTransientFault);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "In-VM smoke for {Agent}: baseline warm-up failed for profile {Profile} / flavor {Flavor}; treating as transient",
+                probe.Kind.Value, target.NetworkProfile ?? "(none)", target.Flavor);
+            return BenchTransientFaultIfRequested(
+                probe.Kind,
+                "baseline warm-up failed",
+                benchOnTransientFault);
         }
 
         AgentCredential? credential;
@@ -715,10 +744,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         }
     }
 
-    private async Task<string?> ResolveReadyBaselineRefAsync(
+    private string? ResolveTargetBaselineRef(
         InVmSmokeSandboxTarget target,
-        string? pinnedBaselineRef,
-        CancellationToken ct)
+        string? pinnedBaselineRef)
     {
         if (string.IsNullOrWhiteSpace(target.NetworkProfile))
             return null;
@@ -729,8 +757,16 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         if (string.IsNullOrWhiteSpace(baselineRef))
             return null;
 
+        return baselineRef;
+    }
+
+    private async Task<string?> EnsureReadyBaselineRefAsync(
+        InVmSmokeSandboxTarget target,
+        string baselineRef,
+        CancellationToken ct)
+    {
         var ensured = await _baselineProvisioner.EnsureBaselineImageAsync(
-            target.NetworkProfile,
+            target.NetworkProfile!,
             target.Flavor,
             baselineRef,
             ct);
