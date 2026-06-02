@@ -832,6 +832,40 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_BackgroundResume_IgnoresStartupTokenCancellationAfterStart()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-startup-token-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var barrier = new StartupRecoveryBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            resumeTimeout: TimeSpan.FromMilliseconds(50),
+            mode: SandboxStartupResumeMode.Background);
+
+        using var startupCts = new CancellationTokenSource();
+        await svc.StartAsync(startupCts.Token);
+        startupCts.Cancel();
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Contains("timed out", after.LastError);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task StartupResume_StopAsync_CancelsBackgroundResume_AndIsIdempotent()
     {
         var item = MakeItem(WorkItemState.Working);
@@ -859,6 +893,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.True(provider.ResumeCancellationObserved);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal("vm-stop-cancel", after.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+        Assert.Null(after.LastError);
+        Assert.Equal(0, after.RecoveryAttempts);
 
         // Host/factory disposal paths may call StopAsync more than once.
         await svc.StopAsync(CancellationToken.None);
@@ -1045,8 +1085,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task AdoptionDeadline_ConfiguredValue_IsPassedToProvider()
     {
-        // Verifies the SandboxAdoptionDeadlineSeconds config knob (Program.cs:1716)
-        // flows through the constructor into the WaitForAdoptedAgentCompletionAsync call.
+        // Verifies the SandboxAdoptionDeadlineSeconds option flows through the
+        // startup resume wiring into WaitForAdoptedAgentCompletionAsync.
         var customDeadline = TimeSpan.FromMinutes(10);
         var item = MakeItem();
         await _store.CreateAsync(item with
@@ -1405,6 +1445,33 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.PreemptCheckpoint);
         Assert.Null(after.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushProviderCancels_DoesNotSetCheckpoint()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/c.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushThrowsCancellation = true,
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
     }
 
     [Fact]
@@ -2040,6 +2107,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool AdoptionFaults { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
+        public bool CheckpointPushThrowsCancellation { get; set; }
         public bool CheckpointPushHangs { get; set; }
 
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
@@ -2108,6 +2176,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _checkpointPushCalls.Enqueue(new CheckpointPushCall(vmName, workingDir, refName, commitMessage));
             if (CheckpointPushThrows)
                 throw new InvalidOperationException("simulated in-VM git push failure");
+            if (CheckpointPushThrowsCancellation)
+                throw new OperationCanceledException("provider cancelled checkpoint promotion");
             if (CheckpointPushHangs)
                 return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);

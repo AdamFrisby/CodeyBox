@@ -207,12 +207,16 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             if (_resumeStarted)
                 return background ? Task.CompletedTask : _resumeTask ?? Task.CompletedTask;
 
+            if (background && ct.IsCancellationRequested)
+                return Task.FromCanceled(ct);
+
             _resumeStarted = true;
             if (background)
             {
-                _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var backgroundCts = new CancellationTokenSource();
+                _backgroundCts = backgroundCts;
                 _resumeTask = Task.Run(
-                    () => ResumeAllAndSignalAsync(_backgroundCts.Token),
+                    () => ResumeAllAndSignalAsync(backgroundCts.Token),
                     CancellationToken.None);
                 return Task.CompletedTask;
             }

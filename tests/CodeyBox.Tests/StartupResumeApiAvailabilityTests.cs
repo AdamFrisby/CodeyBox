@@ -193,6 +193,8 @@ public sealed class StartupResumeApiAvailabilityTests
                 services.RemoveAll<IAgentQuotaProbe>();
                 services.AddSingleton<IAgentQuotaProbe>(new NullQuotaProbe());
 
+                services.RemoveAll<IAgentModelListProbe>();
+
                 services.RemoveAll<IProjectRepository>();
                 services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                     new Project
