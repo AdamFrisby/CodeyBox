@@ -2,6 +2,7 @@ using System.Diagnostics;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -12,15 +13,21 @@ using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
 
+[Collection("GlobalSerilog")]
 public sealed class StartupResumeApiAvailabilityTests
 {
     [Theory]
-    [InlineData("hang")]
-    [InlineData("throw")]
-    public async Task StartupResumeFailure_DoesNotBlockQuotaEndpoint_AndMarksItemFailed(string behavior)
+    [InlineData("hang", SandboxResumeMode.Background)]
+    [InlineData("throw", SandboxResumeMode.Background)]
+    [InlineData("hang", SandboxResumeMode.Blocking)]
+    public async Task StartupResumeFailure_DoesNotBlockQuotaEndpoint_AndMarksItemFailed(
+        string behavior,
+        SandboxResumeMode mode)
     {
-        var configuredTimeout = TimeSpan.FromSeconds(3);
-        using var factory = new StartupResumeFullHostFactory(behavior, configuredTimeout);
+        var configuredTimeout = mode == SandboxResumeMode.Background
+            ? TimeSpan.FromSeconds(10)
+            : TimeSpan.FromSeconds(3);
+        using var factory = new StartupResumeFullHostFactory(behavior, mode, configuredTimeout);
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -45,28 +52,50 @@ public sealed class StartupResumeApiAvailabilityTests
         });
 
         var sw = Stopwatch.StartNew();
-        HttpClient? client = null;
+        HttpClient? bootstrapClient = null;
+        HttpClient? networkClient = null;
         HttpResponseMessage? response = null;
         try
         {
+            var availabilityDeadline = mode == SandboxResumeMode.Background
+                ? configuredTimeout
+                : configuredTimeout + TimeSpan.FromSeconds(7);
             response = await Task.Run(async () =>
             {
-                client = factory.CreateClient();
-                return await client.GetAsync("/quota");
-            }).WaitAsync(configuredTimeout);
+                bootstrapClient = factory.CreateClient();
+                var baseAddress = bootstrapClient.BaseAddress
+                    ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
+                networkClient = new HttpClient { BaseAddress = baseAddress };
+                return await networkClient.GetAsync("/quota");
+            }).WaitAsync(availabilityDeadline);
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
-            Assert.True(sw.Elapsed < configuredTimeout,
-                $"GET /quota was not served before configured startup resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+            if (mode == SandboxResumeMode.Background)
+            {
+                Assert.True(sw.Elapsed < configuredTimeout,
+                    $"GET /quota was not served before configured startup resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+            }
+            else
+            {
+                Assert.True(sw.Elapsed >= configuredTimeout,
+                    $"Blocking startup resume did not honor configured mode; GET /quota was served before resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+                Assert.True(sw.Elapsed < availabilityDeadline,
+                    $"GET /quota was not served after configured blocking resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
+            }
         }
         finally
         {
             response?.Dispose();
-            client?.Dispose();
+            networkClient?.Dispose();
+            bootstrapClient?.Dispose();
         }
 
-        var failed = await WaitForStateAsync(factory.Store, item.Id, WorkItemState.Failed);
+        var failed = await WaitForStateAsync(
+            factory.Store,
+            item.Id,
+            WorkItemState.Failed,
+            configuredTimeout + TimeSpan.FromSeconds(5));
         Assert.Null(failed.SuspendedVmName);
         Assert.Contains(behavior == "hang" ? "timed out" : "simulated resume failure", failed.LastError);
         Assert.Contains(item.SuspendedVmName!, factory.Provider.ResumedNames);
@@ -75,9 +104,10 @@ public sealed class StartupResumeApiAvailabilityTests
     private static async Task<WorkItem> WaitForStateAsync(
         IWorkItemStore store,
         WorkItemId id,
-        WorkItemState expected)
+        WorkItemState expected,
+        TimeSpan timeout)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        var deadline = DateTimeOffset.UtcNow.Add(timeout);
         WorkItem? latest = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -96,6 +126,7 @@ public sealed class StartupResumeApiAvailabilityTests
     private sealed class StartupResumeFullHostFactory : WebApplicationFactory<Program>
     {
         private readonly string _behavior;
+        private readonly SandboxResumeMode _mode;
         private readonly TimeSpan _resumeTimeout;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-startup-resume-api-{Guid.NewGuid():N}.db");
@@ -104,13 +135,18 @@ public sealed class StartupResumeApiAvailabilityTests
         public SqliteWorkerRegistry Registry { get; }
         public StartupResumeProvider Provider { get; }
 
-        public StartupResumeFullHostFactory(string behavior, TimeSpan resumeTimeout)
+        public StartupResumeFullHostFactory(
+            string behavior,
+            SandboxResumeMode mode,
+            TimeSpan resumeTimeout)
         {
             _behavior = behavior;
+            _mode = mode;
             _resumeTimeout = resumeTimeout;
             Store = new SqliteWorkItemStore(_dbPath);
             Registry = new SqliteWorkerRegistry(_dbPath);
             Provider = new StartupResumeProvider(_behavior);
+            UseKestrel(0);
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -129,7 +165,7 @@ public sealed class StartupResumeApiAvailabilityTests
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
                     ["CodeyBox:Smoke:Enabled"] = "false",
                     ["CodeyBox:Smoke:InVm:Enabled"] = "false",
-                    ["CodeyBox:Shutdown:SandboxResumeMode"] = nameof(SandboxStartupResumeMode.Background),
+                    ["CodeyBox:Shutdown:SandboxResumeMode"] = _mode.ToString(),
                     ["CodeyBox:Shutdown:SandboxResumeTimeout"] = _resumeTimeout.ToString(),
                     ["CodeyBox:WorkerProgressWatchdog:CheckInterval"] = "00:00:00.010",
                     ["CodeyBox:WorkerProgressWatchdog:ProgressTimeout"] = "00:00:00.010",
@@ -195,7 +231,7 @@ public sealed class StartupResumeApiAvailabilityTests
         public string Name => "startup-resume-test";
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new NoopSandbox());
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
@@ -212,6 +248,18 @@ public sealed class StartupResumeApiAvailabilityTests
                 throw new InvalidOperationException("simulated resume failure");
 
             return _never.Task;
+        }
+
+        private sealed class NoopSandbox : ISandbox
+        {
+            public string Id => "startup-resume-created";
+
+            public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+                => Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+
+            public void PauseDispatch() { }
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         }
     }
 }

@@ -81,7 +81,7 @@ public sealed class CodeyBoxOptionsValidatorTests
     public void Validate_RejectsInvalidSandboxResumeMode()
     {
         var options = ValidCodeyBoxOptions();
-        options.Shutdown.SandboxResumeMode = (SandboxStartupResumeMode)42;
+        options.Shutdown.SandboxResumeMode = (SandboxResumeMode)42;
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
 

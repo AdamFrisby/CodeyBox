@@ -2014,7 +2014,9 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
         var shutdown = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Shutdown;
         return new SandboxStartupResumeOptions
         {
-            Mode = shutdown.SandboxResumeMode,
+            Mode = shutdown.SandboxResumeMode == SandboxResumeMode.Blocking
+                ? SandboxStartupResumeMode.Blocking
+                : SandboxStartupResumeMode.Background,
             ResumeTimeout = shutdown.SandboxResumeTimeout,
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
@@ -3021,7 +3023,7 @@ namespace CodeyBox.Api
         /// Hot-reloadable for the next resume sweep.
         /// Bound from <c>CodeyBox:Shutdown:SandboxResumeMode</c>.
         /// </summary>
-        public SandboxStartupResumeMode SandboxResumeMode { get; set; } = SandboxStartupResumeMode.Background;
+        public SandboxResumeMode SandboxResumeMode { get; set; } = SandboxResumeMode.Background;
 
         /// <summary>
         /// Caller-side cap for each persisted VM's startup resume call. This is

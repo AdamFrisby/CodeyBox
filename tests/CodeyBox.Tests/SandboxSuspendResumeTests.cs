@@ -1030,6 +1030,45 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             $"configured {configuredDeadline} adoption deadline was not honored; elapsed {sw.Elapsed}");
     }
 
+    [Theory]
+    [InlineData("sync-cancel")]
+    [InlineData("async-cancel")]
+    [InlineData("sync-fault")]
+    [InlineData("async-fault")]
+    public async Task StartupResume_AdoptionProviderCancellationOrFault_ClearsBookkeepingWithoutPromotingCheckpoint(
+        string behavior)
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = $"vm-adoption-{behavior}",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/fault.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionThrowsCancellation = behavior == "sync-cancel",
+            AdoptionFaultsCancellation = behavior == "async-cancel",
+            AdoptionThrows = behavior == "sync-fault",
+            AdoptionFaults = behavior == "async-fault",
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.AdoptionCalls);
+        Assert.Empty(provider.CheckpointPushCalls);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.AgentLogPath);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.PreemptedAt);
+    }
+
     [Fact]
     public async Task StartupResume_WithAgentLogPath_WaitsForAdoptionAndClearsLogPath()
     {
@@ -1788,6 +1827,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool ResumeCancellationObserved { get; private set; }
         public int? AdoptionExitCodeToReturn { get; set; }
         public TaskCompletionSource<int?>? AdoptionResultSource { get; set; }
+        public bool AdoptionThrowsCancellation { get; set; }
+        public bool AdoptionFaultsCancellation { get; set; }
+        public bool AdoptionThrows { get; set; }
+        public bool AdoptionFaults { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
 
@@ -1832,6 +1875,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             CancellationToken ct)
         {
             _adoptionCalls.Enqueue(new AdoptionCall(vmName, agentLogPath, deadline));
+            if (AdoptionThrowsCancellation)
+                throw new OperationCanceledException("provider cancelled adoption");
+            if (AdoptionThrows)
+                throw new InvalidOperationException("simulated adoption failure");
+            if (AdoptionFaultsCancellation)
+                return Task.FromException<int?>(new OperationCanceledException("provider cancelled adoption"));
+            if (AdoptionFaults)
+                return Task.FromException<int?>(new InvalidOperationException("simulated adoption failure"));
             if (AdoptionResultSource is not null)
                 return AdoptionResultSource.Task;
             return Task.FromResult(AdoptionExitCodeToReturn);

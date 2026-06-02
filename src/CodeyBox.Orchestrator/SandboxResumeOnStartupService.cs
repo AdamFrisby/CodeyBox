@@ -14,7 +14,7 @@ public enum SandboxStartupResumeMode
 public sealed record SandboxStartupResumeOptions
 {
     public int MaxParallelResumes { get; init; } = SandboxResumeOnStartupService.DefaultMaxParallelResumes;
-    public TimeSpan ResumeTimeout { get; init; } = SuspendTimeoutPolicy.DefaultFloor;
+    public TimeSpan ResumeTimeout { get; init; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
     public TimeSpan AdoptionDeadline { get; init; } = SandboxResumeOnStartupService.DefaultAdoptionDeadline;
     public SandboxStartupResumeMode Mode { get; init; } = SandboxStartupResumeMode.Background;
 }

@@ -47,7 +47,7 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
     {
         _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _reconcileTask = Task.Run(
-            () => ReconcileAllAsync(_backgroundCts.Token),
+            () => ReconcileAllSafelyAsync(_backgroundCts.Token),
             CancellationToken.None);
         return Task.CompletedTask;
     }
@@ -70,6 +70,22 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
 
     /// <summary>Exposed for tests that drive the reconciler directly.</summary>
     internal Task ReconcileAllForTestAsync(CancellationToken ct) => ReconcileAllAsync(ct);
+
+    private async Task ReconcileAllSafelyAsync(CancellationToken ct)
+    {
+        try
+        {
+            await ReconcileAllAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _log.LogInformation("Startup sandbox reconciliation cancelled before the sweep completed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Startup sandbox reconciliation threw; resume handler and leak reaper will handle the residual state");
+        }
+    }
 
     internal async Task ReconcileAllAsync(CancellationToken ct)
     {
