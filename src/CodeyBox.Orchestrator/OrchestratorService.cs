@@ -471,7 +471,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         Interlocked.Decrement(ref _currentlyRunning);
         AuditLog.WorkerPoolWorkerFinished(lease.WorkerIndex, lease.WorkItemId);
         TryReleaseConcurrencyGate();
+        EnqueueSlotReleasedDispatchWake(lease);
         return true;
+    }
+
+    private void EnqueueSlotReleasedDispatchWake(WorkerSlotLease lease)
+    {
+        try
+        {
+            // Use a real ID as the kick: default(WorkItemId) is reserved for the
+            // shutdown wake sentinel and is discarded before pickup.
+            var wakeTask = _queue.EnqueueAsync(lease.WorkItemId, CancellationToken.None);
+            if (!wakeTask.IsCompletedSuccessfully)
+            {
+                wakeTask.AsTask().ContinueWith(
+                    t => _log.LogDebug(
+                        t.Exception,
+                        "Worker pool: slot-release wake-up kick faulted for work item {WorkItemId}",
+                        lease.WorkItemId),
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex,
+                "Worker pool: slot-release wake-up kick threw synchronously for work item {WorkItemId}",
+                lease.WorkItemId);
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
