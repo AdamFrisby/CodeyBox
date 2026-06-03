@@ -49,12 +49,14 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task EnqueueIfReady_NullQueue_ReturnsWithoutThrowing()
+    public async Task EnqueueIfReady_NullQueue_ReturnsFalse()
     {
         var followup = MakeFollowup(WorkItemState.Queued);
 
-        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
+        var enqueued = await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
             _store, queue: null, followup, CancellationToken.None);
+
+        Assert.False(enqueued);
     }
 
     [Theory]
@@ -65,9 +67,10 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
         var queue = new InMemoryTaskQueue();
         var followup = MakeFollowup(state);
 
-        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
+        var enqueued = await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
             _store, queue, followup, CancellationToken.None);
 
+        Assert.False(enqueued);
         Assert.Equal(0, queue.Count);
     }
 

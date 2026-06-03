@@ -44,14 +44,14 @@ internal static class CheckAndActFollowupRecovery
         };
     }
 
-    public static async Task EnqueueIfReadyAsync(
+    public static async Task<bool> EnqueueIfReadyAsync(
         IWorkItemStore store,
         ITaskQueue? queue,
         WorkItem followup,
         CancellationToken ct)
     {
         if (queue is null || followup.State != WorkItemState.Queued)
-            return;
+            return false;
 
         var depStates = new Dictionary<WorkItemId, WorkItemState>();
         foreach (var depId in followup.DependsOn)
@@ -62,7 +62,12 @@ internal static class CheckAndActFollowupRecovery
         }
 
         if (WorkItemDependencies.AreSatisfied(followup.DependsOn, depStates))
+        {
             await queue.EnqueueAsync(followup.Id, ct);
+            return true;
+        }
+
+        return false;
     }
 
     public static async Task EnqueueExistingFollowupIfActionableAsync(
