@@ -497,6 +497,27 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.False(sandbox.IsOwnedByShutdownHandler);
     }
 
+    [Fact]
+    public async Task ShutdownHandler_InvalidTeardownMode_ThrowsInsteadOfFallingThrough()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new NonSuspendableShutdownSandbox("vm-invalid-mode");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: (SandboxTeardownMode)42);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => svc.TeardownAllAsync());
+        Assert.Contains("SandboxTeardownMode 42 is not handled", ex.Message);
+        Assert.False(sandbox.DisposeCalled);
+        Assert.False(sandbox.IsOwnedByShutdownHandler);
+    }
+
     // ── Startup resume handler ───────────────────────────────────────────────
 
     [Fact]

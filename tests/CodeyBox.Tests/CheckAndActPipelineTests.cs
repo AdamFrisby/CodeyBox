@@ -674,6 +674,9 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Contains(depByExternalId.Id, followup.DependsOn);
         Assert.DoesNotContain(followup.DependsOn,
             id => id != depByGuid.Id && id != depByExternalId.Id);
+        // Both resolved dependencies are still Queued, so the follow-up must
+        // be persisted without being kicked onto the dispatch queue.
+        Assert.Equal(0, tp.Queue.Count);
     }
 
     [Fact]
