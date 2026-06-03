@@ -409,9 +409,9 @@ public sealed class BudgetEnforcementTests : IDisposable
             foreach (var id in successors)
                 successorStates[id] = await _store.GetAsync(id);
 
-            var activeOrDeferred = successors.Count(id =>
-                svc.IsDeferredForTest(id) || IsRunning(successorStates[id]));
             var runningSuccessors = successors.Count(id => IsRunning(successorStates[id]));
+            var deferredSuccessors = successors.Count(svc.IsDeferredForTest);
+            var activeOrDeferred = runningSuccessors + deferredSuccessors;
 
             secondDeferredIdx = Enumerable.Range(1, ids.Count - 1)
                 .Cast<int?>()
@@ -420,6 +420,7 @@ public sealed class BudgetEnforcementTests : IDisposable
             if (secondDeferredIdx is not null
                 && (activeOrDeferred != successors.Length
                     || runningSuccessors == 0
+                    || deferredSuccessors == 0
                     || pipeline.StartedCount < 2))
                 secondDeferredIdx = null;
 

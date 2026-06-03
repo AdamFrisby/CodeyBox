@@ -1111,6 +1111,10 @@ builder.Services.AddSingleton<IWorkerPoolOccupancy>(sp =>
 // does not depend on the concrete router type.
 builder.Services.AddSingleton<IAgentQuotaAvailabilitySnapshot>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
@@ -1881,12 +1885,22 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     sp.GetRequiredService<WorkItemRetrier>(),
     sp.GetRequiredService<OrchestratorOptions>(),
     sp.GetRequiredService<ILogger<QuotaRetryScheduler>>(),
-    sp.GetRequiredService<AgentClassRouter>(),
+    sp.GetRequiredService<IQuotaRetryRouter>(),
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetService<TimeProvider>(),
-    sp.GetRequiredService<IBaselineImageResolver>()));
+    sp.GetRequiredService<IBaselineImageResolver>(),
+    autoRetryOptionsAccessor: () =>
+    {
+        var current = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRetryOnQuotaFailure;
+        return OrchestratorOptionsFactory.BuildAutoRetryOptions(
+            current.Enabled,
+            current.PeriodicCheckInterval,
+            current.ClockDriftSafetyMargin,
+            current.MaxAutoRetriesPerWorkItem);
+    },
+    quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>

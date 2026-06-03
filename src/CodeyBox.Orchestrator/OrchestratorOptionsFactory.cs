@@ -81,33 +81,46 @@ public static class OrchestratorOptionsFactory
     {
         var options = Build(legacyConcurrency, workerPool, log);
 
-        if (autoRetryEnabled)
+        options = options with
         {
-            if (!TimeSpan.TryParse(autoRetryPeriodicInterval, out TimeSpan periodic))
-                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be a valid TimeSpan (e.g. '01:00:00')");
-            if (periodic <= TimeSpan.Zero)
-                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be positive");
-
-            if (!TimeSpan.TryParse(autoRetryDriftMargin, out TimeSpan drift))
-                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be a valid TimeSpan (e.g. '00:02:00')");
-            if (drift < TimeSpan.Zero)
-                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be non-negative");
-
-            if (autoRetryMaxRetries < 0)
-                throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem must be non-negative");
-
-            options = options with
-            {
-                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
-                {
-                    Enabled = true,
-                    PeriodicCheckInterval = periodic,
-                    ClockDriftSafetyMargin = drift,
-                    MaxAutoRetriesPerWorkItem = autoRetryMaxRetries,
-                }
-            };
-        }
+            AutoRetryOnQuotaFailure = BuildAutoRetryOptions(
+                autoRetryEnabled,
+                autoRetryPeriodicInterval,
+                autoRetryDriftMargin,
+                autoRetryMaxRetries)
+        };
 
         return options;
+    }
+
+    public static AutoRetryOnQuotaFailureOptions BuildAutoRetryOptions(
+        bool enabled,
+        string periodicCheckInterval,
+        string clockDriftMargin,
+        int maxRetriesPerWorkItem)
+    {
+        if (!enabled)
+            return new AutoRetryOnQuotaFailureOptions { Enabled = false };
+
+        if (!TimeSpan.TryParse(periodicCheckInterval, out TimeSpan periodic))
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be a valid TimeSpan (e.g. '01:00:00')");
+        if (periodic <= TimeSpan.Zero)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval must be positive");
+
+        if (!TimeSpan.TryParse(clockDriftMargin, out TimeSpan drift))
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be a valid TimeSpan (e.g. '00:02:00')");
+        if (drift < TimeSpan.Zero)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:ClockDriftSafetyMargin must be non-negative");
+
+        if (maxRetriesPerWorkItem < 0)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem must be non-negative");
+
+        return new AutoRetryOnQuotaFailureOptions
+        {
+            Enabled = true,
+            PeriodicCheckInterval = periodic,
+            ClockDriftSafetyMargin = drift,
+            MaxAutoRetriesPerWorkItem = maxRetriesPerWorkItem,
+        };
     }
 }

@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -72,6 +72,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     // determine availability). Updated on every ProbeAsync result.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
         = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), bool> _lastQuotaUsable
+        = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
+        = new();
+
+    private sealed record QuotaRetryAdmission(AgentKind Agent, string ModelId, DateTimeOffset ExpiresAt);
+
+    /// <summary>
+    /// Raised when a routing probe observes an eligible member move from below
+    /// the effective quota floor to usable. Exposed through
+    /// <see cref="IAgentQuotaAvailabilitySignal"/> so consumers do not need the
+    /// concrete router for quota wake-up notifications.
+    /// </summary>
+    public event Action? QuotaUsableThresholdCrossed;
 
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
@@ -218,9 +232,43 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
     /// path. The router never releases on its own.
     /// </para>
     /// </summary>
-    public async Task<AgentRoutingDecision> ResolveAsync(
+    public Task<AgentRoutingDecision> ResolveAsync(
         WorkItem item, Project? project, CancellationToken ct,
         IAgentSlotGate? slotGate = null)
+        => ResolveCoreAsync(
+            item,
+            project,
+            ct,
+            slotGate,
+            bypassRecentFailurePrecheck: false,
+            bypassInProcessExhaustion: false);
+
+    public async Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct)
+    {
+        var decision = await ResolveCoreAsync(
+            item,
+            project,
+            ct,
+            slotGate: null,
+            bypassRecentFailurePrecheck: true,
+            bypassInProcessExhaustion: true);
+        if (decision.Chosen is { } chosen)
+            RecordQuotaRetryAdmission(item, chosen);
+
+        return new QuotaRetryRoutingDecision(
+            decision.ShouldWait,
+            decision.NoEligibleMembers,
+            decision.Reason);
+    }
+
+    private async Task<AgentRoutingDecision> ResolveCoreAsync(
+        WorkItem item, Project? project, CancellationToken ct,
+        IAgentSlotGate? slotGate,
+        bool bypassRecentFailurePrecheck,
+        bool bypassInProcessExhaustion)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -269,6 +317,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
 
         // Step 2: compute effective scores (base + TOD modifier).
         var nowUtc = _time.GetUtcNow();
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
         var scored = eligible.Select(x => new ScoredMember(
             Member: x.Member,
             BaseScore: x.Member.QualityScore,
@@ -282,6 +331,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
             .ThenBy(x => x.ConfigIndex)
             .ToList();
+        var quotaRetryAdmission = bypassRecentFailurePrecheck && bypassInProcessExhaustion
+            ? null
+            : GetQuotaRetryAdmission(item.Id, nowUtc);
+        var quotaRetryAdmissionDeniedAfterProbe = false;
 
         // Rejected members accumulate for the audit event.
         var rejected = new List<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)>();
@@ -342,10 +395,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         foreach (var entry in sorted)
         {
             var member = entry.Member;
+            var quotaRetryAdmissionMatches = QuotaRetryAdmissionMatches(quotaRetryAdmission, member);
             // Mid-iteration fallback may have marked this member exhausted in the
             // current process. Skip it immediately so we don't burn a probe round-trip
             // re-discovering what we just learned from a live failure.
-            if (IsExhausted(member, nowUtc))
+            if (!bypassInProcessExhaustion
+                && !quotaRetryAdmissionMatches
+                && IsExhausted(member, nowUtc))
             {
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
                 continue;
@@ -367,7 +423,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
                     subscriptionSmokeExcluded++;
                 continue;
             }
-            if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
+            if (!bypassRecentFailurePrecheck
+                && !quotaRetryAdmissionMatches
+                && member.Billing == AgentBilling.Subscription
+                && _quotaFailures is not null)
             {
                 var observedAt = await _quotaFailures.GetMostRecentAsync(
                     member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
@@ -435,10 +494,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
                     earliestBudgetReset = r;
             }
 
-            _lastAvailablePct[(member.Agent, member.ModelId ?? string.Empty)] = quota.AvailablePct;
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            RecordAvailabilityAndMaybeNotify(member, quota, gate);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -475,6 +534,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
                     member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
                     quota.AvailablePct);
 
+                ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
@@ -483,8 +543,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
                 };
             }
 
+            if (quotaRetryAdmissionMatches)
+                quotaRetryAdmissionDeniedAfterProbe = true;
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
+
+        if (quotaRetryAdmissionDeniedAfterProbe)
+            ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
         // No member was chosen. Distinguish stall reasons so the caller picks
         // the right defer interval and the audit log shows what actually
@@ -576,6 +641,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             _log.LogWarning(
                 "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
                 item.Id, classId, fallback.Agent);
+            ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
             return new AgentRoutingDecision
             {
                 Chosen = fallback,
@@ -889,6 +955,56 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
         return _exhausted.TryGetValue(key, out var expiry) && expiry > nowUtc;
     }
 
+    private void RecordQuotaRetryAdmission(WorkItem item, AgentMembership member)
+    {
+        var nowUtc = _time.GetUtcNow();
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
+        var ttl = _opts.ObservedFailureWindow > TimeSpan.Zero
+            ? _opts.ObservedFailureWindow
+            : TimeSpan.FromMinutes(1);
+        var admission = new QuotaRetryAdmission(
+            member.Agent,
+            member.ModelId ?? string.Empty,
+            nowUtc + ttl);
+        _quotaRetryAdmissions[item.Id] = admission;
+    }
+
+    private void PruneExpiredQuotaRetryAdmissions(DateTimeOffset nowUtc)
+    {
+        foreach (var entry in _quotaRetryAdmissions)
+        {
+            if (entry.Value.ExpiresAt <= nowUtc)
+                _quotaRetryAdmissions.TryRemove(entry);
+        }
+    }
+
+    private QuotaRetryAdmission? GetQuotaRetryAdmission(WorkItemId itemId, DateTimeOffset nowUtc)
+    {
+        if (!_quotaRetryAdmissions.TryGetValue(itemId, out var admission))
+            return null;
+
+        if (admission.ExpiresAt > nowUtc)
+            return admission;
+
+        _quotaRetryAdmissions.TryRemove(
+            new KeyValuePair<WorkItemId, QuotaRetryAdmission>(itemId, admission));
+        return null;
+    }
+
+    private static bool QuotaRetryAdmissionMatches(QuotaRetryAdmission? admission, AgentMembership member)
+        => admission is not null
+           && admission.Agent == member.Agent
+           && string.Equals(admission.ModelId, member.ModelId ?? string.Empty, StringComparison.Ordinal);
+
+    private void ConsumeQuotaRetryAdmission(WorkItemId itemId, QuotaRetryAdmission? admission)
+    {
+        if (admission is null)
+            return;
+
+        _quotaRetryAdmissions.TryRemove(
+            new KeyValuePair<WorkItemId, QuotaRetryAdmission>(itemId, admission));
+    }
+
     private Task<AgentQuotaSnapshot> ProbeAsync(AgentMembership member, CancellationToken ct)
     {
         if (member.Billing == AgentBilling.PayPerApi)
@@ -1018,6 +1134,55 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
             _ => await EvaluateObservedFailuresAsync(member, ct),
         };
+    }
+
+    private void RecordAvailabilityAndMaybeNotify(
+        AgentMembership member,
+        EffectiveQuota quota,
+        QuotaGateDecision gate)
+    {
+        var key = (member.Agent, member.ModelId ?? string.Empty);
+        _lastAvailablePct[key] = quota.AvailablePct;
+        if (RecordQuotaUsableTransition(key, gate.Allow))
+            NotifyQuotaUsableThresholdCrossed();
+    }
+
+    private void NotifyQuotaUsableThresholdCrossed()
+    {
+        var handlers = QuotaUsableThresholdCrossed;
+        if (handlers is null)
+            return;
+
+        foreach (Action handler in handlers.GetInvocationList().Cast<Action>())
+        {
+            try
+            {
+                handler();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Quota usable threshold subscriber threw; routing decision will continue");
+            }
+        }
+    }
+
+    private bool RecordQuotaUsableTransition((AgentKind Agent, string ModelId) key, bool isUsable)
+    {
+        while (true)
+        {
+            if (!_lastQuotaUsable.TryGetValue(key, out var previous))
+            {
+                if (_lastQuotaUsable.TryAdd(key, isUsable))
+                    return false;
+                continue;
+            }
+
+            if (previous == isUsable)
+                return false;
+
+            if (_lastQuotaUsable.TryUpdate(key, isUsable, previous))
+                return !previous && isUsable;
+        }
     }
 
     /// <summary>

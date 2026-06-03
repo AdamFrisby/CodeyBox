@@ -132,9 +132,39 @@ public sealed class WorkItemRetrier
             : $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)";
         if (autoPickReason is not null)
             auditFrom = $"{auditFrom} (auto-pick: {autoPickReason})";
-        AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
-        await _queue.EnqueueAsync(resumed.Id, ct);
+        try
+        {
+            await _queue.EnqueueAsync(resumed.Id, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var reverted = false;
+            try
+            {
+                reverted = await _store.TryUpdateIfStateAsync(item, resumeState.Value, CancellationToken.None);
+            }
+            catch (Exception rollbackEx)
+            {
+                _log.LogError(rollbackEx,
+                    "Failed to roll back work item {Id} after retry queue kick failed",
+                    item.Id);
+            }
 
+            if (reverted)
+            {
+                _log.LogWarning(ex,
+                    "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
+                    item.Id, resumeState.Value, item.State);
+                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom);
+            }
+
+            _log.LogError(ex,
+                "Retry of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
+                item.Id, resumeState.Value);
+            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom);
+        }
+
+        AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         return (true, null, resumeState, actualFrom);
     }
 
