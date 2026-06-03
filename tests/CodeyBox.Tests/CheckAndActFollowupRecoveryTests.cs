@@ -48,6 +48,29 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
         Assert.Null(completed);
     }
 
+    [Fact]
+    public async Task EnqueueIfReady_NullQueue_ReturnsWithoutThrowing()
+    {
+        var followup = MakeFollowup(WorkItemState.Queued);
+
+        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
+            _store, queue: null, followup, CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Done)]
+    [InlineData(WorkItemState.Working)]
+    public async Task EnqueueIfReady_NonQueuedFollowup_DoesNotKickQueue(WorkItemState state)
+    {
+        var queue = new InMemoryTaskQueue();
+        var followup = MakeFollowup(state);
+
+        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(
+            _store, queue, followup, CancellationToken.None);
+
+        Assert.Equal(0, queue.Count);
+    }
+
     private static WorkItem MakeCheckItem(bool answer, bool actionableAnswer) => new()
     {
         Id = WorkItemId.New(),
@@ -75,5 +98,16 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
             Answer = answer,
             Evidence = answer ? "actionable" : "not actionable",
         },
+    };
+
+    private static WorkItem MakeFollowup(WorkItemState state) => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "Follow up",
+        Prompt = "p",
+        State = state,
+        JobType = JobType.Normal,
+        OriginCheckWorkItemId = WorkItemId.New(),
     };
 }

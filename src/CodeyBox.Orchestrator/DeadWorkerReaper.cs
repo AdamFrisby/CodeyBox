@@ -242,13 +242,8 @@ public sealed class DeadWorkerReaper : BackgroundService
             if (completed is not null)
             {
                 await _store.UpdateAsync(completed, ct);
-                if (item.Verdict is not null
-                    && item.Check is not null
-                    && item.Verdict.Answer == item.Check.ActionableAnswer
-                    && await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, item.Id, ct) is { } followup)
-                {
-                    await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _queue, followup, ct);
-                }
+                await CheckAndActFollowupRecovery.EnqueueExistingFollowupIfActionableAsync(
+                    _store, _queue, item, ct);
                 MarkRecoveredItem(itemId);
                 _log.LogInformation(
                     "Recovery ({WorkerId}): check-and-act item {ItemId} already persisted a final verdict; completed without replaying the check",

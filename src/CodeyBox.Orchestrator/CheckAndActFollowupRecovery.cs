@@ -64,4 +64,22 @@ internal static class CheckAndActFollowupRecovery
         if (WorkItemDependencies.AreSatisfied(followup.DependsOn, depStates))
             await queue.EnqueueAsync(followup.Id, ct);
     }
+
+    public static async Task EnqueueExistingFollowupIfActionableAsync(
+        IWorkItemStore store,
+        ITaskQueue? queue,
+        WorkItem checkItem,
+        CancellationToken ct)
+    {
+        if (checkItem.Verdict is null
+            || checkItem.Check is null
+            || checkItem.Verdict.Answer != checkItem.Check.ActionableAnswer)
+        {
+            return;
+        }
+
+        var followup = await FindExistingFollowupAsync(store, checkItem.Id, ct);
+        if (followup is not null)
+            await EnqueueIfReadyAsync(store, queue, followup, ct);
+    }
 }

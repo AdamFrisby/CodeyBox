@@ -225,7 +225,7 @@ public sealed class SqliteWorkItemStoreMigrationTests : IDisposable
             Assert.Null(firstRead!.OriginCheckWorkItemId);
             Assert.Equal(originCheckId, secondRead!.OriginCheckWorkItemId);
 
-            await Assert.ThrowsAsync<WorkItemExternalIdConflictException>(() =>
+            await Assert.ThrowsAsync<WorkItemOriginCheckConflictException>(() =>
                 reopened.CreateAsync(Sample() with { OriginCheckWorkItemId = originCheckId }));
         }
     }

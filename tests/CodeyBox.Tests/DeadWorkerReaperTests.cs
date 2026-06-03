@@ -263,6 +263,8 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [Fact]
     public async Task Reaper_CheckAndActWithPersistedFollowup_CompletesWithoutDuplicateFollowup()
     {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
         var item = MakeItem(WorkItemState.Working) with
         {
             JobType = JobType.CheckAndAct,
@@ -289,7 +291,8 @@ public sealed class DeadWorkerReaperTests : IDisposable
         };
         await _store.CreateAsync(item);
         await _store.CreateAsync(followup);
-        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+        var workerId = Guid.NewGuid().ToString();
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
 
         await _reaper.RunOnceAsync(CancellationToken.None);
 
@@ -304,6 +307,16 @@ public sealed class DeadWorkerReaperTests : IDisposable
             allItems.Add(stored);
         var followups = allItems.Where(i => i.OriginCheckWorkItemId == item.Id).ToList();
         Assert.Single(followups);
+
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+        Assert.Contains("persisted verdict", release.Reason, StringComparison.OrdinalIgnoreCase);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.Done, evt.WorkItem.State);
     }
 
     [Fact]

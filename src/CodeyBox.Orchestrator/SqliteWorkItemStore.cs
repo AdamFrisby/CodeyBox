@@ -363,9 +363,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
         catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067) // SQLITE_CONSTRAINT_UNIQUE
         {
+            if (item.OriginCheckWorkItemId is { } originCheckId
+                && IsOriginCheckUniqueViolation(sqlex))
+            {
+                throw new WorkItemOriginCheckConflictException(originCheckId);
+            }
+
             // A concurrent request snuck past the application-level pre-check and
             // hit either the legacy work_items.external_id UNIQUE index or the
-            // new work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
+            // work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
             throw new WorkItemExternalIdConflictException();
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
@@ -410,6 +416,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             await cmd.ExecuteNonQueryAsync(ct);
         }
     }
+
+    private static bool IsOriginCheckUniqueViolation(SqliteException ex) =>
+        ex.Message.Contains("work_items.origin_check_work_item_id", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("idx_work_items_origin_check_unique", StringComparison.OrdinalIgnoreCase);
 
     public async Task UpdateAsync(WorkItem item, CancellationToken ct = default)
     {

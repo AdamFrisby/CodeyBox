@@ -2614,7 +2614,7 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             await _store.CreateAsync(followup, ct);
         }
-        catch (WorkItemExternalIdConflictException)
+        catch (WorkItemOriginCheckConflictException)
         {
             existing = await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, checkItem.Id, ct);
             if (existing is null)

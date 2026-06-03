@@ -2622,6 +2622,31 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         await sandboxNoOwner.DisposeAsync();
     }
 
+    [Fact]
+    public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var workItemId = WorkItemId.New();
+        await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+        });
+        var vmName = Assert.Single(states.Keys);
+        Assert.Single(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
+
+        await provider.DisposeLeakedAsync(vmName, CancellationToken.None);
+
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
+        Assert.Empty(states);
+    }
+
     /// <summary>
     /// Build a RecordingMultipassRunner that satisfies the full CreateAsync
     /// happy path (launch → cloud-init wait → stop → start → transfer env →
@@ -2641,9 +2666,29 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 states[argv[3]] = "Running";
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            if (argv is [_, "info", var name, "--format=csv"])
+            if (argv is [_, "info", var csvName, "--format=csv"])
                 return Task.FromResult(new ProcessRunResult(
-                    0, states.TryGetValue(name, out var current) ? current : "Running", ""));
+                    0, states.TryGetValue(csvName, out var current) ? current : "Running", ""));
+            if (argv is [_, "info", var jsonName, "--format=json"])
+            {
+                var state = states.TryGetValue(jsonName, out var current) ? current : "Running";
+                var stdout = JsonSerializer.Serialize(new
+                {
+                    info = new Dictionary<string, object>
+                    {
+                        [jsonName] = new
+                        {
+                            state,
+                            memory = new { total = 17179869184L },
+                            disks = new Dictionary<string, object>(),
+                        },
+                    },
+                });
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stdout,
+                    ""));
+            }
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "stop", var stopName])

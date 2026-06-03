@@ -837,13 +837,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 else if (recovered.State == WorkItemState.Done)
                 {
                     await _store.UpdateAsync(recovered, ct);
-                    if (item.Verdict is not null
-                        && item.Check is not null
-                        && item.Verdict.Answer == item.Check.ActionableAnswer
-                        && await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, item.Id, ct) is { } followup)
-                    {
-                        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _queue, followup, ct);
-                    }
+                    await CheckAndActFollowupRecovery.EnqueueExistingFollowupIfActionableAsync(
+                        _store, _queue, item, ct);
                     _log.LogInformation(
                         "Work item {Id} check-and-act verdict was already persisted; completed startup recovery without replaying the check",
                         item.Id);

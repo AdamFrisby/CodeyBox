@@ -198,6 +198,19 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     public string Name => "multipass";
 
+    private void MarkTrackedActive(string name)
+    {
+        _activeSandboxNames[name] = true;
+        _listCacheExpiry = DateTimeOffset.MinValue;
+    }
+
+    private void MarkNoLongerActive(string name)
+    {
+        _activeSandboxNames.TryRemove(name, out _);
+        _activeSandboxOwners.TryRemove(name, out _);
+        _listCacheExpiry = DateTimeOffset.MinValue;
+    }
+
     private IReadOnlyList<string> DiskGuardPaths
     {
         get
@@ -287,19 +300,6 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var timingItemId = spec.TimingWorkItemId.GetValueOrDefault();
         var workItemId = spec.TimingWorkItemId;
         var timingPhase = spec.TimingPhase ?? "work";
-
-        void MarkTrackedActive(string n)
-        {
-            _activeSandboxNames[n] = true;
-            _listCacheExpiry = DateTimeOffset.MinValue;
-        }
-
-        void MarkNoLongerActive(string n)
-        {
-            _activeSandboxNames.TryRemove(n, out _);
-            _activeSandboxOwners.TryRemove(n, out _);
-            _listCacheExpiry = DateTimeOffset.MinValue;
-        }
 
         try
         {
@@ -806,9 +806,8 @@ git push origin HEAD:{refName}";
         var stagingDir = Path.Combine(_stagingRoot, name);
         try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); }
         catch { /* best-effort */ }
-        // Remove from active set and invalidate cache.
-        _activeSandboxNames.TryRemove(name, out _);
-        _listCacheExpiry = DateTimeOffset.MinValue;
+        // Remove from active indexes and invalidate cache.
+        MarkNoLongerActive(name);
     }
 
     /// <summary>
