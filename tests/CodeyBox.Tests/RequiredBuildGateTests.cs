@@ -51,6 +51,53 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryFromWork_DefaultCodeyBoxOwnedBranchWithBrokenBuild_FailsBeforePickupReset()
+    {
+        // Cheating-finding regression: a Queued/from=work pickup on the
+        // server-owned codeybox/{id8} branch used to force-reset the work
+        // branch back to base BEFORE inspecting whether the prior branch
+        // compiled. That silently erased a non-compiling branch and
+        // proceeded from pristine base, neither fixing the intrinsic
+        // compile error nor reporting it. The pre-reset build gate must
+        // fail loud with the build error instead.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        // Use the default codeybox/{id8} branch naming so the pickup path
+        // takes the IsPickupRebaseOwnedWorkBranch=true reset branch — the
+        // branch suffix MUST match the work item id's first 8 chars or the
+        // ownership check rejects it and the pre-reset gate is bypassed.
+        var workItemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{workItemId.ToString()[..8]}") with { Id = workItemId };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "build.fail", "broken\n", "broken prior attempt");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
+        Assert.Contains("error CS1061", final.LastError);
+        Assert.Equal("build", final.FailureKind);
+
+        // The broken commit must still be on the bare repo's work branch —
+        // the pre-reset gate must fail BEFORE the reset wipes it, so an
+        // operator inspecting the branch can see exactly what failed to
+        // compile rather than finding a pristine base tip.
+        var workTipFile = await TestSupport.RunGit(
+            barePath, "show", $"{item.WorkBranch}:build.fail");
+        Assert.Equal(0, workTipFile.code);
+        Assert.Equal("broken\n", workTipFile.stdout);
+    }
+
+    [Fact]
     public async Task WorkCompletion_NewCommitThatBreaksRequiredBuild_FailsWithBuildFailureKind()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1338,6 +1385,42 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalGitHost_ListFilesEndingWithAsync_ScannedCeilingExceeded_ThrowsRatherThanProcessingUnboundedTree()
+    {
+        // Defensive bound on the TOTAL paths the streamed reader will inspect,
+        // independent of how many actually match the suffix filter. Without
+        // this cap, a branch-controlled tree could carry vastly more
+        // non-matching files than matching ones and tie the pipeline worker
+        // up reading git output indefinitely without ever hitting the match
+        // cap — the exhaustion vector the LLM security reviewer flagged. The
+        // probe runs in the audit-applicability path OUTSIDE the verification
+        // timeout, so the gate cannot rely on a deadline to break the loop.
+        //
+        // Drop the ceiling to a small value so the test can exercise the cap
+        // with a handful of files instead of the production 500k.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        for (var i = 0; i < 24; i++)
+            await File.WriteAllTextAsync(Path.Combine(seed, $"junk-{i:D2}.txt"), "x");
+        await TestSupport.RunGit(seed, "add", "-A");
+        await TestSupport.RunGit(seed, "commit", "-m", "many non-matching files");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = Path.Combine(_workspace, "repos-scan-" + Guid.NewGuid().ToString("N")[..8]),
+                ListFilesEndingScannedPathCeiling = 8,
+            },
+            NullLogger<LocalGitHost>.Instance);
+        var item = NewItem("feature/scan-ceiling") with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            gitHost.ListFilesEndingWithAsync(repoId, item.BaseBranch!, new[] { ".csproj" }, maxResults: 8192));
+        Assert.Contains("scanned more than 8 paths", ex.Message);
+        Assert.Contains("too large to inspect safely", ex.Message);
+    }
+
+    [Fact]
     public async Task LocalGitHost_ListFilesEndingWithAsync_CapExceeded_ThrowsAndDoesNotReturnPartialMatches()
     {
         // Pin the streaming cap behavior of the LocalGitHost ListFilesEndingWithAsync
@@ -1462,6 +1545,68 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task DefaultIGitHost_ListFilesEndingWithAsync_FiltersCaseInsensitivelyAndCallsListFilesAsyncWithNullPrefix()
+    {
+        // The IGitHost default implementation of ListFilesEndingWithAsync is
+        // the host-agnostic fallback used by every IGitHost subtype that does
+        // not override it (test fakes, future remote hosts). Cover the
+        // contract end-to-end against a host whose only override is
+        // ListFilesAsync: case-insensitive suffix filtering, null prefix
+        // delegation, and that paths NOT matching any suffix are dropped.
+        IGitHost host = new FixedListFilesGitHost(
+            (repoId, treeish, prefix) =>
+            {
+                Assert.Null(prefix);
+                return new[]
+                {
+                    "src/App/App.csproj",
+                    "src/App/Readme.md",
+                    "tests/App.Tests/App.Tests.CSPROJ", // upper-case suffix
+                    "tools/dotnet.cake",
+                };
+            });
+
+        var matches = await host.ListFilesEndingWithAsync(
+            "repo", "tree", new[] { ".csproj" }, maxResults: 50);
+
+        Assert.Equal(
+            new[] { "src/App/App.csproj", "tests/App.Tests/App.Tests.CSPROJ" },
+            matches.OrderBy(s => s, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task DefaultIGitHost_ListFilesEndingWithAsync_ThrowsWhenCapExceeded()
+    {
+        // The default implementation must enforce the same cap contract as
+        // the streaming override: throw when matches exceed maxResults so
+        // callers (e.g. the build-marker probe) can treat the tree as too
+        // large to inspect rather than silently truncating.
+        IGitHost host = new FixedListFilesGitHost(
+            (_, _, _) => Enumerable.Range(0, 12).Select(i => $"proj-{i:D2}.csproj").ToArray());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            host.ListFilesEndingWithAsync("repo", "tree", new[] { ".csproj" }, maxResults: 5));
+        Assert.Contains("more than 5 matching paths", ex.Message);
+        Assert.Contains("output cap exceeded", ex.Message);
+    }
+
+    [Fact]
+    public async Task DefaultIGitHost_ListFilesEndingWithAsync_RejectsInvalidArguments()
+    {
+        // Pin argument validation on the default fallback so a regression in
+        // either the default impl OR the LocalGitHost override fails at the
+        // boundary instead of leaking past as an empty result set.
+        IGitHost host = new FixedListFilesGitHost((_, _, _) => Array.Empty<string>());
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            host.ListFilesEndingWithAsync("repo", "tree", null!, maxResults: 1));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            host.ListFilesEndingWithAsync("repo", "tree", Array.Empty<string>(), maxResults: 1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            host.ListFilesEndingWithAsync("repo", "tree", new[] { ".cs" }, maxResults: 0));
+    }
+
+    [Fact]
     public async Task LocalGitHost_ListFilesAsync_NullPrefix_ReturnsEntireTree()
     {
         // Direct coverage of the LocalGitHost.ListFilesAsync change that
@@ -1541,6 +1686,46 @@ public sealed class RequiredBuildGateTests : IDisposable
             Phase = "audit",
         }, CancellationToken.None);
         Assert.Equal(RequiredBuildVerificationStatus.Skipped, verify.Status);
+    }
+
+    /// <summary>
+    /// Minimal IGitHost stub used to exercise the IGitHost-default
+    /// implementation of ListFilesEndingWithAsync. Only ListFilesAsync is
+    /// implemented; the rest throw so the default fallback's dependency
+    /// surface stays pinned (any future default that reaches for another
+    /// IGitHost method would surface here as a test failure rather than
+    /// silently widening the contract).
+    /// </summary>
+    private sealed class FixedListFilesGitHost : IGitHost
+    {
+        private readonly Func<string, string, string?, IReadOnlyList<string>> _produce;
+
+        public FixedListFilesGitHost(Func<string, string, string?, IReadOnlyList<string>> produce)
+            => _produce = produce;
+
+        public Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
+            => Task.FromResult(_produce(repositoryId, treeish, pathPrefix));
+
+        // Unused for these tests; throw so an accidental reach into other
+        // IGitHost methods from a future default-impl change surfaces here.
+        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public SandboxRepositoryAccess GetSandboxAccess(string repositoryId) => throw new NotSupportedException();
+        public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv,
+            UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+            CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<(string DiffStat, string FullDiff)> GetDiffAsync(string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+            => throw new NotSupportedException();
     }
 
     private sealed class CapExceededListFilesGitHost(IGitHost inner, string capMessage) : DelegatingGitHost(inner)

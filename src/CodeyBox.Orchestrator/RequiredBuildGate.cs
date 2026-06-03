@@ -141,6 +141,48 @@ internal sealed class RequiredBuildGate
     }
 
     /// <summary>
+    /// Verifies the existing work-branch state before a Queued (from=work)
+    /// pickup resets it to the base tip. If the branch is non-compiling, the
+    /// gate fails loud with a <see cref="RequiredBuildFailedException"/> so
+    /// the work item transitions to Failed (failureKind=build) instead of
+    /// silently dropping the broken commits and proceeding from pristine
+    /// base — which would neither fix the intrinsic compile error nor
+    /// surface it. Skips entirely when the gate does not apply (no .NET
+    /// markers), when the work branch has not been pushed to origin yet
+    /// (fresh work item: nothing pre-existing to verify), or when the
+    /// branch's tip already equals the base tip (nothing distinct on the
+    /// branch).
+    /// </summary>
+    public async Task EnforceBeforePickupResetAsync(
+        WorkItem item,
+        Project project,
+        IGitHost gitHost,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(gitHost);
+
+        // Fresh work item: no pre-existing branch on origin → no broken
+        // state to inspect. The reset that follows is effectively a
+        // create-from-base, no different from a brand-new WI.
+        if (!await gitHost.BranchExistsAsync(repoId, workBranch, ct))
+            return;
+
+        var applies = await AppliesAsync(item.Id, project.Id, repoId, baseBranch, workBranch, ct);
+        if (!applies) return;
+
+        var result = await VerifyAsync(
+            item, project, repoId, baseBranch, workBranch, phase: "pickup", iteration: null, ct);
+        if (result.Status == RequiredBuildVerificationStatus.Failed)
+        {
+            throw new RequiredBuildFailedException(
+                $"retry-from-work received a non-compiling branch: {BuildFailureSummary(result)}");
+        }
+    }
+
+    /// <summary>
     /// Enforces the build gate when an item resumes at AuditPassed (skips the
     /// normal audit loop). Throws <see cref="AuditFailedException"/> on
     /// failure so the outer catch rolls the item back to AuditFailed.

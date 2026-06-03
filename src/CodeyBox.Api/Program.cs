@@ -1815,6 +1815,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         UpstreamPushBackoff = TimeSpan.FromSeconds(opts.UpstreamPushBackoffSeconds),
         ShutdownGrace = TimeSpan.FromSeconds(Math.Max(1, opts.Shutdown.GraceSeconds)),
         PhaseAbsoluteTimeoutMultiplier = opts.PhaseAbsoluteTimeoutMultiplier,
+        RequiredBuildVerificationTimeout = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds)),
         HostGitIdentity = hostIdentity,
     };
 });
@@ -2682,6 +2683,16 @@ namespace CodeyBox.Api
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
+
+        /// <summary>
+        /// Hard ceiling (seconds) on a single required-build verification
+        /// across every phase / resume path. Defaults to 15 minutes; raise
+        /// for very large .NET solutions or lower to fail faster during
+        /// infrastructure degradation. Floor 60 s. Captured once at startup
+        /// into <see cref="PipelineOptions.RequiredBuildVerificationTimeout"/>;
+        /// edits require restart.
+        /// </summary>
+        public int RequiredBuildVerificationTimeoutSeconds { get; set; } = 900;
 
         /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.

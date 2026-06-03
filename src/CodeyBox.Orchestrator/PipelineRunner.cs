@@ -491,11 +491,20 @@ public sealed class PipelineRunner : IPipelineRunner
             // the fail-quiet "Agent produced no changes to commit" symptom.
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
+            //
+            // Before the reset, verify any pre-existing broken branch state.
+            // A from=work re-drive of a non-compiling branch must either be
+            // fixed or fail loud with the build error — silently resetting
+            // such a branch back to base would erase the broken commits and
+            // proceed from pristine state, neither fixing the intrinsic
+            // compile error nor reporting it.
             using (BeginPhaseScope(item, "pickup"))
             {
                 if (entry is WorkItemState.Queued
                     && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
                 {
+                    await _requiredBuildGate.EnforceBeforePickupResetAsync(
+                        item, project, _gitHost, repoId, baseBranch, workBranch, ct);
                     await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
                 }
                 else if (!skipWork || !skipAudit || !skipMerge)

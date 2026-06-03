@@ -689,6 +689,8 @@ public sealed class LocalGitHost : IGitHost
 
         var results = new List<string>(Math.Min(64, maxResults));
         var capExceeded = false;
+        var scannedCapExceeded = false;
+        var scanned = 0;
         var stderr = string.Empty;
         try
         {
@@ -698,6 +700,12 @@ public sealed class LocalGitHost : IGitHost
                 if (line is null) break;
                 var trimmed = line.Trim();
                 if (trimmed.Length == 0) continue;
+                scanned++;
+                if (scanned > _opts.ListFilesEndingScannedPathCeiling)
+                {
+                    scannedCapExceeded = true;
+                    break;
+                }
                 if (!EndsWithAnySuffix(trimmed, suffixes)) continue;
                 if (results.Count >= maxResults)
                 {
@@ -721,7 +729,7 @@ public sealed class LocalGitHost : IGitHost
         }
         finally
         {
-            if (capExceeded)
+            if (capExceeded || scannedCapExceeded)
             {
                 try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
             }
@@ -731,6 +739,12 @@ public sealed class LocalGitHost : IGitHost
             catch { /* best-effort */ }
             try { await p.WaitForExitAsync(CancellationToken.None); }
             catch { /* best-effort */ }
+        }
+
+        if (scannedCapExceeded)
+        {
+            throw new InvalidOperationException(
+                $"git ls-tree '{treeish}' scanned more than {_opts.ListFilesEndingScannedPathCeiling} paths without filling the match cap (tree too large to inspect safely)");
         }
 
         if (capExceeded)
@@ -1118,4 +1132,18 @@ public sealed record LocalGitHostOptions
 {
     public required string RootDirectory { get; init; }
     public string FallbackDefaultBranch { get; init; } = "main";
+
+    /// <summary>
+    /// Hard ceiling on the TOTAL number of paths the streamed
+    /// <c>ListFilesEndingWithAsync</c> reader will inspect per call,
+    /// independent of how many actually match the suffix filter. Caps the
+    /// resource-exhaustion vector where a branch-controlled tree carries
+    /// vastly more non-matching paths than matching ones, so the loop never
+    /// hits the per-match cap and processes git output unbounded. Real
+    /// monorepos top out in the low hundreds of thousands of files; the
+    /// default leaves comfortable headroom while still bounding adversarial
+    /// trees. Lowered in tests so the cap can be exercised without
+    /// generating half a million paths.
+    /// </summary>
+    public int ListFilesEndingScannedPathCeiling { get; init; } = 500_000;
 }
