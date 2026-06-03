@@ -1684,6 +1684,34 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
 
+// --- Worker pool health watchdog --------------------------------------------
+// Dispatcher-level watchdog for a pool that is under-filled while runnable work
+// and an available agent exist. Complements WorkerProgressWatchdog, which owns
+// per-worker lifecycle stalls after a worker has already been spawned.
+builder.Services.AddSingleton<WorkerPoolHealthWatchdogOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.WorkerPoolHealthWatchdog;
+    opts.Validate();
+    return opts;
+});
+builder.Services.AddSingleton<WorkerPoolHealthWatchdog>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    sp.GetRequiredService<WorkerPoolHealthWatchdogOptions>();
+    return new WorkerPoolHealthWatchdog(
+        sp.GetRequiredService<OrchestratorService>(),
+        () => monitor.CurrentValue.WorkerPoolHealthWatchdog,
+        sp.GetRequiredService<ILogger<WorkerPoolHealthWatchdog>>(),
+        sp.GetService<IProjectRepository>(),
+        sp.GetService<IQueueController>(),
+        sp.GetService<IAgentRegistry>(),
+        sp.GetService<IAgentAvailabilityRegistry>(),
+        sp.GetService<AgentClassRouter>(),
+        sp.GetService<QuotaRetryScheduler>(),
+        sp.GetService<IWebhookDispatcher>(),
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+});
+
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
 {
@@ -1922,7 +1950,10 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
         cbOpts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin,
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
-        startupLog);
+        startupLog) with
+    {
+        ShutdownDrainTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds)),
+    };
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
@@ -2002,6 +2033,7 @@ builder.Services.AddHostedService(sp =>
     watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
     return watchdog;
 });
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WorkerPoolHealthWatchdog>());
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
 // operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
 // bookkeeping so the next process can reattach; Stop is the default and avoids
@@ -2731,6 +2763,12 @@ namespace CodeyBox.Api
         /// construction and requires a restart to change.
         /// </summary>
         public WorkerProgressWatchdogOptions WorkerProgressWatchdog { get; set; } = new();
+
+        /// <summary>
+        /// Dispatcher-level watchdog for under-filled pools with runnable work.
+        /// Hot-reloadable: timeout and recovery settings are read on each sweep.
+        /// </summary>
+        public WorkerPoolHealthWatchdogOptions WorkerPoolHealthWatchdog { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;

@@ -154,6 +154,30 @@ Controls worker concurrency and spawn pacing.
 
 ---
 
+## `WorkerPoolHealthWatchdog`
+
+Detects a dispatcher/pool stall where worker slots are free, dependency-ready
+work exists, an eligible agent is available, and no new worker has spawned for
+the configured window. Settings are read on each sweep, so edits hot-reload.
+
+```json
+"WorkerPoolHealthWatchdog": {
+  "StallTimeout": "00:10:00",
+  "CheckInterval": "00:01:00",
+  "MaxRecoveryAttempts": 2
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `StallTimeout` | `00:10:00` | Under-filled runnable-pool window before a critical alert and recovery attempt. Set `00:00:00` to disable. |
+| `CheckInterval` | `00:01:00` | Sweep cadence. |
+| `MaxRecoveryAttempts` | `2` | Bounded self-recovery attempts before `worker_pool.restart_required`. |
+| `MaxRecoveryEnqueueBatchSize` | `32` | Max runnable work IDs re-kicked per recovery attempt. |
+| `RecoveryVerificationDelay` | `00:00:05` | Delay before checking whether recovery cleared the stall. |
+
+---
+
 ## `Shutdown`
 
 Controls graceful shutdown drains and the startup resume path for sandboxes

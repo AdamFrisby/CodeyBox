@@ -666,8 +666,134 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             inFlight.RemoveAll(t => t.IsCompleted);
         }
 
-        // Drain in-flight tasks before the hosted service exits.
-        await Task.WhenAll(inFlight).ConfigureAwait(false);
+        // Drain in-flight tasks before the hosted service exits, but do not
+        // let a host-shutdown path wait forever on a worker that ignores the
+        // shutdown token. If the drain window expires, rewrite active items to
+        // recoverable states so a restart does not classify graceful shutdown
+        // as "worker died without a preempt checkpoint".
+        await DrainInFlightWorkersAsync(inFlight).ConfigureAwait(false);
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        PauseDispatch();
+        await base.StopAsync(cancellationToken);
+    }
+
+    private async Task DrainInFlightWorkersAsync(List<Task> inFlight)
+    {
+        inFlight.RemoveAll(t => t.IsCompleted);
+        if (inFlight.Count == 0)
+            return;
+
+        var all = Task.WhenAll(inFlight);
+        var drain = _opts.ShutdownDrainTimeout;
+        if (drain <= TimeSpan.Zero)
+        {
+            await all.ConfigureAwait(false);
+            return;
+        }
+
+        var completed = await Task.WhenAny(all, Task.Delay(drain)).ConfigureAwait(false);
+        if (completed == all)
+        {
+            await all.ConfigureAwait(false);
+            return;
+        }
+
+        _log.LogCritical(
+            "OrchestratorService shutdown drain timed out after {Timeout} with {Count} worker(s) still active; re-queueing recoverable in-flight items before service exit",
+            drain,
+            inFlight.Count(t => !t.IsCompleted));
+
+        await RequeueActiveItemsForShutdownDrainTimeoutAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task RequeueActiveItemsForShutdownDrainTimeoutAsync(CancellationToken ct)
+    {
+        foreach (var id in _activeItems.Keys.ToList())
+        {
+            WorkItem? item;
+            try
+            {
+                item = await _store.GetAsync(id, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Shutdown drain recovery could not load active work item {Id}", id);
+                continue;
+            }
+
+            if (item is null)
+                continue;
+
+            var recovered = BuildGracefulShutdownRecoveryState(item);
+            if (recovered is null)
+                continue;
+
+            try
+            {
+                var updated = await _store.TryUpdateIfStateAsync(recovered, item.State, ct)
+                    .ConfigureAwait(false);
+                if (!updated)
+                {
+                    _log.LogInformation(
+                        "Shutdown drain recovery skipped {Id}: state changed from {State} before recovery write",
+                        id, item.State);
+                    continue;
+                }
+
+                await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
+                _log.LogWarning(
+                    "Shutdown drain recovery re-queued {Id}: {FromState} -> {ToState}",
+                    id, item.State, recovered.State);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Shutdown drain recovery failed for active work item {Id}", id);
+            }
+        }
+    }
+
+    private static WorkItem? BuildGracefulShutdownRecoveryState(WorkItem item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return item with
+            {
+                StartedAt = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
+        WorkItemState? target = item.State switch
+        {
+            WorkItemState.Working => WorkItemState.Queued,
+            WorkItemState.Reworking => WorkItemState.Queued,
+            WorkItemState.Auditing => WorkItemState.WorkComplete,
+            WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
+            WorkItemState.Merging => WorkItemState.AuditPassed,
+            WorkItemState.UpstreamPushing => WorkItemState.Merged,
+            WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged => item.State,
+            _ => null,
+        };
+
+        if (target is null)
+            return null;
+
+        var error = target == WorkItemState.Queued
+            ? $"graceful shutdown drain timed out while item was {item.State}; re-queued for a fresh run"
+            : null;
+
+        return item.With(target.Value, error) with
+        {
+            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
     }
 
     /// <summary>
@@ -753,6 +879,60 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+
+    internal async Task<IReadOnlyList<WorkItem>> ListRunnableCandidatesForHealthCheckAsync(
+        int limit,
+        CancellationToken ct)
+    {
+        if (limit <= 0) return [];
+
+        var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
+        foreach (var deferredId in _deferredItems.Keys) skipIds.Add(deferredId);
+
+        Dictionary<WorkItemId, WorkItemState>? statesById = null;
+        var result = new List<WorkItem>(Math.Min(limit, 16));
+
+        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+        {
+            if (candidate.DependsOn.Count > 0)
+            {
+                if (statesById is null)
+                {
+                    var snapshot = new List<WorkItem>();
+                    await foreach (var i in _store.ListAsync(ct)) snapshot.Add(i);
+                    statesById = WorkItemDependencies.BuildStateMap(snapshot);
+                }
+
+                if (!WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
+                    continue;
+            }
+
+            result.Add(candidate);
+            if (result.Count >= limit)
+                break;
+        }
+
+        return result;
+    }
+
+    internal async Task<int> TriggerDispatchRecoveryAsync(
+        IEnumerable<WorkItemId> candidateIds,
+        CancellationToken ct)
+    {
+        var enqueued = 0;
+        var seen = new HashSet<WorkItemId>();
+        foreach (var id in candidateIds)
+        {
+            if (!seen.Add(id))
+                continue;
+
+            _deferredItems.TryRemove(id, out _);
+            await _queue.EnqueueAsync(id, ct);
+            enqueued++;
+        }
+
+        return enqueued;
+    }
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.
@@ -1654,6 +1834,7 @@ public sealed record OrchestratorOptions
 {
     public int MaxConcurrentWorkers { get; init; } = 1;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
+    public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work

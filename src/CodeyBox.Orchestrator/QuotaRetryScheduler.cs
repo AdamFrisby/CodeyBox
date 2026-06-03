@@ -341,6 +341,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         }
     }
 
+    internal async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
+    {
+        _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
+        await RunPeriodicSweepAsync(ct);
+    }
+
     private async Task TryPeriodicRetryAsync(WorkItem item, CancellationToken ct)
     {
         try

@@ -61,6 +61,9 @@ public static class EventSchema
         // Queue-level
         "queue.paused",
         "queue.resumed",
+        // Worker pool / dispatcher health
+        "worker_pool.stalled",
+        "worker_pool.restart_required",
         // Agent-level (smoke probe, fallback)
         "agent.smoke_failed",
         "agent.smoke_recovered",
