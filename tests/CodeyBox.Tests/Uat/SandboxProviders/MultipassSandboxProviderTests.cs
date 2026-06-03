@@ -2093,12 +2093,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     public async Task StopAndPreserveAsync_NonZeroStopExit_Throws()
     {
         var stopCalls = 0;
+        var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "stop", "codeybox-test"])
             {
                 stopCalls++;
                 return Task.FromResult(new ProcessRunResult(3, "", "multipassd: stop failed"));
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
         });
@@ -2109,17 +2115,28 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.True(stopCalls >= 1);
         Assert.Contains("multipass stop codeybox-test failed", ex.Message);
+        Assert.False(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "failed stop must not write the preempt marker that makes the leak reaper defer cleanup");
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(1, deleteCalls);
     }
 
     [Fact]
     public async Task StopAndPreserveAsync_NotStoppedAfterSuccessfulStop_Throws()
     {
+        var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "stop", "codeybox-test"])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "info", "codeybox-test", "--format=csv"])
                 return Task.FromResult(new ProcessRunResult(0, "Running", ""));
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
             return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
         });
         var sandbox = NewMultipassSandbox(
@@ -2131,6 +2148,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
 
         Assert.Contains("did not reach Stopped state", ex.Message);
+        Assert.False(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "unverified stop must not write the preempt marker that makes the leak reaper defer cleanup");
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(1, deleteCalls);
     }
 
     [Fact]

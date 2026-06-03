@@ -168,23 +168,22 @@ public interface ISuspendableSandbox : ISandbox
 
     /// <summary>
     /// True once the suspend-on-shutdown handler has taken ownership of this
-    /// VM's teardown via Suspend (RAM frozen) or Dispose (delete --purge).
+    /// VM's teardown via Suspend (RAM frozen), Stop (preserved), or Dispose
+    /// (delete --purge).
     /// PipelineRunner reads this in its host-shutdown OCE catch block to
     /// short-circuit the in-VM preempt-checkpoint flow when that flow would hang
-    /// against a frozen VM or fault against a deleted VM. Suspend mode flips this
-    /// implicitly via <see cref="IsSuspended"/>; Dispose calls
-    /// <see cref="MarkOwnedByShutdownHandler"/>. Stop mode intentionally does not
-    /// set this flag because PipelineRunner still owns the preempt checkpoint and
-    /// preserve sequence.
+    /// against a frozen, stopped, or deleted VM. Suspend mode flips this
+    /// implicitly via <see cref="IsSuspended"/>; Stop and Dispose call
+    /// <see cref="MarkOwnedByShutdownHandler"/> before their teardown action.
     /// </summary>
     bool IsOwnedByShutdownHandler => IsSuspended;
 
     /// <summary>
     /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
-    /// <c>SandboxSuspendOnShutdownService</c> before Dispose teardown begins so
-    /// PipelineRunner sees the "skip checkpoint" signal even though the suspend
-    /// path was not taken. Default no-op: fakes that don't track teardown
-    /// ownership keep <see cref="IsOwnedByShutdownHandler"/> at the
+    /// <c>SandboxSuspendOnShutdownService</c> before Stop or Dispose teardown
+    /// begins so PipelineRunner sees the "skip checkpoint" signal even though
+    /// the suspend path was not taken. Default no-op: fakes that don't track
+    /// teardown ownership keep <see cref="IsOwnedByShutdownHandler"/> at the
     /// <see cref="IsSuspended"/> fallback.
     /// </summary>
     void MarkOwnedByShutdownHandler() { }
@@ -364,9 +363,8 @@ public interface IShutdownDispatchGate
 /// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
 /// The orchestrator's suspend-on-shutdown hosted service uses
 /// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that need
-/// early lifecycle handling on <c>ApplicationStopping</c> for Suspend or
-/// Dispose mode. Stop mode leaves active sandboxes to PipelineRunner's
-/// preempt-checkpoint and preserve flow. The startup resume handler uses
+/// early lifecycle handling on <c>ApplicationStopping</c> for Suspend, Stop,
+/// or Dispose mode. The startup resume handler uses
 /// <see cref="ResumeSandboxAsync"/> to start each persisted VM by name.
 /// </summary>
 public interface ISuspendingSandboxProvider

@@ -3684,7 +3684,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public async Task StopAndPreserveAsync(CancellationToken ct = default)
     {
         if (_disposed) return;
-        _preserveOnDispose = true;
+        var stop = await RunMultipassAsync(
+            [_opts.MultipassBinary, "stop", _name],
+            stdin: null,
+            ct: ct);
+        if (stop.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"multipass stop {_name} failed (exit {stop.ExitCode}): {stop.Stderr}");
+
+        await WaitForStoppedAfterPreserveAsync(ct);
+
         var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
         try
         {
@@ -3695,15 +3704,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             _log.LogWarning(ex, "Failed to write preempt marker for multipass VM {Name}", _name);
         }
 
-        var stop = await RunMultipassAsync(
-            [_opts.MultipassBinary, "stop", _name],
-            stdin: null,
-            ct: ct);
-        if (stop.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"multipass stop {_name} failed (exit {stop.ExitCode}): {stop.Stderr}");
-
-        await WaitForStoppedAfterPreserveAsync(ct);
+        _preserveOnDispose = true;
     }
 
     private async Task WaitForStoppedAfterPreserveAsync(CancellationToken ct)

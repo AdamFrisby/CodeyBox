@@ -2095,11 +2095,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // the legacy git-checkpoint + multipass-stop path race that
             // in-flight suspend. Dispose mode sets the ownership flag before
             // destroying the VM because in-VM checkpoint commands would fault
-            // after lifecycle teardown. Stop mode deliberately does not set that
-            // flag; PipelineRunner owns its normal preempt checkpoint and
-            // StopAndPreserveAsync flow. We re-read the store under
-            // CancellationToken.None (ct is already cancelled by host
-            // shutdown): on the per-VM suspend-timeout path the handler has
+            // after lifecycle teardown. Stop mode sets the same ownership flag
+            // before stopping/preserving the VM so this catch block does not try
+            // in-VM checkpoint commands against a stopped sandbox. We re-read
+            // the store under CancellationToken.None (ct is already cancelled
+            // by host shutdown): on the per-VM suspend-timeout path the handler has
             // persisted SuspendedVmName and returned while multipassd is still
             // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
             // still be false on the sandbox instance, so the persisted mapping is

@@ -466,7 +466,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var svc = new SandboxSuspendOnShutdownService(
             nonSuspending, _store,
             NullLogger<SandboxSuspendOnShutdownService>.Instance,
-            teardownMode: SandboxTeardownMode.Stop);
+            teardownMode: SandboxTeardownMode.Suspend);
         await svc.SuspendAllAsync();
 
         var after = await _store.GetAsync(item.Id);
