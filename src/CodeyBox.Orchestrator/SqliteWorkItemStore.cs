@@ -202,6 +202,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
         RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+        ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex();
         RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_origin_check_unique ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
 
         // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
@@ -290,6 +291,32 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         {
             // Column already exists from a previous startup — nothing to do.
         }
+    }
+
+    private void ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex()
+    {
+        using var cmd = _conn.CreateCommand();
+        // Keep the same follow-up FindExistingFollowupAsync would see first
+        // through ListAsync's newest-created ordering, then clear only the
+        // duplicate back-links so legacy rows do not block startup.
+        cmd.CommandText = """
+            UPDATE work_items
+            SET origin_check_work_item_id = NULL
+            WHERE rowid IN (
+                SELECT rowid
+                FROM (
+                    SELECT rowid,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY origin_check_work_item_id
+                               ORDER BY created_at DESC, rowid DESC
+                           ) AS duplicate_rank
+                    FROM work_items
+                    WHERE origin_check_work_item_id IS NOT NULL
+                )
+                WHERE duplicate_rank > 1
+            );
+            """;
+        cmd.ExecuteNonQuery();
     }
 
     // SQLite primary error code for SQLITE_FULL. Matched on the primary
