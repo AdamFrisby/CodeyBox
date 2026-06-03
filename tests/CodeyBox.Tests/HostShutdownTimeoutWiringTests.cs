@@ -252,14 +252,18 @@ public sealed class HostShutdownTimeoutWiringTests
 
         await shutdownService.StoppingAsync(CancellationToken.None);
 
+        // Stop mode only pauses dispatch in the lifecycle service. The live VM
+        // remains unclaimed so PipelineRunner can request agent preemption,
+        // checkpoint, and StopAndPreserveAsync when host-shutdown cancellation
+        // reaches the worker.
         Assert.False(sandbox.SuspendCalled);
-        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.StopAndPreserveCalled);
         Assert.False(sandbox.DisposeCalled);
         var after = await store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
-        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", after.PreemptCheckpoint);
-        Assert.NotNull(after.PreemptedAt);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.PreemptedAt);
     }
 
     [Fact]

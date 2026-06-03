@@ -1,27 +1,26 @@
 using CodeyBox.Core;
-using CodeyBox.Sandbox;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// R8-core/R8.1: on graceful host shutdown, tear down every in-flight sandbox
+/// R8-core/R8.1: on graceful host shutdown, handle every in-flight sandbox
 /// according to <see cref="SandboxTeardownMode"/>. Suspend mode freezes the VM
 /// via <see cref="ISuspendableSandbox.SuspendAsync"/> and persists the
 /// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
 /// orchestrator process can <c>multipass start</c> the same VM and re-tail the
 /// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
-/// resume half). Stop cleanly stops and preserves the VM disk without taking a
-/// RAM snapshot. Dispose is a destructive teardown mode with no recovery
-/// artifact.
+/// resume half). Stop avoids the RAM snapshot and lets <see cref="PipelineRunner"/>
+/// own its existing host-shutdown preempt checkpoint and preserve flow. Dispose
+/// is a destructive teardown mode with no recovery artifact.
 ///
 /// <para>This sits alongside — not on top of — the existing per-phase
-/// preempt-checkpoint flow in <see cref="PipelineRunner"/>: that path commits a
-/// git ref the pipeline can resume from before its own preserve call when the
-/// lifecycle service has not already taken ownership. Suspend is an opt-in
+/// preempt-checkpoint flow in <see cref="PipelineRunner"/>: Stop mode deliberately
+/// leaves live sandboxes unclaimed so that path can request agent preemption,
+/// commit a checkpoint ref, and preserve the VM through
+/// <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Suspend is an opt-in
 /// state-preservation path for operators who accept the RAM-snapshot tradeoff;
-/// Stop is the default lock-safe teardown for suspend-capable providers;
 /// Dispose is a destructive teardown mode.</para>
 ///
 /// <para>Implements <see cref="IHostedLifecycleService.StoppingAsync"/> rather
@@ -92,12 +91,12 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
     // directly don't need to hand in a gate.
     private readonly IShutdownDispatchGate? _dispatchGate;
-    // R8.1: ephemeral worker VMs can be handled by Stop (default; cleanly
-    // stop/preserve without a RAM snapshot), Suspend
-    // (opt-in; preserves in-RAM agent state across restart but can wedge
-    // multipassd if interrupted), or Dispose (delete --purge, full teardown —
-    // no suspended-resume bookkeeping is written). Resolved at teardown time so
-    // operator config hot-reload takes effect on the next graceful shutdown.
+    // R8.1: ephemeral worker VMs can be handled by Stop (default; defer to
+    // PipelineRunner's preempt-checkpoint + stop/preserve flow without taking a
+    // RAM snapshot), Suspend (opt-in; preserves in-RAM agent state across restart
+    // but can wedge multipassd if interrupted), or Dispose (delete --purge, full
+    // teardown — no suspended-resume bookkeeping is written). Resolved at teardown
+    // time so operator config hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
     public SandboxSuspendOnShutdownService(
@@ -109,7 +108,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         TimeSpan? perGiBSuspendBudget = null,
         TimeSpan? nonSuspendTeardownTimeout = null,
         IShutdownDispatchGate? dispatchGate = null,
-        SandboxTeardownMode teardownMode = SandboxTeardownMode.Stop,
+        SandboxTeardownMode? teardownMode = null,
         Func<SandboxTeardownMode>? teardownModeAccessor = null)
     {
         _provider = provider;
@@ -120,7 +119,13 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
         _nonSuspendTeardownTimeout = nonSuspendTeardownTimeout is { } n && n > TimeSpan.Zero ? n : DefaultNonSuspendTeardownTimeout;
         _dispatchGate = dispatchGate;
-        _teardownModeAccessor = teardownModeAccessor ?? (() => teardownMode);
+        if (teardownModeAccessor is not null)
+            _teardownModeAccessor = teardownModeAccessor;
+        else if (teardownMode is { } fixedTeardownMode)
+            _teardownModeAccessor = () => fixedTeardownMode;
+        else
+            throw new ArgumentException(
+                "Provide teardownModeAccessor from bound ShutdownOptions, or pass an explicit teardownMode for tests.");
     }
 
     /// <summary>The dispatch-pause-was-called signal as observed by SuspendAllAsync.</summary>
@@ -177,16 +182,23 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     internal async Task SuspendAllAsync()
     {
-        // R8.1 (incident 2026-05-29): pause dispatch BEFORE we snapshot or do
-        // any per-VM teardown. The snapshot is a point-in-time view, so if
-        // dispatch keeps running we'll miss any new sandbox the orchestrator
-        // creates between the snapshot and the BackgroundService cancellation,
-        // leaving those VMs to be torn down uncleanly. Idempotent — a test that
-        // wires the gate but pauses first still observes the same DispatchPauseObserved.
+        // R8.1 (incident 2026-05-29): pause dispatch BEFORE we either snapshot
+        // for Suspend/Dispose or return for Stop. Stop relies on PipelineRunner's
+        // later host-shutdown preempt flow; pausing first prevents new work from
+        // being admitted during that handoff. Idempotent — a test that wires the
+        // gate but pauses first still observes the same DispatchPauseObserved.
         if (_dispatchGate is not null)
         {
             DispatchPauseObserved = true;
             _dispatchGate.PauseDispatch();
+        }
+
+        var teardownMode = _teardownModeAccessor();
+        if (teardownMode == SandboxTeardownMode.Stop)
+        {
+            _log.LogInformation(
+                "Sandbox shutdown teardown (Stop): dispatch paused; active sandboxes remain owned by PipelineRunner for preempt-checkpoint and preserve");
+            return;
         }
 
         if (_provider is not ISuspendingSandboxProvider suspending)
@@ -196,7 +208,6 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             return;
         }
 
-        var teardownMode = _teardownModeAccessor();
         var entries = suspending.SnapshotSuspendableActive();
         if (entries.Count == 0)
         {
@@ -242,128 +253,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         teardownMode switch
         {
             SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
-            SandboxTeardownMode.Stop => StopOneAsync(workItemId, sandbox),
+            SandboxTeardownMode.Stop => Task.CompletedTask,
             SandboxTeardownMode.Dispose => DisposeOneAsync(workItemId, sandbox),
             _ => Task.FromException(new InvalidOperationException(
                 $"SandboxTeardownMode {(int)teardownMode} is not handled; add an explicit case in TeardownOneAsync rather than relying on silent fallthrough.")),
         };
-
-    /// <summary>
-    /// Teardown via clean stop (preserves VM disk but kills the in-VM agent
-    /// process). Faster than suspend and much less likely to wedge multipassd:
-    /// stop releases the qemu disk-image write-lock cleanly, whereas an
-    /// interrupted suspend can leave qemu holding the lock.
-    ///
-    /// <para>Creates and persists a <c>PreemptCheckpoint</c> before claiming
-    /// shutdown ownership. Without that checkpoint, PipelineRunner's later
-    /// host-shutdown catch would skip its in-VM checkpoint path and the next
-    /// startup would see a Working item with no recovery signal. If checkpoint
-    /// creation fails, Stop mode leaves the VM running and unclaimed so
-    /// PipelineRunner can fall back to its existing checkpoint/preserve path.</para>
-    /// </summary>
-    private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
-    {
-        var timeout = NonSuspendTeardownTimeout;
-        using var timeoutCts = new CancellationTokenSource(timeout);
-
-        if (!await TryPersistStopPreemptCheckpointAsync(workItemId, sandbox, timeout, timeoutCts.Token))
-            return;
-
-        sandbox.MarkOwnedByShutdownHandler();
-        try
-        {
-            if (sandbox is IPreemptibleSandbox preemptible)
-            {
-                await preemptible.StopAndPreserveAsync(timeoutCts.Token).WaitAsync(timeoutCts.Token);
-                AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
-                return;
-            }
-
-            _log.LogWarning(
-                "Sandbox {SandboxId} for work item {WorkItemId} does not implement IPreemptibleSandbox; falling back to dispose",
-                sandbox.Id, workItemId);
-            await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
-            AuditLog.SandboxDisposedOnShutdown(workItemId, sandbox.Id);
-        }
-        catch (OperationCanceledException)
-        {
-            _log.LogWarning(
-                "Stop exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
-                timeout, workItemId, sandbox.Id);
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex,
-                "Stop failed for work item {WorkItemId} sandbox {SandboxId}",
-                workItemId, sandbox.Id);
-        }
-    }
-
-    private async Task<bool> TryPersistStopPreemptCheckpointAsync(
-        WorkItemId workItemId,
-        ISuspendableSandbox sandbox,
-        TimeSpan timeout,
-        CancellationToken ct)
-    {
-        var checkpointRef = SandboxResumeOnStartupService.PreemptCheckpointRefFor(workItemId);
-        try
-        {
-            if (_provider is not ISuspendingSandboxProvider suspending)
-            {
-                _log.LogWarning(
-                    "Cannot create stop checkpoint for work item {WorkItemId} sandbox {SandboxId}: provider {Provider} no longer exposes suspend checkpoint support",
-                    workItemId, sandbox.Id, _provider.Name);
-                return false;
-            }
-
-            var pushed = await suspending.PushSuspendedVmCheckpointRefAsync(
-                sandbox.Id,
-                SandboxConventions.WorkDir,
-                checkpointRef,
-                $"codeybox: shutdown stop checkpoint {workItemId}",
-                ct)
-                .WaitAsync(ct);
-            if (!pushed)
-            {
-                _log.LogWarning(
-                    "Stop checkpoint push failed for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
-                    workItemId, sandbox.Id);
-                return false;
-            }
-
-            var item = await _store.GetAsync(workItemId, CancellationToken.None);
-            if (item is null)
-            {
-                _log.LogWarning(
-                    "Cannot persist stop checkpoint {CheckpointRef} for sandbox {SandboxId}: work item {WorkItemId} is no longer present in the store",
-                    checkpointRef, sandbox.Id, workItemId);
-                return false;
-            }
-
-            var now = DateTimeOffset.UtcNow;
-            await _store.UpdateAsync(item with
-            {
-                PreemptedAt = now,
-                PreemptCheckpoint = checkpointRef,
-                UpdatedAt = now,
-            }, CancellationToken.None);
-            return true;
-        }
-        catch (OperationCanceledException)
-        {
-            _log.LogWarning(
-                "Stop checkpoint exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
-                timeout, workItemId, sandbox.Id);
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex,
-                "Stop checkpoint failed for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
-                workItemId, sandbox.Id);
-            return false;
-        }
-    }
 
     /// <summary>
     /// Teardown via dispose (delete --purge). Skips the preserve-on-dispose

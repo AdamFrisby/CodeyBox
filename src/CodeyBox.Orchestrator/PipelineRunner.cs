@@ -2080,12 +2080,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // R8-core: if SandboxSuspendOnShutdownService already took ownership
             // of this VM during IHostedLifecycleService.StoppingAsync (which runs
             // and completes BEFORE BackgroundService cancellation flows down as
-            // hostShutdownToken), the agent process is paused (or being paused)
-            // mid-call and the VM cannot service `git add/commit/push`. The
-            // legacy preempt-checkpoint flow would block on the frozen VM until
-            // the host's shutdown grace expires. Skip both the checkpoint and
-            // the StopAndPreserveAsync so SandboxResumeOnStartupService takes
-            // over on the next boot.
+            // hostShutdownToken), either Suspend is preserving the frozen VM for
+            // SandboxResumeOnStartupService or Dispose is destroying the VM. The
+            // preempt-checkpoint flow would block on a frozen VM or fault against
+            // a deleted VM. Skip both the checkpoint and StopAndPreserveAsync in
+            // those lifecycle-owned cases.
             //
             // The signal is "did the suspend handler take ownership of this
             // VM", NOT just ISuspendableSandbox.IsSuspended: the handler
@@ -2094,10 +2093,12 @@ public sealed class PipelineRunner : IPipelineRunner
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let
             // the legacy git-checkpoint + multipass-stop path race that
-            // in-flight suspend. Stop / Dispose modes set the ownership flag
-            // before stopping or destroying the VM because in-VM checkpoint
-            // commands would fault after lifecycle teardown. We re-read the
-            // store under CancellationToken.None (ct is already cancelled by host
+            // in-flight suspend. Dispose mode sets the ownership flag before
+            // destroying the VM because in-VM checkpoint commands would fault
+            // after lifecycle teardown. Stop mode deliberately does not set that
+            // flag; PipelineRunner owns its normal preempt checkpoint and
+            // StopAndPreserveAsync flow. We re-read the store under
+            // CancellationToken.None (ct is already cancelled by host
             // shutdown): on the per-VM suspend-timeout path the handler has
             // persisted SuspendedVmName and returned while multipassd is still
             // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
@@ -2114,7 +2115,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (suspendHandled)
                 {
                     _log.LogInformation(
-                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen / stopped / disposed VM",
+                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen or disposed VM",
                         item.Id, sandbox.Id);
                     throw;
                 }

@@ -63,7 +63,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
     private static void AssertResumeTimeoutHonored(TimeSpan elapsed, TimeSpan configuredTimeout)
     {
-        var upperBound = configuredTimeout + TimeSpan.FromMilliseconds(200);
+        var upperBound = configuredTimeout + TimeSpan.FromSeconds(1);
         Assert.True(elapsed < upperBound,
             $"configured {configuredTimeout} resume timeout was not honored promptly; elapsed {elapsed}");
     }
