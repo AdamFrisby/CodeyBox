@@ -522,7 +522,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
     [Fact]
     public async Task HostShutdown_WhenSandboxAlreadySuspended_SkipsCheckpointAndPreserve()
     {
-        // Replays the race the SandboxSuspendOnShutdownService → PipelineRunner
+        // Replays the race the SandboxShutdownTeardownService → PipelineRunner
         // shutdown ordering creates: by the time the pipeline catches the
         // host-shutdown OCE, the suspend handler has already frozen the VM
         // (sandbox.IsSuspended == true). The legacy preempt-checkpoint flow
@@ -605,7 +605,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         // Sanity: no preempt-checkpoint ref ever made it to origin either.
@@ -699,7 +699,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
@@ -1237,13 +1237,15 @@ internal sealed class SuspendableSandboxProvider : ISandboxProvider
         => _inner.DisposeLeakedAsync(name, ct);
 }
 
-internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspendableSandbox
+internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
 {
     private readonly ISandbox _inner;
+    private bool _ownedByShutdownHandler;
     public SuspendableSandboxWrapper(ISandbox inner) { _inner = inner; }
 
     public string Id => _inner.Id;
     public bool IsSuspended { get; set; }
+    public bool IsOwnedByShutdownHandler => IsSuspended || _ownedByShutdownHandler;
     public int StopAndPreserveCalls { get; private set; }
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
@@ -1263,4 +1265,6 @@ internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspenda
             return preemptible.StopAndPreserveAsync(ct);
         return Task.CompletedTask;
     }
+
+    public void MarkOwnedByShutdownHandler() => _ownedByShutdownHandler = true;
 }

@@ -1,7 +1,7 @@
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// How the suspend-on-shutdown handler tears down in-flight worker sandboxes
+/// How the shutdown teardown handler tears down in-flight worker sandboxes
 /// during a graceful host shutdown. Picked by operator config
 /// (<c>CodeyBox:Shutdown:SandboxTeardownMode</c>) per the post-incident review
 /// of 2026-05-29: <c>multipass suspend</c> writes a multi-GiB RAM snapshot and

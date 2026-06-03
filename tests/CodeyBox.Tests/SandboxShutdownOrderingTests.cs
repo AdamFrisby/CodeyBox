@@ -77,8 +77,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     public async Task ShutdownHandler_PausesDispatch_BeforeAnyVmTeardown()
     {
         // The single most important sequencing assertion of R8.1. The
-        // SandboxSuspendOnShutdownService must call IShutdownDispatchGate.PauseDispatch
-        // BEFORE it snapshots the suspendable set and begins any per-VM teardown.
+        // SandboxShutdownTeardownService must call IShutdownDispatchGate.PauseDispatch
+        // BEFORE it snapshots the active sandbox set and begins any per-VM teardown.
         // Without that ordering the dispatch loop keeps creating new sandboxes that
         // race the snapshot and end up torn down uncleanly when the BackgroundService
         // cancellation token fires later in the shutdown sequence — the very
@@ -91,16 +91,16 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-x", () => gate.IsDispatchPaused);
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             dispatchGate: gate);
 
         Assert.False(gate.IsDispatchPaused);
         Assert.False(svc.DispatchPauseObserved);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(gate.IsDispatchPaused, "dispatch gate must be flipped during shutdown");
         Assert.True(svc.DispatchPauseObserved, "service should record that it observed the gate");
@@ -123,13 +123,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-no-gate");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             dispatchGate: null);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(svc.DispatchPauseObserved);
         Assert.True(svc.DispatchPausedBeforeTeardown,
@@ -140,18 +140,18 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     [Fact]
     public async Task ShutdownHandler_PausesDispatch_EvenWhenNoSandboxesToTeardown()
     {
-        // Pause must fire even when SnapshotSuspendableActive is empty —
+        // Pause must fire even when SnapshotActiveSandboxes is empty —
         // otherwise a race where the snapshot empties between gate-set and
         // teardown could leave dispatch running while we exit.
         var gate = new TestShutdownDispatchGate();
         var provider = new OrderingFakeProvider();
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop,
             dispatchGate: gate);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(gate.IsDispatchPaused);
     }
@@ -267,12 +267,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-stop");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Stop mode must not call SuspendAsync");
         Assert.True(sandbox.StopAndPreserveCalled,
@@ -303,12 +303,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-deleted-work-item-stop");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(sandbox.StopAndPreserveCalled,
             "Stop mode must still tear down a snapshotted sandbox when its work item row was already deleted");
@@ -333,12 +333,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new SuspendOnlyOrderingFakeSandbox("vm-working-stop-defer");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.SuspendCalled);
         Assert.False(sandbox.DisposeCalled,
@@ -361,12 +361,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-reworking-stop-defer");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.StopAndPreserveCalled,
             "Stop mode must leave uncheckpointed Reworking VMs running for PipelineRunner's preempt-checkpoint path");
@@ -394,15 +394,47 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-working-checkpointed-stop");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(sandbox.StopAndPreserveCalled,
             "Stop mode should stop/preserve Working VMs that already have a preempt checkpoint");
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.DisposeCalled);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(checkpoint, after!.PreemptCheckpoint);
+        Assert.NotNull(after.PreemptedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_StopsCheckpointedReworkingItem()
+    {
+        var item = MakeItem(WorkItemState.Reworking);
+        var checkpoint = $"refs/heads/codeybox/preempt/{item.Id}";
+        item = item with
+        {
+            PreemptCheckpoint = checkpoint,
+            PreemptedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-reworking-checkpointed-stop");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Stop mode should stop/preserve Reworking VMs that already have a preempt checkpoint");
         Assert.True(sandbox.OwnedByShutdownHandler);
         Assert.False(sandbox.DisposeCalled);
         var after = await _store.GetAsync(item.Id);
@@ -427,9 +459,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
 
         var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(
             OptionsWithTeardownMode(SandboxTeardownMode.Suspend));
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownModeAccessor: () => monitor.CurrentValue.Shutdown.SandboxTeardownMode);
 
         monitor.Set(OptionsWithTeardownMode(SandboxTeardownMode.Stop));
@@ -456,13 +488,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-stop-hung", stopTask: neverStopped.Task);
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop,
             nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
 
-        await svc.SuspendAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(neverStopped.Task.IsCompleted);
@@ -485,12 +517,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             stopException: new InvalidOperationException("injected stop failure"));
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(sandbox.OwnedByShutdownHandler,
@@ -503,9 +535,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     {
         var provider = new OrderingFakeProvider();
 
-        Assert.Throws<ArgumentException>(() => new SandboxSuspendOnShutdownService(
+        Assert.Throws<ArgumentException>(() => new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance));
+            NullLogger<SandboxShutdownTeardownService>.Instance));
     }
 
     [Fact]
@@ -518,12 +550,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new SuspendOnlyOrderingFakeSandbox("vm-stop-dispose-fallback");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.SuspendCalled);
         Assert.True(sandbox.DisposeCalled,
@@ -544,12 +576,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-dispose");
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Dispose);
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Dispose mode must not call SuspendAsync");
         Assert.False(sandbox.StopAndPreserveCalled, "Dispose mode must not call StopAndPreserveAsync");
@@ -574,13 +606,13 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-dispose-hung", disposeTask: neverDisposed.Task);
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Dispose,
             nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
 
-        await svc.SuspendAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.True(sandbox.DisposeCalled);
         Assert.False(neverDisposed.Task.IsCompleted);
@@ -1091,10 +1123,10 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         }
     }
 
-    private sealed class OrderingFakeProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class OrderingFakeProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
-        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
-        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
+        private readonly ConcurrentDictionary<WorkItemId, IShutdownTeardownSandbox> _active = new();
+        public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
         public string Name => "fake-ordering";
         public int SnapshotCalls { get; private set; }
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
@@ -1102,10 +1134,10 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
         {
             SnapshotCalls++;
-            var list = new List<(WorkItemId, ISuspendableSandbox)>();
+            var list = new List<(WorkItemId, IShutdownTeardownSandbox)>();
             foreach (var kv in _active) list.Add((kv.Key, kv.Value));
             return list;
         }
@@ -1118,7 +1150,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             CancellationToken ct) => Task.FromResult(true);
     }
 
-    private sealed class OrderingFakeSandbox : IPreemptibleSandbox, ISuspendableSandbox
+    private sealed class OrderingFakeSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
     {
         private readonly Func<bool>? _isDispatchPaused;
         private readonly Task? _disposeTask;
@@ -1185,7 +1217,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         }
     }
 
-    private sealed class SuspendOnlyOrderingFakeSandbox : ISuspendableSandbox
+    private sealed class SuspendOnlyOrderingFakeSandbox : ISuspendableSandbox, IShutdownTeardownSandbox
     {
         public SuspendOnlyOrderingFakeSandbox(string id) { Id = id; }
 
@@ -1213,7 +1245,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public void MarkOwnedByShutdownHandler() => OwnedByShutdownHandler = true;
     }
 
-    private sealed class ReconcilingFakeProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class ReconcilingFakeProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         private readonly List<ManagedSandboxInfo> _managed = new();
         public List<string> RecoveredNames { get; } = new();
@@ -1230,7 +1262,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(_managed);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() => [];
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
         public bool SawStopBeforePurge(string name)
@@ -1273,7 +1305,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         }
     }
 
-    private sealed class BlockingReconcilingProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class BlockingReconcilingProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         private readonly TaskCompletionSource<IReadOnlyList<string>> _release =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1287,7 +1319,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() => [];
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
         public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
@@ -1335,7 +1367,7 @@ public sealed class SandboxShutdownProgramWiringTests
         // the service created here will keep Suspend even after Set(Stop).
         var service = Assert.Single(
             factory.Services.GetServices<IHostedService>()
-                .OfType<SandboxSuspendOnShutdownService>());
+                .OfType<SandboxShutdownTeardownService>());
 
         factory.Monitor.Set(OptionsWithTeardownMode(SandboxTeardownMode.Stop));
 
@@ -1444,7 +1476,7 @@ public sealed class SandboxShutdownProgramWiringTests
                 .ToList();
 
             Assert.True(matches.Count > 0,
-                "Could not locate the SandboxSuspendOnShutdownService hosted-service descriptor. " +
+                "Could not locate the SandboxShutdownTeardownService hosted-service descriptor. " +
                 "Descriptor probe skipped factories requiring: " +
                 string.Join(", ", missingProbeServices.Select(t => t.FullName).Distinct().OrderBy(n => n)));
             return Assert.Single(matches);
@@ -1457,7 +1489,7 @@ public sealed class SandboxShutdownProgramWiringTests
         {
             try
             {
-                return descriptor.ImplementationFactory!(probeProvider) is SandboxSuspendOnShutdownService;
+                return descriptor.ImplementationFactory!(probeProvider) is SandboxShutdownTeardownService;
             }
             catch (ProbeServiceUnavailableException ex)
             {
@@ -1496,8 +1528,8 @@ public sealed class SandboxShutdownProgramWiringTests
                 return _dispatchGate;
             if (serviceType == typeof(IOptionsMonitor<CodeyBoxOptions>))
                 return _monitor;
-            if (serviceType == typeof(ILogger<SandboxSuspendOnShutdownService>))
-                return NullLogger<SandboxSuspendOnShutdownService>.Instance;
+            if (serviceType == typeof(ILogger<SandboxShutdownTeardownService>))
+                return NullLogger<SandboxShutdownTeardownService>.Instance;
 
             throw new ProbeServiceUnavailableException(serviceType);
         }
@@ -1537,13 +1569,13 @@ public sealed class SandboxShutdownProgramWiringTests
         public void PauseDispatch() => IsDispatchPaused = true;
     }
 
-    private sealed class ProgramWiringProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class ProgramWiringProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
-        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
+        private readonly ConcurrentDictionary<WorkItemId, IShutdownTeardownSandbox> _active = new();
 
         public string Name => "program-wiring";
 
-        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
+        public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => Task.FromResult<ISandbox>(new ProgramWiringSandbox("program-wiring-created"));
@@ -1553,9 +1585,9 @@ public sealed class SandboxShutdownProgramWiringTests
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
         {
-            var list = new List<(WorkItemId, ISuspendableSandbox)>();
+            var list = new List<(WorkItemId, IShutdownTeardownSandbox)>();
             foreach (var kv in _active)
                 if (_active.TryRemove(kv.Key, out var sandbox))
                     list.Add((kv.Key, sandbox));
@@ -1571,7 +1603,7 @@ public sealed class SandboxShutdownProgramWiringTests
             CancellationToken ct) => Task.FromResult(true);
     }
 
-    private sealed class ProgramWiringSandbox : IPreemptibleSandbox, ISuspendableSandbox
+    private sealed class ProgramWiringSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
     {
         public ProgramWiringSandbox(string id) { Id = id; }
 

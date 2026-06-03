@@ -32,7 +32,7 @@ namespace CodeyBox.Orchestrator;
 /// multipass takes its snapshot, AND the host honours the async signature
 /// instead of being blocked on a sync-over-async fan-out.</para>
 /// </summary>
-public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
+public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
 {
     /// <summary>
     /// Cap on parallel <c>multipass suspend</c> calls. Suspend writes the VM's
@@ -87,16 +87,16 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     private readonly ISandboxProvider _provider;
     private readonly IWorkItemStore _store;
-    private readonly ILogger<SandboxSuspendOnShutdownService> _log;
+    private readonly ILogger<SandboxShutdownTeardownService> _log;
     private readonly int _maxParallel;
     private readonly TimeSpan _perSuspendTimeout;
     private readonly TimeSpan _perGiBSuspendBudget;
     private readonly TimeSpan _nonSuspendTeardownTimeout;
     // R8.1 (VM-wedging incident 2026-05-29): dispatch must be paused BEFORE
-    // SnapshotSuspendableActive runs, otherwise the orchestrator's dispatch
+    // SnapshotActiveSandboxes runs, otherwise the orchestrator's dispatch
     // loop keeps creating new sandboxes that race the snapshot and are then
     // torn down uncleanly when the BackgroundService cancellation fires later
-    // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
+    // in the shutdown sequence. Nullable so test fixtures driving TeardownAllAsync
     // directly don't need to hand in a gate.
     private readonly IShutdownDispatchGate? _dispatchGate;
     // R8.1: ephemeral worker VMs can be handled by Stop (default; use
@@ -108,10 +108,10 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
-    public SandboxSuspendOnShutdownService(
+    public SandboxShutdownTeardownService(
         ISandboxProvider provider,
         IWorkItemStore store,
-        ILogger<SandboxSuspendOnShutdownService> log,
+        ILogger<SandboxShutdownTeardownService> log,
         int? maxParallel = null,
         TimeSpan? perSuspendTimeout = null,
         TimeSpan? perGiBSuspendBudget = null,
@@ -144,7 +144,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         }
     }
 
-    /// <summary>The dispatch-pause-was-called signal as observed by SuspendAllAsync.</summary>
+    /// <summary>The dispatch-pause-was-called signal as observed by TeardownAllAsync.</summary>
     internal bool DispatchPauseObserved { get; private set; }
     /// <summary>Whether dispatch was paused before the first per-VM teardown call. Test seam.</summary>
     internal bool DispatchPausedBeforeTeardown { get; private set; }
@@ -188,15 +188,15 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             // slow snapshot finishes, the (work item → VM) mapping persisted
             // before the await (SuspendOneAsync) still lets the next startup
             // resume it.
-            await SuspendAllAsync();
+            await TeardownAllAsync();
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Sandbox suspend-on-shutdown failed; in-flight items will follow the existing recovery path");
+            _log.LogError(ex, "Sandbox shutdown teardown failed; in-flight items will follow the existing recovery path");
         }
     }
 
-    internal async Task SuspendAllAsync()
+    internal async Task TeardownAllAsync()
     {
         // R8.1 (incident 2026-05-29): pause dispatch BEFORE we either snapshot
         // for Suspend/Stop/Dispose. Idempotent — a test that wires the gate but
@@ -208,17 +208,17 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         }
 
         var teardownMode = _teardownModeAccessor();
-        if (_provider is not ISuspendingSandboxProvider suspending)
+        if (_provider is not IActiveSandboxProvider activeProvider)
         {
             _log.LogDebug("Sandbox provider {Provider} does not expose active sandbox teardown; skipping shutdown sweep",
                 _provider.Name);
             return;
         }
 
-        var entries = suspending.SnapshotSuspendableActive();
+        var entries = activeProvider.SnapshotActiveSandboxes();
         if (entries.Count == 0)
         {
-            _log.LogInformation("Suspend-on-shutdown: no in-flight sandboxes to {Mode} before exit", teardownMode);
+            _log.LogInformation("Shutdown teardown: no in-flight sandboxes to {Mode} before exit", teardownMode);
             return;
         }
 
@@ -250,7 +250,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         await Task.WhenAll(tasks);
     }
 
-    private Task TeardownOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox, SandboxTeardownMode teardownMode) =>
+    private Task TeardownOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox, SandboxTeardownMode teardownMode) =>
         // The default arm throws rather than silently routing through suspend.
         // Silent fallthrough would defeat the whole feature's intent: a new
         // teardown mode added without an explicit case here would re-introduce
@@ -271,7 +271,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// <c>multipass suspend</c> risky. Falls back to dispose only when a
     /// recoverable sandbox lacks stop/preserve support.
     /// </summary>
-    private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    private async Task StopOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
     {
         var item = await _store.GetAsync(workItemId, CancellationToken.None);
         if (item is not null && WorkItemRecoveryPolicy.RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(item))
@@ -319,14 +319,14 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// This is the most aggressive lock-contention escape hatch, at the cost of
     /// losing in-VM agent state and any uncheckpointed work.
     ///
-    /// <para>Calls <see cref="ISuspendableSandbox.MarkOwnedByShutdownHandler"/>
+    /// <para>Calls <see cref="IShutdownTeardownSandbox.MarkOwnedByShutdownHandler"/>
     /// FIRST so PipelineRunner's host-shutdown OCE catch block skips its
     /// in-VM git checkpoint flow against a VM that is about to be (or has
     /// already been) <c>multipass delete --purge</c>'d — without this signal
     /// the catch block would fault inside a non-existent VM, leaving the work
     /// item Working/Reworking with no PreemptCheckpoint.</para>
     /// </summary>
-    private async Task DisposeOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    private async Task DisposeOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
     {
         sandbox.MarkOwnedByShutdownHandler();
         var timeout = NonSuspendTeardownTimeout;
@@ -350,9 +350,17 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         }
     }
 
-    private async Task SuspendOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    private async Task SuspendOneAsync(WorkItemId workItemId, IShutdownTeardownSandbox sandbox)
     {
-        var timeout = SuspendTimeoutFor(sandbox);
+        if (sandbox is not ISuspendableSandbox suspendable)
+        {
+            _log.LogWarning(
+                "Suspend teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the sandbox does not support suspend; leaving it for normal shutdown recovery",
+                workItemId, sandbox.Id);
+            return;
+        }
+
+        var timeout = SuspendTimeoutFor(suspendable);
 
         // Persist (workItemId → vmName) BEFORE awaiting the suspend. The RAM
         // snapshot is written by multipassd, which keeps going even if our
@@ -370,7 +378,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         using var timeoutCts = new CancellationTokenSource(timeout);
         try
         {
-            await sandbox.SuspendAsync(timeoutCts.Token);
+            await suspendable.SuspendAsync(timeoutCts.Token);
         }
         catch (OperationCanceledException)
         {

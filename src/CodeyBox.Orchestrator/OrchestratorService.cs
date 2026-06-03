@@ -15,7 +15,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
 {
-    // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
+    // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
     // VMs, so the dispatch loop stops picking up new items and creating new
     // sandboxes that would race the snapshot. In-flight workers continue to
@@ -512,8 +512,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         while (!stoppingToken.IsCancellationRequested)
         {
             // Shutdown dispatch gate (R8.1 fix for VM-wedging incident
-            // 2026-05-29): the suspend-on-shutdown handler calls PauseDispatch()
-            // BEFORE it snapshots SnapshotSuspendableActive(), so once the flag
+            // 2026-05-29): the shutdown teardown handler calls PauseDispatch()
+            // BEFORE it snapshots SnapshotActiveSandboxes(), so once the flag
             // is set the dispatch loop MUST stop picking up new work and
             // creating new sandboxes that would race the snapshot — those
             // would otherwise be left mid-launch when the BackgroundService
@@ -577,7 +577,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // were blocked on the concurrency gate. Without this check, one
             // final worker could be spawned after dispatch was paused (the
             // very race this gate exists to close — that final sandbox would
-            // miss the SnapshotSuspendableActive snapshot and be torn down
+            // miss the SnapshotActiveSandboxes snapshot and be torn down
             // uncleanly when the BackgroundService cancellation token fires).
             if (IsDispatchPaused)
             {

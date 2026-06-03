@@ -2077,7 +2077,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
 
-            // R8-core: if SandboxSuspendOnShutdownService already took ownership
+            // R8-core: if SandboxShutdownTeardownService already took ownership
             // of this VM during IHostedLifecycleService.StoppingAsync (which runs
             // and completes BEFORE BackgroundService cancellation flows down as
             // hostShutdownToken), either Suspend is preserving the frozen VM for
@@ -2086,10 +2086,10 @@ public sealed class PipelineRunner : IPipelineRunner
             // a deleted VM. Skip both the checkpoint and StopAndPreserveAsync in
             // those lifecycle-owned cases.
             //
-            // The signal is "did the suspend handler take ownership of this
-            // VM", NOT just ISuspendableSandbox.IsSuspended: the handler
-            // persists SuspendedVmName BEFORE awaiting multipass suspend, and
-            // on a per-VM suspend timeout it returns with the mapping still
+            // The signal is "did the shutdown teardown handler take ownership
+            // of this VM", NOT just ISuspendableSandbox.IsSuspended: the handler
+            // persists SuspendedVmName BEFORE awaiting multipass suspend, and on
+            // a per-VM suspend timeout it returns with the mapping still
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let
             // the legacy git-checkpoint + multipass-stop path race that
@@ -2104,21 +2104,19 @@ public sealed class PipelineRunner : IPipelineRunner
             // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
             // still be false on the sandbox instance, so the persisted mapping is
             // the authoritative late signal.
-            if (sandbox is ISuspendableSandbox suspendable)
+            var lifecycleHandled = sandbox is IShutdownTeardownSandbox teardownSandbox
+                && teardownSandbox.IsOwnedByShutdownHandler;
+            if (!lifecycleHandled)
             {
-                var suspendHandled = suspendable.IsOwnedByShutdownHandler;
-                if (!suspendHandled)
-                {
-                    var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
-                    suspendHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
-                }
-                if (suspendHandled)
-                {
-                    _log.LogInformation(
-                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen, stopped, or disposed VM",
-                        item.Id, sandbox.Id);
-                    throw;
-                }
+                var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
+                lifecycleHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
+            }
+            if (lifecycleHandled)
+            {
+                _log.LogInformation(
+                    "Work item {Id}: sandbox {SandboxId} was taken over by SandboxShutdownTeardownService; skipping preempt-checkpoint and preserve to avoid racing the frozen, stopped, or disposed VM",
+                    item.Id, sandbox.Id);
+                throw;
             }
 
             Exception? checkpointFailure = null;
@@ -4388,7 +4386,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
-        // mid-invocation the suspend-on-shutdown handler reads AgentLogPath out
+        // mid-invocation the shutdown teardown handler reads AgentLogPath out
         // of the store and the startup resume handler re-tails the same file on
         // the resumed VM. Path is keyed by (workItemId, phase, iteration) so
         // a single work item can have its work / audit-rework / merge / conflict-
@@ -5079,7 +5077,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Persists <paramref name="agentLogPath"/> on <paramref name="id"/> BEFORE
-    /// the agent runs so a SIGTERM mid-invocation lets the suspend-on-shutdown
+    /// the agent runs so a SIGTERM mid-invocation lets the shutdown teardown
     /// handler read the path out of the store. Re-reads the latest row so we
     /// do not regress a concurrent update from another worker thread on the
     /// same item (priority bump, prompt edit, etc).
@@ -5116,7 +5114,7 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Best-effort: a store hiccup here must not block the agent
-            // invocation. Worst-case, the suspend-on-shutdown handler does not
+            // invocation. Worst-case, the shutdown teardown handler does not
             // see AgentLogPath and the startup resume handler falls back to
             // the standard stranded-item recovery path.
             log.LogWarning(ex, "Failed to persist agent log path for {WorkItemId}", id);

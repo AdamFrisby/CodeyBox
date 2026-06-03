@@ -1968,7 +1968,7 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IStartupInitialRecoverySink>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
-// SandboxSuspendOnShutdownService can pause new dispatch before the per-VM
+// SandboxShutdownTeardownService can pause new dispatch before the per-VM
 // teardown begins (incident 2026-05-29 fix).
 builder.Services.AddSingleton<IShutdownDispatchGate>(
     sp => sp.GetRequiredService<OrchestratorService>());
@@ -1993,22 +1993,23 @@ builder.Services.AddHostedService(sp =>
 // startup recovery sweep. Blocking resume mode still runs through
 // IHostedLifecycleService.StartingAsync, so the host awaits it natively.
 //
-// R8.1 (incident 2026-05-29): the suspend handler is wired with the orchestrator
-// as an IShutdownDispatchGate so it pauses new dispatch BEFORE snapshotting the
-// suspendable set — without that ordering, the dispatch loop keeps creating
-// new sandboxes that race the snapshot. Teardown mode is operator-tunable via
-// CodeyBox:Shutdown:SandboxTeardownMode (Stop / Suspend / Dispose); default
-// Stop to avoid multipass suspend/qemu-lock wedges unless an operator opts in.
+// R8.1 (incident 2026-05-29): the shutdown teardown service is wired with the
+// orchestrator as an IShutdownDispatchGate so it pauses new dispatch BEFORE
+// snapshotting the active sandbox set — without that ordering, the dispatch
+// loop keeps creating new sandboxes that race the snapshot. Teardown mode is
+// operator-tunable via CodeyBox:Shutdown:SandboxTeardownMode (Stop / Suspend /
+// Dispose); default Stop to avoid multipass suspend/qemu-lock wedges unless an
+// operator opts in.
 // Resolve teardown mode through IOptionsMonitor at shutdown time so a hot config
 // edit affects the next graceful shutdown.
 builder.Services.AddHostedService(sp =>
 {
     var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var shutdown = optionsMonitor.CurrentValue.Shutdown;
-    return new SandboxSuspendOnShutdownService(
+    return new SandboxShutdownTeardownService(
         sp.GetRequiredService<ISandboxProvider>(),
         sp.GetRequiredService<IWorkItemStore>(),
-        sp.GetRequiredService<ILogger<SandboxSuspendOnShutdownService>>(),
+        sp.GetRequiredService<ILogger<SandboxShutdownTeardownService>>(),
         nonSuspendTeardownTimeout: TimeSpan.FromSeconds(Math.Max(1, shutdown.GraceSeconds)),
         dispatchGate: sp.GetService<IShutdownDispatchGate>(),
         teardownModeAccessor: () => optionsMonitor.CurrentValue.Shutdown.SandboxTeardownMode);

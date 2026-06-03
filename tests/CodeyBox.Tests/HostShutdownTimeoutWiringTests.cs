@@ -189,7 +189,7 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public async Task SandboxSuspendOnShutdownService_FromDi_UsesConfiguredSuspendMode()
+    public async Task SandboxShutdownTeardownService_FromDi_UsesConfiguredSuspendMode()
     {
         var fakeProvider = new FakeSuspendingProvider();
         using var factory = new SandboxShutdownServiceWiringFactory(
@@ -198,7 +198,7 @@ public sealed class HostShutdownTimeoutWiringTests
 
         var store = factory.Services.GetRequiredService<IWorkItemStore>();
         var shutdownService = factory.Services.GetServices<IHostedService>()
-            .OfType<SandboxSuspendOnShutdownService>()
+            .OfType<SandboxShutdownTeardownService>()
             .Single();
 
         var item = new WorkItem
@@ -226,14 +226,14 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public async Task SandboxSuspendOnShutdownService_FromDi_DefaultsToStop_WhenModeConfigAbsent()
+    public async Task SandboxShutdownTeardownService_FromDi_DefaultsToStop_WhenModeConfigAbsent()
     {
         var fakeProvider = new FakeSuspendingProvider();
         using var factory = new SandboxShutdownServiceWiringFactory(fakeProvider);
 
         var store = factory.Services.GetRequiredService<IWorkItemStore>();
         var shutdownService = factory.Services.GetServices<IHostedService>()
-            .OfType<SandboxSuspendOnShutdownService>()
+            .OfType<SandboxShutdownTeardownService>()
             .Single();
 
         var item = new WorkItem
@@ -266,7 +266,7 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public async Task SandboxSuspendOnShutdownService_FromDi_UsesConfiguredDisposeMode()
+    public async Task SandboxShutdownTeardownService_FromDi_UsesConfiguredDisposeMode()
     {
         var fakeProvider = new FakeSuspendingProvider();
         using var factory = new SandboxShutdownServiceWiringFactory(
@@ -276,7 +276,7 @@ public sealed class HostShutdownTimeoutWiringTests
 
         var store = factory.Services.GetRequiredService<IWorkItemStore>();
         var shutdownService = factory.Services.GetServices<IHostedService>()
-            .OfType<SandboxSuspendOnShutdownService>()
+            .OfType<SandboxShutdownTeardownService>()
             .Single();
 
         var item = new WorkItem
@@ -436,7 +436,7 @@ public sealed class HostShutdownTimeoutWiringTests
                 services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository());
                 services.AddSingleton(_provider);
                 services.AddSingleton<IHostedService>(sp =>
-                    CreateHostedServiceFromProductionRegistration<SandboxSuspendOnShutdownService>(
+                    CreateHostedServiceFromProductionRegistration<SandboxShutdownTeardownService>(
                         productionHostedServices,
                         sp));
             });
@@ -479,18 +479,18 @@ public sealed class HostShutdownTimeoutWiringTests
         }
     }
 
-    private sealed class FakeSuspendingProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class FakeSuspendingProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
-        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
+        private readonly ConcurrentDictionary<WorkItemId, IShutdownTeardownSandbox> _active = new();
 
         public string Name => "fake-suspending";
-        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
+        public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => throw new NotImplementedException();
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() =>
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
             _active.Select(kv => (kv.Key, kv.Value)).ToList();
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
         public Task<bool> PushSuspendedVmCheckpointRefAsync(
@@ -501,7 +501,7 @@ public sealed class HostShutdownTimeoutWiringTests
             CancellationToken ct) => Task.FromResult(true);
     }
 
-    private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox, IPreemptibleSandbox
+    private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox, IPreemptibleSandbox, IShutdownTeardownSandbox
     {
         public string Id { get; } = id;
         public bool SuspendCalled { get; private set; }

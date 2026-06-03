@@ -46,7 +46,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -80,11 +80,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     // back-reference to the live MultipassSandbox object. Populated only when
     // CreateAsync receives a SandboxSpec carrying TimingWorkItemId — that field
     // is set for every real pipeline phase, so the registry covers everything
-    // the orchestrator might want to suspend on shutdown. Tests that call
+    // the orchestrator might want to handle during shutdown teardown. Tests that call
     // CreateAsync without a work item are intentionally absent.
-    private readonly ConcurrentDictionary<string, SuspendableOwnerEntry> _suspendableOwners = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ActiveSandboxOwnerEntry> _activeSandboxOwners = new(StringComparer.Ordinal);
 
-    private sealed record SuspendableOwnerEntry(WorkItemId WorkItemId, MultipassSandbox Sandbox);
+    private sealed record ActiveSandboxOwnerEntry(WorkItemId WorkItemId, MultipassSandbox Sandbox);
 
     // Test seam: override the RAM-scaled Suspending-settle budget used by
     // WaitWhileSuspendingAsync. Production leaves this null and derives the
@@ -297,7 +297,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
         void MarkNoLongerActive(string n)
         {
             _activeSandboxNames.TryRemove(n, out _);
-            _suspendableOwners.TryRemove(n, out _);
+            _activeSandboxOwners.TryRemove(n, out _);
             _listCacheExpiry = DateTimeOffset.MinValue;
         }
 
@@ -383,7 +383,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
             if (workItemId is { } owner)
-                _suspendableOwners[name] = new SuspendableOwnerEntry(owner, sandbox);
+                _activeSandboxOwners[name] = new ActiveSandboxOwnerEntry(owner, sandbox);
             return sandbox;
         }
         catch
@@ -419,13 +419,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IDiskGuardedSan
     }
 
     /// <inheritdoc/>
-    public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+    public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
     {
         // ConcurrentDictionary enumeration is snapshot-safe; we materialise
-        // immediately so the caller's parallel suspend loop sees a stable list
+        // immediately so the caller's parallel teardown loop sees a stable list
         // even if a sandbox disposes concurrently.
-        var entries = _suspendableOwners.Values.ToList();
-        var result = new List<(WorkItemId, ISuspendableSandbox)>(entries.Count);
+        var entries = _activeSandboxOwners.Values.ToList();
+        var result = new List<(WorkItemId, IShutdownTeardownSandbox)>(entries.Count);
         foreach (var entry in entries)
             result.Add((entry.WorkItemId, entry.Sandbox));
         return result;
@@ -2697,6 +2697,7 @@ internal static class MultipassDaemonRetry
         "info",
         "clone",
         "mount",
+        "stop",
     };
 
     internal static async Task<ProcessRunResult> RunWithRetryAsync(
@@ -3190,7 +3191,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -3230,7 +3231,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public bool IsSuspended => _isSuspended;
 
     /// <summary>
-    /// True once the suspend-on-shutdown handler has taken responsibility for
+    /// True once the shutdown teardown handler has taken responsibility for
     /// this VM's teardown. Set implicitly when <see cref="SuspendAsync"/> flips
     /// <see cref="IsSuspended"/>; set explicitly by
     /// <see cref="MarkOwnedByShutdownHandler"/> for teardown modes whose
@@ -3241,15 +3242,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
 
     /// <summary>
-    /// Called by <c>SandboxSuspendOnShutdownService</c> before Stop/Dispose
-    /// teardown begins so PipelineRunner's shutdown catch sees the
-    /// "skip in-VM checkpoint" signal even though the suspend path was not
-    /// taken. Idempotent; safe to call multiple times.
+    /// Called by <c>SandboxShutdownTeardownService</c> when non-suspend
+    /// teardown becomes authoritative: after successful Stop/preserve, or
+    /// before destructive Dispose. Idempotent; safe to call multiple times.
     /// </summary>
     public void MarkOwnedByShutdownHandler() => _ownedByShutdownHandler = true;
 
     /// <summary>
-    /// RAM size this VM was provisioned with, surfaced so the suspend-on-shutdown
+    /// RAM size this VM was provisioned with, surfaced so the shutdown teardown
     /// service can scale its per-VM timeout: a larger VM has more RAM to flush to
     /// disk on <c>multipass suspend</c>.
     /// </summary>
@@ -3769,7 +3769,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             // startup resume handler (which retries `multipass start`) or the
             // leak reaper (which honours the .codeybox-preempt marker grace
             // window written above). The caller
-            // (SandboxSuspendOnShutdownService.SuspendOneAsync) keeps the
+            // (SandboxShutdownTeardownService.SuspendOneAsync) keeps the
             // persisted SuspendedVmName mapping on this OCE so the next startup
             // can reattach. We deliberately do NOT set _isSuspended: the VM is
             // not confirmed frozen yet, so PipelineRunner falls back to the

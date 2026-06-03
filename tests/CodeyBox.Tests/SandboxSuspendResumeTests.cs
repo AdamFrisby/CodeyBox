@@ -102,7 +102,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedAt);
     }
 
-    // ── Suspend-on-shutdown handler ──────────────────────────────────────────
+    // ── Shutdown teardown handler ──────────────────────────────────────────
 
     [Fact]
     public async Task ShutdownHandler_SuspendsEveryActiveSandbox_AndPersistsVmName()
@@ -118,13 +118,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         provider.Register(item1.Id, sandbox1);
         provider.Register(item2.Id, sandbox2);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend);
 
         await svc.StartAsync(CancellationToken.None);
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(sandbox1.SuspendCalled);
         Assert.True(sandbox2.SuspendCalled);
@@ -146,11 +146,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider();
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend);
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         // The handler persists the (work item → VM) mapping BEFORE awaiting
         // suspend, so suspend must actually have been attempted...
@@ -179,11 +179,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider();
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend);
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.False(sandbox.SuspendCalled);
         Assert.Null(await _store.GetAsync(item.Id));
@@ -207,12 +207,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider();
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMilliseconds(50));
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         var after = await _store.GetAsync(item.Id);
         // Mapping persisted up front and kept on timeout — the VM is still being
@@ -244,9 +244,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider();
         provider.Register(item.Id, sandbox);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMilliseconds(100),
             perGiBSuspendBudget: TimeSpan.FromMilliseconds(3000));
@@ -254,7 +254,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // The budget SuspendOneAsync must apply is the scaled 12s, not the 100ms floor.
         Assert.Equal(TimeSpan.FromSeconds(12), svc.SuspendTimeoutFor(sandbox));
 
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         Assert.True(sandbox.Completed,
             "suspend should run to completion under the RAM-scaled budget");
@@ -271,7 +271,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // Acceptance criterion #3: the (work item → VM) mapping must be written
         // BEFORE the multipass suspend is awaited, so a SIGKILL landing mid-suspend
         // still leaves a resume mapping. Asserting the store only AFTER
-        // SuspendAllAsync returns can't distinguish "persisted before the await"
+        // TeardownAllAsync returns can't distinguish "persisted before the await"
         // from "persisted in the post-timeout handler" — both leave the same final
         // row. So here we read the store WHILE SuspendAsync is still blocked and
         // require the mapping to already be present.
@@ -286,13 +286,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // until we explicitly release it, so any persistence we observe must have
         // happened on the pre-await path, not in the OperationCanceledException
         // handler.
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMinutes(5));
 
-        var suspendAll = svc.SuspendAllAsync();
+        var suspendAll = svc.TeardownAllAsync();
 
         // Wait until the suspend await has actually begun.
         await sandbox.SuspendEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -318,9 +318,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // get a proportionally longer suspend timeout — a uniform cap would
         // truncate the large VM's snapshot. Below the floor (or with no reported
         // RAM size) the flat floor applies.
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             new FakeSuspendingProvider(), _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend,
             perSuspendTimeout: TimeSpan.FromMinutes(10),
             perGiBSuspendBudget: TimeSpan.FromSeconds(150));
@@ -373,12 +373,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // constructor actually applies the raised floor (10 min) and the
         // RAM-scaling budget (150s/GiB). Pin both via wall-clock literals so a
         // silent revert of either constant fails here.
-        Assert.Equal(TimeSpan.FromMinutes(10), SandboxSuspendOnShutdownService.DefaultPerSuspendTimeout);
-        Assert.Equal(TimeSpan.FromSeconds(150), SandboxSuspendOnShutdownService.DefaultPerGiBSuspendBudget);
+        Assert.Equal(TimeSpan.FromMinutes(10), SandboxShutdownTeardownService.DefaultPerSuspendTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(150), SandboxShutdownTeardownService.DefaultPerGiBSuspendBudget);
 
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             new FakeSuspendingProvider(), _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend);
 
         const long gib = 1024L * 1024 * 1024;
@@ -458,16 +458,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var item = MakeItem();
         await _store.CreateAsync(item);
 
-        // A provider that doesn't implement ISuspendingSandboxProvider — e.g.
+        // A provider that doesn't implement IActiveSandboxProvider — e.g.
         // process or bubblewrap. The handler must silently skip and leave the
         // suspend fields untouched so the existing PreemptCheckpoint flow
         // continues to be the recovery mechanism.
         var nonSuspending = new NonSuspendingProvider();
-        var svc = new SandboxSuspendOnShutdownService(
+        var svc = new SandboxShutdownTeardownService(
             nonSuspending, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Suspend);
-        await svc.SuspendAllAsync();
+        await svc.TeardownAllAsync();
 
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
@@ -1810,7 +1810,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         // Any non-terminal state can hold a live suspended VM: the suspend-on-
         // shutdown handler persists a (work item → VM) mapping for every entry
-        // SnapshotSuspendableActive returns, regardless of which in-flight phase
+        // SnapshotActiveSandboxes returns, regardless of which in-flight phase
         // it is in (Working, Auditing, Reworking, Merging, AuditPassed,
         // ReworkingForConflict, ...). The reaper must therefore protect by
         // "not terminal" rather than an allow-list that silently drops a state
@@ -2011,7 +2011,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public void MarkRecoveryInputReady() { }
     }
 
-    private sealed class DeleteOnResumeProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class DeleteOnResumeProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         private readonly IWorkItemStore _store;
         private readonly WorkItemId _itemToDelete;
@@ -2025,7 +2025,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() => [];
         public async Task ResumeSandboxAsync(string name, CancellationToken ct)
         {
             ResumedNames.Add(name);
@@ -2047,7 +2047,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
-    private sealed class FakeSuspendableSandbox : ISuspendableSandbox
+    private sealed class FakeSuspendableSandbox : ISuspendableSandbox, IShutdownTeardownSandbox
     {
         public bool SuspendCalled { get; private set; }
         private readonly bool _shouldThrow;
@@ -2074,7 +2074,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     // inside SuspendAsync, honouring the cancellation token. Lets a test prove the
     // per-VM timeout the handler applies is the RAM-scaled budget (delay completes)
     // rather than a smaller flat floor (delay would be cancelled).
-    private sealed class MemoryAwareDelaySandbox : ISuspendableSandbox
+    private sealed class MemoryAwareDelaySandbox : ISuspendableSandbox, IShutdownTeardownSandbox
     {
         private readonly TimeSpan _delay;
         public MemoryAwareDelaySandbox(string id, long memoryBytes, TimeSpan delay)
@@ -2105,7 +2105,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
-    private sealed class SlowSuspendingSandbox : ISuspendableSandbox
+    private sealed class SlowSuspendingSandbox : ISuspendableSandbox, IShutdownTeardownSandbox
     {
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public SlowSuspendingSandbox(string id) { Id = id; }
@@ -2135,9 +2135,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
     }
 
-    private sealed class FakeSuspendingProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class FakeSuspendingProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
-        private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
+        private readonly ConcurrentDictionary<WorkItemId, IShutdownTeardownSandbox> _active = new();
         // Resume runs items in parallel (SandboxResumeOnStartupService fans out
         // with a SemaphoreSlim gate), so the recording lists MUST be thread-safe
         // — a plain List<T>.Add from two concurrent resumes intermittently loses
@@ -2172,7 +2172,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public bool CheckpointPushThrowsCancellation { get; set; }
         public bool CheckpointPushHangs { get; set; }
 
-        public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
+        public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
 
         public string Name => "fake-suspending";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
@@ -2182,9 +2182,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
         public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
 
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
         {
-            var list = new List<(WorkItemId, ISuspendableSandbox)>();
+            var list = new List<(WorkItemId, IShutdownTeardownSandbox)>();
             foreach (var kv in _active) list.Add((kv.Key, kv.Value));
             return list;
         }

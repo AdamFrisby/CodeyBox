@@ -91,11 +91,11 @@ public sealed class ObservableMetricsTests : IDisposable
     [Fact]
     public async Task SandboxActiveGauge_ReportsSandboxLiveCounter_ForEphemeralProvider()
     {
-        // Non-suspending provider (process/bubblewrap fallback path) is expected
+        // Non-active-lifecycle provider (process/bubblewrap fallback path) is expected
         // to surface SandboxLiveCounter.Active. Without this assertion, a
-        // regression that always took the suspendable branch — or skipped the
+        // regression that always took the active-provider branch — or skipped the
         // Increment/Decrement calls in the ephemeral providers — would still
-        // pass SandboxActiveGauge_ReportsSuspendableCount.
+        // pass SandboxActiveGauge_ReportsActiveProviderCount.
         var store = new SqliteWorkItemStore(_dbPath);
 
         // The live counter is intentionally process-wide, and other tests may
@@ -143,7 +143,7 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
-    public async Task SandboxActiveGauge_ReportsSuspendableCount()
+    public async Task SandboxActiveGauge_ReportsActiveProviderCount()
     {
         var store = new SqliteWorkItemStore(_dbPath);
         using var svc = new CodeyBoxObservableMetrics(
@@ -272,7 +272,7 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendingProvider(int active) : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class FakeSuspendingProvider(int active) : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         public string Name => "fake-vm";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
@@ -281,15 +281,15 @@ public sealed class ObservableMetricsTests : IDisposable
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() =>
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
             Enumerable.Range(0, active)
-                .Select(_ => (new WorkItemId(Guid.NewGuid()), (ISuspendableSandbox)new FakeSuspendable()))
+                .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeSuspendable()))
                 .ToList();
 
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendable : ISuspendableSandbox
+    private sealed class FakeSuspendable : ISuspendableSandbox, IShutdownTeardownSandbox
     {
         public string Id => "fake";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>

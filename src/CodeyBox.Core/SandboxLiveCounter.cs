@@ -6,8 +6,8 @@ namespace CodeyBox.Core;
 /// <see cref="ISandboxProvider.CreateAsync"/> and decrement when the returned
 /// <see cref="ISandbox"/> is disposed, so the OTel <c>codeybox.sandbox.active</c>
 /// gauge reflects in-flight sandboxes on the default local paths and not just on
-/// suspend-capable VM backends (which expose a richer native snapshot via
-/// <see cref="ISuspendingSandboxProvider.SnapshotSuspendableActive"/>).
+/// VM backends that expose a richer native snapshot via
+/// <see cref="IActiveSandboxProvider.SnapshotActiveSandboxes"/>.
 ///
 /// <para>Static to match the existing static telemetry instruments
 /// (<c>CodeyBoxMeters</c> / <c>CodeyBoxActivities</c>) and to avoid threading a

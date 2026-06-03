@@ -1707,7 +1707,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         SandboxProfileFlavor flavor,
         RecordingMultipassRunner runner,
         int? maxScreenshotPngBytes = null,
-        TimeSpan? vmStopTimeout = null)
+        TimeSpan? vmStopTimeout = null,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
     {
         return new MultipassSandbox(
             "codeybox-test",
@@ -1725,6 +1726,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             },
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: runner,
+            daemonRetryPolicy: daemonRetryPolicy,
             maxScreenshotPngBytes: maxScreenshotPngBytes);
     }
 
@@ -2090,6 +2092,74 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task StopAndPreserveAsync_RetriesTransientDaemonStopFailureAndSucceeds()
+    {
+        var stopCalls = 0;
+        var infoCalls = 0;
+        var versionCalls = 0;
+        var deleteCalls = 0;
+        var calls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+            {
+                calls.Add("version");
+                versionCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+            }
+
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                calls.Add("delete");
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                calls.Add("stop");
+                stopCalls++;
+                if (stopCalls == 1)
+                    return Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+            {
+                calls.Add("info");
+                infoCalls++;
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stopCalls >= 2 ? "Stopped" : "Running",
+                    ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewMultipassSandbox(
+            SandboxProfileFlavor.Headless,
+            runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+
+        Assert.Equal(2, stopCalls);
+        Assert.Equal(1, versionCalls);
+        Assert.True(infoCalls >= 1);
+        var firstStop = calls.IndexOf("stop");
+        var probe = calls.IndexOf("version");
+        var secondStop = calls.IndexOf("stop", firstStop + 1);
+        Assert.True(firstStop >= 0 && probe > firstStop && secondStop > probe,
+            $"expected stop, health probe, second stop; got: {string.Join(", ", calls)}");
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
     public async Task StopAndPreserveAsync_NonZeroStopExit_ThrowsAndPreservesOnDispose()
     {
         var stopCalls = 0;
@@ -2192,7 +2262,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Critical safety contract: a failed `multipass suspend` MUST NOT flip
         // _preserveOnDispose to true. Otherwise the subsequent DisposeAsync
         // becomes a no-op while the VM is still Running on disk — a silent
-        // leak. The SandboxSuspendOnShutdownService caller persists the
+        // leak. The SandboxShutdownTeardownService caller persists the
         // SuspendedVmName mapping BEFORE awaiting suspend and CLEARS it again
         // when suspend throws a non-cancellation exception, so this failed,
         // still-Running VM is left with no resume bookkeeping and DisposeAsync
@@ -2234,7 +2304,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         // Critical safety contract for the per-VM suspend timeout: when
         // `multipass suspend` is abandoned by OperationCanceledException (the
-        // SandboxSuspendOnShutdownService per-VM timeout fired while multipassd
+        // SandboxShutdownTeardownService per-VM timeout fired while multipassd
         // was still writing the RAM snapshot), DisposeAsync MUST NOT run
         // `multipass delete --purge`. multipassd keeps freezing the VM after we
         // give up; the caller keeps the persisted SuspendedVmName mapping so the
@@ -2276,7 +2346,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     [Fact]
     public void MemoryBytes_ReflectsSpecLimits_ForSuspendTimeoutScaling()
     {
-        // SandboxSuspendOnShutdownService.SuspendTimeoutFor scales the per-VM
+        // SandboxShutdownTeardownService.SuspendTimeoutFor scales the per-VM
         // suspend timeout by ISuspendableSandbox.MemoryBytes. MultipassSandbox
         // must surface the provisioned RAM from its SandboxSpec.Limits — and
         // specifically the *memory* field, not disk — so scaling is fed a real
@@ -2497,7 +2567,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // CreateAsync WITHOUT TimingWorkItemId — must NOT register (no owner
         // to suspend back to). The snapshot stays empty.
         var sandboxNoOwner = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
-        Assert.Empty(((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive());
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
 
         // CreateAsync WITH TimingWorkItemId — populated; snapshot returns one entry.
         var workItemId = WorkItemId.New();
@@ -2506,14 +2576,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ImageReference = "ignored",
             TimingWorkItemId = workItemId,
         });
-        var snapshot = ((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive();
+        var snapshot = ((IActiveSandboxProvider)provider).SnapshotActiveSandboxes();
         Assert.Single(snapshot);
         Assert.Equal(workItemId, snapshot[0].WorkItemId);
 
         // Dispose removes the owner from the snapshot — defends against the
         // suspend handler trying to freeze a sandbox that just released.
         await sandboxWithOwner.DisposeAsync();
-        Assert.Empty(((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive());
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
 
         await sandboxNoOwner.DisposeAsync();
     }

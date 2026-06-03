@@ -133,6 +133,33 @@ public interface IPreemptibleSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional sandbox capability for live sandboxes that participate in the
+/// orchestrator's graceful shutdown teardown sweep. The marker lets the normal
+/// phase runner detect that shutdown teardown has already become authoritative
+/// for this sandbox and must not race it with in-VM preempt-checkpoint commands.
+/// </summary>
+public interface IShutdownTeardownSandbox : ISandbox
+{
+    /// <summary>
+    /// True once the shutdown teardown handler has taken ownership of this
+    /// sandbox via Suspend (RAM frozen), successful Stop (preserved), or Dispose
+    /// (delete --purge). PipelineRunner reads this in its host-shutdown OCE
+    /// catch block to short-circuit the in-VM preempt-checkpoint flow when that
+    /// flow would hang against a frozen/stopped sandbox or fault against a
+    /// deleted sandbox.
+    /// </summary>
+    bool IsOwnedByShutdownHandler => false;
+
+    /// <summary>
+    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
+    /// <c>SandboxShutdownTeardownService</c> when lifecycle teardown has safely
+    /// become authoritative. Default no-op: fakes that don't track teardown
+    /// ownership keep <see cref="IsOwnedByShutdownHandler"/> false.
+    /// </summary>
+    void MarkOwnedByShutdownHandler() { }
+}
+
+/// <summary>
 /// Optional sandbox capability for providers that can freeze a running sandbox
 /// (including its RAM state) and resume it later via
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently
@@ -167,31 +194,8 @@ public interface ISuspendableSandbox : ISandbox
     bool IsSuspended => false;
 
     /// <summary>
-    /// True once the suspend-on-shutdown handler has taken ownership of this
-    /// VM's teardown via Suspend (RAM frozen), successful Stop (preserved), or
-    /// Dispose (delete --purge).
-    /// PipelineRunner reads this in its host-shutdown OCE catch block to
-    /// short-circuit the in-VM preempt-checkpoint flow when that flow would hang
-    /// against a frozen, stopped, or deleted VM. Suspend mode flips this
-    /// implicitly via <see cref="IsSuspended"/>; Dispose calls
-    /// <see cref="MarkOwnedByShutdownHandler"/> before teardown, while Stop
-    /// calls it only after stop/preserve succeeds and only for items that do
-    /// not need PipelineRunner to create a preempt checkpoint.
-    /// </summary>
-    bool IsOwnedByShutdownHandler => IsSuspended;
-
-    /// <summary>
-    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
-    /// <c>SandboxSuspendOnShutdownService</c> when lifecycle teardown has
-    /// safely become authoritative. Default no-op: fakes that don't track
-    /// teardown ownership keep <see cref="IsOwnedByShutdownHandler"/> at the
-    /// <see cref="IsSuspended"/> fallback.
-    /// </summary>
-    void MarkOwnedByShutdownHandler() { }
-
-    /// <summary>
     /// Best-effort RAM size of this sandbox in bytes, or null when the provider
-    /// cannot report it. The suspend-on-shutdown handler scales the per-VM
+    /// cannot report it. The shutdown teardown handler scales the per-VM
     /// suspend timeout by this value: <c>multipass suspend</c> writes the whole
     /// RAM image to disk, so a 12 GiB VM under load legitimately takes far longer
     /// than a 1 GiB idle one. Null falls back to the flat floor timeout.
@@ -202,7 +206,7 @@ public interface ISuspendableSandbox : ISandbox
 /// <summary>
 /// Shared policy for how long a RAM-snapshot suspend is allowed to take, scaled
 /// by VM RAM size. Centralised so the shutdown suspend handler's per-VM timeout
-/// (<see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>), the
+/// (<see cref="CodeyBox.Orchestrator.SandboxShutdownTeardownService"/>), the
 /// startup resume wait (how long to wait out a still-freezing VM before
 /// <c>multipass start</c>), and the host shutdown grace all derive from one
 /// formula and cannot drift apart. <c>multipass suspend</c> writes the whole RAM
@@ -252,7 +256,7 @@ public static class SuspendTimeoutPolicy
 
     /// <summary>
     /// Host-shutdown ceiling (<c>HostOptions.ShutdownTimeout</c>) that must cover
-    /// the worst-case suspend drain, not just a single VM. The suspend-on-shutdown
+    /// the worst-case suspend drain, not just a single VM. The shutdown teardown
     /// handler fans suspends out through a semaphore capped at
     /// <paramref name="maxParallelSuspends"/> and awaits all of them, so with up to
     /// <paramref name="maxConcurrentSandboxes"/> in-flight VMs the drain runs
@@ -287,7 +291,7 @@ public static class SuspendTimeoutPolicy
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
     /// per-VM budget) STACKED ON TOP OF the requested <paramref name="grace"/>.
-    /// The two windows are sequential, not overlapping: suspend-on-shutdown runs
+    /// The two windows are sequential, not overlapping: shutdown teardown runs
     /// in <c>IHostedLifecycleService.StoppingAsync</c> (before BackgroundService
     /// cancellation), and the preempt-checkpoint / listener-drain window still
     /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
@@ -355,20 +359,18 @@ public interface IShutdownDispatchGate
     /// Stop accepting new work for dispatch. Idempotent. Returns immediately;
     /// in-flight sandboxes that have already been created are still in the
     /// provider's active set and will be picked up by
-    /// <c>SnapshotSuspendableActive</c>.
+    /// <c>SnapshotActiveSandboxes</c>.
     /// </summary>
     void PauseDispatch();
 }
 
 /// <summary>
-/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
-/// The orchestrator's suspend-on-shutdown hosted service uses
-/// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that need
-/// early lifecycle handling on <c>ApplicationStopping</c> for Suspend, Stop,
-/// or Dispose mode. The startup resume handler uses
-/// <see cref="ResumeSandboxAsync"/> to start each persisted VM by name.
+/// Optional provider capability for enumerating live sandboxes that need early
+/// lifecycle handling on graceful host shutdown. This is intentionally separate
+/// from <see cref="ISuspendingSandboxProvider"/> so Stop/Dispose teardown does
+/// not depend on suspend/resume support.
 /// </summary>
-public interface ISuspendingSandboxProvider
+public interface IActiveSandboxProvider
 {
     /// <summary>
     /// Snapshot of currently-active sandboxes that can participate in early
@@ -382,8 +384,16 @@ public interface ISuspendingSandboxProvider
     /// determine the owner (e.g. an in-process <c>CreateAsync</c> that did not
     /// pass <see cref="SandboxSpec.TimingWorkItemId"/>) omit those entries.
     /// </summary>
-    IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive();
+    IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes();
+}
 
+/// <summary>
+/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
+/// The startup resume handler uses <see cref="ResumeSandboxAsync"/> to start
+/// each persisted VM by name and adopt its still-running agent process.
+/// </summary>
+public interface ISuspendingSandboxProvider
+{
     /// <summary>
     /// Best-effort resume of a previously-suspended sandbox by name. Implementations
     /// should treat "VM not found" / "already running" as non-fatal so the

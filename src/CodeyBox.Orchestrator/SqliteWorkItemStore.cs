@@ -129,7 +129,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: VM-suspend recovery metadata (R8-core). Records the
         // name of the suspended multipass VM that holds this item's in-progress
         // sandbox state across an orchestrator restart. Nullable: only set
-        // between the suspend-on-shutdown handler and the startup resume
+        // between the shutdown teardown handler and the startup resume
         // handler. The leak reaper skips VMs named here so the suspended VM is
         // not auto-disposed during the restart window.
         RunMigration("ALTER TABLE work_items ADD COLUMN suspended_vm_name TEXT;");
