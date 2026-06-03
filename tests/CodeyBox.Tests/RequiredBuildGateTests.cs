@@ -191,8 +191,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/non-dotnet") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -273,8 +272,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
             tp.GitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
         var verification = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
@@ -367,8 +365,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/malicious-build") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -411,8 +408,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             throwingHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/marker-inspection-fails") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -458,8 +454,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             brokenHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/isolated-clone-fails") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -494,8 +489,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new GitFailingSandboxProvider("fatal: simulated git clone failure inside sandbox"),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/sandbox-clone-fails") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -660,8 +654,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             sandboxes,
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/no-build-target") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -705,8 +698,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/nested-solution") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -749,8 +741,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var item = NewItem("feature/csproj-only") with { State = WorkItemState.WorkComplete };
         var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -859,8 +850,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verifier = new SandboxRequiredBuildVerifier(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
 
         var workOnBaseItem = NewItem("main") with { BaseBranch = "main" };
         var repoId = await gitHost.EnsureRepositoryAsync(workOnBaseItem.Id, seed, workOnBaseItem.BaseBranch);
@@ -885,8 +875,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var emptyVerifier = new SandboxRequiredBuildVerifier(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             emptyHost,
-            new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+            new PipelineOptions { SandboxImageReference = "ignored" });
         var emptyItem = NewItem("main") with { BaseBranch = "main" };
         var emptyRepoId = await emptyHost.EnsureRepositoryAsync(emptyItem.Id, emptySeed, emptyItem.BaseBranch);
         var notApplyingProbe = await emptyVerifier.ProbeAsync(new RequiredBuildProbeRequest
@@ -1067,6 +1056,226 @@ public sealed class RequiredBuildGateTests : IDisposable
             $"expected the timeout test to call VerifyAsync at least once; observed {hangingVerifier.VerifyCalls}");
         Assert.True(hangingVerifier.ObservedCancellation,
             "verifier never observed cancellation, so the timeout token was not linked into VerifyAsync");
+    }
+
+    [Fact]
+    public async Task AuditPass_CannotReachAuditPassed_WhenWorkBranchDeletesOnlyPlainSourceCsproj()
+    {
+        // Covers the (baseHasMarkers && !workHasMarkers) half of the
+        // applicability decision: base carries ONLY a plain source .csproj
+        // (no .sln/.slnx, no test project — so IsRequiredBaseMarkerPath
+        // returns false for the deleted file and `missingRequired` is empty).
+        // A regression that drops the second half of the OR would let this
+        // case slip the gate silently. We assert it still fails.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddCsprojOnlyMarkerAsync(seed);
+        var fakeDotnet = await CreateFlexibleFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/deletes-plain-csproj") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await DeleteFromBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "delete the only plain source csproj",
+            "src/Solo/Solo.csproj");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("required build failed", final.LastError);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+    }
+
+    [Fact]
+    public async Task RequiredBuildGate_DefaultBaseFallback_VerifierResolvesDefaultBranchWhenBaseBranchOmitted()
+    {
+        // BaseBranch null/blank on the probe/verify request must trigger
+        // GetDefaultBranchAsync resolution before marker comparison. A
+        // regression that validated null, skipped the fallback, or compared
+        // against the wrong base would not have been caught by tests that
+        // always pass an explicit BaseBranch.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var recordingHost = new RecordingDefaultBranchGitHost(gitHost);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            recordingHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/default-base-fallback") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            gitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        var probe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = null,
+            WorkBranch = item.WorkBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.Applies, probe.Status);
+        Assert.True(recordingHost.GetDefaultBranchCalls >= 1,
+            $"expected the verifier to call GetDefaultBranchAsync when BaseBranch was null; observed {recordingHost.GetDefaultBranchCalls}");
+
+        recordingHost.GetDefaultBranchCalls = 0;
+        var verifyResult = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = null,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, verifyResult.Status);
+        Assert.True(recordingHost.GetDefaultBranchCalls >= 1,
+            $"expected VerifyAsync to resolve the default branch when BaseBranch was null; observed {recordingHost.GetDefaultBranchCalls}");
+    }
+
+    [Fact]
+    public async Task RequiredBuildGate_VerifyAsync_PropagatesSandboxPolicyToSandboxSpec()
+    {
+        // The orchestrator pre-resolves the audit-tool network profile and
+        // baseline image ref and hands them to the verifier through
+        // RequiredBuildSandboxPolicy. The verifier must forward those onto
+        // the SandboxSpec it asks the provider to materialise — otherwise
+        // the required build runs in the wrong network profile / baseline.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var capturingProvider = new SpecCapturingSandboxProvider(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+        var verifier = new SandboxRequiredBuildVerifier(
+            capturingProvider,
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/policy-propagates") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            gitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy
+            {
+                NetworkProfile = "audit-tool-test-profile",
+                BaselineImageRef = "baseline-pin:abcdef0123",
+            },
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        var spec = Assert.Single(capturingProvider.CapturedSpecs);
+        Assert.Equal("audit-tool-test-profile", spec.Network.ProfileName);
+        Assert.Equal("baseline-pin:abcdef0123", spec.BaselineImageRef);
+    }
+
+    [Fact]
+    public async Task RequiredBuildGate_DotnetNotFound_PersistsAuditReportWithOutputViaOrchestrator()
+    {
+        // The Unavailable-with-output report-persistence branch:
+        // verifier hit dotnet-not-found (or no-target), so result.Status is
+        // Unavailable but result.Output carries the script's stderr. The
+        // canonical persistence path must still write an AuditReport so
+        // operators can see why the build gate could not run. A regression
+        // that dropped this branch (e.g. by treating any Unavailable as
+        // "do not persist") would let infra-degradation findings vanish.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateUnavailableDotnetAsync();
+        var captureStore = new CapturingAuditReportStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new PassingAuditor()],
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            auditReportStore: captureStore);
+
+        var item = NewItem("feature/dotnet-not-found-report") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+
+        var report = Assert.Single(
+            captureStore.Reports,
+            r => r.AuditorName == RequiredBuildGateIdentity.AuditorName);
+        Assert.Equal("shell", report.AuditorKind);
+        Assert.Empty(report.Findings);
+        Assert.NotNull(report.RawOutput);
+        Assert.Contains("dotnet is not available", report.RawOutput);
+    }
+
+    private sealed class RecordingDefaultBranchGitHost(IGitHost inner) : DelegatingGitHost(inner)
+    {
+        public int GetDefaultBranchCalls;
+
+        public override Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref GetDefaultBranchCalls);
+            return Inner.GetDefaultBranchAsync(repositoryId, ct);
+        }
+    }
+
+    private sealed class SpecCapturingSandboxProvider(ISandboxProvider inner) : ISandboxProvider
+    {
+        public List<SandboxSpec> CapturedSpecs { get; } = [];
+
+        public string Name => inner.Name;
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            CapturedSpecs.Add(spec);
+            return await inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => inner.DisposeLeakedAsync(name, ct);
     }
 
     /// <summary>
@@ -1573,6 +1782,11 @@ public sealed class RequiredBuildGateTests : IDisposable
     {
         public override Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
             => throw new InvalidOperationException(message);
+
+        public override Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+            string repositoryId, string treeish, IReadOnlyList<string> filenameSuffixes,
+            int maxResults, CancellationToken ct = default)
+            => throw new InvalidOperationException(message);
     }
 
     private sealed class BrokenIsolatedCloneGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
@@ -1634,6 +1848,10 @@ public sealed class RequiredBuildGateTests : IDisposable
             => Inner.ReadTextFileAsync(repositoryId, treeish, path, ct);
         public virtual Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
             => Inner.ListFilesAsync(repositoryId, treeish, pathPrefix, ct);
+        public virtual Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+            string repositoryId, string treeish, IReadOnlyList<string> filenameSuffixes,
+            int maxResults, CancellationToken ct = default)
+            => Inner.ListFilesEndingWithAsync(repositoryId, treeish, filenameSuffixes, maxResults, ct);
         public virtual Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(string repositoryId, string fromTreeish, string toTreeish, CancellationToken ct = default)
             => Inner.GetChangedPathsAsync(repositoryId, fromTreeish, toTreeish, ct);
         public virtual Task<string> GetUnifiedDiffAsync(string repositoryId, string fromTreeish, string toTreeish, string path, CancellationToken ct = default)

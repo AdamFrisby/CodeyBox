@@ -3519,50 +3519,69 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
-        try
-        {
-            const int MaxRawBytes = 256 * 1024;
-            string? rawOutput = null;
-            if (!string.IsNullOrEmpty(result.Output))
-            {
-                var redacted = RawOutputRedactor.Redact(result.Output);
-                rawOutput = RawOutputRedactor.TruncateToBytes(redacted, MaxRawBytes);
-            }
+        // Adapt the build verifier's result into the canonical AuditResult
+        // shape and persist via the same path normal auditors use. This keeps
+        // RawOutput redaction/truncation, finding-id computation, and store
+        // wiring single-sourced — future audit-pipeline changes only have to
+        // be made in one place.
+        var auditResult = ToBuildAuditResult(result);
+        var ctxForReport = new AuditContext(
+            WorkItemId: workItemId,
+            WorkBranch: string.Empty,
+            BaseBranch: string.Empty,
+            Iteration: iteration,
+            OriginalPrompt: string.Empty);
+        await PersistAuditReportAsync(
+            ctxForReport,
+            RequiredBuildAuditorAdapter.Instance,
+            auditResult,
+            startedAt,
+            elapsed,
+            ct);
+    }
 
-            var isFailure = result.Status == RequiredBuildVerificationStatus.Failed;
-            var findings = isFailure
-                ? new List<AuditReportFinding>
-                {
-                    new(
-                        FindingIdComputer.Compute(RequiredBuildGateIdentity.AuditorName, "required build failed", []),
-                        AuditSeverity.Error.ToString(),
-                        $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-                        $"Required build exited with code {result.ExitCode}.",
-                        [],
-                        []),
-                }
-                : new List<AuditReportFinding>();
-            var report = new AuditReport
+    private static AuditResult ToBuildAuditResult(RequiredBuildVerificationResult result)
+    {
+        var isFailure = result.Status == RequiredBuildVerificationStatus.Failed;
+        var findings = isFailure
+            ? new AuditFinding[]
             {
-                Id = Guid.NewGuid().ToString(),
-                WorkItemId = workItemId.ToString(),
-                Iteration = iteration,
-                AuditorName = RequiredBuildGateIdentity.AuditorName,
-                AuditorKind = "shell",
-                WorstSeverity = isFailure ? AuditSeverity.Error.ToString() : "none",
-                StartedAt = startedAt,
-                EndedAt = startedAt + elapsed,
-                DurationMs = (long)elapsed.TotalMilliseconds,
-                Findings = findings,
-                RawOutput = rawOutput,
-            };
-            await _auditReports.CreateAsync(report, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // Non-fatal: audit report persistence must never abort the pipeline.
-            _log.LogWarning(ex, "Failed to persist required build audit report for work item {WorkItemId}", workItemId);
-        }
+                new(
+                    AuditorName: RequiredBuildGateIdentity.AuditorName,
+                    Severity: AuditSeverity.Error,
+                    Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
+                    Description: $"Required build exited with code {result.ExitCode}."),
+            }
+            : Array.Empty<AuditFinding>();
+        return new AuditResult(
+            Passed: !isFailure,
+            Findings: findings,
+            RawOutput: string.IsNullOrEmpty(result.Output) ? null : result.Output);
+    }
+
+    /// <summary>
+    /// Persistence-only adapter exposing the build gate's identity to the
+    /// canonical <see cref="PersistAuditReportAsync"/> code path. The build
+    /// verifier owns execution; this adapter exists solely so the persisted
+    /// AuditReport carries the same auditor name / kind every other auditor
+    /// uses and goes through the same redaction / finding-id wiring.
+    /// </summary>
+    private sealed class RequiredBuildAuditorAdapter : IAuditor
+    {
+        public static readonly RequiredBuildAuditorAdapter Instance = new();
+        private RequiredBuildAuditorAdapter() { }
+
+        public string Name => RequiredBuildGateIdentity.AuditorName;
+        public string Kind => "shell";
+        public AuditCapabilities Required => AuditCapabilities.None;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+            => throw new NotSupportedException(
+                "RequiredBuildAuditorAdapter is a persistence-only adapter; the build verifier owns execution.");
     }
 
     /// <summary>

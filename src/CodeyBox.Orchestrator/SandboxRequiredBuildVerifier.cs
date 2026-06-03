@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 
@@ -12,10 +11,24 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 {
-    public const string AuditorName = RequiredBuildGateIdentity.AuditorName;
-    public const string DisplayCommand = RequiredBuildGateIdentity.DisplayCommand;
-
     private const int OutputMaxBytes = 16 * 1024;
+
+    // Filename suffixes that identify .NET build markers. The host streams
+    // ls-tree output line-by-line and only keeps paths whose final filename
+    // ends with one of these, so a tree containing millions of non-.NET files
+    // does not consume unbounded memory in the orchestrator.
+    private static readonly string[] DotnetMarkerSuffixes =
+    [
+        ".sln",
+        ".slnx",
+        ".csproj",
+    ];
+
+    // Upper bound on .NET marker paths the probe will inspect per branch.
+    // Real-world monorepos with thousands of projects fit; anything larger is
+    // treated as a tree we cannot safely inspect (the gate falls back to
+    // Unavailable rather than partial-data).
+    private const int MaxDotnetMarkerPathsPerBranch = 8192;
     // POSIX shells conventionally use 127 for "command not found".
     private const int DotnetCommandNotFoundExitCode = 127;
     // Internal BuildScript sentinel: marker inspection said this gate applies,
@@ -74,18 +87,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
-    private readonly ILogger<SandboxRequiredBuildVerifier> _log;
 
     public SandboxRequiredBuildVerifier(
         ISandboxProvider sandboxes,
         IGitHost gitHost,
-        PipelineOptions pipelineOptions,
-        ILogger<SandboxRequiredBuildVerifier> log)
+        PipelineOptions pipelineOptions)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
-        _log = log;
     }
 
     public async Task<RequiredBuildProbeResult> ProbeAsync(
@@ -177,7 +187,17 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     {
         try
         {
-            return await _gitHost.ListFilesAsync(repositoryId, branch, pathPrefix: null, ct);
+            // Streamed, suffix-filtered ls-tree: the host reads ls-tree output
+            // line-by-line and only retains paths whose filename ends with a
+            // .NET marker suffix. A capped result count guards against trees
+            // with an unbounded number of markers (defensive: real codebases
+            // fit comfortably under the cap).
+            return await _gitHost.ListFilesEndingWithAsync(
+                repositoryId,
+                branch,
+                DotnetMarkerSuffixes,
+                MaxDotnetMarkerPathsPerBranch,
+                ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException)
         {

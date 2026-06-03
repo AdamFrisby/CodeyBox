@@ -338,6 +338,55 @@ public interface IGitHost
     Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side file listing.");
 
+    /// <summary>
+    /// Returns repository-relative paths in <paramref name="treeish"/> whose final
+    /// filename ends (case-insensitive) with any of <paramref name="filenameSuffixes"/>.
+    /// Production implementations should stream the underlying tree listing and
+    /// filter line by line so a huge tree cannot consume unbounded host memory.
+    /// Stops accumulating once <paramref name="maxResults"/> matches have been
+    /// collected and throws if any additional matches exist, so callers can treat
+    /// the tree as too large to safely inspect rather than silently returning
+    /// partial data.
+    ///
+    /// <para>The default implementation falls back to <see cref="ListFilesAsync"/>
+    /// and filters client-side — convenient for hosts that don't need the streaming
+    /// bound (e.g. test fakes) but still gives callers the same cap semantics.
+    /// Hosts that talk to real git (where unbounded memory IS a concern) override
+    /// this with a streaming implementation.</para>
+    /// </summary>
+    async Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+        string repositoryId,
+        string treeish,
+        IReadOnlyList<string> filenameSuffixes,
+        int maxResults,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(filenameSuffixes);
+        if (filenameSuffixes.Count == 0)
+            throw new ArgumentException("at least one filename suffix is required", nameof(filenameSuffixes));
+        if (maxResults <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxResults), maxResults, "must be positive");
+
+        var all = await ListFilesAsync(repositoryId, treeish, pathPrefix: null, ct);
+        var matches = new List<string>();
+        foreach (var p in all)
+        {
+            var ok = false;
+            foreach (var s in filenameSuffixes)
+            {
+                if (p.EndsWith(s, StringComparison.OrdinalIgnoreCase)) { ok = true; break; }
+            }
+            if (!ok) continue;
+            if (matches.Count >= maxResults)
+            {
+                throw new InvalidOperationException(
+                    $"tree listing produced more than {maxResults} matching paths (output cap exceeded)");
+            }
+            matches.Add(p);
+        }
+        return matches;
+    }
+
     /// <summary>Returns name-status changes between two commits or trees in the host bare repo.</summary>
     Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
         string repositoryId,

@@ -643,6 +643,110 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
+    public async Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+        string repositoryId,
+        string treeish,
+        IReadOnlyList<string> filenameSuffixes,
+        int maxResults,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(filenameSuffixes);
+        if (filenameSuffixes.Count == 0)
+            throw new ArgumentException("at least one filename suffix is required", nameof(filenameSuffixes));
+        if (maxResults <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxResults), maxResults, "must be positive");
+
+        var suffixes = new string[filenameSuffixes.Count];
+        for (var i = 0; i < filenameSuffixes.Count; i++)
+        {
+            var s = filenameSuffixes[i];
+            if (string.IsNullOrWhiteSpace(s))
+                throw new ArgumentException("filename suffix entries must be non-empty", nameof(filenameSuffixes));
+            suffixes[i] = s;
+        }
+
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = path,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add($"core.hooksPath={_disabledHooksPath}");
+        psi.ArgumentList.Add("ls-tree");
+        psi.ArgumentList.Add("-r");
+        psi.ArgumentList.Add("--name-only");
+        psi.ArgumentList.Add(treeish);
+
+        using var p = new System.Diagnostics.Process { StartInfo = psi };
+        p.Start();
+
+        var results = new List<string>(Math.Min(64, maxResults));
+        var capExceeded = false;
+        try
+        {
+            while (true)
+            {
+                var line = await p.StandardOutput.ReadLineAsync(ct);
+                if (line is null) break;
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0) continue;
+                if (!EndsWithAnySuffix(trimmed, suffixes)) continue;
+                if (results.Count >= maxResults)
+                {
+                    capExceeded = true;
+                    break;
+                }
+                results.Add(trimmed);
+            }
+        }
+        finally
+        {
+            if (capExceeded)
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            }
+        }
+
+        string stderr;
+        try
+        {
+            stderr = await p.StandardError.ReadToEndAsync(CancellationToken.None);
+        }
+        catch
+        {
+            stderr = string.Empty;
+        }
+        await p.WaitForExitAsync(CancellationToken.None);
+
+        if (capExceeded)
+        {
+            throw new InvalidOperationException(
+                $"git ls-tree '{treeish}' produced more than {maxResults} matching paths (output cap exceeded)");
+        }
+
+        if (p.ExitCode != 0)
+            throw new InvalidOperationException($"git ls-tree '{treeish}' failed: {stderr}");
+
+        return results;
+    }
+
+    private static bool EndsWithAnySuffix(string path, IReadOnlyList<string> suffixes)
+    {
+        foreach (var s in suffixes)
+        {
+            if (path.EndsWith(s, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     public async Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
         string repositoryId,
         string fromTreeish,

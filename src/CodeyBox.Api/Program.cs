@@ -455,8 +455,7 @@ builder.Services.AddSingleton<IPreMergeVerifier>(sp => new LocalGitPreMergeVerif
 builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredBuildVerifier(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
-    sp.GetRequiredService<PipelineOptions>(),
-    sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>()));
+    sp.GetRequiredService<PipelineOptions>()));
 
 // --- Pull request service (in-memory by default) -----------------------------
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();

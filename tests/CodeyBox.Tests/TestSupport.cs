@@ -189,8 +189,7 @@ internal static class TestSupport
             requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
                 sandboxes,
                 gitHost,
-                resolvedOptions,
-                NullLogger<SandboxRequiredBuildVerifier>.Instance));
+                resolvedOptions));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }
