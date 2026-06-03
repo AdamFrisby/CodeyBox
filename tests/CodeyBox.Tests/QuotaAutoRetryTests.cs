@@ -387,6 +387,140 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_StartupRearm_RequeuedItemDispatchesThroughStaleQuotaState()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var failuresDb = Path.Combine(_workspace, "quota-failures-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        using var quotaFailures = new SqliteQuotaFailureStore(failuresDb);
+        var projectId = new ProjectId("test-project");
+        await quotaFailures.RecordAsync(
+            AgentKind.Claude,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            _time.Now,
+            CancellationToken.None);
+
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "startup-recent-failure-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var member = new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 };
+        var probe = new MutableProbe(AgentKind.Claude, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "startup-recent-failure-class",
+                    DisplayName = "Startup Recent Failure",
+                    Members = [member],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10,
+                ObservedFailureWindow = TimeSpan.FromMinutes(10),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaFailures: quotaFailures);
+        router.MarkExhausted(member, TimeSpan.FromMinutes(30));
+
+        var blockedWithoutRetryAdmission = await router.ResolveAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "blocked",
+            Prompt = "p",
+            AgentClassId = "startup-recent-failure-class",
+        }, project, CancellationToken.None);
+        Assert.True(blockedWithoutRetryAdmission.ShouldWait);
+        Assert.Null(blockedWithoutRetryAdmission.Chosen);
+        Assert.Equal(0, probe.CallCount);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "startup-recent-failure-class",
+            NextQuotaRetryAt = _time.Now.AddHours(1),
+        };
+        await store.CreateAsync(item);
+
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+                MaxConcurrentWorkers = 1,
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var requeued = await WaitForAttemptsAsync(store, item.Id, expectedAttempts: 1, TimeSpan.FromSeconds(10));
+            Assert.Equal(WorkItemState.Queued, requeued.State);
+
+            using var registry = new CancellationRegistry(CancellationToken.None);
+            var tracking = new AgentTrackingPipeline(store);
+            using var orchestrator = new OrchestratorService(
+                taskQueue,
+                store,
+                tracking,
+                registry,
+                new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+                NullLogger<OrchestratorService>.Instance,
+                router,
+                projects);
+
+            await orchestrator.StartAsync(CancellationToken.None);
+            try
+            {
+                await WaitForConditionAsync(
+                    () => tracking.LastAgent == AgentKind.Claude,
+                    TimeSpan.FromSeconds(5));
+            }
+            finally
+            {
+                await orchestrator.StopAsync(CancellationToken.None);
+            }
+
+            Assert.Equal(AgentKind.Claude, tracking.LastAgent);
+            Assert.True(probe.CallCount >= 2);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Scheduler_RequeuedWaitingItemDispatchesThroughStaleQuotaState()
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -1301,6 +1435,32 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var retried = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var tracking = new AgentTrackingPipeline(store);
+        using var orchestrator = new OrchestratorService(
+            taskQueue,
+            store,
+            tracking,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects);
+
+        await orchestrator.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitForConditionAsync(
+                () => tracking.LastAgent == AgentKind.Claude,
+                TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(AgentKind.Claude, tracking.LastAgent);
     }
 
     [Fact]
@@ -1627,6 +1787,75 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
         Assert.Equal(WorkItemState.Queued, retried.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Router_QuotaRetryAdmissionIsConsumedWhenDispatchProbeDenies()
+    {
+        var failuresDb = Path.Combine(_workspace, "quota-failures-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var quotaFailures = new SqliteQuotaFailureStore(failuresDb);
+        var projectId = new ProjectId("test-project");
+        await quotaFailures.RecordAsync(
+            AgentKind.Claude,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            _time.Now,
+            CancellationToken.None);
+
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "admission-denial-class",
+        };
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.Queued,
+            AgentClassId = "admission-denial-class",
+        };
+        var probe = new MutableProbe(AgentKind.Claude, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "admission-denial-class",
+                    DisplayName = "Admission Denial",
+                    Members =
+                    [
+                        new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    ],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10,
+                ObservedFailureWindow = TimeSpan.FromMinutes(10),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaFailures: quotaFailures);
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(item, project, CancellationToken.None);
+        Assert.False(retryDecision.ShouldWait);
+        Assert.Equal(1, probe.CallCount);
+
+        probe.AvailablePct = 0;
+        var deniedDispatch = await router.ResolveAsync(item, project, CancellationToken.None);
+        Assert.True(deniedDispatch.ShouldWait);
+        Assert.Null(deniedDispatch.Chosen);
+        Assert.Equal(2, probe.CallCount);
+
+        probe.AvailablePct = 80;
+        var blockedAfterAdmissionConsumed = await router.ResolveAsync(item, project, CancellationToken.None);
+        Assert.True(blockedAfterAdmissionConsumed.ShouldWait);
+        Assert.Null(blockedAfterAdmissionConsumed.Chosen);
+        Assert.Equal(2, probe.CallCount);
     }
 
     [Fact]

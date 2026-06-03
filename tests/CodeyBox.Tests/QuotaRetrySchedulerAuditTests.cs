@@ -159,7 +159,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
-    public async Task RearmTimers_WaitingItemAtMaxRetriesUsesRetryCapOnStartup()
+    public async Task RearmTimers_WaitingItemAtMaxRetriesRequeuesOnStartup()
     {
         using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
         var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
@@ -173,13 +173,13 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         var stored = await fixture.Store.GetAsync(item.Id);
         Assert.NotNull(stored);
-        Assert.Equal(WorkItemState.Failed, stored!.State);
-        Assert.Equal("quota", stored.FailureKind);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Null(stored.FailureKind);
         Assert.Null(stored.NextQuotaRetryAt);
-        Assert.Equal(3, stored.QuotaRetryAttempts);
+        Assert.Equal(4, stored.QuotaRetryAttempts);
 
-        var evt = AssertQuotaAttempt(item, "startup", "skipped:max-retries", "WaitingForQuotaReset");
-        Assert.Equal("attempts=3; max=3", GetScalar<string>(evt, "Reason"));
+        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
+        Assert.Equal("from=work", GetScalar<string>(evt, "Reason"));
     }
 
     [Fact]
@@ -440,9 +440,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     {
         var first = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
         using var fixture = BuildScheduler(
-            BuildRouter(availablePct: 100),
-            BuildProjects(),
-            taskQueue: new ThrowingForWorkItemQueue(first.Id));
+            new ThrowingForWorkItemQuotaRetryRouter(first.Id),
+            BuildProjects());
         var later = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
         await fixture.Store.CreateAsync(first);
         await fixture.Store.CreateAsync(later);
@@ -455,11 +454,34 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         var laterStored = await fixture.Store.GetAsync(later.Id);
         Assert.Equal(WorkItemState.Queued, laterStored!.State);
         Assert.Equal(1, laterStored.QuotaRetryAttempts);
-        Assert.Contains(
-            "queue enqueue failed after state update; rolled back to WaitingForQuotaReset",
-            GetScalar<string>(AssertQuotaAttempt(first, "startup", "retry-failed", "WaitingForQuotaReset"), "Reason"),
-            StringComparison.Ordinal);
+        Assert.Equal(
+            "startup router failed",
+            GetScalar<string>(AssertQuotaAttempt(first, "startup", "error", "WaitingForQuotaReset"), "Reason"));
         Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
+    public async Task RearmTimers_AuditsRollbackNotAppliedWhenQueueFailureRacesState()
+    {
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        var queue = new StateChangingThrowingQueue(item.Id);
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            BuildProjects(),
+            taskQueue: queue);
+        queue.Store = fixture.Store;
+        await fixture.Store.CreateAsync(item);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Working, stored!.State);
+        Assert.Equal(1, stored.QuotaRetryAttempts);
+        Assert.Contains(
+            "queue enqueue failed after state update and rollback did not apply",
+            GetScalar<string>(AssertQuotaAttempt(item, "startup", "retry-failed", "WaitingForQuotaReset"), "Reason"),
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -543,7 +565,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             NullLogger<AgentClassRouter>.Instance);
 
     private SchedulerFixture BuildScheduler(
-        AgentClassRouter? router,
+        IQuotaRetryRouter? router,
         IProjectRepository? projects,
         IQueueController? queueController = null,
         IWebhookDispatcher? webhooks = null,
@@ -765,6 +787,70 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
             => _inner.DequeueAsync(ct);
+    }
+
+    private sealed class StateChangingThrowingQueue : ITaskQueue
+    {
+        private readonly WorkItemId _throwFor;
+        private readonly InMemoryTaskQueue _inner = new();
+
+        public StateChangingThrowingQueue(WorkItemId throwFor) => _throwFor = throwFor;
+
+        public SqliteWorkItemStore? Store { get; set; }
+
+        public int Count => _inner.Count;
+
+        public async ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+        {
+            if (id == _throwFor)
+            {
+                var store = Store ?? throw new InvalidOperationException("store not configured");
+                var current = await store.GetAsync(id, ct);
+                if (current is not null)
+                {
+                    var pickedUp = current with
+                    {
+                        State = WorkItemState.Working,
+                        StartedAt = DateTimeOffset.UtcNow,
+                    };
+                    await store.TryUpdateIfStateAsync(pickedUp, WorkItemState.Queued, CancellationToken.None);
+                }
+
+                throw new InvalidOperationException("queue enqueue failed");
+            }
+
+            await _inner.EnqueueAsync(id, ct);
+        }
+
+        public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
+            => _inner.DequeueAsync(ct);
+    }
+
+    private sealed class ThrowingForWorkItemQuotaRetryRouter : IQuotaRetryRouter
+    {
+        private readonly WorkItemId _throwFor;
+
+        public ThrowingForWorkItemQuotaRetryRouter(WorkItemId throwFor) => _throwFor = throwFor;
+
+        public Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct)
+        {
+            if (item.Id == _throwFor)
+                throw new InvalidOperationException("startup router failed");
+
+            return Task.FromResult(new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: false,
+                Reason: "test admission allowed"));
+        }
+
+        public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct)
+            => Task.FromResult<DateTimeOffset?>(null);
     }
 
     private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher

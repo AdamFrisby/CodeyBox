@@ -317,6 +317,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         // Step 2: compute effective scores (base + TOD modifier).
         var nowUtc = _time.GetUtcNow();
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
         var scored = eligible.Select(x => new ScoredMember(
             Member: x.Member,
             BaseScore: x.Member.QualityScore,
@@ -956,14 +957,25 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private void RecordQuotaRetryAdmission(WorkItem item, AgentMembership member)
     {
+        var nowUtc = _time.GetUtcNow();
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
         var ttl = _opts.ObservedFailureWindow > TimeSpan.Zero
             ? _opts.ObservedFailureWindow
             : TimeSpan.FromMinutes(1);
         var admission = new QuotaRetryAdmission(
             member.Agent,
             member.ModelId ?? string.Empty,
-            _time.GetUtcNow() + ttl);
+            nowUtc + ttl);
         _quotaRetryAdmissions[item.Id] = admission;
+    }
+
+    private void PruneExpiredQuotaRetryAdmissions(DateTimeOffset nowUtc)
+    {
+        foreach (var entry in _quotaRetryAdmissions)
+        {
+            if (entry.Value.ExpiresAt <= nowUtc)
+                _quotaRetryAdmissions.TryRemove(entry);
+        }
     }
 
     private QuotaRetryAdmission? GetQuotaRetryAdmission(WorkItemId itemId, DateTimeOffset nowUtc)

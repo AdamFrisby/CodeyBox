@@ -29,7 +29,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
     private readonly ILogger<QuotaRetryScheduler> _log;
+    private readonly CancellationTokenSource _quotaUsableSweepCts = new();
+    private readonly object _quotaUsableSweepLock = new();
+    private Task? _quotaUsableSweepTask;
     private int _quotaUsableSweepScheduled;
+    private int _disposed;
 
     // Active timers for targeted wakeups. Key = WorkItemId.
     private readonly ConcurrentDictionary<WorkItemId, ITimer> _targetedTimers = new();
@@ -260,24 +264,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                 _log.LogInformation("Quota auto-retry is disabled; skipping startup retry for work item {Id}", item.Id);
                 outcome = new QuotaRetryAttemptResult("skipped:auto-retry-disabled");
             }
-            else if (item.QuotaRetryAttempts >= retryOptions.MaxAutoRetriesPerWorkItem)
-            {
-                if (item.State == WorkItemState.WaitingForQuotaReset)
-                {
-                    outcome = await TransitionWaitingItemAtRetryCapAsync(item, retryOptions, ct);
-                }
-                else
-                {
-                    outcome = new QuotaRetryAttemptResult("skipped:max-retries",
-                        $"attempts={item.QuotaRetryAttempts}; max={retryOptions.MaxAutoRetriesPerWorkItem}");
-                }
-            }
             else
             {
                 // Startup is the escape hatch for persisted WaitingForQuotaReset rows:
                 // every parked item is put back on the queue so dispatch evaluates
-                // current agent availability from scratch. Preserve the saved phase
-                // rather than forcing from=work.
+                // current agent availability from scratch, even when the row is
+                // already at the periodic auto-retry cap. The router preflight is
+                // advisory: it records the short-lived quota-retry admission that
+                // lets the subsequent dispatch bypass stale local quota suppression,
+                // but it does not block the unconditional startup requeue.
+                item = await PrepareStartupQuotaRetryAdmissionAsync(item, ct);
+                // Preserve the saved phase rather than forcing from=work.
                 outcome = await PerformRetryAsync(item, "startup", ct);
             }
 
@@ -293,6 +290,32 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             AuditLog.QuotaRetryAttempted(item.Id, "startup", "error", item.State.ToString(), ex.Message);
             throw;
         }
+    }
+
+    private async Task<WorkItem> PrepareStartupQuotaRetryAdmissionAsync(WorkItem item, CancellationToken ct)
+    {
+        if (_router is null || _projects is null)
+            return item;
+
+        var project = await _projects.GetAsync(item.ProjectId, ct);
+        if (project is null)
+            return item;
+
+        if (item.BaselineImageRef is null)
+        {
+            var pinnedRef = ResolveBaselineRefForRetry(item, project);
+            if (pinnedRef is not null)
+                item = item with { BaselineImageRef = pinnedRef };
+        }
+
+        var decision = await _router.ResolveQuotaRetryAsync(item, project, ct);
+        _log.LogDebug(
+            "Quota retry startup preflight for work item {Id}: shouldWait={ShouldWait} noEligible={NoEligible} reason={Reason}",
+            item.Id,
+            decision.ShouldWait,
+            decision.NoEligibleMembers,
+            decision.Reason);
+        return item;
     }
 
     // The periodic sweep is the safety net: it walks every Failed/quota item
@@ -364,24 +387,37 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     {
         if (!CurrentRetryOptions.Enabled)
             return;
+        if (Volatile.Read(ref _disposed) == 1)
+            return;
+        if (_quotaUsableSweepCts.IsCancellationRequested)
+            return;
         if (Interlocked.Exchange(ref _quotaUsableSweepScheduled, 1) == 1)
             return;
 
-        _ = Task.Run(async () =>
+        var task = Task.Run(() => RunQuotaUsableWakeUpSweepAsync(_quotaUsableSweepCts.Token));
+        lock (_quotaUsableSweepLock)
         {
-            try
-            {
-                await RunPeriodicSweepAsync(CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Error during quota-usable wake-up sweep");
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _quotaUsableSweepScheduled, 0);
-            }
-        });
+            _quotaUsableSweepTask = task;
+        }
+    }
+
+    private async Task RunQuotaUsableWakeUpSweepAsync(CancellationToken ct)
+    {
+        try
+        {
+            await RunPeriodicSweepAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error during quota-usable wake-up sweep");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _quotaUsableSweepScheduled, 0);
+        }
     }
 
     private void OnTargetedTimerFired(object? state)
@@ -694,8 +730,53 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             _log.LogError(ex, "Error updating NextQuotaRetryAt for work item {Id}", item.Id);
         }
     }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _quotaUsableSweepCts.Cancel();
+        await base.StopAsync(cancellationToken);
+
+        Task? wakeUpSweep;
+        lock (_quotaUsableSweepLock)
+        {
+            wakeUpSweep = _quotaUsableSweepTask;
+        }
+
+        if (wakeUpSweep is null)
+            return;
+
+        try
+        {
+            await wakeUpSweep.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _quotaUsableSweepCts.IsCancellationRequested)
+        {
+        }
+    }
+
     public override void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
+        _quotaUsableSweepCts.Cancel();
+        Task? wakeUpSweep;
+        lock (_quotaUsableSweepLock)
+        {
+            wakeUpSweep = _quotaUsableSweepTask;
+        }
+
+        if (wakeUpSweep is not null)
+        {
+            try
+            {
+                wakeUpSweep.GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException) when (_quotaUsableSweepCts.IsCancellationRequested)
+            {
+            }
+        }
+
         if (_quotaAvailabilitySignal is not null)
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed -= OnQuotaUsableThresholdCrossed;
         foreach (var timer in _targetedTimers.Values)
@@ -703,6 +784,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             timer.Dispose();
         }
         _targetedTimers.Clear();
+        _quotaUsableSweepCts.Dispose();
         base.Dispose();
     }
 }
