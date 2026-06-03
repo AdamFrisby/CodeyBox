@@ -34,6 +34,14 @@ public sealed class WorkerPoolHealthWatchdogOptions
     public int MaxRecoveryEnqueueBatchSize { get; set; } = 32;
 
     /// <summary>
+    /// Maximum number of persisted candidates to inspect while deciding whether
+    /// runnable work exists. Kept separate from the recovery enqueue batch so
+    /// a small recovery kick cannot hide lower-priority routable work behind
+    /// unroutable top-priority items.
+    /// </summary>
+    public int MaxHealthCheckCandidateScan { get; set; } = 256;
+
+    /// <summary>
     /// Delay after a recovery attempt before the watchdog re-evaluates the pool
     /// to decide whether escalation is needed. Default 5 s.
     /// </summary>
@@ -65,6 +73,10 @@ public sealed class WorkerPoolHealthWatchdogOptions
         if (MaxRecoveryEnqueueBatchSize <= 0)
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerPoolHealthWatchdog:MaxRecoveryEnqueueBatchSize ({MaxRecoveryEnqueueBatchSize}) must be > 0.");
+
+        if (MaxHealthCheckCandidateScan <= 0)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerPoolHealthWatchdog:MaxHealthCheckCandidateScan ({MaxHealthCheckCandidateScan}) must be > 0.");
 
         if (RecoveryVerificationDelay < TimeSpan.Zero)
             throw new InvalidOperationException(

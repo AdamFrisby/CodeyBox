@@ -169,6 +169,18 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.False(result.Failed, result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsInvalidWorkerPoolHealthWatchdogOptions()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.WorkerPoolHealthWatchdog.MaxHealthCheckCandidateScan = 0;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:WorkerPoolHealthWatchdog:MaxHealthCheckCandidateScan", result.FailureMessage);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 

@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IWorkerPoolHealthSource, IAgentCapacitySnapshot
 {
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -252,6 +252,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return opts.Members.TryGetValue(agent.Value, out var entry) && entry is { MaxConcurrent: > 0 }
             ? entry.MaxConcurrent
             : 0;
+    }
+
+    public bool HasCapacity(AgentKind agent)
+    {
+        var cap = GetAgentCap(agent);
+        return cap <= 0 || GetRunning(agent) < cap;
     }
 
     /// <summary>
@@ -756,45 +762,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static WorkItem? BuildGracefulShutdownRecoveryState(WorkItem item)
-    {
-        if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
-            return null;
-
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
-            && item.State is WorkItemState.Working or WorkItemState.Reworking)
-        {
-            return item with
-            {
-                StartedAt = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            };
-        }
-
-        WorkItemState? target = item.State switch
-        {
-            WorkItemState.Working => WorkItemState.Queued,
-            WorkItemState.Reworking => WorkItemState.Queued,
-            WorkItemState.Auditing => WorkItemState.WorkComplete,
-            WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
-            WorkItemState.Merging => WorkItemState.AuditPassed,
-            WorkItemState.UpstreamPushing => WorkItemState.Merged,
-            WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged => item.State,
-            _ => null,
-        };
-
-        if (target is null)
-            return null;
-
-        var error = target == WorkItemState.Queued
-            ? $"graceful shutdown drain timed out while item was {item.State}; re-queued for a fresh run"
-            : null;
-
-        return item.With(target.Value, error) with
-        {
-            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
-            UpdatedAt = DateTimeOffset.UtcNow,
-        };
-    }
+        => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(item, DateTimeOffset.UtcNow);
 
     /// <summary>
     /// Walks dispatch-eligible non-terminal items by priority order and returns
@@ -871,6 +839,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // starting the full worker loop.
     internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
     internal WorkItem? TryBuildRecoveredStateForTest(WorkItem item) => TryBuildRecoveredState(item);
+    internal WorkItem? BuildGracefulShutdownRecoveryStateForTest(WorkItem item) =>
+        BuildGracefulShutdownRecoveryState(item);
 
     // Exposed as internal so tests can verify the deferred-pickup contract
     // without spinning the BackgroundService: PickNextEligibleAsync must skip
@@ -880,17 +850,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
 
-    internal async Task<IReadOnlyList<WorkItem>> ListRunnableCandidatesForHealthCheckAsync(
+    internal Task<IReadOnlyList<WorkItem>> ListRunnableCandidatesForHealthCheckAsync(
         int limit,
+        CancellationToken ct) =>
+        ListPoolHealthCandidatesAsync(limit, ct);
+
+    public async Task<IReadOnlyList<WorkItem>> ListPoolHealthCandidatesAsync(
+        int scanLimit,
         CancellationToken ct)
     {
-        if (limit <= 0) return [];
+        if (scanLimit <= 0) return [];
 
         var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
-        foreach (var deferredId in _deferredItems.Keys) skipIds.Add(deferredId);
 
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
-        var result = new List<WorkItem>(Math.Min(limit, 16));
+        var result = new List<WorkItem>(Math.Min(scanLimit, 16));
 
         await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
         {
@@ -908,14 +882,40 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
 
             result.Add(candidate);
-            if (result.Count >= limit)
+            if (result.Count >= scanLimit)
+                break;
+        }
+
+        if (result.Count >= scanLimit)
+            return result;
+
+        await foreach (var candidate in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            if (skipIds.Contains(candidate.Id))
+                continue;
+
+            if (candidate.DependsOn.Count > 0)
+            {
+                if (statesById is null)
+                {
+                    var snapshot = new List<WorkItem>();
+                    await foreach (var i in _store.ListAsync(ct)) snapshot.Add(i);
+                    statesById = WorkItemDependencies.BuildStateMap(snapshot);
+                }
+
+                if (!WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
+                    continue;
+            }
+
+            result.Add(candidate);
+            if (result.Count >= scanLimit)
                 break;
         }
 
         return result;
     }
 
-    internal async Task<int> TriggerDispatchRecoveryAsync(
+    public async Task<int> TriggerDispatchRecoveryAsync(
         IEnumerable<WorkItemId> candidateIds,
         CancellationToken ct)
     {

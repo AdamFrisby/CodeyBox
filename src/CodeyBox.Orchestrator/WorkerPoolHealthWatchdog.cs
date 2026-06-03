@@ -12,14 +12,15 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class WorkerPoolHealthWatchdog : BackgroundService
 {
-    private readonly OrchestratorService _orchestrator;
+    private readonly IWorkerPoolHealthSource _pool;
     private readonly Func<WorkerPoolHealthWatchdogOptions> _optsAccessor;
+    private readonly IAgentCapacitySnapshot _capacity;
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IAgentRegistry? _agents;
     private readonly IAgentAvailabilityRegistry? _availability;
-    private readonly AgentClassRouter? _router;
-    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
+    private readonly IAgentRoutingReadiness? _routingReadiness;
+    private readonly IWorkerPoolQuotaRecovery? _quotaRecovery;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly ILogger<WorkerPoolHealthWatchdog> _log;
     private readonly TimeProvider _time;
@@ -33,48 +34,52 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
     private WorkerPoolHealthWatchdogOptions _opts => _optsAccessor();
 
     public WorkerPoolHealthWatchdog(
-        OrchestratorService orchestrator,
+        IWorkerPoolHealthSource pool,
+        IAgentCapacitySnapshot capacity,
         Func<WorkerPoolHealthWatchdogOptions> optionsAccessor,
         ILogger<WorkerPoolHealthWatchdog> log,
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentAvailabilityRegistry? availability = null,
-        AgentClassRouter? router = null,
-        QuotaRetryScheduler? quotaRetryScheduler = null,
+        IAgentRoutingReadiness? routingReadiness = null,
+        IWorkerPoolQuotaRecovery? quotaRecovery = null,
         IWebhookDispatcher? webhooks = null,
         TimeProvider? timeProvider = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
     {
-        _orchestrator = orchestrator;
+        _pool = pool;
+        _capacity = capacity;
         _optsAccessor = optionsAccessor;
         _log = log;
         _projects = projects;
         _queueController = queueController;
         _agents = agents;
         _availability = availability;
-        _router = router;
-        _quotaRetryScheduler = quotaRetryScheduler;
+        _routingReadiness = routingReadiness;
+        _quotaRecovery = quotaRecovery;
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
         _startupRecoveryBarrier = startupRecoveryBarrier;
     }
 
     public WorkerPoolHealthWatchdog(
-        OrchestratorService orchestrator,
+        IWorkerPoolHealthSource pool,
+        IAgentCapacitySnapshot capacity,
         WorkerPoolHealthWatchdogOptions opts,
         ILogger<WorkerPoolHealthWatchdog> log,
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentAvailabilityRegistry? availability = null,
-        AgentClassRouter? router = null,
-        QuotaRetryScheduler? quotaRetryScheduler = null,
+        IAgentRoutingReadiness? routingReadiness = null,
+        IWorkerPoolQuotaRecovery? quotaRecovery = null,
         IWebhookDispatcher? webhooks = null,
         TimeProvider? timeProvider = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
-        : this(orchestrator, () => opts, log, projects, queueController, agents, availability,
-            router, quotaRetryScheduler, webhooks, timeProvider, startupRecoveryBarrier) { }
+        : this(pool, capacity, () => opts, log, projects, queueController, agents, availability,
+            routingReadiness, quotaRecovery, webhooks, timeProvider, startupRecoveryBarrier)
+    { }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -93,8 +98,8 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
 
     /// <summary>
     /// Runs one pool-health evaluation. Public for tests and future operator
-    /// endpoints; idempotent across repeated calls while the same condition is
-    /// active.
+    /// endpoints. Repeated calls while a stuck condition remains active can
+    /// advance bounded recovery attempts after <see cref="WorkerPoolHealthWatchdogOptions.StallTimeout"/>.
     /// </summary>
     public async Task RunOnceAsync(CancellationToken ct)
     {
@@ -146,25 +151,38 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         if (stuckFor < opts.StallTimeout)
             return;
 
-        await RecoverOrEscalateAsync(condition, opts, stuckFor, ct);
+        try
+        {
+            await RecoverOrEscalateAsync(condition, opts, stuckFor, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Worker-pool health watchdog recovery failed");
+            if (_recoveryAttempts >= opts.MaxRecoveryAttempts)
+                await EscalateRestartRequiredAsync(condition, stuckFor, ct);
+        }
     }
 
     private async Task<PoolHealthCondition?> EvaluateConditionAsync(
         WorkerPoolHealthWatchdogOptions opts,
         CancellationToken ct)
     {
-        if (_orchestrator.IsDispatchPaused)
+        if (_pool.IsDispatchPaused)
             return null;
 
         if (_queueController is not null && _queueController.State == QueueState.Paused)
             return null;
 
-        var status = await _orchestrator.GetStatusAsync(ct);
+        var status = await _pool.GetStatusAsync(ct);
         if (status.CurrentlyRunning >= status.MaxConcurrent)
             return null;
 
-        var candidates = await _orchestrator.ListRunnableCandidatesForHealthCheckAsync(
-            opts.MaxRecoveryEnqueueBatchSize, ct);
+        var candidates = await _pool.ListPoolHealthCandidatesAsync(
+            opts.MaxHealthCheckCandidateScan, ct);
         if (candidates.Count == 0)
             return null;
 
@@ -207,12 +225,12 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
                 return false;
         }
 
-        if (_router is not null)
+        if (_routingReadiness is not null)
         {
-            var decision = await _router.ResolveAsync(item, project, ct, slotGate: null);
-            if (decision.Chosen is { } chosen)
-                return IsDirectAgentAvailable(chosen.Agent);
-            if (decision.ShouldWait || decision.NoEligibleMembers)
+            var readiness = await _routingReadiness.CheckReadinessAsync(item, project, _capacity, ct);
+            if (readiness.State == AgentRoutingReadinessState.Available)
+                return true;
+            if (readiness.State == AgentRoutingReadinessState.Unavailable)
                 return false;
         }
 
@@ -229,8 +247,7 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         if (availability is { Available: false })
             return false;
 
-        var cap = _orchestrator.GetAgentCap(agent);
-        return cap <= 0 || _orchestrator.GetRunning(agent) < cap;
+        return _capacity.HasCapacity(agent);
     }
 
     private async Task RecoverOrEscalateAsync(
@@ -272,32 +289,59 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             maxRecoveryAttempts = maxAttempts,
         }, ct);
 
-        var quotaSweepRan = false;
-        if (_quotaRetryScheduler is not null)
+        try
         {
-            await _quotaRetryScheduler.RunWatchdogRecoverySweepAsync(ct);
-            quotaSweepRan = true;
+            var quotaSweepRan = false;
+            if (_quotaRecovery is not null)
+            {
+                await _quotaRecovery.RunWatchdogRecoverySweepAsync(ct);
+                quotaSweepRan = true;
+            }
+
+            var enqueueIds = condition.RunnableCandidates
+                .Where(static i => i.State != WorkItemState.WaitingForQuotaReset)
+                .Take(opts.MaxRecoveryEnqueueBatchSize)
+                .Select(i => i.Id);
+            var enqueued = await _pool.TriggerDispatchRecoveryAsync(enqueueIds, ct);
+
+            _log.LogWarning(
+                "Worker-pool health watchdog recovery attempt {Attempt}: enqueued {Enqueued} runnable candidate(s); quotaSweepRan={QuotaSweepRan}",
+                attempt, enqueued, quotaSweepRan);
+
+            if (opts.RecoveryVerificationDelay > TimeSpan.Zero)
+                await Task.Delay(opts.RecoveryVerificationDelay, ct);
+
+            var after = await EvaluateConditionAsync(opts, ct);
+            if (after is null || HasDispatchProgress(condition, after))
+            {
+                ResetCondition();
+                return;
+            }
+
+            if (_recoveryAttempts >= maxAttempts)
+                await EscalateRestartRequiredAsync(
+                    after,
+                    _time.GetUtcNow() - (_conditionObservedAt ?? _time.GetUtcNow()),
+                    ct);
         }
-
-        var enqueued = await _orchestrator.TriggerDispatchRecoveryAsync(
-            condition.RunnableCandidates.Select(i => i.Id), ct);
-
-        _log.LogWarning(
-            "Worker-pool health watchdog recovery attempt {Attempt}: enqueued {Enqueued} runnable candidate(s); quotaSweepRan={QuotaSweepRan}",
-            attempt, enqueued, quotaSweepRan);
-
-        if (opts.RecoveryVerificationDelay > TimeSpan.Zero)
-            await Task.Delay(opts.RecoveryVerificationDelay, ct);
-
-        var after = await EvaluateConditionAsync(opts, ct);
-        if (after is null)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            ResetCondition();
-            return;
+            throw;
         }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Worker-pool health watchdog recovery attempt {Attempt} failed", attempt);
+            if (_recoveryAttempts >= maxAttempts)
+                await EscalateRestartRequiredAsync(condition, stuckFor, ct);
+        }
+    }
 
-        if (_recoveryAttempts >= maxAttempts)
-            await EscalateRestartRequiredAsync(after, _time.GetUtcNow() - (_conditionObservedAt ?? _time.GetUtcNow()), ct);
+    private static bool HasDispatchProgress(PoolHealthCondition before, PoolHealthCondition after)
+    {
+        if (after.LastSpawnAt != before.LastSpawnAt)
+            return true;
+
+        return after.CurrentlyRunning > before.CurrentlyRunning;
     }
 
     private async Task EscalateRestartRequiredAsync(

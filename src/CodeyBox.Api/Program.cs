@@ -1121,6 +1121,8 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
@@ -1699,15 +1701,16 @@ builder.Services.AddSingleton<WorkerPoolHealthWatchdog>(sp =>
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     sp.GetRequiredService<WorkerPoolHealthWatchdogOptions>();
     return new WorkerPoolHealthWatchdog(
-        sp.GetRequiredService<OrchestratorService>(),
+        sp.GetRequiredService<IWorkerPoolHealthSource>(),
+        sp.GetRequiredService<IAgentCapacitySnapshot>(),
         () => monitor.CurrentValue.WorkerPoolHealthWatchdog,
         sp.GetRequiredService<ILogger<WorkerPoolHealthWatchdog>>(),
         sp.GetService<IProjectRepository>(),
         sp.GetService<IQueueController>(),
         sp.GetService<IAgentRegistry>(),
         sp.GetService<IAgentAvailabilityRegistry>(),
-        sp.GetService<AgentClassRouter>(),
-        sp.GetService<QuotaRetryScheduler>(),
+        sp.GetService<IAgentRoutingReadiness>(),
+        sp.GetService<IWorkerPoolQuotaRecovery>(),
         sp.GetService<IWebhookDispatcher>(),
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
@@ -1937,6 +1940,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxAutoRetriesPerWorkItem);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -1952,7 +1957,7 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
         startupLog) with
     {
-        ShutdownDrainTimeout = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds)),
+        ShutdownDrainTimeout = Program.ComputeOrchestratorShutdownDrainTimeout(cbOpts.Shutdown.GraceSeconds),
     };
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
@@ -2017,6 +2022,10 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>()));
+builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
+    sp.GetRequiredService<OrchestratorService>());
+builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>
+    sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxShutdownTeardownService can pause new dispatch before the per-VM
@@ -3679,5 +3688,15 @@ public partial class Program
             .MaxConcurrentWorkers;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
             providerSupportsSuspend, grace, maxConcurrent);
+    }
+
+    internal static TimeSpan ComputeOrchestratorShutdownDrainTimeout(int graceSeconds)
+    {
+        var grace = TimeSpan.FromSeconds(Math.Max(1, graceSeconds));
+        var reserve = grace >= TimeSpan.FromSeconds(10)
+            ? TimeSpan.FromSeconds(5)
+            : TimeSpan.FromMilliseconds(Math.Max(100, grace.TotalMilliseconds * 0.2));
+        var drain = grace - reserve;
+        return drain > TimeSpan.Zero ? drain : TimeSpan.FromMilliseconds(100);
     }
 }

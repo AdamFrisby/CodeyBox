@@ -9,7 +9,7 @@ namespace CodeyBox.Orchestrator;
 /// Hosted service that automatically retries work items that failed due to
 /// quota exhaustion, once quota is available again.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery
 {
     // There is no provider-agnostic options-change callback on this class: the
     // live options enter through an accessor. While disabled, poll that
@@ -341,7 +341,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         }
     }
 
-    internal async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
+    public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
     {
         _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
         await RunPeriodicSweepAsync(ct);

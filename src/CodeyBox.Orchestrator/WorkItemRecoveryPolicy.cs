@@ -50,4 +50,39 @@ internal static class WorkItemRecoveryPolicy
         };
         return true;
     }
+
+    public static WorkItem? BuildGracefulShutdownRecoveryState(
+        WorkItem item,
+        DateTimeOffset now)
+    {
+        if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return item with
+            {
+                StartedAt = null,
+                UpdatedAt = now,
+            };
+        }
+
+        var target = item.State == WorkItemState.Working
+            ? WorkItemState.Queued
+            : DeadWorkerReaper.MapToRecoveryState(item.State);
+
+        if (target is null)
+            return null;
+
+        var error = target == WorkItemState.Queued
+            ? $"graceful shutdown drain timed out while item was {item.State}; re-queued for a fresh run"
+            : null;
+
+        return item.With(target.Value, error) with
+        {
+            StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
+            UpdatedAt = now,
+        };
+    }
 }

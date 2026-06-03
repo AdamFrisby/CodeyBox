@@ -150,6 +150,17 @@ public sealed class HostShutdownTimeoutWiringTests
         Assert.Equal(TimeSpan.FromHours(4) + TimeSpan.FromMinutes(30), timeout);
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(60)]
+    public void OrchestratorShutdownDrainTimeout_ReservesHostStopMargin(int graceSeconds)
+    {
+        var drain = Program.ComputeOrchestratorShutdownDrainTimeout(graceSeconds);
+
+        Assert.True(drain > TimeSpan.Zero);
+        Assert.True(drain < TimeSpan.FromSeconds(graceSeconds));
+    }
+
     // --- DI-level wiring: the AddOptions<HostOptions>().Configure callback -------
     // The static-helper tests above pin ComputeHostShutdownTimeout, but the
     // production path also depends on the Configure delegate (Program.cs ~line 188)

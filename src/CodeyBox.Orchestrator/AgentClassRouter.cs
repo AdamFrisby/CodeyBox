@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IAgentRoutingReadiness
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -242,6 +242,80 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             slotGate,
             bypassRecentFailurePrecheck: false,
             bypassInProcessExhaustion: false);
+
+    public Task<AgentRoutingReadiness> CheckReadinessAsync(
+        WorkItem item,
+        Project? project,
+        IAgentCapacitySnapshot capacity,
+        CancellationToken ct)
+    {
+        var cfg = Volatile.Read(ref _routingConfig);
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (classId is null)
+            return Task.FromResult(AgentRoutingReadiness.NotApplicable("no agent class configured"));
+
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return Task.FromResult(AgentRoutingReadiness.NotApplicable($"unknown agent class '{classId}'"));
+
+        var nowUtc = _time.GetUtcNow();
+        var eligible = agentClass.Members
+            .Select((m, idx) => (Member: m, ConfigIndex: idx))
+            .Where(x => x.Member.QualityScore >= item.MinModelScore)
+            .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
+            .Select(x => new
+            {
+                x.Member,
+                x.ConfigIndex,
+                EffectiveScore = x.Member.QualityScore + ComputeTodModifier(cfg.TodModifiers, x.Member.Agent, nowUtc),
+            })
+            .OrderByDescending(x => x.EffectiveScore)
+            .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+            .ThenBy(x => x.ConfigIndex)
+            .Select(x => x.Member)
+            .ToList();
+
+        if (eligible.Count == 0)
+            return Task.FromResult(AgentRoutingReadiness.Unavailable($"no eligible members in class '{classId}'"));
+
+        var sawAtCap = false;
+        var sawUnavailable = false;
+        var sawQuotaBlocked = false;
+        foreach (var member in eligible)
+        {
+            if (IsExhausted(member, nowUtc))
+                continue;
+
+            var availability = _availability?.GetAvailability(member.Agent);
+            if (availability is { Available: false })
+            {
+                sawUnavailable = true;
+                continue;
+            }
+
+            if (!capacity.HasCapacity(member.Agent))
+            {
+                sawAtCap = true;
+                continue;
+            }
+
+            if (!HasCachedQuotaHeadroom(member, nowUtc))
+            {
+                sawQuotaBlocked = true;
+                continue;
+            }
+
+            return Task.FromResult(AgentRoutingReadiness.Available(member.Agent));
+        }
+
+        var reason = sawAtCap
+            ? $"all eligible members in class '{classId}' are at cap or blocked"
+            : sawQuotaBlocked
+                ? $"all eligible members in class '{classId}' are below cached quota floor"
+                : sawUnavailable
+                    ? $"all eligible members in class '{classId}' are unavailable"
+                    : $"all eligible members in class '{classId}' are exhausted";
+        return Task.FromResult(AgentRoutingReadiness.Unavailable(reason));
+    }
 
     public async Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
         WorkItem item,
@@ -705,6 +779,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var cap = GetAgentCap(member.Agent);
         if (cap <= 0) return false;
         return _runningCounters.GetRunning(member.Agent) >= cap;
+    }
+
+    private bool HasCachedQuotaHeadroom(
+        AgentMembership member,
+        DateTimeOffset nowUtc)
+    {
+        if (member.Billing == AgentBilling.PayPerApi)
+            return true;
+
+        if (!_lastAvailablePct.TryGetValue((member.Agent, member.ModelId ?? string.Empty), out var pct))
+            return true;
+
+        if (pct < 0)
+            return true;
+
+        var floor = Math.Max(_opts.MinQuotaPct, ComputeEffectiveFloorPct(member.Agent, resetAt: null, nowUtc));
+        if (pct < floor)
+            return false;
+
+        // The watchdog's health probe is read-only. Budget details may be
+        // refreshed asynchronously by the router/retry paths; without a cached
+        // negative signal here, do not block pool-health detection.
+        return true;
     }
 
     /// <summary>

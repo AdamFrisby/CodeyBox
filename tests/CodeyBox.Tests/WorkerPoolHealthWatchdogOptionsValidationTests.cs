@@ -40,6 +40,7 @@ public sealed class WorkerPoolHealthWatchdogOptionsValidationTests
     [InlineData("check")]
     [InlineData("attempts")]
     [InlineData("batch")]
+    [InlineData("scan")]
     [InlineData("verify")]
     public void InvalidValues_Throw(string scenario)
     {
@@ -57,6 +58,9 @@ public sealed class WorkerPoolHealthWatchdogOptionsValidationTests
                 break;
             case "batch":
                 opts.MaxRecoveryEnqueueBatchSize = 0;
+                break;
+            case "scan":
+                opts.MaxHealthCheckCandidateScan = 0;
                 break;
             case "verify":
                 opts.RecoveryVerificationDelay = TimeSpan.FromSeconds(-1);
