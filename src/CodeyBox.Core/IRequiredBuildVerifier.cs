@@ -51,15 +51,13 @@ public sealed record RequiredBuildProbeResult(
 public sealed record RequiredBuildVerificationRequest
 {
     public required WorkItemId WorkItemId { get; init; }
-    public required ProjectId ProjectId { get; init; }
+    public required Project Project { get; init; }
     public required string RepositoryId { get; init; }
     public string? BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
     public required string Phase { get; init; }
     public int? Iteration { get; init; }
-    public string? NetworkProfile { get; init; }
-    public SandboxProfileFlavor Flavor { get; init; } = SandboxProfileFlavor.Headless;
-    public string? BaselineImageRef { get; init; }
+    public string? WorkItemBaselineImageRef { get; init; }
 }
 
 public enum RequiredBuildVerificationStatus

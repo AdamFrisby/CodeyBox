@@ -637,6 +637,22 @@ public sealed class PipelineRunner : IPipelineRunner
                 item = item with { PreemptedAt = null, PreemptCheckpoint = null };
             }
 
+            // -------- Phase 1.5b: AuditPassed-resume build gate --------
+            // skipAudit=true items entered from AuditPassed/Merged (retry or
+            // resume past the audit phase). The audit loop is skipped, so the
+            // required-build gate above never runs for them. Re-verify the
+            // build here before any merge work: a branch that reached
+            // AuditPassed under an earlier degraded gate (or with a broken
+            // verifier) must not be promoted to merge if it does not actually
+            // compile. The check is skipped when there is no merge to do
+            // (skipMerge=true: the item already merged, we are resuming the
+            // upstream-push phase, and the merge commit is fixed).
+            if (skipAudit && !skipMerge)
+            {
+                await EnforceRequiredBuildOnAuditPassedResumeAsync(
+                    item, project, repoId, baseBranch, workBranch, ct);
+            }
+
             // -------- Phase 1.6: Post-act re-validation (check-and-act follow-ups) --------
             // For items that were enqueued as the on-yes follow-up of a CheckAndAct
             // (OriginCheckWorkItemId set), re-run the originating check's question
@@ -3479,6 +3495,36 @@ public sealed class PipelineRunner : IPipelineRunner
             Description: BuildRequiredBuildFailureSummary(result));
     }
 
+    /// <summary>
+    /// Gates the merge phase for items resuming at <see cref="WorkItemState.AuditPassed"/>.
+    /// The normal audit loop is skipped on that resume path, so without this
+    /// re-verification a branch that previously slipped past a broken or
+    /// degraded build gate could still be merged. Throws
+    /// <see cref="AuditFailedException"/> on failure so the outer catch rolls
+    /// the item back to AuditFailed, and propagates Unavailable through
+    /// VerifyRequiredBuildOnBranchAsync's existing infrastructure-failure
+    /// exception.
+    /// </summary>
+    private async Task EnforceRequiredBuildOnAuditPassedResumeAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        CancellationToken ct)
+    {
+        var applies = await RequiredBuildAppliesAsync(item, project, repoId, baseBranch, workBranch, ct);
+        if (!applies) return;
+
+        var result = await VerifyRequiredBuildOnBranchAsync(
+            item, project, repoId, baseBranch, workBranch, phase: "audit", ct: ct);
+        if (result.Status == RequiredBuildVerificationStatus.Failed)
+        {
+            throw new AuditFailedException(
+                $"required build failed on AuditPassed resume: {BuildRequiredBuildFailureSummary(result)}");
+        }
+    }
+
     private async Task<RequiredBuildVerificationResult> VerifyRequiredBuildOnBranchAsync(
         WorkItem item,
         Project project,
@@ -3489,24 +3535,16 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         int? iteration = null)
     {
-        var sandboxTarget = SandboxTargetResolver.ResolveAudit(
-            project.NetworkProfiles.AuditTool,
-            AuditCapabilities.None);
         var result = await _requiredBuildVerifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = project.Id,
+            Project = project,
             RepositoryId = repoId,
             BaseBranch = baseBranch,
             WorkBranch = workBranch,
             Phase = phase,
             Iteration = iteration,
-            NetworkProfile = sandboxTarget.NetworkProfile,
-            Flavor = sandboxTarget.Flavor,
-            BaselineImageRef = SandboxTargetResolver.BaselineRefForTarget(
-                project,
-                sandboxTarget,
-                item.BaselineImageRef),
+            WorkItemBaselineImageRef = item.BaselineImageRef,
         }, ct);
 
         if (result.Status == RequiredBuildVerificationStatus.Unavailable)

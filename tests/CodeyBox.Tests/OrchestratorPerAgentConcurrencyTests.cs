@@ -642,9 +642,12 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // budget, the deferred item must re-attempt pickup and reserve
             // Codex's slot. If the orchestrator had used the 60s quota
             // interval, Codex's in-flight count would still be 0 at the
-            // deadline. We wait up to 2s — well under the 60s quota window
-            // but well over the 200ms cap-retry interval.
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+            // deadline. The 8s budget is well under the 60s quota window
+            // but several orders of magnitude over the 200ms cap-retry
+            // interval, leaving room for the audit-runtime CI scheduler
+            // (many parallel test classes) without weakening the
+            // not-the-quota-interval claim.
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(8);
             int observedCodex = 0;
             while (DateTimeOffset.UtcNow < deadline)
             {
@@ -658,7 +661,7 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // chosen-and-reserved member from the re-pickup. The reservation
             // counter increments inside the router before the subsequent
             // StartedAt/Agent store write, so wait for the persisted stamp.
-            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(2);
+            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
             WorkItem? snap = null;
             while (DateTimeOffset.UtcNow < stampDeadline)
             {

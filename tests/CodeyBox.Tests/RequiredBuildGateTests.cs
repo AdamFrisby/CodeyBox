@@ -213,7 +213,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -279,7 +279,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var verification = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -382,7 +382,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -424,7 +424,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -473,7 +473,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -511,7 +511,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -554,7 +554,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -606,7 +606,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -650,7 +650,7 @@ public sealed class RequiredBuildGateTests : IDisposable
         var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            ProjectId = item.ProjectId,
+            Project = NewProject(item),
             RepositoryId = repoId,
             BaseBranch = item.BaseBranch,
             WorkBranch = item.WorkBranch!,
@@ -694,6 +694,175 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("dotnet is not available", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+    }
+
+    [Fact]
+    public async Task WorkPhase_BuildVerifierUnavailable_FailsAsInfrastructure_NotAuditPassed()
+    {
+        // Coverage gap repro for the work/rework gate. Audit-time
+        // Unavailable handling is exercised elsewhere; this test drives the
+        // same Unavailable code path through the initial work pass so the
+        // verifier-unavailable failure mode is locked in for the work phase
+        // too: an Unavailable verifier during a fresh work pickup must fail
+        // the item as infrastructure rather than letting work completion
+        // proceed or surface a generic "no changes" error.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Unavailable(
+                "could not verify required build: sandbox cannot launch (CI infra)"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            requiredBuildVerifier: verifier);
+
+        var item = NewItem("feature/work-verifier-unavailable");
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("initial.txt", "initial\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could not verify required build", final.LastError);
+        Assert.Contains("sandbox cannot launch", final.LastError);
+        Assert.NotEqual(WorkItemState.WorkComplete, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.True(verifier.VerifyCalls >= 1,
+            $"expected the work-phase build gate to call VerifyAsync; observed {verifier.VerifyCalls}");
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_WorkOnBase_AppliesWhenWorkBranchHasMarkers()
+    {
+        // Work-on-base path coverage: baseBranch == workBranch. The verifier
+        // must decide applicability solely from the work-branch markers
+        // (no base/work comparison) and still enforce the gate when those
+        // markers are present.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            auditReports: null,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var workOnBaseItem = NewItem("main") with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(workOnBaseItem.Id, seed, workOnBaseItem.BaseBranch);
+
+        var applyingProbe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = workOnBaseItem.Id,
+            ProjectId = workOnBaseItem.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = workOnBaseItem.BaseBranch,
+            WorkBranch = workOnBaseItem.WorkBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.Applies, applyingProbe.Status);
+
+        // Same identity, but the seed has no .NET markers — the verifier
+        // must report NotApplicable when the single (work == base) branch
+        // carries no markers, never silently enforce or skip.
+        var emptySeed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var emptyHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var emptyVerifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            emptyHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            auditReports: null,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+        var emptyItem = NewItem("main") with { BaseBranch = "main" };
+        var emptyRepoId = await emptyHost.EnsureRepositoryAsync(emptyItem.Id, emptySeed, emptyItem.BaseBranch);
+        var notApplyingProbe = await emptyVerifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = emptyItem.Id,
+            ProjectId = emptyItem.ProjectId,
+            RepositoryId = emptyRepoId,
+            BaseBranch = emptyItem.BaseBranch,
+            WorkBranch = emptyItem.WorkBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.NotApplicable, notApplyingProbe.Status);
+    }
+
+    [Fact]
+    public async Task AuditPassedResume_CannotMerge_WhenRequiredBuildFails()
+    {
+        // The retry-from-audit-passed path skips the audit loop. Without an
+        // explicit gate it would walk a non-compiling branch into merge.
+        // This test enters the pipeline at AuditPassed with a build-broken
+        // work branch and asserts the runner refuses to proceed: the item
+        // is demoted to AuditFailed citing the required build failure
+        // instead of advancing to Merging / Merged.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/audit-passed-resume-broken") with { State = WorkItemState.AuditPassed };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "build.fail", "broken\n", "broken branch already past audit");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("required build failed", final.LastError);
+        Assert.Contains("AuditPassed resume", final.LastError);
+        Assert.NotEqual(WorkItemState.Merging, final.State);
+        Assert.NotEqual(WorkItemState.Merged, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+    }
+
+    [Fact]
+    public async Task AuditPassedResume_BuildVerifierUnavailable_FailsAsInfrastructure()
+    {
+        // Companion test to the AuditPassed-resume build gate above: when
+        // the verifier itself cannot execute, the resume path must defer
+        // / fail with an infrastructure reason — never silently fall
+        // through to merge against an unverified branch.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Unavailable("sandbox provisioning failed"),
+            RequiredBuildVerificationResult.Unavailable("verify should not run"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            requiredBuildVerifier: verifier);
+
+        var item = NewItem("feature/audit-passed-resume-unavailable") with { State = WorkItemState.AuditPassed };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could not verify required build", final.LastError);
+        Assert.NotEqual(WorkItemState.Merging, final.State);
+        Assert.NotEqual(WorkItemState.Merged, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
     }
 
     private async Task ReplaceBaseMarkersWithLeafProjectAsync(string barePath, string branch)
@@ -904,6 +1073,14 @@ public sealed class RequiredBuildGateTests : IDisposable
         BaseBranch = "main",
         WorkBranch = workBranch,
         PushUpstream = false,
+    };
+
+    private static Project NewProject(WorkItem item) => new()
+    {
+        Id = item.ProjectId,
+        DisplayName = "Required-build verifier test project",
+        RepositoryUrl = "ignored",
+        DefaultBaseBranch = "main",
     };
 
     private sealed record FakeDotnet(

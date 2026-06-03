@@ -200,7 +200,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         var inspection = await InspectDotnetBuildMarkersAsync(new RequiredBuildProbeRequest
         {
             WorkItemId = request.WorkItemId,
-            ProjectId = request.ProjectId,
+            ProjectId = request.Project.Id,
             RepositoryId = request.RepositoryId,
             BaseBranch = request.BaseBranch,
             WorkBranch = request.WorkBranch,
@@ -349,11 +349,23 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         SandboxRepositoryAccess access,
         RequiredBuildVerificationRequest request)
     {
+        // Resolve the audit-tool sandbox target internally from the project so
+        // the public IRequiredBuildVerifier contract does not leak sandbox
+        // infrastructure choices (network profile, flavor, baseline image) to
+        // callers; the verifier owns those decisions for itself.
+        var target = SandboxTargetResolver.ResolveAudit(
+            request.Project.NetworkProfiles.AuditTool,
+            AuditCapabilities.None);
+        var baselineRef = SandboxTargetResolver.BaselineRefForTarget(
+            request.Project,
+            target,
+            request.WorkItemBaselineImageRef);
+
         var net = new SandboxNetworkPolicy
         {
             AllowedHosts = [],
             HostGitEndpoint = access.Network.HostGitEndpoint,
-            ProfileName = request.NetworkProfile,
+            ProfileName = target.NetworkProfile,
         };
 
         return new SandboxSpec
@@ -366,11 +378,11 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             ],
             Environment = new Dictionary<string, string>(),
             Network = net,
-            Flavor = request.Flavor,
+            Flavor = target.Flavor,
             WorkingDirectory = SandboxConventions.WorkDir,
             TimingWorkItemId = request.WorkItemId,
             TimingPhase = request.Phase,
-            BaselineImageRef = request.BaselineImageRef,
+            BaselineImageRef = baselineRef,
         };
     }
 
