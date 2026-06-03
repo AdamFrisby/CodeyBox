@@ -227,7 +227,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            suggestions: suggestionStore);
+            suggestions: suggestionStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new SuggestionTestSetup(pipeline, store, suggestionStore, webhooks, gitRoot);
     }

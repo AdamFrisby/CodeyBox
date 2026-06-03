@@ -240,7 +240,8 @@ public sealed class MissingAuditAgentCredentialTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new CredTestPipeline(pipeline, store, claudeAgent, webhooks);
     }
@@ -275,4 +276,3 @@ internal sealed class CredTestPipeline : IDisposable
 
     public void Dispose() => Store.Dispose();
 }
-

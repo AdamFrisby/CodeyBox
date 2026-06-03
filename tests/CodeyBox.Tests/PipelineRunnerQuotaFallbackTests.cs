@@ -847,7 +847,12 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             time,
             step: TimeSpan.FromMilliseconds(100),
             maxSteps: 200);
-        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
+        // The hard real-time wait after the claude fallback has started must
+        // tolerate the highly-parallel audit environment: a 10 s ceiling
+        // flaked under load even though the pipeline completes in well
+        // under a second locally. Lift to 60 s so a true regression still
+        // fails the test but a heavily-loaded run does not.
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(60));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
@@ -1410,7 +1415,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
             inVmSmokeGate: inVmSmokeGate,
-            involvement: involvementForPipeline);
+            involvement: involvementForPipeline,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -1488,7 +1494,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
-            involvement: involvement);
+            involvement: involvement,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
@@ -1588,7 +1595,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             auditQuotaProbes: [codexProbe, claudeProbe, geminiProbe],
             classRouter: router,
             fallbackHistory: fallbackHistory,
-            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }));
+            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new ThreeMemberFixture(
             pipeline,

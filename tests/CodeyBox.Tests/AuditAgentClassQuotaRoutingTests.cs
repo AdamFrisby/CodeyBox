@@ -498,7 +498,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             ]),
-            budgetProvider: budgetProvider);
+            budgetProvider: budgetProvider,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new RoutingFixture(pipeline, store, webhooks, codex);
     }

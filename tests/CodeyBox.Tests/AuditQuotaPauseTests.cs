@@ -254,7 +254,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
-            ]));
+            ]),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new AuditQuotaFixture(pipeline, scheduler, store, queue, webhooks, fallbackHistory, time, gemini, codex);
     }

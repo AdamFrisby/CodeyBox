@@ -77,7 +77,8 @@ internal static class PluginsUatHelpers
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditReports: auditReportStore);
+            auditReports: auditReportStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new PluginPipelineContext(pipeline, store, agent, gitHost, gitRoot);
     }

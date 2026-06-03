@@ -72,6 +72,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly IPreMergeVerifier? _preMergeVerifier;
+    private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
     // hang in store.UpdateAsync (sqlite write contention) or
     // webhooks.PublishAsync (slow remote sink) fails the item within bounded
@@ -204,7 +205,8 @@ public sealed class PipelineRunner : IPipelineRunner
         AgenticConflictResolver? agenticConflictResolver = null,
         IInVmSmokeGate? inVmSmokeGate = null,
         IAgentInvolvementStore? involvement = null,
-        Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null)
+        Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -272,6 +274,10 @@ public sealed class PipelineRunner : IPipelineRunner
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
         _preMergeVerifier = preMergeVerifier;
+        _requiredBuildVerifier = requiredBuildVerifier
+            ?? throw new ArgumentNullException(
+                nameof(requiredBuildVerifier),
+                "PipelineRunner requires an IRequiredBuildVerifier supplied by the composition root.");
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         // Wire the credential-file materialiser into the default resolver so
@@ -285,7 +291,13 @@ public sealed class PipelineRunner : IPipelineRunner
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
+        _requiredBuildGate = new RequiredBuildGate(
+            _requiredBuildVerifier,
+            _opts.RequiredBuildVerificationTimeout,
+            _auditReports is null ? null : PersistAuditReportAsync);
     }
+
+    private readonly RequiredBuildGate _requiredBuildGate;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
@@ -479,11 +491,20 @@ public sealed class PipelineRunner : IPipelineRunner
             // the fail-quiet "Agent produced no changes to commit" symptom.
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
+            //
+            // Before the reset, verify any pre-existing broken branch state.
+            // A from=work re-drive of a non-compiling branch must either be
+            // fixed or fail loud with the build error — silently resetting
+            // such a branch back to base would erase the broken commits and
+            // proceed from pristine state, neither fixing the intrinsic
+            // compile error nor reporting it.
             using (BeginPhaseScope(item, "pickup"))
             {
                 if (entry is WorkItemState.Queued
                     && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
                 {
+                    await _requiredBuildGate.EnforceBeforePickupResetAsync(
+                        item, project, _gitHost, repoId, baseBranch, workBranch, ct);
                     await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
                 }
                 else if (!skipWork || !skipAudit || !skipMerge)
@@ -609,7 +630,12 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             // -------- Phase 1.5: Audit + rework loop --------
-            if (auditors.Count > 0 && !skipAudit)
+            var requiredBuildApplies = false;
+            if (!skipAudit)
+            {
+                requiredBuildApplies = await _requiredBuildGate.AppliesAsync(item.Id, project.Id, repoId, baseBranch, workBranch, ct);
+            }
+            if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
                 var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
@@ -624,6 +650,22 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 await ClearPreemptAsync(item, ct);
                 item = item with { PreemptedAt = null, PreemptCheckpoint = null };
+            }
+
+            // -------- Phase 1.5b: AuditPassed-resume build gate --------
+            // skipAudit=true items entered from AuditPassed/Merged (retry or
+            // resume past the audit phase). The audit loop is skipped, so the
+            // required-build gate above never runs for them. Re-verify the
+            // build here before any merge work: a branch that reached
+            // AuditPassed under an earlier degraded gate (or with a broken
+            // verifier) must not be promoted to merge if it does not actually
+            // compile. The check is skipped when there is no merge to do
+            // (skipMerge=true: the item already merged, we are resuming the
+            // upstream-push phase, and the merge commit is fixed).
+            if (skipAudit && !skipMerge)
+            {
+                await _requiredBuildGate.EnforceOnAuditPassedResumeAsync(
+                    item, project, repoId, baseBranch, workBranch, ct);
             }
 
             // -------- Phase 1.6: Post-act re-validation (check-and-act follow-ups) --------
@@ -917,6 +959,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 "Work item {Id} parking in WaitingForQuotaReset: {Reason}",
                 item.Id, ex.Message);
             await TransitionWaitingForQuotaResetAsync(item, ex, project);
+        }
+        catch (RequiredBuildFailedException ex)
+        {
+            _log.LogWarning("Work item {Id} failed required build gate: {Error}", item.Id, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "build");
+        }
+        catch (RequiredBuildVerificationUnavailableException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (TerminalQuotaError ex)
         {
@@ -1988,23 +2040,31 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        var checkedOutExistingBranch = false;
         if (resumingPreempt)
         {
             var preemptCheckpoint = item.PreemptCheckpoint!;
             var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
+            checkedOutExistingBranch = true;
             prompt = BuildResumePrompt(prompt, preemptCheckpoint);
         }
         else if (isInitial)
         {
             if (await OriginBranchExistsAsync(sandbox, branch, ct))
+            {
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                checkedOutExistingBranch = true;
+            }
             else
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
         }
         else
+        {
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+            checkedOutExistingBranch = true;
+        }
         var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
         await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
         await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
@@ -2346,8 +2406,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (isInitial && suggestionsJson is not null)
                     await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
+                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
                 return agentResult.Stdout;
             }
+
+            if (checkedOutExistingBranch)
+                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
             var msg = isInitial
                 ? "Agent produced no changes to commit"
@@ -2364,6 +2428,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // Pick up suggestions after the sandbox pushes; sandbox is still alive here.
         if (isInitial && suggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
+
+        await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
         return agentResult.Stdout;
     }
@@ -3182,7 +3248,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        for (var iteration = 1; iteration <= project.Audit.MaxIterations; iteration++)
+        var maxIterations = Math.Max(1, project.Audit.MaxIterations);
+        for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
@@ -3206,6 +3273,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             IReadOnlyList<AuditFinding> findings;
             AgentKind? activeAuditAgentKind;
+            AuditFinding? requiredBuildFinding;
             try
             {
                 var revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
@@ -3228,11 +3296,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 (findings, activeAuditAgentKind) = await collectTask;
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
+
+                requiredBuildFinding = await _requiredBuildGate.RunForAuditAsync(
+                    item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
                 throw auditPhase.Wrap(oce);
             }
+
+            if (requiredBuildFinding is not null)
+                findings = [.. findings, requiredBuildFinding];
 
             // Emit cross-review event once per iteration when at least one LLM
             // auditor actually ran with a different agent than the work agent.
@@ -3242,7 +3316,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
 
-            AuditLog.AuditIterationComplete(iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking);
+            AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
                 new KeyValuePair<string, object?>("iteration", iteration.ToString()));
 
@@ -3255,7 +3329,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 WorkItem = await _store.GetAsync(item.Id, ct) ?? item,
                 Project = project,
                 Details = new AuditIterationDetails(
-                    iteration, project.Audit.MaxIterations, blocking.Count, nonBlocking,
+                    iteration, maxIterations, blocking.Count, nonBlocking,
                     activeAuditAgentKind?.Value),
                 Usage = iterUsage?.Iteration,
                 UsageTotal = iterUsage?.Total,
@@ -3274,9 +3348,9 @@ public sealed class PipelineRunner : IPipelineRunner
             }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
-                iteration, project.Audit.MaxIterations, blocking.Count, item.Id);
+                iteration, maxIterations, blocking.Count, item.Id);
 
-            if (iteration == project.Audit.MaxIterations)
+            if (iteration == maxIterations)
             {
                 AuditLog.AuditFailed(iteration, blocking.Count);
                 CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
@@ -3327,7 +3401,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
                 ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
                 : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, project.Audit.MaxIterations, answeredQuestions, project.AllowAgentQuestions);
+            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
             using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
             reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
@@ -9012,6 +9086,18 @@ internal sealed class AuditFailedException : Exception
     public AuditFailedException(string message) : base(message) { }
 }
 
+internal sealed class RequiredBuildFailedException : Exception
+{
+    public RequiredBuildFailedException(string message) : base(message) { }
+}
+
+internal sealed class RequiredBuildVerificationUnavailableException : Exception
+{
+    public RequiredBuildVerificationUnavailableException(string message) : base(message) { }
+    public RequiredBuildVerificationUnavailableException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
 {
     public SandboxPushReconcileConflictException(string branch, string strategy)
@@ -9105,6 +9191,14 @@ public sealed record PipelineOptions
     public HostGitIdentity? HostGitIdentity { get; init; }
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
     public double PhaseAbsoluteTimeoutMultiplier { get; init; } = 3.0;
+    /// <summary>
+    /// Hard ceiling on a single required-build verification (per call) across
+    /// every phase / resume path. Bounds branch-controlled MSBuild targets
+    /// that sleep or loop forever so they cannot hold a pipeline worker
+    /// indefinitely; on timeout the gate fails as <c>Unavailable</c> and the
+    /// item defers / fails-infrastructure rather than passing by default.
+    /// </summary>
+    public TimeSpan RequiredBuildVerificationTimeout { get; init; } = TimeSpan.FromMinutes(15);
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
     public TimeSpan AgentPreemptSignalTimeout => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
     public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);

@@ -1433,7 +1433,8 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
-            pipelineTuning: pipelineTuning);
+            pipelineTuning: pipelineTuning,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
     }
 
     /// <summary>
