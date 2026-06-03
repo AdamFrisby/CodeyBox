@@ -419,11 +419,14 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
     /// <summary>
     /// "Required" base markers are the ones whose deletion from the work branch
-    /// would silently narrow the build gate: any root-level <c>.sln</c>/<c>.slnx</c>
-    /// solution file and any test project (filename prefixed with <c>test</c>, or
-    /// any <c>.csproj</c> under a <c>test</c>/<c>tests</c> directory). If the base
-    /// branch carries these, the work branch must preserve them — keeping a trivial
-    /// leaf project around must not be enough to bypass the gate.
+    /// would silently narrow the build gate: any <c>.sln</c>/<c>.slnx</c>
+    /// solution file (at any depth) and any test project (filename prefixed with
+    /// <c>test</c>, or any <c>.csproj</c> under a <c>test</c>/<c>tests</c>
+    /// directory). If the base branch carries these, the work branch must
+    /// preserve them — keeping a trivial leaf project around must not be enough
+    /// to bypass the gate. Nested solution files are protected too because the
+    /// build script falls back to building any remaining .csproj if every .sln
+    /// has been removed.
     /// </summary>
     private static bool IsRequiredBaseMarkerPath(string path)
     {
@@ -432,9 +435,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
         var fileName = segments[^1];
         var lowerFileName = fileName.ToLowerInvariant();
-        if (segments.Length == 1
-            && (lowerFileName.EndsWith(".sln", StringComparison.Ordinal)
-                || lowerFileName.EndsWith(".slnx", StringComparison.Ordinal)))
+        if (lowerFileName.EndsWith(".sln", StringComparison.Ordinal)
+            || lowerFileName.EndsWith(".slnx", StringComparison.Ordinal))
         {
             return true;
         }

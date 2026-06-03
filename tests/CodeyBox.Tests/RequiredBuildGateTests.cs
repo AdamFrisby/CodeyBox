@@ -1018,6 +1018,101 @@ public sealed class RequiredBuildGateTests : IDisposable
             $"expected the AuditPassed-resume gate to call VerifyAsync; observed {verifier.VerifyCalls}");
     }
 
+    [Fact]
+    public async Task RequiredBuildVerification_ExceedsTimeout_FailsAsInfrastructure_NotAuditPassed()
+    {
+        // Drives the dedicated RequiredBuildVerificationTimeout code path:
+        // the verifier observes its cancellation token but never returns. The
+        // orchestrator's per-call timeout must cancel the verify call, surface
+        // a RequiredBuildVerificationUnavailableException with a clear
+        // "exceeded" reason, and fail the item as infrastructure. Without
+        // this coverage, a regression that fails to link the timeout token,
+        // treats the timeout as ordinary cancellation, or lets the verifier
+        // hang would not be caught.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var hangingVerifier = new HangingRequiredBuildVerifier();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            requiredBuildVerifier: hangingVerifier,
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                RequiredBuildVerificationTimeout = TimeSpan.FromMilliseconds(75),
+            });
+
+        var item = NewItem("feature/required-build-timeout") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could not verify required build", final.LastError);
+        Assert.Contains("exceeded the required-build verification timeout", final.LastError);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.NotEqual(WorkItemState.Merging, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.True(hangingVerifier.VerifyCalls >= 1,
+            $"expected the timeout test to call VerifyAsync at least once; observed {hangingVerifier.VerifyCalls}");
+        Assert.True(hangingVerifier.ObservedCancellation,
+            "verifier never observed cancellation, so the timeout token was not linked into VerifyAsync");
+    }
+
+    /// <summary>
+    /// Required-build verifier that probes Applies and then blocks inside
+    /// VerifyAsync until its cancellation token fires. Used to exercise the
+    /// RequiredBuildVerificationTimeout path: when the orchestrator's
+    /// per-call timeout linked token cancels, the verifier throws
+    /// OperationCanceledException and the orchestrator must convert that
+    /// into a RequiredBuildVerificationUnavailableException with an
+    /// "exceeded" reason.
+    /// </summary>
+    private sealed class HangingRequiredBuildVerifier : IRequiredBuildVerifier
+    {
+        public int ProbeCalls { get; private set; }
+        public int VerifyCalls { get; private set; }
+        public bool ObservedCancellation { get; private set; }
+
+        public Task<RequiredBuildProbeResult> ProbeAsync(
+            RequiredBuildProbeRequest request,
+            CancellationToken ct)
+        {
+            _ = request;
+            _ = ct;
+            ProbeCalls++;
+            return Task.FromResult(RequiredBuildProbeResult.Applies);
+        }
+
+        public async Task<RequiredBuildVerificationResult> VerifyAsync(
+            RequiredBuildVerificationRequest request,
+            CancellationToken ct)
+        {
+            _ = request;
+            VerifyCalls++;
+            try
+            {
+                await Task.Delay(Timeout.Infinite, ct);
+                return RequiredBuildVerificationResult.Passed(0, "unreachable: verifier should be cancelled before returning");
+            }
+            catch (OperationCanceledException)
+            {
+                ObservedCancellation = true;
+                throw;
+            }
+        }
+    }
+
     private async Task ReplaceBaseMarkersWithLeafProjectAsync(string barePath, string branch)
     {
         var clone = Path.Combine(_workspace, "branch-" + Guid.NewGuid().ToString("N")[..8]);

@@ -1,9 +1,14 @@
-namespace CodeyBox.Core;
+using CodeyBox.Core;
+
+namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Hard build gate used before work completion and audit pass. Implementations
 /// decide whether a branch needs the gate, materialise the branch into an
 /// isolated execution environment, and run the required build command.
+/// Lives in the orchestrator layer because the contract carries sandbox
+/// policy fields (network profile, baseline image) that are infrastructure
+/// concerns; Core must not depend on those.
 /// </summary>
 public interface IRequiredBuildVerifier
 {
