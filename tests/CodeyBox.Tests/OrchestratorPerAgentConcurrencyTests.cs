@@ -238,6 +238,32 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
     }
 
     [Fact]
+    public void HasCapacity_ReflectsConfiguredCapAndLiveReservations()
+    {
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } }
+        };
+        var orchestrator = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new PinnedPipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            NullLogger<OrchestratorService>.Instance,
+            agentConcurrency: concurrency);
+
+        Assert.True(orchestrator.HasCapacity(Codex));
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Codex));
+        Assert.False(orchestrator.HasCapacity(Codex));
+
+        orchestrator.ReleaseAgentSlotForTest(Codex);
+        Assert.True(orchestrator.HasCapacity(Codex));
+
+        Assert.True(orchestrator.TryReserveAgentSlotForTest(Claude));
+        Assert.True(orchestrator.HasCapacity(Claude));
+        orchestrator.ReleaseAgentSlotForTest(Claude);
+    }
+
+    [Fact]
     public async Task TryReserveAgentSlot_UnderConcurrentReservers_DoesNotExceedCap()
     {
         // Spec acceptance: per-agent cap is never violated under concurrent

@@ -15,7 +15,7 @@ public sealed record WebhookEvent
     /// fields or event types are minor bumps; renames or removals are major.
     /// Trackers opting into strict mode reject majors they don't recognise.
     /// </summary>
-    public const string CurrentSchemaVersion = "1.1";
+    public const string CurrentSchemaVersion = "1.2";
 
     public Guid DeliveryId { get; init; } = Guid.NewGuid();
 

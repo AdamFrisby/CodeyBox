@@ -47,6 +47,15 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds must be > 0 and <= {(int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds}");
         }
 
+        try
+        {
+            options.WorkerPoolHealthWatchdog.Validate();
+        }
+        catch (InvalidOperationException ex)
+        {
+            failures.Add(ex.Message);
+        }
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0

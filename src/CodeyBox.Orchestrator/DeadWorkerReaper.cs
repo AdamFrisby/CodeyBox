@@ -426,7 +426,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     }
 
     internal static bool HandlesRecoveryState(WorkItemState state)
-        => state == WorkItemState.Working || MapToRecoveryState(state) is not null;
+        => WorkItemRecoveryPolicy.HandlesRecoveryState(state);
 
     /// <summary>
     /// Maps a state for which a stale worker row could exist to the state the
@@ -435,19 +435,6 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// resting states map to themselves and are only re-dispatched. Returns
     /// null for terminal, parked, or otherwise dispatcher-owned states.
     /// </summary>
-    internal static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
-    {
-        WorkItemState.Reworking => WorkItemState.Queued,
-        WorkItemState.WorkComplete => WorkItemState.WorkComplete,
-        WorkItemState.Auditing => WorkItemState.WorkComplete,
-        WorkItemState.AuditPassed => WorkItemState.AuditPassed,
-        WorkItemState.Merging => WorkItemState.AuditPassed,
-        WorkItemState.Merged => WorkItemState.Merged,
-        // A dead worker mid-ReworkingForConflict resumes from AuditPassed so
-        // the merge phase re-runs. The ConflictReworkAttempts counter is
-        // preserved so the third-line fallback cannot fire a second time.
-        WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
-        WorkItemState.UpstreamPushing => WorkItemState.Merged,
-        _ => null,
-    };
+    internal static WorkItemState? MapToRecoveryState(WorkItemState state)
+        => WorkItemRecoveryPolicy.MapToRecoveryState(state);
 }

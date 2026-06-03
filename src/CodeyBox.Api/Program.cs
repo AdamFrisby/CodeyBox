@@ -1121,6 +1121,8 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
@@ -1684,6 +1686,29 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
 
+// --- Worker pool health watchdog --------------------------------------------
+// Dispatcher-level watchdog for a pool that is under-filled while runnable work
+// and an available agent exist. Complements WorkerProgressWatchdog, which owns
+// per-worker lifecycle stalls after a worker has already been spawned.
+builder.Services.AddSingleton<WorkerPoolHealthWatchdogOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.WorkerPoolHealthWatchdog;
+    opts.Validate();
+    return opts;
+});
+builder.Services.AddSingleton<WorkerPoolHealthWatchdog>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    sp.GetRequiredService<WorkerPoolHealthWatchdogOptions>();
+    return new WorkerPoolHealthWatchdog(
+        sp.GetRequiredService<IWorkerPoolHealthSource>(),
+        () => monitor.CurrentValue.WorkerPoolHealthWatchdog,
+        sp.GetRequiredService<ILogger<WorkerPoolHealthWatchdog>>(),
+        quotaRecovery: sp.GetRequiredService<IWorkerPoolQuotaRecovery>(),
+        webhooks: sp.GetService<IWebhookDispatcher>(),
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+});
+
 // --- Agent cost extractors + calculator ------------------------------------
 builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>(sp =>
 {
@@ -1909,6 +1934,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxAutoRetriesPerWorkItem);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
+builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
@@ -1922,7 +1949,10 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
         cbOpts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin,
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
-        startupLog);
+        startupLog) with
+    {
+        ShutdownDrainTimeout = Program.ComputeOrchestratorShutdownDrainTimeout(cbOpts.Shutdown.GraceSeconds),
+    };
 });
 builder.Services.AddSingleton<CancellationRegistry>(sp =>
     new CancellationRegistry(sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping));
@@ -1986,6 +2016,20 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>()));
+builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(
+    sp.GetRequiredService<OrchestratorService>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<ILogger<WorkerPoolHealthCoordinator>>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IQueueController>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentRoutingReadiness>()));
+builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
+    sp.GetRequiredService<WorkerPoolHealthCoordinator>());
+builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>
+    sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxShutdownTeardownService can pause new dispatch before the per-VM
@@ -2002,6 +2046,7 @@ builder.Services.AddHostedService(sp =>
     watchdog.AttachWorkerPoolSlotReleaser(sp.GetRequiredService<OrchestratorService>());
     return watchdog;
 });
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WorkerPoolHealthWatchdog>());
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
 // operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
 // bookkeeping so the next process can reattach; Stop is the default and avoids
@@ -2731,6 +2776,12 @@ namespace CodeyBox.Api
         /// construction and requires a restart to change.
         /// </summary>
         public WorkerProgressWatchdogOptions WorkerProgressWatchdog { get; set; } = new();
+
+        /// <summary>
+        /// Dispatcher-level watchdog for under-filled pools with runnable work.
+        /// Hot-reloadable: timeout and recovery settings are read on each sweep.
+        /// </summary>
+        public WorkerPoolHealthWatchdogOptions WorkerPoolHealthWatchdog { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
@@ -3641,5 +3692,15 @@ public partial class Program
             .MaxConcurrentWorkers;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
             providerSupportsSuspend, grace, maxConcurrent);
+    }
+
+    internal static TimeSpan ComputeOrchestratorShutdownDrainTimeout(int graceSeconds)
+    {
+        var grace = TimeSpan.FromSeconds(Math.Max(1, graceSeconds));
+        var reserve = grace >= TimeSpan.FromSeconds(10)
+            ? TimeSpan.FromSeconds(5)
+            : TimeSpan.FromMilliseconds(Math.Max(100, grace.TotalMilliseconds * 0.2));
+        var drain = grace - reserve;
+        return drain > TimeSpan.Zero ? drain : TimeSpan.FromMilliseconds(100);
     }
 }

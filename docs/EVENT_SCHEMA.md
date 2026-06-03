@@ -15,7 +15,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.1"
+eventSchemaVersion = "1.2"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -37,7 +37,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.1",                  // semver string
+  "eventSchemaVersion": "1.2",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -89,6 +89,8 @@ subscribe to.
 |---|---|---|
 | `queue.paused` | 1.0 | Operator paused the global pickup queue. |
 | `queue.resumed` | 1.0 | Operator resumed the global pickup queue. |
+| `worker_pool.stalled` | 1.2 | Worker pool had free slots and runnable work with an available agent, but no worker spawn occurred past the configured watchdog threshold; self-recovery was attempted. |
+| `worker_pool.restart_required` | 1.2 | Worker-pool watchdog self-recovery did not restore dispatch progress; operator restart is required. |
 | `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
 | `agent.smoke_recovered` | 1.0 | Previously-excluded agent recovered: a subsequent smoke probe passed. |
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
@@ -141,7 +143,8 @@ subscribe to.
 | `upstream.pr_stale_base` | 1.1 | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase. |
 
 See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
-Schema 1.1 adds the sandbox leak `reason` details field.
+Schema 1.1 adds the sandbox leak `reason` details field. Schema 1.2 adds
+worker-pool health watchdog events for dispatcher stalls and restart escalation.
 
 ---
 

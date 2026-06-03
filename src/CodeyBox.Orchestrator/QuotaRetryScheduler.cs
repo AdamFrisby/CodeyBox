@@ -9,7 +9,7 @@ namespace CodeyBox.Orchestrator;
 /// Hosted service that automatically retries work items that failed due to
 /// quota exhaustion, once quota is available again.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery
 {
     // There is no provider-agnostic options-change callback on this class: the
     // live options enter through an accessor. While disabled, poll that
@@ -341,6 +341,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         }
     }
 
+    public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
+    {
+        _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        {
+            await TryWatchdogRecoveryRetryAsync(item, ct);
+        }
+    }
+
     private async Task TryPeriodicRetryAsync(WorkItem item, CancellationToken ct)
     {
         try
@@ -357,6 +366,29 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         catch (Exception ex)
         {
             _log.LogError(ex, "Error during periodic quota retry for work item {Id}; continuing sweep", item.Id);
+        }
+    }
+
+    private async Task TryWatchdogRecoveryRetryAsync(WorkItem item, CancellationToken ct)
+    {
+        try
+        {
+            var outcome = await TryRetryWithAutoRetryGateAsync(
+                item,
+                "watchdog",
+                ct,
+                requireAutoRetryEnabled: false);
+            _log.LogInformation(
+                "Quota retry watchdog recovery walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
+                item.Id, item.State, outcome.Outcome, outcome.Reason);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error during watchdog quota retry recovery for work item {Id}; continuing sweep", item.Id);
         }
     }
 
@@ -444,11 +476,25 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         });
     }
 
-    private async Task<QuotaRetryAttemptResult> TryRetryAsync(WorkItem item, string source, CancellationToken ct)
+    private Task<QuotaRetryAttemptResult> TryRetryAsync(
+        WorkItem item,
+        string source,
+        CancellationToken ct)
+        => TryRetryWithAutoRetryGateAsync(
+            item,
+            source,
+            ct,
+            requireAutoRetryEnabled: true);
+
+    private async Task<QuotaRetryAttemptResult> TryRetryWithAutoRetryGateAsync(
+        WorkItem item,
+        string source,
+        CancellationToken ct,
+        bool requireAutoRetryEnabled)
     {
         try
         {
-            var outcome = await TryRetryCoreAsync(item, source, ct);
+            var outcome = await TryRetryCoreAsync(item, source, ct, requireAutoRetryEnabled);
             AuditLog.QuotaRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason);
             return outcome;
         }
@@ -463,10 +509,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         }
     }
 
-    private async Task<QuotaRetryAttemptResult> TryRetryCoreAsync(WorkItem item, string trigger, CancellationToken ct)
+    private async Task<QuotaRetryAttemptResult> TryRetryCoreAsync(
+        WorkItem item,
+        string trigger,
+        CancellationToken ct,
+        bool requireAutoRetryEnabled)
     {
         var retryOptions = CurrentRetryOptions;
-        if (!retryOptions.Enabled)
+        if (requireAutoRetryEnabled && !retryOptions.Enabled)
         {
             _log.LogInformation("Quota auto-retry is disabled; skipping retry for work item {Id}", item.Id);
             return new QuotaRetryAttemptResult("skipped:auto-retry-disabled");
@@ -733,7 +783,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _quotaUsableSweepCts.Cancel();
+        CancelQuotaUsableSweep();
         await base.StopAsync(cancellationToken);
 
         Task? wakeUpSweep;
@@ -749,7 +799,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         {
             await wakeUpSweep.WaitAsync(cancellationToken);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _quotaUsableSweepCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || IsQuotaUsableSweepCancellationRequested())
         {
         }
     }
@@ -759,7 +809,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) == 1)
             return;
 
-        _quotaUsableSweepCts.Cancel();
+        CancelQuotaUsableSweep();
         Task? wakeUpSweep;
         lock (_quotaUsableSweepLock)
         {
@@ -772,7 +822,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
             {
                 wakeUpSweep.GetAwaiter().GetResult();
             }
-            catch (OperationCanceledException) when (_quotaUsableSweepCts.IsCancellationRequested)
+            catch (OperationCanceledException) when (IsQuotaUsableSweepCancellationRequested())
             {
             }
         }
@@ -786,5 +836,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         _targetedTimers.Clear();
         _quotaUsableSweepCts.Dispose();
         base.Dispose();
+    }
+
+    private void CancelQuotaUsableSweep()
+    {
+        try { _quotaUsableSweepCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    private bool IsQuotaUsableSweepCancellationRequested()
+    {
+        try { return _quotaUsableSweepCts.IsCancellationRequested; }
+        catch (ObjectDisposedException) { return true; }
     }
 }

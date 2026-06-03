@@ -254,6 +254,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             : 0;
     }
 
+    public bool HasCapacity(AgentKind agent)
+    {
+        var cap = GetAgentCap(agent);
+        return cap <= 0 || GetRunning(agent) < cap;
+    }
+
     /// <summary>
     /// Replaces the per-agent concurrency cap dictionary with <paramref name="next"/>.
     /// Called by the hot-reload coordinator when <c>CodeyBox:AgentConcurrency</c>
@@ -666,9 +672,101 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             inFlight.RemoveAll(t => t.IsCompleted);
         }
 
-        // Drain in-flight tasks before the hosted service exits.
-        await Task.WhenAll(inFlight).ConfigureAwait(false);
+        // Drain in-flight tasks before the hosted service exits, but do not
+        // let a host-shutdown path wait forever on a worker that ignores the
+        // shutdown token. Recovery writes are only safe once the worker task has
+        // stopped; startup recovery handles rows left live past this bounded
+        // drain after the previous process is gone.
+        await DrainInFlightWorkersAsync(inFlight).ConfigureAwait(false);
     }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        PauseDispatch();
+        await base.StopAsync(cancellationToken);
+    }
+
+    private async Task DrainInFlightWorkersAsync(List<Task> inFlight)
+    {
+        inFlight.RemoveAll(t => t.IsCompleted);
+        if (inFlight.Count == 0)
+            return;
+
+        var all = Task.WhenAll(inFlight);
+        var drain = _opts.ShutdownDrainTimeout;
+        if (drain <= TimeSpan.Zero)
+        {
+            await all.ConfigureAwait(false);
+            return;
+        }
+
+        var completed = await Task.WhenAny(all, Task.Delay(drain)).ConfigureAwait(false);
+        if (completed == all)
+        {
+            await all.ConfigureAwait(false);
+            return;
+        }
+
+        _log.LogCritical(
+            "OrchestratorService shutdown drain timed out after {Timeout} with {Count} worker(s) still active; not re-queueing active items until the workers stop or startup recovery proves they are gone",
+            drain,
+            inFlight.Count(t => !t.IsCompleted));
+    }
+
+    private async Task RecoverHostShutdownAbortedItemAsync(WorkItemId id)
+    {
+        try
+        {
+            await TryRecoverActiveItemForGracefulShutdownAsync(
+                id,
+                "host shutdown cancellation",
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Host-shutdown recovery failed for active work item {Id}; startup recovery will reconcile persisted state",
+                id);
+        }
+    }
+
+    private async Task TryRecoverActiveItemForGracefulShutdownAsync(
+        WorkItemId id,
+        string recoveryReason,
+        CancellationToken ct)
+    {
+        var item = await _store.GetAsync(id, ct).ConfigureAwait(false);
+        if (item is null)
+            return;
+
+        var recovered = BuildGracefulShutdownRecoveryState(item, recoveryReason);
+        if (recovered is null)
+            return;
+
+        var updated = await _store.TryUpdateIfStateAsync(recovered, item.State, ct)
+            .ConfigureAwait(false);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Shutdown recovery skipped {Id}: state changed from {State} before recovery write",
+                id, item.State);
+            return;
+        }
+
+        await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
+        _log.LogWarning(
+            "Shutdown recovery re-queued {Id}: {FromState} -> {ToState} ({Reason})",
+            id, item.State, recovered.State, recoveryReason);
+    }
+
+    private static WorkItem? BuildGracefulShutdownRecoveryState(
+        WorkItem item,
+        string recoveryReason = "graceful shutdown drain timed out")
+        => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            recoveryReason);
 
     /// <summary>
     /// Walks dispatch-eligible non-terminal items by priority order and returns
@@ -745,6 +843,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // starting the full worker loop.
     internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
     internal WorkItem? TryBuildRecoveredStateForTest(WorkItem item) => TryBuildRecoveredState(item);
+    internal WorkItem? BuildGracefulShutdownRecoveryStateForTest(WorkItem item) =>
+        BuildGracefulShutdownRecoveryState(item);
 
     // Exposed as internal so tests can verify the deferred-pickup contract
     // without spinning the BackgroundService: PickNextEligibleAsync must skip
@@ -753,6 +853,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+
+    internal IReadOnlyCollection<WorkItemId> ActiveWorkItemIdsForHealthCheck() =>
+        _activeItems.Keys.ToList();
+
+    internal void ClearDeferredForHealthRecovery(WorkItemId id) =>
+        _deferredItems.TryRemove(id, out _);
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.
@@ -1372,6 +1478,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _log.LogInformation(
                     "Worker {WorkerId} item {Id} aborted by host shutdown: phase={Phase} source={CancellationSource}",
                     workerIndex, id, pex.Phase, pex.Source);
+                await RecoverHostShutdownAbortedItemAsync(id);
                 return;
             }
             catch (PhaseCancellationException pex)
@@ -1382,6 +1489,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                await RecoverHostShutdownAbortedItemAsync(id);
                 return;
             }
             catch (OperationCanceledException)
@@ -1654,6 +1762,7 @@ public sealed record OrchestratorOptions
 {
     public int MaxConcurrentWorkers { get; init; } = 1;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
+    public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work
