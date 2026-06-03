@@ -124,8 +124,13 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     };
 
     [Fact]
-    public async Task PipelinePersistsQuotaResetAndNextRetryAfterAgentFailure()
+    public async Task PipelineParksQuotaFailedItemForRetryAfterAgentFailure()
     {
+        // Quota rejections must NEVER hard-Fail the work item: the agent (or a
+        // peer in its class) will be available again at ResetAt, so the item is
+        // parked in WaitingForQuotaReset and QuotaRetryScheduler re-dispatches
+        // it. Asserting Failed here would codify the bug that prompted this
+        // branch — a quota condition silently killing in-flight work.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var context = BuildPipelineContext(
             projectRepositoryUrl: seed,
@@ -145,24 +150,29 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
 
         await context.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var failed = await context.Store.GetAsync(item.Id);
-        Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Equal("quota", failed.FailureKind);
-        Assert.NotNull(failed.QuotaResetAt);
-        Assert.NotNull(failed.NextQuotaRetryAt);
-        Assert.True(failed.NextQuotaRetryAt >= failed.QuotaResetAt);
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.NotNull(parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+        Assert.True(parked.NextQuotaRetryAt >= parked.QuotaResetAt);
     }
 
     [Fact]
-    public async Task PipelineClassifiesClaudeRateLimitEventStdoutAsQuotaAndPersistsResetAt()
+    public async Task PipelineParksClaudeRateLimitEventStdoutAsWaitingForQuotaReset()
     {
         // Regression for the claude 5h-window exhaustion path: when the CLI
         // emits {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",...}}
-        // on stdout and exits 1, the pipeline must persist
-        // failureKind="quota" and quotaResetAt=resetsAt — NOT failureKind="other".
-        // resetsAt is picked ~1h from now so the pipeline's MaxParsedQuotaResetWindow
-        // clamp (24h) is a no-op here.
+        // on stdout and exits 1, the pipeline must (a) classify the failure as
+        // quota, (b) park the item as WaitingForQuotaReset with QuotaResetAt
+        // = resetsAt, and (c) NEVER move it to Failed. Asserting Failed would
+        // codify the bug being fixed: the orchestrator silently killed
+        // in-flight items every time Claude's 5h window ran out mid-run instead
+        // of letting QuotaRetryScheduler resume the item at reset.
+        //
+        // resetsAt is picked ~1h from now so the pipeline's
+        // MaxParsedQuotaResetWindow clamp (24h) is a no-op here.
         var expectedReset = DateTimeOffset.UtcNow.AddHours(1);
         var resetsAtUnixSeconds = expectedReset.ToUnixTimeSeconds();
         // FromUnixTimeSeconds rounds to whole seconds; round-trip so the equality
@@ -191,12 +201,13 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
 
         await context.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var failed = await context.Store.GetAsync(item.Id);
-        Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Equal("quota", failed.FailureKind);
-        Assert.Equal(expectedResetRounded, failed.QuotaResetAt);
-        Assert.NotNull(failed.NextQuotaRetryAt);
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.NotEqual(WorkItemState.Failed, parked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Equal(expectedResetRounded, parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
     }
 
     [Fact]

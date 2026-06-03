@@ -142,19 +142,35 @@ public sealed class ClaudeQuotaFailureDetectorTests
     public void ScopeStdoutForQuotaDetection_PreservesRateLimitEventBesideTerminalError()
     {
         // When a terminal stream-json error coexists with a rate_limit_event
-        // rejection, both must remain visible to Detect so the rejection signal
-        // isn't dropped by the narrowing step that otherwise scopes to the
-        // terminal error line only.
-        var stdout = """
-            {"type":"result","subtype":"error","is_error":true,"result":"compilation failed"}
-            {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"five_hour"}}
-            """;
+        // rejection, the narrowing step must preserve the *parseable*
+        // rate_limit_event line — not just stray substrings — so Detect's
+        // subsequent JSON parse still finds the rejection and surfaces resetsAt.
+        // A plausible regression here would be to truncate or corrupt the JSON
+        // line while leaving the words "rate_limit_event" / "compilation failed"
+        // in place; substring checks would pass but classification would fall
+        // back to "other" and the orchestrator would hard-fail the item.
+        const long resetsAt = 1782000000L;
+        var stdout =
+            "{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"compilation failed\"}\n"
+            + "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + resetsAt + ",\"rateLimitType\":\"five_hour\"}}";
 
         var scoped = _detector.ScopeStdoutForQuotaDetection(stdout);
 
         Assert.NotNull(scoped);
         Assert.Contains("rate_limit_event", scoped);
         Assert.Contains("compilation failed", scoped);
+
+        // Round-trip the scoped output through Detect (the exact next step the
+        // composite classifier takes after scoping) to prove the
+        // rate_limit_event line survived intact and yields the expected
+        // RateLimitExceeded verdict with the parsed ResetAt — not just that
+        // the marker substring is preserved.
+        var scopedDetection = _detector.Detect(stderr: null, stdout: scoped);
+
+        Assert.NotNull(scopedDetection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, scopedDetection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(resetsAt), scopedDetection.ResetAt);
     }
 
     [Fact]

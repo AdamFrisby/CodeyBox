@@ -259,11 +259,14 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         await pipeline.RunAsync(item, CancellationToken.None);
 
-        var failed = await store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Equal("quota", failed.FailureKind);
-        Assert.NotNull(failed.QuotaResetAt);
-        Assert.NotNull(failed.NextQuotaRetryAt);
+        // A quota rejection must never hard-Fail the work item: it parks as
+        // WaitingForQuotaReset so QuotaRetryScheduler re-dispatches it once
+        // the agent (or a class peer) is available again.
+        var parked = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.NotNull(parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
     }
 
     [Fact]
