@@ -258,6 +258,8 @@ public sealed class HostShutdownTimeoutWiringTests
         var after = await store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", after.PreemptCheckpoint);
+        Assert.NotNull(after.PreemptedAt);
     }
 
     [Fact]
@@ -488,6 +490,12 @@ public sealed class HostShutdownTimeoutWiringTests
         public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() =>
             _active.Select(kv => (kv.Key, kv.Value)).ToList();
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> PushSuspendedVmCheckpointRefAsync(
+            string vmName,
+            string workingDir,
+            string refName,
+            string commitMessage,
+            CancellationToken ct) => Task.FromResult(true);
     }
 
     private sealed class FakeSuspendableSandbox(string id) : ISuspendableSandbox, IPreemptibleSandbox

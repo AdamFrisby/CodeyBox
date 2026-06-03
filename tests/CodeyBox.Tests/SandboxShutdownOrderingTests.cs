@@ -265,7 +265,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await _store.CreateAsync(item);
 
         var provider = new OrderingFakeProvider();
-        var sandbox = new OrderingFakeSandbox("vm-stop");
+        var events = new List<string>();
+        provider.RecordEvent = events.Add;
+        var sandbox = new OrderingFakeSandbox("vm-stop", recordEvent: events.Add);
         provider.Register(item.Id, sandbox);
 
         var svc = new SandboxSuspendOnShutdownService(
@@ -276,18 +278,23 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Stop mode must not call SuspendAsync");
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", provider.LastCheckpointRef);
         Assert.True(sandbox.StopAndPreserveCalled,
             "Stop mode should call IPreemptibleSandbox.StopAndPreserveAsync");
         Assert.False(sandbox.DisposeCalled,
             "Stop mode must not delete/purge a sandbox that supports StopAndPreserveAsync");
         Assert.True(sandbox.OwnedByShutdownHandler,
             "Stop mode must suppress PipelineRunner's later in-VM checkpoint path after the VM has been stopped");
-        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.StopAndPreserveOrder,
-            "Stop mode must mark shutdown ownership before stopping the VM");
+        Assert.True(events.IndexOf("checkpoint") >= 0 && events.IndexOf("checkpoint") < events.IndexOf("mark-owned"),
+            "Stop mode must push a preempt checkpoint before suppressing PipelineRunner's checkpoint path");
+        Assert.True(events.IndexOf("mark-owned") >= 0 && events.IndexOf("mark-owned") < events.IndexOf("stop"),
+            "Stop mode must mark shutdown ownership after checkpointing and before stopping the VM");
         // Stop mode does not persist SuspendedVmName; that field is reserved for
         // opt-in RAM-snapshot suspend/resume.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", after.PreemptCheckpoint);
+        Assert.NotNull(after.PreemptedAt);
     }
 
     [Fact]
@@ -302,7 +309,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await _store.CreateAsync(item);
 
         var provider = new OrderingFakeProvider();
-        var sandbox = new OrderingFakeSandbox("vm-hot-reload");
+        var events = new List<string>();
+        provider.RecordEvent = events.Add;
+        var sandbox = new OrderingFakeSandbox("vm-hot-reload", recordEvent: events.Add);
         provider.Register(item.Id, sandbox);
 
         var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(
@@ -318,10 +327,39 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
 
         Assert.False(sandbox.SuspendCalled,
             "shutdown must not use the startup SandboxTeardownMode after a hot reload");
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", provider.LastCheckpointRef);
         Assert.True(sandbox.StopAndPreserveCalled,
             "shutdown must use the current SandboxTeardownMode from IOptionsMonitor");
         Assert.True(sandbox.OwnedByShutdownHandler,
             "hot-reloaded Stop mode must mark shutdown ownership before stopping");
+        Assert.True(events.IndexOf("checkpoint") >= 0 && events.IndexOf("checkpoint") < events.IndexOf("mark-owned"),
+            "hot-reloaded Stop mode must checkpoint before taking shutdown ownership");
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_CancelsHungStopAtNonSuspendTimeout()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var neverStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sandbox = new OrderingFakeSandbox("vm-stop-hung", stopTask: neverStopped.Task);
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop,
+            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
+
+        await svc.SuspendAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.False(neverStopped.Task.IsCompleted);
+        Assert.Equal(TimeSpan.FromMilliseconds(25), svc.NonSuspendTeardownTimeout);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", after!.PreemptCheckpoint);
     }
 
     [Fact]
@@ -888,6 +926,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
         public string Name => "fake-ordering";
+        public string? LastCheckpointRef { get; private set; }
+        public Action<string>? RecordEvent { get; set; }
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => Task.FromResult<ISandbox>(new OrderingFakeSandbox("fake-ordering-created"));
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
@@ -900,17 +940,37 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             return list;
         }
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> PushSuspendedVmCheckpointRefAsync(
+            string vmName,
+            string workingDir,
+            string refName,
+            string commitMessage,
+            CancellationToken ct)
+        {
+            LastCheckpointRef = refName;
+            RecordEvent?.Invoke("checkpoint");
+            return Task.FromResult(true);
+        }
     }
 
     private sealed class OrderingFakeSandbox : IPreemptibleSandbox, ISuspendableSandbox
     {
         private readonly Func<bool>? _isDispatchPaused;
         private readonly Task? _disposeTask;
-        public OrderingFakeSandbox(string id, Func<bool>? isDispatchPaused = null, Task? disposeTask = null)
+        private readonly Task? _stopTask;
+        private readonly Action<string>? _recordEvent;
+        public OrderingFakeSandbox(
+            string id,
+            Func<bool>? isDispatchPaused = null,
+            Task? disposeTask = null,
+            Task? stopTask = null,
+            Action<string>? recordEvent = null)
         {
             Id = id;
             _isDispatchPaused = isDispatchPaused;
             _disposeTask = disposeTask;
+            _stopTask = stopTask;
+            _recordEvent = recordEvent;
         }
         public string Id { get; }
         public bool SuspendCalled { get; private set; }
@@ -943,13 +1003,15 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             if (_isDispatchPaused?.Invoke() == true) SawDispatchPaused = true;
             StopAndPreserveCalled = true;
             StopAndPreserveOrder = ++_order;
-            return Task.CompletedTask;
+            _recordEvent?.Invoke("stop");
+            return _stopTask ?? Task.CompletedTask;
         }
         public bool IsOwnedByShutdownHandler => OwnedByShutdownHandler;
         public void MarkOwnedByShutdownHandler()
         {
             OwnedByShutdownHandler = true;
             MarkOwnedOrder = ++_order;
+            _recordEvent?.Invoke("mark-owned");
         }
     }
 
@@ -1301,6 +1363,12 @@ public sealed class SandboxShutdownProgramWiringTests
         }
 
         public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> PushSuspendedVmCheckpointRefAsync(
+            string vmName,
+            string workingDir,
+            string refName,
+            string commitMessage,
+            CancellationToken ct) => Task.FromResult(true);
     }
 
     private sealed class ProgramWiringSandbox : IPreemptibleSandbox, ISuspendableSandbox

@@ -61,6 +61,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.True(await condition(), "condition was not met before the timeout elapsed");
     }
 
+    private static void AssertResumeTimeoutHonored(TimeSpan elapsed, TimeSpan configuredTimeout)
+    {
+        var upperBound = configuredTimeout + TimeSpan.FromMilliseconds(200);
+        Assert.True(elapsed < upperBound,
+            $"configured {configuredTimeout} resume timeout was not honored promptly; elapsed {elapsed}");
+    }
+
     // ── Schema round-trip ────────────────────────────────────────────────────
 
     [Fact]
@@ -544,7 +551,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             NoopStartupRecoveryInputSink.Instance,
             resumeTimeout: configuredTimeout);
 
+        var sw = Stopwatch.StartNew();
         await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        sw.Stop();
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
@@ -560,6 +569,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             && string.Equals(vmName?.ToString(), "vm-hung-start", StringComparison.Ordinal)
             && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
             && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
+        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
     [Fact]
@@ -659,7 +669,9 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             resumeTimeout: configuredTimeout,
             mode: SandboxStartupResumeMode.Blocking);
 
+        var sw = Stopwatch.StartNew();
         await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        sw.Stop();
         await svc.StartAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
@@ -667,6 +679,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedVmName);
         Assert.Single(provider.ResumedNames);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
+        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
     [Fact]
@@ -689,11 +702,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             resumeTimeout: configuredTimeout,
             mode: SandboxStartupResumeMode.Blocking);
 
+        var sw = Stopwatch.StartNew();
         var resumeTask = Task.Run(() => svc.StartingAsync(CancellationToken.None));
         await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
         try
         {
             await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
+            sw.Stop();
         }
         finally
         {
@@ -705,6 +720,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after.SuspendedVmName);
         Assert.Contains("timed out", after.LastError);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
+        AssertResumeTimeoutHonored(sw.Elapsed, configuredTimeout);
     }
 
     [Fact]

@@ -174,7 +174,10 @@ public sealed class HostShutdownCancellationTests : IDisposable
         await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
         await hostShutdownCts.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+        var thrownText = thrown.ToString();
+        Assert.Contains("preserving the sandbox failed", thrownText);
+        Assert.Contains("injected preserve failure", thrownText);
 
         var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, final!.State);

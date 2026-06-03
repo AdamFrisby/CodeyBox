@@ -2139,6 +2139,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
             }
 
+            Exception? preserveFailure = null;
             if (sandbox is IPreemptibleSandbox preemptible)
             {
                 using var preserveCts = new CancellationTokenSource(_opts.SandboxPreserveDrain);
@@ -2146,14 +2147,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     await preemptible.StopAndPreserveAsync(preserveCts.Token);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
+                    preserveFailure = ex;
                     _log.LogWarning(
                         "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
                         sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
                 }
                 catch (Exception ex)
                 {
+                    preserveFailure = ex;
                     _log.LogWarning(ex,
                         "Failed preserving sandbox {SandboxId} for work item {Id} during host shutdown; leaving the checkpointed item recoverable and the VM for operator cleanup",
                         sandbox.Id, item.Id);
@@ -2162,6 +2165,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (checkpointFailure is not null)
                 throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
+            if (preserveFailure is not null)
+                throw new OperationCanceledException("Host shutdown interrupted work and created a preempt checkpoint, but preserving the sandbox failed.", preserveFailure, hostShutdownToken);
 
             throw;
         }

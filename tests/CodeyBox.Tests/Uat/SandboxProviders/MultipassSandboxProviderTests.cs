@@ -2049,9 +2049,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         var stopCalls = 0;
         var infoCalls = 0;
+        var deleteCalls = 0;
         var calls = new List<string>();
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                calls.Add("delete");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
             if (argv is [_, "stop", "codeybox-test"])
             {
                 calls.Add("stop");
@@ -2078,6 +2085,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(calls.IndexOf("stop") >= 0 && calls.IndexOf("stop") < calls.IndexOf("info"),
             $"expected stop before info verification, got: {string.Join(", ", calls)}");
         Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
     }
 
     [Fact]

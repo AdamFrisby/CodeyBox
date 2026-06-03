@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -235,9 +236,9 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         // The default arm throws rather than silently routing through suspend.
         // Silent fallthrough would defeat the whole feature's intent: a new
         // teardown mode added without an explicit case here would re-introduce
-        // the qemu-lock wedge this code path exists to avoid. The throw is
-        // caught by SuspendAllAsync's per-VM Task.Run / await Task.WhenAll
-        // wrapper so one mis-bound enum value cannot break the whole drain.
+        // the qemu-lock wedge this code path exists to avoid. Task.WhenAll
+        // propagates the fault to StoppingAsync, where the lifecycle-level catch
+        // logs it and lets the host continue shutting down.
         teardownMode switch
         {
             SandboxTeardownMode.Suspend => SuspendOneAsync(workItemId, sandbox),
@@ -253,24 +254,27 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// stop releases the qemu disk-image write-lock cleanly, whereas an
     /// interrupted suspend can leave qemu holding the lock.
     ///
-    /// <para>Calls <see cref="ISuspendableSandbox.MarkOwnedByShutdownHandler"/>
-    /// FIRST so PipelineRunner's host-shutdown OCE catch block, which fires
-    /// after StoppingAsync has already torn the VM down here, skips its in-VM git
-    /// checkpoint flow. Otherwise it would run <c>git add/commit/push</c> inside
-    /// a now-stopped VM, fail, and convert shutdown cleanup trouble into a work
-    /// item failure. The signal is set before any teardown call so even an early
-    /// timeout or exception still gives PipelineRunner the right answer.</para>
+    /// <para>Creates and persists a <c>PreemptCheckpoint</c> before claiming
+    /// shutdown ownership. Without that checkpoint, PipelineRunner's later
+    /// host-shutdown catch would skip its in-VM checkpoint path and the next
+    /// startup would see a Working item with no recovery signal. If checkpoint
+    /// creation fails, Stop mode leaves the VM running and unclaimed so
+    /// PipelineRunner can fall back to its existing checkpoint/preserve path.</para>
     /// </summary>
     private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
-        sandbox.MarkOwnedByShutdownHandler();
         var timeout = NonSuspendTeardownTimeout;
         using var timeoutCts = new CancellationTokenSource(timeout);
+
+        if (!await TryPersistStopPreemptCheckpointAsync(workItemId, sandbox, timeout, timeoutCts.Token))
+            return;
+
+        sandbox.MarkOwnedByShutdownHandler();
         try
         {
             if (sandbox is IPreemptibleSandbox preemptible)
             {
-                await preemptible.StopAndPreserveAsync(timeoutCts.Token);
+                await preemptible.StopAndPreserveAsync(timeoutCts.Token).WaitAsync(timeoutCts.Token);
                 AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
                 return;
             }
@@ -292,6 +296,72 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             _log.LogWarning(ex,
                 "Stop failed for work item {WorkItemId} sandbox {SandboxId}",
                 workItemId, sandbox.Id);
+        }
+    }
+
+    private async Task<bool> TryPersistStopPreemptCheckpointAsync(
+        WorkItemId workItemId,
+        ISuspendableSandbox sandbox,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        var checkpointRef = SandboxResumeOnStartupService.PreemptCheckpointRefFor(workItemId);
+        try
+        {
+            if (_provider is not ISuspendingSandboxProvider suspending)
+            {
+                _log.LogWarning(
+                    "Cannot create stop checkpoint for work item {WorkItemId} sandbox {SandboxId}: provider {Provider} no longer exposes suspend checkpoint support",
+                    workItemId, sandbox.Id, _provider.Name);
+                return false;
+            }
+
+            var pushed = await suspending.PushSuspendedVmCheckpointRefAsync(
+                sandbox.Id,
+                SandboxConventions.WorkDir,
+                checkpointRef,
+                $"codeybox: shutdown stop checkpoint {workItemId}",
+                ct)
+                .WaitAsync(ct);
+            if (!pushed)
+            {
+                _log.LogWarning(
+                    "Stop checkpoint push failed for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
+                    workItemId, sandbox.Id);
+                return false;
+            }
+
+            var item = await _store.GetAsync(workItemId, CancellationToken.None);
+            if (item is null)
+            {
+                _log.LogWarning(
+                    "Cannot persist stop checkpoint {CheckpointRef} for sandbox {SandboxId}: work item {WorkItemId} is no longer present in the store",
+                    checkpointRef, sandbox.Id, workItemId);
+                return false;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            await _store.UpdateAsync(item with
+            {
+                PreemptedAt = now,
+                PreemptCheckpoint = checkpointRef,
+                UpdatedAt = now,
+            }, CancellationToken.None);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning(
+                "Stop checkpoint exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
+                timeout, workItemId, sandbox.Id);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Stop checkpoint failed for work item {WorkItemId} sandbox {SandboxId}; deferring preserve to PipelineRunner",
+                workItemId, sandbox.Id);
+            return false;
         }
     }
 

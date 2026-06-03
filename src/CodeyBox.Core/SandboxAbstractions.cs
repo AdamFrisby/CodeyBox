@@ -278,10 +278,11 @@ public static class SuspendTimeoutPolicy
     }
 
     /// <summary>
-    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Shutdown
-    /// paths that suspend VMs must not have a healthy RAM snapshot truncated by
-    /// a SIGKILL, so when <paramref name="suspendsOnShutdown"/> is set the
-    /// ceiling is the worst-case suspend drain
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Deployments
+    /// with a suspend-capable provider reserve enough room for a future
+    /// hot-reload to Suspend mode; otherwise a healthy RAM snapshot could be
+    /// truncated by SIGKILL. When <paramref name="suspendsOnShutdown"/> is set,
+    /// the ceiling is the worst-case suspend drain
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
     /// per-VM budget) STACKED ON TOP OF the requested <paramref name="grace"/>.
@@ -291,8 +292,8 @@ public static class SuspendTimeoutPolicy
     /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
     /// two would let a suspend that consumes its whole reserve leave zero room for
     /// the post-suspend drain, so the host could SIGKILL the process while
-    /// PipelineRunner is still shutting down. Non-Suspend teardown keeps the
-    /// tighter <paramref name="grace"/> alone.
+    /// PipelineRunner is still shutting down. Providers that cannot suspend keep
+    /// the tighter <paramref name="grace"/> alone.
     ///
     /// <para>This is deliberately mode-and-capability-driven, not
     /// provider-name-driven: the caller folds together whether the configured
@@ -307,7 +308,7 @@ public static class SuspendTimeoutPolicy
     /// and the max() logic stay co-located with the suspend/resume budget
     /// formula they must agree with.</para>
     /// </summary>
-    /// <param name="suspendsOnShutdown">True when the effective shutdown path freezes VMs on shutdown.</param>
+    /// <param name="suspendsOnShutdown">True when the host must reserve suspend budget for a suspend-capable, hot-reloadable shutdown path.</param>
     /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
     /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
     /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
