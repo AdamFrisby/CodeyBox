@@ -106,6 +106,56 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task SlotReleaseWake_DoesNotCollapseCompletedItemDeferral()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var capRetryDelay = TimeSpan.FromMilliseconds(750);
+        var concurrency = new AgentConcurrencyOptions
+        {
+            Members = { ["codex"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
+        };
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            agentConcurrency: concurrency,
+            quotaRouterOptions: new QuotaRouterOptions { CapRetryRecheckInterval = capRetryDelay });
+
+        Assert.True(svc.TryReserveAgentSlotForTest(AgentKind.Codex));
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var item = MakeItem(DateTimeOffset.UtcNow) with { Agent = AgentKind.Codex };
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        Assert.True(
+            await WaitUntilAsync(() => svc.IsDeferredForTest(item.Id), DispatchWaitTimeout),
+            "The item itself should enter the cap deferral path.");
+        Assert.True(
+            await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
+            "The slot-release wake should be consumed as a generic rescan after the deferring worker exits.");
+
+        Assert.Equal(1, queue.EnqueueCount(item.Id));
+        Assert.False(pipeline.HasEntered(item.Id));
+
+        Assert.False(
+            await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, TimeSpan.FromMilliseconds(300)),
+            "The generic slot-release wake must not clear the completed item's deferral or enqueue an immediate retry.");
+        Assert.True(svc.IsDeferredForTest(item.Id));
+
+        Assert.True(
+            await WaitUntilAsync(() => queue.EnqueueCount(item.Id) > 1, TimeSpan.FromSeconds(2)),
+            "The item-specific retry should occur only when the configured cap deferral interval fires.");
+
+        svc.ReleaseAgentSlotForTest(AgentKind.Codex);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotDispatchWhileQueuePaused()
     {
         using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
@@ -181,7 +231,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await queue.WaitForDequeueCallsAsync(2, DispatchWaitTimeout),
             "The dispatch loop should be blocked on the next queue wake before shutdown is paused.");
 
-        queue.DropDefaultEnqueues = true;
+        queue.DropDispatchWakeEnqueueCount = 1;
         svc.PauseDispatch();
         pipeline.Release(running.Id);
         Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
@@ -255,7 +305,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
-    public async Task RecoveredSlotRelease_DoesNotEmitWakeBeforeRecoveryStateTransition()
+    public async Task RecoveredSlotRelease_CanSuppressWakeBeforeRecoveryStateTransition()
     {
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
@@ -282,18 +332,65 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var worker = await WaitForWorkerRegistrationAsync(workerRegistry, running.Id, DispatchWaitTimeout);
         Assert.NotNull(worker);
 
-        Assert.True(svc.TryReleaseRecoveredWorkerSlot(
+        Assert.True(await svc.TryReleaseRecoveredWorkerSlotAsync(
             worker!.WorkerId,
             running.Id,
-            "test recovery release while durable row is still worker-owned"));
+            "test recovery release while durable row is still worker-owned",
+            wakeDispatcher: false));
 
-        Assert.Equal(0, queue.SlotReleaseWakeEnqueueCount);
+        Assert.Equal(0, queue.GenericWakeEnqueueCount);
         Assert.False(
             await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
             "Recovery release must not emit a generic wake before the recovery path updates or parks the item.");
 
         pipeline.Release(running.Id);
         Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RecoveredSlotRelease_WakesDispatcherAfterRecoveryStateTransition()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var workerRegistry = new SqliteWorkerRegistry(_dbPath, NullLogger<SqliteWorkerRegistry>.Instance);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            workerRegistry: workerRegistry,
+            deadWorkerOpts: new DeadWorkerOptions());
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(createdAt: now);
+        var readyBacklog = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(running);
+        await _store.CreateAsync(readyBacklog);
+        await queue.EnqueueAsync(running.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+        var worker = await WaitForWorkerRegistrationAsync(workerRegistry, running.Id, DispatchWaitTimeout);
+        Assert.NotNull(worker);
+
+        var failed = running.With(WorkItemState.Failed, "test recovery transition");
+        await _store.UpdateAsync(failed);
+
+        Assert.True(await svc.TryReleaseRecoveredWorkerSlotAsync(
+            worker!.WorkerId,
+            running.Id,
+            "test recovery release after durable transition",
+            wakeDispatcher: true));
+
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
+            "A recovered slot release with a safe durable state should wake the dispatcher for unrelated ready work.");
+
+        pipeline.Release(running.Id);
+        pipeline.Release(readyBacklog.Id);
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -342,20 +439,24 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     private sealed class ObservedTaskQueue : ITaskQueue
     {
         private readonly InMemoryTaskQueue _inner = new();
-        private readonly ConcurrentQueue<WorkItemId> _enqueued = new();
-        private readonly ConcurrentQueue<WorkItemId> _dequeued = new();
+        private readonly ConcurrentQueue<TaskQueueDispatch> _enqueued = new();
+        private readonly ConcurrentQueue<TaskQueueDispatch> _dequeued = new();
         private readonly TaskCompletionSource _firstDequeue =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _dequeueCalls;
+        private int _dropDispatchWakeEnqueueCount;
 
-        public bool DropDefaultEnqueues { get; set; }
+        public int DropDispatchWakeEnqueueCount
+        {
+            get => Volatile.Read(ref _dropDispatchWakeEnqueueCount);
+            set => Volatile.Write(ref _dropDispatchWakeEnqueueCount, value);
+        }
         public EnqueueFailureMode FailureMode { get; set; } = EnqueueFailureMode.None;
 
         public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
-            _enqueued.Enqueue(id);
-            if (DropDefaultEnqueues && id == default)
-                return ValueTask.CompletedTask;
+            var dispatch = TaskQueueDispatch.ForWorkItem(id);
+            _enqueued.Enqueue(dispatch);
 
             return FailureMode switch
             {
@@ -367,28 +468,55 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             };
         }
 
+        public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
+        {
+            _enqueued.Enqueue(TaskQueueDispatch.GenericWake);
+            while (true)
+            {
+                var remaining = Volatile.Read(ref _dropDispatchWakeEnqueueCount);
+                if (remaining <= 0) break;
+                if (Interlocked.CompareExchange(ref _dropDispatchWakeEnqueueCount, remaining - 1, remaining) == remaining)
+                    return ValueTask.CompletedTask;
+            }
+
+            return FailureMode switch
+            {
+                EnqueueFailureMode.ThrowSynchronously =>
+                    throw new InvalidOperationException("synthetic synchronous enqueue failure"),
+                EnqueueFailureMode.FaultAsynchronously =>
+                    new ValueTask(Task.FromException(new InvalidOperationException("synthetic asynchronous enqueue failure"))),
+                _ => _inner.EnqueueDispatchWakeAsync(ct),
+            };
+        }
+
         public int Count => _inner.Count;
         public int TotalEnqueueCount => _enqueued.Count;
         public int CompletedDequeueCount => _dequeued.Count;
         public int DequeueCallCount => Volatile.Read(ref _dequeueCalls);
-        public int SlotReleaseWakeEnqueueCount => _enqueued.Count(OrchestratorService.IsSlotReleasedDispatchWakeForTest);
+        public int GenericWakeEnqueueCount => _enqueued.Count(static d => d.Kind == TaskQueueDispatchKind.GenericWake);
 
         public int EnqueueCount(WorkItemId id)
         {
             var count = 0;
             foreach (var enqueued in _enqueued)
-                if (enqueued == id) count++;
+                if (enqueued.WorkItemId == id) count++;
             return count;
         }
 
         public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         {
+            var dispatch = await DequeueDispatchAsync(ct);
+            return dispatch?.WorkItemId;
+        }
+
+        public async ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
+        {
             Interlocked.Increment(ref _dequeueCalls);
             _firstDequeue.TrySetResult();
-            var id = await _inner.DequeueAsync(ct);
-            if (id is { } actual)
+            var dispatch = await _inner.DequeueDispatchAsync(ct);
+            if (dispatch is { } actual)
                 _dequeued.Enqueue(actual);
-            return id;
+            return dispatch;
         }
 
         public Task WaitForFirstDequeueAsync(TimeSpan timeout) =>

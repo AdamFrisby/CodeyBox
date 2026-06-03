@@ -176,14 +176,14 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (worker.CurrentWorkItemId is null)
         {
             _log.LogDebug("Dead worker {WorkerId} (host={Host}) had no active work item; row removed", worker.WorkerId, worker.HostName);
-            ReleaseRecoveredWorkerSlot(worker.WorkerId, null, "dead worker row had no active work item");
+            await ReleaseRecoveredWorkerSlotAsync(worker.WorkerId, null, "dead worker row had no active work item", ct);
             return;
         }
 
         if (!Guid.TryParse(worker.CurrentWorkItemId, out var guid))
         {
             _log.LogWarning("Dead worker {WorkerId} had malformed work item id '{ItemId}'; skipping", worker.WorkerId, worker.CurrentWorkItemId);
-            ReleaseRecoveredWorkerSlot(worker.WorkerId, null, "dead worker row had malformed work item id");
+            await ReleaseRecoveredWorkerSlotAsync(worker.WorkerId, null, "dead worker row had malformed work item id", ct);
             return;
         }
 
@@ -192,7 +192,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         if (item is null)
         {
             _log.LogWarning("Dead worker {WorkerId} referenced work item {ItemId} which no longer exists", worker.WorkerId, itemId);
-            ReleaseRecoveredWorkerSlot(worker.WorkerId, itemId, "dead worker row referenced a missing work item");
+            await ReleaseRecoveredWorkerSlotAsync(worker.WorkerId, itemId, "dead worker row referenced a missing work item", ct);
             return;
         }
 
@@ -266,7 +266,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                         },
                     }, CancellationToken.None);
                 }
-                ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery completed check-and-act item from persisted verdict");
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery completed check-and-act item from persisted verdict", ct);
                 return;
             }
 
@@ -290,7 +290,7 @@ public sealed class DeadWorkerReaper : BackgroundService
                 AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, checkAttempt);
                 await _store.UpdateAsync(recovered, ct);
                 MarkRecoveredItem(itemId);
-                ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery failed interrupted check-and-act item permanently without re-dispatch");
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed interrupted check-and-act item permanently without re-dispatch", ct);
                 return;
             }
 
@@ -329,7 +329,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             _log.LogWarning(
                 "Recovery ({WorkerId}): work item {ItemId} was Working without a preempt checkpoint; marked Failed",
                 workerIdContext, itemId);
-            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery marked Working item Failed without re-dispatch");
+            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery marked Working item Failed without re-dispatch", ct);
             return;
         }
 
@@ -339,7 +339,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             _log.LogInformation(
                 "Recovery ({WorkerId}): item {ItemId} in non-recoverable state {State} (already terminal or not worker-owned); no action",
                 workerIdContext, itemId, item.State);
-            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery found non-recoverable state and did not re-dispatch");
+            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery found non-recoverable state and did not re-dispatch", ct);
             return;
         }
 
@@ -408,16 +408,22 @@ public sealed class DeadWorkerReaper : BackgroundService
         else
         {
             MarkRecoveredItem(itemId);
-            ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery failed item permanently without re-dispatch");
+            await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed item permanently without re-dispatch", ct);
         }
     }
 
     private void MarkRecoveredItem(WorkItemId itemId)
         => _recoveredItemsThisProcess[itemId] = 0;
 
-    private void ReleaseRecoveredWorkerSlot(string workerId, WorkItemId? itemId, string reason)
+    private async Task ReleaseRecoveredWorkerSlotAsync(
+        string workerId,
+        WorkItemId? itemId,
+        string reason,
+        CancellationToken ct)
     {
-        if (_slotReleaser?.TryReleaseRecoveredWorkerSlot(workerId, itemId, reason) == true)
+        if (_slotReleaser is not null
+            && await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
+                workerId, itemId, reason, wakeDispatcher: true, ct))
         {
             _log.LogWarning(
                 "Recovery ({WorkerId}): released worker-pool slot for item {ItemId}: {Reason}",

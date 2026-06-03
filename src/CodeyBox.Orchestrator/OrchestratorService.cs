@@ -30,11 +30,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogInformation(
                 "OrchestratorService: dispatch paused for shutdown — no new work will be picked up");
             // Wake the dispatch loop so it observes the flag immediately rather
-            // than blocking on DequeueAsync until the next natural kick. A
-            // default WorkItemId (Guid.Empty) is treated as a spurious kick by
-            // the loop — both the IsDispatchPaused check at the top and the
-            // explicit `kick == default` skip in ExecuteAsync fire before
-            // PickNextEligibleAsync runs and exit the loop cleanly.
+            // than blocking on DequeueDispatchAsync until the next natural kick.
+            // The loop checks IsDispatchPaused immediately after dequeue, before
+            // it can call PickNextEligibleAsync.
             //
             // ContinueWith observes (rather than discards) any fault on the
             // returned task so an asynchronous channel-writer exception during
@@ -45,7 +43,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // exists to prevent).
             try
             {
-                var kickTask = _queue.EnqueueAsync(default, CancellationToken.None);
+                var kickTask = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
                 if (!kickTask.IsCompletedSuccessfully)
                 {
                     kickTask.AsTask().ContinueWith(
@@ -159,12 +157,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     private static readonly TimeSpan DefaultCapRetryRecheckInterval = TimeSpan.FromSeconds(15);
 
-    // Generic dispatch wake used when a worker slot frees up. It intentionally
-    // is not a real work-item id: item-specific kicks clear _deferredItems as an
-    // explicit retry-now signal, while this token only asks the loop to rescan
-    // the durable queue for any currently eligible work.
-    private static readonly WorkItemId SlotReleasedDispatchWakeId =
-        new(new Guid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
 
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
@@ -436,7 +428,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         catch (ObjectDisposedException) { /* shutdown teardown race; gate already disposed */ }
     }
 
-    public bool TryReleaseRecoveredWorkerSlot(string workerId, WorkItemId? workItemId, string reason)
+    public async ValueTask<bool> TryReleaseRecoveredWorkerSlotAsync(
+        string workerId,
+        WorkItemId? workItemId,
+        string reason,
+        bool wakeDispatcher,
+        CancellationToken ct = default)
     {
         if (!_workerSlotsByRegistryId.TryGetValue(workerId, out var lease))
             return false;
@@ -449,15 +446,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return false;
         }
 
-        // Do not emit the generic dispatch wake from recovery release. The
-        // watchdog calls this before it updates or parks the durable item row,
-        // and an early queue rescan can redispatch stale worker-owned state.
         if (!ReleaseWorkerSlotLease(lease))
             return false;
 
         _log.LogWarning(
             "Worker pool: worker {WorkerIndex} slot for work item {WorkItemId} released by recovery ({WorkerId}): {Reason}",
             lease.WorkerIndex, lease.WorkItemId, workerId, reason);
+
+        if (wakeDispatcher)
+            await EnqueueSlotReleasedDispatchWakeAsync(lease, ct);
+
         return true;
     }
 
@@ -502,7 +500,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             try
             {
-                await _queue.EnqueueAsync(SlotReleasedDispatchWakeId, ct);
+                await _queue.EnqueueDispatchWakeAsync(ct);
                 return;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -573,45 +571,45 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // from the channel. In-flight workers continue normally during pause.
             if (!await WaitIfPausedAsync(stoppingToken)) break;
 
-            // Wait for a kick. The channel ID is no longer the source of truth —
-            // we use it purely as a "something changed, re-check the DB" signal
-            // so that priority and equal-priority FIFO ordering come from
-            // a single ORDER BY query rather than channel insertion order.
-            WorkItemId? kick;
-            try { kick = await _queue.DequeueAsync(stoppingToken); }
+            // Wait for a kick. The queue payload is no longer the source of
+            // truth — we use it as a "something changed, re-check the DB"
+            // signal so that priority and equal-priority FIFO ordering come
+            // from a single ORDER BY query rather than channel insertion order.
+            TaskQueueDispatch? dispatch;
+            try { dispatch = await _queue.DequeueDispatchAsync(stoppingToken); }
             catch (OperationCanceledException) { break; }
-            if (kick is null) break;
+            if (dispatch is null) break;
 
             // Re-check after dequeue: PauseDispatch may have fired while
-            // DequeueAsync was blocked, and the wake-up kick (a default
-            // WorkItemId enqueued by PauseDispatch itself) must not be allowed
-            // to flow through to PickNextEligibleAsync — that would happily
-            // pick up a real queued item from the store and spawn a new
+            // DequeueDispatchAsync was blocked, and the wake-up kick must not
+            // be allowed to flow through to PickNextEligibleAsync — that would
+            // happily pick up a real queued item from the store and spawn a new
             // sandbox that races the snapshot.
             if (IsDispatchPaused) break;
-
-            // Defence-in-depth: a default WorkItemId is the PauseDispatch
-            // wake-up sentinel — never a real work item. If the IsDispatchPaused
-            // re-check above is ever removed/reordered by a future refactor, or
-            // if some other path enqueues default(WorkItemId), discard it here
-            // rather than letting PickNextEligibleAsync pick up any eligible
-            // store item against the contract.
-            if (kick.Value == default) continue;
 
             // A work-item-specific kick for an item currently sleeping in a
             // defer-requeue delay is treated as an explicit "retry now" signal:
             // clear the deferred mark so pickup considers the item on this
-            // tick. Generic slot-release wakes only rescan the queue and must
-            // not collapse quota/budget/disk recheck delays.
-            if (kick.Value != SlotReleasedDispatchWakeId)
-                _deferredItems.TryRemove(kick.Value, out _);
+            // tick. Generic wakes only rescan the queue and must not collapse
+            // quota/budget/disk recheck delays.
+            if (dispatch.Value.Kind == TaskQueueDispatchKind.WorkItem)
+            {
+                if (dispatch.Value.WorkItemId is not { } kickedId || kickedId == default)
+                    continue;
+
+                _deferredItems.TryRemove(kickedId, out _);
+            }
 
             // Post-dequeue pause check: handles the race where the queue was paused
             // while we were blocked in DequeueAsync. Just loop; we'll re-check
             // WaitIfPausedAsync on the next iteration.
             if (_queueController is not null && _queueController.State == QueueState.Paused)
             {
-                await _queue.EnqueueAsync(kick.Value, stoppingToken);
+                if (dispatch.Value.Kind == TaskQueueDispatchKind.WorkItem
+                    && dispatch.Value.WorkItemId is { } kickedId)
+                    await _queue.EnqueueAsync(kickedId, stoppingToken);
+                else
+                    await _queue.EnqueueDispatchWakeAsync(stoppingToken);
                 continue;
             }
 
@@ -803,8 +801,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
-    internal static bool IsSlotReleasedDispatchWakeForTest(WorkItemId id) =>
-        id == SlotReleasedDispatchWakeId;
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.

@@ -375,10 +375,15 @@ public sealed class DeadWorkerReaperTests : IDisposable
     {
         public List<(string WorkerId, WorkItemId? WorkItemId, string Reason)> Releases { get; } = [];
 
-        public bool TryReleaseRecoveredWorkerSlot(string workerId, WorkItemId? workItemId, string reason)
+        public ValueTask<bool> TryReleaseRecoveredWorkerSlotAsync(
+            string workerId,
+            WorkItemId? workItemId,
+            string reason,
+            bool wakeDispatcher,
+            CancellationToken ct = default)
         {
             Releases.Add((workerId, workItemId, reason));
-            return true;
+            return ValueTask.FromResult(true);
         }
     }
 }

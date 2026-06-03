@@ -233,16 +233,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             return;
         }
 
-        // Free the pool slot regardless of whether the underlying worker task
-        // ever exits — once the slot is released the dispatcher can pick up
-        // queued / finishing-phase work that was starving behind this wedge.
-        if (_slotReleaser is not null)
-        {
-            _slotReleaser.TryReleaseRecoveredWorkerSlot(
-                worker.WorkerId, item.Id,
-                $"watchdog: no progress for {sinceProgressSeconds}s in state {item.State}");
-        }
-
         // Pick a recovery target. Mirror the dead-worker reaper's mapping so
         // operators see the same "from → to" transition regardless of whether
         // the wedge was a stale heartbeat or a stalled-but-heartbeating worker.
@@ -293,6 +283,15 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             };
             await _store.UpdateAsync(failed, ct);
             _recoveredWorkers[worker.WorkerId] = 0;
+            if (_slotReleaser is not null)
+            {
+                await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
+                    worker.WorkerId, item.Id,
+                    $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}) after {sinceProgressSeconds}s without progress",
+                    wakeDispatcher: true,
+                    ct);
+            }
+
             AuditLog.WorkItemWatchdogRecovered(item.Id, worker.WorkerId, fromState, WorkItemState.Failed, dependentsRestored: 0);
             _log.LogWarning(
                 "Watchdog: work item {ItemId} (worker {WorkerId}) exceeded MaxRecoveryAttempts ({Max}); failing permanently",
@@ -348,6 +347,18 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
         await _store.UpdateAsync(updated, ct);
         _recoveredWorkers[worker.WorkerId] = 0;
+
+        // Free the pool slot regardless of whether the underlying worker task
+        // ever exits. The durable row is updated first so the generic wake
+        // cannot redispatch stale worker-owned state.
+        if (_slotReleaser is not null)
+        {
+            await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
+                worker.WorkerId, item.Id,
+                $"watchdog: no progress for {sinceProgressSeconds}s in state {item.State}",
+                wakeDispatcher: true,
+                ct);
+        }
 
         // Restore any descendants that were cascade-cancelled because of THIS
         // parent. The operator-cancel cascade today (CascadeCancelDependentsAsync)
@@ -444,10 +455,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         if (claimed is null)
             return;
 
-        _slotReleaser?.TryReleaseRecoveredWorkerSlot(
-            worker.WorkerId, item.Id,
-            $"watchdog: parking item after {sinceProgressSeconds}s without progress (auto-recover disabled)");
-
         var parked = item with
         {
             State = WorkItemState.NeedsOperatorInput,
@@ -456,6 +463,16 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         };
         await _store.UpdateAsync(parked, ct);
         _recoveredWorkers[worker.WorkerId] = 0;
+
+        if (_slotReleaser is not null)
+        {
+            await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
+                worker.WorkerId, item.Id,
+                $"watchdog: parking item after {sinceProgressSeconds}s without progress (auto-recover disabled)",
+                wakeDispatcher: true,
+                ct);
+        }
+
         AuditLog.WorkItemWatchdogParked(item.Id, worker.WorkerId, item.State);
     }
 
