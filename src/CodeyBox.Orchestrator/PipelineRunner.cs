@@ -8788,9 +8788,24 @@ Original merge-phase failure (for context):
         }, ct);
     }
 
-    private static string RetryFromForQuotaPhase(string phase) => phase switch
+    /// <summary>
+    /// Maps the per-phase quota-park label to the <c>from</c> phase string the
+    /// retry scheduler/<see cref="WorkItemRetrier"/> understands. Each value
+    /// chooses the lifecycle slot the item resumes at after the quota window
+    /// resets — work/audit/merge/upstream map 1:1 onto Queued/WorkComplete/
+    /// AuditPassed/Merged. <c>rework</c> deliberately maps to <c>audit</c>:
+    /// resuming via WorkComplete preserves the in-flight WorkBranch (Queued
+    /// clears it in <see cref="WorkItem.With(WorkItemState, string?, WorkItemCancellationReason?, string?, DateTimeOffset?, string?)"/>),
+    /// so a mid-rework Claude five-hour reset doesn't discard the agent's prior
+    /// commits and the audit findings the rework was responding to. Mirrors the
+    /// transient-cancel mapper
+    /// (<see cref="ResumeStateForTransientRetry"/>: <c>rework → WorkComplete</c>).
+    /// Internal (not private) so the phase table is unit-testable directly.
+    /// </summary>
+    internal static string RetryFromForQuotaPhase(string phase) => phase switch
     {
         "audit" => "audit",
+        "rework" => "audit",
         "merge" => "merge",
         "upstream" => "upstream",
         _ => "work",
@@ -8801,9 +8816,10 @@ Original merge-phase failure (for context):
     /// a quota rejection as <see cref="WorkItemState.WaitingForQuotaReset"/>. The
     /// phase drives <see cref="RetryFromForQuotaPhase"/> so the scheduler resumes
     /// the item in the correct lifecycle slot (work / rework / audit / merge /
-    /// upstream) after the quota window resets.
+    /// upstream) after the quota window resets. Internal (not private) so the
+    /// state-to-phase table is unit-testable directly.
     /// </summary>
-    private static string PhaseForQuotaPark(WorkItemState state) => state switch
+    internal static string PhaseForQuotaPark(WorkItemState state) => state switch
     {
         WorkItemState.Auditing => "audit",
         WorkItemState.Reworking => "rework",

@@ -210,6 +210,85 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         Assert.NotNull(parked.NextQuotaRetryAt);
     }
 
+    /// <summary>
+    /// Pins the full work-item-state → quota-park-phase table. The mapping
+    /// drives <see cref="PipelineRunner.RetryFromForQuotaPhase"/> which in turn
+    /// chooses the <c>from</c> the scheduler will replay through
+    /// <see cref="WorkItemRetrier"/>: a mis-mapping for a rework/audit/merge
+    /// state would either lose the WorkBranch (re-queuing from "work" clears
+    /// it) or resume the wrong phase. Driving the entire pipeline through each
+    /// phase + park sequence to exercise the switch would dwarf the table it
+    /// verifies, so we hit the helpers directly — same approach as
+    /// <see cref="PipelineRunner.ResumeStateForTransientRetry"/>'s table test.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkItemState.Working, "work")]
+    [InlineData(WorkItemState.Queued, "work")]
+    [InlineData(WorkItemState.Auditing, "audit")]
+    [InlineData(WorkItemState.Reworking, "rework")]
+    [InlineData(WorkItemState.ReworkingForConflict, "rework")]
+    [InlineData(WorkItemState.AuditFailed, "rework")]
+    [InlineData(WorkItemState.Merging, "merge")]
+    [InlineData(WorkItemState.UpstreamPushing, "upstream")]
+    public void PhaseForQuotaPark_MapsStateToParkPhase(WorkItemState state, string expectedPhase)
+    {
+        Assert.Equal(expectedPhase, PipelineRunner.PhaseForQuotaPark(state));
+    }
+
+    /// <summary>
+    /// The companion table for <see cref="PipelineRunner.RetryFromForQuotaPhase"/>.
+    /// "rework" deliberately maps to "audit" so a mid-rework quota window reset
+    /// resumes via WorkComplete (preserving the in-flight WorkBranch) rather than
+    /// via Queued (which <see cref="WorkItem.With"/> clears WorkBranch on, losing
+    /// agent commits + audit findings the rework was responding to). A
+    /// regression that fell through to "work" — the original mid-rework Claude
+    /// five-hour incident — fails here.
+    /// </summary>
+    [Theory]
+    [InlineData("work", "work")]
+    [InlineData("audit", "audit")]
+    [InlineData("rework", "audit")]
+    [InlineData("merge", "merge")]
+    [InlineData("upstream", "upstream")]
+    [InlineData("unrecognised", "work")]
+    public void RetryFromForQuotaPhase_MapsParkPhaseToRetryFrom(string phase, string expectedFrom)
+    {
+        Assert.Equal(expectedFrom, PipelineRunner.RetryFromForQuotaPhase(phase));
+    }
+
+    /// <summary>
+    /// End-to-end park assertion for a Reworking item: a quota rejection caught
+    /// mid-rework must persist QuotaRetryFrom="audit" (NOT "work"), so the
+    /// scheduler resumes the item from WorkComplete and the WorkBranch the
+    /// rework was operating on survives the quota window. The original
+    /// mid-rework Claude five-hour incident landed QuotaRetryFrom="work" which
+    /// <see cref="WorkItemRetrier"/> resolves to <see cref="WorkItemState.Queued"/>;
+    /// <see cref="WorkItem.With"/> then clears WorkBranch, discarding the
+    /// in-flight branch + the audit findings the rework was addressing.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkItemState.Reworking, "audit")]
+    [InlineData(WorkItemState.ReworkingForConflict, "audit")]
+    [InlineData(WorkItemState.Auditing, "audit")]
+    [InlineData(WorkItemState.Merging, "merge")]
+    [InlineData(WorkItemState.UpstreamPushing, "upstream")]
+    [InlineData(WorkItemState.Working, "work")]
+    public void QuotaRetryFromForState_ResumesAtBranchPreservingSlot(
+        WorkItemState state, string expectedRetryFrom)
+    {
+        // PhaseForQuotaPark + RetryFromForQuotaPhase compose end-to-end: a
+        // Reworking item → "rework" park-phase → "audit" retry-from. Hitting
+        // both layers in one assertion is what catches the original incident
+        // (Reworking landing QuotaRetryFrom="work" because the rework arm was
+        // missing from RetryFromForQuotaPhase even though PhaseForQuotaPark
+        // recorded "rework"). Asserting only the inner helper would leave the
+        // mapper-chain unguarded against the same bug recurring on a different
+        // arm.
+        var parkPhase = PipelineRunner.PhaseForQuotaPark(state);
+        var retryFrom = PipelineRunner.RetryFromForQuotaPhase(parkPhase);
+        Assert.Equal(expectedRetryFrom, retryFrom);
+    }
+
     [Fact]
     public async Task NotifyQuotaFailure_PersistsNextRetryAtWithClockDriftMargin()
     {

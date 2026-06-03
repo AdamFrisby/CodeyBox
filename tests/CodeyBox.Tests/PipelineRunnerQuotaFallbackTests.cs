@@ -152,6 +152,89 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
+    {
+        // The exact regression that prompted the mid-rework Claude 5h-window
+        // fix: claude exits 1 emitting only
+        //   {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",...}}
+        // on stdout. Before this branch the classifier returned null for this
+        // shape, the orchestrator recorded failureKind="other", and
+        // InvokeAgentWithQuotaFallbackAsync never saw a TerminalQuotaError to
+        // fall back on — silently hard-Failing the item even though the class
+        // had an available peer. The pre-existing fallback tests all wire
+        // stderr "rate_limit_exceeded", so a regression that broke the
+        // stdout-rate_limit_event detection path would slip past them.
+        //
+        // This test pins acceptance-criterion (a): "first attempt cross-agent
+        // fallback within the class" for the exact wire shape captured from
+        // production. Claude is the WORK agent, claude emits the JSON, the
+        // wrapper must catch the TerminalQuotaError and re-dispatch Codex —
+        // not park as WaitingForQuotaReset (a peer is available) and not hard
+        // Fail.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        const long resetsAtUnixSeconds = 1782000000L;
+        var rateLimitStdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + resetsAtUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\",\"overageStatus\":\"rejected\"}}";
+
+        fix.Claude.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: rateLimitStdout,
+            Stderr: null));
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem(initialAgent: AgentKind.Claude);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Claude burned its one quota attempt for work; Codex picked the
+        // work up and committed the diff. Claude is called a second time for
+        // the MERGE phase — the pipeline keeps item.Agent (Claude) for merge
+        // even after a work-phase fallback, and the ScriptableAgent harness
+        // short-circuits any "# Merge task" prompt to a real git merge that
+        // succeeds without consuming scripted failures (same behaviour the
+        // existing Codex_HitsQuota_FallsBackToClaude_SameIteration test pins).
+        // Asserting the exact counts catches a regression that, e.g.,
+        // re-dispatched the rate_limit_event scripted failure on the merge
+        // phase and silently re-triggered fallback.
+        Assert.Equal(2, fix.Claude.CallCount);
+        Assert.Equal(1, fix.Codex.CallCount);
+
+        // Item must NOT be Failed or parked — a peer was available, so the
+        // fallback path is the contract.
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.NotEqual(WorkItemState.Failed, finalItem!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem.State);
+
+        // Webhook + fallback-history must record the swap as the WORK phase
+        // (the rate_limit_event was emitted during work), with claude→codex
+        // attribution and a quota-shaped reason. A regression that swallowed
+        // the TerminalQuotaError and let the item Fail "other" would leave the
+        // fallback record entirely missing.
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "agent.fallback");
+        var fallback = fix.Webhooks.Events.First(e => e.Event == "agent.fallback");
+        var details = Assert.IsType<AgentFallbackDetails>(fallback.Details);
+        Assert.Equal("claude", details.FromAgent);
+        Assert.Equal("codex", details.ToAgent);
+        Assert.Equal("work", details.Phase);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var swap = Assert.Single(history, h => h.Phase == "work" && h.ToAgent == AgentKind.Codex);
+        Assert.Equal(AgentKind.Claude, swap.FromAgent);
+
+        // Claude was marked exhausted on its quota probe (write-back path) so
+        // subsequent in-process picks skip it. A regression that detected the
+        // rate_limit_event but failed to propagate MarkExhausted would let the
+        // class oscillate back to claude on the next iteration.
+        Assert.Contains(AgentKind.Claude, fix.ClaudeProbe.MarkedExhausted);
+    }
+
+    [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_SameIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
