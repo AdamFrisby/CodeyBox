@@ -3495,6 +3495,76 @@ public sealed class PipelineRunner : IPipelineRunner
             Description: BuildRequiredBuildFailureSummary(result));
     }
 
+    private async Task PersistRequiredBuildAuditReportAsync(
+        WorkItemId workItemId,
+        int iteration,
+        DateTimeOffset startedAt,
+        TimeSpan elapsed,
+        RequiredBuildVerificationResult result,
+        CancellationToken ct)
+    {
+        if (_auditReports is null) return;
+        // Skipped: the gate did not apply on this branch, so there is no
+        // auditor invocation to record. Unavailable with no captured output
+        // also has nothing useful to persist (the build script never ran:
+        // marker inspection, isolated clone, or sandbox setup failed before
+        // the build emitted anything). Failed/Passed always persist; an
+        // Unavailable that DOES carry build output (dotnet-not-found,
+        // no-target) is treated like a script-ran-but-couldn't-finish
+        // outcome and persisted with its output so operators can inspect it.
+        if (result.Status == RequiredBuildVerificationStatus.Skipped) return;
+        if (result.Status == RequiredBuildVerificationStatus.Unavailable
+            && string.IsNullOrEmpty(result.Output))
+        {
+            return;
+        }
+
+        try
+        {
+            const int MaxRawBytes = 256 * 1024;
+            string? rawOutput = null;
+            if (!string.IsNullOrEmpty(result.Output))
+            {
+                var redacted = RawOutputRedactor.Redact(result.Output);
+                rawOutput = RawOutputRedactor.TruncateToBytes(redacted, MaxRawBytes);
+            }
+
+            var isFailure = result.Status == RequiredBuildVerificationStatus.Failed;
+            var findings = isFailure
+                ? new List<AuditReportFinding>
+                {
+                    new(
+                        FindingIdComputer.Compute(RequiredBuildGateIdentity.AuditorName, "required build failed", []),
+                        AuditSeverity.Error.ToString(),
+                        $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
+                        $"Required build exited with code {result.ExitCode}.",
+                        [],
+                        []),
+                }
+                : new List<AuditReportFinding>();
+            var report = new AuditReport
+            {
+                Id = Guid.NewGuid().ToString(),
+                WorkItemId = workItemId.ToString(),
+                Iteration = iteration,
+                AuditorName = RequiredBuildGateIdentity.AuditorName,
+                AuditorKind = "shell",
+                WorstSeverity = isFailure ? AuditSeverity.Error.ToString() : "none",
+                StartedAt = startedAt,
+                EndedAt = startedAt + elapsed,
+                DurationMs = (long)elapsed.TotalMilliseconds,
+                Findings = findings,
+                RawOutput = rawOutput,
+            };
+            await _auditReports.CreateAsync(report, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Non-fatal: audit report persistence must never abort the pipeline.
+            _log.LogWarning(ex, "Failed to persist required build audit report for work item {WorkItemId}", workItemId);
+        }
+    }
+
     /// <summary>
     /// Gates the merge phase for items resuming at <see cref="WorkItemState.AuditPassed"/>.
     /// The normal audit loop is skipped on that resume path, so without this
@@ -3535,17 +3605,65 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         int? iteration = null)
     {
-        var result = await _requiredBuildVerifier.VerifyAsync(new RequiredBuildVerificationRequest
+        // Branch-controlled MSBuild targets can sleep or loop forever.
+        // Enforce a dedicated timeout for every required-build verification
+        // (work, audit, AuditPassed-resume) so the gate cannot hold the
+        // pipeline worker indefinitely. The audit phase already imposes a
+        // per-iteration timeout, but this layered bound applies on every
+        // call path — including the AuditPassed-resume path that runs under
+        // only the ambient pipeline token.
+        var auditTarget = SandboxTargetResolver.ResolveAudit(
+            project.NetworkProfiles.AuditTool,
+            AuditCapabilities.None);
+        var baselineRef = SandboxTargetResolver.BaselineRefForTarget(
+            project, auditTarget, item.BaselineImageRef);
+        var request = new RequiredBuildVerificationRequest
         {
             WorkItemId = item.Id,
-            Project = project,
+            ProjectId = project.Id,
             RepositoryId = repoId,
             BaseBranch = baseBranch,
             WorkBranch = workBranch,
             Phase = phase,
             Iteration = iteration,
-            WorkItemBaselineImageRef = item.BaselineImageRef,
-        }, ct);
+            SandboxPolicy = new RequiredBuildSandboxPolicy
+            {
+                NetworkProfile = auditTarget.NetworkProfile,
+                BaselineImageRef = baselineRef,
+            },
+        };
+
+        var verificationTimeout = _opts.RequiredBuildVerificationTimeout;
+        using var timeoutCts = new CancellationTokenSource(verificationTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var sw = Stopwatch.StartNew();
+        RequiredBuildVerificationResult result;
+        try
+        {
+            result = await _requiredBuildVerifier.VerifyAsync(request, linkedCts.Token);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new RequiredBuildVerificationUnavailableException(
+                $"could not verify required build: build exceeded the required-build verification timeout of {verificationTimeout.TotalMinutes:0.##} minutes");
+        }
+        finally
+        {
+            sw.Stop();
+        }
+
+        // Persist the audit report through the orchestrator's canonical
+        // path on the audit-phase call site (iteration is set). The verifier
+        // owns execution only; report persistence lives here so the gate
+        // doesn't bypass the same raw-output redaction / truncation that
+        // normal auditors get and so persistence is wired through a single
+        // store dependency.
+        if (iteration is int iter)
+        {
+            await PersistRequiredBuildAuditReportAsync(item.Id, iter, startedAt, sw.Elapsed, result, ct);
+        }
 
         if (result.Status == RequiredBuildVerificationStatus.Unavailable)
         {
@@ -9315,6 +9433,14 @@ public sealed record PipelineOptions
     public HostGitIdentity? HostGitIdentity { get; init; }
     public TimeSpan ShutdownGrace { get; init; } = TimeSpan.FromSeconds(60);
     public double PhaseAbsoluteTimeoutMultiplier { get; init; } = 3.0;
+    /// <summary>
+    /// Hard ceiling on a single required-build verification (per call) across
+    /// every phase / resume path. Bounds branch-controlled MSBuild targets
+    /// that sleep or loop forever so they cannot hold a pipeline worker
+    /// indefinitely; on timeout the gate fails as <c>Unavailable</c> and the
+    /// item defers / fails-infrastructure rather than passing by default.
+    /// </summary>
+    public TimeSpan RequiredBuildVerificationTimeout { get; init; } = TimeSpan.FromMinutes(15);
     public TimeSpan AuditShutdownDrain => Min(TimeSpan.FromSeconds(60), ShutdownGrace);
     public TimeSpan AgentPreemptSignalTimeout => Min(TimeSpan.FromSeconds(2), ShutdownGrace);
     public TimeSpan AgentPreemptDrain => Min(TimeSpan.FromSeconds(2), ShutdownGrace);

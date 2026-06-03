@@ -456,7 +456,6 @@ builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredB
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
     sp.GetRequiredService<PipelineOptions>(),
-    sp.GetRequiredService<IAuditReportStore>(),
     sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>()));
 
 // --- Pull request service (in-memory by default) -----------------------------

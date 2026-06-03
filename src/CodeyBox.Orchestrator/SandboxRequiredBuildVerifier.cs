@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -75,20 +74,17 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
-    private readonly IAuditReportStore? _auditReports;
     private readonly ILogger<SandboxRequiredBuildVerifier> _log;
 
     public SandboxRequiredBuildVerifier(
         ISandboxProvider sandboxes,
         IGitHost gitHost,
         PipelineOptions pipelineOptions,
-        IAuditReportStore? auditReports,
         ILogger<SandboxRequiredBuildVerifier> log)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
-        _auditReports = auditReports;
         _log = log;
     }
 
@@ -200,7 +196,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         var inspection = await InspectDotnetBuildMarkersAsync(new RequiredBuildProbeRequest
         {
             WorkItemId = request.WorkItemId,
-            ProjectId = request.Project.Id,
+            ProjectId = request.ProjectId,
             RepositoryId = request.RepositoryId,
             BaseBranch = request.BaseBranch,
             WorkBranch = request.WorkBranch,
@@ -214,7 +210,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
         if (inspection.MissingRequiredMarkers.Count > 0 || (inspection.BaseBranchHasMarkers && !inspection.WorkBranchHasMarkers))
         {
-            var startedAt = DateTimeOffset.UtcNow;
             var output = inspection.MissingRequiredMarkers.Count > 0
                 ? $"Work branch '{request.WorkBranch}' deleted or moved required .NET build marker(s) " +
                   $"present on base branch '{inspection.BaseBranch}': {string.Join(", ", inspection.MissingRequiredMarkers)}. " +
@@ -222,15 +217,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 : $"Required .NET build markers exist on base branch '{inspection.BaseBranch}', " +
                   $"but work branch '{request.WorkBranch}' contains no solution or project file. " +
                   "The branch deleted or moved the files required for the non-skippable build gate.";
-            await PersistReportAsync(
-                request.WorkItemId,
-                request.Iteration ?? 0,
-                startedAt,
-                TimeSpan.Zero,
-                success: false,
-                rawOutput: output,
-                exitCode: NoRequiredBuildTargetExitCode,
-                ct);
             return RequiredBuildVerificationResult.Failed(NoRequiredBuildTargetExitCode, output);
         }
 
@@ -241,8 +227,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 request.RepositoryId,
                 request.WorkItemId,
                 ct);
-            var startedAt = DateTimeOffset.UtcNow;
-            var sw = Stopwatch.StartNew();
             var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
             var spec = BuildSandboxSpec(access, request);
 
@@ -270,19 +254,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 Argv = ["sh", "-c", BuildScript],
                 WorkingDirectory = SandboxConventions.WorkDir,
             }, ct);
-            sw.Stop();
 
             var rawOutput = CombinedOutput(build);
             var redactedOutput = TruncateOutput(rawOutput);
-            await PersistReportAsync(
-                request.WorkItemId,
-                request.Iteration ?? 0,
-                startedAt,
-                sw.Elapsed,
-                build.Success,
-                redactedOutput,
-                build.ExitCode,
-                ct);
 
             if (build.Success)
                 return RequiredBuildVerificationResult.Passed(build.ExitCode, redactedOutput);
@@ -349,23 +323,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         SandboxRepositoryAccess access,
         RequiredBuildVerificationRequest request)
     {
-        // Resolve the audit-tool sandbox target internally from the project so
-        // the public IRequiredBuildVerifier contract does not leak sandbox
-        // infrastructure choices (network profile, flavor, baseline image) to
-        // callers; the verifier owns those decisions for itself.
-        var target = SandboxTargetResolver.ResolveAudit(
-            request.Project.NetworkProfiles.AuditTool,
-            AuditCapabilities.None);
-        var baselineRef = SandboxTargetResolver.BaselineRefForTarget(
-            request.Project,
-            target,
-            request.WorkItemBaselineImageRef);
-
+        // The audit-tool sandbox target is pre-resolved by the orchestrator
+        // and arrives via the request's SandboxPolicy. This verifier never
+        // sees the full Project aggregate. Audit-tool sandboxes are always
+        // headless for required-build verification.
         var net = new SandboxNetworkPolicy
         {
             AllowedHosts = [],
             HostGitEndpoint = access.Network.HostGitEndpoint,
-            ProfileName = target.NetworkProfile,
+            ProfileName = request.SandboxPolicy.NetworkProfile,
         };
 
         return new SandboxSpec
@@ -378,11 +344,11 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             ],
             Environment = new Dictionary<string, string>(),
             Network = net,
-            Flavor = target.Flavor,
+            Flavor = SandboxProfileFlavor.Headless,
             WorkingDirectory = SandboxConventions.WorkDir,
             TimingWorkItemId = request.WorkItemId,
             TimingPhase = request.Phase,
-            BaselineImageRef = baselineRef,
+            BaselineImageRef = request.SandboxPolicy.BaselineImageRef,
         };
     }
 
@@ -396,54 +362,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             throw new InvalidOperationException(
                 $"{argv[0]} failed while preparing required build: {SingleLineSummary(CombinedOutput(result))}");
-        }
-    }
-
-    private async Task PersistReportAsync(
-        WorkItemId workItemId,
-        int iteration,
-        DateTimeOffset startedAt,
-        TimeSpan elapsed,
-        bool success,
-        string rawOutput,
-        int exitCode,
-        CancellationToken ct)
-    {
-        if (_auditReports is null)
-            return;
-
-        try
-        {
-            var findings = success
-                ? []
-                : new List<AuditReportFinding>
-                {
-                    new(
-                        FindingIdComputer.Compute(AuditorName, "required build failed", []),
-                        AuditSeverity.Error.ToString(),
-                        $"required build failed: {DisplayCommand}",
-                        $"Required build exited with code {exitCode}.",
-                        [],
-                        []),
-                };
-            await _auditReports.CreateAsync(new AuditReport
-            {
-                Id = Guid.NewGuid().ToString(),
-                WorkItemId = workItemId.ToString(),
-                Iteration = iteration,
-                AuditorName = AuditorName,
-                AuditorKind = "shell",
-                WorstSeverity = success ? "none" : AuditSeverity.Error.ToString(),
-                StartedAt = startedAt,
-                EndedAt = startedAt + elapsed,
-                DurationMs = (long)elapsed.TotalMilliseconds,
-                Findings = findings,
-                RawOutput = rawOutput,
-            }, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _log.LogWarning(ex, "Failed to persist required build report for work item {WorkItemId}", workItemId);
         }
     }
 

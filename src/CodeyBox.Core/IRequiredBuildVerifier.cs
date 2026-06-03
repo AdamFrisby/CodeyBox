@@ -51,13 +51,34 @@ public sealed record RequiredBuildProbeResult(
 public sealed record RequiredBuildVerificationRequest
 {
     public required WorkItemId WorkItemId { get; init; }
-    public required Project Project { get; init; }
+    /// <summary>Project the work item belongs to; available for logging only.</summary>
+    public required ProjectId ProjectId { get; init; }
     public required string RepositoryId { get; init; }
     public string? BaseBranch { get; init; }
     public required string WorkBranch { get; init; }
     public required string Phase { get; init; }
     public int? Iteration { get; init; }
-    public string? WorkItemBaselineImageRef { get; init; }
+    /// <summary>
+    /// Pre-resolved sandbox/build policy. The orchestrator resolves
+    /// project-aware fields (audit-tool network profile, baseline image)
+    /// before crossing this boundary so the verifier contract does not
+    /// expose the full <see cref="Project"/> aggregate to implementations.
+    /// </summary>
+    public required RequiredBuildSandboxPolicy SandboxPolicy { get; init; }
+}
+
+/// <summary>
+/// Minimum sandbox/build inputs a required-build verifier needs from the
+/// orchestrator. Resolved once by the orchestrator from the work item /
+/// project so verifier implementations do not pull in unrelated project
+/// configuration.
+/// </summary>
+public sealed record RequiredBuildSandboxPolicy
+{
+    /// <summary>Network profile to apply to the audit-tool sandbox, or null for the default profile.</summary>
+    public string? NetworkProfile { get; init; }
+    /// <summary>Pre-resolved baseline image ref, or null if not applicable.</summary>
+    public string? BaselineImageRef { get; init; }
 }
 
 public enum RequiredBuildVerificationStatus

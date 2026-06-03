@@ -190,7 +190,6 @@ internal static class TestSupport
                 sandboxes,
                 gitHost,
                 resolvedOptions,
-                auditReportStore,
                 NullLogger<SandboxRequiredBuildVerifier>.Instance));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
