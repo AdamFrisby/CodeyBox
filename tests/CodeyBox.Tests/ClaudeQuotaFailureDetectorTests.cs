@@ -59,6 +59,166 @@ public sealed class ClaudeQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_RateLimitEvent_FiveHourRejected_ClassifiesAsQuotaWithResetAt()
+    {
+        // Captured shape from the 2026-06-02/03 incident (work item 36a7ff0c):
+        // claude exhausts its 5-hour subscription window mid-run and emits a
+        // rate_limit_event with status=rejected. Before this branch the
+        // QuotaClassifier returned null for this shape — the orchestrator
+        // recorded failureKind="other" and hard-Failed the item instead of
+        // parking it as WaitingForQuotaReset. resetsAt below is a future unix
+        // timestamp (2026-07-01) chosen to outlast the test's lifetime.
+        const long ResetsAtUnixSeconds = 1782000000L;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + ResetsAtUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\",\"overageStatus\":\"rejected\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(ResetsAtUnixSeconds), detection.ResetAt);
+    }
+
+    [Theory]
+    [InlineData("seven_day")]
+    [InlineData("weekly")]
+    public void Detect_RateLimitEvent_WeeklyRejected_ClassifiesAsQuota(string rateLimitType)
+    {
+        const long ResetsAtUnixSeconds = 1782000000L;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + ResetsAtUnixSeconds
+            + ",\"rateLimitType\":\"" + rateLimitType + "\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(ResetsAtUnixSeconds), detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_AllowedStatus_ReturnsNull()
+    {
+        // The CLI also emits rate_limit_event lines for non-rejection telemetry
+        // (status=allowed). Those must not classify as quota failures.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1782000000,"rateLimitType":"five_hour"}}""";
+
+        Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_UnknownRateLimitType_ReturnsNull()
+    {
+        // Defensive: only quota-scope window types are treated as terminal.
+        // Unknown rateLimitType values must not silently classify as quota.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"per_minute"}}""";
+
+        Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_MissingResetsAt_StillClassifiesAsQuota()
+    {
+        // A missing/malformed resetsAt must not lose the quota signal — the
+        // orchestrator falls back to its own quota-reset policy when ResetAt
+        // is null.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}""";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_StringFormResetsAt_StillExtractsResetAt()
+    {
+        // Some CLI versions / proxies serialize resetsAt as a JSON string. The
+        // detector must accept the string-form so the quota-reset timer is
+        // armed at the actual reset (rather than the orchestrator's default
+        // pause). A regression that only matched the number branch would
+        // silently degrade NextQuotaRetryAt for half the wire shapes.
+        const long ResetsAtUnixSeconds = 1782000000L;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":\""
+            + ResetsAtUnixSeconds
+            + "\",\"rateLimitType\":\"five_hour\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(ResetsAtUnixSeconds), detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_OutOfRangeUnixSeconds_StillClassifiesAsQuotaWithNullReset()
+    {
+        // DateTimeOffset.FromUnixTimeSeconds throws on values outside its
+        // representable range. A malformed payload must NOT lose the quota
+        // signal (the orchestrator still needs to park as WaitingForQuotaReset),
+        // but ResetAt must come through as null so the resolver falls back to
+        // the configured default pause window instead of crashing the
+        // classification. A regression that propagated the throw would
+        // re-introduce the "hard-Fail on unparseable resetsAt" failure mode
+        // for any CLI variant that emits a bogus value.
+        const long OutOfRangeUnixSeconds = long.MaxValue;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + OutOfRangeUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void ScopeStdoutForQuotaDetection_PreservesRateLimitEventBesideTerminalError()
+    {
+        // When a terminal stream-json error coexists with a rate_limit_event
+        // rejection, the narrowing step must preserve the *parseable*
+        // rate_limit_event line — not just stray substrings — so Detect's
+        // subsequent JSON parse still finds the rejection and surfaces resetsAt.
+        // A plausible regression here would be to truncate or corrupt the JSON
+        // line while leaving the words "rate_limit_event" / "compilation failed"
+        // in place; substring checks would pass but classification would fall
+        // back to "other" and the orchestrator would hard-fail the item.
+        const long resetsAt = 1782000000L;
+        var stdout =
+            "{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"compilation failed\"}\n"
+            + "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + resetsAt + ",\"rateLimitType\":\"five_hour\"}}";
+
+        var scoped = _detector.ScopeStdoutForQuotaDetection(stdout);
+
+        Assert.NotNull(scoped);
+        Assert.Contains("rate_limit_event", scoped);
+        Assert.Contains("compilation failed", scoped);
+
+        // Round-trip the scoped output through Detect (the exact next step the
+        // composite classifier takes after scoping) to prove the
+        // rate_limit_event line survived intact and yields the expected
+        // RateLimitExceeded verdict with the parsed ResetAt — not just that
+        // the marker substring is preserved.
+        var scopedDetection = _detector.Detect(stderr: null, stdout: scoped);
+
+        Assert.NotNull(scopedDetection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, scopedDetection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(resetsAt), scopedDetection.ResetAt);
+    }
+
+    [Fact]
     public void Detect_GeminiStreamShape_ReturnsNull()
     {
         var stdout =

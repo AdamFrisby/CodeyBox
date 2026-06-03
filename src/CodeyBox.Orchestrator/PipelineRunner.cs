@@ -972,22 +972,25 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (TerminalQuotaError ex)
         {
+            // Quota rejection is never a terminal Failure: the agent (or a peer
+            // in its class) will become available again at ResetAt, so the item
+            // must always park as WaitingForQuotaReset so QuotaRetryScheduler
+            // re-dispatches on reset. The mid-iteration fallback inside
+            // InvokeAgentWithQuotaFallbackAsync only converts to
+            // AgentClassExhaustedException when a class is wired; the
+            // no-class / single-agent path delivers TerminalQuotaError here
+            // unchanged, and that path must NOT hard-fail the work item
+            // (acceptance: Claude five_hour rate_limit_event rejection must
+            // park, not Fail).
             _log.LogWarning("Work item {Id} hit quota: {Error}", item.Id, ex.Message);
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            if (current.State == WorkItemState.Auditing)
-            {
-                await TransitionWaitingForQuotaResetAsync(
-                    item,
-                    ex.Message,
-                    phase: "audit",
-                    quotaResetAt: ex.ResetAt,
-                    project: project,
-                    iteration: null);
-            }
-            else
-            {
-                await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "quota", quotaResetAt: ex.ResetAt);
-            }
+            await TransitionWaitingForQuotaResetAsync(
+                item,
+                ex.Message,
+                phase: PhaseForQuotaPark(current.State),
+                quotaResetAt: ex.ResetAt,
+                project: project,
+                iteration: null);
         }
         catch (SandboxDiskDeferredException)
         {
@@ -8785,11 +8788,45 @@ Original merge-phase failure (for context):
         }, ct);
     }
 
-    private static string RetryFromForQuotaPhase(string phase) => phase switch
+    /// <summary>
+    /// Maps the per-phase quota-park label to the <c>from</c> phase string the
+    /// retry scheduler/<see cref="WorkItemRetrier"/> understands. Each value
+    /// chooses the lifecycle slot the item resumes at after the quota window
+    /// resets — work/audit/merge/upstream map 1:1 onto Queued/WorkComplete/
+    /// AuditPassed/Merged. <c>rework</c> deliberately maps to <c>audit</c>:
+    /// resuming via WorkComplete preserves the in-flight WorkBranch (Queued
+    /// clears it in <see cref="WorkItem.With(WorkItemState, string?, WorkItemCancellationReason?, string?, DateTimeOffset?, string?)"/>),
+    /// so a mid-rework Claude five-hour reset doesn't discard the agent's prior
+    /// commits and the audit findings the rework was responding to. Mirrors the
+    /// transient-cancel mapper
+    /// (<see cref="ResumeStateForTransientRetry"/>: <c>rework → WorkComplete</c>).
+    /// Internal (not private) so the phase table is unit-testable directly.
+    /// </summary>
+    internal static string RetryFromForQuotaPhase(string phase) => phase switch
     {
         "audit" => "audit",
+        "rework" => "audit",
         "merge" => "merge",
         "upstream" => "upstream",
+        _ => "work",
+    };
+
+    /// <summary>
+    /// Maps the work item's current state to the phase string used when parking
+    /// a quota rejection as <see cref="WorkItemState.WaitingForQuotaReset"/>. The
+    /// phase drives <see cref="RetryFromForQuotaPhase"/> so the scheduler resumes
+    /// the item in the correct lifecycle slot (work / rework / audit / merge /
+    /// upstream) after the quota window resets. Internal (not private) so the
+    /// state-to-phase table is unit-testable directly.
+    /// </summary>
+    internal static string PhaseForQuotaPark(WorkItemState state) => state switch
+    {
+        WorkItemState.Auditing => "audit",
+        WorkItemState.Reworking => "rework",
+        WorkItemState.ReworkingForConflict => "rework",
+        WorkItemState.AuditFailed => "rework",
+        WorkItemState.Merging => "merge",
+        WorkItemState.UpstreamPushing => "upstream",
         _ => "work",
     };
 

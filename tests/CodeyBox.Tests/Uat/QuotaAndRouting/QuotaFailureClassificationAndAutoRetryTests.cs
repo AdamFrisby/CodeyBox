@@ -63,6 +63,25 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public void ClaudeRateLimitEventRejection_IsClassifiedAsQuotaWithResetAt()
+    {
+        // Captured stdout shape from a claude run that exhausted its 5h
+        // window mid-rework. Before this branch the classifier returned null
+        // for this shape, the orchestrator recorded failureKind="other" and
+        // hard-Failed the item; it never tried cross-agent fallback or parked
+        // as WaitingForQuotaReset. The detector must now classify the
+        // rejection and surface resetsAt for QuotaRetryScheduler.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"five_hour","overageStatus":"rejected"}}""";
+
+        var detection = BuildClassifier().Detect(AgentKind.Claude, stderr: null, stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1782000000L), detection.ResetAt);
+    }
+
+    [Fact]
     public void ResetDuration_IsDetectedFromQuotaMessage()
     {
         var detection = BuildClassifier().Detect(AgentKind.Gemini,
@@ -105,8 +124,13 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     };
 
     [Fact]
-    public async Task PipelinePersistsQuotaResetAndNextRetryAfterAgentFailure()
+    public async Task PipelineParksQuotaFailedItemForRetryAfterAgentFailure()
     {
+        // Quota rejections must NEVER hard-Fail the work item: the agent (or a
+        // peer in its class) will be available again at ResetAt, so the item is
+        // parked in WaitingForQuotaReset and QuotaRetryScheduler re-dispatches
+        // it. Asserting Failed here would codify the bug that prompted this
+        // branch — a quota condition silently killing in-flight work.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var context = BuildPipelineContext(
             projectRepositoryUrl: seed,
@@ -126,13 +150,143 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
 
         await context.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var failed = await context.Store.GetAsync(item.Id);
-        Assert.NotNull(failed);
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Equal("quota", failed.FailureKind);
-        Assert.NotNull(failed.QuotaResetAt);
-        Assert.NotNull(failed.NextQuotaRetryAt);
-        Assert.True(failed.NextQuotaRetryAt >= failed.QuotaResetAt);
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.NotNull(parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+        Assert.True(parked.NextQuotaRetryAt >= parked.QuotaResetAt);
+    }
+
+    [Fact]
+    public async Task PipelineParksClaudeRateLimitEventStdoutAsWaitingForQuotaReset()
+    {
+        // Regression for the claude 5h-window exhaustion path: when the CLI
+        // emits {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",...}}
+        // on stdout and exits 1, the pipeline must (a) classify the failure as
+        // quota, (b) park the item as WaitingForQuotaReset with QuotaResetAt
+        // = resetsAt, and (c) NEVER move it to Failed. Asserting Failed would
+        // codify the bug being fixed: the orchestrator silently killed
+        // in-flight items every time Claude's 5h window ran out mid-run instead
+        // of letting QuotaRetryScheduler resume the item at reset.
+        //
+        // resetsAt is picked ~1h from now so the pipeline's
+        // MaxParsedQuotaResetWindow clamp (24h) is a no-op here.
+        var expectedReset = DateTimeOffset.UtcNow.AddHours(1);
+        var resetsAtUnixSeconds = expectedReset.ToUnixTimeSeconds();
+        // FromUnixTimeSeconds rounds to whole seconds; round-trip so the equality
+        // assertion below is exact.
+        var expectedResetRounded = DateTimeOffset.FromUnixTimeSeconds(resetsAtUnixSeconds);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + resetsAtUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\",\"overageStatus\":\"rejected\"}}";
+        using var context = BuildPipelineContext(
+            projectRepositoryUrl: seed,
+            agent: new QuotaFailingAgent(stdout: stdout));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "claude 5h rate-limit-event UAT",
+            Prompt = "do work",
+            Agent = AgentKind.Claude,
+            BaseBranch = "main",
+            WorkBranch = "feature/claude-rate-limit-event",
+            PushUpstream = false,
+        };
+        await context.Store.CreateAsync(item);
+
+        await context.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.NotEqual(WorkItemState.Failed, parked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Equal(expectedResetRounded, parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+    }
+
+    /// <summary>
+    /// Pins the full work-item-state → quota-park-phase table. The mapping
+    /// drives <see cref="PipelineRunner.RetryFromForQuotaPhase"/> which in turn
+    /// chooses the <c>from</c> the scheduler will replay through
+    /// <see cref="WorkItemRetrier"/>: a mis-mapping for a rework/audit/merge
+    /// state would either lose the WorkBranch (re-queuing from "work" clears
+    /// it) or resume the wrong phase. Driving the entire pipeline through each
+    /// phase + park sequence to exercise the switch would dwarf the table it
+    /// verifies, so we hit the helpers directly — same approach as
+    /// <see cref="PipelineRunner.ResumeStateForTransientRetry"/>'s table test.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkItemState.Working, "work")]
+    [InlineData(WorkItemState.Queued, "work")]
+    [InlineData(WorkItemState.Auditing, "audit")]
+    [InlineData(WorkItemState.Reworking, "rework")]
+    [InlineData(WorkItemState.ReworkingForConflict, "rework")]
+    [InlineData(WorkItemState.AuditFailed, "rework")]
+    [InlineData(WorkItemState.Merging, "merge")]
+    [InlineData(WorkItemState.UpstreamPushing, "upstream")]
+    public void PhaseForQuotaPark_MapsStateToParkPhase(WorkItemState state, string expectedPhase)
+    {
+        Assert.Equal(expectedPhase, PipelineRunner.PhaseForQuotaPark(state));
+    }
+
+    /// <summary>
+    /// The companion table for <see cref="PipelineRunner.RetryFromForQuotaPhase"/>.
+    /// "rework" deliberately maps to "audit" so a mid-rework quota window reset
+    /// resumes via WorkComplete (preserving the in-flight WorkBranch) rather than
+    /// via Queued (which <see cref="WorkItem.With"/> clears WorkBranch on, losing
+    /// agent commits + audit findings the rework was responding to). A
+    /// regression that fell through to "work" — the original mid-rework Claude
+    /// five-hour incident — fails here.
+    /// </summary>
+    [Theory]
+    [InlineData("work", "work")]
+    [InlineData("audit", "audit")]
+    [InlineData("rework", "audit")]
+    [InlineData("merge", "merge")]
+    [InlineData("upstream", "upstream")]
+    [InlineData("unrecognised", "work")]
+    public void RetryFromForQuotaPhase_MapsParkPhaseToRetryFrom(string phase, string expectedFrom)
+    {
+        Assert.Equal(expectedFrom, PipelineRunner.RetryFromForQuotaPhase(phase));
+    }
+
+    /// <summary>
+    /// End-to-end park assertion for a Reworking item: a quota rejection caught
+    /// mid-rework must persist QuotaRetryFrom="audit" (NOT "work"), so the
+    /// scheduler resumes the item from WorkComplete and the WorkBranch the
+    /// rework was operating on survives the quota window. The original
+    /// mid-rework Claude five-hour incident landed QuotaRetryFrom="work" which
+    /// <see cref="WorkItemRetrier"/> resolves to <see cref="WorkItemState.Queued"/>;
+    /// <see cref="WorkItem.With"/> then clears WorkBranch, discarding the
+    /// in-flight branch + the audit findings the rework was addressing.
+    /// </summary>
+    [Theory]
+    [InlineData(WorkItemState.Reworking, "audit")]
+    [InlineData(WorkItemState.ReworkingForConflict, "audit")]
+    [InlineData(WorkItemState.Auditing, "audit")]
+    [InlineData(WorkItemState.Merging, "merge")]
+    [InlineData(WorkItemState.UpstreamPushing, "upstream")]
+    [InlineData(WorkItemState.Working, "work")]
+    public void QuotaRetryFromForState_ResumesAtBranchPreservingSlot(
+        WorkItemState state, string expectedRetryFrom)
+    {
+        // PhaseForQuotaPark + RetryFromForQuotaPhase compose end-to-end: a
+        // Reworking item → "rework" park-phase → "audit" retry-from. Hitting
+        // both layers in one assertion is what catches the original incident
+        // (Reworking landing QuotaRetryFrom="work" because the rework arm was
+        // missing from RetryFromForQuotaPhase even though PhaseForQuotaPark
+        // recorded "rework"). Asserting only the inner helper would leave the
+        // mapper-chain unguarded against the same bug recurring on a different
+        // arm.
+        var parkPhase = PipelineRunner.PhaseForQuotaPark(state);
+        var retryFrom = PipelineRunner.RetryFromForQuotaPhase(parkPhase);
+        Assert.Equal(expectedRetryFrom, retryFrom);
     }
 
     [Fact]

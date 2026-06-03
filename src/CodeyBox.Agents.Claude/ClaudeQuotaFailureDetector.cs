@@ -12,6 +12,10 @@ namespace CodeyBox.Agents.Claude;
 ///   <item>stderr / stdout text (e.g. <c>rate_limit_exceeded</c>).</item>
 ///   <item>Stream-json error events: <c>{"type":"result","is_error":true,"result":"..."}</c>
 ///         (with optional <c>subtype:"error"</c>).</item>
+///   <item>Stream-json rate-limit events: <c>{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":...,"rateLimitType":"five_hour"|"seven_day"|"weekly"}}</c>.
+///         Emitted by the host CLI when the user's 5h or weekly subscription
+///         window is rejected mid-run; no <c>rate_limit_exceeded</c> string
+///         appears in the line, so the structured envelope is the only signal.</item>
 /// </list>
 ///
 /// <para><b>401 / Unauthorized is deliberately NOT classified as a quota
@@ -118,15 +122,25 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
     /// text from earlier events in a long multi-turn run from false-positiving
     /// the final failure. Non-NDJSON / empty input is returned unchanged so
     /// stderr-style buffers still flow through <see cref="Detect"/> intact.
+    ///
+    /// When a terminal <c>result</c> error line coexists with a
+    /// <c>rate_limit_event</c> rejection line (CLI emits the latter just before
+    /// exiting on a 5h / weekly window cap), both are preserved so the rejection
+    /// signal isn't dropped by the narrowing step.
     /// </summary>
     public string? ScopeStdoutForQuotaDetection(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout))
             return stdout;
 
-        return TryGetTerminalStreamError(stdout, out var terminal)
-            ? terminal.RawLine
-            : stdout;
+        if (!TryGetTerminalStreamError(stdout, out var terminal))
+            return stdout;
+
+        var rejections = ExtractRateLimitRejections(stdout);
+        if (rejections.Count == 0)
+            return terminal.RawLine;
+
+        return terminal.RawLine + "\n" + rejections[^1].RawLine;
     }
 
     public QuotaDetection? Detect(string? stderr, string? stdout)
@@ -150,6 +164,19 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
                 if (!string.IsNullOrEmpty(stdout)) resetSources.Add(stdout);
                 return new QuotaDetection(kind, QuotaResetParser.TryParseResetAt(resetSources));
             }
+        }
+
+        // Structured rate-limit-event rejection (5h / weekly window): the line
+        // carries no "rate_limit_exceeded" text — the only quota signal is the
+        // envelope {type:"rate_limit_event", rate_limit_info:{status:"rejected", ...}}.
+        // claude exhausts its 5h window routinely, and before this branch the
+        // failure classified as "other", hard-Failing the work item instead of
+        // routing it through cross-agent fallback / WaitingForQuotaReset.
+        var rejections = ExtractRateLimitRejections(stdout);
+        if (rejections.Count > 0)
+        {
+            var resetAt = rejections.Select(r => r.ResetAt).FirstOrDefault(r => r is not null);
+            return new QuotaDetection(QuotaFailureKind.RateLimitExceeded, resetAt);
         }
 
         return null;
@@ -190,6 +217,98 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
         var message = last.Result ?? last.Message ?? last.ErrorObjectMessage;
         terminal = new TerminalStreamError(last.RawLine, message, last.ApiErrorStatus);
         return true;
+    }
+
+    /// <summary>
+    /// Walks NDJSON lines and returns every <c>rate_limit_event</c> with
+    /// <c>rate_limit_info.status == "rejected"</c> and a recognised quota-scope
+    /// <c>rateLimitType</c> (<c>five_hour</c>, <c>seven_day</c>, <c>weekly</c>).
+    /// The full set is returned in source order so <see cref="Detect"/> can pick
+    /// the first resetsAt and <see cref="ScopeStdoutForQuotaDetection"/> can
+    /// preserve the latest line.
+    /// </summary>
+    internal static IReadOnlyList<RateLimitRejection> ExtractRateLimitRejections(string? stdout)
+    {
+        var empty = Array.Empty<RateLimitRejection>();
+        if (string.IsNullOrWhiteSpace(stdout)) return empty;
+
+        var first = stdout.AsSpan().TrimStart();
+        if (first.IsEmpty || first[0] != '{') return empty;
+
+        List<RateLimitRejection>? rejections = null;
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith('{')) continue;
+            if (!TryParseRateLimitEvent(line, out var rejection)) continue;
+            rejections ??= new List<RateLimitRejection>();
+            rejections.Add(rejection);
+        }
+        return (IReadOnlyList<RateLimitRejection>?)rejections ?? empty;
+    }
+
+    private static bool TryParseRateLimitEvent(string line, out RateLimitRejection rejection)
+    {
+        rejection = default!;
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("type", out var typeProp)
+                || typeProp.ValueKind != JsonValueKind.String
+                || typeProp.GetString() != "rate_limit_event")
+            {
+                return false;
+            }
+
+            if (!root.TryGetProperty("rate_limit_info", out var info)
+                || info.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            var status = ReadString(info, "status");
+            if (!string.Equals(status, "rejected", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var rateLimitType = ReadString(info, "rateLimitType");
+            if (!IsQuotaScope(rateLimitType))
+                return false;
+
+            DateTimeOffset? resetAt = null;
+            if (info.TryGetProperty("resetsAt", out var resetsProp))
+            {
+                switch (resetsProp.ValueKind)
+                {
+                    case JsonValueKind.Number when resetsProp.TryGetInt64(out var unix):
+                        resetAt = TryFromUnixSeconds(unix);
+                        break;
+                    case JsonValueKind.String when long.TryParse(resetsProp.GetString(), out var unixStr):
+                        resetAt = TryFromUnixSeconds(unixStr);
+                        break;
+                }
+            }
+
+            rejection = new RateLimitRejection(line, resetAt, rateLimitType);
+            return true;
+        }
+        catch (JsonException) { return false; }
+        catch (InvalidOperationException) { return false; }
+    }
+
+    private static DateTimeOffset? TryFromUnixSeconds(long unix)
+    {
+        // DateTimeOffset.FromUnixTimeSeconds throws on out-of-range; treat any
+        // bad payload as a missing reset hint rather than failing classification.
+        try { return DateTimeOffset.FromUnixTimeSeconds(unix); }
+        catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    private static bool IsQuotaScope(string? rateLimitType)
+    {
+        if (string.IsNullOrEmpty(rateLimitType)) return false;
+        return rateLimitType.Equals("five_hour", StringComparison.OrdinalIgnoreCase)
+            || rateLimitType.Equals("seven_day", StringComparison.OrdinalIgnoreCase)
+            || rateLimitType.Equals("weekly", StringComparison.OrdinalIgnoreCase);
     }
 
     private static List<StreamJsonErrorEntry> EnumerateTerminalErrorEntries(string? stdout)
@@ -282,6 +401,8 @@ public sealed class ClaudeQuotaFailureDetector : IAgentQuotaFailureDetector
     }
 
     internal sealed record TerminalStreamError(string RawLine, string? Message, int? ApiErrorStatus);
+
+    internal sealed record RateLimitRejection(string RawLine, DateTimeOffset? ResetAt, string? RateLimitType);
 
     private sealed record StreamJsonErrorEntry(
         string RawLine,
