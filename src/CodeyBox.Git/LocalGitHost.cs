@@ -628,14 +628,18 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout;
     }
 
-    public async Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string pathPrefix, CancellationToken ct = default)
+    public async Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
     {
-        ValidateRepositoryRelativePath(pathPrefix);
+        var hasPrefix = !string.IsNullOrEmpty(pathPrefix);
+        if (hasPrefix)
+            ValidateRepositoryRelativePath(pathPrefix!);
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
-        var rc = await RunGitAsync(path, ct, "ls-tree", "-r", "--name-only", treeish, "--", pathPrefix);
+        var rc = hasPrefix
+            ? await RunGitAsync(path, ct, "ls-tree", "-r", "--name-only", treeish, "--", pathPrefix!)
+            : await RunGitAsync(path, ct, "ls-tree", "-r", "--name-only", treeish);
         if (rc.ExitCode != 0)
-            throw new InvalidOperationException($"git ls-tree '{treeish}:{pathPrefix}' failed: {rc.Stderr}");
+            throw new InvalidOperationException($"git ls-tree '{treeish}{(hasPrefix ? ":" + pathPrefix : string.Empty)}' failed: {rc.Stderr}");
         return rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 

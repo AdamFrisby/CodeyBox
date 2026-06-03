@@ -331,8 +331,11 @@ public interface IGitHost
     Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side file reads.");
 
-    /// <summary>Lists repository-relative files under a path prefix from a commit or tree.</summary>
-    Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string pathPrefix, CancellationToken ct = default)
+    /// <summary>
+    /// Lists repository-relative files under a path prefix from a commit or tree.
+    /// Pass an empty or null <paramref name="pathPrefix"/> to list every file in the tree.
+    /// </summary>
+    Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side file listing.");
 
     /// <summary>Returns name-status changes between two commits or trees in the host bare repo.</summary>

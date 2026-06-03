@@ -400,6 +400,274 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxRequiredBuildVerifier_MarkerInspectionFailure_ReturnsUnavailable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var throwingHost = new ThrowingListFilesGitHost(gitHost, "git ls-tree blew up");
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            throwingHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/marker-inspection-fails") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("could not verify required build", result.Reason);
+        Assert.Contains("git ls-tree blew up", result.Reason);
+        Assert.Empty(captureStore.Reports);
+
+        var probe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.Unavailable, probe.Status);
+        Assert.Contains("git ls-tree blew up", probe.Reason);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_IsolatedRepoCreationFailure_ReturnsUnavailable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var brokenHost = new BrokenIsolatedCloneGitHost(gitHost, "disk full while preparing isolated clone");
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            brokenHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/isolated-clone-fails") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("could not verify required build", result.Reason);
+        Assert.Contains("isolated build repository", result.Reason);
+        Assert.Contains("disk full while preparing isolated clone", result.Reason);
+        Assert.Empty(captureStore.Reports);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_GitCloneInsideSandboxFails_ReturnsUnavailable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new GitFailingSandboxProvider("fatal: simulated git clone failure inside sandbox"),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/sandbox-clone-fails") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("could not verify required build", result.Reason);
+        Assert.Contains("git", result.Reason);
+        Assert.Contains("simulated git clone failure", result.Reason);
+        Assert.Empty(captureStore.Reports);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_FailingBuild_PersistsAuditReportWithErrorFinding()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/audit-report-fail") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            gitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "build.fail",
+            "broken\n",
+            "broken branch");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+            Iteration = 3,
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        var report = Assert.Single(captureStore.Reports);
+        Assert.Equal(RequiredBuildGateIdentity.AuditorName, report.AuditorName);
+        Assert.Equal("shell", report.AuditorKind);
+        Assert.Equal(AuditSeverity.Error.ToString(), report.WorstSeverity);
+        Assert.Equal(3, report.Iteration);
+        Assert.Equal(item.Id.ToString(), report.WorkItemId);
+        Assert.NotNull(report.RawOutput);
+        Assert.Contains("error CS1061", report.RawOutput);
+        var finding = Assert.Single(report.Findings);
+        Assert.Equal(AuditSeverity.Error.ToString(), finding.Severity);
+        Assert.Contains("required build failed", finding.Title);
+        Assert.StartsWith("f-", finding.Id);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_PassingBuild_PersistsAuditReportWithSeverityNone()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/audit-report-pass") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            gitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+            Iteration = 7,
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        var report = Assert.Single(captureStore.Reports);
+        Assert.Equal(RequiredBuildGateIdentity.AuditorName, report.AuditorName);
+        Assert.Equal("shell", report.AuditorKind);
+        Assert.Equal("none", report.WorstSeverity);
+        Assert.Equal(7, report.Iteration);
+        Assert.Empty(report.Findings);
+        Assert.NotNull(report.RawOutput);
+        Assert.Contains("Build succeeded", report.RawOutput);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_WorkDeletesRootSolution_FailsEvenWhenLeafCsprojRemains()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var captureStore = new CapturingAuditReportStore();
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            captureStore,
+            NullLogger<SandboxRequiredBuildVerifier>.Instance);
+
+        var item = NewItem("feature/work-deletes-root-keeps-leaf") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await ReplaceBaseMarkersWithLeafProjectAsync(barePath, item.WorkBranch!);
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+            Iteration = 1,
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.Contains("deleted or moved", result.Output);
+        Assert.Contains("CodeyBox.slnx", result.Output);
+        Assert.Contains("tests/CodeyBox.Tests.csproj", result.Output);
+        var report = Assert.Single(captureStore.Reports);
+        Assert.Equal(AuditSeverity.Error.ToString(), report.WorstSeverity);
+        Assert.Equal(1, report.Iteration);
+    }
+
+    [Fact]
     public async Task AuditPass_CannotReachAuditPassed_WhenRequiredBuildCannotRun()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -426,6 +694,22 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("dotnet is not available", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+    }
+
+    private async Task ReplaceBaseMarkersWithLeafProjectAsync(string barePath, string branch)
+    {
+        var clone = Path.Combine(_workspace, "branch-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch);
+        await TestSupport.RunGit(clone, "rm", "--", "CodeyBox.slnx", "tests/CodeyBox.Tests.csproj");
+        var leafDir = Path.Combine(clone, "tools", "trivial");
+        Directory.CreateDirectory(leafDir);
+        await File.WriteAllTextAsync(Path.Combine(leafDir, "trivial.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        await TestSupport.RunGit(clone, "add", "tools/trivial/trivial.csproj");
+        await TestSupport.RunGit(clone, "commit", "-m", $"swap root solution for leaf project\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
     private async Task<FakeDotnet> CreateFakeDotnetAsync()
@@ -715,5 +999,128 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
 
         public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
+    private sealed class GitFailingSandboxProvider(string stderr) : ISandboxProvider
+    {
+        public string Name => "git-failing";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            return Task.FromResult<ISandbox>(new GitFailingSandbox(stderr));
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(Array.Empty<ManagedSandboxInfo>());
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class GitFailingSandbox(string stderr) : ISandbox
+    {
+        public string Id { get; } = "git-failing-" + Guid.NewGuid().ToString("N")[..8];
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = ct;
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "git")
+                return Task.FromResult(new SandboxExecResult(128, string.Empty, stderr));
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class CapturingAuditReportStore : IAuditReportStore
+    {
+        public List<AuditReport> Reports { get; } = [];
+
+        public Task CreateAsync(AuditReport report, CancellationToken ct = default)
+        {
+            Reports.Add(report);
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AuditReport>>(Reports.Where(r => r.WorkItemId == workItemId).ToList());
+
+        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+            => Task.FromResult<string?>(null);
+
+        public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+            => Task.FromResult(0);
+    }
+
+    private sealed class ThrowingListFilesGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
+    {
+        public override Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
+            => throw new InvalidOperationException(message);
+    }
+
+    private sealed class BrokenIsolatedCloneGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
+    {
+        public override Task<string> CreateIsolatedMergeCloneAsync(string repositoryId, WorkItemId workItemId, CancellationToken ct = default)
+            => throw new InvalidOperationException(message);
+    }
+
+    private abstract class DelegatingGitHost(IGitHost inner) : IGitHost
+    {
+        protected readonly IGitHost Inner = inner;
+
+        public virtual Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+            => Inner.EnsureRepositoryAsync(id, seedFromUrl, ct);
+        public virtual Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
+            => Inner.EnsureRepositoryAsync(id, seedFromUrl, baseBranch, ct);
+        public virtual SandboxRepositoryAccess GetSandboxAccess(string repositoryId) => Inner.GetSandboxAccess(repositoryId);
+        public virtual string GetRepoPath(string repositoryId) => Inner.GetRepoPath(repositoryId);
+        public virtual string GetMergeStagingRoot(string repositoryId) => Inner.GetMergeStagingRoot(repositoryId);
+        public virtual SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+            => Inner.GetIsolatedRepoSandboxAccess(isolatedRepoHostPath);
+        public virtual Task<string> CreateIsolatedMergeCloneAsync(string repositoryId, WorkItemId workItemId, CancellationToken ct = default)
+            => Inner.CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
+        public virtual Task RestoreIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
+            => Inner.RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+        public virtual Task DisposeIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
+            => Inner.DisposeIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+        public virtual Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+            => Inner.GetDefaultBranchAsync(repositoryId, ct);
+        public virtual Task PushToUpstreamAsync(string repositoryId, string upstreamUrl, string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv,
+            UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+            CancellationToken ct = default)
+            => Inner.PushToUpstreamAsync(repositoryId, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
+        public virtual Task<string?> FetchUpstreamBranchAsync(string repositoryId, string upstreamUrl, string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv, CancellationToken ct = default)
+            => Inner.FetchUpstreamBranchAsync(repositoryId, upstreamUrl, branch, upstreamEnv, ct);
+        public virtual Task SetBranchToCommitAsync(string repositoryId, string branch, string sha, CancellationToken ct = default)
+            => Inner.SetBranchToCommitAsync(repositoryId, branch, sha, ct);
+        public virtual Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+            => Inner.DisposeRepositoryAsync(repositoryId, ct);
+        public virtual Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+            => Inner.RepositoryExistsAsync(id, ct);
+        public virtual Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
+            => Inner.BranchExistsAsync(repositoryId, branch, ct);
+        public virtual Task<bool> BranchHasCommitsAheadAsync(string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+            => Inner.BranchHasCommitsAheadAsync(repositoryId, baseBranch, workBranch, ct);
+        public virtual Task<(string DiffStat, string FullDiff)> GetDiffAsync(string repositoryId, string baseBranch, string workBranch, CancellationToken ct = default)
+            => Inner.GetDiffAsync(repositoryId, baseBranch, workBranch, ct);
+        public virtual Task<GitMergeTreeResult> ComputeMergeTreeAsync(string repositoryId, string mainCommit, string workCommit, CancellationToken ct = default)
+            => Inner.ComputeMergeTreeAsync(repositoryId, mainCommit, workCommit, ct);
+        public virtual Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+            => Inner.ResolveCommitAsync(repositoryId, commitish, ct);
+        public virtual Task ResetWorkBranchToBaseAsync(string repositoryId, string workBranch, string baseBranch, CancellationToken ct = default)
+            => Inner.ResetWorkBranchToBaseAsync(repositoryId, workBranch, baseBranch, ct);
+        public virtual Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
+            => Inner.ResolveTreeAsync(repositoryId, treeish, ct);
+        public virtual Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
+            => Inner.ReadTextFileAsync(repositoryId, treeish, path, ct);
+        public virtual Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
+            => Inner.ListFilesAsync(repositoryId, treeish, pathPrefix, ct);
+        public virtual Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(string repositoryId, string fromTreeish, string toTreeish, CancellationToken ct = default)
+            => Inner.GetChangedPathsAsync(repositoryId, fromTreeish, toTreeish, ct);
+        public virtual Task<string> GetUnifiedDiffAsync(string repositoryId, string fromTreeish, string toTreeish, string path, CancellationToken ct = default)
+            => Inner.GetUnifiedDiffAsync(repositoryId, fromTreeish, toTreeish, path, ct);
     }
 }

@@ -23,10 +23,10 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // but no buildable .NET target was present after checkout.
     private const int NoRequiredBuildTargetExitCode = 125;
 
-    private const string BuildScript = """
+    private static readonly string BuildScript = $$"""
         set -eu
-        dotnet_command_not_found_exit=127
-        no_required_build_target_exit=125
+        dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
+        no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
 
         if ! command -v dotnet >/dev/null 2>&1; then
           echo "dotnet is not available in the sandbox PATH" >&2
@@ -108,46 +108,56 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         try
         {
             Validation.ValidateBranchName(request.WorkBranch, nameof(request.WorkBranch));
-            var repoPath = _gitHost.GetRepoPath(request.RepositoryId);
 
-            var workInspection = await InspectBranchForDotnetBuildMarkersAsync(
-                repoPath,
-                request.WorkBranch,
-                ct);
-            if (!workInspection.Success)
-            {
-                return DotnetBuildMarkerInspection.Unavailable(
-                    $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {workInspection.FailureDetail}");
-            }
-
-            if (workInspection.HasMarkers)
-                return DotnetBuildMarkerInspection.Applies(workBranchHasMarkers: true, baseBranchHasMarkers: false);
+            var workPaths = await ListBranchPathsAsync(request.RepositoryId, request.WorkBranch, ct);
+            var workHasMarkers = workPaths.Any(IsRequiredDotnetBuildMarkerPath);
 
             var baseBranch = request.BaseBranch;
             if (string.IsNullOrWhiteSpace(baseBranch))
                 baseBranch = await _gitHost.GetDefaultBranchAsync(request.RepositoryId, ct);
             Validation.ValidateBranchName(baseBranch, nameof(request.BaseBranch));
 
+            // Work-on-base case: no base/work comparison applies; only the
+            // work-branch markers decide whether the gate is enforced.
             if (string.Equals(baseBranch, request.WorkBranch, StringComparison.Ordinal))
-                return DotnetBuildMarkerInspection.NotApplicable();
-
-            var baseInspection = await InspectBranchForDotnetBuildMarkersAsync(
-                repoPath,
-                baseBranch,
-                ct);
-            if (!baseInspection.Success)
             {
-                return DotnetBuildMarkerInspection.Unavailable(
-                    $"failed to inspect base branch '{baseBranch}' for .NET build markers: {baseInspection.FailureDetail}");
+                return workHasMarkers
+                    ? DotnetBuildMarkerInspection.Applies(
+                        workBranchHasMarkers: true,
+                        baseBranchHasMarkers: false,
+                        missingRequiredMarkers: Array.Empty<string>())
+                    : DotnetBuildMarkerInspection.NotApplicable();
             }
 
-            if (baseInspection.HasMarkers)
+            var basePaths = await ListBranchPathsAsync(request.RepositoryId, baseBranch, ct);
+            var baseHasMarkers = basePaths.Any(IsRequiredDotnetBuildMarkerPath);
+
+            // "Required" base markers are the ones whose deletion would silently
+            // narrow the build gate: root solution files plus test projects.
+            // Removing any of these from the work branch must downgrade neither
+            // the gate's applicability nor its outcome.
+            var workPathSet = new HashSet<string>(workPaths, StringComparer.Ordinal);
+            var missingRequired = basePaths
+                .Where(IsRequiredBaseMarkerPath)
+                .Where(p => !workPathSet.Contains(p))
+                .ToArray();
+
+            if (missingRequired.Length > 0 || (baseHasMarkers && !workHasMarkers))
             {
                 return DotnetBuildMarkerInspection.Applies(
-                    workBranchHasMarkers: false,
+                    workBranchHasMarkers: workHasMarkers,
                     baseBranchHasMarkers: true,
                     baseBranch: baseBranch,
-                    reason: $"base branch '{baseBranch}' contains .NET build markers, but work branch '{request.WorkBranch}' does not");
+                    missingRequiredMarkers: missingRequired);
+            }
+
+            if (workHasMarkers)
+            {
+                return DotnetBuildMarkerInspection.Applies(
+                    workBranchHasMarkers: true,
+                    baseBranchHasMarkers: baseHasMarkers,
+                    baseBranch: baseBranch,
+                    missingRequiredMarkers: Array.Empty<string>());
             }
 
             return DotnetBuildMarkerInspection.NotApplicable();
@@ -161,6 +171,23 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             return DotnetBuildMarkerInspection.Unavailable(
                 $"failed to inspect branch '{request.WorkBranch}' for .NET build markers: {SingleLineSummary(ex.Message)}");
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> ListBranchPathsAsync(
+        string repositoryId,
+        string branch,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await _gitHost.ListFilesAsync(repositoryId, branch, pathPrefix: null, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && ex is not NotSupportedException)
+        {
+            throw new InvalidOperationException(
+                $"failed to inspect branch '{branch}' for .NET build markers: {SingleLineSummary(ex.Message)}",
+                ex);
         }
     }
 
@@ -185,13 +212,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             return RequiredBuildVerificationResult.Unavailable(
                 $"could not verify required build: {inspection.Reason}");
 
-        if (inspection.BaseBranchHasMarkers && !inspection.WorkBranchHasMarkers)
+        if (inspection.MissingRequiredMarkers.Count > 0 || (inspection.BaseBranchHasMarkers && !inspection.WorkBranchHasMarkers))
         {
             var startedAt = DateTimeOffset.UtcNow;
-            var output =
-                $"Required .NET build markers exist on base branch '{inspection.BaseBranch}', " +
-                $"but work branch '{request.WorkBranch}' contains no solution or project file. " +
-                "The branch deleted or moved the files required for the non-skippable build gate.";
+            var output = inspection.MissingRequiredMarkers.Count > 0
+                ? $"Work branch '{request.WorkBranch}' deleted or moved required .NET build marker(s) " +
+                  $"present on base branch '{inspection.BaseBranch}': {string.Join(", ", inspection.MissingRequiredMarkers)}. " +
+                  "The non-skippable build gate requires these markers to be present on the work branch."
+                : $"Required .NET build markers exist on base branch '{inspection.BaseBranch}', " +
+                  $"but work branch '{request.WorkBranch}' contains no solution or project file. " +
+                  "The branch deleted or moved the files required for the non-skippable build gate.";
             await PersistReportAsync(
                 request.WorkItemId,
                 request.Iteration ?? 0,
@@ -405,87 +435,33 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         }
     }
 
-    private static async Task<(string Stdout, string Stderr, int ExitCode)> RunHostGitCaptureNoThrowAsync(
-        string workdir,
-        CancellationToken ct,
-        params string[] args)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = "git",
-            WorkingDirectory = workdir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        foreach (var a in args)
-            psi.ArgumentList.Add(a);
-
-        using var process = new Process { StartInfo = psi };
-        process.Start();
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-        return (await stdoutTask, await stderrTask, process.ExitCode);
-    }
-
-    private static async Task<BranchDotnetMarkerInspection> InspectBranchForDotnetBuildMarkersAsync(
-        string repoPath,
-        string branch,
-        CancellationToken ct)
-    {
-        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(
-            repoPath,
-            ct,
-            "ls-tree",
-            "-r",
-            "--name-only",
-            branch);
-        if (exitCode != 0)
-        {
-            var detail = SingleLineSummary(string.IsNullOrWhiteSpace(stderr) ? stdout : stderr);
-            return BranchDotnetMarkerInspection.Failed(
-                string.IsNullOrWhiteSpace(detail) ? $"git ls-tree exited {exitCode}" : detail);
-        }
-
-        var hasMarkers = stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Any(IsRequiredDotnetBuildMarkerPath);
-        return BranchDotnetMarkerInspection.Completed(hasMarkers);
-    }
-
-    private sealed record BranchDotnetMarkerInspection(
-        bool Success,
-        bool HasMarkers,
-        string? FailureDetail)
-    {
-        public static BranchDotnetMarkerInspection Completed(bool hasMarkers) =>
-            new(true, hasMarkers, null);
-
-        public static BranchDotnetMarkerInspection Failed(string failureDetail) =>
-            new(false, false, failureDetail);
-    }
-
     private sealed record DotnetBuildMarkerInspection(
         RequiredBuildProbeStatus Status,
         bool WorkBranchHasMarkers,
         bool BaseBranchHasMarkers,
+        IReadOnlyList<string> MissingRequiredMarkers,
         string? BaseBranch = null,
         string? Reason = null)
     {
         public static DotnetBuildMarkerInspection NotApplicable() =>
-            new(RequiredBuildProbeStatus.NotApplicable, false, false);
+            new(RequiredBuildProbeStatus.NotApplicable, false, false, Array.Empty<string>());
 
         public static DotnetBuildMarkerInspection Applies(
             bool workBranchHasMarkers,
             bool baseBranchHasMarkers,
+            IReadOnlyList<string> missingRequiredMarkers,
             string? baseBranch = null,
             string? reason = null) =>
-            new(RequiredBuildProbeStatus.Applies, workBranchHasMarkers, baseBranchHasMarkers, baseBranch, reason);
+            new(
+                RequiredBuildProbeStatus.Applies,
+                workBranchHasMarkers,
+                baseBranchHasMarkers,
+                missingRequiredMarkers,
+                baseBranch,
+                reason);
 
         public static DotnetBuildMarkerInspection Unavailable(string reason) =>
-            new(RequiredBuildProbeStatus.Unavailable, false, false, Reason: reason);
+            new(RequiredBuildProbeStatus.Unavailable, false, false, Array.Empty<string>(), Reason: reason);
 
         public RequiredBuildProbeResult ToProbeResult() =>
             Status switch
@@ -502,15 +478,67 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
     private static bool IsRequiredDotnetBuildMarkerPath(string path)
     {
+        if (!TrySplitMarkerSegments(path, out var segments))
+            return false;
+
+        var fileName = segments[^1];
+        return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// "Required" base markers are the ones whose deletion from the work branch
+    /// would silently narrow the build gate: any root-level <c>.sln</c>/<c>.slnx</c>
+    /// solution file and any test project (filename prefixed with <c>test</c>, or
+    /// any <c>.csproj</c> under a <c>test</c>/<c>tests</c> directory). If the base
+    /// branch carries these, the work branch must preserve them — keeping a trivial
+    /// leaf project around must not be enough to bypass the gate.
+    /// </summary>
+    private static bool IsRequiredBaseMarkerPath(string path)
+    {
+        if (!TrySplitMarkerSegments(path, out var segments))
+            return false;
+
+        var fileName = segments[^1];
+        var lowerFileName = fileName.ToLowerInvariant();
+        if (segments.Length == 1
+            && (lowerFileName.EndsWith(".sln", StringComparison.Ordinal)
+                || lowerFileName.EndsWith(".slnx", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        if (!lowerFileName.EndsWith(".csproj", StringComparison.Ordinal))
+            return false;
+
+        if (lowerFileName.StartsWith("test", StringComparison.Ordinal))
+            return true;
+
+        for (var i = 0; i < segments.Length - 1; i++)
+        {
+            if (segments[i].Equals("tests", StringComparison.OrdinalIgnoreCase)
+                || segments[i].Equals("test", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TrySplitMarkerSegments(string path, out string[] segments)
+    {
+        segments = Array.Empty<string>();
         if (string.IsNullOrWhiteSpace(path))
             return false;
 
-        var segments = path.Replace('\\', '/')
+        var parts = path.Replace('\\', '/')
             .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (segments.Length == 0)
+        if (parts.Length == 0)
             return false;
 
-        if (segments.Any(static s =>
+        if (parts.Any(static s =>
                 s.Equals(".git", StringComparison.OrdinalIgnoreCase)
                 || s.Equals("bin", StringComparison.OrdinalIgnoreCase)
                 || s.Equals("obj", StringComparison.OrdinalIgnoreCase)
@@ -519,10 +547,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             return false;
         }
 
-        var fileName = segments[^1];
-        return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+        segments = parts;
+        return true;
     }
 
     private static string CombinedOutput(SandboxExecResult result)

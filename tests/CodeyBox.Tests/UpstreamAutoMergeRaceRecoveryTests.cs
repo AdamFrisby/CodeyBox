@@ -587,7 +587,7 @@ internal sealed class SetBranchThrowingGitHost : IGitHost
         => _inner.ResolveTreeAsync(repositoryId, treeish, ct);
     public Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
         => _inner.ReadTextFileAsync(repositoryId, treeish, path, ct);
-    public Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string pathPrefix, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
         => _inner.ListFilesAsync(repositoryId, treeish, pathPrefix, ct);
     public Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(string repositoryId, string fromTreeish, string toTreeish, CancellationToken ct = default)
         => _inner.GetChangedPathsAsync(repositoryId, fromTreeish, toTreeish, ct);
