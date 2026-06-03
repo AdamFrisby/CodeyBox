@@ -63,6 +63,25 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public void ClaudeRateLimitEventRejection_IsClassifiedAsQuotaWithResetAt()
+    {
+        // Captured stdout shape from a claude run that exhausted its 5h
+        // window mid-rework. Before this branch the classifier returned null
+        // for this shape, the orchestrator recorded failureKind="other" and
+        // hard-Failed the item; it never tried cross-agent fallback or parked
+        // as WaitingForQuotaReset. The detector must now classify the
+        // rejection and surface resetsAt for QuotaRetryScheduler.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"five_hour","overageStatus":"rejected"}}""";
+
+        var detection = BuildClassifier().Detect(AgentKind.Claude, stderr: null, stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1782000000L), detection.ResetAt);
+    }
+
+    [Fact]
     public void ResetDuration_IsDetectedFromQuotaMessage()
     {
         var detection = BuildClassifier().Detect(AgentKind.Gemini,
@@ -133,6 +152,51 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         Assert.NotNull(failed.QuotaResetAt);
         Assert.NotNull(failed.NextQuotaRetryAt);
         Assert.True(failed.NextQuotaRetryAt >= failed.QuotaResetAt);
+    }
+
+    [Fact]
+    public async Task PipelineClassifiesClaudeRateLimitEventStdoutAsQuotaAndPersistsResetAt()
+    {
+        // Regression for the claude 5h-window exhaustion path: when the CLI
+        // emits {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",...}}
+        // on stdout and exits 1, the pipeline must persist
+        // failureKind="quota" and quotaResetAt=resetsAt — NOT failureKind="other".
+        // resetsAt is picked ~1h from now so the pipeline's MaxParsedQuotaResetWindow
+        // clamp (24h) is a no-op here.
+        var expectedReset = DateTimeOffset.UtcNow.AddHours(1);
+        var resetsAtUnixSeconds = expectedReset.ToUnixTimeSeconds();
+        // FromUnixTimeSeconds rounds to whole seconds; round-trip so the equality
+        // assertion below is exact.
+        var expectedResetRounded = DateTimeOffset.FromUnixTimeSeconds(resetsAtUnixSeconds);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + resetsAtUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\",\"overageStatus\":\"rejected\"}}";
+        using var context = BuildPipelineContext(
+            projectRepositoryUrl: seed,
+            agent: new QuotaFailingAgent(stdout: stdout));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "claude 5h rate-limit-event UAT",
+            Prompt = "do work",
+            Agent = AgentKind.Claude,
+            BaseBranch = "main",
+            WorkBranch = "feature/claude-rate-limit-event",
+            PushUpstream = false,
+        };
+        await context.Store.CreateAsync(item);
+
+        await context.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("quota", failed.FailureKind);
+        Assert.Equal(expectedResetRounded, failed.QuotaResetAt);
+        Assert.NotNull(failed.NextQuotaRetryAt);
     }
 
     [Fact]

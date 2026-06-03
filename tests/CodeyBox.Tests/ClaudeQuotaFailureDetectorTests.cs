@@ -59,6 +59,105 @@ public sealed class ClaudeQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_RateLimitEvent_FiveHourRejected_ClassifiesAsQuotaWithResetAt()
+    {
+        // Captured shape from the 2026-06-02/03 incident (work item 36a7ff0c):
+        // claude exhausts its 5-hour subscription window mid-run and emits a
+        // rate_limit_event with status=rejected. Before this branch the
+        // QuotaClassifier returned null for this shape — the orchestrator
+        // recorded failureKind="other" and hard-Failed the item instead of
+        // parking it as WaitingForQuotaReset. resetsAt below is a future unix
+        // timestamp (2026-07-01) chosen to outlast the test's lifetime.
+        const long ResetsAtUnixSeconds = 1782000000L;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + ResetsAtUnixSeconds
+            + ",\"rateLimitType\":\"five_hour\",\"overageStatus\":\"rejected\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(ResetsAtUnixSeconds), detection.ResetAt);
+    }
+
+    [Theory]
+    [InlineData("seven_day")]
+    [InlineData("weekly")]
+    public void Detect_RateLimitEvent_WeeklyRejected_ClassifiesAsQuota(string rateLimitType)
+    {
+        const long ResetsAtUnixSeconds = 1782000000L;
+        var stdout =
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"resetsAt\":"
+            + ResetsAtUnixSeconds
+            + ",\"rateLimitType\":\"" + rateLimitType + "\"}}";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(ResetsAtUnixSeconds), detection.ResetAt);
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_AllowedStatus_ReturnsNull()
+    {
+        // The CLI also emits rate_limit_event lines for non-rejection telemetry
+        // (status=allowed). Those must not classify as quota failures.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1782000000,"rateLimitType":"five_hour"}}""";
+
+        Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_UnknownRateLimitType_ReturnsNull()
+    {
+        // Defensive: only quota-scope window types are treated as terminal.
+        // Unknown rateLimitType values must not silently classify as quota.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"per_minute"}}""";
+
+        Assert.Null(_detector.Detect(stderr: null, stdout: stdout));
+    }
+
+    [Fact]
+    public void Detect_RateLimitEvent_MissingResetsAt_StillClassifiesAsQuota()
+    {
+        // A missing/malformed resetsAt must not lose the quota signal — the
+        // orchestrator falls back to its own quota-reset policy when ResetAt
+        // is null.
+        var stdout =
+            """{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}""";
+
+        var detection = _detector.Detect(stderr: null, stdout: stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void ScopeStdoutForQuotaDetection_PreservesRateLimitEventBesideTerminalError()
+    {
+        // When a terminal stream-json error coexists with a rate_limit_event
+        // rejection, both must remain visible to Detect so the rejection signal
+        // isn't dropped by the narrowing step that otherwise scopes to the
+        // terminal error line only.
+        var stdout = """
+            {"type":"result","subtype":"error","is_error":true,"result":"compilation failed"}
+            {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1782000000,"rateLimitType":"five_hour"}}
+            """;
+
+        var scoped = _detector.ScopeStdoutForQuotaDetection(stdout);
+
+        Assert.NotNull(scoped);
+        Assert.Contains("rate_limit_event", scoped);
+        Assert.Contains("compilation failed", scoped);
+    }
+
+    [Fact]
     public void Detect_GeminiStreamShape_ReturnsNull()
     {
         var stdout =
