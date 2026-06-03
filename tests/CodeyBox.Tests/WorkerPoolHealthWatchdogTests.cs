@@ -229,6 +229,87 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task RoutingReadinessAvailable_MarksCandidateRunnable()
+    {
+        var source = new FakePoolHealthSource
+        {
+            Status = new WorkerPoolStatus(2, 0, 1, null),
+            Candidates = [Item() with { Agent = null }],
+        };
+        var watchdog = new WorkerPoolHealthWatchdog(
+            source,
+            source,
+            StandardOptions(),
+            NullLogger<WorkerPoolHealthWatchdog>.Instance,
+            _projects,
+            agents: new AgentRegistry([]),
+            routingReadiness: new FixedRoutingReadiness(AgentRoutingReadiness.Available(AgentKind.Codex)),
+            webhooks: _webhooks,
+            timeProvider: _time);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+        Assert.Equal(1, source.EnqueueCalls);
+    }
+
+    [Fact]
+    public async Task RoutingReadinessNotApplicable_FallsBackToProjectDefaultAgent()
+    {
+        var source = new FakePoolHealthSource
+        {
+            Status = new WorkerPoolStatus(2, 0, 1, null),
+            Candidates = [Item() with { Agent = null }],
+        };
+        var watchdog = new WorkerPoolHealthWatchdog(
+            source,
+            source,
+            StandardOptions(),
+            NullLogger<WorkerPoolHealthWatchdog>.Instance,
+            _projects,
+            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
+            routingReadiness: new FixedRoutingReadiness(AgentRoutingReadiness.NotApplicable("direct agent")),
+            webhooks: _webhooks,
+            timeProvider: _time);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+        Assert.Equal(1, source.EnqueueCalls);
+    }
+
+    [Fact]
+    public async Task RecoveryThrows_FinalAttemptEscalatesRestartRequired()
+    {
+        var source = new FakePoolHealthSource
+        {
+            Status = new WorkerPoolStatus(2, 0, 1, null),
+            Candidates = [Item()],
+            ThrowOnRecovery = true,
+        };
+        var watchdog = new WorkerPoolHealthWatchdog(
+            source,
+            source,
+            StandardOptions(maxAttempts: 1),
+            NullLogger<WorkerPoolHealthWatchdog>.Instance,
+            _projects,
+            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
+            webhooks: _webhooks,
+            timeProvider: _time);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.restart_required");
+    }
+
+    [Fact]
     public async Task DispatchProgressAfterRecovery_ResetsStallInsteadOfEscalating()
     {
         var source = new FakePoolHealthSource
@@ -548,6 +629,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         public bool HasAgentCapacity { get; set; } = true;
         public bool AdvanceLastSpawnOnRecovery { get; set; }
         public bool ThrowOnStatus { get; set; }
+        public bool ThrowOnRecovery { get; set; }
         public WorkerPoolStatus Status { get; set; } = new(2, 0, 0, null);
         public IReadOnlyList<WorkItem> Candidates { get; set; } = [];
         public int EnqueueCalls { get; private set; }
@@ -570,6 +652,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             IEnumerable<WorkItemId> candidateIds,
             CancellationToken ct)
         {
+            if (ThrowOnRecovery)
+                throw new InvalidOperationException("recovery failed");
+
             var ids = candidateIds.ToList();
             EnqueueCalls += ids.Count;
             if (AdvanceLastSpawnOnRecovery)

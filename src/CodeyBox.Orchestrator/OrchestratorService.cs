@@ -720,46 +720,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var failures = new List<Exception>();
         foreach (var id in _activeItems.Keys.ToList())
         {
-            WorkItem? item;
             try
             {
-                item = await _store.GetAsync(id, ct).ConfigureAwait(false);
+                await TryRecoverActiveItemForGracefulShutdownAsync(
+                    id,
+                    "graceful shutdown drain timed out",
+                    ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Shutdown drain recovery could not load active work item {Id}", id);
-                failures.Add(new InvalidOperationException(
-                    $"Shutdown drain recovery could not load active work item {id}", ex));
-                continue;
-            }
-
-            if (item is null)
-                continue;
-
-            var recovered = BuildGracefulShutdownRecoveryState(item);
-            if (recovered is null)
-                continue;
-
-            try
-            {
-                var updated = await _store.TryUpdateIfStateAsync(recovered, item.State, ct)
-                    .ConfigureAwait(false);
-                if (!updated)
-                {
-                    _log.LogInformation(
-                        "Shutdown drain recovery skipped {Id}: state changed from {State} before recovery write",
-                        id, item.State);
-                    continue;
-                }
-
-                await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
-                _log.LogWarning(
-                    "Shutdown drain recovery re-queued {Id}: {FromState} -> {ToState}",
-                    id, item.State, recovered.State);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Shutdown drain recovery failed for active work item {Id}", id);
                 failures.Add(new InvalidOperationException(
                     $"Shutdown drain recovery failed for active work item {id}", ex));
             }
@@ -771,8 +740,60 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 failures);
     }
 
-    private static WorkItem? BuildGracefulShutdownRecoveryState(WorkItem item)
-        => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(item, DateTimeOffset.UtcNow);
+    private async Task RecoverHostShutdownAbortedItemAsync(WorkItemId id)
+    {
+        try
+        {
+            await TryRecoverActiveItemForGracefulShutdownAsync(
+                id,
+                "host shutdown cancellation",
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Host-shutdown recovery failed for active work item {Id}; startup recovery will reconcile persisted state",
+                id);
+        }
+    }
+
+    private async Task TryRecoverActiveItemForGracefulShutdownAsync(
+        WorkItemId id,
+        string recoveryReason,
+        CancellationToken ct)
+    {
+        var item = await _store.GetAsync(id, ct).ConfigureAwait(false);
+        if (item is null)
+            return;
+
+        var recovered = BuildGracefulShutdownRecoveryState(item, recoveryReason);
+        if (recovered is null)
+            return;
+
+        var updated = await _store.TryUpdateIfStateAsync(recovered, item.State, ct)
+            .ConfigureAwait(false);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Shutdown recovery skipped {Id}: state changed from {State} before recovery write",
+                id, item.State);
+            return;
+        }
+
+        await _queue.EnqueueAsync(id, ct).ConfigureAwait(false);
+        _log.LogWarning(
+            "Shutdown recovery re-queued {Id}: {FromState} -> {ToState} ({Reason})",
+            id, item.State, recovered.State, recoveryReason);
+    }
+
+    private static WorkItem? BuildGracefulShutdownRecoveryState(
+        WorkItem item,
+        string recoveryReason = "graceful shutdown drain timed out")
+        => WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            recoveryReason);
 
     /// <summary>
     /// Walks dispatch-eligible non-terminal items by priority order and returns
@@ -1588,6 +1609,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _log.LogInformation(
                     "Worker {WorkerId} item {Id} aborted by host shutdown: phase={Phase} source={CancellationSource}",
                     workerIndex, id, pex.Phase, pex.Source);
+                await RecoverHostShutdownAbortedItemAsync(id);
                 return;
             }
             catch (PhaseCancellationException pex)
@@ -1598,6 +1620,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                await RecoverHostShutdownAbortedItemAsync(id);
                 return;
             }
             catch (OperationCanceledException)

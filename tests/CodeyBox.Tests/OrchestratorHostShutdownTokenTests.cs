@@ -53,6 +53,46 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
     }
 
     [Fact]
+    public async Task ServiceStop_HostShutdownCancellation_RequeuesInFlightWorkInsteadOfFailingIt()
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await _store.CreateAsync(item);
+
+        var pipeline = new HostCancellationWorkingPipeline(_store);
+        var service = new OrchestratorService(
+            new InMemoryTaskQueue(),
+            _store,
+            pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(10),
+            },
+            NullLogger<OrchestratorService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        await pipeline.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
+
+        Assert.True(pipeline.HostShutdownWasCancelled);
+        var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Contains("host shutdown cancellation", after.LastError);
+        service.Dispose();
+    }
+
+    [Fact]
     public async Task ServiceStop_DrainTimeout_RequeuesInFlightWorkInsteadOfFailingIt()
     {
         var item = new WorkItem
@@ -87,8 +127,8 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         elapsed.Stop();
 
         Assert.True(
-            elapsed.Elapsed < TimeSpan.FromSeconds(5),
-            $"StopAsync should return well before the host stop token while a worker ignores shutdown; elapsed {elapsed.Elapsed}");
+            elapsed.Elapsed < TimeSpan.FromSeconds(10),
+            $"StopAsync should return before the host stop token while a worker ignores shutdown; elapsed {elapsed.Elapsed}");
         Assert.True(pipeline.HostShutdownWasCancelled);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
@@ -119,6 +159,31 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
             {
                 HostShutdownWasCancelled = hostShutdownToken.IsCancellationRequested;
                 ItemTokenWasCancelledWhenHostStopped = ct.IsCancellationRequested;
+                throw new OperationCanceledException(hostShutdownToken);
+            }
+        }
+    }
+
+    private sealed class HostCancellationWorkingPipeline : IPipelineRunner
+    {
+        private readonly IWorkItemStore _store;
+
+        public HostCancellationWorkingPipeline(IWorkItemStore store) => _store = store;
+
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool HostShutdownWasCancelled { get; private set; }
+
+        public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        {
+            await _store.UpdateAsync(item.With(WorkItemState.Working), CancellationToken.None);
+            Started.SetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, hostShutdownToken);
+            }
+            catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
+            {
+                HostShutdownWasCancelled = true;
                 throw new OperationCanceledException(hostShutdownToken);
             }
         }

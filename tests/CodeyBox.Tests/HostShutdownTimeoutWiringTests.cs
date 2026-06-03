@@ -151,14 +151,15 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Theory]
-    [InlineData(1)]
-    [InlineData(60)]
-    public void OrchestratorShutdownDrainTimeout_ReservesHostStopMargin(int graceSeconds)
+    [InlineData(1, 800)]
+    [InlineData(60, 55_000)]
+    public void OrchestratorShutdownDrainTimeout_ReservesHostStopMargin(
+        int graceSeconds,
+        int expectedDrainMilliseconds)
     {
         var drain = Program.ComputeOrchestratorShutdownDrainTimeout(graceSeconds);
 
-        Assert.True(drain > TimeSpan.Zero);
-        Assert.True(drain < TimeSpan.FromSeconds(graceSeconds));
+        Assert.Equal(TimeSpan.FromMilliseconds(expectedDrainMilliseconds), drain);
     }
 
     // --- DI-level wiring: the AddOptions<HostOptions>().Configure callback -------

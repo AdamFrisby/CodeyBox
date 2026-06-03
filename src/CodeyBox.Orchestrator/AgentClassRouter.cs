@@ -255,7 +255,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             ct,
             new ReadOnlyCapacitySlotGate(capacity),
             bypassRecentFailurePrecheck: false,
-            bypassInProcessExhaustion: false);
+            bypassInProcessExhaustion: false,
+            commitDispatchSideEffects: false);
 
         if (decision.Chosen is { } chosen)
             return AgentRoutingReadiness.Available(chosen.Agent, decision.Reason);
@@ -288,7 +289,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             ct,
             slotGate: null,
             bypassRecentFailurePrecheck: true,
-            bypassInProcessExhaustion: true);
+            bypassInProcessExhaustion: true,
+            commitDispatchSideEffects: true);
         if (decision.Chosen is { } chosen)
             RecordQuotaRetryAdmission(item, chosen);
 
@@ -302,7 +304,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         WorkItem item, Project? project, CancellationToken ct,
         IAgentSlotGate? slotGate,
         bool bypassRecentFailurePrecheck,
-        bool bypassInProcessExhaustion)
+        bool bypassInProcessExhaustion,
+        bool commitDispatchSideEffects = true)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -345,7 +348,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     EffectiveScore: m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtcFloor),
                     RejectReason: DescribeIneligibility(m, item)))
                 .ToList();
-            AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, below);
+            if (commitDispatchSideEffects)
+                AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, below);
             return new AgentRoutingDecision { Reason = reason, NoEligibleMembers = true };
         }
 
@@ -490,7 +494,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                 capSaturatedMembers.Add(member);
-                AuditLog.ConcurrencyGated(item.Id, member.Agent, running, cap);
+                if (commitDispatchSideEffects)
+                    AuditLog.ConcurrencyGated(item.Id, member.Agent, running, cap);
                 continue;
             }
 
@@ -528,10 +533,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     earliestBudgetReset = r;
             }
 
-            AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
+            if (commitDispatchSideEffects)
+                AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
-            RecordAvailabilityAndMaybeNotify(member, quota, gate);
+            if (commitDispatchSideEffects)
+                RecordAvailabilityAndMaybeNotify(member, quota, gate);
+            else
+                RecordObservedAvailability(member, quota);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -555,11 +564,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     rejected.Add((other.Member.Agent, other.Member.ModelId, other.EffectiveScore, "ranked lower"));
 
                 var modDesc = DescribeModifiers(cfg.TodModifiers, member.Agent, nowUtc);
-                AuditLog.QuotaRouterScored(
-                    item.Id, classId,
-                    member.Agent, member.ModelId,
-                    entry.BaseScore, entry.EffectiveScore, modDesc,
-                    rejected);
+                if (commitDispatchSideEffects)
+                {
+                    AuditLog.QuotaRouterScored(
+                        item.Id, classId,
+                        member.Agent, member.ModelId,
+                        entry.BaseScore, entry.EffectiveScore, modDesc,
+                        rejected);
+                }
 
                 _log.LogInformation(
                     "Work item {Id}: routed to {Agent}/{Billing} model={Model} " +
@@ -568,7 +580,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
                     quota.AvailablePct);
 
-                ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
+                if (commitDispatchSideEffects)
+                    ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
                 return new AgentRoutingDecision
                 {
                     Chosen = member,
@@ -582,7 +595,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
-        if (quotaRetryAdmissionDeniedAfterProbe)
+        if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
             ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
         // No member was chosen. Distinguish stall reasons so the caller picks
@@ -636,7 +649,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                          $"(ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%)";
                 suggested = _opts.QuotaRecheckInterval;
             }
-            AuditLog.QuotaRouterWaiting(classId, item.Id, suggested);
+            if (commitDispatchSideEffects)
+                AuditLog.QuotaRouterWaiting(classId, item.Id, suggested);
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
@@ -675,7 +689,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             _log.LogWarning(
                 "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
                 item.Id, classId, fallback.Agent);
-            ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
+            if (commitDispatchSideEffects)
+                ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
             return new AgentRoutingDecision
             {
                 Chosen = fallback,
@@ -715,7 +730,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _log.LogInformation(
             "Work item {Id}: class '{ClassId}' parking — {Reason}",
             item.Id, classId, parkReason);
-        AuditLog.QuotaRouterWaiting(classId, item.Id, budgetRecheck);
+        if (commitDispatchSideEffects)
+            AuditLog.QuotaRouterWaiting(classId, item.Id, budgetRecheck);
         return new AgentRoutingDecision
         {
             ShouldWait = true,
@@ -1175,10 +1191,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         EffectiveQuota quota,
         QuotaGateDecision gate)
     {
-        var key = (member.Agent, member.ModelId ?? string.Empty);
-        _lastAvailablePct[key] = quota.AvailablePct;
+        var key = RecordObservedAvailability(member, quota);
         if (RecordQuotaUsableTransition(key, gate.Allow))
             NotifyQuotaUsableThresholdCrossed();
+    }
+
+    private (AgentKind Agent, string ModelId) RecordObservedAvailability(
+        AgentMembership member,
+        EffectiveQuota quota)
+    {
+        var key = (member.Agent, member.ModelId ?? string.Empty);
+        _lastAvailablePct[key] = quota.AvailablePct;
+        return key;
     }
 
     private void NotifyQuotaUsableThresholdCrossed()

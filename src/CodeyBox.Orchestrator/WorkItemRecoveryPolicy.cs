@@ -53,7 +53,8 @@ internal static class WorkItemRecoveryPolicy
 
     public static WorkItem? BuildGracefulShutdownRecoveryState(
         WorkItem item,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        string recoveryReason = "graceful shutdown drain timed out")
     {
         if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
             return null;
@@ -76,7 +77,7 @@ internal static class WorkItemRecoveryPolicy
             return null;
 
         var error = target == WorkItemState.Queued
-            ? $"graceful shutdown drain timed out while item was {item.State}; re-queued for a fresh run"
+            ? $"{recoveryReason} while item was {item.State}; re-queued for a fresh run"
             : null;
 
         return item.With(target.Value, error) with
