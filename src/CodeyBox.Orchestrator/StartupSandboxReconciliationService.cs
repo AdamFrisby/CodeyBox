@@ -8,9 +8,7 @@ namespace CodeyBox.Orchestrator;
 /// R8.1 (incident 2026-05-29): on startup, sweep any managed sandboxes left in
 /// a suspend-lifecycle (<c>Suspending</c>/<c>Suspended</c>) or transitional
 /// state from a prior unclean shutdown and attempt to bring them back to a
-/// clean state BEFORE <see cref="SandboxResumeOnStartupService"/> tries to
-/// reattach work-item-mapped VMs and BEFORE the leak reaper's grace window
-/// elapses on an orphan.
+/// clean state without blocking the HTTP listener from binding.
 ///
 /// <para>Why early reconciliation matters: an orphaned <c>Suspending</c> VM
 /// from a SIGKILLed prior process leaves a root-owned qemu process holding the
@@ -22,17 +20,19 @@ namespace CodeyBox.Orchestrator;
 /// ever firing, and surfaces the genuinely unrecoverable cases as actionable
 /// leak events instead of silent hangs.</para>
 ///
-/// <para>Implemented as <see cref="IHostedLifecycleService.StartingAsync"/> so
-/// it runs BEFORE <see cref="SandboxResumeOnStartupService"/> (registered after
-/// us in <c>Program.cs</c>; StartingAsync is forward order). Sequencing matters:
-/// the resume handler MUST see the orphan set already recovered so it does not
-/// attempt to multipass-start a VM whose qemu is wedged.</para>
+/// <para>Implemented as a background sweep from <see cref="StartAsync"/>. The
+/// provider path may shell out to Multipass, so it must not run from
+/// <see cref="IHostedLifecycleService.StartingAsync"/> where a wedged daemon
+/// would keep Kestrel offline.</para>
 /// </summary>
 public sealed class StartupSandboxReconciliationService : IHostedLifecycleService
 {
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<StartupSandboxReconciliationService> _log;
+    private readonly Lock _lifecycleGate = new();
+    private CancellationTokenSource? _backgroundCts;
+    private Task? _reconcileTask;
 
     public StartupSandboxReconciliationService(
         ISandboxProvider? provider,
@@ -44,16 +44,65 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
         _log = log;
     }
 
-    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
-    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StartAsync(CancellationToken ct)
+    {
+        lock (_lifecycleGate)
+        {
+            if (_reconcileTask is not null)
+                return Task.CompletedTask;
+
+            _backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _reconcileTask = Task.Run(
+                () => ReconcileAllSafelyAsync(_backgroundCts.Token),
+                CancellationToken.None);
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken ct) =>
+        HostedLifecycleTask.StopAsync(
+            () =>
+            {
+                lock (_lifecycleGate)
+                    return (_backgroundCts, _reconcileTask);
+            },
+            expected =>
+            {
+                lock (_lifecycleGate)
+                {
+                    if (!ReferenceEquals(_backgroundCts, expected))
+                        return null;
+
+                    var dispose = _backgroundCts;
+                    _backgroundCts = null;
+                    return dispose;
+                }
+            },
+            ct);
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppedAsync(CancellationToken ct) => Task.CompletedTask;
 
-    public Task StartingAsync(CancellationToken ct) => ReconcileAllAsync(ct);
+    public Task StartingAsync(CancellationToken ct) => Task.CompletedTask;
 
     /// <summary>Exposed for tests that drive the reconciler directly.</summary>
     internal Task ReconcileAllForTestAsync(CancellationToken ct) => ReconcileAllAsync(ct);
+
+    private async Task ReconcileAllSafelyAsync(CancellationToken ct)
+    {
+        try
+        {
+            await ReconcileAllAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _log.LogInformation("Startup sandbox reconciliation cancelled before the sweep completed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Startup sandbox reconciliation threw; resume handler and leak reaper will handle the residual state");
+        }
+    }
 
     internal async Task ReconcileAllAsync(CancellationToken ct)
     {
@@ -86,7 +135,11 @@ public sealed class StartupSandboxReconciliationService : IHostedLifecycleServic
             foreach (var name in unrecoverable)
                 AuditLog.SandboxStartupReconcileFailed(name, "wedged after stop+purge recovery — root cleanup likely required");
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (OperationCanceledException ex)
+        {
+            _log.LogWarning(ex, "Startup sandbox reconciliation was cancelled by the provider; resume handler and leak reaper will handle the residual state");
+        }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Startup sandbox reconciliation threw; resume handler and leak reaper will handle the residual state");

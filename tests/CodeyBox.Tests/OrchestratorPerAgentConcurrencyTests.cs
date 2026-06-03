@@ -629,7 +629,13 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // work item's State stays Queued throughout, but the orchestrator
             // increments the running count the moment the router reserves a
             // slot during pickup.
-            await Task.Delay(100);
+            var deferredDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (!orchestrator.IsDeferredForTest(item.Id) && DateTimeOffset.UtcNow < deferredDeadline)
+                await Task.Delay(25);
+            Assert.True(
+                orchestrator.IsDeferredForTest(item.Id),
+                "the item must defer while every class member is at its per-agent cap");
+
             // Pre-release sanity: only the two test pre-reservations are visible.
             var pre = orchestrator.Snapshot();
             Assert.Equal(1, pre.GetValueOrDefault(Codex));
@@ -642,9 +648,9 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
             // budget, the deferred item must re-attempt pickup and reserve
             // Codex's slot. If the orchestrator had used the 60s quota
             // interval, Codex's in-flight count would still be 0 at the
-            // deadline. We wait up to 2s — well under the 60s quota window
+            // deadline. We wait up to 10s — well under the 60s quota window
             // but well over the 200ms cap-retry interval.
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
             int observedCodex = 0;
             while (DateTimeOffset.UtcNow < deadline)
             {

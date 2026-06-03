@@ -38,6 +38,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
+    private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -55,7 +56,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         ILogger<WorkerProgressWatchdog> log,
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
-        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _registry = registry;
         _store = store;
@@ -65,6 +67,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _streams = streams;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
+        _startupRecoveryBarrier = startupRecoveryBarrier;
     }
 
     public WorkerProgressWatchdog(
@@ -75,8 +78,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         ILogger<WorkerProgressWatchdog> log,
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
-        IWorkerPoolRecoverySlotReleaser? slotReleaser = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser) { }
+        IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -92,6 +96,16 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (_startupRecoveryBarrier is not null)
+        {
+            // Keep the first watchdog pass behind the orchestrator's startup
+            // recovery sweep. The watchdog ignores heartbeat freshness, so it
+            // must not claim stale rows left for the startup reaper path.
+            await _startupRecoveryBarrier.InitialRecoveryCompleted.WaitAsync(stoppingToken);
+        }
+
+        await RunOnceAsync(stoppingToken);
+
         // Snapshot the configured interval at startup; matching DeadWorkerReaper,
         // changes to CheckInterval take effect on the next process restart while
         // ProgressTimeout / AutoRecover / PostAgentTransitionTimeout are resolved

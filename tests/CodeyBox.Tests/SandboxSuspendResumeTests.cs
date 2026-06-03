@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -39,6 +41,25 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         State = state,
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        await WaitUntilAsync(() => Task.FromResult(condition()));
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(1);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+                return;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.True(await condition(), "condition was not met before the timeout elapsed");
+    }
 
     // ── Schema round-trip ────────────────────────────────────────────────────
 
@@ -473,13 +494,352 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await _store.CreateAsync(item with { SuspendedVmName = "vm-gone", SuspendedAt = DateTimeOffset.UtcNow });
 
         var provider = new FakeSuspendingProvider { ResumeThrows = true };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Contains(log.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Properties.TryGetValue("VmName", out var vmName)
+            && string.Equals(vmName?.ToString(), "vm-gone", StringComparison.Ordinal)
+            && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
+            && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StartupResume_ResumeTimeout_MarksWorkingItemFailedAndClearsBookkeeping()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-hung-start",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        var sw = Stopwatch.StartNew();
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+        sw.Stop();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("timed out", after.LastError);
+        Assert.Contains(log.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            && entry.Properties.TryGetValue("VmName", out var vmName)
+            && string.Equals(vmName?.ToString(), "vm-hung-start", StringComparison.Ordinal)
+            && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
+            && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"configured {configuredTimeout} resume timeout was not honored; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StartupResume_ProviderCancellation_MarksWorkingItemFailedAndClearsBookkeeping()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-provider-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrowsCancellation = true };
         var svc = MakeResumeService(provider);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Null(after!.SuspendedVmName);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Contains("provider cancelled resume", after.LastError);
+    }
+
+    [Fact]
+    public async Task StartupResume_ResumeFailure_WithPreemptCheckpoint_RemainsRecoverable()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        var checkpoint = $"refs/heads/codeybox/preempt/{item.Id}";
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-failed-with-checkpoint",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = checkpoint,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrows = true };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(checkpoint, after.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Equal(0, after.RecoveryAttempts);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.ReworkingForConflict)]
+    public async Task StartupResume_ResumeFailure_ForNonWorkingSuspendedItems_ClearsBookkeepingWithoutFailing(
+        WorkItemState state)
+    {
+        var item = MakeItem(state);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = $"vm-{state}",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeThrows = true };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(state, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.LastError);
+        Assert.Equal(0, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task StartupResume_BlockingMode_RunsFromStartingAsyncAndHonorsTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-blocking-timeout",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout,
+            mode: SandboxStartupResumeMode.Blocking);
+
+        var sw = Stopwatch.StartNew();
+        await svc.StartingAsync(CancellationToken.None);
+        sw.Stop();
+        await svc.StartAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Single(provider.ResumedNames);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"blocking startup did not honor configured {configuredTimeout} resume timeout; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StartupResume_ProviderBlocksBeforeReturningTask_StillHonorsTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-sync-blocking-provider",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeBlocksBeforeReturningTask = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout,
+            mode: SandboxStartupResumeMode.Blocking);
+
+        var sw = Stopwatch.StartNew();
+        var resumeTask = svc.StartingAsync(CancellationToken.None);
+        await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        try
+        {
+            await resumeTask.WaitAsync(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            provider.ReleaseBlockedResume();
+        }
+        sw.Stop();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Contains("timed out", after.LastError);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"startup resume did not honor configured {configuredTimeout} timeout around a synchronously blocking provider; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
+    public async Task StartupResume_ModeReloadBetweenLifecycleCallbacks_UsesReloadedBlockingMode()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-mode-race",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var barrier = new StartupRecoveryBarrier();
+        var options = new SandboxStartupResumeOptions
+        {
+            Mode = SandboxStartupResumeMode.Background,
+            ResumeTimeout = TimeSpan.FromMilliseconds(250),
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            () => options,
+            barrier);
+
+        await svc.StartingAsync(CancellationToken.None);
+        options = options with { Mode = SandboxStartupResumeMode.Blocking };
+        var startTask = svc.StartAsync(CancellationToken.None);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        Assert.False(startTask.IsCompleted);
+        await startTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Contains("vm-mode-race", provider.ResumedNames);
+    }
+
+    [Fact]
+    public async Task StartupResume_CancellationObservingTimeout_MarksFailedInsteadOfHostCancellation()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-cancel-observing",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: TimeSpan.FromMilliseconds(50));
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.True(provider.ResumeCancellationObserved);
+        Assert.Contains("timed out", after.LastError);
+    }
+
+    [Fact]
+    public async Task StartupResume_ReloadedOptions_AreReadForLaterResumeAndAdoption()
+    {
+        var gate = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(gate with
+        {
+            SuspendedVmName = "vm-0-hot-gate",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+        var hung = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(hung with
+        {
+            SuspendedVmName = "vm-1-hot-timeout",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+        var adopted = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(adopted with
+        {
+            SuspendedVmName = "vm-2-hot-adoption",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/hot.log",
+        });
+
+        var options = new SandboxStartupResumeOptions
+        {
+            Mode = SandboxStartupResumeMode.Background,
+            MaxParallelResumes = 1,
+            ResumeTimeout = TimeSpan.FromSeconds(30),
+            AdoptionDeadline = TimeSpan.FromMinutes(30),
+        };
+        var gateRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeSuspendingProvider
+        {
+            ResumeReleaseSources = new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal)
+            {
+                ["vm-0-hot-gate"] = gateRelease,
+            },
+            ResumeNamesToHang = new HashSet<string>(StringComparer.Ordinal) { "vm-1-hot-timeout" },
+            AdoptionExitCodeToReturn = 0,
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            () => options,
+            NoopStartupRecoveryInputSink.Instance);
+
+        var resumeTask = svc.ResumeAllForTestAsync(CancellationToken.None);
+        await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-0-hot-gate"));
+
+        var hotDeadline = TimeSpan.FromSeconds(7);
+        options = options with
+        {
+            ResumeTimeout = TimeSpan.FromMilliseconds(50),
+            AdoptionDeadline = hotDeadline,
+        };
+        gateRelease.SetResult();
+
+        await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var timedOut = await _store.GetAsync(hung.Id);
+        Assert.Equal(WorkItemState.Failed, timedOut!.State);
+        Assert.Contains("timed out", timedOut.LastError);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-2-hot-adoption", adoption.VmName);
+        Assert.Equal(hotDeadline, adoption.Deadline);
     }
 
     [Fact]
@@ -494,6 +854,139 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         Assert.Empty(provider.ResumedNames);
+    }
+
+    [Fact]
+    public async Task StartupResume_NoSuspendedItems_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupRecoveryBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            new FakeSuspendingProvider(),
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundResume_IgnoresStartupTokenCancellationAfterStart()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-startup-token-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var barrier = new StartupRecoveryBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            resumeTimeout: TimeSpan.FromMilliseconds(50),
+            mode: SandboxStartupResumeMode.Background);
+
+        using var startupCts = new CancellationTokenSource();
+        await svc.StartAsync(startupCts.Token);
+        startupCts.Cancel();
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Contains("timed out", after.LastError);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_StopAsync_CancelsBackgroundResume_AndIsIdempotent()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-stop-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeObservesCancellation = true };
+        var barrier = new StartupRecoveryBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            resumeTimeout: TimeSpan.FromHours(1),
+            mode: SandboxStartupResumeMode.Background);
+
+        await svc.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => provider.ResumedNames.Contains("vm-stop-cancel"));
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(stopCts.Token);
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => provider.ResumeCancellationObserved);
+
+        Assert.True(provider.ResumeCancellationObserved);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal("vm-stop-cancel", after.SuspendedVmName);
+        Assert.NotNull(after.SuspendedAt);
+        Assert.Null(after.LastError);
+        Assert.Equal(0, after.RecoveryAttempts);
+
+        // Host/factory disposal paths may call StopAsync more than once.
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundRecoveryInput_StaysBlockedDuringSlowAdoption()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-slow-input",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/slow-input.log",
+        });
+
+        var barrier = new StartupRecoveryBarrier();
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionResultSource = new TaskCompletionSource<int?>(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier,
+            adoptionDeadline: TimeSpan.FromSeconds(30),
+            mode: SandboxStartupResumeMode.Background);
+
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => provider.AdoptionCalls.Count == 1);
+
+            Assert.False(barrier.RecoveryInputReady.IsCompleted);
+            var duringAdoption = await _store.GetAsync(item.Id);
+            Assert.Equal("vm-slow-input", duringAdoption!.SuspendedVmName);
+
+            provider.AdoptionResultSource!.SetResult(0);
+            await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            await svc.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -512,12 +1005,35 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxResumeOnStartupService(
             new NonSuspendingProvider(), _store,
-            NullLogger<SandboxResumeOnStartupService>.Instance);
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal("vm-orphan", after!.SuspendedVmName);
         Assert.NotNull(after.SuspendedAt);
+    }
+
+    [Fact]
+    public async Task StartupResume_NonSuspendingProvider_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupRecoveryBarrier();
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-no-provider-barrier",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            new NonSuspendingProvider(), _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -535,13 +1051,52 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         var svc = new SandboxResumeOnStartupService(
             provider: null, _store,
-            NullLogger<SandboxResumeOnStartupService>.Instance);
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
         // Rows untouched — operator-visible signal that the suspended VM
         // bookkeeping was inherited from a different configuration.
         var after = await _store.GetAsync(item.Id);
         Assert.Equal("vm-old", after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task StartupResume_NullProvider_CompletesBackgroundBarrier()
+    {
+        var barrier = new StartupRecoveryBarrier();
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-null-provider-barrier",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var svc = new SandboxResumeOnStartupService(
+            provider: null, _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupResume_BackgroundSweepException_CompletesBarrier()
+    {
+        var barrier = new StartupRecoveryBarrier();
+        var svc = new SandboxResumeOnStartupService(
+            new FakeSuspendingProvider(),
+            new StubWorkItemStore(),
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -572,8 +1127,8 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task AdoptionDeadline_ConfiguredValue_IsPassedToProvider()
     {
-        // Verifies the SandboxAdoptionDeadlineSeconds config knob (Program.cs:1716)
-        // flows through the constructor into the WaitForAdoptedAgentCompletionAsync call.
+        // Verifies the SandboxAdoptionDeadlineSeconds option flows through the
+        // startup resume wiring into WaitForAdoptedAgentCompletionAsync.
         var customDeadline = TimeSpan.FromMinutes(10);
         var item = MakeItem();
         await _store.CreateAsync(item with
@@ -586,6 +1141,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
         var svc = new SandboxResumeOnStartupService(
             provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: customDeadline);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -593,6 +1149,30 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var adoption = Assert.Single(provider.AdoptionCalls);
         Assert.Equal("vm-dl-config", adoption.VmName);
         Assert.Equal(customDeadline, adoption.Deadline);
+    }
+
+    [Fact]
+    public async Task AdoptionDeadline_AboveMaximum_IsCappedBeforeProvider()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-dl-max",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/max.log",
+        });
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = new SandboxResumeOnStartupService(
+            provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            adoptionDeadline: SandboxResumeOnStartupService.MaximumAdoptionDeadline + TimeSpan.FromTicks(1));
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var adoption = Assert.Single(provider.AdoptionCalls);
+        Assert.Equal("vm-dl-max", adoption.VmName);
+        Assert.Equal(SandboxResumeOnStartupService.MaximumAdoptionDeadline, adoption.Deadline);
     }
 
     [Fact]
@@ -636,6 +1216,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
         var svc = new SandboxResumeOnStartupService(
             provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
             adoptionDeadline: TimeSpan.Zero);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
@@ -643,6 +1224,88 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         var adoption = Assert.Single(provider.AdoptionCalls);
         Assert.Equal("vm-dl-zero", adoption.VmName);
         Assert.Equal(SandboxResumeOnStartupService.DefaultAdoptionDeadline, adoption.Deadline);
+    }
+
+    [Fact]
+    public async Task AdoptionDeadline_HungProviderWait_IsBoundedByConfiguredDeadline()
+    {
+        var configuredDeadline = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-adoption-hang",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/hung.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionResultSource = new TaskCompletionSource<int?>(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var log = new CapturingLogger<SandboxResumeOnStartupService>();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            log,
+            NoopStartupRecoveryInputSink.Instance,
+            adoptionDeadline: configuredDeadline);
+
+        var sw = Stopwatch.StartNew();
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+        sw.Stop();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
+        Assert.Contains(log.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("adoption timed out", StringComparison.OrdinalIgnoreCase)
+            && entry.Properties.TryGetValue("VmName", out var vmName)
+            && string.Equals(vmName?.ToString(), "vm-adoption-hang", StringComparison.Ordinal)
+            && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
+            && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"configured {configuredDeadline} adoption deadline was not honored; elapsed {sw.Elapsed}");
+    }
+
+    [Theory]
+    [InlineData("sync-cancel")]
+    [InlineData("async-cancel")]
+    [InlineData("sync-fault")]
+    [InlineData("async-fault")]
+    public async Task StartupResume_AdoptionProviderCancellationOrFault_ClearsBookkeepingWithoutPromotingCheckpoint(
+        string behavior)
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = $"vm-adoption-{behavior}",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/fault.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionThrowsCancellation = behavior == "sync-cancel",
+            AdoptionFaultsCancellation = behavior == "async-cancel",
+            AdoptionThrows = behavior == "sync-fault",
+            AdoptionFaults = behavior == "async-fault",
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.AdoptionCalls);
+        Assert.Empty(provider.CheckpointPushCalls);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.AgentLogPath);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.PreemptedAt);
     }
 
     [Fact]
@@ -827,6 +1490,67 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushProviderCancels_DoesNotSetCheckpoint()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-cancel",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/c.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushThrowsCancellation = true,
+        };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
+    }
+
+    [Fact]
+    public async Task StartupResume_AdoptionExit0_ButPushHangs_IsBoundedByResumeTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem();
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-push-hangs",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/h.log",
+        });
+
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionExitCodeToReturn = 0,
+            CheckpointPushHangs = true,
+        };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(provider.CheckpointPushCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.AgentLogPath);
+    }
+
+    [Fact]
     public async Task StartupResume_ResumeFailure_SkipsCheckpointPromotion()
     {
         // If multipass start failed, the VM is not running and any git push
@@ -935,6 +1659,92 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // Re-enqueue clears StartedAt so the item is again pickup-eligible.
         Assert.Null(afterSweep.StartedAt);
         Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", afterSweep.PreemptCheckpoint);
+    }
+
+    [Fact]
+    public async Task DeadWorkerReaper_PeriodicSweep_WaitsForSlowStartupAdoption()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-slow-adopt",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/slow.log",
+        });
+
+        using var registry = new SqliteWorkerRegistry(_dbPath);
+        await registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "stale-worker",
+            HostName = "host",
+            ProcessId = 123,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            LastHeartbeatAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var barrier = new StartupRecoveryBarrier();
+        var queue = new InMemoryTaskQueue();
+        var provider = new FakeSuspendingProvider
+        {
+            AdoptionResultSource = new TaskCompletionSource<int?>(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var resume = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            barrier);
+        var reaper = new DeadWorkerReaper(
+            registry,
+            _store,
+            queue,
+            new DeadWorkerOptions
+            {
+                HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+                DeadWorkerThreshold = TimeSpan.FromMilliseconds(20),
+                CheckInterval = TimeSpan.FromMilliseconds(20),
+                MaxRecoveryAttempts = 2,
+            },
+            NullLogger<DeadWorkerReaper>.Instance,
+            new NullWebhookDispatcher(),
+            startupRecoveryBarrier: barrier);
+
+        await reaper.StartAsync(CancellationToken.None);
+        try
+        {
+            await resume.StartAsync(CancellationToken.None);
+            await WaitUntilAsync(() => provider.AdoptionCalls.Count == 1);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(120));
+            var duringAdoption = await _store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.Working, duringAdoption!.State);
+            Assert.Equal("vm-slow-adopt", duringAdoption.SuspendedVmName);
+            Assert.Null(duringAdoption.PreemptCheckpoint);
+            Assert.Equal(0, queue.Count);
+            Assert.Single(await registry.ListAsync(CancellationToken.None));
+
+            provider.AdoptionResultSource!.SetResult(0);
+            await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+            barrier.MarkInitialRecoveryCompleted();
+            await WaitUntilAsync(async () =>
+            {
+                var after = await _store.GetAsync(item.Id);
+                return queue.Count == 1
+                    && after?.PreemptCheckpoint == $"refs/heads/codeybox/preempt/{item.Id}"
+                    && after.StartedAt is null;
+            });
+
+            var recovered = await _store.GetAsync(item.Id);
+            Assert.NotEqual(WorkItemState.Failed, recovered!.State);
+            Assert.Null(recovered.SuspendedVmName);
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await reaper.StopAsync(stopCts.Token);
+            await resume.StopAsync(CancellationToken.None);
+        }
     }
 
     // ── Leak reaper integration ──────────────────────────────────────────────
@@ -1170,7 +1980,20 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private SandboxResumeOnStartupService MakeResumeService(ISandboxProvider provider) =>
-        new(provider, _store, NullLogger<SandboxResumeOnStartupService>.Instance);
+        new(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance);
+
+    private sealed class NoopStartupRecoveryInputSink : IStartupRecoveryInputSink
+    {
+        public static readonly NoopStartupRecoveryInputSink Instance = new();
+
+        private NoopStartupRecoveryInputSink() { }
+
+        public void MarkRecoveryInputReady() { }
+    }
 
     private sealed class DeleteOnResumeProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
@@ -1300,20 +2123,38 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
         // Resume runs items in parallel (SandboxResumeOnStartupService fans out
-        // via Task.Run with a SemaphoreSlim gate), so the recording lists MUST
-        // be thread-safe — a plain List<T>.Add from two concurrent resumes
-        // intermittently loses one entry, which historically surfaced as a
-        // flaky "vm-1 not in ResumedNames" assertion.
+        // with a SemaphoreSlim gate), so the recording lists MUST be thread-safe
+        // — a plain List<T>.Add from two concurrent resumes intermittently loses
+        // one entry, which historically surfaced as a flaky "vm-1 not in
+        // ResumedNames" assertion.
         private readonly ConcurrentQueue<string> _resumedNames = new();
         private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
         private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
+        private readonly ManualResetEventSlim _resumeBlockRelease = new();
         public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
+        public bool ResumeThrowsCancellation { get; set; }
+        public bool ResumeHangs { get; set; }
+        public bool ResumeBlocksBeforeReturningTask { get; set; }
+        public TaskCompletionSource ResumeBlockEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
+        public IDictionary<string, TaskCompletionSource> ResumeReleaseSources { get; set; } =
+            new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal);
+        public bool ResumeObservesCancellation { get; set; }
+        public bool ResumeCancellationObserved { get; private set; }
         public int? AdoptionExitCodeToReturn { get; set; }
+        public TaskCompletionSource<int?>? AdoptionResultSource { get; set; }
+        public bool AdoptionThrowsCancellation { get; set; }
+        public bool AdoptionFaultsCancellation { get; set; }
+        public bool AdoptionThrows { get; set; }
+        public bool AdoptionFaults { get; set; }
         public bool CheckpointPushReturns { get; set; } = true;
         public bool CheckpointPushThrows { get; set; }
+        public bool CheckpointPushThrowsCancellation { get; set; }
+        public bool CheckpointPushHangs { get; set; }
 
         public void Register(WorkItemId id, ISuspendableSandbox sandbox) => _active[id] = sandbox;
 
@@ -1323,6 +2164,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
 
         public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
         {
@@ -1335,6 +2177,23 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         {
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
+            if (ResumeThrowsCancellation) throw new OperationCanceledException("provider cancelled resume");
+            if (ResumeBlocksBeforeReturningTask)
+            {
+                ResumeBlockEntered.TrySetResult();
+                _resumeBlockRelease.Wait();
+            }
+            if (ResumeReleaseSources.TryGetValue(name, out var resumeRelease))
+                return resumeRelease.Task;
+            if (ResumeHangs || ResumeNamesToHang.Contains(name))
+                return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+            if (ResumeObservesCancellation)
+            {
+                while (!ct.IsCancellationRequested)
+                    Thread.Sleep(1);
+                ResumeCancellationObserved = true;
+                throw new OperationCanceledException(ct);
+            }
             return Task.CompletedTask;
         }
 
@@ -1346,6 +2205,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             CancellationToken ct)
         {
             _adoptionCalls.Enqueue(new AdoptionCall(vmName, agentLogPath, deadline));
+            if (AdoptionThrowsCancellation)
+                throw new OperationCanceledException("provider cancelled adoption");
+            if (AdoptionThrows)
+                throw new InvalidOperationException("simulated adoption failure");
+            if (AdoptionFaultsCancellation)
+                return Task.FromException<int?>(new OperationCanceledException("provider cancelled adoption"));
+            if (AdoptionFaults)
+                return Task.FromException<int?>(new InvalidOperationException("simulated adoption failure"));
+            if (AdoptionResultSource is not null)
+                return AdoptionResultSource.Task;
             return Task.FromResult(AdoptionExitCodeToReturn);
         }
 
@@ -1359,6 +2228,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _checkpointPushCalls.Enqueue(new CheckpointPushCall(vmName, workingDir, refName, commitMessage));
             if (CheckpointPushThrows)
                 throw new InvalidOperationException("simulated in-VM git push failure");
+            if (CheckpointPushThrowsCancellation)
+                throw new OperationCanceledException("provider cancelled checkpoint promotion");
+            if (CheckpointPushHangs)
+                return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);
         }
     }

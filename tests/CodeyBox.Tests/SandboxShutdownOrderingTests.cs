@@ -32,9 +32,9 @@ namespace CodeyBox.Tests;
 ///   BEFORE per-VM teardown, so no new sandboxes race the snapshot;</item>
 ///   <item>operator-tunable <see cref="SandboxTeardownMode"/> picks between
 ///   Suspend (legacy), Stop (multipass stop, lock-safe), Dispose (purge);</item>
-///   <item>startup reconciler runs BEFORE the resume handler and tries to
-///   recover orphaned suspend-lifecycle VMs (stop, then purge) instead of
-///   waiting out the leak reaper's grace.</item>
+///   <item>startup reconciler runs in the background and tries to recover
+///   orphaned suspend-lifecycle VMs (stop, then purge) without blocking the
+///   API listener.</item>
 /// </list>
 /// </summary>
 public sealed class SandboxShutdownOrderingTests : IDisposable
@@ -454,6 +454,56 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupReconciler_LifecycleStartup_DoesNotBlockOnProviderRecovery()
+    {
+        var provider = new BlockingReconcilingProvider();
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        Assert.False(provider.ReconcileEntered.Task.IsCompleted);
+
+        await svc.StartAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        await provider.ReconcileEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        provider.Release();
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupReconciler_StopAsync_CancelsBackgroundRecovery_AndIsIdempotent()
+    {
+        var provider = new BlockingReconcilingProvider();
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None).WaitAsync(TimeSpan.FromMilliseconds(250));
+        await provider.ReconcileEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await svc.StopAsync(stopCts.Token);
+
+        Assert.True(provider.ReconcileCancellationObserved);
+
+        // Host/factory disposal paths may call StopAsync more than once.
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupReconciler_ProviderCancellation_DoesNotPropagate_WhenHostTokenIsActive()
+    {
+        var provider = new ReconcilingFakeProvider { ReconcileThrowsProviderCancellation = true };
+        var svc = new StartupSandboxReconciliationService(
+            provider, _store, NullLogger<StartupSandboxReconciliationService>.Instance);
+
+        using var hostCts = new CancellationTokenSource();
+        await svc.ReconcileAllForTestAsync(hostCts.Token).WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(hostCts.IsCancellationRequested);
+        Assert.True(provider.ReconcileCalled);
+    }
+
+    [Fact]
     public async Task StartupReconciler_UnrecoverableVm_IsReturnedForOperatorAttention()
     {
         // When the provider can't recover a VM (root cleanup needed — the
@@ -853,6 +903,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public IReadOnlyList<string> UnrecoverableReturned { get; private set; } = [];
         private readonly ConcurrentDictionary<string, List<string>> _opsByVm = new();
         public string? RecoveryThrowsFor { get; set; }
+        public bool ReconcileThrowsProviderCancellation { get; set; }
+        public bool ReconcileCalled { get; private set; }
 
         public void SeedManaged(ManagedSandboxInfo info) => _managed.Add(info);
         public string Name => "fake-reconciling";
@@ -875,6 +927,10 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
             IReadOnlySet<string> liveSuspendedNames, CancellationToken ct)
         {
+            ReconcileCalled = true;
+            if (ReconcileThrowsProviderCancellation)
+                throw new OperationCanceledException("provider cancelled reconciliation");
+
             var unrecoverable = new List<string>();
             foreach (var info in _managed)
             {
@@ -898,6 +954,42 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             UnrecoverableReturned = unrecoverable;
             return unrecoverable;
         }
+    }
+
+    private sealed class BlockingReconcilingProvider : ISandboxProvider, ISuspendingSandboxProvider
+    {
+        private readonly TaskCompletionSource<IReadOnlyList<string>> _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReconcileEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string Name => "fake-blocking-reconciling";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotImplementedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
+
+        public async Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
+            IReadOnlySet<string> liveSuspendedNames, CancellationToken ct)
+        {
+            ReconcileEntered.TrySetResult();
+            try
+            {
+                return await _release.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                ReconcileCancellationObserved = true;
+                throw;
+            }
+        }
+
+        public bool ReconcileCancellationObserved { get; private set; }
+        public void Release() => _release.TrySetResult([]);
     }
 
     private sealed class ShortCircuitPipelineRunner : IPipelineRunner

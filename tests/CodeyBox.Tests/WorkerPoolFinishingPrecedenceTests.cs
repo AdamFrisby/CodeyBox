@@ -7,6 +7,8 @@ namespace CodeyBox.Tests;
 
 public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 {
+    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(15);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-finishing-precedence-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -65,8 +67,8 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         await queue.EnqueueAsync(reworkA.Id);
         await queue.EnqueueAsync(reworkB.Id);
 
-        Assert.True(await pipeline.WaitForEnteredAsync(reworkA.Id, TimeSpan.FromSeconds(5)));
-        Assert.True(await pipeline.WaitForEnteredAsync(reworkB.Id, TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForEnteredAsync(reworkA.Id, DispatchWaitTimeout));
+        Assert.True(await pipeline.WaitForEnteredAsync(reworkB.Id, DispatchWaitTimeout));
 
         var highPriorityQueued = Item(WorkItemState.Queued, priority: 100);
         var finishing = Item(finishingState, priority: 0);
@@ -81,14 +83,14 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 
         pipeline.Release(reworkA.Id);
 
-        Assert.True(await pipeline.WaitForStateAsync(finishing.Id, expectedActiveState, TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForStateAsync(finishing.Id, expectedActiveState, DispatchWaitTimeout));
         Assert.False(pipeline.HasEntered(highPriorityQueued.Id));
         var thirdEntered = pipeline.ThirdEntered;
         Assert.True(thirdEntered.HasValue);
         Assert.Equal(finishing.Id, thirdEntered.Value);
 
         pipeline.Release(finishing.Id);
-        Assert.True(await pipeline.WaitForDoneAsync(finishing.Id, TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForDoneAsync(finishing.Id, DispatchWaitTimeout));
 
         pipeline.Release(reworkB.Id);
         pipeline.Release(highPriorityQueued.Id);
@@ -177,7 +179,7 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
 
         foreach (var rework in reworks)
-            Assert.True(await pipeline.WaitForEnteredAsync(rework.Id, TimeSpan.FromSeconds(5)));
+            Assert.True(await pipeline.WaitForEnteredAsync(rework.Id, DispatchWaitTimeout));
 
         Assert.Equal(0, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
 
@@ -195,7 +197,7 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 
         pipeline.Release(reworks[0].Id);
 
-        Assert.True(await pipeline.WaitForStateAsync(auditPassed.Id, WorkItemState.Merging, TimeSpan.FromSeconds(5)));
+        Assert.True(await pipeline.WaitForStateAsync(auditPassed.Id, WorkItemState.Merging, DispatchWaitTimeout));
         Assert.False(pipeline.HasEntered(highPriorityQueued.Id));
         Assert.Equal(auditPassed.Id, pipeline.NthEntered(5));
         Assert.Equal(1, svc.Snapshot().GetValueOrDefault(AgentKind.Claude));
