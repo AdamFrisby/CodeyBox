@@ -689,6 +689,7 @@ public sealed class LocalGitHost : IGitHost
 
         var results = new List<string>(Math.Min(64, maxResults));
         var capExceeded = false;
+        var stderr = string.Empty;
         try
         {
             while (true)
@@ -706,24 +707,31 @@ public sealed class LocalGitHost : IGitHost
                 results.Add(trimmed);
             }
         }
+        catch
+        {
+            // Read failure (cancellation, broken pipe, etc.): kill the child
+            // before propagating so the git process is not left wedged on
+            // its stdout pipe after we stop draining it. Without this, an
+            // interrupted ListFilesEndingWithAsync would leak the OS
+            // process: the finally block below only ran the kill on the
+            // cap-exceeded happy-path. Drain + WaitForExit happen in the
+            // finally below so the child is always reaped.
+            try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+            throw;
+        }
         finally
         {
             if (capExceeded)
             {
                 try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
             }
+            // Always reap stderr + exit with CancellationToken.None so a
+            // cancelled caller does not skip the wait and leak the child.
+            try { stderr = await p.StandardError.ReadToEndAsync(CancellationToken.None); }
+            catch { /* best-effort */ }
+            try { await p.WaitForExitAsync(CancellationToken.None); }
+            catch { /* best-effort */ }
         }
-
-        string stderr;
-        try
-        {
-            stderr = await p.StandardError.ReadToEndAsync(CancellationToken.None);
-        }
-        catch
-        {
-            stderr = string.Empty;
-        }
-        await p.WaitForExitAsync(CancellationToken.None);
 
         if (capExceeded)
         {

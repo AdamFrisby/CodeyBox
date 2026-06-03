@@ -135,6 +135,31 @@ public interface IGitHost
             "This git host does not support isolated merge clone staging.");
 
     /// <summary>
+    /// Neutral entry point used by phases that need an isolated bare clone
+    /// for read-only or scratch-write inspection (e.g. the required-build
+    /// gate). The clone is staged under the same root and with the same
+    /// in-flight-marker semantics that
+    /// <see cref="CreateIsolatedMergeCloneAsync"/> uses; the difference is
+    /// purely intent — these callers do not perform merge resolution and
+    /// must not depend on merge-specific protocol around the clone.
+    ///
+    /// <para>The <paramref name="lifetimeId"/> is the work item that owns
+    /// the clone's lifetime so concurrent reapers can tie a stranded clone
+    /// back to its work item.</para>
+    ///
+    /// <para>Default delegates to <see cref="CreateIsolatedMergeCloneAsync"/>
+    /// so existing hosts keep working without per-call-site implementations;
+    /// hosts that want to surface non-merge clones differently (separate
+    /// staging root, alternative marker convention) can override here
+    /// without affecting merge callers.</para>
+    /// </summary>
+    Task<string> CreateIsolatedRepositoryCloneAsync(
+        string repositoryId,
+        WorkItemId lifetimeId,
+        CancellationToken ct = default)
+        => CreateIsolatedMergeCloneAsync(repositoryId, lifetimeId, ct);
+
+    /// <summary>
     /// Re-stages the isolated bare clone at <paramref name="targetPath"/>
     /// after the host directory has gone missing between create-time and
     /// mount-time (e.g. tmpwatch reaping, future host-side cleanup, or an
@@ -183,6 +208,23 @@ public interface IGitHost
         }
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Neutral disposal entry point that pairs with
+    /// <see cref="CreateIsolatedRepositoryCloneAsync"/>. Removes the staged
+    /// clone directory and any host-written marker artifacts. Best-effort:
+    /// implementations log failures rather than throwing so a partial
+    /// cleanup does not mask the caller's primary outcome.
+    ///
+    /// <para>Default delegates to <see cref="DisposeIsolatedMergeCloneAsync"/>
+    /// so the on-disk cleanup surface is single-sourced; hosts overriding the
+    /// neutral create may also override this for a matched disposal.</para>
+    /// </summary>
+    Task DisposeIsolatedRepositoryCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+        => DisposeIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
 
     /// <summary>Returns the resolved default branch name for the repo.</summary>
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);

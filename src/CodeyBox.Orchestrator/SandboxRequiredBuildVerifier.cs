@@ -314,7 +314,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             if (isolatedRepoPath is not null)
             {
-                await _gitHost.DisposeIsolatedMergeCloneAsync(
+                await _gitHost.DisposeIsolatedRepositoryCloneAsync(
                     request.RepositoryId,
                     isolatedRepoPath,
                     CancellationToken.None);
@@ -329,7 +329,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     {
         try
         {
-            return await _gitHost.CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
+            return await _gitHost.CreateIsolatedRepositoryCloneAsync(repositoryId, workItemId, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

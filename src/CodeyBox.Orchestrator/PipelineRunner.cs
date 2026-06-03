@@ -291,7 +291,13 @@ public sealed class PipelineRunner : IPipelineRunner
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
+        _requiredBuildGate = new RequiredBuildGate(
+            _requiredBuildVerifier,
+            _opts.RequiredBuildVerificationTimeout,
+            _auditReports is null ? null : PersistAuditReportAsync);
     }
+
+    private readonly RequiredBuildGate _requiredBuildGate;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
@@ -618,7 +624,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var requiredBuildApplies = false;
             if (!skipAudit)
             {
-                requiredBuildApplies = await RequiredBuildAppliesAsync(item, project, repoId, baseBranch, workBranch, ct);
+                requiredBuildApplies = await _requiredBuildGate.AppliesAsync(item.Id, project.Id, repoId, baseBranch, workBranch, ct);
             }
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
@@ -649,7 +655,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // upstream-push phase, and the merge commit is fixed).
             if (skipAudit && !skipMerge)
             {
-                await EnforceRequiredBuildOnAuditPassedResumeAsync(
+                await _requiredBuildGate.EnforceOnAuditPassedResumeAsync(
                     item, project, repoId, baseBranch, workBranch, ct);
             }
 
@@ -2391,12 +2397,12 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (isInitial && suggestionsJson is not null)
                     await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
                 return agentResult.Stdout;
             }
 
             if (checkedOutExistingBranch)
-                await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+                await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
             var msg = isInitial
                 ? "Agent produced no changes to commit"
@@ -2414,7 +2420,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (isInitial && suggestionsJson is not null)
             await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-        await EnforceRequiredBuildForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+        await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
         return agentResult.Stdout;
     }
@@ -3282,7 +3288,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (hostShutdownToken.IsCancellationRequested)
                     throw auditPhase.Wrap(new OperationCanceledException(hostShutdownToken));
 
-                requiredBuildFinding = await RunRequiredBuildForAuditAsync(
+                requiredBuildFinding = await _requiredBuildGate.RunForAuditAsync(
                     item, project, repoId, baseBranch, workBranch, iteration, auditPhase.Token);
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
@@ -3423,282 +3429,6 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
         return false;
-    }
-
-    private async Task<bool> RequiredBuildAppliesAsync(
-        WorkItem item,
-        Project project,
-        string repoId,
-        string baseBranch,
-        string workBranch,
-        CancellationToken ct)
-    {
-        var probe = await _requiredBuildVerifier.ProbeAsync(new RequiredBuildProbeRequest
-        {
-            WorkItemId = item.Id,
-            ProjectId = project.Id,
-            RepositoryId = repoId,
-            BaseBranch = baseBranch,
-            WorkBranch = workBranch,
-        }, ct);
-
-        return probe.Status switch
-        {
-            RequiredBuildProbeStatus.Applies => true,
-            RequiredBuildProbeStatus.NotApplicable => false,
-            RequiredBuildProbeStatus.Unavailable => throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: {probe.Reason ?? "build marker inspection failed"}"),
-            _ => throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: unknown probe status {probe.Status}"),
-        };
-    }
-
-    private async Task EnforceRequiredBuildForWorkPhaseAsync(
-        WorkItem item,
-        Project project,
-        string repoId,
-        string baseBranch,
-        string workBranch,
-        string agentPhase,
-        CancellationToken ct)
-    {
-        var result = await VerifyRequiredBuildOnBranchAsync(
-            item, project, repoId, baseBranch, workBranch, phase: agentPhase, ct: ct);
-        if (result.Status == RequiredBuildVerificationStatus.Failed)
-        {
-            var phaseLabel = agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase)
-                ? "rework"
-                : "work";
-            throw new RequiredBuildFailedException(
-                $"{phaseLabel} left the branch non-compiling: {BuildRequiredBuildFailureSummary(result)}");
-        }
-    }
-
-    private async Task<AuditFinding?> RunRequiredBuildForAuditAsync(
-        WorkItem item,
-        Project project,
-        string repoId,
-        string baseBranch,
-        string workBranch,
-        int iteration,
-        CancellationToken ct)
-    {
-        var result = await VerifyRequiredBuildOnBranchAsync(
-            item, project, repoId, baseBranch, workBranch, phase: "audit", ct: ct, iteration: iteration);
-        if (result.Status != RequiredBuildVerificationStatus.Failed)
-            return null;
-
-        return new AuditFinding(
-            AuditorName: RequiredBuildGateIdentity.AuditorName,
-            Severity: AuditSeverity.Error,
-            Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-            Description: BuildRequiredBuildFailureSummary(result));
-    }
-
-    private async Task PersistRequiredBuildAuditReportAsync(
-        WorkItemId workItemId,
-        int iteration,
-        DateTimeOffset startedAt,
-        TimeSpan elapsed,
-        RequiredBuildVerificationResult result,
-        CancellationToken ct)
-    {
-        if (_auditReports is null) return;
-        // Skipped: the gate did not apply on this branch, so there is no
-        // auditor invocation to record. Unavailable with no captured output
-        // also has nothing useful to persist (the build script never ran:
-        // marker inspection, isolated clone, or sandbox setup failed before
-        // the build emitted anything). Failed/Passed always persist; an
-        // Unavailable that DOES carry build output (dotnet-not-found,
-        // no-target) is treated like a script-ran-but-couldn't-finish
-        // outcome and persisted with its output so operators can inspect it.
-        if (result.Status == RequiredBuildVerificationStatus.Skipped) return;
-        if (result.Status == RequiredBuildVerificationStatus.Unavailable
-            && string.IsNullOrEmpty(result.Output))
-        {
-            return;
-        }
-
-        // Adapt the build verifier's result into the canonical AuditResult
-        // shape and persist via the same path normal auditors use. This keeps
-        // RawOutput redaction/truncation, finding-id computation, and store
-        // wiring single-sourced — future audit-pipeline changes only have to
-        // be made in one place.
-        var auditResult = ToBuildAuditResult(result);
-        var ctxForReport = new AuditContext(
-            WorkItemId: workItemId,
-            WorkBranch: string.Empty,
-            BaseBranch: string.Empty,
-            Iteration: iteration,
-            OriginalPrompt: string.Empty);
-        await PersistAuditReportAsync(
-            ctxForReport,
-            RequiredBuildAuditorAdapter.Instance,
-            auditResult,
-            startedAt,
-            elapsed,
-            ct);
-    }
-
-    private static AuditResult ToBuildAuditResult(RequiredBuildVerificationResult result)
-    {
-        var isFailure = result.Status == RequiredBuildVerificationStatus.Failed;
-        var findings = isFailure
-            ? new AuditFinding[]
-            {
-                new(
-                    AuditorName: RequiredBuildGateIdentity.AuditorName,
-                    Severity: AuditSeverity.Error,
-                    Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-                    Description: $"Required build exited with code {result.ExitCode}."),
-            }
-            : Array.Empty<AuditFinding>();
-        return new AuditResult(
-            Passed: !isFailure,
-            Findings: findings,
-            RawOutput: string.IsNullOrEmpty(result.Output) ? null : result.Output);
-    }
-
-    /// <summary>
-    /// Persistence-only adapter exposing the build gate's identity to the
-    /// canonical <see cref="PersistAuditReportAsync"/> code path. The build
-    /// verifier owns execution; this adapter exists solely so the persisted
-    /// AuditReport carries the same auditor name / kind every other auditor
-    /// uses and goes through the same redaction / finding-id wiring.
-    /// </summary>
-    private sealed class RequiredBuildAuditorAdapter : IAuditor
-    {
-        public static readonly RequiredBuildAuditorAdapter Instance = new();
-        private RequiredBuildAuditorAdapter() { }
-
-        public string Name => RequiredBuildGateIdentity.AuditorName;
-        public string Kind => "shell";
-        public AuditCapabilities Required => AuditCapabilities.None;
-
-        public Task<AuditResult> RunAsync(
-            ISandbox sandbox,
-            string workingDirectory,
-            AuditContext context,
-            CancellationToken ct = default)
-            => throw new NotSupportedException(
-                "RequiredBuildAuditorAdapter is a persistence-only adapter; the build verifier owns execution.");
-    }
-
-    /// <summary>
-    /// Gates the merge phase for items resuming at <see cref="WorkItemState.AuditPassed"/>.
-    /// The normal audit loop is skipped on that resume path, so without this
-    /// re-verification a branch that previously slipped past a broken or
-    /// degraded build gate could still be merged. Throws
-    /// <see cref="AuditFailedException"/> on failure so the outer catch rolls
-    /// the item back to AuditFailed, and propagates Unavailable through
-    /// VerifyRequiredBuildOnBranchAsync's existing infrastructure-failure
-    /// exception.
-    /// </summary>
-    private async Task EnforceRequiredBuildOnAuditPassedResumeAsync(
-        WorkItem item,
-        Project project,
-        string repoId,
-        string baseBranch,
-        string workBranch,
-        CancellationToken ct)
-    {
-        var applies = await RequiredBuildAppliesAsync(item, project, repoId, baseBranch, workBranch, ct);
-        if (!applies) return;
-
-        var result = await VerifyRequiredBuildOnBranchAsync(
-            item, project, repoId, baseBranch, workBranch, phase: "audit", ct: ct);
-        if (result.Status == RequiredBuildVerificationStatus.Failed)
-        {
-            throw new AuditFailedException(
-                $"required build failed on AuditPassed resume: {BuildRequiredBuildFailureSummary(result)}");
-        }
-    }
-
-    private async Task<RequiredBuildVerificationResult> VerifyRequiredBuildOnBranchAsync(
-        WorkItem item,
-        Project project,
-        string repoId,
-        string baseBranch,
-        string workBranch,
-        string phase,
-        CancellationToken ct,
-        int? iteration = null)
-    {
-        // Branch-controlled MSBuild targets can sleep or loop forever.
-        // Enforce a dedicated timeout for every required-build verification
-        // (work, audit, AuditPassed-resume) so the gate cannot hold the
-        // pipeline worker indefinitely. The audit phase already imposes a
-        // per-iteration timeout, but this layered bound applies on every
-        // call path — including the AuditPassed-resume path that runs under
-        // only the ambient pipeline token.
-        var auditTarget = SandboxTargetResolver.ResolveAudit(
-            project.NetworkProfiles.AuditTool,
-            AuditCapabilities.None);
-        var baselineRef = SandboxTargetResolver.BaselineRefForTarget(
-            project, auditTarget, item.BaselineImageRef);
-        var request = new RequiredBuildVerificationRequest
-        {
-            WorkItemId = item.Id,
-            ProjectId = project.Id,
-            RepositoryId = repoId,
-            BaseBranch = baseBranch,
-            WorkBranch = workBranch,
-            Phase = phase,
-            Iteration = iteration,
-            SandboxPolicy = new RequiredBuildSandboxPolicy
-            {
-                NetworkProfile = auditTarget.NetworkProfile,
-                BaselineImageRef = baselineRef,
-            },
-        };
-
-        var verificationTimeout = _opts.RequiredBuildVerificationTimeout;
-        using var timeoutCts = new CancellationTokenSource(verificationTimeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-        var startedAt = DateTimeOffset.UtcNow;
-        var sw = Stopwatch.StartNew();
-        RequiredBuildVerificationResult result;
-        try
-        {
-            result = await _requiredBuildVerifier.VerifyAsync(request, linkedCts.Token);
-        }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
-        {
-            throw new RequiredBuildVerificationUnavailableException(
-                $"could not verify required build: build exceeded the required-build verification timeout of {verificationTimeout.TotalMinutes:0.##} minutes");
-        }
-        finally
-        {
-            sw.Stop();
-        }
-
-        // Persist the audit report through the orchestrator's canonical
-        // path on the audit-phase call site (iteration is set). The verifier
-        // owns execution only; report persistence lives here so the gate
-        // doesn't bypass the same raw-output redaction / truncation that
-        // normal auditors get and so persistence is wired through a single
-        // store dependency.
-        if (iteration is int iter)
-        {
-            await PersistRequiredBuildAuditReportAsync(item.Id, iter, startedAt, sw.Elapsed, result, ct);
-        }
-
-        if (result.Status == RequiredBuildVerificationStatus.Unavailable)
-        {
-            throw new RequiredBuildVerificationUnavailableException(
-                result.Reason ?? "could not verify required build: verifier unavailable");
-        }
-
-        return result;
-    }
-
-    private static string BuildRequiredBuildFailureSummary(RequiredBuildVerificationResult result)
-    {
-        var detail = string.IsNullOrWhiteSpace(result.Output)
-            ? "(no build output captured)"
-            : result.Output.Trim();
-        return $"required build failed (exit {result.ExitCode}): {detail}";
     }
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(

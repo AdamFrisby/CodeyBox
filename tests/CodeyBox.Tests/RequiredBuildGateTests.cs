@@ -1248,6 +1248,180 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("dotnet is not available", report.RawOutput);
     }
 
+    [Fact]
+    public async Task LocalGitHost_ListFilesEndingWithAsync_CapExceeded_ThrowsAndDoesNotReturnPartialMatches()
+    {
+        // Pin the streaming cap behavior of the LocalGitHost ListFilesEndingWithAsync
+        // override that the required-build probe relies on. If this method
+        // silently truncated instead of throwing, the verifier would inspect
+        // partial marker data and could pass/skip a branch that actually has
+        // a larger marker set than the cap allows — the audit failure mode the
+        // probe's Unavailable fallback exists to prevent.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const int markerCount = 12;
+        const int maxResults = 5;
+        for (var i = 0; i < markerCount; i++)
+        {
+            var projectPath = Path.Combine(seed, $"proj-{i:D2}.csproj");
+            await File.WriteAllTextAsync(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+            await TestSupport.RunGit(seed, "add", $"proj-{i:D2}.csproj");
+        }
+        await TestSupport.RunGit(seed, "commit", "-m", "many marker files");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-cap-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var item = NewItem("feature/cap-overflow") with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            gitHost.ListFilesEndingWithAsync(repoId, item.BaseBranch!, new[] { ".csproj" }, maxResults));
+        Assert.Contains("more than 5 matching paths", ex.Message);
+        Assert.Contains("output cap exceeded", ex.Message);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_MarkerCapOverflow_ReportsUnavailable()
+    {
+        // End-to-end: when the underlying marker listing exceeds the per-branch
+        // cap (signalled as an InvalidOperationException by IGitHost contract),
+        // the verifier must convert that into Unavailable so the build gate
+        // defers instead of inspecting partial data. Without this, the probe
+        // would silently fall back to "no markers found" and the gate would
+        // either skip or fail a branch incorrectly.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-cap-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var capExceededHost = new CapExceededListFilesGitHost(gitHost,
+            "tree listing produced more than 8192 matching paths (output cap exceeded)");
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            capExceededHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/cap-overflow-e2e") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var probe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildProbeStatus.Unavailable, probe.Status);
+        Assert.Contains("output cap exceeded", probe.Reason);
+
+        var verify = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, verify.Status);
+        Assert.Contains("output cap exceeded", verify.Reason);
+    }
+
+    [Fact]
+    public async Task LocalGitHost_ListFilesAsync_NullPrefix_ReturnsEntireTree()
+    {
+        // Direct coverage of the LocalGitHost.ListFilesAsync change that
+        // accepts null/empty pathPrefix. The required-build probe uses
+        // ListFilesEndingWithAsync, not this entrypoint, so a regression
+        // that validates/rejects null on this public method would not be
+        // caught by the verifier tests. Pin the contract here.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await File.WriteAllTextAsync(Path.Combine(seed, "root.txt"), "root\n");
+        Directory.CreateDirectory(Path.Combine(seed, "sub"));
+        await File.WriteAllTextAsync(Path.Combine(seed, "sub", "leaf.txt"), "leaf\n");
+        await TestSupport.RunGit(seed, "add", "root.txt", "sub/leaf.txt");
+        await TestSupport.RunGit(seed, "commit", "-m", "two files at two depths");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-null-prefix-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var item = NewItem("feature/null-prefix") with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        var allWithNull = await gitHost.ListFilesAsync(repoId, item.BaseBranch!, pathPrefix: null);
+        var allWithEmpty = await gitHost.ListFilesAsync(repoId, item.BaseBranch!, pathPrefix: string.Empty);
+
+        Assert.Contains("root.txt", allWithNull);
+        Assert.Contains("sub/leaf.txt", allWithNull);
+        Assert.Equal(allWithNull.OrderBy(s => s).ToArray(), allWithEmpty.OrderBy(s => s).ToArray());
+    }
+
+    [Theory]
+    [InlineData("bin")]
+    [InlineData("obj")]
+    [InlineData("node_modules")]
+    public async Task SandboxRequiredBuildVerifier_MarkerUnderIgnoredDirectory_DoesNotApply(string ignoredDir)
+    {
+        // The verifier's marker classifier skips paths under .git, bin, obj,
+        // and node_modules so generated artifacts (e.g. a .csproj copied into
+        // bin/, a build cache laying down a fake .slnx) cannot trick the gate
+        // into running on a non-.NET branch or picking the wrong target. Cover
+        // each ignored directory: a single marker-looking path under one of
+        // these dirs (and nothing else) must produce NotApplicable.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var ignoredPath = Path.Combine(seed, ignoredDir, "Spurious.csproj");
+        Directory.CreateDirectory(Path.GetDirectoryName(ignoredPath)!);
+        await File.WriteAllTextAsync(ignoredPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        await TestSupport.RunGit(seed, "add", $"{ignoredDir}/Spurious.csproj");
+        await TestSupport.RunGit(seed, "commit", "-m", $"spurious csproj under {ignoredDir}");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-ignored-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/ignored-marker-" + ignoredDir) with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        var probe = await verifier.ProbeAsync(new RequiredBuildProbeRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.BaseBranch!,
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildProbeStatus.NotApplicable, probe.Status);
+
+        var verify = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.BaseBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+        Assert.Equal(RequiredBuildVerificationStatus.Skipped, verify.Status);
+    }
+
+    private sealed class CapExceededListFilesGitHost(IGitHost inner, string capMessage) : DelegatingGitHost(inner)
+    {
+        public override Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+            string repositoryId, string treeish, IReadOnlyList<string> filenameSuffixes,
+            int maxResults, CancellationToken ct = default)
+            => throw new InvalidOperationException(capMessage);
+    }
+
     private sealed class RecordingDefaultBranchGitHost(IGitHost inner) : DelegatingGitHost(inner)
     {
         public int GetDefaultBranchCalls;
