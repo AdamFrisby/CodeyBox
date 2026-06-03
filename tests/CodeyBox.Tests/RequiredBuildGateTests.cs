@@ -975,6 +975,68 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task PreemptResumeRework_NoChangeOnBrokenCheckpoint_FailsWithBuildErrorNotWorkComplete()
+    {
+        // Coverage gap on the resumingPreempt branch of RunAgentPhaseAsync
+        // (PipelineRunner.cs:2398-2410). When a Reworking item resumes from
+        // a PreemptCheckpoint and the resumed agent produces no new commit,
+        // the runner must still verify the branch compiles before pushing
+        // and returning success. Without this gate, a non-compiling
+        // checkpoint resumes, declares "no changes" silently, then walks
+        // through WorkComplete → AuditPassed and on to merge — the same
+        // class of failure the work/rework no-change gate catches on the
+        // ordinary pickup path. A regression that removed or bypassed the
+        // EnforceForWorkPhaseAsync call on this branch would leave only the
+        // initial-work, audit-rework, and queued-from-work tests as
+        // coverage, none of which exercise the preempt-resume entry.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        // Non-default branch name keeps the pickup-time rebase out of the
+        // way (IsPickupRebaseOwnedWorkBranch matches only "codeybox/{id8}").
+        // Entering at Reworking + PreemptCheckpoint forces the
+        // resumingPreempt && entry==Reworking branch in PipelineRunner.
+        var item = NewItem("feature/preempt-rework-broken") with
+        {
+            State = WorkItemState.Reworking,
+        };
+        item = item with { PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}" };
+
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await PushPreemptCheckpointWithFileAsync(
+            barePath,
+            item.WorkBranch!,
+            item.PreemptCheckpoint!,
+            "build.fail",
+            "broken\n",
+            "broken checkpoint awaiting resume");
+
+        // Agent re-writes the same content the checkpoint already has, so
+        // `git diff --cached --quiet` exits 0 and the resume path observes
+        // shaBefore == shaAfter — the precise condition under which the
+        // resumingPreempt build gate must still run.
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("build.fail", "broken\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("build", final.FailureKind);
+        Assert.Contains("rework left the branch non-compiling", final.LastError);
+        Assert.Contains("error CS1061", final.LastError);
+        Assert.NotEqual(WorkItemState.WorkComplete, final.State);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+    }
+
+    [Fact]
     public async Task SandboxRequiredBuildVerifier_WorkOnBase_AppliesWhenWorkBranchHasMarkers()
     {
         // Work-on-base path coverage: baseBranch == workBranch. The verifier
@@ -2147,6 +2209,28 @@ public sealed class RequiredBuildGateTests : IDisposable
         await TestSupport.RunGit(clone, "add", fileName);
         await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
+    }
+
+    private async Task PushPreemptCheckpointWithFileAsync(
+        string barePath,
+        string workBranch,
+        string checkpointRef,
+        string fileName,
+        string contents,
+        string subject)
+    {
+        var clone = Path.Combine(_workspace, "checkpoint-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", workBranch);
+
+        var path = Path.Combine(clone, fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, contents);
+        await TestSupport.RunGit(clone, "add", "-A");
+        await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{checkpointRef}");
     }
 
     private async Task DeleteFromBareBranchAsync(
