@@ -11,9 +11,9 @@ namespace CodeyBox.Orchestrator;
 /// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
 /// orchestrator process can <c>multipass start</c> the same VM and re-tail the
 /// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
-/// resume half). Stop avoids the RAM snapshot. It leaves Working items that
-/// still need a preempt checkpoint to <see cref="PipelineRunner"/>, and
-/// stop/preserves other recoverable active VMs via
+/// resume half). Stop avoids the RAM snapshot. It leaves Working/Reworking
+/// items that still need a preempt checkpoint to <see cref="PipelineRunner"/>,
+/// and stop/preserves other recoverable active VMs via
 /// <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Dispose is a
 /// destructive teardown mode with no recovery artifact.
 ///
@@ -76,6 +76,13 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// <see cref="SuspendTimeoutPolicy"/> so the three cannot drift apart.
     /// </summary>
     public static readonly TimeSpan DefaultPerGiBSuspendBudget = SuspendTimeoutPolicy.DefaultPerGiB;
+
+    /// <summary>
+    /// Fallback per-VM timeout for Stop/Dispose teardown when the service is
+    /// constructed outside production DI. Program.cs passes
+    /// <c>ShutdownOptions.GraceSeconds</c> for this value; the fallback mirrors
+    /// that option's 60 second default rather than defining a separate policy.
+    /// </summary>
     public static readonly TimeSpan DefaultNonSuspendTeardownTimeout = TimeSpan.FromSeconds(60);
 
     private readonly ISandboxProvider _provider;
@@ -267,10 +274,10 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
         var item = await _store.GetAsync(workItemId, CancellationToken.None);
-        if (item is not null && RequiresPipelinePreemptCheckpoint(item))
+        if (item is not null && WorkItemRecoveryPolicy.RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(item))
         {
             _log.LogInformation(
-                "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the work phase still needs PipelineRunner's preempt checkpoint; leaving it running for host-shutdown recovery",
+                "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the active agent phase still needs PipelineRunner's preempt checkpoint; leaving it running for host-shutdown recovery",
                 workItemId, sandbox.Id);
             return;
         }
@@ -306,10 +313,6 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         }
     }
 
-    private static bool RequiresPipelinePreemptCheckpoint(WorkItem item) =>
-        item.State == WorkItemState.Working
-        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-
     /// <summary>
     /// Teardown via dispose (delete --purge). Skips the preserve-on-dispose
     /// path entirely: the VM is destroyed and no suspend mapping is written.
@@ -321,7 +324,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     /// in-VM git checkpoint flow against a VM that is about to be (or has
     /// already been) <c>multipass delete --purge</c>'d — without this signal
     /// the catch block would fault inside a non-existent VM, leaving the work
-    /// item Working with no PreemptCheckpoint.</para>
+    /// item Working/Reworking with no PreemptCheckpoint.</para>
     /// </summary>
     private async Task DisposeOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {

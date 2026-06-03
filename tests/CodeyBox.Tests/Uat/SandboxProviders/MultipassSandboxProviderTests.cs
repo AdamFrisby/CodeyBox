@@ -2090,7 +2090,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task StopAndPreserveAsync_NonZeroStopExit_Throws()
+    public async Task StopAndPreserveAsync_NonZeroStopExit_ThrowsAndPreservesOnDispose()
     {
         var stopCalls = 0;
         var deleteCalls = 0;
@@ -2115,15 +2115,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.True(stopCalls >= 1);
         Assert.Contains("multipass stop codeybox-test failed", ex.Message);
-        Assert.False(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
-            "failed stop must not write the preempt marker that makes the leak reaper defer cleanup");
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "stop/preserve must mark the VM as preempt-retained before multipass stop can fail");
 
         await sandbox.DisposeAsync();
-        Assert.Equal(1, deleteCalls);
+        Assert.Equal(0, deleteCalls);
     }
 
     [Fact]
-    public async Task StopAndPreserveAsync_NotStoppedAfterSuccessfulStop_Throws()
+    public async Task StopAndPreserveAsync_NotStoppedAfterSuccessfulStop_ThrowsAndPreservesOnDispose()
     {
         var deleteCalls = 0;
         var runner = new RecordingMultipassRunner((argv, _, _) =>
@@ -2148,11 +2148,42 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
 
         Assert.Contains("did not reach Stopped state", ex.Message);
-        Assert.False(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
-            "unverified stop must not write the preempt marker that makes the leak reaper defer cleanup");
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "an abandoned stop verification must still leave the VM preempt-retained");
 
         await sandbox.DisposeAsync();
-        Assert.Equal(1, deleteCalls);
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_CanceledStop_PreservesVmOnDispose()
+    {
+        var stopCalls = 0;
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                throw new OperationCanceledException(ct);
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.Equal(1, stopCalls);
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
     }
 
     [Fact]

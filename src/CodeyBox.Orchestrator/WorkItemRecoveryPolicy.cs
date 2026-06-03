@@ -4,6 +4,10 @@ namespace CodeyBox.Orchestrator;
 
 internal static class WorkItemRecoveryPolicy
 {
+    public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
+        item.State is WorkItemState.Working or WorkItemState.Reworking
+        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+
     public static bool TryBuildWorkingWithoutPreemptFailure(
         WorkItem item,
         string lastError,

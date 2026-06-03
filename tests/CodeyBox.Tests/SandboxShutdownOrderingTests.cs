@@ -325,6 +325,65 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_StopMode_DefersReworkingWithoutCheckpointToPipelineRunner()
+    {
+        var item = MakeItem(WorkItemState.Reworking);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-reworking-stop-defer");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.SuspendAllAsync();
+
+        Assert.False(sandbox.StopAndPreserveCalled,
+            "Stop mode must leave uncheckpointed Reworking VMs running for PipelineRunner's preempt-checkpoint path");
+        Assert.False(sandbox.DisposeCalled);
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path for Reworking items without a checkpoint");
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
+        Assert.Null(after.PreemptedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_StopsCheckpointedWorkingItem()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        var checkpoint = $"refs/heads/codeybox/preempt/{item.Id}";
+        item = item with
+        {
+            PreemptCheckpoint = checkpoint,
+            PreemptedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-working-checkpointed-stop");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.SuspendAllAsync();
+
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Stop mode should stop/preserve Working VMs that already have a preempt checkpoint");
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.DisposeCalled);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(checkpoint, after!.PreemptCheckpoint);
+        Assert.NotNull(after.PreemptedAt);
+    }
+
+    [Fact]
     public async Task ShutdownHandler_TeardownModeAccessor_UsesHotReloadedValueAtShutdown()
     {
         // Regression for the 2026-06-02 incident: the hosted service used to
@@ -385,6 +444,31 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         Assert.Null(after!.PreemptCheckpoint);
         Assert.False(sandbox.OwnedByShutdownHandler,
             "a timed-out stop/preserve must not suppress any later recovery path");
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_FailedStopDoesNotMarkShutdownOwnership()
+    {
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox(
+            "vm-stop-fails",
+            stopException: new InvalidOperationException("injected stop failure"));
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.SuspendAllAsync();
+
+        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "a failed stop/preserve must not suppress PipelineRunner or startup recovery");
+        Assert.Equal(0, sandbox.MarkOwnedOrder);
     }
 
     [Fact]
@@ -1012,18 +1096,21 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         private readonly Func<bool>? _isDispatchPaused;
         private readonly Task? _disposeTask;
         private readonly Task? _stopTask;
+        private readonly Exception? _stopException;
         private readonly Action<string>? _recordEvent;
         public OrderingFakeSandbox(
             string id,
             Func<bool>? isDispatchPaused = null,
             Task? disposeTask = null,
             Task? stopTask = null,
+            Exception? stopException = null,
             Action<string>? recordEvent = null)
         {
             Id = id;
             _isDispatchPaused = isDispatchPaused;
             _disposeTask = disposeTask;
             _stopTask = stopTask;
+            _stopException = stopException;
             _recordEvent = recordEvent;
         }
         public string Id { get; }
@@ -1058,6 +1145,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             StopAndPreserveCalled = true;
             StopAndPreserveOrder = ++_order;
             _recordEvent?.Invoke("stop");
+            if (_stopException is not null)
+                throw _stopException;
             return _stopTask ?? Task.CompletedTask;
         }
         public bool IsOwnedByShutdownHandler => OwnedByShutdownHandler;

@@ -3684,6 +3684,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public async Task StopAndPreserveAsync(CancellationToken ct = default)
     {
         if (_disposed) return;
+
+        // Stop/preserve is called only after the orchestrator has either
+        // created a preempt checkpoint or decided the active state is
+        // recoverable without one. From this point, DisposeAsync must not
+        // delete the VM even if multipass stop fails, times out, or shutdown
+        // cancellation abandons the wait.
+        _preserveOnDispose = true;
+        await TryWritePreemptMarkerAsync(CancellationToken.None);
+
         var stop = await RunMultipassAsync(
             [_opts.MultipassBinary, "stop", _name],
             stdin: null,
@@ -3693,7 +3702,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                 $"multipass stop {_name} failed (exit {stop.ExitCode}): {stop.Stderr}");
 
         await WaitForStoppedAfterPreserveAsync(ct);
+    }
 
+    private async Task TryWritePreemptMarkerAsync(CancellationToken ct)
+    {
         var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
         try
         {
@@ -3703,8 +3715,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         {
             _log.LogWarning(ex, "Failed to write preempt marker for multipass VM {Name}", _name);
         }
-
-        _preserveOnDispose = true;
     }
 
     private async Task WaitForStoppedAfterPreserveAsync(CancellationToken ct)
@@ -3739,15 +3749,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     public async Task SuspendAsync(CancellationToken ct = default)
     {
         if (_disposed) return;
-        var markerPath = Path.Combine(_sandboxRoot, ".codeybox-preempt");
-        try
-        {
-            await File.WriteAllTextAsync(markerPath, DateTimeOffset.UtcNow.ToString("O"), ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Failed to write preempt marker for suspended multipass VM {Name}", _name);
-        }
+        await TryWritePreemptMarkerAsync(ct);
 
         ProcessRunResult result;
         try
