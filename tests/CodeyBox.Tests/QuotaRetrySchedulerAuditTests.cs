@@ -385,6 +385,30 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task RearmTimers_ContinuesAfterWaitingItemStartupRequeueThrows()
+    {
+        var first = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        using var fixture = BuildScheduler(
+            BuildRouter(availablePct: 100),
+            BuildProjects(),
+            taskQueue: new ThrowingForWorkItemQueue(first.Id));
+        var later = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(first);
+        await fixture.Store.CreateAsync(later);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var firstStored = await fixture.Store.GetAsync(first.Id);
+        Assert.Equal(WorkItemState.Queued, firstStored!.State);
+        Assert.Equal(1, firstStored.QuotaRetryAttempts);
+        var laterStored = await fixture.Store.GetAsync(later.Id);
+        Assert.Equal(WorkItemState.Queued, laterStored!.State);
+        Assert.Equal(1, laterStored.QuotaRetryAttempts);
+        Assert.Equal("queue enqueue failed", GetScalar<string>(AssertQuotaAttempt(first, "startup", "error", "WaitingForQuotaReset"), "Reason"));
+        Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
+    }
+
+    [Fact]
     public async Task PeriodicRetry_RethrowsSchedulerCancellation()
     {
         using var cts = new CancellationTokenSource();
@@ -469,14 +493,15 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         IProjectRepository? projects,
         IQueueController? queueController = null,
         IWebhookDispatcher? webhooks = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ITaskQueue? taskQueue = null)
     {
         var dbPath = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N") + ".db");
         var store = new SqliteWorkItemStore(dbPath);
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")) },
             NullLogger<LocalGitHost>.Instance);
-        var retrier = new WorkItemRetrier(store, new InMemoryTaskQueue(), gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var retrier = new WorkItemRetrier(store, taskQueue ?? new InMemoryTaskQueue(), gitHost, NullLogger<WorkItemRetrier>.Instance);
         var time = timeProvider ?? new InertTimeProvider(DateTimeOffset.UtcNow);
         var scheduler = new QuotaRetryScheduler(
             store,
@@ -652,6 +677,27 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             => Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
         public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyDictionary<string, bool>>(new Dictionary<string, bool>());
+    }
+
+    private sealed class ThrowingForWorkItemQueue : ITaskQueue
+    {
+        private readonly WorkItemId _throwFor;
+        private readonly InMemoryTaskQueue _inner = new();
+
+        public ThrowingForWorkItemQueue(WorkItemId throwFor) => _throwFor = throwFor;
+
+        public int Count => _inner.Count;
+
+        public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+        {
+            if (id == _throwFor)
+                throw new InvalidOperationException("queue enqueue failed");
+
+            return _inner.EnqueueAsync(id, ct);
+        }
+
+        public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
+            => _inner.DequeueAsync(ct);
     }
 
     private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher

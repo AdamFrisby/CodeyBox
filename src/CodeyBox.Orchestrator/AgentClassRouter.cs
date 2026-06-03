@@ -72,6 +72,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // determine availability). Updated on every ProbeAsync result.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
         = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), bool> _lastQuotaUsable
+        = new();
 
     /// <summary>
     /// Raised when a routing probe observes an eligible member move from below
@@ -446,7 +448,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
-            RecordAvailabilityAndMaybeNotify(member, quota, gate, nowUtc);
+            RecordAvailabilityAndMaybeNotify(member, quota, gate);
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -1031,20 +1033,31 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private void RecordAvailabilityAndMaybeNotify(
         AgentMembership member,
         EffectiveQuota quota,
-        QuotaGateDecision gate,
-        DateTimeOffset nowUtc)
+        QuotaGateDecision gate)
     {
         var key = (member.Agent, member.ModelId ?? string.Empty);
-        var hadPrevious = _lastAvailablePct.TryGetValue(key, out var previous);
         _lastAvailablePct[key] = quota.AvailablePct;
-        if (!gate.Allow)
-            return;
-
-        var floor = member.Billing == AgentBilling.Subscription
-            ? ComputeEffectiveFloorPct(member.Agent, quota.ResetAt, nowUtc)
-            : _opts.MinQuotaPct;
-        if (hadPrevious && previous < floor && quota.AvailablePct >= floor)
+        if (RecordQuotaUsableTransition(key, gate.Allow))
             QuotaUsableThresholdCrossed?.Invoke();
+    }
+
+    private bool RecordQuotaUsableTransition((AgentKind Agent, string ModelId) key, bool isUsable)
+    {
+        while (true)
+        {
+            if (!_lastQuotaUsable.TryGetValue(key, out var previous))
+            {
+                if (_lastQuotaUsable.TryAdd(key, isUsable))
+                    return false;
+                continue;
+            }
+
+            if (previous == isUsable)
+                return false;
+
+            if (_lastQuotaUsable.TryUpdate(key, isUsable, previous))
+                return !previous && isUsable;
+        }
     }
 
     /// <summary>
