@@ -482,7 +482,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             costStore: costStore,
             costExtractors: extractors,
             costCalculator: calculator,
-            usageStore: usageStore);
+            usageStore: usageStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

@@ -554,7 +554,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: probes,
             auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
-            classRouter: router);
+            classRouter: router,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new CandidateFixture(pipeline, store, project);
     }
@@ -673,7 +674,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             auditQuotaOptions: probes is null ? null : new QuotaRouterOptions { MinQuotaPct = 10.0 },
             classRouter: router,
             agentRunningCounters: runningCounters,
-            agentConcurrency: agentConcurrency);
+            agentConcurrency: agentConcurrency,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new RoutingFixture(pipeline, store, gitHost);
     }

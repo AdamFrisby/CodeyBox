@@ -57,6 +57,55 @@ public sealed class PipelineOptionsWiringTests
         Assert.Contains("PhaseAbsoluteTimeoutMultiplier", ex.Message);
     }
 
+    [Fact]
+    public void ProgramMapsConfiguredRequiredBuildVerificationTimeoutIntoPipelineOptions()
+    {
+        // Operators must be able to tune the required-build gate's per-call
+        // ceiling without recompiling — a very large .NET solution may need
+        // longer than the 15-min default, and infrastructure degradation may
+        // call for a tighter ceiling. Pin the CodeyBoxOptions →
+        // PipelineOptions mapping so a future refactor cannot silently
+        // drop the knob and pin the operator to the embedded default.
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:RequiredBuildVerificationTimeoutSeconds"] = "1800",
+        });
+
+        var options = factory.Services.GetRequiredService<PipelineOptions>();
+
+        Assert.Equal(TimeSpan.FromMinutes(30), options.RequiredBuildVerificationTimeout);
+    }
+
+    [Fact]
+    public void ProgramDefaultsRequiredBuildVerificationTimeoutWhenUnset()
+    {
+        // Default must remain 15 minutes (Pipeline embedded default and the
+        // CodeyBoxOptions default agree). A drift between the two would
+        // confuse operators reading config vs. observed behavior.
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>());
+
+        var options = factory.Services.GetRequiredService<PipelineOptions>();
+
+        Assert.Equal(TimeSpan.FromMinutes(15), options.RequiredBuildVerificationTimeout);
+    }
+
+    [Fact]
+    public void ProgramFloorsRequiredBuildVerificationTimeoutBelowMinimum()
+    {
+        // Sub-minute timeouts would make the gate effectively impossible to
+        // pass even on the smallest .NET solution; clamp to a 60 s floor at
+        // the wiring boundary so an accidental misconfig fails-safe to an
+        // overrun-prone gate rather than a never-passes one.
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:RequiredBuildVerificationTimeoutSeconds"] = "5",
+        });
+
+        var options = factory.Services.GetRequiredService<PipelineOptions>();
+
+        Assert.Equal(TimeSpan.FromSeconds(60), options.RequiredBuildVerificationTimeout);
+    }
+
     private sealed class PipelineOptionsWiringFactory : WebApplicationFactory<Program>
     {
         private readonly Dictionary<string, string?> _extraConfig;

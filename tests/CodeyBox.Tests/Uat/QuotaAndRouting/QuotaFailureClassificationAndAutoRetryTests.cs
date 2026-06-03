@@ -338,7 +338,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             retryScheduler: retryScheduler,
-            quotaClassifier: BuildClassifier());
+            quotaClassifier: BuildClassifier(),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new PipelineContext(pipeline, store);
     }

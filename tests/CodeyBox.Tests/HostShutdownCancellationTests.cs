@@ -87,7 +87,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             projects, upstreamFactory, composer, store,
             new NullWebhookDispatcher(),
             options ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            logger ?? NullLogger<PipelineRunner>.Instance);
+            logger ?? NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new ShutdownTestHarness(pipeline, store, gitHost);
     }
@@ -282,7 +283,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             projects, new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = NewItem() with
         {
@@ -337,7 +339,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
         using var orchestrator = new OrchestratorService(
             queue, store, pipeline, new CancellationRegistry(CancellationToken.None),
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
@@ -484,7 +487,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            logger);
+            logger,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = NewItem();
         await store.CreateAsync(item);
@@ -581,7 +585,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            logger);
+            logger,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = NewItem();
         await store.CreateAsync(item);
@@ -673,7 +678,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
     }
 
     private async Task CreatePreemptCheckpointAsync(LocalGitHost gitHost, WorkItem item, string seed, bool includeScratchpad = true)

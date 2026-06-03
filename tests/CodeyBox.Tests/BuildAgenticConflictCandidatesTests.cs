@@ -532,7 +532,8 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             agentConcurrency: agentConcurrency,
             auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
             budgetProvider: budgetProvider,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new Fixture(pipeline, store, project);
     }

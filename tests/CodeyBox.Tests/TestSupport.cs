@@ -101,6 +101,7 @@ internal static class TestSupport
         AgentCostCalculator? costCalculator = null,
         string? stateDbPathOverride = null,
         IPreMergeVerifier? preMergeVerifier = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null,
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         ITaskQueue? taskQueue = null,
@@ -184,7 +185,11 @@ internal static class TestSupport
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
             involvement: involvement,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
+                sandboxes,
+                gitHost,
+                resolvedOptions));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }
@@ -221,6 +226,47 @@ internal sealed class StaticCredentialProvider : ICredentialProvider
 {
     public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
         => Task.FromResult<AgentCredential?>(null);
+}
+
+internal sealed class TestRequiredBuildVerifier : IRequiredBuildVerifier
+{
+    public static TestRequiredBuildVerifier NotApplicable => new(
+        RequiredBuildProbeResult.NotApplicable,
+        RequiredBuildVerificationResult.Skipped);
+
+    private readonly RequiredBuildProbeResult _probeResult;
+    private readonly RequiredBuildVerificationResult _verificationResult;
+
+    public TestRequiredBuildVerifier(
+        RequiredBuildProbeResult probeResult,
+        RequiredBuildVerificationResult verificationResult)
+    {
+        _probeResult = probeResult;
+        _verificationResult = verificationResult;
+    }
+
+    public int ProbeCalls { get; private set; }
+    public int VerifyCalls { get; private set; }
+
+    public Task<RequiredBuildProbeResult> ProbeAsync(
+        RequiredBuildProbeRequest request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        ProbeCalls++;
+        return Task.FromResult(_probeResult);
+    }
+
+    public Task<RequiredBuildVerificationResult> VerifyAsync(
+        RequiredBuildVerificationRequest request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        VerifyCalls++;
+        return Task.FromResult(_verificationResult);
+    }
 }
 
 internal sealed class TestUpstreamFactory : IUpstreamRemoteFactory

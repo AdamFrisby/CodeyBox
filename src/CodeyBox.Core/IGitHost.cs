@@ -135,6 +135,31 @@ public interface IGitHost
             "This git host does not support isolated merge clone staging.");
 
     /// <summary>
+    /// Neutral entry point used by phases that need an isolated bare clone
+    /// for read-only or scratch-write inspection (e.g. the required-build
+    /// gate). The clone is staged under the same root and with the same
+    /// in-flight-marker semantics that
+    /// <see cref="CreateIsolatedMergeCloneAsync"/> uses; the difference is
+    /// purely intent — these callers do not perform merge resolution and
+    /// must not depend on merge-specific protocol around the clone.
+    ///
+    /// <para>The <paramref name="lifetimeId"/> is the work item that owns
+    /// the clone's lifetime so concurrent reapers can tie a stranded clone
+    /// back to its work item.</para>
+    ///
+    /// <para>Default delegates to <see cref="CreateIsolatedMergeCloneAsync"/>
+    /// so existing hosts keep working without per-call-site implementations;
+    /// hosts that want to surface non-merge clones differently (separate
+    /// staging root, alternative marker convention) can override here
+    /// without affecting merge callers.</para>
+    /// </summary>
+    Task<string> CreateIsolatedRepositoryCloneAsync(
+        string repositoryId,
+        WorkItemId lifetimeId,
+        CancellationToken ct = default)
+        => CreateIsolatedMergeCloneAsync(repositoryId, lifetimeId, ct);
+
+    /// <summary>
     /// Re-stages the isolated bare clone at <paramref name="targetPath"/>
     /// after the host directory has gone missing between create-time and
     /// mount-time (e.g. tmpwatch reaping, future host-side cleanup, or an
@@ -183,6 +208,23 @@ public interface IGitHost
         }
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Neutral disposal entry point that pairs with
+    /// <see cref="CreateIsolatedRepositoryCloneAsync"/>. Removes the staged
+    /// clone directory and any host-written marker artifacts. Best-effort:
+    /// implementations log failures rather than throwing so a partial
+    /// cleanup does not mask the caller's primary outcome.
+    ///
+    /// <para>Default delegates to <see cref="DisposeIsolatedMergeCloneAsync"/>
+    /// so the on-disk cleanup surface is single-sourced; hosts overriding the
+    /// neutral create may also override this for a matched disposal.</para>
+    /// </summary>
+    Task DisposeIsolatedRepositoryCloneAsync(
+        string repositoryId,
+        string targetPath,
+        CancellationToken ct = default)
+        => DisposeIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
 
     /// <summary>Returns the resolved default branch name for the repo.</summary>
     Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default);
@@ -331,9 +373,61 @@ public interface IGitHost
     Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side file reads.");
 
-    /// <summary>Lists repository-relative files under a path prefix from a commit or tree.</summary>
-    Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string pathPrefix, CancellationToken ct = default)
+    /// <summary>
+    /// Lists repository-relative files under a path prefix from a commit or tree.
+    /// Pass an empty or null <paramref name="pathPrefix"/> to list every file in the tree.
+    /// </summary>
+    Task<IReadOnlyList<string>> ListFilesAsync(string repositoryId, string treeish, string? pathPrefix, CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side file listing.");
+
+    /// <summary>
+    /// Returns repository-relative paths in <paramref name="treeish"/> whose final
+    /// filename ends (case-insensitive) with any of <paramref name="filenameSuffixes"/>.
+    /// Production implementations should stream the underlying tree listing and
+    /// filter line by line so a huge tree cannot consume unbounded host memory.
+    /// Stops accumulating once <paramref name="maxResults"/> matches have been
+    /// collected and throws if any additional matches exist, so callers can treat
+    /// the tree as too large to safely inspect rather than silently returning
+    /// partial data.
+    ///
+    /// <para>The default implementation falls back to <see cref="ListFilesAsync"/>
+    /// and filters client-side — convenient for hosts that don't need the streaming
+    /// bound (e.g. test fakes) but still gives callers the same cap semantics.
+    /// Hosts that talk to real git (where unbounded memory IS a concern) override
+    /// this with a streaming implementation.</para>
+    /// </summary>
+    async Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+        string repositoryId,
+        string treeish,
+        IReadOnlyList<string> filenameSuffixes,
+        int maxResults,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(filenameSuffixes);
+        if (filenameSuffixes.Count == 0)
+            throw new ArgumentException("at least one filename suffix is required", nameof(filenameSuffixes));
+        if (maxResults <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxResults), maxResults, "must be positive");
+
+        var all = await ListFilesAsync(repositoryId, treeish, pathPrefix: null, ct);
+        var matches = new List<string>();
+        foreach (var p in all)
+        {
+            var ok = false;
+            foreach (var s in filenameSuffixes)
+            {
+                if (p.EndsWith(s, StringComparison.OrdinalIgnoreCase)) { ok = true; break; }
+            }
+            if (!ok) continue;
+            if (matches.Count >= maxResults)
+            {
+                throw new InvalidOperationException(
+                    $"tree listing produced more than {maxResults} matching paths (output cap exceeded)");
+            }
+            matches.Add(p);
+        }
+        return matches;
+    }
 
     /// <summary>Returns name-status changes between two commits or trees in the host bare repo.</summary>
     Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
