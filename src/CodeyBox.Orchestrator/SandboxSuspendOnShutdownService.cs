@@ -159,11 +159,13 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
             // calls — in Suspend mode each VM gets its own RAM-scaled timeout
             // (see SuspendTimeoutFor / SuspendOneAsync) so one stuck multipassd
             // call can't block the rest of the drain. The host still enforces
-            // HostOptions.ShutdownTimeout overall; Program.cs raises that
-            // ceiling only when Suspend teardown is selected so a healthy RAM
-            // snapshot is not truncated. If the host kills us before a slow
-            // snapshot finishes, the (work item → VM) mapping persisted before
-            // the await (SuspendOneAsync) still lets the next startup resume it.
+            // HostOptions.ShutdownTimeout overall; Program.cs keeps that
+            // ceiling capability-based for suspending providers because teardown
+            // mode is hot-reloadable, so a later switch to Suspend still has
+            // room for a healthy RAM snapshot. If the host kills us before a
+            // slow snapshot finishes, the (work item → VM) mapping persisted
+            // before the await (SuspendOneAsync) still lets the next startup
+            // resume it.
             await SuspendAllAsync();
         }
         catch (Exception ex)

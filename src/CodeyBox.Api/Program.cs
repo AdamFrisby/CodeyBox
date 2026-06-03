@@ -3607,8 +3607,7 @@ public partial class Program
         var maxConcurrent = OrchestratorOptionsFactory
             .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
             .MaxConcurrentWorkers;
-        var suspendsOnShutdown = providerSupportsSuspend;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
-            suspendsOnShutdown, grace, maxConcurrent);
+            providerSupportsSuspend, grace, maxConcurrent);
     }
 }
