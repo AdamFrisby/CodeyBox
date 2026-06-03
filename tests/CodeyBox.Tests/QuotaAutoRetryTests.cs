@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
@@ -153,7 +154,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
         string gitRoot,
         Func<AutoRetryOnQuotaFailureOptions>? autoRetryOptionsAccessor = null,
         AutoRetryOnQuotaFailureOptions? retryOptions = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ILogger<QuotaRetryScheduler>? logger = null)
     {
         var time = timeProvider ?? _time;
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
@@ -198,7 +200,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             store,
             retrier,
             opts,
-            NullLogger<QuotaRetryScheduler>.Instance,
+            logger ?? NullLogger<QuotaRetryScheduler>.Instance,
             router,
             projects,
             null,
@@ -382,6 +384,138 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
         Assert.Equal(1, probe.CallCount);
+    }
+
+    [Fact]
+    public async Task Scheduler_RequeuedWaitingItemDispatchesThroughStaleQuotaState()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var failuresDb = Path.Combine(_workspace, "quota-failures-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        using var quotaFailures = new SqliteQuotaFailureStore(failuresDb);
+        var projectId = new ProjectId("test-project");
+        await quotaFailures.RecordAsync(
+            AgentKind.Claude,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            _time.Now,
+            CancellationToken.None);
+
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "recent-failure-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var member = new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 };
+        var probe = new MutableProbe(AgentKind.Claude, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "recent-failure-class",
+                    DisplayName = "Recent Failure",
+                    Members = [member],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10,
+                ObservedFailureWindow = TimeSpan.FromMinutes(10),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaFailures: quotaFailures);
+        router.MarkExhausted(member, TimeSpan.FromMinutes(30));
+
+        var blockedWithoutRetryAdmission = await router.ResolveAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "blocked",
+            Prompt = "p",
+            AgentClassId = "recent-failure-class",
+        }, project, CancellationToken.None);
+        Assert.True(blockedWithoutRetryAdmission.ShouldWait);
+        Assert.Null(blockedWithoutRetryAdmission.Chosen);
+        Assert.Equal(0, probe.CallCount);
+
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+                MaxConcurrentWorkers = 1,
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "recent-failure-class",
+            NextQuotaRetryAt = _time.Now.AddHours(1),
+        };
+        await store.CreateAsync(item);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var requeued = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, requeued!.State);
+        Assert.Equal(1, requeued.QuotaRetryAttempts);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var tracking = new AgentTrackingPipeline(store);
+        using var orchestrator = new OrchestratorService(
+            taskQueue,
+            store,
+            tracking,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects);
+
+        await orchestrator.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitForConditionAsync(
+                () => tracking.LastAgent == AgentKind.Claude,
+                TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(AgentKind.Claude, tracking.LastAgent);
+        Assert.True(probe.CallCount >= 2);
     }
 
     [Fact]
@@ -1035,6 +1169,62 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_ExecuteAsync_InvalidPeriodicIntervalUsesReloadPollFallback()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var logger = new SignalLogger<QuotaRetryScheduler>("Re-armed or re-evaluated");
+
+        using var store = new SqliteWorkItemStore(stateDb);
+        using var scheduler = BuildPayPerApiRetryScheduler(
+            store,
+            gitRoot,
+            retryOptions: new AutoRetryOnQuotaFailureOptions
+            {
+                Enabled = true,
+                PeriodicCheckInterval = TimeSpan.Zero,
+                ClockDriftSafetyMargin = TimeSpan.FromMinutes(2),
+                MaxAutoRetriesPerWorkItem = 3,
+            },
+            timeProvider: TimeProvider.System,
+            logger: logger);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var rearmObserved = await Task.WhenAny(logger.Seen, Task.Delay(TimeSpan.FromSeconds(3)));
+            Assert.Same(logger.Seen, rearmObserved);
+
+            var item = new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = new ProjectId("test-project"),
+                Title = "test",
+                Prompt = "do thing",
+                State = WorkItemState.WaitingForQuotaReset,
+                FailureKind = "quota",
+                QuotaRetryAttempts = 0,
+                AgentClassId = "test-class",
+                NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(12),
+            };
+            await store.CreateAsync(item);
+
+            await Task.Delay(200);
+            var early = await store.GetAsync(item.Id);
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, early!.State);
+            Assert.Equal(0, early.QuotaRetryAttempts);
+
+            var retried = await WaitForAttemptsAsync(store, item.Id, expectedAttempts: 1, TimeSpan.FromSeconds(4));
+            Assert.Equal(WorkItemState.Queued, retried.State);
+            Assert.Equal(1, retried.QuotaRetryAttempts);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Scheduler_PeriodicSweep_RequeuesWhenEligiblePeerIsAvailable()
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -1560,6 +1750,38 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var timersField = typeof(QuotaRetryScheduler).GetField("_targetedTimers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         var timers = (System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, ITimer>)timersField!.GetValue(scheduler)!;
         Assert.False(timers.ContainsKey(item.Id));
+    }
+
+    private sealed class SignalLogger<T> : ILogger<T>
+    {
+        private readonly string _needle;
+        private readonly TaskCompletionSource _seen = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public SignalLogger(string needle) => _needle = needle;
+
+        public Task Seen => _seen.Task;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            if (message.Contains(_needle, StringComparison.Ordinal))
+                _seen.TrySetResult();
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
+        }
     }
 
     private static async Task<WorkItem> WaitForAttemptsAsync(

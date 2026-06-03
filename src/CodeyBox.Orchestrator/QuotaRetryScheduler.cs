@@ -233,9 +233,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private async Task StartupRequeueWaitingItemAsync(WorkItem item, CancellationToken ct)
     {
         var outcome = await TryStartupRequeueAsync(item, ct);
+        var action = outcome.Outcome switch
+        {
+            "retried" => "re-queued",
+            "retry-failed" => "left-waiting",
+            "skipped:max-retries" => "max-retries",
+            _ when outcome.Outcome.StartsWith("skipped:", StringComparison.Ordinal) => "skipped",
+            _ => "evaluated",
+        };
         _log.LogInformation(
-            "Quota retry startup sweep re-queued work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
-            item.Id, item.State, outcome.Outcome, outcome.Reason);
+            "Quota retry startup sweep evaluated work item {Id} in state {State}: action={Action} outcome={Outcome} reason={Reason}",
+            item.Id, item.State, action, outcome.Outcome, outcome.Reason);
 
         if (outcome.Outcome == "retried")
             CancelTargetedRetry(item.Id);
@@ -567,10 +575,9 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     private async Task<QuotaRetryAttemptResult> PerformRetryAsync(
         WorkItem item,
         string trigger,
-        CancellationToken ct,
-        string? retryFromOverride = null)
+        CancellationToken ct)
     {
-        var retryFrom = retryFromOverride ?? NormalizeRetryFrom(item.QuotaRetryFrom);
+        var retryFrom = NormalizeRetryFrom(item.QuotaRetryFrom);
         _log.LogInformation("Triggering quota auto-retry ({Trigger}) for work item {Id} (attempt {Attempt})",
             trigger, item.Id, item.QuotaRetryAttempts + 1);
 

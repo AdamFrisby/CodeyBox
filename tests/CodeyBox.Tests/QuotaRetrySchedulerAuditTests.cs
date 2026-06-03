@@ -450,12 +450,15 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         await RearmTimersAsync(fixture.Scheduler);
 
         var firstStored = await fixture.Store.GetAsync(first.Id);
-        Assert.Equal(WorkItemState.Queued, firstStored!.State);
-        Assert.Equal(1, firstStored.QuotaRetryAttempts);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, firstStored!.State);
+        Assert.Equal(0, firstStored.QuotaRetryAttempts);
         var laterStored = await fixture.Store.GetAsync(later.Id);
         Assert.Equal(WorkItemState.Queued, laterStored!.State);
         Assert.Equal(1, laterStored.QuotaRetryAttempts);
-        Assert.Equal("queue enqueue failed", GetScalar<string>(AssertQuotaAttempt(first, "startup", "error", "WaitingForQuotaReset"), "Reason"));
+        Assert.Contains(
+            "queue enqueue failed after state update; rolled back to WaitingForQuotaReset",
+            GetScalar<string>(AssertQuotaAttempt(first, "startup", "retry-failed", "WaitingForQuotaReset"), "Reason"),
+            StringComparison.Ordinal);
         Assert.Equal("from=work", GetScalar<string>(AssertQuotaAttempt(later, "startup", "retried", "WaitingForQuotaReset"), "Reason"));
     }
 
