@@ -395,9 +395,8 @@ internal sealed class CapturingTaskQueue : ITaskQueue
     public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         => ValueTask.FromResult<WorkItemId?>(Enqueued.Count == 0 ? null : Enqueued[0]);
 
-    public ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
-        => ValueTask.FromResult<TaskQueueDispatch?>(
-            Enqueued.Count == 0 ? null : TaskQueueDispatch.ForWorkItem(Enqueued[0]));
+    public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        => ValueTask.FromResult(Enqueued.Count > 0);
 }
 
 internal sealed class RecordingSyncRemote : IUpstreamRemote

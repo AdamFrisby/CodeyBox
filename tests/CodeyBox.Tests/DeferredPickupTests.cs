@@ -8,10 +8,8 @@ namespace CodeyBox.Tests;
 /// Verifies the _deferredItems contract introduced by the priority pickup:
 ///   (a) PickNextEligibleAsync skips items currently in _deferredItems even
 ///       though their store state is still Queued.
-///   (b) An explicit kick on the queue clears the deferred mark immediately
-///       (the dispatch loop calls _deferredItems.TryRemove on work-item kicks),
-///       so a 'retry now' EnqueueAsync does not have to wait for the deferral
-///       timer to fire.
+///   (b) A queued kick does not clear the deferred mark; the deferral owner
+///       clears it when its recheck interval actually elapses.
 /// </summary>
 public sealed class DeferredPickupTests : IDisposable
 {
@@ -84,12 +82,12 @@ public sealed class DeferredPickupTests : IDisposable
     }
 
     [Fact]
-    public async Task ExplicitKick_ClearsDeferral_AndItemIsPickedUpImmediately()
+    public async Task StaleKick_DoesNotClearDeferral_OrPickUpBeforeRecheck()
     {
-        // Mark an item deferred (simulating ScheduleDeferredRequeue's pre-sleep mark),
-        // then send an explicit kick on the queue. The dispatch loop must TryRemove the
-        // ID from _deferredItems on item-specific kicks, so the next pickup tick selects it
-        // without waiting for any deferral timer.
+        // Mark an item deferred (simulating ScheduleDeferredRequeue's pre-sleep
+        // mark), then send an older queued kick for the same item. The dispatch
+        // loop must not treat that buffered kick as a fresh retry-now signal,
+        // or quota/budget/disk deferrals can be bypassed immediately.
         var item = QueuedItem("p");
         await _store.CreateAsync(item);
 
@@ -104,18 +102,16 @@ public sealed class DeferredPickupTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Send a kick — the dispatch loop must clear the deferred mark and pick up
-        // immediately (no Task.Delay involved).
+        // Send a stale kick; the item must stay deferred until the deferral
+        // owner clears the marker.
         await queue.EnqueueAsync(item.Id);
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
-        while (DateTimeOffset.UtcNow < deadline && Volatile.Read(ref pickupCount) < 1)
-            await Task.Delay(25);
+        await Task.Delay(250);
 
         await svc.StopAsync(CancellationToken.None);
 
-        Assert.Equal(1, Volatile.Read(ref pickupCount));
-        Assert.False(svc.IsDeferredForTest(item.Id));
+        Assert.Equal(0, Volatile.Read(ref pickupCount));
+        Assert.True(svc.IsDeferredForTest(item.Id));
     }
 
     private sealed class NoopPipelineRunner : IPipelineRunner

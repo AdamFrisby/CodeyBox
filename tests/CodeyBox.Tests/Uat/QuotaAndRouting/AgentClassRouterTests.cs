@@ -366,45 +366,33 @@ public sealed class AgentClassRouterTests : IDisposable
 
     private sealed class RecordingTaskQueue : ITaskQueue
     {
-        private readonly Channel<TaskQueueDispatch> _channel = Channel.CreateUnbounded<TaskQueueDispatch>();
-        private readonly ConcurrentQueue<TaskQueueDispatch> _enqueued = new();
+        private readonly Channel<WorkItemId?> _channel = Channel.CreateUnbounded<WorkItemId?>();
+        private readonly ConcurrentQueue<WorkItemId> _enqueued = new();
         private int _workItemEnqueueCount;
 
         public TaskCompletionSource<WorkItemId> SecondWorkItemEnqueue { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public WorkItemId[] WorkItemEnqueuedIds => _enqueued
-            .Where(dispatch => dispatch.Kind == TaskQueueDispatchKind.WorkItem)
-            .Select(dispatch => dispatch.WorkItemId!.Value)
-            .ToArray();
+        public WorkItemId[] WorkItemEnqueuedIds => _enqueued.ToArray();
 
         public int Count => _channel.Reader.Count;
 
         public async ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
-            var dispatch = TaskQueueDispatch.ForWorkItem(id);
-            _enqueued.Enqueue(dispatch);
+            _enqueued.Enqueue(id);
             var count = Interlocked.Increment(ref _workItemEnqueueCount);
             if (count == 2)
                 SecondWorkItemEnqueue.TrySetResult(id);
 
-            await _channel.Writer.WriteAsync(dispatch, ct);
+            await _channel.Writer.WriteAsync(id, ct);
         }
 
         public async ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
         {
-            var dispatch = TaskQueueDispatch.GenericWake;
-            _enqueued.Enqueue(dispatch);
-            await _channel.Writer.WriteAsync(dispatch, ct);
+            await _channel.Writer.WriteAsync(null, ct);
         }
 
         public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
-        {
-            var dispatch = await DequeueDispatchAsync(ct);
-            return dispatch?.WorkItemId;
-        }
-
-        public async ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
         {
             try
             {
@@ -413,6 +401,19 @@ public sealed class AgentClassRouterTests : IDisposable
             catch (ChannelClosedException)
             {
                 return null;
+            }
+        }
+
+        public async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                await _channel.Reader.ReadAsync(ct);
+                return true;
+            }
+            catch (ChannelClosedException)
+            {
+                return false;
             }
         }
     }

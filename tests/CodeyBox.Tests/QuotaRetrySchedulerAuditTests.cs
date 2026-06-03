@@ -791,8 +791,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
             => _inner.DequeueAsync(ct);
 
-        public ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
-            => _inner.DequeueDispatchAsync(ct);
+        public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+            => _inner.DequeueDispatchSignalAsync(ct);
     }
 
     private sealed class StateChangingThrowingQueue : ITaskQueue
@@ -834,8 +834,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
             => _inner.DequeueAsync(ct);
 
-        public ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
-            => _inner.DequeueDispatchAsync(ct);
+        public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+            => _inner.DequeueDispatchSignalAsync(ct);
     }
 
     private sealed class ThrowingForWorkItemQuotaRetryRouter : IQuotaRetryRouter

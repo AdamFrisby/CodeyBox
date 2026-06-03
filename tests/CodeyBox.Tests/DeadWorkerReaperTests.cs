@@ -379,7 +379,6 @@ public sealed class DeadWorkerReaperTests : IDisposable
             string workerId,
             WorkItemId? workItemId,
             string reason,
-            bool wakeDispatcher,
             CancellationToken ct = default)
         {
             Releases.Add((workerId, workItemId, reason));

@@ -12,6 +12,5 @@ public interface IWorkerPoolRecoverySlotReleaser
         string workerId,
         WorkItemId? workItemId,
         string reason,
-        bool wakeDispatcher,
         CancellationToken ct = default);
 }

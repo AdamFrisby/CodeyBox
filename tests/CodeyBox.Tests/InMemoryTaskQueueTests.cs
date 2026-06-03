@@ -21,11 +21,9 @@ public sealed class InMemoryTaskQueueTests
         var q = new InMemoryTaskQueue();
         await q.EnqueueDispatchWakeAsync();
 
-        var got = await q.DequeueDispatchAsync();
+        var got = await q.DequeueDispatchSignalAsync();
 
-        Assert.NotNull(got);
-        Assert.Equal(TaskQueueDispatchKind.GenericWake, got.Value.Kind);
-        Assert.Null(got.Value.WorkItemId);
+        Assert.True(got);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
@@ -304,6 +305,104 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task QueuePauseAfterPickupDuringSpawnPacing_UnreservesAndPreservesWake()
+    {
+        using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                MinSpawnInterval = TimeSpan.FromSeconds(2),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            queueController: controller);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var first = MakeItem(createdAt: now);
+        var second = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+        await queue.EnqueueAsync(first.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(first.Id, DispatchWaitTimeout));
+        pipeline.Release(first.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
+
+        Assert.True(
+            await WaitUntilAsync(() => svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
+            "The second item should be reserved before the spawn-pacing delay completes.");
+
+        await controller.PauseAsync("pause after pickup during spawn pacing");
+        Assert.True(
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(4)),
+            "The queue-pause branch after spawn pacing must unreserve the item and release the gate.");
+        Assert.False(pipeline.HasEntered(second.Id));
+
+        await controller.ResumeAsync();
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(second.Id, DispatchWaitTimeout),
+            "The post-pickup queue-pause branch should preserve a wake so resume dispatches the item.");
+
+        pipeline.Release(second.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(second.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task ShutdownPauseAfterPickupDuringSpawnPacing_UnreservesAndStopsDispatch()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                MinSpawnInterval = TimeSpan.FromSeconds(2),
+            },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var first = MakeItem(createdAt: now);
+        var second = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+        await queue.EnqueueAsync(first.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(first.Id, DispatchWaitTimeout));
+        pipeline.Release(first.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
+
+        Assert.True(
+            await WaitUntilAsync(() => svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
+            "The second item should be reserved before the spawn-pacing delay completes.");
+
+        svc.PauseDispatch();
+        Assert.True(
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(4)),
+            "The shutdown-pause branch after spawn pacing must unreserve the item and release the gate.");
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(second.Id, NoDispatchQuietPeriod),
+            "Shutdown dispatch pause must suppress the reserved item after it is unreserved.");
+
+        var stored = await _store.GetAsync(second.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotDispatchAfterShutdownPause()
     {
         var queue = new ObservedTaskQueue();
@@ -429,12 +528,17 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
         var worker = await WaitForWorkerRegistrationAsync(workerRegistry, running.Id, DispatchWaitTimeout);
         Assert.NotNull(worker);
+        await _store.UpdateAsync(running with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        });
 
         Assert.True(await svc.TryReleaseRecoveredWorkerSlotAsync(
             worker!.WorkerId,
             running.Id,
-            "test recovery release while durable row is still worker-owned",
-            wakeDispatcher: false));
+            "test recovery release while durable row is still worker-owned"));
 
         Assert.Equal(0, queue.GenericWakeEnqueueCount);
         Assert.False(
@@ -480,8 +584,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.True(await svc.TryReleaseRecoveredWorkerSlotAsync(
             worker!.WorkerId,
             running.Id,
-            "test recovery release after durable transition",
-            wakeDispatcher: true));
+            "test recovery release after durable transition"));
 
         Assert.True(
             await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
@@ -536,9 +639,9 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
     private sealed class ObservedTaskQueue : ITaskQueue
     {
-        private readonly InMemoryTaskQueue _inner = new();
-        private readonly ConcurrentQueue<TaskQueueDispatch> _enqueued = new();
-        private readonly ConcurrentQueue<TaskQueueDispatch> _dequeued = new();
+        private readonly Channel<ObservedDispatch> _channel = Channel.CreateUnbounded<ObservedDispatch>();
+        private readonly ConcurrentQueue<ObservedDispatch> _enqueued = new();
+        private readonly ConcurrentQueue<ObservedDispatch> _dequeued = new();
         private readonly TaskCompletionSource _firstDequeue =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _dequeueCalls;
@@ -553,7 +656,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
-            var dispatch = TaskQueueDispatch.ForWorkItem(id);
+            var dispatch = ObservedDispatch.ForWorkItem(id);
             _enqueued.Enqueue(dispatch);
 
             return FailureMode switch
@@ -562,13 +665,14 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
                     throw new InvalidOperationException("synthetic synchronous enqueue failure"),
                 EnqueueFailureMode.FaultAsynchronously =>
                     new ValueTask(Task.FromException(new InvalidOperationException("synthetic asynchronous enqueue failure"))),
-                _ => _inner.EnqueueAsync(id, ct),
+                _ => _channel.Writer.WriteAsync(dispatch, ct),
             };
         }
 
         public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
         {
-            _enqueued.Enqueue(TaskQueueDispatch.GenericWake);
+            var dispatch = ObservedDispatch.GenericWake;
+            _enqueued.Enqueue(dispatch);
             while (true)
             {
                 var remaining = Volatile.Read(ref _dropDispatchWakeEnqueueCount);
@@ -583,15 +687,15 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
                     throw new InvalidOperationException("synthetic synchronous enqueue failure"),
                 EnqueueFailureMode.FaultAsynchronously =>
                     new ValueTask(Task.FromException(new InvalidOperationException("synthetic asynchronous enqueue failure"))),
-                _ => _inner.EnqueueDispatchWakeAsync(ct),
+                _ => _channel.Writer.WriteAsync(dispatch, ct),
             };
         }
 
-        public int Count => _inner.Count;
+        public int Count => _channel.Reader.Count;
         public int TotalEnqueueCount => _enqueued.Count;
         public int CompletedDequeueCount => _dequeued.Count;
         public int DequeueCallCount => Volatile.Read(ref _dequeueCalls);
-        public int GenericWakeEnqueueCount => _enqueued.Count(static d => d.Kind == TaskQueueDispatchKind.GenericWake);
+        public int GenericWakeEnqueueCount => _enqueued.Count(static d => d.IsGenericWake);
 
         public int EnqueueCount(WorkItemId id)
         {
@@ -603,18 +707,28 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         {
-            var dispatch = await DequeueDispatchAsync(ct);
-            return dispatch?.WorkItemId;
+            try
+            {
+                var dispatch = await ReadObservedDispatchAsync(ct);
+                return dispatch.WorkItemId;
+            }
+            catch (ChannelClosedException)
+            {
+                return null;
+            }
         }
 
-        public async ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
+        public async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
         {
-            Interlocked.Increment(ref _dequeueCalls);
-            _firstDequeue.TrySetResult();
-            var dispatch = await _inner.DequeueDispatchAsync(ct);
-            if (dispatch is { } actual)
-                _dequeued.Enqueue(actual);
-            return dispatch;
+            try
+            {
+                await ReadObservedDispatchAsync(ct);
+                return true;
+            }
+            catch (ChannelClosedException)
+            {
+                return false;
+            }
         }
 
         public Task WaitForFirstDequeueAsync(TimeSpan timeout) =>
@@ -625,6 +739,21 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         public Task<bool> WaitForCompletedDequeuesAsync(int count, TimeSpan timeout) =>
             WaitUntilAsync(() => CompletedDequeueCount >= count, timeout);
+
+        private async ValueTask<ObservedDispatch> ReadObservedDispatchAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _dequeueCalls);
+            _firstDequeue.TrySetResult();
+            var dispatch = await _channel.Reader.ReadAsync(ct);
+            _dequeued.Enqueue(dispatch);
+            return dispatch;
+        }
+
+        private readonly record struct ObservedDispatch(WorkItemId? WorkItemId, bool IsGenericWake)
+        {
+            public static ObservedDispatch ForWorkItem(WorkItemId id) => new(id, false);
+            public static ObservedDispatch GenericWake { get; } = new(null, true);
+        }
     }
 
     public enum EnqueueFailureMode

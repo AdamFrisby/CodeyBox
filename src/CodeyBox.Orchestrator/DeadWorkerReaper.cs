@@ -423,7 +423,7 @@ public sealed class DeadWorkerReaper : BackgroundService
     {
         if (_slotReleaser is not null
             && await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
-                workerId, itemId, reason, wakeDispatcher: true, ct))
+                workerId, itemId, reason, ct))
         {
             _log.LogWarning(
                 "Recovery ({WorkerId}): released worker-pool slot for item {ItemId}: {Reason}",

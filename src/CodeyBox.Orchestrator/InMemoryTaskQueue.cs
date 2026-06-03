@@ -10,27 +10,22 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class InMemoryTaskQueue : ITaskQueue
 {
-    private readonly Channel<TaskQueueDispatch> _channel = Channel.CreateUnbounded<TaskQueueDispatch>();
+    private readonly Channel<DispatchSignal> _channel = Channel.CreateUnbounded<DispatchSignal>();
 
     public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
-        => _channel.Writer.WriteAsync(TaskQueueDispatch.ForWorkItem(id), ct);
+        => _channel.Writer.WriteAsync(DispatchSignal.ForWorkItem(id), ct);
 
     public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
-        => _channel.Writer.WriteAsync(TaskQueueDispatch.GenericWake, ct);
+        => _channel.Writer.WriteAsync(DispatchSignal.GenericWake, ct);
 
     public int Count => _channel.Reader.Count;
 
     public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
     {
-        var dispatch = await DequeueDispatchAsync(ct);
-        return dispatch?.WorkItemId;
-    }
-
-    public async ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default)
-    {
         try
         {
-            return await _channel.Reader.ReadAsync(ct);
+            var signal = await _channel.Reader.ReadAsync(ct);
+            return signal.WorkItemId;
         }
         catch (ChannelClosedException)
         {
@@ -38,5 +33,24 @@ public sealed class InMemoryTaskQueue : ITaskQueue
         }
     }
 
+    public async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await _channel.Reader.ReadAsync(ct);
+            return true;
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+    }
+
     public void Complete() => _channel.Writer.TryComplete();
+
+    private readonly record struct DispatchSignal(WorkItemId? WorkItemId)
+    {
+        public static DispatchSignal ForWorkItem(WorkItemId id) => new(id);
+        public static DispatchSignal GenericWake { get; } = new(null);
+    }
 }

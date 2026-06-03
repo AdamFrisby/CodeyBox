@@ -120,10 +120,15 @@ public sealed class BudgetResetTests : IDisposable
         var queue = new InMemoryTaskQueue();
         var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
         var reg = new CancellationRegistry(CancellationToken.None);
+        var budgetRecheck = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            HourlyLimitRecheck = TimeSpan.FromMilliseconds(500),
+        });
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
             NullLogger<OrchestratorService>.Instance,
-            projects: projectRepo);
+            projects: projectRepo,
+            budgetDeferralRecheck: budgetRecheck);
 
         // Pre-seed 1 item whose StartedAt is inside the 1-hour window → cap is reached.
         var blocking = Started("defer-retry", DateTimeOffset.UtcNow.AddMinutes(-30));
@@ -143,15 +148,15 @@ public sealed class BudgetResetTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Give the orchestrator time to attempt pickup and defer.
-        await Task.Delay(300);
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        while (DateTimeOffset.UtcNow < deferDeadline && !svc.IsDeferredForTest(newItem.Id))
+            await Task.Delay(25);
+
+        Assert.True(svc.IsDeferredForTest(newItem.Id));
         Assert.Equal(0, pickupCount);
 
         // Simulate the rolling window advancing: age the blocking item out of the window.
         await _store.UpdateAsync(blocking with { StartedAt = DateTimeOffset.UtcNow.AddHours(-2) });
-
-        // Re-enqueue the deferred item (simulating ScheduleDeferredRequeue completing).
-        await queue.EnqueueAsync(newItem.Id);
 
         // Now the cap is not reached — the item should be picked up.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(10);

@@ -288,7 +288,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
                     worker.WorkerId, item.Id,
                     $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}) after {sinceProgressSeconds}s without progress",
-                    wakeDispatcher: true,
                     ct);
             }
 
@@ -356,7 +355,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
                 worker.WorkerId, item.Id,
                 $"watchdog: no progress for {sinceProgressSeconds}s in state {item.State}",
-                wakeDispatcher: true,
                 ct);
         }
 
@@ -469,7 +467,6 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             await _slotReleaser.TryReleaseRecoveredWorkerSlotAsync(
                 worker.WorkerId, item.Id,
                 $"watchdog: parking item after {sinceProgressSeconds}s without progress (auto-recover disabled)",
-                wakeDispatcher: true,
                 ct);
         }
 

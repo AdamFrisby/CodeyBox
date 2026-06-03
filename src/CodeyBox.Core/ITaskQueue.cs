@@ -1,20 +1,5 @@
 namespace CodeyBox.Core;
 
-public enum TaskQueueDispatchKind
-{
-    WorkItem,
-    GenericWake,
-}
-
-public readonly record struct TaskQueueDispatch(TaskQueueDispatchKind Kind, WorkItemId? WorkItemId)
-{
-    public static TaskQueueDispatch ForWorkItem(WorkItemId id) =>
-        new(TaskQueueDispatchKind.WorkItem, id);
-
-    public static TaskQueueDispatch GenericWake { get; } =
-        new(TaskQueueDispatchKind.GenericWake, null);
-}
-
 /// <summary>
 /// In-process dispatch notification stream. The durable work item store is the
 /// source of truth for queued work; this queue wakes the dispatcher when a row
@@ -37,10 +22,11 @@ public interface ITaskQueue
     ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default);
 
     /// <summary>
-    /// Awaits the next dispatch kick, preserving whether it is item-specific or
-    /// a generic rescan wake. Returns null when the stream is closed.
+    /// Awaits the next dispatch kick. Returns false when the stream is closed.
+    /// The durable store remains the source of truth for which item to pick.
     /// </summary>
-    ValueTask<TaskQueueDispatch?> DequeueDispatchAsync(CancellationToken ct = default);
+    async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        => await DequeueAsync(ct) is not null;
 
     /// <summary>
     /// Number of buffered dispatch kicks, not the durable queued work-item count.
