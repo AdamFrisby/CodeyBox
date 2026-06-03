@@ -994,8 +994,7 @@ public sealed class RequiredBuildGateTests : IDisposable
             maxAuditIterations: 1,
             requiredBuildVerifier: verifier);
 
-        var item = NewItem("feature/audit-passed-resume-verify-unavailable")
-            with { State = WorkItemState.AuditPassed };
+        var item = NewItem("feature/audit-passed-resume-verify-unavailable") with { State = WorkItemState.AuditPassed };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         await CommitToBareBranchAsync(
             tp.GitHost.GetRepoPath(repoId),
