@@ -15,7 +15,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
 {
-    // Flipped by PauseDispatch() — the SandboxSuspendOnShutdownService calls it
+    // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
     // VMs, so the dispatch loop stops picking up new items and creating new
     // sandboxes that would race the snapshot. In-flight workers continue to
@@ -512,8 +512,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         while (!stoppingToken.IsCancellationRequested)
         {
             // Shutdown dispatch gate (R8.1 fix for VM-wedging incident
-            // 2026-05-29): the suspend-on-shutdown handler calls PauseDispatch()
-            // BEFORE it snapshots SnapshotSuspendableActive(), so once the flag
+            // 2026-05-29): the shutdown teardown handler calls PauseDispatch()
+            // BEFORE it snapshots SnapshotActiveSandboxes(), so once the flag
             // is set the dispatch loop MUST stop picking up new work and
             // creating new sandboxes that would race the snapshot — those
             // would otherwise be left mid-launch when the BackgroundService
@@ -577,7 +577,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // were blocked on the concurrency gate. Without this check, one
             // final worker could be spawned after dispatch was paused (the
             // very race this gate exists to close — that final sandbox would
-            // miss the SnapshotSuspendableActive snapshot and be torn down
+            // miss the SnapshotActiveSandboxes snapshot and be torn down
             // uncleanly when the BackgroundService cancellation token fires).
             if (IsDispatchPaused)
             {
@@ -816,7 +816,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
                 continue;
 
-            var recovered = TryBuildRecoveredState(item);
+            var recovered = await TryBuildRecoveredStateAsync(item, ct);
             if (recovered is not null)
             {
                 if (recovered.State == WorkItemState.AbandonedAfterRecoveryAttempts)
@@ -832,6 +832,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     await _store.UpdateAsync(recovered, ct);
                     _log.LogWarning(
                         "Work item {Id} was left Working without a preempt checkpoint; marked Failed as a crash case",
+                        item.Id);
+                }
+                else if (recovered.State == WorkItemState.Done)
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    await CheckAndActFollowupRecovery.EnqueueExistingFollowupIfActionableAsync(
+                        _store, _queue, item, ct);
+                    _log.LogInformation(
+                        "Work item {Id} check-and-act verdict was already persisted; completed startup recovery without replaying the check",
                         item.Id);
                 }
                 else
@@ -855,6 +864,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
         }
+    }
+
+    private async Task<WorkItem?> TryBuildRecoveredStateAsync(WorkItem item, CancellationToken ct)
+    {
+        if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var completed = await CheckAndActFollowupRecovery.TryBuildCompletedFromPersistedVerdictAsync(
+                _store, item, ct);
+            if (completed is not null)
+                return completed;
+        }
+
+        return TryBuildRecoveredState(item);
     }
 
     private async Task HeartbeatLoopAsync(string workerId, string currentWorkItemId, TimeSpan interval, CancellationToken ct)
@@ -909,6 +931,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
+        }
+
+        if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var checkAttempts = item.RecoveryAttempts + 1;
+            if (_opts.MaxRecoveryAttempts > 0 && checkAttempts > _opts.MaxRecoveryAttempts)
+            {
+                return item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                    RecoveryAttempts = checkAttempts,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                };
+            }
+
+            return WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempts);
         }
 
         if (item.State == WorkItemState.Working)

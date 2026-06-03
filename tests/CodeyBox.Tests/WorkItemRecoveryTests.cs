@@ -70,6 +70,119 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task CheckAndActWorkingWithoutPreempt_RequeuesForFreshCheck()
+    {
+        var item = Item(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator();
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+        Assert.Null(recovered.LastError);
+    }
+
+    [Fact]
+    public async Task CheckAndActWorkingWithPersistedVerdict_CompletesAndEnqueuesExistingFollowup()
+    {
+        var check = Item(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+            Verdict = new CheckVerdict
+            {
+                Answer = true,
+                Evidence = "actionable",
+            },
+            LastError = "stale worker exit",
+        };
+        var followup = Item(WorkItemState.Queued) with
+        {
+            JobType = JobType.Normal,
+            OriginCheckWorkItemId = check.Id,
+            // The startup state map is built before the check is recovered from
+            // Working to Done, so the follow-up's own Queued replay path will
+            // still see this dependency as unsatisfied. The enqueue below must
+            // come from the recovered.State == Done branch.
+            DependsOn = [check.Id],
+        };
+        await _store.CreateAsync(check);
+        await _store.CreateAsync(followup);
+
+        var queue = new InMemoryTaskQueue();
+        var svc = new OrchestratorService(queue, _store, new FakePipelineRunner(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, recovered!.State);
+        Assert.Equal(0, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+        Assert.Null(recovered.LastError);
+
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(followup.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CheckAndActWorkingWithoutPreempt_AtRecoveryCap_TransitionsToAbandoned()
+    {
+        var item = Item(WorkItemState.Working, recoveryAttempts: 2) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator(maxRecovery: 2);
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Contains("2 recovery attempts", recovered.LastError);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
     public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
     {
         var item = Item(WorkItemState.Working) with

@@ -10,7 +10,7 @@ namespace CodeyBox.Tests;
 /// Unit coverage for the two R8-core helpers in <see cref="PipelineRunner"/>
 /// that compute the in-VM agent log path and persist it on the work item
 /// before the agent runs. The persisted value is the contract the
-/// suspend-on-shutdown handler reads back; corrupting it silently breaks
+/// shutdown teardown handler reads back; corrupting it silently breaks
 /// re-tail across a restart.
 /// </summary>
 public sealed class AgentLogPathHelpersTests : IDisposable
@@ -158,7 +158,7 @@ public sealed class AgentLogPathHelpersTests : IDisposable
     {
         // Any non-cancellation store exception must NOT bubble out so a
         // transient SQLite hiccup cannot block the agent invocation. The
-        // worst-case outcome is the suspend-on-shutdown handler missing the
+        // worst-case outcome is the shutdown teardown handler missing the
         // path and the item recovering through the stranded-item sweep.
         var throwingStore = new ThrowOnUpdateStore();
 

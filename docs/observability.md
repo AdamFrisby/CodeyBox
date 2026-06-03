@@ -140,7 +140,7 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.work_item.active` | `{work_item}` | `state` | Work items currently persisted in each state (refreshed on a 15 s background cadence so the collection thread never blocks on SQLite). |
 | `codeybox.workers.in_use` | `{worker}` | — | Worker slots currently occupied by an in-flight pipeline run. |
 | `codeybox.workers.max` | `{worker}` | — | Configured `MaxConcurrentWorkers` ceiling. |
-| `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking. Suspend-capable providers (e.g. Multipass) report from `ISuspendingSandboxProvider.SnapshotSuspendableActive()`; ephemeral providers (process, bubblewrap) report in-flight created-but-not-disposed sandboxes via the process-wide `SandboxLiveCounter`. |
+| `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking. Providers that expose lifecycle-aware active sandboxes report from `IActiveSandboxProvider.SnapshotActiveSandboxes()`; ephemeral providers (process, bubblewrap) report in-flight created-but-not-disposed sandboxes via the process-wide `SandboxLiveCounter`. |
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.

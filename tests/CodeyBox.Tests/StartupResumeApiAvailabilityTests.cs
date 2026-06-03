@@ -348,7 +348,7 @@ public sealed class StartupResumeApiAvailabilityTests
         }
     }
 
-    private sealed class StartupResumeProvider : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class StartupResumeProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         private readonly string _behavior;
         private readonly TaskCompletionSource _never = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -386,7 +386,7 @@ public sealed class StartupResumeApiAvailabilityTests
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() => [];
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() => [];
 
         public Task ResumeSandboxAsync(string name, CancellationToken ct)
         {

@@ -61,7 +61,7 @@ Hot-reloadable today:
   retention at startup though, so log-file retention continues to require a
   restart.
 - `Shutdown.SandboxTeardownMode` — re-read when graceful shutdown teardown
-  begins. Operators can switch from `Suspend` to `Stop` or `Dispose` before
+  begins. Operators can switch between `Stop`, `Suspend`, and `Dispose` before
   stopping the process, and that shutdown uses the updated mode.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
@@ -85,8 +85,9 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   at startup.
 - `SandboxImageReference`, `AgentAllowedHosts`, `AuditToolAllowedHosts`,
   `UpstreamPushMaxAttempts`, `UpstreamPushBackoffSeconds`, `Shutdown.GraceSeconds`,
-  `PhaseAbsoluteTimeoutMultiplier` — bound into `PipelineOptions` and consumed
-  by `PipelineRunner` / `ReleaseService` constructors.
+  `PhaseAbsoluteTimeoutMultiplier` — bound into
+  startup services and consumed by `PipelineRunner` / `ReleaseService` /
+  shutdown-service constructors.
 - `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
   `OrchestratorOptions` and the worker-pool plumbing at startup.
 - `QuotaRouter.*` — `QuotaRouterOptions` and the per-probe `QuotaCacheTtl` are
@@ -130,6 +131,7 @@ startup); we add explicit guards as we tighten the contract.
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |
+| `Shutdown.SandboxTeardownMode` | enum | `Stop` | Graceful-shutdown sandbox teardown mode: `Stop` cleanly stops and preserves the VM without a RAM snapshot; `Suspend` preserves RAM state via `multipass suspend` and is opt-in; `Dispose` purges the VM. |
 | `PhaseAbsoluteTimeoutMultiplier` | number | `3.0` | Multiplier applied to a phase's per-attempt timeout to bound fallback chains. Work/rework attempts each get the full `WorkTimeout`; merge attempts each get the full `MergeTimeout`; the whole fallback chain is capped at this multiplier times that per-attempt timeout. |
 
 ---
@@ -163,7 +165,7 @@ that were suspended by the previous process.
   "SandboxResumeMode": "Background",
   "SandboxResumeTimeout": "00:10:00",
   "SandboxAdoptionDeadlineSeconds": 1800,
-  "SandboxTeardownMode": "Suspend"
+  "SandboxTeardownMode": "Stop"
 }
 ```
 
@@ -173,7 +175,7 @@ that were suspended by the previous process.
 | `SandboxResumeMode` | `Background` | `Background` starts the HTTP listener before resuming suspended sandboxes. `Blocking` preserves startup-blocking behavior but still applies `SandboxResumeTimeout` per VM. |
 | `SandboxResumeTimeout` | `00:10:00` | Caller-side cap for each persisted VM resume call. On timeout, suspend bookkeeping is cleared and normal recovery/leak handling proceeds. |
 | `SandboxAdoptionDeadlineSeconds` | `1800` | Max wait for an adopted in-VM agent to finish after its VM resumes. |
-| `SandboxTeardownMode` | `Suspend` | `Suspend`, `Stop`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. |
+| `SandboxTeardownMode` | `Stop` | `Stop`, `Suspend`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. `Suspend` is opt-in because it writes a RAM snapshot. |
 
 ---
 

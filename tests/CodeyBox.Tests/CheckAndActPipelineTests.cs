@@ -82,6 +82,109 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task YesVerdict_ExistingOriginFollowup_IsReusedInsteadOfDuplicated()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "src/Foo.cs still needs remediation", "high"));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for SQL injection",
+            Prompt = "evaluate the repo",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-idempotent",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Fix it",
+                    Prompt = "remediate",
+                },
+            },
+        };
+        var existingFollowup = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = check.ProjectId,
+            Title = "Fix it",
+            Prompt = "remediate",
+            BaseBranch = check.BaseBranch,
+            PushUpstream = check.PushUpstream,
+            OriginCheckWorkItemId = check.Id,
+            JobType = JobType.Normal,
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Store.CreateAsync(existingFollowup);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followups = allItems.Where(i => i.OriginCheckWorkItemId == check.Id).ToList();
+        var followup = Assert.Single(followups);
+        Assert.Equal(existingFollowup.Id, followup.Id);
+    }
+
+    [Fact]
+    public async Task YesVerdict_RacingDuplicateOriginCreate_ReusesExistingFollowup()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        RacingFollowupCreateStore? racingStore = null;
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            workItemStoreDecorator: store => racingStore = new RacingFollowupCreateStore(store));
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "src/Foo.cs still needs remediation", "high"));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for SQL injection",
+            Prompt = "evaluate the repo",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-race",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Fix it",
+                    Prompt = "remediate",
+                },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(racingStore?.RacedFollowupId);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+        Assert.Equal(racingStore!.RacedFollowupId, followup.Id);
+        Assert.Equal(1, tp.Queue.Count);
+    }
+
+    [Fact]
     public async Task NoVerdict_NoFollowupEnqueued_VerdictRecorded_CheckDone()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -571,6 +674,9 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Contains(depByExternalId.Id, followup.DependsOn);
         Assert.DoesNotContain(followup.DependsOn,
             id => id != depByGuid.Id && id != depByExternalId.Id);
+        // Both resolved dependencies are still Queued, so the follow-up must
+        // be persisted without being kicked onto the dispatch queue.
+        Assert.Equal(0, tp.Queue.Count);
     }
 
     [Fact]
@@ -1008,6 +1114,63 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var ans = answer ? "true" : "false";
         var confSegment = confidence is null ? "" : $", \"confidence\": \"{confidence}\"";
         return $"some preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\"{confSegment}}}\n{CheckAndActPipeline.EndSentinel}\n";
+    }
+
+    private sealed class RacingFollowupCreateStore : IWorkItemStore
+    {
+        private readonly SqliteWorkItemStore _inner;
+        private int _hasRaced;
+
+        public RacingFollowupCreateStore(SqliteWorkItemStore inner)
+        {
+            _inner = inner;
+        }
+
+        public WorkItemId? RacedFollowupId { get; private set; }
+
+        public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
+        {
+            if (item.OriginCheckWorkItemId is not null && Interlocked.Exchange(ref _hasRaced, 1) == 0)
+            {
+                var raced = item with
+                {
+                    Id = WorkItemId.New(),
+                    Title = item.Title + " (race winner)",
+                };
+                RacedFollowupId = raced.Id;
+                await _inner.CreateAsync(raced, ct);
+            }
+
+            await _inner.CreateAsync(item, ct);
+        }
+
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) => _inner.UpdateAsync(item, ct);
+        public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+        public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => _inner.GetAsync(id, ct);
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => _inner.ListAsync(ct);
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.ListByStateAsync(state, ct);
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.CountByStateAsync(state, ct);
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => _inner.ReorderAsync(orderedIds, ct);
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+        public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) => _inner.CountStartedInWindowAsync(projectId, since, ct);
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) => _inner.CountInFlightAsync(projectId, ct);
+        public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) => _inner.GetByExternalIdAsync(projectId, externalId, ct);
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) => _inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+        public Task<WorkItem?> ReplaceExternalIdsAsync(WorkItemId id, IReadOnlyDictionary<string, string> externalIds, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) => _inner.GetFleetStateCountsAsync(ct);
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) => _inner.GetFleetRecentOutcomesAsync(perProject, ct);
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) => _inner.GetFleetPauseStatesAsync(ct);
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) => _inner.ListByReplaySourceAsync(sourceId, ct);
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) => _inner.ListSuspendedAsync(ct);
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) => _inner.GetActiveBaselineImageRefsAsync(ct);
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(string baselineImageRef, CancellationToken ct = default) => _inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) => _inner.OrphanReplaysAsync(sourceId, ct);
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) => _inner.ListByReleaseAsync(releaseId, ct);
+        public Task<PromptReplaceResult> TryReplacePromptAsync(WorkItemId id, string newPrompt, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+        public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => _inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => _inner.GetIterationsAsync(workItemId, ct);
     }
 
     private sealed class RecordingInVmSmokeGate : IInVmSmokeGate

@@ -2137,52 +2137,46 @@ public sealed class PipelineRunner : IPipelineRunner
             if (streamCapture is not null)
                 await streamCapture.DisposeAsync();
 
-            // R8-core: if SandboxSuspendOnShutdownService already took ownership
+            // R8-core: if SandboxShutdownTeardownService already took ownership
             // of this VM during IHostedLifecycleService.StoppingAsync (which runs
             // and completes BEFORE BackgroundService cancellation flows down as
-            // hostShutdownToken), the agent process is paused (or being paused)
-            // mid-call and the VM cannot service `git add/commit/push`. The
-            // legacy preempt-checkpoint flow would block on the frozen VM until
-            // the host's shutdown grace expires. Skip both the checkpoint and
-            // the StopAndPreserveAsync so SandboxResumeOnStartupService takes
-            // over on the next boot.
+            // hostShutdownToken), either Suspend is preserving the frozen VM for
+            // SandboxResumeOnStartupService or Dispose is destroying the VM. The
+            // preempt-checkpoint flow would block on a frozen VM or fault against
+            // a deleted VM. Skip both the checkpoint and StopAndPreserveAsync in
+            // those lifecycle-owned cases.
             //
-            // The signal is "did the suspend handler take ownership of this
-            // VM", NOT just ISuspendableSandbox.IsSuspended: the handler
-            // persists SuspendedVmName BEFORE awaiting multipass suspend, and
-            // on a per-VM suspend timeout it returns with the mapping still
+            // The signal is "did the shutdown teardown handler take ownership
+            // of this VM", NOT just ISuspendableSandbox.IsSuspended: the handler
+            // persists SuspendedVmName BEFORE awaiting multipass suspend, and on
+            // a per-VM suspend timeout it returns with the mapping still
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let
             // the legacy git-checkpoint + multipass-stop path race that
-            // in-flight suspend. For Stop / Dispose teardown modes the handler
-            // explicitly calls MarkOwnedByShutdownHandler() on the sandbox
-            // BEFORE tearing the VM down — without that signal PipelineRunner
-            // would run git add/commit/push inside an already-stopped /
-            // already-disposed VM, the in-VM exec would fail, and the work
-            // item would be left Working with no PreemptCheckpoint (the next
-            // boot's DeadWorkerReaper would then mark it Failed). We re-read
-            // the store under CancellationToken.None (ct is already cancelled
-            // by host shutdown): on the per-VM suspend-timeout path the
-            // handler has persisted SuspendedVmName and returned while
-            // multipassd is still writing the snapshot and IsSuspended /
-            // IsOwnedByShutdownHandler may still be false on the sandbox
-            // instance, so the persisted mapping is the authoritative late
-            // signal.
-            if (sandbox is ISuspendableSandbox suspendable)
+            // in-flight suspend. Dispose mode sets the ownership flag before
+            // destroying the VM because in-VM checkpoint commands would fault
+            // after lifecycle teardown. Stop mode sets the flag only after a
+            // successful stop/preserve, and only for items whose state can
+            // recover without PipelineRunner creating a new preempt checkpoint.
+            // We re-read the store under CancellationToken.None (ct is already
+            // cancelled by host shutdown): on the per-VM suspend-timeout path the handler has
+            // persisted SuspendedVmName and returned while multipassd is still
+            // writing the snapshot and IsSuspended / IsOwnedByShutdownHandler may
+            // still be false on the sandbox instance, so the persisted mapping is
+            // the authoritative late signal.
+            var lifecycleHandled = sandbox is IShutdownTeardownSandbox teardownSandbox
+                && teardownSandbox.IsOwnedByShutdownHandler;
+            if (!lifecycleHandled)
             {
-                var suspendHandled = suspendable.IsOwnedByShutdownHandler;
-                if (!suspendHandled)
-                {
-                    var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
-                    suspendHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
-                }
-                if (suspendHandled)
-                {
-                    _log.LogInformation(
-                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen / stopped / disposed VM",
-                        item.Id, sandbox.Id);
-                    throw;
-                }
+                var persisted = await _store.GetAsync(item.Id, CancellationToken.None);
+                lifecycleHandled = !string.IsNullOrEmpty(persisted?.SuspendedVmName);
+            }
+            if (lifecycleHandled)
+            {
+                _log.LogInformation(
+                    "Work item {Id}: sandbox {SandboxId} was taken over by SandboxShutdownTeardownService; skipping preempt-checkpoint and preserve to avoid racing the frozen, stopped, or disposed VM",
+                    item.Id, sandbox.Id);
+                throw;
             }
 
             Exception? checkpointFailure = null;
@@ -2204,6 +2198,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 _log.LogError(ex, "Preempt checkpoint failed for work item {Id}; preserving sandbox for operator recovery", item.Id);
             }
 
+            Exception? preserveFailure = null;
             if (sandbox is IPreemptibleSandbox preemptible)
             {
                 using var preserveCts = new CancellationTokenSource(_opts.SandboxPreserveDrain);
@@ -2211,16 +2206,26 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     await preemptible.StopAndPreserveAsync(preserveCts.Token);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
+                    preserveFailure = ex;
                     _log.LogWarning(
                         "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
                         sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
+                }
+                catch (Exception ex)
+                {
+                    preserveFailure = ex;
+                    _log.LogWarning(ex,
+                        "Failed preserving sandbox {SandboxId} for work item {Id} during host shutdown; leaving the checkpointed item recoverable and the VM for operator cleanup",
+                        sandbox.Id, item.Id);
                 }
             }
 
             if (checkpointFailure is not null)
                 throw new OperationCanceledException("Host shutdown interrupted work, but the preempt checkpoint could not be created.", checkpointFailure, hostShutdownToken);
+            if (preserveFailure is not null)
+                throw new OperationCanceledException("Host shutdown interrupted work and created a preempt checkpoint, but preserving the sandbox failed.", preserveFailure, hostShutdownToken);
 
             throw;
         }
@@ -2636,6 +2641,16 @@ public sealed class PipelineRunner : IPipelineRunner
     private async Task EnqueueOnYesFollowupAsync(
         WorkItem checkItem, Project project, OnYesActionSpec onYes, CancellationToken ct)
     {
+        var existing = await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, checkItem.Id, ct);
+        if (existing is not null)
+        {
+            await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, existing, ct);
+            _log.LogInformation(
+                "Work item {Id} already has check-and-act follow-up {FollowupId}; not creating a duplicate",
+                checkItem.Id, existing.Id);
+            return;
+        }
+
         var newId = WorkItemId.New();
         var dependsOn = await ResolveOnYesDependsOnAsync(checkItem.ProjectId, onYes.DependsOn ?? [], ct);
         AgentKind? agentOverride = string.IsNullOrWhiteSpace(onYes.Agent) ? null : new AgentKind(onYes.Agent.Trim());
@@ -2661,20 +2676,29 @@ public sealed class PipelineRunner : IPipelineRunner
             JobType = JobType.Normal,
         };
 
-        await _store.CreateAsync(followup, ct);
+        try
+        {
+            await _store.CreateAsync(followup, ct);
+        }
+        catch (WorkItemOriginCheckConflictException)
+        {
+            existing = await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, checkItem.Id, ct);
+            if (existing is null)
+                throw;
+
+            await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, existing, ct);
+            _log.LogInformation(
+                "Work item {Id} lost a race creating check-and-act follow-up {FollowupId}; reusing the existing follow-up",
+                checkItem.Id, existing.Id);
+            return;
+        }
+
         AuditLog.WorkItemCreated(followup.Id, followup.ProjectId, followup.Title);
 
         // Enqueue iff all (zero-or-more) dependencies are already satisfied.
         // Same posture as POST /workitems: unsatisfied deps mean we persist
         // Queued but defer enqueue until they reach Done.
-        var depStates = new Dictionary<WorkItemId, WorkItemState>();
-        foreach (var depId in followup.DependsOn)
-        {
-            var dep = await _store.GetAsync(depId, ct);
-            if (dep is not null) depStates[depId] = dep.State;
-        }
-        if (_taskQueue is not null && WorkItemDependencies.AreSatisfied(followup.DependsOn, depStates))
-            await _taskQueue.EnqueueAsync(followup.Id, ct);
+        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, followup, ct);
 
         await _webhooks.PublishAsync(new WebhookEvent
         {
@@ -4455,7 +4479,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
-        // mid-invocation the suspend-on-shutdown handler reads AgentLogPath out
+        // mid-invocation the shutdown teardown handler reads AgentLogPath out
         // of the store and the startup resume handler re-tails the same file on
         // the resumed VM. Path is keyed by (workItemId, phase, iteration) so
         // a single work item can have its work / audit-rework / merge / conflict-
@@ -5146,7 +5170,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Persists <paramref name="agentLogPath"/> on <paramref name="id"/> BEFORE
-    /// the agent runs so a SIGTERM mid-invocation lets the suspend-on-shutdown
+    /// the agent runs so a SIGTERM mid-invocation lets the shutdown teardown
     /// handler read the path out of the store. Re-reads the latest row so we
     /// do not regress a concurrent update from another worker thread on the
     /// same item (priority bump, prompt edit, etc).
@@ -5183,7 +5207,7 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Best-effort: a store hiccup here must not block the agent
-            // invocation. Worst-case, the suspend-on-shutdown handler does not
+            // invocation. Worst-case, the shutdown teardown handler does not
             // see AgentLogPath and the startup resume handler falls back to
             // the standard stranded-item recovery path.
             log.LogWarning(ex, "Failed to persist agent log path for {WorkItemId}", id);

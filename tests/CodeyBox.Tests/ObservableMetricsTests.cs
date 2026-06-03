@@ -10,6 +10,7 @@ namespace CodeyBox.Tests;
 /// gauges that poll live store/process state. Uses a real SQLite store and the
 /// built-in MeterListener so no OTel SDK or collector is required.
 /// </summary>
+[Collection("Observable metrics")]
 public sealed class ObservableMetricsTests : IDisposable
 {
     private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"cb-obs-metrics-{Guid.NewGuid():N}.db");
@@ -90,17 +91,18 @@ public sealed class ObservableMetricsTests : IDisposable
     [Fact]
     public async Task SandboxActiveGauge_ReportsSandboxLiveCounter_ForEphemeralProvider()
     {
-        // Non-suspending provider (process/bubblewrap fallback path) is expected
+        // Non-active-lifecycle provider (process/bubblewrap fallback path) is expected
         // to surface SandboxLiveCounter.Active. Without this assertion, a
-        // regression that always took the suspendable branch — or skipped the
+        // regression that always took the active-provider branch — or skipped the
         // Increment/Decrement calls in the ephemeral providers — would still
-        // pass SandboxActiveGauge_ReportsSuspendableCount.
+        // pass SandboxActiveGauge_ReportsActiveProviderCount.
         var store = new SqliteWorkItemStore(_dbPath);
 
         // The live counter is intentionally process-wide, and other tests may
-        // have ephemeral sandboxes alive at the same time. Use a large local
-        // contribution so this test proves the gauge is reading the counter
-        // without assuming exclusive ownership of the static value.
+        // have ephemeral sandboxes alive at the same time or leave a non-zero
+        // baseline. Use a large local contribution so this test proves the
+        // gauge is reading the counter without assuming exclusive ownership of
+        // the static value.
         const int localContribution = 1_000;
         for (var i = 0; i < localContribution; i++)
             SandboxLiveCounter.Increment();
@@ -141,12 +143,12 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
-    public async Task SandboxActiveGauge_ReportsSuspendableCount()
+    public async Task SandboxActiveGauge_ReportsActiveProviderCount()
     {
         var store = new SqliteWorkItemStore(_dbPath);
         using var svc = new CodeyBoxObservableMetrics(
             store,
-            new FakeSuspendingProvider(2),
+            new FakeActiveProvider(2),
             new OrchestratorOptions { MaxConcurrentWorkers = 4 },
             NullLogger<CodeyBoxObservableMetrics>.Instance,
             workerPool: new FakeWorkerPool(0),
@@ -270,7 +272,7 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendingProvider(int active) : ISandboxProvider, ISuspendingSandboxProvider
+    private sealed class FakeActiveProvider(int active) : ISandboxProvider, IActiveSandboxProvider
     {
         public string Name => "fake-vm";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
@@ -279,20 +281,17 @@ public sealed class ObservableMetricsTests : IDisposable
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
-        public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive() =>
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
             Enumerable.Range(0, active)
-                .Select(_ => (new WorkItemId(Guid.NewGuid()), (ISuspendableSandbox)new FakeSuspendable()))
+                .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeActiveSandbox()))
                 .ToList();
-
-        public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendable : ISuspendableSandbox
+    private sealed class FakeActiveSandbox : IShutdownTeardownSandbox
     {
         public string Id => "fake";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             throw new NotSupportedException();
-        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
@@ -347,4 +346,9 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task RecordIterationDispatchAsync(WorkItemId workItemId, int iteration, int promptRevisionAtDispatch, DateTimeOffset dispatchedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) => throw new NotSupportedException();
     }
+}
+
+[CollectionDefinition("Observable metrics", DisableParallelization = true)]
+public sealed class ObservableMetricsCollection
+{
 }

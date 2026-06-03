@@ -133,6 +133,33 @@ public interface IPreemptibleSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional sandbox capability for live sandboxes that participate in the
+/// orchestrator's graceful shutdown teardown sweep. The marker lets the normal
+/// phase runner detect that shutdown teardown has already become authoritative
+/// for this sandbox and must not race it with in-VM preempt-checkpoint commands.
+/// </summary>
+public interface IShutdownTeardownSandbox : ISandbox
+{
+    /// <summary>
+    /// True once the shutdown teardown handler has taken ownership of this
+    /// sandbox via Suspend (RAM frozen), successful Stop (preserved), or Dispose
+    /// (delete --purge). PipelineRunner reads this in its host-shutdown OCE
+    /// catch block to short-circuit the in-VM preempt-checkpoint flow when that
+    /// flow would hang against a frozen/stopped sandbox or fault against a
+    /// deleted sandbox.
+    /// </summary>
+    bool IsOwnedByShutdownHandler => false;
+
+    /// <summary>
+    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
+    /// <c>SandboxShutdownTeardownService</c> when lifecycle teardown has safely
+    /// become authoritative. Default no-op: fakes that don't track teardown
+    /// ownership keep <see cref="IsOwnedByShutdownHandler"/> false.
+    /// </summary>
+    void MarkOwnedByShutdownHandler() { }
+}
+
+/// <summary>
 /// Optional sandbox capability for providers that can freeze a running sandbox
 /// (including its RAM state) and resume it later via
 /// <see cref="ISuspendingSandboxProvider.ResumeSandboxAsync"/>. Currently
@@ -167,32 +194,8 @@ public interface ISuspendableSandbox : ISandbox
     bool IsSuspended => false;
 
     /// <summary>
-    /// True once the suspend-on-shutdown handler has taken ownership of this
-    /// VM's teardown — via Suspend (RAM frozen), Stop (clean shutdown), or
-    /// Dispose (delete --purge). PipelineRunner reads this in its host-shutdown
-    /// OCE catch block to short-circuit the legacy in-VM preempt-checkpoint flow:
-    /// the git add/commit/push inside the VM would hang (Suspend), fail (Stop
-    /// — the VM is no longer running the agent), or fault (Dispose — the VM
-    /// is gone), in any case stalling or breaking the orchestrator exit while
-    /// also leaving the work item Working without a checkpoint. Suspend mode
-    /// flips this implicitly via <see cref="IsSuspended"/>; Stop and Dispose
-    /// modes call <see cref="MarkOwnedByShutdownHandler"/>.
-    /// </summary>
-    bool IsOwnedByShutdownHandler => IsSuspended;
-
-    /// <summary>
-    /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
-    /// <c>SandboxSuspendOnShutdownService</c> immediately before non-Suspend
-    /// teardown modes begin so PipelineRunner sees the "skip checkpoint" signal
-    /// even though the suspend path was not taken. Default no-op: fakes that
-    /// don't track teardown ownership keep <see cref="IsOwnedByShutdownHandler"/>
-    /// at the <see cref="IsSuspended"/> fallback.
-    /// </summary>
-    void MarkOwnedByShutdownHandler() { }
-
-    /// <summary>
     /// Best-effort RAM size of this sandbox in bytes, or null when the provider
-    /// cannot report it. The suspend-on-shutdown handler scales the per-VM
+    /// cannot report it. The shutdown teardown handler scales the per-VM
     /// suspend timeout by this value: <c>multipass suspend</c> writes the whole
     /// RAM image to disk, so a 12 GiB VM under load legitimately takes far longer
     /// than a 1 GiB idle one. Null falls back to the flat floor timeout.
@@ -203,7 +206,7 @@ public interface ISuspendableSandbox : ISandbox
 /// <summary>
 /// Shared policy for how long a RAM-snapshot suspend is allowed to take, scaled
 /// by VM RAM size. Centralised so the shutdown suspend handler's per-VM timeout
-/// (<see cref="CodeyBox.Orchestrator.SandboxSuspendOnShutdownService"/>), the
+/// (<see cref="CodeyBox.Orchestrator.SandboxShutdownTeardownService"/>), the
 /// startup resume wait (how long to wait out a still-freezing VM before
 /// <c>multipass start</c>), and the host shutdown grace all derive from one
 /// formula and cannot drift apart. <c>multipass suspend</c> writes the whole RAM
@@ -253,7 +256,7 @@ public static class SuspendTimeoutPolicy
 
     /// <summary>
     /// Host-shutdown ceiling (<c>HostOptions.ShutdownTimeout</c>) that must cover
-    /// the worst-case suspend drain, not just a single VM. The suspend-on-shutdown
+    /// the worst-case suspend drain, not just a single VM. The shutdown teardown
     /// handler fans suspends out through a semaphore capped at
     /// <paramref name="maxParallelSuspends"/> and awaits all of them, so with up to
     /// <paramref name="maxConcurrentSandboxes"/> in-flight VMs the drain runs
@@ -280,28 +283,29 @@ public static class SuspendTimeoutPolicy
     }
 
     /// <summary>
-    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Providers
-    /// that suspend on shutdown must not have a healthy RAM snapshot truncated by
-    /// a SIGKILL, so when <paramref name="providerSuspendsOnShutdown"/> is set the
-    /// ceiling is the worst-case suspend drain
+    /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Deployments
+    /// with a suspend-capable provider reserve enough room for a future
+    /// hot-reload to Suspend mode; otherwise a healthy RAM snapshot could be
+    /// truncated by SIGKILL. When <paramref name="providerSupportsSuspend"/> is set,
+    /// the ceiling is the worst-case suspend drain
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
     /// per-VM budget) STACKED ON TOP OF the requested <paramref name="grace"/>.
-    /// The two windows are sequential, not overlapping: suspend-on-shutdown runs
+    /// The two windows are sequential, not overlapping: shutdown teardown runs
     /// in <c>IHostedLifecycleService.StoppingAsync</c> (before BackgroundService
     /// cancellation), and the preempt-checkpoint / listener-drain window still
     /// needs the full <paramref name="grace"/> AFTERWARD. Taking the max of the
     /// two would let a suspend that consumes its whole reserve leave zero room for
     /// the post-suspend drain, so the host could SIGKILL the process while
-    /// PipelineRunner is still shutting down. Providers that don't suspend keep the
-    /// tighter <paramref name="grace"/> alone.
+    /// PipelineRunner is still shutting down. Providers that cannot suspend keep
+    /// the tighter <paramref name="grace"/> alone.
     ///
-    /// <para>This is deliberately capability-driven, not provider-name-driven:
-    /// the caller passes whether the configured provider implements
-    /// <see cref="ISuspendingSandboxProvider"/> (i.e. participates in
-    /// suspend-on-shutdown). Core therefore stays provider-agnostic — a new
-    /// suspend-capable backend raises the ceiling automatically without adding
-    /// another magic string here.</para>
+    /// <para>This is deliberately mode-and-capability-driven, not
+    /// provider-name-driven: the caller folds together whether the configured
+    /// provider implements <see cref="ISuspendingSandboxProvider"/> and whether
+    /// the selected or hot-reloadable shutdown path can suspend. Core therefore
+    /// stays provider-agnostic — a new suspend-capable backend can raise the
+    /// ceiling without adding another magic string here.</para>
     ///
     /// <para>Lives on the Core policy (rather than on the orchestrator suspend
     /// handler) so the API composition root can size the ceiling without
@@ -309,19 +313,19 @@ public static class SuspendTimeoutPolicy
     /// and the max() logic stay co-located with the suspend/resume budget
     /// formula they must agree with.</para>
     /// </summary>
-    /// <param name="providerSuspendsOnShutdown">True when the configured provider implements <see cref="ISuspendingSandboxProvider"/> and so freezes VMs on shutdown.</param>
+    /// <param name="providerSupportsSuspend">True when the host must reserve suspend budget because the provider can suspend and the shutdown mode can hot-reload to Suspend.</param>
     /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
     /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
     /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
     /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
     public static TimeSpan ResolveHostShutdownTimeout(
-        bool providerSuspendsOnShutdown,
+        bool providerSupportsSuspend,
         TimeSpan grace,
         int maxConcurrentSandboxes,
         int maxParallelSuspends = DefaultMaxParallelSuspends,
         long? maxVmMemoryBytes = null)
     {
-        if (!providerSuspendsOnShutdown)
+        if (!providerSupportsSuspend)
             return grace;
         var reserve = HostShutdownReserve(
             maxConcurrentSandboxes,
@@ -355,33 +359,41 @@ public interface IShutdownDispatchGate
     /// Stop accepting new work for dispatch. Idempotent. Returns immediately;
     /// in-flight sandboxes that have already been created are still in the
     /// provider's active set and will be picked up by
-    /// <c>SnapshotSuspendableActive</c>.
+    /// <c>SnapshotActiveSandboxes</c>.
     /// </summary>
     void PauseDispatch();
 }
 
 /// <summary>
-/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
-/// The orchestrator's suspend-on-shutdown hosted service uses
-/// <see cref="SnapshotSuspendableActive"/> to enumerate sandboxes that should
-/// be frozen on <c>ApplicationStopping</c>, and the startup resume handler
-/// uses <see cref="ResumeSandboxAsync"/> to start each persisted VM by name.
+/// Optional provider capability for enumerating live sandboxes that need early
+/// lifecycle handling on graceful host shutdown. This is intentionally separate
+/// from <see cref="ISuspendingSandboxProvider"/> so Stop/Dispose teardown does
+/// not depend on suspend/resume support.
 /// </summary>
-public interface ISuspendingSandboxProvider
+public interface IActiveSandboxProvider
 {
     /// <summary>
-    /// Snapshot of currently-active sandboxes that can be suspended, paired
-    /// with the work item that owns each entry. Implementations that
+    /// Snapshot of currently-active sandboxes that can participate in early
+    /// shutdown lifecycle handling, paired with the work item that owns each
+    /// entry. Implementations that
     /// internally use a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
     /// or other snapshot-safe data structure return entries that are
     /// consistent with concurrent disposals — a sandbox racing dispose may
-    /// still appear here, but its <see cref="ISuspendableSandbox.SuspendAsync"/>
-    /// is a no-op once the sandbox is disposed. Implementations that cannot
+    /// still appear here, but its suspend/dispose operation is a no-op once the
+    /// sandbox is disposed. Implementations that cannot
     /// determine the owner (e.g. an in-process <c>CreateAsync</c> that did not
     /// pass <see cref="SandboxSpec.TimingWorkItemId"/>) omit those entries.
     /// </summary>
-    IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive();
+    IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes();
+}
 
+/// <summary>
+/// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
+/// The startup resume handler uses <see cref="ResumeSandboxAsync"/> to start
+/// each persisted VM by name and adopt its still-running agent process.
+/// </summary>
+public interface ISuspendingSandboxProvider
+{
     /// <summary>
     /// Best-effort resume of a previously-suspended sandbox by name. Implementations
     /// should treat "VM not found" / "already running" as non-fatal so the

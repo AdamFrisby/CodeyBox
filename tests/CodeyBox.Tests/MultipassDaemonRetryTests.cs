@@ -46,10 +46,10 @@ public sealed class MultipassDaemonRetryTests
     [Fact]
     public void ClassifyTransient_ReturnsNull_ForNonRetryableCommand_EvenWithSocketStderr()
     {
-        // 'stop', 'delete', 'transfer', 'list' must fail fast even when the
+        // 'delete', 'transfer', 'list' must fail fast even when the
         // stderr looks transient — they're outside RetryableCommands and
         // running them again may have side effects.
-        foreach (var nonRetryable in new[] { "stop", "delete", "transfer", "list", "purge" })
+        foreach (var nonRetryable in new[] { "delete", "transfer", "list", "purge" })
         {
             var classification = MultipassDaemonRetry.ClassifyTransient(
                 Argv(nonRetryable, "codeybox-x"),

@@ -129,7 +129,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Additive migration: VM-suspend recovery metadata (R8-core). Records the
         // name of the suspended multipass VM that holds this item's in-progress
         // sandbox state across an orchestrator restart. Nullable: only set
-        // between the suspend-on-shutdown handler and the startup resume
+        // between the shutdown teardown handler and the startup resume
         // handler. The leak reaper skips VMs named here so the suspended VM is
         // not auto-disposed during the restart window.
         RunMigration("ALTER TABLE work_items ADD COLUMN suspended_vm_name TEXT;");
@@ -202,6 +202,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
         RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+        ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex();
+        RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_origin_check_unique ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
 
         // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
         // Populated only on follow-up items by the re-validation loop that re-runs
@@ -291,6 +293,32 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    private void ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex()
+    {
+        using var cmd = _conn.CreateCommand();
+        // Keep the same follow-up FindExistingFollowupAsync would see first
+        // through ListAsync's newest-created ordering, then clear only the
+        // duplicate back-links so legacy rows do not block startup.
+        cmd.CommandText = """
+            UPDATE work_items
+            SET origin_check_work_item_id = NULL
+            WHERE rowid IN (
+                SELECT rowid
+                FROM (
+                    SELECT rowid,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY origin_check_work_item_id
+                               ORDER BY created_at DESC, rowid DESC
+                           ) AS duplicate_rank
+                    FROM work_items
+                    WHERE origin_check_work_item_id IS NOT NULL
+                )
+                WHERE duplicate_rank > 1
+            );
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
     // SQLite primary error code for SQLITE_FULL. Matched on the primary
     // code (SqliteErrorCode) rather than the extended variant so any
     // SQLITE_FULL_*  refinement still routes through the disk-full path.
@@ -335,9 +363,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
         catch (SqliteException sqlex) when (sqlex.SqliteExtendedErrorCode == 2067) // SQLITE_CONSTRAINT_UNIQUE
         {
+            if (item.OriginCheckWorkItemId is { } originCheckId
+                && IsOriginCheckUniqueViolation(sqlex))
+            {
+                throw new WorkItemOriginCheckConflictException(originCheckId);
+            }
+
             // A concurrent request snuck past the application-level pre-check and
             // hit either the legacy work_items.external_id UNIQUE index or the
-            // new work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
+            // work_item_external_ids UNIQUE index on (project_id, namespace, external_id).
             throw new WorkItemExternalIdConflictException();
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
@@ -382,6 +416,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             await cmd.ExecuteNonQueryAsync(ct);
         }
     }
+
+    private static bool IsOriginCheckUniqueViolation(SqliteException ex) =>
+        ex.Message.Contains("work_items.origin_check_work_item_id", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("idx_work_items_origin_check_unique", StringComparison.OrdinalIgnoreCase);
 
     public async Task UpdateAsync(WorkItem item, CancellationToken ct = default)
     {

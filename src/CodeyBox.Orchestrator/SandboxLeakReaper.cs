@@ -296,7 +296,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         {
             // Honour SuspendedVmName for any non-terminal item. The suspend-on-
             // shutdown handler persists a mapping for every entry from
-            // SnapshotSuspendableActive — Working/Auditing/Reworking/Merging but
+            // SnapshotActiveSandboxes — Working/Auditing/Reworking/Merging but
             // also ReworkingForConflict and any other mid-flight phase that can
             // hold a live sandbox — so the exemption must track "not terminal"
             // rather than an explicit allow-list that silently drops a state and

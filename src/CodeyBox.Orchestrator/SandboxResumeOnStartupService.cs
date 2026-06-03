@@ -28,7 +28,7 @@ public sealed record SandboxStartupResumeOptions
 /// stranded-item recovery path can re-engage the pipeline.
 ///
 /// <para>Implemented as <see cref="IHostedLifecycleService.StartingAsync"/>
-/// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
+/// (sibling of <see cref="SandboxShutdownTeardownService.StoppingAsync"/>)
 /// only when configured for blocking mode. The default background mode starts
 /// the resume sweep from <see cref="StartAsync"/> and signals
 /// <see cref="IStartupRecoveryInputSink"/> when done, so the HTTP listener can
@@ -60,11 +60,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 {
     /// <summary>
     /// Cap on parallel <c>multipass start</c> calls. Mirrors
-    /// <see cref="SandboxSuspendOnShutdownService.DefaultMaxParallelSuspends"/>
+    /// <see cref="SandboxShutdownTeardownService.DefaultMaxParallelSuspends"/>
     /// so the resume side cannot flood multipassd worse than the suspend side
     /// already did at shutdown time.
     /// </summary>
-    public const int DefaultMaxParallelResumes = SandboxSuspendOnShutdownService.DefaultMaxParallelSuspends;
+    public const int DefaultMaxParallelResumes = SandboxShutdownTeardownService.DefaultMaxParallelSuspends;
 
     /// <summary>
     /// Default upper bound on how long we wait for an adopted in-VM agent
@@ -513,7 +513,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         try
         {
-            var adoptionExitCode = await adoptionTask.WaitAsync(timeoutCts.Token);
+            var adoptionExitCode = await adoptionTask.WaitAsync(adoptionDeadline, ct);
             if (adoptionExitCode is null)
             {
                 _log.LogWarning(
@@ -526,6 +526,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             throw;
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            ObserveProviderTaskException(adoptionTask);
+            _log.LogWarning(
+                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                vmName, itemId, adoptionDeadline);
+            return null;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {

@@ -1,7 +1,7 @@
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// How the suspend-on-shutdown handler tears down in-flight worker sandboxes
+/// How the shutdown teardown handler tears down in-flight worker sandboxes
 /// during a graceful host shutdown. Picked by operator config
 /// (<c>CodeyBox:Shutdown:SandboxTeardownMode</c>) per the post-incident review
 /// of 2026-05-29: <c>multipass suspend</c> writes a multi-GiB RAM snapshot and
@@ -18,16 +18,18 @@ public enum SandboxTeardownMode
     /// Original behaviour: freeze the VM's RAM via <c>multipass suspend</c> and
     /// resume from the snapshot on restart. Preserves in-VM agent state across
     /// the restart. Vulnerable to qemu-lock wedging if the host is SIGKILLed
-    /// before the snapshot finishes. Default for backward-compat.
+    /// before the snapshot finishes. Opt-in via
+    /// <c>CodeyBox:Shutdown:SandboxTeardownMode=Suspend</c>.
     /// </summary>
     Suspend = 0,
 
     /// <summary>
-    /// Clean stop: <c>multipass stop</c> kills the in-VM agent process but
-    /// preserves the VM's disk. Far less likely to wedge multipassd than
-    /// suspend (no RAM snapshot, qemu shuts down cleanly and releases the
-    /// disk-image lock). The work item recovers via its preempt-checkpoint
-    /// the same way it would under any non-suspending provider.
+    /// Clean stop/preserve without <c>multipass suspend</c>. Working items that
+    /// still need a preempt checkpoint stay owned by <c>PipelineRunner</c>;
+    /// other recoverable active sandboxes are stopped through
+    /// <c>IPreemptibleSandbox.StopAndPreserveAsync</c>. Far less likely to wedge
+    /// multipassd than suspend (no RAM snapshot, qemu shuts down cleanly and
+    /// releases the disk-image lock). This is the <c>ShutdownOptions</c> default.
     /// </summary>
     Stop = 1,
 
@@ -39,4 +41,3 @@ public enum SandboxTeardownMode
     /// </summary>
     Dispose = 2,
 }
-

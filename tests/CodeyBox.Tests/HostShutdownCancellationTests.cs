@@ -55,7 +55,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         string seedRepoUrl,
         IAgentRunner agent,
         PipelineOptions? options = null,
-        ILogger<PipelineRunner>? logger = null)
+        ILogger<PipelineRunner>? logger = null,
+        ISandboxProvider? sandboxProvider = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -64,7 +65,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider
+            ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
 
@@ -147,6 +149,78 @@ public sealed class HostShutdownCancellationTests : IDisposable
                 && s == "RunAsync.host-shutdown");
         Assert.Equal(CancellationSources.HostShutdown, boundary.Properties["CancellationSource"]);
         Assert.Equal(true, boundary.Properties["HostShutdown"]);
+    }
+
+    [Fact]
+    public async Task HostShutdown_StopAndPreserveFailure_LeavesCheckpointedItemRecoverable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            logger: logger,
+            sandboxProvider: new PreserveFailingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance)));
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+        var thrownText = thrown.ToString();
+        Assert.Contains("preserving the sandbox failed", thrownText);
+        Assert.Contains("injected preserve failure", thrownText);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        Assert.Null(final.FailureKind);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("Failed preserving sandbox", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HostShutdown_StopAndPreserveTimeout_LeavesCheckpointedItemRecoverable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            logger: logger,
+            sandboxProvider: new PreserveCancelingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance)));
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+        Assert.Contains("preserving the sandbox failed", thrown.ToString());
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        Assert.Null(final.FailureKind);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("Timed out preserving sandbox", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -451,7 +525,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
     [Fact]
     public async Task HostShutdown_WhenSandboxAlreadySuspended_SkipsCheckpointAndPreserve()
     {
-        // Replays the race the SandboxSuspendOnShutdownService → PipelineRunner
+        // Replays the race the SandboxShutdownTeardownService → PipelineRunner
         // shutdown ordering creates: by the time the pipeline catches the
         // host-shutdown OCE, the suspend handler has already frozen the VM
         // (sandbox.IsSuspended == true). The legacy preempt-checkpoint flow
@@ -535,7 +609,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         // Sanity: no preempt-checkpoint ref ever made it to origin either.
@@ -630,7 +704,87 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
 
         Assert.Contains(logger.Entries, e =>
-            e.Message.Contains("was taken over by SandboxSuspendOnShutdownService", StringComparison.Ordinal)
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
+            && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
+
+        var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref");
+        Assert.DoesNotContain("codeybox/preempt", showRef.stdout);
+
+        store.Dispose();
+    }
+
+    [Fact]
+    public async Task HostShutdown_WhenShutdownHandlerOwnsNonSuspendedSandbox_SkipsCheckpointAndPreserve()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var wrappingProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var agent = new BlockingAgentRunner();
+        var pipeline = new PipelineRunner(
+            wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            }),
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            logger);
+
+        var item = NewItem();
+        await store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+
+        SuspendableSandboxWrapper? liveSandbox = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            liveSandbox = wrappingProvider.Wrappers.LastOrDefault();
+            if (liveSandbox is not null) break;
+            await Task.Delay(25);
+        }
+        Assert.NotNull(liveSandbox);
+        Assert.False(liveSandbox.IsSuspended);
+
+        liveSandbox.MarkOwnedByShutdownHandler();
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+
+        var final = await store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Working, final.State);
+        Assert.Null(final.SuspendedVmName);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.PreemptedAt);
+        Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
+
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
             && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
 
         var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
@@ -1051,6 +1205,88 @@ internal sealed class CapturingSandboxProvider : ISandboxProvider
         => _inner.DisposeLeakedAsync(name, ct);
 }
 
+internal sealed class PreserveFailingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public PreserveFailingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PreserveFailingSandbox(await _inner.CreateAsync(spec, ct));
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class PreserveFailingSandbox : IPreemptibleSandbox
+{
+    private readonly ISandbox _inner;
+
+    public PreserveFailingSandbox(ISandbox inner)
+    {
+        _inner = inner;
+    }
+
+    public string Id => _inner.Id;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => _inner.ExecAsync(exec, ct);
+
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+        => throw new InvalidOperationException("injected preserve failure");
+}
+
+internal sealed class PreserveCancelingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public PreserveCancelingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PreserveCancelingSandbox(await _inner.CreateAsync(spec, ct));
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class PreserveCancelingSandbox : IPreemptibleSandbox
+{
+    private readonly ISandbox _inner;
+
+    public PreserveCancelingSandbox(ISandbox inner)
+    {
+        _inner = inner;
+    }
+
+    public string Id => _inner.Id;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => _inner.ExecAsync(exec, ct);
+
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+        => throw new OperationCanceledException("injected preserve timeout", ct);
+}
+
 /// <summary>
 /// Test wrapper that gives a non-suspending sandbox provider an
 /// <see cref="ISuspendableSandbox"/> capability. Used by the R8-core test
@@ -1087,13 +1323,15 @@ internal sealed class SuspendableSandboxProvider : ISandboxProvider
         => _inner.DisposeLeakedAsync(name, ct);
 }
 
-internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspendableSandbox
+internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
 {
     private readonly ISandbox _inner;
+    private bool _ownedByShutdownHandler;
     public SuspendableSandboxWrapper(ISandbox inner) { _inner = inner; }
 
     public string Id => _inner.Id;
     public bool IsSuspended { get; set; }
+    public bool IsOwnedByShutdownHandler => IsSuspended || _ownedByShutdownHandler;
     public int StopAndPreserveCalls { get; private set; }
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
@@ -1113,4 +1351,6 @@ internal sealed class SuspendableSandboxWrapper : IPreemptibleSandbox, ISuspenda
             return preemptible.StopAndPreserveAsync(ct);
         return Task.CompletedTask;
     }
+
+    public void MarkOwnedByShutdownHandler() => _ownedByShutdownHandler = true;
 }

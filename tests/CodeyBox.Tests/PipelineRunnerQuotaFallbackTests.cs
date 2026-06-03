@@ -21,6 +21,7 @@ namespace CodeyBox.Tests;
 /// item Failed. The 3-member exhaustion case parks the item in
 /// <see cref="WorkItemState.WaitingForQuotaReset"/>.
 /// </summary>
+[Collection("Pipeline integration")]
 public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 {
     private readonly string _workspace;

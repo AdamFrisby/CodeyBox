@@ -544,6 +544,40 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeAsync_DeleteFailure_WhenOwnedByShutdownHandler_Throws()
+    {
+        var noLongerActiveNames = new List<string>();
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "delete", "--purge", "codeybox-shutdown-deletefail"])
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(17, "", "still running"));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = new MultipassSandbox(
+            "codeybox-shutdown-deletefail",
+            Path.Combine(_workspace, "shutdown-delete-fail-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            onNoLongerTrackedActive: noLongerActiveNames.Add,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        ((IShutdownTeardownSandbox)sandbox).MarkOwnedByShutdownHandler();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
+
+        Assert.Contains("multipass delete --purge codeybox-shutdown-deletefail failed", ex.Message);
+        Assert.Equal(1, deleteCalls);
+        Assert.Equal(["codeybox-shutdown-deletefail"], noLongerActiveNames);
+    }
+
+    [Fact]
     public async Task ProviderCreatedSandbox_DeleteFailureUntracksActiveCacheAndReaperDisposes()
     {
         var staging = Path.Combine(_workspace, "provider-delete-fail-staging");
@@ -1697,15 +1731,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
         Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler,
-        int? maxScreenshotPngBytes = null)
+        int? maxScreenshotPngBytes = null,
+        TimeSpan? vmStopTimeout = null)
     {
-        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes);
+        return NewMultipassSandbox(flavor, new RecordingMultipassRunner(handler), maxScreenshotPngBytes, vmStopTimeout);
     }
 
     private MultipassSandbox NewMultipassSandbox(
         SandboxProfileFlavor flavor,
         RecordingMultipassRunner runner,
-        int? maxScreenshotPngBytes = null)
+        int? maxScreenshotPngBytes = null,
+        TimeSpan? vmStopTimeout = null,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null)
     {
         return new MultipassSandbox(
             "codeybox-test",
@@ -1716,9 +1753,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Flavor = flavor,
                 WorkingDirectory = "/work",
             },
-            new MultipassSandboxOptions { MultipassBinary = "/bin/true" },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/true",
+                VmStopTimeout = vmStopTimeout ?? MultipassSandboxOptions.DefaultVmStopTimeout,
+            },
             NullLogger<MultipassSandboxProvider>.Instance,
             runner: runner,
+            daemonRetryPolicy: daemonRetryPolicy,
             maxScreenshotPngBytes: maxScreenshotPngBytes);
     }
 
@@ -2039,12 +2081,222 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task StopAndPreserveAsync_RunsStopAndVerifiesStopped()
+    {
+        var stopCalls = 0;
+        var infoCalls = 0;
+        var deleteCalls = 0;
+        var calls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                calls.Add("delete");
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                calls.Add("stop");
+                stopCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+            {
+                calls.Add("info");
+                infoCalls++;
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stopCalls > 0 ? "Stopped" : "Running",
+                    ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+
+        Assert.Equal(1, stopCalls);
+        Assert.True(infoCalls >= 1);
+        Assert.True(calls.IndexOf("stop") >= 0 && calls.IndexOf("stop") < calls.IndexOf("info"),
+            $"expected stop before info verification, got: {string.Join(", ", calls)}");
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_RetriesTransientDaemonStopFailureAndSucceeds()
+    {
+        var stopCalls = 0;
+        var infoCalls = 0;
+        var versionCalls = 0;
+        var deleteCalls = 0;
+        var calls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+            {
+                calls.Add("version");
+                versionCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+            }
+
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                calls.Add("delete");
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                calls.Add("stop");
+                stopCalls++;
+                if (stopCalls == 1)
+                    return Task.FromResult(new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+            {
+                calls.Add("info");
+                infoCalls++;
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stopCalls >= 2 ? "Stopped" : "Running",
+                    ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = NewMultipassSandbox(
+            SandboxProfileFlavor.Headless,
+            runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync();
+
+        Assert.Equal(2, stopCalls);
+        Assert.Equal(1, versionCalls);
+        Assert.True(infoCalls >= 1);
+        var firstStop = calls.IndexOf("stop");
+        var probe = calls.IndexOf("version");
+        var secondStop = calls.IndexOf("stop", firstStop + 1);
+        Assert.True(firstStop >= 0 && probe > firstStop && secondStop > probe,
+            $"expected stop, health probe, second stop; got: {string.Join(", ", calls)}");
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_NonZeroStopExit_ThrowsAndPreservesOnDispose()
+    {
+        var stopCalls = 0;
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                return Task.FromResult(new ProcessRunResult(3, "", "multipassd: stop failed"));
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.True(stopCalls >= 1);
+        Assert.Contains("multipass stop codeybox-test failed", ex.Message);
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "stop/preserve must mark the VM as preempt-retained before multipass stop can fail");
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_NotStoppedAfterSuccessfulStop_ThrowsAndPreservesOnDispose()
+    {
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            if (argv is [_, "info", "codeybox-test", "--format=csv"])
+                return Task.FromResult(new ProcessRunResult(0, "Running", ""));
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(
+            SandboxProfileFlavor.Headless,
+            runner,
+            vmStopTimeout: TimeSpan.FromMilliseconds(1));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.Contains("did not reach Stopped state", ex.Message);
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")),
+            "an abandoned stop verification must still leave the VM preempt-retained");
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
+    public async Task StopAndPreserveAsync_CanceledStop_PreservesVmOnDispose()
+    {
+        var stopCalls = 0;
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            if (argv is [_, "stop", "codeybox-test"])
+            {
+                stopCalls++;
+                throw new OperationCanceledException(ct);
+            }
+            if (argv.Count >= 2 && argv[1] == "delete")
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+        });
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            ((IPreemptibleSandbox)sandbox).StopAndPreserveAsync());
+
+        Assert.Equal(1, stopCalls);
+        Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, deleteCalls);
+    }
+
+    [Fact]
     public async Task SuspendAsync_NonZeroExit_ThrowsAndLeavesDisposeActive()
     {
         // Critical safety contract: a failed `multipass suspend` MUST NOT flip
         // _preserveOnDispose to true. Otherwise the subsequent DisposeAsync
         // becomes a no-op while the VM is still Running on disk — a silent
-        // leak. The SandboxSuspendOnShutdownService caller persists the
+        // leak. The SandboxShutdownTeardownService caller persists the
         // SuspendedVmName mapping BEFORE awaiting suspend and CLEARS it again
         // when suspend throws a non-cancellation exception, so this failed,
         // still-Running VM is left with no resume bookkeeping and DisposeAsync
@@ -2086,7 +2338,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         // Critical safety contract for the per-VM suspend timeout: when
         // `multipass suspend` is abandoned by OperationCanceledException (the
-        // SandboxSuspendOnShutdownService per-VM timeout fired while multipassd
+        // SandboxShutdownTeardownService per-VM timeout fired while multipassd
         // was still writing the RAM snapshot), DisposeAsync MUST NOT run
         // `multipass delete --purge`. multipassd keeps freezing the VM after we
         // give up; the caller keeps the persisted SuspendedVmName mapping so the
@@ -2128,7 +2380,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     [Fact]
     public void MemoryBytes_ReflectsSpecLimits_ForSuspendTimeoutScaling()
     {
-        // SandboxSuspendOnShutdownService.SuspendTimeoutFor scales the per-VM
+        // SandboxShutdownTeardownService.SuspendTimeoutFor scales the per-VM
         // suspend timeout by ISuspendableSandbox.MemoryBytes. MultipassSandbox
         // must surface the provisioned RAM from its SandboxSpec.Limits — and
         // specifically the *memory* field, not disk — so scaling is fed a real
@@ -2349,7 +2601,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // CreateAsync WITHOUT TimingWorkItemId — must NOT register (no owner
         // to suspend back to). The snapshot stays empty.
         var sandboxNoOwner = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
-        Assert.Empty(((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive());
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
 
         // CreateAsync WITH TimingWorkItemId — populated; snapshot returns one entry.
         var workItemId = WorkItemId.New();
@@ -2358,16 +2610,41 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ImageReference = "ignored",
             TimingWorkItemId = workItemId,
         });
-        var snapshot = ((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive();
+        var snapshot = ((IActiveSandboxProvider)provider).SnapshotActiveSandboxes();
         Assert.Single(snapshot);
         Assert.Equal(workItemId, snapshot[0].WorkItemId);
 
         // Dispose removes the owner from the snapshot — defends against the
         // suspend handler trying to freeze a sandbox that just released.
         await sandboxWithOwner.DisposeAsync();
-        Assert.Empty(((ISuspendingSandboxProvider)provider).SnapshotSuspendableActive());
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
 
         await sandboxNoOwner.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var workItemId = WorkItemId.New();
+        await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+        });
+        var vmName = Assert.Single(states.Keys);
+        Assert.Single(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
+
+        await provider.DisposeLeakedAsync(vmName, CancellationToken.None);
+
+        Assert.Empty(((IActiveSandboxProvider)provider).SnapshotActiveSandboxes());
+        Assert.Empty(states);
     }
 
     /// <summary>
@@ -2389,9 +2666,29 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 states[argv[3]] = "Running";
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
-            if (argv is [_, "info", var name, "--format=csv"])
+            if (argv is [_, "info", var csvName, "--format=csv"])
                 return Task.FromResult(new ProcessRunResult(
-                    0, states.TryGetValue(name, out var current) ? current : "Running", ""));
+                    0, states.TryGetValue(csvName, out var current) ? current : "Running", ""));
+            if (argv is [_, "info", var jsonName, "--format=json"])
+            {
+                var state = states.TryGetValue(jsonName, out var current) ? current : "Running";
+                var stdout = JsonSerializer.Serialize(new
+                {
+                    info = new Dictionary<string, object>
+                    {
+                        [jsonName] = new
+                        {
+                            state,
+                            memory = new { total = 17179869184L },
+                            disks = new Dictionary<string, object>(),
+                        },
+                    },
+                });
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stdout,
+                    ""));
+            }
             if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "stop", var stopName])

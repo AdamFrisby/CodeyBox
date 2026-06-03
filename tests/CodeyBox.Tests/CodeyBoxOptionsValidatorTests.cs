@@ -90,6 +90,18 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:Shutdown:SandboxResumeMode", result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsInvalidSandboxTeardownMode()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxTeardownMode = (SandboxTeardownMode)42;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxTeardownMode", result.FailureMessage);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]

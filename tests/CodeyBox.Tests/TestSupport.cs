@@ -105,6 +105,7 @@ internal static class TestSupport
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         ITaskQueue? taskQueue = null,
+        Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         IAgentInvolvementStore? involvement = null,
         IInVmSmokeGate? inVmSmokeGate = null)
     {
@@ -112,6 +113,7 @@ internal static class TestSupport
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var pipelineStore = workItemStoreDecorator?.Invoke(store) ?? store;
         var queue = taskQueue ?? new InMemoryTaskQueue();
         var realGitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         // Tests that need to inject failures (e.g. SetBranchToCommitAsync throw)
@@ -163,7 +165,7 @@ internal static class TestSupport
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, resolvedUpstreamFactory, composer,
-            store,
+            pipelineStore,
             webhookDispatcher ?? new NullWebhookDispatcher(),
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,

@@ -177,4 +177,64 @@ public sealed class SqliteWorkItemStoreMigrationTests : IDisposable
         count.CommandText = "SELECT COUNT(*) FROM work_item_external_ids;";
         Assert.Equal(1, Convert.ToInt32(count.ExecuteScalar()));
     }
+
+    [Fact]
+    public async Task OriginCheckUniqueIndexMigration_ClearsDuplicateBacklinksBeforeCreatingIndex()
+    {
+        var originCheckId = WorkItemId.New();
+        var first = Sample() with
+        {
+            Title = "first follow-up",
+            OriginCheckWorkItemId = originCheckId,
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+        };
+        var second = Sample() with
+        {
+            Title = "second follow-up",
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+
+        using (var store = new SqliteWorkItemStore(_dbPath))
+        {
+            await store.CreateAsync(first);
+            await store.CreateAsync(second);
+        }
+
+        using (var raw = new SqliteConnection($"Data Source={_dbPath}"))
+        {
+            raw.Open();
+            using var cmd = raw.CreateCommand();
+            cmd.CommandText = """
+                DROP INDEX idx_work_items_origin_check_unique;
+                UPDATE work_items
+                SET origin_check_work_item_id = $origin
+                WHERE id = $second;
+                """;
+            cmd.Parameters.AddWithValue("$origin", originCheckId.ToString());
+            cmd.Parameters.AddWithValue("$second", second.Id.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var reopened = new SqliteWorkItemStore(_dbPath))
+        {
+            var firstRead = await reopened.GetAsync(first.Id);
+            var secondRead = await reopened.GetAsync(second.Id);
+
+            Assert.NotNull(firstRead);
+            Assert.NotNull(secondRead);
+            Assert.Null(firstRead!.OriginCheckWorkItemId);
+            Assert.Equal(originCheckId, secondRead!.OriginCheckWorkItemId);
+
+            await Assert.ThrowsAsync<WorkItemOriginCheckConflictException>(() =>
+                reopened.CreateAsync(Sample() with { OriginCheckWorkItemId = originCheckId }));
+        }
+    }
+
+    private static WorkItem Sample() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("proj"),
+        Title = "t",
+        Prompt = "p",
+    };
 }
