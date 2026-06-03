@@ -414,12 +414,25 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         try
         {
             resumeTask = suspending.ResumeSandboxAsync(vmName, timeoutCts.Token);
-            await resumeTask.WaitAsync(timeoutCts.Token);
+            await resumeTask.WaitAsync(timeout, ct);
             return (true, null);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
             throw;
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
+            var error = $"timed out after {timeout}";
+            _log.LogWarning(
+                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId, timeout);
+            return (false, error);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
