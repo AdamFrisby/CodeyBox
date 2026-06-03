@@ -1,4 +1,6 @@
 using CodeyBox.Api;
+using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
@@ -74,6 +76,85 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("CodeyBox:MaxTemplateChecks", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsInvalidSandboxResumeMode()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxResumeMode = (SandboxResumeMode)42;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxResumeMode", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_RejectsNonPositiveSandboxResumeTimeout(int seconds)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxResumeTimeout = TimeSpan.FromSeconds(seconds);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxResumeTimeout", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedSandboxResumeTimeout()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxResumeTimeout =
+            SandboxStartupResumePolicy.MaximumResumeTimeout + TimeSpan.FromTicks(1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxResumeTimeout", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_RejectsNonPositiveSandboxAdoptionDeadline(int seconds)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxAdoptionDeadlineSeconds = seconds;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedSandboxAdoptionDeadline()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxAdoptionDeadlineSeconds =
+            (int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds + 1;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Shutdown:SandboxAdoptionDeadlineSeconds", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsMaximumStartupResumeBoundaries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.Shutdown.SandboxResumeTimeout = SandboxStartupResumePolicy.MaximumResumeTimeout;
+        options.Shutdown.SandboxAdoptionDeadlineSeconds =
+            (int)SandboxStartupResumePolicy.MaximumAdoptionDeadline.TotalSeconds;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
     }
 
     private static CodeyBoxOptions ValidCodeyBoxOptions()

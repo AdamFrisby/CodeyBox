@@ -389,4 +389,89 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         // Pipeline must NOT have executed the stranded item.
         Assert.DoesNotContain(item.Id, pipeline.Executed);
     }
+
+    [Fact]
+    public async Task OrchestratorStartup_WaitsForRecoveryInputBeforeStartupReaperAndReplay()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var barrier = new TestStartupRecoveryBarrier();
+        var pipeline = new ImmediateDonePipeline(_store);
+        var cancellations = new CancellationRegistry(CancellationToken.None);
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1, MaxRecoveryAttempts = 5 };
+
+        using var svc = new OrchestratorService(
+            _queue, _store, pipeline, cancellations, opts,
+            NullLogger<OrchestratorService>.Instance,
+            workerRegistry: _registry,
+            deadWorkerOpts: _opts,
+            reaper: _reaper,
+            startupRecoveryBarrier: barrier,
+            startupRecoveryCompletion: barrier);
+
+        await svc.StartAsync(CancellationToken.None);
+        await barrier.WaitObserved.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+
+        var beforeSignal = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, beforeSignal!.State);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+
+        barrier.MarkRecoveryInputReady();
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        WorkItem? final = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            final = await _store.GetAsync(item.Id);
+            if (final?.State == WorkItemState.Failed) break;
+            await Task.Delay(30);
+        }
+
+        await barrier.InitialRecoveryCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.DoesNotContain(item.Id, pipeline.Executed);
+        Assert.Equal(1, barrier.InitialRecoveryCompletedSignals);
+    }
+
+    private sealed class TestStartupRecoveryBarrier :
+        IStartupRecoveryInputBarrier,
+        IStartupRecoveryInputSink,
+        IStartupInitialRecoveryBarrier,
+        IStartupInitialRecoverySink
+    {
+        private readonly TaskCompletionSource _recoveryInputReady =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _initialRecoveryCompleted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _waitObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _initialRecoveryCompletedSignals;
+
+        public Task WaitObserved => _waitObserved.Task;
+        public int InitialRecoveryCompletedSignals => Volatile.Read(ref _initialRecoveryCompletedSignals);
+
+        public Task RecoveryInputReady
+        {
+            get
+            {
+                _waitObserved.TrySetResult();
+                return _recoveryInputReady.Task;
+            }
+        }
+
+        public Task InitialRecoveryCompleted => _initialRecoveryCompleted.Task;
+
+        public void MarkRecoveryInputReady() => _recoveryInputReady.TrySetResult();
+
+        public void MarkInitialRecoveryCompleted()
+        {
+            Interlocked.Increment(ref _initialRecoveryCompletedSignals);
+            _initialRecoveryCompleted.TrySetResult();
+        }
+    }
 }

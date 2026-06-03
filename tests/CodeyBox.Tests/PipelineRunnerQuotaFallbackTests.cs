@@ -1056,6 +1056,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     public async Task ReworkFallbackAttemptTimeouts_AreBoundedByAbsolutePhaseCap()
     {
         var time = new ManualTimeProvider();
+        var attemptTimeout = TimeSpan.FromMinutes(240);
+        var phaseCap = TimeSpan.FromMinutes(720);
+        var fallbackAdvanceStep = TimeSpan.FromMinutes(10);
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipelineThreeMembers(
             seed,
@@ -1071,7 +1074,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var item = NewItem(initialAgent: AgentKind.Gemini) with
         {
-            WorkTimeout = TimeSpan.FromMinutes(240),
+            WorkTimeout = attemptTimeout,
         };
         await fix.Store.CreateAsync(item);
 
@@ -1085,31 +1088,31 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             codexReworkStarted,
             pipelineTask,
             time,
-            step: TimeSpan.FromSeconds(10),
-            maxSteps: 2000);
+            step: fallbackAdvanceStep,
+            maxSteps: 36);
         await RunWithAdvancingTimeUntilAsync(
             claudeReworkStarted,
             pipelineTask,
             time,
-            step: TimeSpan.FromSeconds(10),
-            maxSteps: 2000);
+            step: fallbackAdvanceStep,
+            maxSteps: 36);
 
         await AdvanceManualTimeToElapsedAsync(
             time,
-            TimeSpan.FromMinutes(720) - TimeSpan.FromSeconds(10),
+            phaseCap - TimeSpan.FromSeconds(10),
             pipelineTask,
             step: TimeSpan.FromSeconds(10));
         Assert.False(pipelineTask.IsCompleted, "The rework phase completed before the absolute timeout cap.");
 
         await AdvanceManualTimeToElapsedAsync(
             time,
-            TimeSpan.FromMinutes(720),
+            phaseCap,
             pipelineTask,
             step: TimeSpan.FromSeconds(10),
             maxSteps: 10);
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
-        Assert.Equal(TimeSpan.FromMinutes(720), elapsed);
+        Assert.Equal(phaseCap, elapsed);
         await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);

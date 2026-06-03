@@ -47,7 +47,12 @@ public sealed class ObservableMetricsTests : IDisposable
             lock (observed) observed.Add((instrument.Name, value, tag));
         });
         listener.Start();
-        listener.RecordObservableInstruments();
+        for (var i = 0; i < 3; i++)
+        {
+            listener.RecordObservableInstruments();
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+        GC.KeepAlive(svc);
         return observed;
     }
 
@@ -92,13 +97,14 @@ public sealed class ObservableMetricsTests : IDisposable
         // pass SandboxActiveGauge_ReportsSuspendableCount.
         var store = new SqliteWorkItemStore(_dbPath);
 
-        // Reset to a known starting value so concurrent tests cannot perturb the
-        // counter; snapshot the baseline to keep this test independent of
-        // unrelated callers that might also push values.
-        var baseline = SandboxLiveCounter.Active;
-        SandboxLiveCounter.Increment();
-        SandboxLiveCounter.Increment();
-        SandboxLiveCounter.Increment();
+        // The live counter is intentionally process-wide, and other tests may
+        // have ephemeral sandboxes alive at the same time. Use a large local
+        // contribution so this test proves the gauge is reading the counter
+        // without assuming exclusive ownership of the static value.
+        const int localContribution = 1_000;
+        for (var i = 0; i < localContribution; i++)
+            SandboxLiveCounter.Increment();
+        var remainingContribution = localContribution;
         try
         {
             using var svc = new CodeyBoxObservableMetrics(
@@ -115,20 +121,22 @@ public sealed class ObservableMetricsTests : IDisposable
             Assert.Contains(observed,
                 m => m.Instrument == "codeybox.sandbox.active"
                     && m.Tag == "inert"
-                    && m.Value == baseline + 3);
+                    && m.Value >= localContribution);
 
             SandboxLiveCounter.Decrement();
+            remainingContribution--;
             observed = CollectLong(svc, "provider", "codeybox.sandbox.active");
             Assert.Contains(observed,
                 m => m.Instrument == "codeybox.sandbox.active"
                     && m.Tag == "inert"
-                    && m.Value == baseline + 2);
+                    && m.Value >= localContribution - 1);
 
             await svc.StopAsync(CancellationToken.None);
         }
         finally
         {
-            while (SandboxLiveCounter.Active > baseline) SandboxLiveCounter.Decrement();
+            for (var i = 0; i < remainingContribution; i++)
+                SandboxLiveCounter.Decrement();
         }
     }
 
@@ -190,7 +198,12 @@ public sealed class ObservableMetricsTests : IDisposable
             lock (observed) observed.Add((value, agent, model));
         });
         listener.Start();
-        listener.RecordObservableInstruments();
+        for (var i = 0; i < 3; i++)
+        {
+            listener.RecordObservableInstruments();
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+        GC.KeepAlive(svc);
 
         Assert.Contains(observed, m => m.Agent == "claude" && m.Model == "claude-opus-4-8" && Math.Abs(m.Value - 72.5) < 1e-9);
         Assert.Contains(observed, m => m.Agent == "codex" && m.Model == "(default)" && m.Value == -1);

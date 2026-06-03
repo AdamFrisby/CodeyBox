@@ -5,6 +5,20 @@ using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
+public enum SandboxStartupResumeMode
+{
+    Background = 0,
+    Blocking = 1,
+}
+
+public sealed record SandboxStartupResumeOptions
+{
+    public int MaxParallelResumes { get; init; } = SandboxResumeOnStartupService.DefaultMaxParallelResumes;
+    public TimeSpan ResumeTimeout { get; init; } = SandboxResumeOnStartupService.DefaultResumeTimeout;
+    public TimeSpan AdoptionDeadline { get; init; } = SandboxResumeOnStartupService.DefaultAdoptionDeadline;
+    public SandboxStartupResumeMode Mode { get; init; } = SandboxStartupResumeMode.Background;
+}
+
 /// <summary>
 /// R8-core startup half: for every work item the previous process suspended
 /// (<see cref="WorkItem.SuspendedVmName"/> non-null), <c>multipass start</c>
@@ -15,12 +29,14 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>Implemented as <see cref="IHostedLifecycleService.StartingAsync"/>
 /// (sibling of <see cref="SandboxSuspendOnShutdownService.StoppingAsync"/>)
-/// so it runs BEFORE <see cref="OrchestratorService.ExecuteAsync"/> kicks
-/// off the dispatch loop, the dead-worker reaper, and
-/// <c>ReplayPendingAsync</c>. Sequencing matters: the leak reaper sees a
-/// consistent picture (the VM is back to Running, the work item still
-/// carries SuspendedVmName until adoption completes) and recovery doesn't
-/// race the resume.</para>
+/// only when configured for blocking mode. The default background mode starts
+/// the resume sweep from <see cref="StartAsync"/> and signals
+/// <see cref="IStartupRecoveryInputSink"/> when done, so the HTTP listener can
+/// bind while <see cref="OrchestratorService.ExecuteAsync"/> waits before its
+/// dead-worker startup sweep. Sequencing matters: the leak reaper sees a
+/// consistent picture (the VM is back to Running, the work item still carries
+/// SuspendedVmName until adoption completes) and recovery doesn't race the
+/// resume.</para>
 ///
 /// <para>Adoption flow per item:</para>
 /// <list type="number">
@@ -57,43 +73,205 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     /// minutes), short enough that a wedged agent does not block the
     /// orchestrator boot indefinitely. Configurable via constructor.
     /// </summary>
-    public static readonly TimeSpan DefaultAdoptionDeadline = TimeSpan.FromMinutes(30);
+    public static readonly TimeSpan DefaultAdoptionDeadline =
+        SandboxStartupResumePolicy.DefaultAdoptionDeadline;
+
+    /// <summary>
+    /// Default caller-side cap for a single persisted VM resume. The Multipass
+    /// provider has its own launch/readiness limits, but the orchestrator also
+    /// needs an outer guard for daemon/provider calls that ignore cancellation.
+    /// </summary>
+    public static readonly TimeSpan DefaultResumeTimeout =
+        SandboxStartupResumePolicy.DefaultResumeTimeout;
+
+    /// <summary>
+    /// Hard ceiling for startup resume/adoption waits. The operator-facing
+    /// values are configurable, but startup recovery must stay bounded.
+    /// </summary>
+    public static readonly TimeSpan MaximumResumeTimeout =
+        SandboxStartupResumePolicy.MaximumResumeTimeout;
+    public static readonly TimeSpan MaximumAdoptionDeadline =
+        SandboxStartupResumePolicy.MaximumAdoptionDeadline;
 
     private readonly ISandboxProvider? _provider;
     private readonly IWorkItemStore _store;
     private readonly ILogger<SandboxResumeOnStartupService> _log;
-    private readonly int _maxParallel;
-    private readonly TimeSpan _adoptionDeadline;
+    private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
+    private readonly IStartupRecoveryInputSink _startupRecovery;
+    private readonly Lock _resumeStartGate = new();
+    private CancellationTokenSource? _backgroundCts;
+    private Task? _resumeTask;
+    private bool _resumeStarted;
 
     public SandboxResumeOnStartupService(
         ISandboxProvider? provider,
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
+        IStartupRecoveryInputSink recoveryInput,
         int? maxParallel = null,
-        TimeSpan? adoptionDeadline = null)
+        TimeSpan? adoptionDeadline = null,
+        TimeSpan? resumeTimeout = null,
+        SandboxStartupResumeMode? mode = null)
+        : this(
+            provider,
+            store,
+            log,
+            () => new SandboxStartupResumeOptions
+            {
+                MaxParallelResumes = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelResumes,
+                AdoptionDeadline = adoptionDeadline is { } d && d > TimeSpan.Zero
+                    ? d
+                    : DefaultAdoptionDeadline,
+                ResumeTimeout = resumeTimeout is { } r && r > TimeSpan.Zero
+                    ? r
+                    : DefaultResumeTimeout,
+                Mode = mode ?? SandboxStartupResumeMode.Background,
+            },
+            recoveryInput)
     {
+    }
+
+    public SandboxResumeOnStartupService(
+        ISandboxProvider? provider,
+        IWorkItemStore store,
+        ILogger<SandboxResumeOnStartupService> log,
+        Func<SandboxStartupResumeOptions> optionsAccessor,
+        IStartupRecoveryInputSink recoveryInput)
+    {
+        ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
         _store = store;
         _log = log;
-        _maxParallel = maxParallel is > 0 ? maxParallel.Value : DefaultMaxParallelResumes;
-        _adoptionDeadline = adoptionDeadline is { } d && d > TimeSpan.Zero
-            ? d
-            : DefaultAdoptionDeadline;
+        _optionsAccessor = optionsAccessor;
+        _startupRecovery = recoveryInput;
     }
 
-    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
-    public Task StopAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task StartAsync(CancellationToken ct)
+    {
+        var mode = CurrentOptions().Mode;
+        if (mode == SandboxStartupResumeMode.Background)
+            return StartResumeOnceAsync(background: true, ct);
+
+        // If configuration reloads from Background to Blocking between
+        // StartingAsync and StartAsync, honor the latest value by running the
+        // one-shot sweep here. The _resumeStartGate lock + _resumeStarted bool
+        // in StartResumeOnceAsync keep the normal Blocking path from executing
+        // twice.
+        return StartResumeOnceAsync(background: false, ct);
+    }
+
+    public Task StopAsync(CancellationToken ct) =>
+        HostedLifecycleTask.StopAsync(
+            () =>
+            {
+                lock (_resumeStartGate)
+                    return (_backgroundCts, _resumeTask);
+            },
+            expected =>
+            {
+                lock (_resumeStartGate)
+                {
+                    if (!ReferenceEquals(_backgroundCts, expected))
+                        return null;
+
+                    var dispose = _backgroundCts;
+                    _backgroundCts = null;
+                    return dispose;
+                }
+            },
+            ct);
+
     public Task StartedAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppingAsync(CancellationToken ct) => Task.CompletedTask;
     public Task StoppedAsync(CancellationToken ct) => Task.CompletedTask;
 
-    public Task StartingAsync(CancellationToken ct) => ResumeAllAsync(ct);
+    public Task StartingAsync(CancellationToken ct)
+    {
+        var mode = CurrentOptions().Mode;
+        if (mode != SandboxStartupResumeMode.Blocking)
+            return Task.CompletedTask;
+
+        return StartResumeOnceAsync(background: false, ct);
+    }
 
     /// <summary>
     /// Exposed for test fixtures that drive the resume cycle directly without
     /// spinning the full host lifecycle.
     /// </summary>
     internal Task ResumeAllForTestAsync(CancellationToken ct) => ResumeAllAsync(ct);
+
+    private Task StartResumeOnceAsync(bool background, CancellationToken ct)
+    {
+        lock (_resumeStartGate)
+        {
+            if (_resumeStarted)
+                return background ? Task.CompletedTask : _resumeTask ?? Task.CompletedTask;
+
+            if (background && ct.IsCancellationRequested)
+                return Task.FromCanceled(ct);
+
+            _resumeStarted = true;
+            if (background)
+            {
+                var backgroundCts = new CancellationTokenSource();
+                _backgroundCts = backgroundCts;
+                _resumeTask = RunLongRunningAsync(
+                    () => ResumeAllAndSignalAsync(backgroundCts.Token));
+                return Task.CompletedTask;
+            }
+
+            _resumeTask = ResumeAllAndSignalAsync(ct);
+            return _resumeTask;
+        }
+    }
+
+    private async Task ResumeAllAndSignalAsync(CancellationToken ct)
+    {
+        try
+        {
+            await ResumeAllAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _log.LogInformation("Startup resume cancelled before all suspended sandboxes were processed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Startup resume sweep threw; continuing host startup");
+        }
+        finally
+        {
+            _startupRecovery.MarkRecoveryInputReady();
+        }
+    }
+
+    private SandboxStartupResumeOptions CurrentOptions()
+    {
+        var raw = _optionsAccessor();
+        var maxParallel = raw.MaxParallelResumes > 0
+            ? raw.MaxParallelResumes
+            : DefaultMaxParallelResumes;
+        var resumeTimeout = raw.ResumeTimeout > TimeSpan.Zero
+            ? Cap(raw.ResumeTimeout, MaximumResumeTimeout)
+            : DefaultResumeTimeout;
+        var adoptionDeadline = raw.AdoptionDeadline > TimeSpan.Zero
+            ? Cap(raw.AdoptionDeadline, MaximumAdoptionDeadline)
+            : DefaultAdoptionDeadline;
+        var mode = Enum.IsDefined(raw.Mode)
+            ? raw.Mode
+            : SandboxStartupResumeMode.Background;
+
+        return raw with
+        {
+            MaxParallelResumes = maxParallel,
+            ResumeTimeout = resumeTimeout,
+            AdoptionDeadline = adoptionDeadline,
+            Mode = mode,
+        };
+    }
+
+    private static TimeSpan Cap(TimeSpan value, TimeSpan maximum)
+        => value <= maximum ? value : maximum;
 
     internal async Task ResumeAllAsync(CancellationToken ct)
     {
@@ -112,46 +290,43 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         _log.LogInformation("Startup resume: {Count} suspended sandbox(es) to start", suspended.Count);
 
-        using var gate = new SemaphoreSlim(_maxParallel, _maxParallel);
+        var options = CurrentOptions();
+        using var gate = new SemaphoreSlim(options.MaxParallelResumes, options.MaxParallelResumes);
         var tasks = new List<Task>(suspended.Count);
-        foreach (var item in suspended)
+        try
         {
-            await gate.WaitAsync(ct);
-            tasks.Add(Task.Run(async () =>
+            foreach (var item in suspended)
             {
-                try
-                {
-                    await ResumeOneAsync(suspending, item, ct);
-                }
-                finally
-                {
-                    gate.Release();
-                }
-            }, ct));
+                await gate.WaitAsync(ct);
+                tasks.Add(ResumeOneWithGateAsync(item));
+            }
         }
-        await Task.WhenAll(tasks);
+        finally
+        {
+            if (tasks.Count > 0)
+                await Task.WhenAll(tasks);
+        }
+
+        async Task ResumeOneWithGateAsync(WorkItem item)
+        {
+            try
+            {
+                await ResumeOneAsync(suspending, item, ct);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
     }
 
     private async Task ResumeOneAsync(ISuspendingSandboxProvider suspending, WorkItem item, CancellationToken ct)
     {
         var vmName = item.SuspendedVmName!;
         var agentLogPath = item.AgentLogPath;
-        var resumeSucceeded = true;
-        string? resumeError = null;
+        var (resumeSucceeded, resumeError) = await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
         int? adoptionExitCode = null;
         var adopted = false;
-        try
-        {
-            await suspending.ResumeSandboxAsync(vmName, ct);
-        }
-        catch (Exception ex)
-        {
-            resumeSucceeded = false;
-            resumeError = ex.Message;
-            _log.LogWarning(ex,
-                "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
-                vmName, item.Id);
-        }
 
         if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
         {
@@ -159,32 +334,9 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             // .exit marker appears (or the deadline elapses). Streaming what
             // the agent emits post-resume to the orchestrator log captures
             // output the host stream lost when the previous process exited.
-            try
-            {
-                adoptionExitCode = await suspending.WaitForAdoptedAgentCompletionAsync(
-                    vmName,
-                    agentLogPath!,
-                    chunk =>
-                    {
-                        if (!string.IsNullOrEmpty(chunk))
-                            _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
-                    },
-                    _adoptionDeadline,
-                    ct);
-                adopted = adoptionExitCode is not null;
-                if (!adopted)
-                {
-                    _log.LogWarning(
-                        "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
-                        vmName, item.Id, _adoptionDeadline);
-                }
-            }
-            catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
-            {
-                _log.LogWarning(adoptionEx,
-                    "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
-                    vmName, item.Id);
-            }
+            adoptionExitCode = await TryWaitForAdoptionAsync(
+                suspending, item.Id, vmName, agentLogPath!, ct);
+            adopted = adoptionExitCode is not null;
         }
 
         // Promote whatever the adopted agent committed inside the VM into a
@@ -201,31 +353,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         if (resumeSucceeded && adopted && adoptionExitCode == 0)
         {
             var refName = PreemptCheckpointRefFor(item.Id);
-            try
-            {
-                var pushed = await suspending.PushSuspendedVmCheckpointRefAsync(
-                    vmName,
-                    SandboxConventions.WorkDir,
-                    refName,
-                    $"codeybox: suspend-resume checkpoint {item.Id}",
-                    ct);
-                if (pushed)
-                {
-                    promotedCheckpointRef = refName;
-                }
-                else
-                {
-                    _log.LogWarning(
-                        "Failed to promote adopted-VM HEAD to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
-                        refName, item.Id);
-                }
-            }
-            catch (Exception promoteEx) when (promoteEx is not OperationCanceledException)
-            {
-                _log.LogWarning(promoteEx,
-                    "Promote of adopted-VM HEAD to preempt-checkpoint {RefName} threw for work item {WorkItemId}; falling through to stranded-item recovery",
-                    refName, item.Id);
-            }
+            if (await TryPromoteCheckpointAsync(suspending, item.Id, vmName, refName, ct))
+                promotedCheckpointRef = refName;
         }
 
         // Clear the suspended-bookkeeping AFTER the adoption + promotion
@@ -249,6 +378,17 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             AgentLogPath = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         };
+        if (!resumeSucceeded
+            && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
+                updatedItem,
+                $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
+                out var failedItem))
+        {
+            updatedItem = failedItem;
+            _log.LogWarning(
+                "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
+                item.Id, vmName, resumeError ?? "unknown error");
+        }
         if (promotedCheckpointRef is not null)
         {
             updatedItem = updatedItem with
@@ -260,6 +400,242 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         await _store.UpdateAsync(updatedItem, ct);
         AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
     }
+
+    private async Task<(bool Succeeded, string? Error)> TryResumeSandboxAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        CancellationToken ct)
+    {
+        var timeout = CurrentOptions().ResumeTimeout;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+
+        Task? resumeTask = null;
+        try
+        {
+            resumeTask = RunLongRunningAsync(
+                () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
+            await resumeTask.WaitAsync(timeout, ct);
+            return (true, null);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            timeoutCts.Cancel();
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
+            throw;
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
+            var error = $"timed out after {timeout}";
+            _log.LogWarning(
+                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId, timeout);
+            return (false, error);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            if (resumeTask is not null)
+                ObserveProviderTaskException(resumeTask);
+            var error = $"timed out after {timeout}";
+            _log.LogWarning(
+                "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId, timeout);
+            return (false, error);
+        }
+        catch (OperationCanceledException ex)
+        {
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled resume" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup resume was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId);
+            return (false, error);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
+                vmName, itemId);
+            return (false, ex.Message);
+        }
+    }
+
+    private async Task<int?> TryWaitForAdoptionAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        string agentLogPath,
+        CancellationToken ct)
+    {
+        var adoptionDeadline = CurrentOptions().AdoptionDeadline;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(adoptionDeadline);
+
+        Task<int?> adoptionTask;
+        try
+        {
+            adoptionTask = RunLongRunningAsync(
+                () => suspending.WaitForAdoptedAgentCompletionAsync(
+                    vmName,
+                    agentLogPath,
+                    chunk =>
+                    {
+                        if (!string.IsNullOrEmpty(chunk))
+                            _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
+                    },
+                    adoptionDeadline,
+                    timeoutCts.Token));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            timeoutCts.Cancel();
+            throw;
+        }
+        catch (OperationCanceledException ex)
+        {
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                vmName, itemId, error);
+            return null;
+        }
+        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+        {
+            _log.LogWarning(adoptionEx,
+                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                vmName, itemId);
+            return null;
+        }
+
+        try
+        {
+            var adoptionExitCode = await adoptionTask.WaitAsync(timeoutCts.Token);
+            if (adoptionExitCode is null)
+            {
+                _log.LogWarning(
+                    "Startup adoption deadline elapsed for sandbox {VmName} (work item {WorkItemId}); the resumed agent has not signalled completion within {Deadline}. The work item will recover via the stranded-item path.",
+                    vmName, itemId, adoptionDeadline);
+            }
+            return adoptionExitCode;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            timeoutCts.Cancel();
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            ObserveProviderTaskException(adoptionTask);
+            _log.LogWarning(
+                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                vmName, itemId, adoptionDeadline);
+            return null;
+        }
+        catch (OperationCanceledException ex)
+        {
+            var error = string.IsNullOrWhiteSpace(ex.Message) ? "provider cancelled adoption" : ex.Message;
+            _log.LogWarning(ex,
+                "Startup adoption was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}): {Error}; falling through to recovery",
+                vmName, itemId, error);
+            return null;
+        }
+        catch (Exception adoptionEx) when (adoptionEx is not OperationCanceledException)
+        {
+            _log.LogWarning(adoptionEx,
+                "Startup adoption errored for sandbox {VmName} (work item {WorkItemId}); falling through to recovery",
+                vmName, itemId);
+            return null;
+        }
+    }
+
+    private async Task<bool> TryPromoteCheckpointAsync(
+        ISuspendingSandboxProvider suspending,
+        WorkItemId itemId,
+        string vmName,
+        string refName,
+        CancellationToken ct)
+    {
+        var timeout = CurrentOptions().ResumeTimeout;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+
+        Task<bool>? promoteTask = null;
+        try
+        {
+            promoteTask = RunLongRunningAsync(
+                () => suspending.PushSuspendedVmCheckpointRefAsync(
+                    vmName,
+                    SandboxConventions.WorkDir,
+                    refName,
+                    $"codeybox: suspend-resume checkpoint {itemId}",
+                    timeoutCts.Token));
+
+            var pushed = await promoteTask.WaitAsync(timeoutCts.Token);
+            if (pushed)
+                return true;
+
+            _log.LogWarning(
+                "Failed to promote adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} for work item {WorkItemId}; falling through to stranded-item recovery (item will be marked Failed unless it has an earlier checkpoint)",
+                vmName, refName, itemId);
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            timeoutCts.Cancel();
+            throw;
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            if (promoteTask is not null)
+                ObserveProviderTaskException(promoteTask);
+
+            _log.LogWarning(
+                "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
+                vmName, itemId, timeout);
+            return false;
+        }
+        catch (OperationCanceledException promoteEx)
+        {
+            _log.LogWarning(promoteEx,
+                "Startup checkpoint promotion was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}); falling through to stranded-item recovery",
+                vmName, itemId);
+            return false;
+        }
+        catch (Exception promoteEx)
+        {
+            _log.LogWarning(promoteEx,
+                "Promote of adopted-VM HEAD for sandbox {VmName} to preempt-checkpoint {RefName} threw for work item {WorkItemId}; falling through to stranded-item recovery",
+                vmName, refName, itemId);
+            return false;
+        }
+    }
+
+    private static void ObserveProviderTaskException(Task task)
+    {
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private static Task RunLongRunningAsync(Func<Task> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default).Unwrap();
+
+    private static Task<T> RunLongRunningAsync<T>(Func<Task<T>> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default).Unwrap();
 
     /// <summary>
     /// Must stay in lockstep with <c>PipelineRunner.PreemptRefFor</c>: the

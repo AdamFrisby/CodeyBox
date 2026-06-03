@@ -280,6 +280,8 @@ public sealed class BudgetEnforcementTests : IDisposable
     {
         private int _started;
 
+        public int StartedCount => Volatile.Read(ref _started);
+
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
             var n = Interlocked.Increment(ref _started) - 1;
@@ -418,7 +420,8 @@ public sealed class BudgetEnforcementTests : IDisposable
             if (secondDeferredIdx is not null
                 && (activeOrDeferred != successors.Length
                     || runningSuccessors == 0
-                    || deferredSuccessors == 0))
+                    || deferredSuccessors == 0
+                    || pipeline.StartedCount < 2))
                 secondDeferredIdx = null;
 
             if (secondDeferredIdx is null)
