@@ -1262,12 +1262,10 @@ public sealed class RequiredBuildGateTests : IDisposable
     [Fact]
     public async Task AuditPass_CannotReachAuditPassed_WhenWorkBranchDeletesOnlyPlainSourceCsproj()
     {
-        // Covers the (baseHasMarkers && !workHasMarkers) half of the
-        // applicability decision: base carries ONLY a plain source .csproj
-        // (no .sln/.slnx, no test project — so IsRequiredBaseMarkerPath
-        // returns false for the deleted file and `missingRequired` is empty).
-        // A regression that drops the second half of the OR would let this
-        // case slip the gate silently. We assert it still fails.
+        // Csproj-only base with a single plain source .csproj — deleting it
+        // must fail the gate. The csproj-only fallback in the build script
+        // would otherwise build whatever .csproj remains (here, nothing),
+        // and the applicability check has to catch that.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddCsprojOnlyMarkerAsync(seed);
         var fakeDotnet = await CreateFlexibleFakeDotnetAsync();
@@ -1292,6 +1290,52 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("required build failed", final.LastError);
         Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+    }
+
+    [Fact]
+    public async Task AuditPass_CannotReachAuditPassed_WhenCsprojOnlyRepoDropsOneProductionProject()
+    {
+        // Csproj-only base (no .sln/.slnx) with multiple non-test projects:
+        // deleting one production .csproj while leaving the other behind
+        // must fail the gate. workHasMarkers stays true, and the deleted
+        // file is neither a solution nor a test project, so unless every
+        // base .csproj is "required" in csproj-only mode the verifier would
+        // silently narrow the build surface to just the surviving project
+        // and let a non-compiling deletion reach AuditPassed.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddTwoNonTestCsprojOnlyMarkersAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        var captureStore = new CapturingAuditReportStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 1,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            auditReportStore: captureStore);
+
+        var item = NewItem("feature/drops-one-production-csproj") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await DeleteFromBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "delete one production csproj, keep the other",
+            "src/Alpha/Alpha.csproj");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("required build failed", final.LastError);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+
+        var report = Assert.Single(
+            captureStore.Reports,
+            r => r.AuditorName == RequiredBuildGateIdentity.AuditorName);
+        Assert.Equal(AuditSeverity.Error.ToString(), report.WorstSeverity);
+        Assert.NotNull(report.RawOutput);
+        Assert.Contains("deleted or moved", report.RawOutput);
+        Assert.Contains("src/Alpha/Alpha.csproj", report.RawOutput);
     }
 
     [Fact]
@@ -1412,6 +1456,9 @@ public sealed class RequiredBuildGateTests : IDisposable
         // operators can see why the build gate could not run. A regression
         // that dropped this branch (e.g. by treating any Unavailable as
         // "do not persist") would let infra-degradation findings vanish.
+        // The report must ALSO carry a distinct Unavailable finding so that
+        // "auditor could not run" does not look like a clean pass in
+        // audit-report views (worstSeverity=none would hide the failure).
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateUnavailableDotnetAsync();
@@ -1444,7 +1491,11 @@ public sealed class RequiredBuildGateTests : IDisposable
             captureStore.Reports,
             r => r.AuditorName == RequiredBuildGateIdentity.AuditorName);
         Assert.Equal("shell", report.AuditorKind);
-        Assert.Empty(report.Findings);
+        Assert.Equal(AuditSeverity.Error.ToString(), report.WorstSeverity);
+        var finding = Assert.Single(report.Findings);
+        Assert.Equal(AuditSeverity.Error.ToString(), finding.Severity);
+        Assert.Contains("unavailable", finding.Title, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("failed:", finding.Title, StringComparison.OrdinalIgnoreCase);
         Assert.NotNull(report.RawOutput);
         Assert.Contains("dotnet is not available", report.RawOutput);
     }
@@ -2188,6 +2239,25 @@ public sealed class RequiredBuildGateTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(solo, "Solo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
         await TestSupport.RunGit(repoPath, "add", "src/Solo/Solo.csproj");
         await TestSupport.RunGit(repoPath, "commit", "-m", "add solo csproj (no solution)");
+    }
+
+    /// <summary>
+    /// Adds two non-test .csproj files at the repo root (no .slnx/.sln), so
+    /// deleting one and keeping the other leaves <c>workHasMarkers=true</c>.
+    /// The csproj-only-repo arm of the build script would then silently build
+    /// only the remaining project unless the marker-preservation rule treats
+    /// every base .csproj as required in that mode.
+    /// </summary>
+    private static async Task AddTwoNonTestCsprojOnlyMarkersAsync(string repoPath)
+    {
+        var first = Path.Combine(repoPath, "src", "Alpha");
+        var second = Path.Combine(repoPath, "src", "Beta");
+        Directory.CreateDirectory(first);
+        Directory.CreateDirectory(second);
+        await File.WriteAllTextAsync(Path.Combine(first, "Alpha.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        await File.WriteAllTextAsync(Path.Combine(second, "Beta.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        await TestSupport.RunGit(repoPath, "add", "src/Alpha/Alpha.csproj", "src/Beta/Beta.csproj");
+        await TestSupport.RunGit(repoPath, "commit", "-m", "add two non-test csprojs (no solution)");
     }
 
     private async Task CommitToBareBranchAsync(

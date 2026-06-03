@@ -317,19 +317,38 @@ internal sealed class RequiredBuildGate
 
     private static AuditResult ToAuditResult(RequiredBuildVerificationResult result)
     {
-        var isFailure = result.Status == RequiredBuildVerificationStatus.Failed;
-        var findings = isFailure
-            ? new AuditFinding[]
+        // Failed: real build breakage on the branch — Error finding, fails the report.
+        // Unavailable: the auditor could not execute the build (dotnet missing,
+        // no target after marker detection, etc.). The work item separately
+        // fails with failureKind=infrastructure, but the persisted report must
+        // not look clean — otherwise operators reading audit-report views
+        // cannot tell "auditor could not run" from a real pass. Emit a clear
+        // Error finding with a distinct title so the two cases are
+        // distinguishable in the report.
+        var findings = result.Status switch
+        {
+            RequiredBuildVerificationStatus.Failed => new AuditFinding[]
             {
                 new(
                     AuditorName: RequiredBuildGateIdentity.AuditorName,
                     Severity: AuditSeverity.Error,
                     Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
                     Description: $"Required build exited with code {result.ExitCode}."),
-            }
-            : Array.Empty<AuditFinding>();
+            },
+            RequiredBuildVerificationStatus.Unavailable => new AuditFinding[]
+            {
+                new(
+                    AuditorName: RequiredBuildGateIdentity.AuditorName,
+                    Severity: AuditSeverity.Error,
+                    Title: $"required build unavailable: {RequiredBuildGateIdentity.DisplayCommand}",
+                    Description: result.Reason
+                        ?? $"Required build auditor could not execute (exit {result.ExitCode})."),
+            },
+            _ => Array.Empty<AuditFinding>(),
+        };
+        var passed = result.Status == RequiredBuildVerificationStatus.Passed;
         return new AuditResult(
-            Passed: !isFailure,
+            Passed: passed,
             Findings: findings,
             RawOutput: string.IsNullOrEmpty(result.Output) ? null : result.Output);
     }

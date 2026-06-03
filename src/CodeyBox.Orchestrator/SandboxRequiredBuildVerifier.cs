@@ -146,8 +146,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             // Removing any of these from the work branch must downgrade neither
             // the gate's applicability nor its outcome.
             var workPathSet = new HashSet<string>(workPaths, StringComparer.Ordinal);
+            // When base carries no solution file, the build script falls back
+            // to building every .csproj it finds, so every base .csproj is
+            // load-bearing — deleting any one (test or production) silently
+            // narrows the gate. When a solution exists, the .sln itself
+            // references each project and a missing csproj would surface as
+            // a build failure through the solution.
+            var baseHasAnySolution = basePaths.Any(IsSolutionPath);
             var missingRequired = basePaths
-                .Where(IsRequiredBaseMarkerPath)
+                .Where(p => IsRequiredBaseMarkerPath(p, baseHasAnySolution))
                 .Where(p => !workPathSet.Contains(p))
                 .ToArray();
 
@@ -442,16 +449,17 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
     /// <summary>
     /// "Required" base markers are the ones whose deletion from the work branch
-    /// would silently narrow the build gate: any <c>.sln</c>/<c>.slnx</c>
-    /// solution file (at any depth) and any test project (filename prefixed with
-    /// <c>test</c>, or any <c>.csproj</c> under a <c>test</c>/<c>tests</c>
-    /// directory). If the base branch carries these, the work branch must
-    /// preserve them — keeping a trivial leaf project around must not be enough
-    /// to bypass the gate. Nested solution files are protected too because the
-    /// build script falls back to building any remaining .csproj if every .sln
-    /// has been removed.
+    /// would silently narrow the build gate. Always required: any
+    /// <c>.sln</c>/<c>.slnx</c> solution file (at any depth) and any test
+    /// project (filename prefixed with <c>test</c>, or any <c>.csproj</c> under
+    /// a <c>test</c>/<c>tests</c> directory). Additionally required when the
+    /// base carries no solution file: every base <c>.csproj</c>, because the
+    /// build script then falls back to building each one and dropping any
+    /// production project would silently narrow the build surface. With a
+    /// solution present, non-test projects are protected by the .sln itself
+    /// (a referenced project that goes missing fails the solution build).
     /// </summary>
-    private static bool IsRequiredBaseMarkerPath(string path)
+    private static bool IsRequiredBaseMarkerPath(string path, bool baseHasSolution)
     {
         if (!TrySplitMarkerSegments(path, out var segments))
             return false;
@@ -467,6 +475,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         if (!lowerFileName.EndsWith(".csproj", StringComparison.Ordinal))
             return false;
 
+        if (!baseHasSolution)
+            return true;
+
         if (lowerFileName.StartsWith("test", StringComparison.Ordinal))
             return true;
 
@@ -480,6 +491,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         }
 
         return false;
+    }
+
+    private static bool IsSolutionPath(string path)
+    {
+        if (!TrySplitMarkerSegments(path, out var segments))
+            return false;
+
+        var fileName = segments[^1];
+        return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TrySplitMarkerSegments(string path, out string[] segments)
