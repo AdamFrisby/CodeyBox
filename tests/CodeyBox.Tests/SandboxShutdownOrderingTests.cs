@@ -293,6 +293,33 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_StopMode_StopsSandboxWhoseWorkItemWasDeleted()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+        await _store.DeleteRowForTestAsync(item.Id);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-deleted-work-item-stop");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.SuspendAllAsync();
+
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Stop mode must still tear down a snapshotted sandbox when its work item row was already deleted");
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.DisposeCalled);
+        Assert.Equal(1, provider.SnapshotCalls);
+        Assert.Null(await _store.GetAsync(item.Id));
+    }
+
+    [Fact]
     public async Task ShutdownHandler_StopMode_DefersWorkingWithoutCheckpointToPipelineRunner()
     {
         // Working recovery requires a preempt checkpoint. The lifecycle service
