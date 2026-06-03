@@ -165,6 +165,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // the durable queue for any currently eligible work.
     private static readonly WorkItemId SlotReleasedDispatchWakeId =
         new(new Guid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+    private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
 
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
@@ -448,6 +449,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return false;
         }
 
+        // Do not emit the generic dispatch wake from recovery release. The
+        // watchdog calls this before it updates or parks the durable item row,
+        // and an early queue rescan can redispatch stale worker-owned state.
         if (!ReleaseWorkerSlotLease(lease))
             return false;
 
@@ -478,33 +482,43 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         Interlocked.Decrement(ref _currentlyRunning);
         AuditLog.WorkerPoolWorkerFinished(lease.WorkerIndex, lease.WorkItemId);
         TryReleaseConcurrencyGate();
-        EnqueueSlotReleasedDispatchWake(lease);
         return true;
     }
 
-    private void EnqueueSlotReleasedDispatchWake(WorkerSlotLease lease)
+    private async ValueTask ReleaseCompletedWorkerSlotLeaseAsync(WorkerSlotLease lease, CancellationToken ct)
     {
-        try
+        if (!ReleaseWorkerSlotLease(lease))
+            return;
+
+        await EnqueueSlotReleasedDispatchWakeAsync(lease, ct);
+    }
+
+    private async ValueTask EnqueueSlotReleasedDispatchWakeAsync(WorkerSlotLease lease, CancellationToken ct)
+    {
+        // Use the generic rescan token rather than the completed item id:
+        // item-specific kicks clear _deferredItems as retry-now signals.
+        var attempt = 0;
+        while (true)
         {
-            // Use the generic rescan token rather than the completed item id:
-            // item-specific kicks clear _deferredItems as retry-now signals.
-            var wakeTask = _queue.EnqueueAsync(SlotReleasedDispatchWakeId, CancellationToken.None);
-            if (!wakeTask.IsCompletedSuccessfully)
+            try
             {
-                wakeTask.AsTask().ContinueWith(
-                    t => _log.LogDebug(
-                        t.Exception,
-                        "Worker pool: slot-release wake-up kick faulted for work item {WorkItemId}",
-                        lease.WorkItemId),
-                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                await _queue.EnqueueAsync(SlotReleasedDispatchWakeId, ct);
+                return;
             }
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(
-                ex,
-                "Worker pool: slot-release wake-up kick threw synchronously for work item {WorkItemId}",
-                lease.WorkItemId);
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                _log.LogError(
+                    ex,
+                    "Worker pool: required slot-release wake-up kick failed for work item {WorkItemId} on attempt {Attempt}; retrying",
+                    lease.WorkItemId,
+                    attempt);
+                await Task.Delay(SlotReleasedDispatchWakeRetryDelay, ct);
+            }
         }
     }
 
@@ -692,7 +706,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
                 finally
                 {
-                    ReleaseWorkerSlotLease(slotLease);
+                    await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, stoppingToken);
                 }
             });
 

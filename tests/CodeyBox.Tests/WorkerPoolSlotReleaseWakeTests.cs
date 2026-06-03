@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -8,6 +9,7 @@ namespace CodeyBox.Tests;
 public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 {
     private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan NoDispatchQuietPeriod = TimeSpan.FromMilliseconds(500);
 
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-slot-release-wake-{Guid.NewGuid():N}.db");
@@ -93,12 +95,12 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
             "The slot-release wake should be consumed as a generic rescan.");
 
-        await Task.Delay(500);
-
         Assert.True(
             svc.IsDeferredForTest(deferred.Id),
             "A generic slot-release wake must not clear deferred items as retry-now signals.");
-        Assert.False(pipeline.HasEntered(deferred.Id));
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(deferred.Id, NoDispatchQuietPeriod),
+            "The deferred item should remain quiet long enough to prove the generic wake was not treated as retry-now.");
 
         await svc.StopAsync(CancellationToken.None);
     }
@@ -135,11 +137,19 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await WaitUntilAsync(() => queue.TotalEnqueueCount >= 2, DispatchWaitTimeout),
             "The slot-release wake should be enqueued even when the queue is paused.");
 
-        await Task.Delay(500);
-
-        Assert.False(pipeline.HasEntered(readyBacklog.Id));
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
+            "The paused queue should hold the slot-release wake without dispatching during the quiet period.");
         var stored = await _store.GetAsync(readyBacklog.Id);
         Assert.Equal(WorkItemState.Queued, stored!.State);
+
+        await controller.ResumeAsync();
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
+            "The paused branch should preserve the slot-release wake so resume picks up the ready backlog.");
+
+        pipeline.Release(readyBacklog.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(readyBacklog.Id, DispatchWaitTimeout));
 
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await svc.StopAsync(stopCts.Token);
@@ -182,9 +192,9 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
             "The slot-release wake should be delivered to the loop and suppressed by IsDispatchPaused.");
 
-        await Task.Delay(500);
-
-        Assert.False(pipeline.HasEntered(readyBacklog.Id));
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
+            "The shutdown dispatch gate should suppress the delivered slot-release wake during the quiet period.");
         var stored = await _store.GetAsync(readyBacklog.Id);
         Assert.Equal(WorkItemState.Queued, stored!.State);
 
@@ -192,11 +202,10 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Theory]
-    [InlineData(EnqueueFailureMode.ThrowSynchronously, "threw synchronously")]
-    [InlineData(EnqueueFailureMode.FaultAsynchronously, "faulted")]
-    public async Task SlotReleaseWake_EnqueueFailure_DoesNotFaultWorkerOrHostedService(
-        EnqueueFailureMode failureMode,
-        string expectedLogText)
+    [InlineData(EnqueueFailureMode.ThrowSynchronously)]
+    [InlineData(EnqueueFailureMode.FaultAsynchronously)]
+    public async Task SlotReleaseWake_EnqueueFailure_RetriesUntilWakeIsDelivered(
+        EnqueueFailureMode failureMode)
     {
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
@@ -210,8 +219,11 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
         await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
 
-        var running = MakeItem(DateTimeOffset.UtcNow);
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(now);
+        var readyBacklog = MakeItem(now.AddMilliseconds(1));
         await _store.CreateAsync(running);
+        await _store.CreateAsync(readyBacklog);
         await queue.EnqueueAsync(running.Id);
 
         Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
@@ -223,11 +235,65 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.True(
             await WaitUntilAsync(
                 () => logger.Entries.Any(e =>
-                    e.Message.Contains("slot-release wake-up kick", StringComparison.Ordinal)
-                    && e.Message.Contains(expectedLogText, StringComparison.Ordinal)),
+                    e.Level == LogLevel.Error
+                    && e.Exception is InvalidOperationException
+                    && e.Message.Contains("required slot-release wake-up kick failed", StringComparison.Ordinal)),
                 DispatchWaitTimeout),
-            "A slot-release enqueue failure should be caught and logged without faulting the worker task.");
+            "A slot-release enqueue failure should be logged as an invariant failure before retrying.");
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
+            "The ready backlog should remain parked while the wake enqueue keeps failing.");
 
+        queue.FailureMode = EnqueueFailureMode.None;
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
+            "The retry loop should deliver the slot-release wake once the queue accepts writes again.");
+
+        pipeline.Release(readyBacklog.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(readyBacklog.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RecoveredSlotRelease_DoesNotEmitWakeBeforeRecoveryStateTransition()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var workerRegistry = new SqliteWorkerRegistry(_dbPath, NullLogger<SqliteWorkerRegistry>.Instance);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            workerRegistry: workerRegistry,
+            deadWorkerOpts: new DeadWorkerOptions());
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(createdAt: now);
+        var readyBacklog = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(running);
+        await _store.CreateAsync(readyBacklog);
+        await queue.EnqueueAsync(running.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+        var worker = await WaitForWorkerRegistrationAsync(workerRegistry, running.Id, DispatchWaitTimeout);
+        Assert.NotNull(worker);
+
+        Assert.True(svc.TryReleaseRecoveredWorkerSlot(
+            worker!.WorkerId,
+            running.Id,
+            "test recovery release while durable row is still worker-owned"));
+
+        Assert.Equal(0, queue.SlotReleaseWakeEnqueueCount);
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
+            "Recovery release must not emit a generic wake before the recovery path updates or parks the item.");
+
+        pipeline.Release(running.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -251,6 +317,26 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await Task.Delay(25);
         }
         return predicate();
+    }
+
+    private static async Task<WorkerRegistration?> WaitForWorkerRegistrationAsync(
+        IWorkerRegistry registry,
+        WorkItemId workItemId,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var worker = (await registry.ListAsync())
+                .FirstOrDefault(w => w.CurrentWorkItemId == workItemId.ToString());
+            if (worker is not null)
+                return worker;
+
+            await Task.Delay(25);
+        }
+
+        return (await registry.ListAsync())
+            .FirstOrDefault(w => w.CurrentWorkItemId == workItemId.ToString());
     }
 
     private sealed class ObservedTaskQueue : ITaskQueue
@@ -285,6 +371,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         public int TotalEnqueueCount => _enqueued.Count;
         public int CompletedDequeueCount => _dequeued.Count;
         public int DequeueCallCount => Volatile.Read(ref _dequeueCalls);
+        public int SlotReleaseWakeEnqueueCount => _enqueued.Count(OrchestratorService.IsSlotReleasedDispatchWakeForTest);
 
         public int EnqueueCount(WorkItemId id)
         {

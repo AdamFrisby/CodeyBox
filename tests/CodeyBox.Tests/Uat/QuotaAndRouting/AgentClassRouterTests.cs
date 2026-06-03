@@ -373,7 +373,6 @@ public sealed class AgentClassRouterTests : IDisposable
         public TaskCompletionSource<WorkItemId> SecondWorkItemEnqueue { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public WorkItemId[] EnqueuedIds => _enqueued.ToArray();
         public WorkItemId[] WorkItemEnqueuedIds => _enqueued
             .Where(id => !OrchestratorService.IsSlotReleasedDispatchWakeForTest(id))
             .ToArray();
