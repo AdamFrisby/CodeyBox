@@ -207,7 +207,7 @@ public sealed class HostShutdownTimeoutWiringTests
             ProjectId = new ProjectId("test"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
         };
         await store.CreateAsync(item);
@@ -242,7 +242,7 @@ public sealed class HostShutdownTimeoutWiringTests
             ProjectId = new ProjectId("test"),
             Title = "t",
             Prompt = "p",
-            State = WorkItemState.Working,
+            State = WorkItemState.Auditing,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
         };
         await store.CreateAsync(item);
@@ -252,8 +252,9 @@ public sealed class HostShutdownTimeoutWiringTests
 
         await shutdownService.StoppingAsync(CancellationToken.None);
 
-        // Stop mode is the default and must perform the non-RAM stop/preserve
-        // teardown instead of silently returning.
+        // Stop mode is the default and must perform non-RAM stop/preserve
+        // teardown for recoverable phases that do not need a new preempt
+        // checkpoint.
         Assert.False(sandbox.SuspendCalled);
         Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(sandbox.DisposeCalled);

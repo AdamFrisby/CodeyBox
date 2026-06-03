@@ -188,6 +188,41 @@ public sealed class HostShutdownCancellationTests : IDisposable
     }
 
     [Fact]
+    public async Task HostShutdown_StopAndPreserveTimeout_LeavesCheckpointedItemRecoverable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            logger: logger,
+            sandboxProvider: new PreserveCancelingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance)));
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+        Assert.Contains("preserving the sandbox failed", thrown.ToString());
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        Assert.Null(final.FailureKind);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("Timed out preserving sandbox", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task HostShutdown_PreemptHookTimeout_StillCreatesCheckpoint()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1123,6 +1158,47 @@ internal sealed class PreserveFailingSandbox : IPreemptibleSandbox
 
     public Task StopAndPreserveAsync(CancellationToken ct = default)
         => throw new InvalidOperationException("injected preserve failure");
+}
+
+internal sealed class PreserveCancelingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public PreserveCancelingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PreserveCancelingSandbox(await _inner.CreateAsync(spec, ct));
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class PreserveCancelingSandbox : IPreemptibleSandbox
+{
+    private readonly ISandbox _inner;
+
+    public PreserveCancelingSandbox(ISandbox inner)
+    {
+        _inner = inner;
+    }
+
+    public string Id => _inner.Id;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => _inner.ExecAsync(exec, ct);
+
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+        => throw new OperationCanceledException("injected preserve timeout", ct);
 }
 
 /// <summary>

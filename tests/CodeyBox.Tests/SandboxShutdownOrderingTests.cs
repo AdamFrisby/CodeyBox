@@ -258,9 +258,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     public async Task ShutdownHandler_StopMode_StopsAndPreservesActiveSandbox()
     {
         // Stop is the default anti-suspend-wedge mode, but the shutdown lifecycle
-        // service must actually perform the stop/preserve teardown. A no-op
-        // Stop branch reports success while leaving the live VM running.
-        var item = MakeItem();
+        // service must actually perform stop/preserve teardown for states whose
+        // recovery does not depend on PipelineRunner creating a preempt ref.
+        var item = MakeItem(WorkItemState.Auditing);
         await _store.CreateAsync(item);
 
         var provider = new OrderingFakeProvider();
@@ -280,15 +280,47 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         Assert.False(sandbox.DisposeCalled,
             "Stop mode must not delete/purge the sandbox");
         Assert.True(sandbox.OwnedByShutdownHandler,
-            "Stop mode must claim the VM before stopping it so PipelineRunner does not run in-VM checkpoint commands against a stopped sandbox");
-        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.StopAndPreserveOrder,
-            "Stop mode must mark shutdown ownership before stop/preserve begins");
+            "Stop mode must claim the VM after a successful stop so PipelineRunner does not run in-VM commands against a stopped sandbox");
+        Assert.True(sandbox.StopAndPreserveOrder > 0 && sandbox.MarkOwnedOrder > sandbox.StopAndPreserveOrder,
+            "Stop mode must not mark shutdown ownership until stop/preserve succeeds");
         Assert.Equal(1, provider.SnapshotCalls);
         // Stop mode does not persist SuspendedVmName; that field is reserved for
         // opt-in RAM-snapshot suspend/resume.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.PreemptedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_DefersWorkingWithoutCheckpointToPipelineRunner()
+    {
+        // Working recovery requires a preempt checkpoint. The lifecycle service
+        // cannot create that checkpoint because it does not own the active agent
+        // runner or its preempt hook, so Stop mode must leave this VM running
+        // for PipelineRunner's host-shutdown catch block.
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new SuspendOnlyOrderingFakeSandbox("vm-working-stop-defer");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.SuspendAllAsync();
+
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.DisposeCalled,
+            "Stop mode must not dispose a Working VM before PipelineRunner creates its preempt checkpoint");
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path for Working items without a checkpoint");
+        Assert.Equal(1, provider.SnapshotCalls);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.PreemptCheckpoint);
         Assert.Null(after.PreemptedAt);
     }
 
@@ -320,17 +352,17 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
 
         Assert.False(sandbox.SuspendCalled,
             "shutdown must not use the startup SandboxTeardownMode after a hot reload");
-        Assert.True(sandbox.StopAndPreserveCalled,
-            "hot-reloaded Stop mode must stop/preserve active sandboxes");
-        Assert.True(sandbox.OwnedByShutdownHandler,
-            "hot-reloaded Stop mode must claim the VM before stopping it");
+        Assert.False(sandbox.StopAndPreserveCalled,
+            "hot-reloaded Stop mode must leave Working checkpoint recovery to PipelineRunner");
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "hot-reloaded Stop mode must not suppress PipelineRunner's checkpoint path");
         Assert.Equal(1, provider.SnapshotCalls);
     }
 
     [Fact]
     public async Task ShutdownHandler_StopMode_CancelsHungStopAtNonSuspendTimeout()
     {
-        var item = MakeItem();
+        var item = MakeItem(WorkItemState.Auditing);
         await _store.CreateAsync(item);
 
         var provider = new OrderingFakeProvider();
@@ -351,28 +383,41 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         Assert.Equal(TimeSpan.FromMilliseconds(25), svc.NonSuspendTeardownTimeout);
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.PreemptCheckpoint);
-        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.OwnedByShutdownHandler,
+            "a timed-out stop/preserve must not suppress any later recovery path");
     }
 
     [Fact]
-    public async Task ShutdownHandler_DefaultConstructorTeardownMode_IsStop()
+    public void ShutdownHandler_RequiresExplicitTeardownModeOrAccessor()
     {
-        var item = MakeItem();
+        var provider = new OrderingFakeProvider();
+
+        Assert.Throws<ArgumentException>(() => new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance));
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_DisposesNonPreemptibleRecoverableSandbox()
+    {
+        var item = MakeItem(WorkItemState.Auditing);
         await _store.CreateAsync(item);
 
         var provider = new OrderingFakeProvider();
-        var sandbox = new OrderingFakeSandbox("vm-default-stop");
+        var sandbox = new SuspendOnlyOrderingFakeSandbox("vm-stop-dispose-fallback");
         provider.Register(item.Id, sandbox);
 
         var svc = new SandboxSuspendOnShutdownService(
             provider, _store,
-            NullLogger<SandboxSuspendOnShutdownService>.Instance);
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
 
         await svc.SuspendAllAsync();
 
-        Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(sandbox.SuspendCalled);
-        Assert.False(sandbox.DisposeCalled);
+        Assert.True(sandbox.DisposeCalled,
+            "Stop mode must still tear down recoverable active sandboxes that do not implement IPreemptibleSandbox");
+        Assert.True(sandbox.OwnedByShutdownHandler);
         Assert.Equal(1, provider.SnapshotCalls);
     }
 
@@ -1024,6 +1069,34 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         }
     }
 
+    private sealed class SuspendOnlyOrderingFakeSandbox : ISuspendableSandbox
+    {
+        public SuspendOnlyOrderingFakeSandbox(string id) { Id = id; }
+
+        public string Id { get; }
+        public bool SuspendCalled { get; private set; }
+        public bool DisposeCalled { get; private set; }
+        public bool OwnedByShutdownHandler { get; private set; }
+        public bool IsOwnedByShutdownHandler => OwnedByShutdownHandler;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalled = true;
+            return ValueTask.CompletedTask;
+        }
+
+        public Task SuspendAsync(CancellationToken ct = default)
+        {
+            SuspendCalled = true;
+            return Task.CompletedTask;
+        }
+
+        public void MarkOwnedByShutdownHandler() => OwnedByShutdownHandler = true;
+    }
+
     private sealed class ReconcilingFakeProvider : ISandboxProvider, ISuspendingSandboxProvider
     {
         private readonly List<ManagedSandboxInfo> _managed = new();
@@ -1155,7 +1228,7 @@ public sealed class SandboxShutdownProgramWiringTests
         Assert.False(sandbox.SuspendCalled,
             "Program.cs must not capture the startup SandboxTeardownMode in the hosted-service registration");
         Assert.True(sandbox.StopAndPreserveCalled,
-            "hot-reloaded Stop mode must stop/preserve active sandboxes");
+            "hot-reloaded Stop mode must stop/preserve recoverable active sandboxes");
         Assert.True(factory.DispatchGate.IsDispatchPaused,
             "Program.cs must wire the shutdown service to read the current IOptionsMonitor value at teardown time");
     }
@@ -1166,7 +1239,7 @@ public sealed class SandboxShutdownProgramWiringTests
         ProjectId = new ProjectId("test"),
         Title = "t",
         Prompt = "p",
-        State = WorkItemState.Working,
+        State = WorkItemState.Auditing,
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
 

@@ -24,8 +24,9 @@ public enum SandboxTeardownMode
     Suspend = 0,
 
     /// <summary>
-    /// Clean stop/preserve through the shutdown teardown service: avoids
-    /// <c>multipass suspend</c> entirely and calls <c>multipass stop</c> through
+    /// Clean stop/preserve without <c>multipass suspend</c>. Working items that
+    /// still need a preempt checkpoint stay owned by <c>PipelineRunner</c>;
+    /// other recoverable active sandboxes are stopped through
     /// <c>IPreemptibleSandbox.StopAndPreserveAsync</c>. Far less likely to wedge
     /// multipassd than suspend (no RAM snapshot, qemu shuts down cleanly and
     /// releases the disk-image lock). This is the <c>ShutdownOptions</c> default.

@@ -1984,8 +1984,9 @@ builder.Services.AddHostedService(sp =>
 });
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
 // operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
-// bookkeeping so the next process can reattach; Stop is the default and stops /
-// preserves active VMs instead of taking the unreliable RAM-snapshot path.
+// bookkeeping so the next process can reattach; Stop is the default and avoids
+// the unreliable RAM-snapshot path while preserving PipelineRunner's checkpoint
+// recovery path for active work.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
 // to background mode so a wedged multipassd cannot keep Kestrel offline;
 // OrchestratorService waits for startup recovery input before its dead-worker

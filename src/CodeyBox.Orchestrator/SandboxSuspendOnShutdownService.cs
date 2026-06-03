@@ -11,15 +11,18 @@ namespace CodeyBox.Orchestrator;
 /// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
 /// orchestrator process can <c>multipass start</c> the same VM and re-tail the
 /// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
-/// resume half). Stop avoids the RAM snapshot by stopping and preserving the VM
-/// via <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Dispose is a
+/// resume half). Stop avoids the RAM snapshot. It leaves Working items that
+/// still need a preempt checkpoint to <see cref="PipelineRunner"/>, and
+/// stop/preserves other recoverable active VMs via
+/// <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Dispose is a
 /// destructive teardown mode with no recovery artifact.
 ///
 /// <para>This sits alongside — not on top of — the existing per-phase
 /// preempt-checkpoint flow in <see cref="PipelineRunner"/>. All teardown modes
 /// use the same active-sandbox snapshot after dispatch has paused. Suspend is
 /// an opt-in state-preservation path for operators who accept the RAM-snapshot
-/// tradeoff; Stop preserves the VM without RAM state; Dispose is destructive.</para>
+/// tradeoff; Stop avoids RAM snapshots while preserving PipelineRunner's
+/// checkpoint recovery path; Dispose is destructive.</para>
 ///
 /// <para>Implements <see cref="IHostedLifecycleService.StoppingAsync"/> rather
 /// than registering a synchronous callback on
@@ -89,12 +92,13 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
     // directly don't need to hand in a gate.
     private readonly IShutdownDispatchGate? _dispatchGate;
-    // R8.1: ephemeral worker VMs can be handled by Stop (default; stop/preserve
-    // without taking a RAM snapshot), Suspend (opt-in; preserves in-RAM agent
-    // state across restart but can wedge multipassd if interrupted), or Dispose
-    // (delete --purge, full teardown — no suspended-resume bookkeeping is
-    // written). Resolved at teardown time so operator config hot-reload takes
-    // effect on the next graceful shutdown.
+    // R8.1: ephemeral worker VMs can be handled by Stop (default; use
+    // PipelineRunner's preempt-checkpoint flow for Working items, otherwise
+    // stop/preserve without taking a RAM snapshot), Suspend (opt-in; preserves
+    // in-RAM agent state across restart but can wedge multipassd if interrupted),
+    // or Dispose (delete --purge, full teardown — no suspended-resume
+    // bookkeeping is written). Resolved at teardown time so operator config
+    // hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
     public SandboxSuspendOnShutdownService(
@@ -106,7 +110,7 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         TimeSpan? perGiBSuspendBudget = null,
         TimeSpan? nonSuspendTeardownTimeout = null,
         IShutdownDispatchGate? dispatchGate = null,
-        SandboxTeardownMode teardownMode = SandboxTeardownMode.Stop,
+        SandboxTeardownMode? teardownMode = null,
         Func<SandboxTeardownMode>? teardownModeAccessor = null)
     {
         _provider = provider;
@@ -117,7 +121,20 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
         _nonSuspendTeardownTimeout = nonSuspendTeardownTimeout is { } n && n > TimeSpan.Zero ? n : DefaultNonSuspendTeardownTimeout;
         _dispatchGate = dispatchGate;
-        _teardownModeAccessor = teardownModeAccessor ?? (() => teardownMode);
+        if (teardownModeAccessor is not null)
+        {
+            _teardownModeAccessor = teardownModeAccessor;
+        }
+        else if (teardownMode is { } fixedTeardownMode)
+        {
+            _teardownModeAccessor = () => fixedTeardownMode;
+        }
+        else
+        {
+            throw new ArgumentException(
+                "Provide teardownModeAccessor from bound ShutdownOptions, or pass an explicit teardownMode for tests.",
+                nameof(teardownMode));
+        }
     }
 
     /// <summary>The dispatch-pause-was-called signal as observed by SuspendAllAsync.</summary>
@@ -244,24 +261,35 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
 
     /// <summary>
     /// Teardown via stop/preserve. Avoids the RAM snapshot that makes
-    /// <c>multipass suspend</c> risky, while also avoiding delete/purge.
+    /// <c>multipass suspend</c> risky. Falls back to dispose only when a
+    /// recoverable sandbox lacks stop/preserve support.
     /// </summary>
     private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
-        if (sandbox is not IPreemptibleSandbox preemptible)
+        var item = await _store.GetAsync(workItemId, CancellationToken.None);
+        if (item is not null && RequiresPipelinePreemptCheckpoint(item))
         {
-            _log.LogWarning(
-                "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the sandbox does not support stop/preserve",
+            _log.LogInformation(
+                "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the work phase still needs PipelineRunner's preempt checkpoint; leaving it running for host-shutdown recovery",
                 workItemId, sandbox.Id);
             return;
         }
 
-        sandbox.MarkOwnedByShutdownHandler();
+        if (sandbox is not IPreemptibleSandbox preemptible)
+        {
+            _log.LogWarning(
+                "Stop teardown selected for work item {WorkItemId} sandbox {SandboxId}, but the sandbox does not support stop/preserve; falling back to dispose",
+                workItemId, sandbox.Id);
+            await DisposeOneAsync(workItemId, sandbox);
+            return;
+        }
+
         var timeout = NonSuspendTeardownTimeout;
         using var timeoutCts = new CancellationTokenSource(timeout);
         try
         {
             await preemptible.StopAndPreserveAsync(timeoutCts.Token).WaitAsync(timeoutCts.Token);
+            sandbox.MarkOwnedByShutdownHandler();
             AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
         }
         catch (OperationCanceledException)
@@ -277,6 +305,10 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
                 workItemId, sandbox.Id);
         }
     }
+
+    private static bool RequiresPipelinePreemptCheckpoint(WorkItem item) =>
+        item.State == WorkItemState.Working
+        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
     /// <summary>
     /// Teardown via dispose (delete --purge). Skips the preserve-on-dispose
