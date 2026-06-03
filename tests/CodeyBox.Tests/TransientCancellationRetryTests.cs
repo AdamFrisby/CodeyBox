@@ -203,7 +203,8 @@ public sealed class TransientCancellationRetryTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             taskQueue: queue,
-            orchestratorOptions: new OrchestratorOptions { MaxTransientCancelRetries = maxRetries });
+            orchestratorOptions: new OrchestratorOptions { MaxTransientCancelRetries = maxRetries },
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TransientHarness(pipeline, store, gitHost, agent, queue);
     }

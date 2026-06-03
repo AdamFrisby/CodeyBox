@@ -69,7 +69,8 @@ internal static class PipelineLifecycleUatHelpers
                 AgentAllowedHosts = [],
                 UpstreamPushBackoff = TimeSpan.Zero,
             },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new UatPipelineContext(pipeline, store, agent, gitHost, gitRoot, webhooks);
     }

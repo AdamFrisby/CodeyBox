@@ -191,7 +191,8 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
             timingStore: null,
             costStore: costStore,
             costExtractors: extractors,
-            costCalculator: calculator);
+            costCalculator: calculator,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

@@ -288,7 +288,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            inVmSmokeGate: prober);
+            inVmSmokeGate: prober,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = new WorkItem
         {
@@ -380,7 +381,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             }),
-            availability: availability);
+            availability: availability,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability);
     }

@@ -187,7 +187,8 @@ public sealed class QuotaFallthroughTests : IDisposable
             smokeGate: null,
             suggestions: null,
             auditQuotaProbes: auditProbes,
-            auditQuotaOptions: quotaOptions);
+            auditQuotaOptions: quotaOptions,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new QuotaTestPipeline(pipeline, store, claudeAgent, webhooks);
     }

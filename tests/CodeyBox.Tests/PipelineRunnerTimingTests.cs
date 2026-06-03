@@ -251,7 +251,8 @@ public sealed class PipelineRunnerTimingTests : IDisposable
                 AgentAllowedHosts = [],
             },
             NullLogger<PipelineRunner>.Instance,
-            timingStore: timingStore);
+            timingStore: timingStore,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestPipeline(pipeline, store, agent, gitHost, gitRoot);
     }

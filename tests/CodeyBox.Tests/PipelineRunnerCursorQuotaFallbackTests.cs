@@ -177,7 +177,8 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             {
                 new CursorQuotaFailureDetector(),
                 new ClaudeQuotaFailureDetector(),
-            }));
+            }),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new CursorFallbackFixture(pipeline, store, cursor, claude, cursorProbe, claudeProbe, webhooks, fallbackHistory);
     }
@@ -248,7 +249,8 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             {
                 new CursorQuotaFailureDetector(),
                 new ClaudeQuotaFailureDetector(),
-            }));
+            }),
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new CursorFallbackFixture(pipeline, store, cursor, claude, cursorProbe, claudeProbe, webhooks, fallbackHistory);
     }

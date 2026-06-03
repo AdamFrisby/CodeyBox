@@ -103,7 +103,8 @@ public sealed class StuckRecoveryTests : IDisposable
             store,
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         // Inject fast probe: zero-activity source + instant poll so the
         // threshold is hit after thresholdSamples polls (each ~1ms).
@@ -211,7 +212,8 @@ public sealed class StuckRecoveryTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored" },
-            NullLogger<PipelineRunner>.Instance);
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = new WorkItem
         {
@@ -258,4 +260,3 @@ internal sealed class TestPipelineWithStuck : IDisposable
 
     public void Dispose() => Store.Dispose();
 }
-
