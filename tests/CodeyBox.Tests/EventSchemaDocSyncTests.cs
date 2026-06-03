@@ -106,7 +106,10 @@ public sealed class EventSchemaDocSyncTests
 
         Assert.All(schema.Envelope.Values, field =>
             Assert.Equal("1.0", field.IntroducedIn));
-        Assert.All(schema.EventTypes.Values, eventType =>
-            Assert.Equal("1.0", eventType.IntroducedIn));
+        Assert.All(
+            schema.EventTypes.Where(kv => !kv.Key.StartsWith("worker_pool.", StringComparison.Ordinal)),
+            kv => Assert.Equal("1.0", kv.Value.IntroducedIn));
+        Assert.Equal("1.2", schema.EventTypes["worker_pool.stalled"].IntroducedIn);
+        Assert.Equal("1.2", schema.EventTypes["worker_pool.restart_required"].IntroducedIn);
     }
 }

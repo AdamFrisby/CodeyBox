@@ -70,7 +70,7 @@ internal static class WorkItemRecoveryPolicy
 
         var target = item.State == WorkItemState.Working
             ? WorkItemState.Queued
-            : DeadWorkerReaper.MapToRecoveryState(item.State);
+            : MapToRecoveryState(item.State);
 
         if (target is null)
             return null;
@@ -85,4 +85,26 @@ internal static class WorkItemRecoveryPolicy
             UpdatedAt = now,
         };
     }
+
+    public static bool HandlesRecoveryState(WorkItemState state)
+        => state == WorkItemState.Working || MapToRecoveryState(state) is not null;
+
+    /// <summary>
+    /// Maps a state for which a stale worker row could exist to the state the
+    /// recovery layer should redispatch it into. Mid-flight states map back to
+    /// durable resume points; phase-boundary resting states map to themselves.
+    /// Returns null for terminal, parked, or otherwise dispatcher-owned states.
+    /// </summary>
+    public static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
+    {
+        WorkItemState.Reworking => WorkItemState.Queued,
+        WorkItemState.WorkComplete => WorkItemState.WorkComplete,
+        WorkItemState.Auditing => WorkItemState.WorkComplete,
+        WorkItemState.AuditPassed => WorkItemState.AuditPassed,
+        WorkItemState.Merging => WorkItemState.AuditPassed,
+        WorkItemState.Merged => WorkItemState.Merged,
+        WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
+        WorkItemState.UpstreamPushing => WorkItemState.Merged,
+        _ => null,
+    };
 }

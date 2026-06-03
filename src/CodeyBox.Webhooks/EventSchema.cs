@@ -17,6 +17,7 @@ public static class EventSchema
     /// <summary>Current schema version. Bumped per the rules below.</summary>
     public const string CurrentVersion = WebhookEvent.CurrentSchemaVersion;
     private const string InitialVersion = "1.0";
+    private const string WorkerPoolHealthVersion = "1.2";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -48,8 +49,15 @@ public static class EventSchema
 
     private static IReadOnlyDictionary<string, EventTypeSchema> BuildEventTypes()
         => KnownEventTypes
-            .Select(name => new KeyValuePair<string, EventTypeSchema>(name, new EventTypeSchema(InitialVersion)))
+            .Select(name => new KeyValuePair<string, EventTypeSchema>(
+                name,
+                new EventTypeSchema(EventTypeIntroducedIn(name))))
             .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+
+    private static string EventTypeIntroducedIn(string name)
+        => name.StartsWith("worker_pool.", StringComparison.Ordinal)
+            ? WorkerPoolHealthVersion
+            : InitialVersion;
 
     /// <summary>
     /// Authoritative list of every event the pipeline can emit at this schema

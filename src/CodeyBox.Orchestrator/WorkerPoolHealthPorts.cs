@@ -47,9 +47,10 @@ public sealed record AgentRoutingReadiness(
 }
 
 /// <summary>
-/// Read-side routing availability probe. Implementations must avoid dispatch
-/// side effects such as slot reservation, sandbox provisioning, or quota API
-/// refreshes; this is a health-check predicate, not the authoritative router.
+/// Routing availability probe for health checks. Implementations should avoid
+/// committing dispatch side effects such as durable slot reservation, but must
+/// apply the same gates the dispatcher would apply so pool-health detection
+/// cannot drift from real routing.
 /// </summary>
 public interface IAgentRoutingReadiness
 {

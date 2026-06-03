@@ -717,6 +717,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private async Task RequeueActiveItemsForShutdownDrainTimeoutAsync(CancellationToken ct)
     {
+        var failures = new List<Exception>();
         foreach (var id in _activeItems.Keys.ToList())
         {
             WorkItem? item;
@@ -726,7 +727,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Shutdown drain recovery could not load active work item {Id}", id);
+                _log.LogError(ex, "Shutdown drain recovery could not load active work item {Id}", id);
+                failures.Add(new InvalidOperationException(
+                    $"Shutdown drain recovery could not load active work item {id}", ex));
                 continue;
             }
 
@@ -756,9 +759,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Shutdown drain recovery failed for active work item {Id}", id);
+                _log.LogError(ex, "Shutdown drain recovery failed for active work item {Id}", id);
+                failures.Add(new InvalidOperationException(
+                    $"Shutdown drain recovery failed for active work item {id}", ex));
             }
         }
+
+        if (failures.Count > 0)
+            throw new AggregateException(
+                "Shutdown drain recovery failed for one or more active work items.",
+                failures);
     }
 
     private static WorkItem? BuildGracefulShutdownRecoveryState(WorkItem item)
@@ -881,6 +891,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
             }
 
+            if (await IsBudgetBlockedForPoolHealthAsync(candidate, ct))
+                continue;
+
             result.Add(candidate);
             if (result.Count >= scanLimit)
                 break;
@@ -907,12 +920,35 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
             }
 
+            if (await IsBudgetBlockedForPoolHealthAsync(candidate, ct))
+                continue;
+
             result.Add(candidate);
             if (result.Count >= scanLimit)
                 break;
         }
 
         return result;
+    }
+
+    private async Task<bool> IsBudgetBlockedForPoolHealthAsync(WorkItem item, CancellationToken ct)
+    {
+        if (_projects is null)
+            return false;
+
+        var project = await _projects.GetAsync(item.ProjectId, ct);
+        if (project is null)
+            return false;
+
+        var defer = await CheckBudgetAsync(item, project.Budget, ct);
+        if (defer is null)
+            return false;
+
+        _log.LogDebug(
+            "Worker-pool health skip {Id}: project budget gate is active ({Reason})",
+            item.Id,
+            defer.Reason);
+        return true;
     }
 
     public async Task<int> TriggerDispatchRecoveryAsync(

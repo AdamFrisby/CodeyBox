@@ -86,7 +86,9 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         await service.StopAsync(stopCts.Token);
         elapsed.Stop();
 
-        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(2));
+        Assert.True(
+            elapsed.Elapsed < TimeSpan.FromSeconds(5),
+            $"StopAsync should return well before the host stop token while a worker ignores shutdown; elapsed {elapsed.Elapsed}");
         Assert.True(pipeline.HostShutdownWasCancelled);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));

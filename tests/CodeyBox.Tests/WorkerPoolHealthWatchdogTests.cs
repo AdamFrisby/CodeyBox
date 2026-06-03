@@ -256,17 +256,60 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task WaitingForQuotaResetCandidate_TriggersQuotaRecoverySweep()
+    public async Task WaitingForQuotaResetCandidate_WatchdogRecoveryRequeuesEvenWhenAutoRetryDisabled()
     {
-        var source = new FakePoolHealthSource
+        var parked = Item() with
         {
-            Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item() with { State = WorkItemState.WaitingForQuotaReset }],
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "test-class",
+            NextQuotaRetryAt = _time.GetUtcNow().AddHours(1),
         };
-        var quotaRecovery = new RecordingQuotaRecovery();
+        await _store.CreateAsync(parked);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "test-class",
+                    DisplayName = "Test Class",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Claude,
+                            Billing = AgentBilling.PayPerApi,
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+            [new PayPerApiQuotaProbe()],
+            new QuotaRouterOptions(),
+            NullLogger<AgentClassRouter>.Instance,
+            _time);
+        var retrier = new WorkItemRetrier(
+            _store,
+            _queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var quotaRecovery = new QuotaRetryScheduler(
+            _store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = false,
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            _projects,
+            timeProvider: _time);
         var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
+            _orchestrator,
+            _orchestrator,
             StandardOptions(),
             NullLogger<WorkerPoolHealthWatchdog>.Instance,
             _projects,
@@ -279,8 +322,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         _time.Advance(TimeSpan.FromMinutes(2));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal(1, quotaRecovery.SweepCalls);
-        Assert.Equal(0, source.EnqueueCalls);
+        var refetched = Assert.IsType<WorkItem>(await _store.GetAsync(parked.Id));
+        Assert.Equal(WorkItemState.Queued, refetched.State);
+        Assert.Equal(1, refetched.QuotaRetryAttempts);
+        Assert.Equal(1, _queue.Count);
         Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
     }
 
@@ -307,6 +352,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
         Assert.Equal(1, _queue.Count);
+        Assert.Equal(routable.Id, await _queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -324,6 +370,85 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         Assert.False(_orchestrator.IsDeferredForTest(item.Id));
         Assert.Equal(1, _queue.Count);
         Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+    }
+
+    [Fact]
+    public async Task WatchdogEvaluationFailure_EmitsCriticalRestartRequiredWebhook()
+    {
+        var source = new FakePoolHealthSource
+        {
+            ThrowOnStatus = true,
+        };
+        var watchdog = new WorkerPoolHealthWatchdog(
+            source,
+            source,
+            StandardOptions(),
+            NullLogger<WorkerPoolHealthWatchdog>.Instance,
+            _projects,
+            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
+            webhooks: _webhooks,
+            timeProvider: _time);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var evt = Assert.Single(_webhooks.Events, e => e.Event == "worker_pool.restart_required");
+        using var details = JsonDocument.Parse(JsonSerializer.Serialize(evt.Details));
+        Assert.Equal("critical", details.RootElement.GetProperty("severity").GetString());
+        Assert.Equal(
+            "worker-pool health watchdog evaluation failed",
+            details.RootElement.GetProperty("reason").GetString());
+    }
+
+    [Fact]
+    public async Task HealthCandidates_FilterUnsatisfiedDependencies()
+    {
+        var satisfiedParent = Item() with { State = WorkItemState.Done };
+        var blockedParent = Item() with { State = WorkItemState.Failed };
+        var satisfiedChild = Item() with { DependsOn = [satisfiedParent.Id], Priority = 100 };
+        var blockedChild = Item() with { DependsOn = [blockedParent.Id], Priority = 200 };
+        await _store.CreateAsync(satisfiedParent);
+        await _store.CreateAsync(blockedParent);
+        await _store.CreateAsync(satisfiedChild);
+        await _store.CreateAsync(blockedChild);
+
+        var candidates = await _orchestrator.ListRunnableCandidatesForHealthCheckAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.Contains(candidates, i => i.Id == satisfiedChild.Id);
+        Assert.DoesNotContain(candidates, i => i.Id == blockedChild.Id);
+    }
+
+    [Fact]
+    public async Task HealthCandidates_FilterBudgetBlockedWork()
+    {
+        var projects = new InMemoryProjectRepository(Project() with
+        {
+            Budget = new ProjectBudget { MaxConcurrentForProject = 1 },
+        });
+        var orchestrator = new OrchestratorService(
+            _queue,
+            _store,
+            new NoopPipeline(_store),
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: projects);
+        var inFlight = Item() with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var candidate = Item();
+        await _store.CreateAsync(inFlight);
+        await _store.CreateAsync(candidate);
+
+        var candidates = await orchestrator.ListRunnableCandidatesForHealthCheckAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(candidates, i => i.Id == candidate.Id);
+        orchestrator.Dispose();
     }
 
     [Fact]
@@ -422,14 +547,19 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         public bool DispatchPaused { get; set; }
         public bool HasAgentCapacity { get; set; } = true;
         public bool AdvanceLastSpawnOnRecovery { get; set; }
+        public bool ThrowOnStatus { get; set; }
         public WorkerPoolStatus Status { get; set; } = new(2, 0, 0, null);
         public IReadOnlyList<WorkItem> Candidates { get; set; } = [];
         public int EnqueueCalls { get; private set; }
 
         public bool IsDispatchPaused => DispatchPaused;
 
-        public Task<WorkerPoolStatus> GetStatusAsync(CancellationToken ct = default) =>
-            Task.FromResult(Status);
+        public Task<WorkerPoolStatus> GetStatusAsync(CancellationToken ct = default)
+        {
+            if (ThrowOnStatus)
+                throw new InvalidOperationException("health source failed");
+            return Task.FromResult(Status);
+        }
 
         public Task<IReadOnlyList<WorkItem>> ListPoolHealthCandidatesAsync(
             int scanLimit,
@@ -462,17 +592,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             IAgentCapacitySnapshot capacity,
             CancellationToken ct) =>
             Task.FromResult(_readiness);
-    }
-
-    private sealed class RecordingQuotaRecovery : IWorkerPoolQuotaRecovery
-    {
-        public int SweepCalls { get; private set; }
-
-        public Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
-        {
-            SweepCalls++;
-            return Task.CompletedTask;
-        }
     }
 
     private sealed class FakeQueueController : IQueueController

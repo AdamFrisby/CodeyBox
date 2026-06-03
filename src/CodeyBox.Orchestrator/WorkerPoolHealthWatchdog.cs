@@ -121,7 +121,8 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Worker-pool health watchdog evaluation failed");
+            _log.LogCritical(ex, "Worker-pool health watchdog evaluation failed");
+            await PublishWatchdogFailureAsync(ex, ct);
             return;
         }
 
@@ -397,6 +398,15 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             _log.LogWarning(ex, "Worker-pool health watchdog failed to publish {Event}", eventName);
         }
     }
+
+    private Task PublishWatchdogFailureAsync(Exception ex, CancellationToken ct)
+        => PublishAsync("worker_pool.restart_required", new
+        {
+            severity = "critical",
+            reason = "worker-pool health watchdog evaluation failed",
+            exceptionType = ex.GetType().Name,
+            message = ex.Message,
+        }, ct);
 
     private void ResetCondition()
     {
