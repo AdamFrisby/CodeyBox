@@ -318,8 +318,14 @@ internal sealed class AutoCompleteTaskQueue : ITaskQueue
             await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 
+    public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
+        => ValueTask.CompletedTask;
+
     public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         => ValueTask.FromResult<WorkItemId?>(null);
+
+    public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        => ValueTask.FromResult(false);
 }
 
 /// <summary>

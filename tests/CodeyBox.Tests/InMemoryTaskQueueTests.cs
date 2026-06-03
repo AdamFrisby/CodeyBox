@@ -16,6 +16,28 @@ public sealed class InMemoryTaskQueueTests
     }
 
     [Fact]
+    public async Task RoundTripsGenericDispatchWake()
+    {
+        var q = new InMemoryTaskQueue();
+        await q.EnqueueDispatchWakeAsync();
+
+        var got = await q.DequeueDispatchSignalAsync();
+
+        Assert.True(got);
+    }
+
+    [Fact]
+    public async Task Dequeue_ReturnsNullForGenericDispatchWake()
+    {
+        var q = new InMemoryTaskQueue();
+        await q.EnqueueDispatchWakeAsync();
+
+        var got = await q.DequeueAsync();
+
+        Assert.Null(got);
+    }
+
+    [Fact]
     public async Task Complete_ReturnsNullFromDequeue()
     {
         var q = new InMemoryTaskQueue();

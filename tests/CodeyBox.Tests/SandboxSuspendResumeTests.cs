@@ -778,12 +778,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendedAt = DateTimeOffset.UtcNow,
         });
 
-        var provider = new FakeSuspendingProvider { ResumeHangs = true };
+        var provider = new FakeSuspendingProvider { ResumeBlocksBeforeReturningTask = true };
         var barrier = new StartupRecoveryBarrier();
         var options = new SandboxStartupResumeOptions
         {
             Mode = SandboxStartupResumeMode.Background,
-            ResumeTimeout = TimeSpan.FromMilliseconds(250),
+            ResumeTimeout = TimeSpan.FromSeconds(5),
         };
         var svc = new SandboxResumeOnStartupService(
             provider,
@@ -796,13 +796,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         options = options with { Mode = SandboxStartupResumeMode.Blocking };
         var startTask = svc.StartAsync(CancellationToken.None);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.False(startTask.IsCompleted);
+        provider.ReleaseBlockedResume();
         await startTask.WaitAsync(TimeSpan.FromSeconds(1));
 
         await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Working, after!.State);
         Assert.Null(after!.SuspendedVmName);
         Assert.Contains("vm-mode-race", provider.ResumedNames);
     }

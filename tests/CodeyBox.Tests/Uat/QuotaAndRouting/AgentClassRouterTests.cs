@@ -239,13 +239,13 @@ public sealed class AgentClassRouterTests : IDisposable
         await service.StartAsync(CancellationToken.None);
         try
         {
-            var reenqueuedId = await queue.SecondEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var reenqueuedId = await queue.SecondWorkItemEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var stored = await _items.GetAsync(item.Id);
 
             Assert.Equal(item.Id, reenqueuedId);
             Assert.Equal(WorkItemState.Queued, stored!.State);
             Assert.Equal(0, pipeline.RunCount);
-            Assert.Equal([item.Id, item.Id], queue.EnqueuedIds.Take(2).ToArray());
+            Assert.Equal([item.Id, item.Id], queue.WorkItemEnqueuedIds.Take(2).ToArray());
         }
         finally
         {
@@ -366,25 +366,30 @@ public sealed class AgentClassRouterTests : IDisposable
 
     private sealed class RecordingTaskQueue : ITaskQueue
     {
-        private readonly Channel<WorkItemId> _channel = Channel.CreateUnbounded<WorkItemId>();
+        private readonly Channel<WorkItemId?> _channel = Channel.CreateUnbounded<WorkItemId?>();
         private readonly ConcurrentQueue<WorkItemId> _enqueued = new();
-        private int _enqueueCount;
+        private int _workItemEnqueueCount;
 
-        public TaskCompletionSource<WorkItemId> SecondEnqueue { get; } =
+        public TaskCompletionSource<WorkItemId> SecondWorkItemEnqueue { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public WorkItemId[] EnqueuedIds => _enqueued.ToArray();
+        public WorkItemId[] WorkItemEnqueuedIds => _enqueued.ToArray();
 
         public int Count => _channel.Reader.Count;
 
         public async ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
-            var count = Interlocked.Increment(ref _enqueueCount);
             _enqueued.Enqueue(id);
+            var count = Interlocked.Increment(ref _workItemEnqueueCount);
             if (count == 2)
-                SecondEnqueue.TrySetResult(id);
+                SecondWorkItemEnqueue.TrySetResult(id);
 
             await _channel.Writer.WriteAsync(id, ct);
+        }
+
+        public async ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
+        {
+            await _channel.Writer.WriteAsync(null, ct);
         }
 
         public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
@@ -396,6 +401,19 @@ public sealed class AgentClassRouterTests : IDisposable
             catch (ChannelClosedException)
             {
                 return null;
+            }
+        }
+
+        public async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                await _channel.Reader.ReadAsync(ct);
+                return true;
+            }
+            catch (ChannelClosedException)
+            {
+                return false;
             }
         }
     }

@@ -10,10 +10,13 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class InMemoryTaskQueue : ITaskQueue
 {
-    private readonly Channel<WorkItemId> _channel = Channel.CreateUnbounded<WorkItemId>();
+    private readonly Channel<DispatchSignal> _channel = Channel.CreateUnbounded<DispatchSignal>();
 
     public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
-        => _channel.Writer.WriteAsync(id, ct);
+        => _channel.Writer.WriteAsync(DispatchSignal.ForWorkItem(id), ct);
+
+    public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
+        => _channel.Writer.WriteAsync(DispatchSignal.GenericWake, ct);
 
     public int Count => _channel.Reader.Count;
 
@@ -21,7 +24,8 @@ public sealed class InMemoryTaskQueue : ITaskQueue
     {
         try
         {
-            return await _channel.Reader.ReadAsync(ct);
+            var signal = await _channel.Reader.ReadAsync(ct);
+            return signal.WorkItemId;
         }
         catch (ChannelClosedException)
         {
@@ -29,5 +33,24 @@ public sealed class InMemoryTaskQueue : ITaskQueue
         }
     }
 
+    public async ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await _channel.Reader.ReadAsync(ct);
+            return true;
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+    }
+
     public void Complete() => _channel.Writer.TryComplete();
+
+    private readonly record struct DispatchSignal(WorkItemId? WorkItemId)
+    {
+        public static DispatchSignal ForWorkItem(WorkItemId id) => new(id);
+        public static DispatchSignal GenericWake { get; } = new(null);
+    }
 }

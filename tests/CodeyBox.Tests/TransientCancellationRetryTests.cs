@@ -274,8 +274,14 @@ internal sealed class RecordingTaskQueue : ITaskQueue
         return ValueTask.CompletedTask;
     }
 
+    public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default)
+        => ValueTask.CompletedTask;
+
     public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         => new(_q.TryDequeue(out var id) ? id : null);
+
+    public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default)
+        => ValueTask.FromResult(_q.TryDequeue(out _));
 
     public int Count => _q.Count;
 }
