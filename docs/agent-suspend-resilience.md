@@ -1,9 +1,11 @@
 # Agent suspend resilience (R8-resilience)
 
-R8-core freezes multipass VMs on orchestrator shutdown and resumes them on
-startup. While the VM is suspended, in-flight TCP connections to LLM
-providers are torn down from the peer's perspective. Each agent CLI handles
-that freeze window differently.
+When `Shutdown.SandboxTeardownMode=Suspend` is explicitly selected, R8-core
+freezes multipass VMs on orchestrator shutdown and resumes them on startup.
+While the VM is suspended, in-flight TCP connections to LLM providers are torn
+down from the peer's perspective. Each agent CLI handles that freeze window
+differently. The default teardown mode is `Stop`, which avoids the RAM snapshot
+and does not preserve in-VM process state.
 
 This document records observed behaviour and the CodeyBox mitigations that
 keep work-phase LLM calls dependable without operator intervention.

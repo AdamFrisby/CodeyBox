@@ -88,6 +88,36 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_CheckAndActWorkingItem_NoWorker_NoCheckpoint_Requeues()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.LastError);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
     public async Task Sweep_WorkingItem_NoWorker_WithCheckpoint_ReenqueuesForResume()
     {
         var item = MakeItem(

@@ -429,7 +429,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         // Providers that don't suspend on shutdown → ceiling stays at the grace
         // window regardless of worker count. The decision is capability-driven
-        // (suspendsOnShutdown=false), not a provider-name comparison.
+        // (providerSupportsSuspend=false), not a provider-name comparison.
         Assert.Equal(grace,
             SuspendTimeoutPolicy.ResolveHostShutdownTimeout(false, grace, 32));
 

@@ -3672,6 +3672,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             {
                 _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
             }
+            if (_ownedByShutdownHandler)
+                throw;
             return;
         }
         _disposed = true;

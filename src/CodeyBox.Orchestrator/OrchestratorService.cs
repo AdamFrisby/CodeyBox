@@ -911,6 +911,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             };
         }
 
+        if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var checkAttempts = item.RecoveryAttempts + 1;
+            if (_opts.MaxRecoveryAttempts > 0 && checkAttempts > _opts.MaxRecoveryAttempts)
+            {
+                return item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                };
+            }
+
+            return WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempts);
+        }
+
         if (item.State == WorkItemState.Working)
         {
             return item with

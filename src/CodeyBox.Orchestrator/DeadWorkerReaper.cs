@@ -235,6 +235,60 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
+        if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var checkAttempt = item.RecoveryAttempts + 1;
+            WorkItem recovered;
+            if (_opts.MaxRecoveryAttempts > 0 && checkAttempt > _opts.MaxRecoveryAttempts)
+            {
+                recovered = item with
+                {
+                    State = WorkItemState.Failed,
+                    LastError = "exceeded MaxRecoveryAttempts",
+                    RecoveryAttempts = checkAttempt,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                };
+                _log.LogWarning(
+                    "Recovery ({WorkerId}): check-and-act item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                    workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, checkAttempt);
+                await _store.UpdateAsync(recovered, ct);
+                MarkRecoveredItem(itemId);
+                ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery failed interrupted check-and-act item permanently without re-dispatch");
+                return;
+            }
+
+            recovered = WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempt);
+            await _store.UpdateAsync(recovered, ct);
+            await _queue.EnqueueAsync(itemId, ct);
+            MarkRecoveredItem(itemId);
+            _log.LogInformation(
+                "Recovery ({WorkerId}): check-and-act item {ItemId} was interrupted while Working without a preempt checkpoint; re-enqueued for a fresh check run (attempt {Attempt}/{Max})",
+                workerIdContext, itemId, checkAttempt, _opts.MaxRecoveryAttempts);
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = recovered,
+                    Details = new
+                    {
+                        workItemId = itemId.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = item.State.ToString(),
+                        toState = recovered.State.ToString(),
+                        reason = webhookReason,
+                        recoveryAttempt = checkAttempt,
+                        maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                    },
+                }, CancellationToken.None);
+            }
+            return;
+        }
+
         if (WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(item, noPreemptFailedReason, out var failed))
         {
             await _store.UpdateAsync(failed, ct);

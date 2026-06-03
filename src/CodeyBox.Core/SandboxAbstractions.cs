@@ -286,7 +286,7 @@ public static class SuspendTimeoutPolicy
     /// Resolve the host's <c>HostOptions.ShutdownTimeout</c> ceiling. Deployments
     /// with a suspend-capable provider reserve enough room for a future
     /// hot-reload to Suspend mode; otherwise a healthy RAM snapshot could be
-    /// truncated by SIGKILL. When <paramref name="suspendsOnShutdown"/> is set,
+    /// truncated by SIGKILL. When <paramref name="providerSupportsSuspend"/> is set,
     /// the ceiling is the worst-case suspend drain
     /// (<see cref="HostShutdownReserve"/>:
     /// <c>ceil(maxConcurrent / maxParallelSuspends)</c> waves of the largest
@@ -313,19 +313,19 @@ public static class SuspendTimeoutPolicy
     /// and the max() logic stay co-located with the suspend/resume budget
     /// formula they must agree with.</para>
     /// </summary>
-    /// <param name="suspendsOnShutdown">True when the host must reserve suspend budget for a suspend-capable, hot-reloadable shutdown path.</param>
+    /// <param name="providerSupportsSuspend">True when the host must reserve suspend budget because the provider can suspend and the shutdown mode can hot-reload to Suspend.</param>
     /// <param name="grace">Baseline shutdown grace (request-drain / preempt-checkpoint window).</param>
     /// <param name="maxConcurrentSandboxes">Upper bound on concurrently in-flight (hence suspendable) VMs.</param>
     /// <param name="maxParallelSuspends">Parallel-suspend batch size; defaults to <see cref="DefaultMaxParallelSuspends"/>.</param>
     /// <param name="maxVmMemoryBytes">Largest per-VM RAM the deployment provisions; null uses <see cref="SandboxResourceLimits.Default"/>.</param>
     public static TimeSpan ResolveHostShutdownTimeout(
-        bool suspendsOnShutdown,
+        bool providerSupportsSuspend,
         TimeSpan grace,
         int maxConcurrentSandboxes,
         int maxParallelSuspends = DefaultMaxParallelSuspends,
         long? maxVmMemoryBytes = null)
     {
-        if (!suspendsOnShutdown)
+        if (!providerSupportsSuspend)
             return grace;
         var reserve = HostShutdownReserve(
             maxConcurrentSandboxes,

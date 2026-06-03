@@ -544,6 +544,40 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeAsync_DeleteFailure_WhenOwnedByShutdownHandler_Throws()
+    {
+        var noLongerActiveNames = new List<string>();
+        var deleteCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "delete", "--purge", "codeybox-shutdown-deletefail"])
+            {
+                deleteCalls++;
+                return Task.FromResult(new ProcessRunResult(17, "", "still running"));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var sandbox = new MultipassSandbox(
+            "codeybox-shutdown-deletefail",
+            Path.Combine(_workspace, "shutdown-delete-fail-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            onNoLongerTrackedActive: noLongerActiveNames.Add,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        ((IShutdownTeardownSandbox)sandbox).MarkOwnedByShutdownHandler();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
+
+        Assert.Contains("multipass delete --purge codeybox-shutdown-deletefail failed", ex.Message);
+        Assert.Equal(1, deleteCalls);
+        Assert.Equal(["codeybox-shutdown-deletefail"], noLongerActiveNames);
+    }
+
+    [Fact]
     public async Task ProviderCreatedSandbox_DeleteFailureUntracksActiveCacheAndReaperDisposes()
     {
         var staging = Path.Combine(_workspace, "provider-delete-fail-staging");

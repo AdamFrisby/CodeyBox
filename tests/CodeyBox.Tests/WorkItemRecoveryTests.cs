@@ -70,6 +70,35 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task CheckAndActWorkingWithoutPreempt_RequeuesForFreshCheck()
+    {
+        var item = Item(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator();
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+        Assert.Null(recovered.LastError);
+    }
+
+    [Fact]
     public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
     {
         var item = Item(WorkItemState.Working) with

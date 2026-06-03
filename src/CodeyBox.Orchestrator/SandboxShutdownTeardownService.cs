@@ -310,6 +310,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             _log.LogWarning(ex,
                 "Stop/preserve failed for work item {WorkItemId} sandbox {SandboxId}",
                 workItemId, sandbox.Id);
+            throw;
         }
     }
 
@@ -347,6 +348,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
             _log.LogWarning(ex,
                 "Dispose failed for work item {WorkItemId} sandbox {SandboxId}",
                 workItemId, sandbox.Id);
+            throw;
         }
     }
 

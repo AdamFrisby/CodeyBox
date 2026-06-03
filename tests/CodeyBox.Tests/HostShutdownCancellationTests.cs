@@ -710,6 +710,86 @@ public sealed class HostShutdownCancellationTests : IDisposable
     }
 
     [Fact]
+    public async Task HostShutdown_WhenShutdownHandlerOwnsNonSuspendedSandbox_SkipsCheckpointAndPreserve()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var wrappingProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var agent = new BlockingAgentRunner();
+        var pipeline = new PipelineRunner(
+            wrappingProvider, gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = seed,
+                DefaultBaseBranch = "main",
+                DefaultAgent = AgentKind.Claude,
+                Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+            }),
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store, new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            logger);
+
+        var item = NewItem();
+        await store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+
+        SuspendableSandboxWrapper? liveSandbox = null;
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            liveSandbox = wrappingProvider.Wrappers.LastOrDefault();
+            if (liveSandbox is not null) break;
+            await Task.Delay(25);
+        }
+        Assert.NotNull(liveSandbox);
+        Assert.False(liveSandbox.IsSuspended);
+
+        liveSandbox.MarkOwnedByShutdownHandler();
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+
+        var final = await store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Working, final.State);
+        Assert.Null(final.SuspendedVmName);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.PreemptedAt);
+        Assert.Equal(0, liveSandbox.StopAndPreserveCalls);
+
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("was taken over by SandboxShutdownTeardownService", StringComparison.Ordinal)
+            && e.Message.Contains("skipping preempt-checkpoint", StringComparison.Ordinal));
+
+        var showRef = await TestSupport.RunGit(gitHost.GetRepoPath(item.Id.ToString()),
+            "show-ref");
+        Assert.DoesNotContain("codeybox/preempt", showRef.stdout);
+
+        store.Dispose();
+    }
+
+    [Fact]
     public async Task ProcessSandbox_StopAndPreserve_SkipsDisposeDeletion()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);

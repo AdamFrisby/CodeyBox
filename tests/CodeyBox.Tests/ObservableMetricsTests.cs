@@ -148,7 +148,7 @@ public sealed class ObservableMetricsTests : IDisposable
         var store = new SqliteWorkItemStore(_dbPath);
         using var svc = new CodeyBoxObservableMetrics(
             store,
-            new FakeSuspendingProvider(2),
+            new FakeActiveProvider(2),
             new OrchestratorOptions { MaxConcurrentWorkers = 4 },
             NullLogger<CodeyBoxObservableMetrics>.Instance,
             workerPool: new FakeWorkerPool(0),
@@ -272,7 +272,7 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendingProvider(int active) : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
+    private sealed class FakeActiveProvider(int active) : ISandboxProvider, IActiveSandboxProvider
     {
         public string Name => "fake-vm";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
@@ -283,18 +283,15 @@ public sealed class ObservableMetricsTests : IDisposable
 
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
             Enumerable.Range(0, active)
-                .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeSuspendable()))
+                .Select(_ => (new WorkItemId(Guid.NewGuid()), (IShutdownTeardownSandbox)new FakeActiveSandbox()))
                 .ToList();
-
-        public Task ResumeSandboxAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
-    private sealed class FakeSuspendable : ISuspendableSandbox, IShutdownTeardownSandbox
+    private sealed class FakeActiveSandbox : IShutdownTeardownSandbox
     {
         public string Id => "fake";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             throw new NotSupportedException();
-        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 

@@ -293,6 +293,31 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     }
 
     [Fact]
+    public async Task ShutdownHandler_StopMode_UsesActiveProviderWithoutSuspendCapability()
+    {
+        var item = MakeItem(WorkItemState.Auditing);
+        await _store.CreateAsync(item);
+
+        var provider = new ActiveOnlyOrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-active-only-stop");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        Assert.False((object)provider is ISuspendingSandboxProvider);
+        Assert.Equal(1, provider.SnapshotCalls);
+        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.DisposeCalled);
+    }
+
+    [Fact]
     public async Task ShutdownHandler_StopMode_StopsSandboxWhoseWorkItemWasDeleted()
     {
         var item = MakeItem(WorkItemState.Working);
@@ -349,6 +374,46 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.PreemptCheckpoint);
         Assert.Null(after.PreemptedAt);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_StopMode_StopsWorkingCheckAndActWithoutPreemptCheckpoint()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is a follow-up needed?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Do the follow-up.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox("vm-check-and-act-stop");
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Stop);
+
+        await svc.TeardownAllAsync();
+
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "CheckAndAct is read-only and rerunnable, so Stop mode must not wait for a PipelineRunner preempt checkpoint this job type cannot create");
+        Assert.True(sandbox.OwnedByShutdownHandler);
+        Assert.False(sandbox.SuspendCalled);
+        Assert.False(sandbox.DisposeCalled);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Null(after.PreemptCheckpoint);
     }
 
     [Fact]
@@ -522,8 +587,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop);
 
-        await svc.TeardownAllAsync();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => svc.TeardownAllAsync());
 
+        Assert.Contains("injected stop failure", ex.Message);
         Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(sandbox.OwnedByShutdownHandler,
             "a failed stop/preserve must not suppress PipelineRunner or startup recovery");
@@ -617,6 +683,32 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         Assert.True(sandbox.DisposeCalled);
         Assert.False(neverDisposed.Task.IsCompleted);
         Assert.Equal(TimeSpan.FromMilliseconds(25), svc.NonSuspendTeardownTimeout);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_DisposeMode_FailedDisposeSurfacesAndLeavesOwnershipMarked()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var sandbox = new OrderingFakeSandbox(
+            "vm-dispose-fails",
+            disposeException: new InvalidOperationException("injected dispose failure"));
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Dispose);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => svc.TeardownAllAsync());
+
+        Assert.Contains("injected dispose failure", ex.Message);
+        Assert.True(sandbox.DisposeCalled);
+        Assert.True(sandbox.OwnedByShutdownHandler,
+            "Dispose mode claims ownership before delete/purge so PipelineRunner does not run in-VM commands against a VM being deleted");
+        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.DisposeOrder);
     }
 
     [Fact]
@@ -1150,10 +1242,31 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             CancellationToken ct) => Task.FromResult(true);
     }
 
+    private sealed class ActiveOnlyOrderingFakeProvider : ISandboxProvider, IActiveSandboxProvider
+    {
+        private readonly ConcurrentDictionary<WorkItemId, IShutdownTeardownSandbox> _active = new();
+        public void Register(WorkItemId id, IShutdownTeardownSandbox sandbox) => _active[id] = sandbox;
+        public string Name => "fake-active-only";
+        public int SnapshotCalls { get; private set; }
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => Task.FromResult<ISandbox>(new OrderingFakeSandbox("fake-active-only-created"));
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
+        {
+            SnapshotCalls++;
+            var list = new List<(WorkItemId, IShutdownTeardownSandbox)>();
+            foreach (var kv in _active) list.Add((kv.Key, kv.Value));
+            return list;
+        }
+    }
+
     private sealed class OrderingFakeSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
     {
         private readonly Func<bool>? _isDispatchPaused;
         private readonly Task? _disposeTask;
+        private readonly Exception? _disposeException;
         private readonly Task? _stopTask;
         private readonly Exception? _stopException;
         private readonly Action<string>? _recordEvent;
@@ -1161,6 +1274,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             string id,
             Func<bool>? isDispatchPaused = null,
             Task? disposeTask = null,
+            Exception? disposeException = null,
             Task? stopTask = null,
             Exception? stopException = null,
             Action<string>? recordEvent = null)
@@ -1168,6 +1282,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             Id = id;
             _isDispatchPaused = isDispatchPaused;
             _disposeTask = disposeTask;
+            _disposeException = disposeException;
             _stopTask = stopTask;
             _stopException = stopException;
             _recordEvent = recordEvent;
@@ -1188,6 +1303,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         {
             DisposeCalled = true;
             DisposeOrder = ++_order;
+            if (_disposeException is not null)
+                throw _disposeException;
             return _disposeTask is null
                 ? ValueTask.CompletedTask
                 : new ValueTask(_disposeTask);
