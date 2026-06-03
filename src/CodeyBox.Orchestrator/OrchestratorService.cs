@@ -520,6 +520,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
+    private bool IsQueuePaused =>
+        _queueController is not null && _queueController.State == QueueState.Paused;
+
+    private ValueTask RequeueDispatchAsync(TaskQueueDispatch dispatch, CancellationToken ct)
+    {
+        if (dispatch.Kind == TaskQueueDispatchKind.WorkItem
+            && dispatch.WorkItemId is { } kickedId)
+            return _queue.EnqueueAsync(kickedId, ct);
+
+        return _queue.EnqueueDispatchWakeAsync(ct);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // R8-core suspend/resume: SandboxResumeOnStartupService now runs in the
@@ -554,8 +566,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // Collect in-flight item tasks so we can await them all on shutdown.
         // List is safe here: only the dispatch loop (single logical thread) touches it.
         var inFlight = new List<Task>();
+        var stopDispatchLoop = false;
 
-        while (!stoppingToken.IsCancellationRequested)
+        while (!stoppingToken.IsCancellationRequested && !stopDispatchLoop)
         {
             // Shutdown dispatch gate (R8.1 fix for VM-wedging incident
             // 2026-05-29): the shutdown teardown handler calls PauseDispatch()
@@ -603,114 +616,162 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // Post-dequeue pause check: handles the race where the queue was paused
             // while we were blocked in DequeueAsync. Just loop; we'll re-check
             // WaitIfPausedAsync on the next iteration.
-            if (_queueController is not null && _queueController.State == QueueState.Paused)
+            if (IsQueuePaused)
             {
-                if (dispatch.Value.Kind == TaskQueueDispatchKind.WorkItem
-                    && dispatch.Value.WorkItemId is { } kickedId)
-                    await _queue.EnqueueAsync(kickedId, stoppingToken);
-                else
-                    await _queue.EnqueueDispatchWakeAsync(stoppingToken);
+                await RequeueDispatchAsync(dispatch.Value, stoppingToken);
                 continue;
             }
 
-            // Block until a concurrency slot is free. We acquire the gate BEFORE
-            // resolving which item to pick up so the pickup decision uses the
-            // freshest store state — a priority bump that arrives while a worker
-            // is in-flight is reflected when the gate next frees up.
-            try { await _concurrencyGate.WaitAsync(stoppingToken); }
-            catch (OperationCanceledException) { break; }
+            var blockForFirstSlot = true;
+            var requeueOnPause = dispatch.Value;
 
-            // Late dispatch-pause check: PauseDispatch may have fired while we
-            // were blocked on the concurrency gate. Without this check, one
-            // final worker could be spawned after dispatch was paused (the
-            // very race this gate exists to close — that final sandbox would
-            // miss the SnapshotActiveSandboxes snapshot and be torn down
-            // uncleanly when the BackgroundService cancellation token fires).
-            if (IsDispatchPaused)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                TryReleaseConcurrencyGate();
-                break;
-            }
-
-            // Resolve the next eligible item by priority: highest Priority first,
-            // ties broken by CreatedAt ascending. Skips items currently in-flight
-            // (_activeItems) and items currently sleeping in a defer-requeue delay
-            // (_deferredItems). When nothing eligible is found, this kick was
-            // spurious — release the slot and loop back for the next kick.
-            WorkItemId? id = await PickNextEligibleAsync(stoppingToken);
-            if (id is null)
-            {
-                TryReleaseConcurrencyGate();
-                continue;
-            }
-
-            // Reserve the slot now so the next dispatch iteration's pickup query
-            // skips this ID. The Task.Run cleanup below removes the reservation
-            // when the worker exits.
-            if (!_activeItems.TryAdd(id.Value, 0))
-            {
-                TryReleaseConcurrencyGate();
-                continue;
-            }
-
-            // Spawn pacing: enforce MinSpawnInterval between successive spawns.
-            if (_opts.MinSpawnInterval > TimeSpan.Zero)
-            {
-                long lastTicks;
-                lock (_spawnTimeLock) { lastTicks = _lastSpawnAtTicks; }
-                if (lastTicks != 0)
+                // Acquire the gate BEFORE resolving which item to pick up so the
+                // pickup decision uses the freshest store state. The first pass
+                // may block because a buffered kick can arrive while the pool is
+                // full; refill passes only use slots already free for this turn.
+                if (blockForFirstSlot)
                 {
-                    var lastSpawnAt = new DateTimeOffset(lastTicks, TimeSpan.Zero);
-                    var nextEligible = lastSpawnAt + _opts.MinSpawnInterval;
-                    var wait = nextEligible - DateTimeOffset.UtcNow;
-                    if (wait > TimeSpan.Zero)
+                    try { await _concurrencyGate.WaitAsync(stoppingToken); }
+                    catch (OperationCanceledException)
                     {
-                        AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
-                        try { await Task.Delay(wait, stoppingToken); }
-                        catch (OperationCanceledException)
+                        stopDispatchLoop = true;
+                        break;
+                    }
+                }
+                else if (!_concurrencyGate.Wait(0))
+                {
+                    break;
+                }
+
+                // Late dispatch-pause check: PauseDispatch may have fired while we
+                // were blocked on the concurrency gate. Without this check, one
+                // final worker could be spawned after dispatch was paused (the
+                // very race this gate exists to close — that final sandbox would
+                // miss the SnapshotActiveSandboxes snapshot and be torn down
+                // uncleanly when the BackgroundService cancellation token fires).
+                if (IsDispatchPaused)
+                {
+                    TryReleaseConcurrencyGate();
+                    stopDispatchLoop = true;
+                    break;
+                }
+
+                // Queue pause can also happen while a consumed kick is waiting on
+                // a full pool. Preserve a wake for resume, but do not pick work
+                // while the operator-visible queue state is Paused.
+                if (IsQueuePaused)
+                {
+                    TryReleaseConcurrencyGate();
+                    await RequeueDispatchAsync(requeueOnPause, stoppingToken);
+                    break;
+                }
+
+                // Resolve the next eligible item by priority: highest Priority first,
+                // ties broken by CreatedAt ascending. Skips items currently in-flight
+                // (_activeItems) and items currently sleeping in a defer-requeue delay
+                // (_deferredItems). When nothing eligible is found, this kick was
+                // spurious — release the slot and loop back for the next kick.
+                WorkItemId? id = await PickNextEligibleAsync(stoppingToken);
+                if (id is null)
+                {
+                    TryReleaseConcurrencyGate();
+                    break;
+                }
+
+                // Reserve the slot now so the next dispatch iteration's pickup query
+                // skips this ID. The Task.Run cleanup below removes the reservation
+                // when the worker exits.
+                if (!_activeItems.TryAdd(id.Value, 0))
+                {
+                    TryReleaseConcurrencyGate();
+                    blockForFirstSlot = false;
+                    requeueOnPause = TaskQueueDispatch.GenericWake;
+                    continue;
+                }
+
+                // Spawn pacing: enforce MinSpawnInterval between successive spawns.
+                if (_opts.MinSpawnInterval > TimeSpan.Zero)
+                {
+                    long lastTicks;
+                    lock (_spawnTimeLock) { lastTicks = _lastSpawnAtTicks; }
+                    if (lastTicks != 0)
+                    {
+                        var lastSpawnAt = new DateTimeOffset(lastTicks, TimeSpan.Zero);
+                        var nextEligible = lastSpawnAt + _opts.MinSpawnInterval;
+                        var wait = nextEligible - DateTimeOffset.UtcNow;
+                        if (wait > TimeSpan.Zero)
                         {
-                            _activeItems.TryRemove(id.Value, out _);
-                            TryReleaseConcurrencyGate();
-                            break;
+                            AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
+                            try { await Task.Delay(wait, stoppingToken); }
+                            catch (OperationCanceledException)
+                            {
+                                _activeItems.TryRemove(id.Value, out _);
+                                TryReleaseConcurrencyGate();
+                                stopDispatchLoop = true;
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            // Record spawn timestamp before launching the task.
-            lock (_spawnTimeLock) { _lastSpawnAtTicks = DateTimeOffset.UtcNow.Ticks; }
-            try { _opts.OnWorkerSpawned?.Invoke(); }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
-                _activeItems.TryRemove(id.Value, out _);
-                TryReleaseConcurrencyGate();
-                continue;
-            }
-            var workerIndex = Interlocked.Increment(ref _nextWorkerId);
-
-            var capturedId = id.Value;
-            CodeyBoxMeters.Dispatches.Add(1);
-            // Increment before Task.Run so the counter is never transiently negative
-            // if the task's finally block executes before we reach the increment.
-            Interlocked.Increment(ref _currentlyRunning);
-            var slotLease = new WorkerSlotLease(workerIndex, capturedId);
-            var task = Task.Run(async () =>
-            {
-                AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
-                try
+                if (IsDispatchPaused)
                 {
-                    await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
+                    _activeItems.TryRemove(id.Value, out _);
+                    TryReleaseConcurrencyGate();
+                    stopDispatchLoop = true;
+                    break;
                 }
-                finally
-                {
-                    await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, stoppingToken);
-                }
-            });
 
-            inFlight.Add(task);
-            // Prune completed tasks on every iteration to prevent unbounded growth.
-            inFlight.RemoveAll(t => t.IsCompleted);
+                if (IsQueuePaused)
+                {
+                    _activeItems.TryRemove(id.Value, out _);
+                    TryReleaseConcurrencyGate();
+                    await _queue.EnqueueDispatchWakeAsync(stoppingToken);
+                    break;
+                }
+
+                // Record spawn timestamp before launching the task.
+                lock (_spawnTimeLock) { _lastSpawnAtTicks = DateTimeOffset.UtcNow.Ticks; }
+                try { _opts.OnWorkerSpawned?.Invoke(); }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
+                    _activeItems.TryRemove(id.Value, out _);
+                    TryReleaseConcurrencyGate();
+                    blockForFirstSlot = false;
+                    requeueOnPause = TaskQueueDispatch.GenericWake;
+                    continue;
+                }
+                var workerIndex = Interlocked.Increment(ref _nextWorkerId);
+
+                var capturedId = id.Value;
+                CodeyBoxMeters.Dispatches.Add(1);
+                // Increment before Task.Run so the counter is never transiently negative
+                // if the task's finally block executes before we reach the increment.
+                Interlocked.Increment(ref _currentlyRunning);
+                var slotLease = new WorkerSlotLease(workerIndex, capturedId);
+                var task = Task.Run(async () =>
+                {
+                    AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
+                    try
+                    {
+                        await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
+                    }
+                    finally
+                    {
+                        await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, stoppingToken);
+                    }
+                });
+
+                inFlight.Add(task);
+                // Prune completed tasks on every iteration to prevent unbounded growth.
+                inFlight.RemoveAll(t => t.IsCompleted);
+
+                blockForFirstSlot = false;
+                requeueOnPause = TaskQueueDispatch.GenericWake;
+            }
         }
 
         // Drain in-flight tasks before the hosted service exits.

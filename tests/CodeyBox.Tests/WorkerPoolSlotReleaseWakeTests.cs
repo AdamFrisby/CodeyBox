@@ -65,6 +65,54 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task SlotReleaseWake_RefillsAllOpenSlotsFromIndependentReadyBacklogWithoutExternalKick()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(createdAt: now);
+        var readyBacklog = new[]
+        {
+            MakeItem(createdAt: now.AddMilliseconds(1)),
+            MakeItem(createdAt: now.AddMilliseconds(2)),
+            MakeItem(createdAt: now.AddMilliseconds(3)),
+        };
+
+        await _store.CreateAsync(running);
+        foreach (var item in readyBacklog)
+            await _store.CreateAsync(item);
+
+        await queue.EnqueueAsync(running.Id);
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+
+        foreach (var item in readyBacklog)
+            Assert.False(pipeline.HasEntered(item.Id));
+
+        pipeline.Release(running.Id);
+
+        foreach (var item in readyBacklog)
+        {
+            Assert.True(
+                await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
+                "One slot-release wake should keep refilling while free slots and ready backlog remain.");
+            Assert.Equal(0, queue.EnqueueCount(item.Id));
+        }
+
+        foreach (var item in readyBacklog)
+            pipeline.Release(item.Id);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotClearDeferredBacklogItem()
     {
         var queue = new ObservedTaskQueue();
@@ -203,6 +251,56 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await svc.StopAsync(stopCts.Token);
+    }
+
+    [Fact]
+    public async Task QueuePauseSuppressesBufferedKickWaitingForReleasedSlot()
+    {
+        using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            queueController: controller);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(createdAt: now);
+        var readyBacklog = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(running);
+        await _store.CreateAsync(readyBacklog);
+        await queue.EnqueueAsync(running.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+
+        await queue.EnqueueAsync(readyBacklog.Id);
+        Assert.True(
+            await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
+            "The ready item kick should be consumed while the dispatcher is blocked on the full pool.");
+
+        await controller.PauseAsync("pause while buffered kick waits for a worker slot");
+        pipeline.Release(running.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
+
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, NoDispatchQuietPeriod),
+            "A queued pause must suppress a buffered kick that unblocks after a worker slot is released.");
+        var stored = await _store.GetAsync(readyBacklog.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+
+        await controller.ResumeAsync();
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(readyBacklog.Id, DispatchWaitTimeout),
+            "The suppressed buffered kick should be preserved so resume can pick up the ready backlog.");
+
+        pipeline.Release(readyBacklog.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(readyBacklog.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
     }
 
     [Fact]
