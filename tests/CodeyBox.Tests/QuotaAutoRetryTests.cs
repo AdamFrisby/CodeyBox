@@ -294,6 +294,97 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_PeriodicSweep_ProbesRecentlyFailedAgentWhenQuotaRecovered()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var failuresDb = Path.Combine(_workspace, "quota-failures-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        using var quotaFailures = new SqliteQuotaFailureStore(failuresDb);
+        await quotaFailures.RecordAsync(
+            AgentKind.Claude,
+            modelId: null,
+            QuotaFailureKind.LimitReached,
+            _time.Now,
+            CancellationToken.None);
+
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("test-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "recent-failure-class",
+        });
+        var probe = new MutableProbe(AgentKind.Claude, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "recent-failure-class",
+                    DisplayName = "Recent Failure",
+                    Members =
+                    [
+                        new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    ],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10,
+                ObservedFailureWindow = TimeSpan.FromMinutes(10),
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaFailures: quotaFailures);
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time);
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "test",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "recent-failure-class",
+            NextQuotaRetryAt = _time.Now.AddHours(1),
+        };
+        await store.CreateAsync(item);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod("RunPeriodicSweepAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var retried = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Equal(1, probe.CallCount);
+    }
+
+    [Fact]
     public async Task Scheduler_RespectsMaxRetries()
     {
         var agent = new QuotaFailingAgent();
@@ -682,14 +773,18 @@ public sealed class QuotaAutoRetryTests : IDisposable
         }
 
         public AgentKind Kind { get; }
+        public int CallCount { get; private set; }
         public AgentQuotaSnapshot Snapshot { get; set; }
         public double AvailablePct
         {
             get => Snapshot.AvailablePct;
             set => Snapshot = Snapshot with { AvailablePct = value };
         }
-        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
-            Task.FromResult(Snapshot);
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        {
+            CallCount++;
+            return Task.FromResult(Snapshot);
+        }
     }
 
     [Fact]
@@ -1186,6 +1281,52 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
         Assert.Equal(WorkItemState.Queued, retried.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Router_QuotaUsableSignal_SubscriberExceptionDoesNotBreakResolve()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "subscriber-class",
+        };
+        var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "subscriber-class",
+                    DisplayName = "Subscriber",
+                    Members =
+                    [
+                        new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    ],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time);
+        router.QuotaUsableThresholdCrossed += () => throw new InvalidOperationException("subscriber failed");
+
+        var probeItem = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = project.Id,
+            Title = "probe",
+            Prompt = "p",
+            AgentClassId = "subscriber-class",
+        };
+        var firstDecision = await router.ResolveAsync(probeItem, project, CancellationToken.None);
+        Assert.True(firstDecision.ShouldWait);
+
+        probe.AvailablePct = 80;
+        var secondDecision = await router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, project, CancellationToken.None);
+
+        Assert.NotNull(secondDecision.Chosen);
     }
 
     [Fact]

@@ -140,8 +140,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                     continue;
                 }
 
+                lastSweepAt = now;
                 await RunPeriodicSweepAsync(stoppingToken);
-                lastSweepAt = _time.GetUtcNow();
             }
             catch (OperationCanceledException)
             {
@@ -245,10 +245,34 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
     {
         try
         {
-            // Startup is the escape hatch for persisted WaitingForQuotaReset rows:
-            // every parked item is put back on the work queue so normal dispatch
-            // evaluates the current agent-class availability from scratch.
-            var outcome = await PerformRetryAsync(item, "startup", ct, retryFromOverride: "work");
+            var retryOptions = CurrentRetryOptions;
+            QuotaRetryAttemptResult outcome;
+            if (!retryOptions.Enabled)
+            {
+                _log.LogInformation("Quota auto-retry is disabled; skipping startup retry for work item {Id}", item.Id);
+                outcome = new QuotaRetryAttemptResult("skipped:auto-retry-disabled");
+            }
+            else if (item.QuotaRetryAttempts >= retryOptions.MaxAutoRetriesPerWorkItem)
+            {
+                if (item.State == WorkItemState.WaitingForQuotaReset)
+                {
+                    outcome = await TransitionWaitingItemAtRetryCapAsync(item, retryOptions, ct);
+                }
+                else
+                {
+                    outcome = new QuotaRetryAttemptResult("skipped:max-retries",
+                        $"attempts={item.QuotaRetryAttempts}; max={retryOptions.MaxAutoRetriesPerWorkItem}");
+                }
+            }
+            else
+            {
+                // Startup is the escape hatch for persisted WaitingForQuotaReset rows:
+                // every parked item is put back on the queue so dispatch evaluates
+                // current agent availability from scratch. Preserve the saved phase
+                // rather than forcing from=work.
+                outcome = await PerformRetryAsync(item, "startup", ct);
+            }
+
             AuditLog.QuotaRetryAttempted(item.Id, "startup", outcome.Outcome, item.State.ToString(), outcome.Reason);
             return outcome;
         }
@@ -455,7 +479,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
                 item = item with { BaselineImageRef = pinnedRef };
         }
 
-        var decision = await _router.ResolveAsync(item, project, ct);
+        var decision = await _router.ResolveQuotaRetryAsync(item, project, ct);
         if (decision.ShouldWait)
         {
             _log.LogDebug("Work item {Id} still gated by quota; decision: {Reason}", item.Id, decision.Reason);
@@ -494,7 +518,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable
         var reason = $"attempts={item.QuotaRetryAttempts}; max={retryOptions.MaxAutoRetriesPerWorkItem}";
         var failed = item.With(
             WorkItemState.Failed,
-            $"quota auto-retry reached max attempts ({retryOptions.MaxAutoRetriesPerWorkItem}) after quota became available; operator retry required",
+            $"quota auto-retry reached max attempts ({retryOptions.MaxAutoRetriesPerWorkItem}); operator retry required",
             failureKind: "quota",
             quotaResetAt: item.QuotaResetAt) with
         {

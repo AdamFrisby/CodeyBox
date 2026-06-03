@@ -159,6 +159,30 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task RearmTimers_WaitingItemAtMaxRetriesUsesRetryCapOnStartup()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            QuotaRetryAttempts = 3,
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("quota", stored.FailureKind);
+        Assert.Null(stored.NextQuotaRetryAt);
+        Assert.Equal(3, stored.QuotaRetryAttempts);
+
+        var evt = AssertQuotaAttempt(item, "startup", "skipped:max-retries", "WaitingForQuotaReset");
+        Assert.Equal("attempts=3; max=3", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public async Task RearmTimers_ImmediatelyRetriesOverdueFailedQuotaItemAndAuditsSuccess()
     {
         using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
@@ -240,6 +264,33 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
         Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
         Assert.Equal("from=work", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
+    public async Task RearmTimers_WaitingItemUsesPersistedQuotaRetryFromOnStartup()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 100), BuildProjects());
+        var workBranch = "codeybox/startup-quota-phase";
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset) with
+        {
+            BaseBranch = "main",
+            WorkBranch = workBranch,
+            QuotaRetryFrom = "upstream",
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var repoId = await fixture.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(fixture.GitHost.GetRepoPath(repoId), workBranch);
+
+        await RearmTimersAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Merged, retried!.State);
+        Assert.Equal(workBranch, retried.WorkBranch);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
+        Assert.Equal("from=upstream", GetScalar<string>(evt, "Reason"));
     }
 
     [Fact]
@@ -548,6 +599,19 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             AgentClassId = "frontier",
             NextQuotaRetryAt = DateTimeOffset.UtcNow.AddHours(-2),
         };
+
+    private async Task CommitToBareBranchAsync(string barePath, string branch)
+    {
+        var clone = Path.Combine(_workspace, "bare-edit-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch);
+        await File.WriteAllTextAsync(Path.Combine(clone, "work.txt"), "work complete\n");
+        await TestSupport.RunGit(clone, "add", "work.txt");
+        await TestSupport.RunGit(clone, "commit", "-m", $"work complete\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
+    }
 
     private static async Task RunPeriodicSweepAsync(QuotaRetryScheduler scheduler)
     {

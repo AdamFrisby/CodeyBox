@@ -9,14 +9,18 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public interface IQuotaRetryRouter
 {
-    Task<AgentRoutingDecision> ResolveAsync(
+    Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
         WorkItem item,
         Project? project,
-        CancellationToken ct,
-        IAgentSlotGate? slotGate = null);
+        CancellationToken ct);
 
     Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
         WorkItem item,
         Project? project,
         CancellationToken ct);
 }
+
+public sealed record QuotaRetryRoutingDecision(
+    bool ShouldWait,
+    bool NoEligibleMembers,
+    string? Reason);

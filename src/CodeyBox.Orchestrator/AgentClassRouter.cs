@@ -228,9 +228,32 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// path. The router never releases on its own.
     /// </para>
     /// </summary>
-    public async Task<AgentRoutingDecision> ResolveAsync(
+    public Task<AgentRoutingDecision> ResolveAsync(
         WorkItem item, Project? project, CancellationToken ct,
         IAgentSlotGate? slotGate = null)
+        => ResolveCoreAsync(item, project, ct, slotGate, bypassRecentFailurePrecheck: false);
+
+    public async Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct)
+    {
+        var decision = await ResolveCoreAsync(
+            item,
+            project,
+            ct,
+            slotGate: null,
+            bypassRecentFailurePrecheck: true);
+        return new QuotaRetryRoutingDecision(
+            decision.ShouldWait,
+            decision.NoEligibleMembers,
+            decision.Reason);
+    }
+
+    private async Task<AgentRoutingDecision> ResolveCoreAsync(
+        WorkItem item, Project? project, CancellationToken ct,
+        IAgentSlotGate? slotGate,
+        bool bypassRecentFailurePrecheck)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -377,7 +400,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     subscriptionSmokeExcluded++;
                 continue;
             }
-            if (member.Billing == AgentBilling.Subscription && _quotaFailures is not null)
+            if (!bypassRecentFailurePrecheck
+                && member.Billing == AgentBilling.Subscription
+                && _quotaFailures is not null)
             {
                 var observedAt = await _quotaFailures.GetMostRecentAsync(
                     member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
@@ -1038,7 +1063,26 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var key = (member.Agent, member.ModelId ?? string.Empty);
         _lastAvailablePct[key] = quota.AvailablePct;
         if (RecordQuotaUsableTransition(key, gate.Allow))
-            QuotaUsableThresholdCrossed?.Invoke();
+            NotifyQuotaUsableThresholdCrossed();
+    }
+
+    private void NotifyQuotaUsableThresholdCrossed()
+    {
+        var handlers = QuotaUsableThresholdCrossed;
+        if (handlers is null)
+            return;
+
+        foreach (Action handler in handlers.GetInvocationList().Cast<Action>())
+        {
+            try
+            {
+                handler();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Quota usable threshold subscriber threw; routing decision will continue");
+            }
+        }
     }
 
     private bool RecordQuotaUsableTransition((AgentKind Agent, string ModelId) key, bool isUsable)
