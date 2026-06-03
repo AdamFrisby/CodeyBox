@@ -24,12 +24,11 @@ public enum SandboxTeardownMode
     Suspend = 0,
 
     /// <summary>
-    /// Clean stop after preempt checkpoint: the shutdown lifecycle service
-    /// avoids <c>multipass suspend</c> and lets PipelineRunner write the
-    /// preempt-checkpoint before its preserve step calls <c>multipass stop</c>.
-    /// Far less likely to wedge multipassd than suspend (no RAM snapshot, qemu
-    /// shuts down cleanly and releases the disk-image lock). This is the
-    /// <c>ShutdownOptions</c> default.
+    /// Clean stop/preserve from the shutdown lifecycle service: avoids
+    /// <c>multipass suspend</c> entirely, writes the provider's preempt marker,
+    /// and calls <c>multipass stop</c>. Far less likely to wedge multipassd than
+    /// suspend (no RAM snapshot, qemu shuts down cleanly and releases the
+    /// disk-image lock). This is the <c>ShutdownOptions</c> default.
     /// </summary>
     Stop = 1,
 

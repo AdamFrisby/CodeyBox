@@ -11,18 +11,17 @@ namespace CodeyBox.Orchestrator;
 /// <c>(workItemId → vmName, suspendedAt, agentLogPath)</c> mapping so the next
 /// orchestrator process can <c>multipass start</c> the same VM and re-tail the
 /// in-VM agent log (see <see cref="SandboxResumeOnStartupService"/> for the
-/// resume half). Stop leaves the active VM to the existing preempt-checkpoint
-/// flow in <see cref="PipelineRunner"/> instead of taking shutdown ownership
-/// here; after host cancellation, that path commits the checkpoint and then
-/// calls <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Dispose is a
-/// destructive teardown mode with no recovery artifact.
+/// resume half). Stop cleanly stops and preserves the VM disk without taking a
+/// RAM snapshot. Dispose is a destructive teardown mode with no recovery
+/// artifact.
 ///
 /// <para>This sits alongside — not on top of — the existing per-phase
 /// preempt-checkpoint flow in <see cref="PipelineRunner"/>: that path commits a
-/// git ref the pipeline can resume from, and is still the safety net for Stop
-/// and sandbox providers that do not support suspend (process, bubblewrap).
-/// Suspend is an opt-in state-preservation path for operators who accept the
-/// RAM-snapshot tradeoff; Dispose is a destructive teardown mode.</para>
+/// git ref the pipeline can resume from before its own preserve call when the
+/// lifecycle service has not already taken ownership. Suspend is an opt-in
+/// state-preservation path for operators who accept the RAM-snapshot tradeoff;
+/// Stop is the default lock-safe teardown for suspend-capable providers;
+/// Dispose is a destructive teardown mode.</para>
 ///
 /// <para>Implements <see cref="IHostedLifecycleService.StoppingAsync"/> rather
 /// than registering a synchronous callback on
@@ -56,9 +55,10 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     ///
     /// <para>This bounds how long shutdown blocks per stuck VM, but it is not the
     /// only bound: the host's global <c>HostOptions.ShutdownTimeout</c> still caps
-    /// total shutdown time. <c>Program.cs</c> raises that ceiling only when
-    /// Suspend teardown is selected, so a healthy snapshot is not truncated. And
-    /// because the (work item → VM) mapping
+    /// total shutdown time. <c>Program.cs</c> raises that ceiling for
+    /// suspend-capable providers because teardown mode is hot-reloadable, so a
+    /// healthy snapshot is not truncated if an operator switches to Suspend
+    /// before stopping the process. And because the (work item → VM) mapping
     /// is persisted BEFORE the suspend is awaited (see
     /// <see cref="SuspendOneAsync"/>), even a SIGKILL mid-snapshot still leaves a
     /// resume mapping for the next startup — recovery does not depend on the
@@ -91,12 +91,11 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
     // in the shutdown sequence. Nullable so test fixtures driving SuspendAllAsync
     // directly don't need to hand in a gate.
     private readonly IShutdownDispatchGate? _dispatchGate;
-    // R8.1: ephemeral worker VMs can be handled by Stop (default; defer to
-    // PipelineRunner's preempt-checkpoint + StopAndPreserve path), Suspend
+    // R8.1: ephemeral worker VMs can be handled by Stop (default; cleanly
+    // stop/preserve without a RAM snapshot), Suspend
     // (opt-in; preserves in-RAM agent state across restart but can wedge
     // multipassd if interrupted), or Dispose (delete --purge, full teardown —
-    // no suspended-resume bookkeeping is written, the work item recovers via
-    // the existing preempt-checkpoint flow). Resolved at teardown time so
+    // no suspended-resume bookkeeping is written). Resolved at teardown time so
     // operator config hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
 
@@ -247,21 +246,51 @@ public sealed class SandboxSuspendOnShutdownService : IHostedLifecycleService
         };
 
     /// <summary>
-    /// Stop mode deliberately does not take ownership in StoppingAsync. The
-    /// service has already paused dispatch; when the host cancellation token
-    /// reaches <see cref="PipelineRunner"/>, its normal preempt path can still
-    /// run <c>git add/commit/push</c> inside the live VM, persist
-    /// <c>PreemptCheckpoint</c>, and then call
-    /// <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/>. Marking ownership
-    /// or stopping here would suppress that checkpoint and leave a Working item
-    /// with neither <c>SuspendedVmName</c> nor <c>PreemptCheckpoint</c>.
+    /// Teardown via clean stop (preserves VM disk but kills the in-VM agent
+    /// process). Faster than suspend and much less likely to wedge multipassd:
+    /// stop releases the qemu disk-image write-lock cleanly, whereas an
+    /// interrupted suspend can leave qemu holding the lock.
+    ///
+    /// <para>Calls <see cref="ISuspendableSandbox.MarkOwnedByShutdownHandler"/>
+    /// FIRST so PipelineRunner's host-shutdown OCE catch block, which fires
+    /// after StoppingAsync has already torn the VM down here, skips its in-VM git
+    /// checkpoint flow. Otherwise it would run <c>git add/commit/push</c> inside
+    /// a now-stopped VM, fail, and convert shutdown cleanup trouble into a work
+    /// item failure. The signal is set before any teardown call so even an early
+    /// timeout or exception still gives PipelineRunner the right answer.</para>
     /// </summary>
-    private Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
+    private async Task StopOneAsync(WorkItemId workItemId, ISuspendableSandbox sandbox)
     {
-        _log.LogDebug(
-            "Stop teardown for work item {WorkItemId} sandbox {SandboxId} is deferred to PipelineRunner preempt-checkpoint handling",
-            workItemId, sandbox.Id);
-        return Task.CompletedTask;
+        sandbox.MarkOwnedByShutdownHandler();
+        var timeout = NonSuspendTeardownTimeout;
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        try
+        {
+            if (sandbox is IPreemptibleSandbox preemptible)
+            {
+                await preemptible.StopAndPreserveAsync(timeoutCts.Token);
+                AuditLog.SandboxStoppedOnShutdown(workItemId, sandbox.Id);
+                return;
+            }
+
+            _log.LogWarning(
+                "Sandbox {SandboxId} for work item {WorkItemId} does not implement IPreemptibleSandbox; falling back to dispose",
+                sandbox.Id, workItemId);
+            await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
+            AuditLog.SandboxDisposedOnShutdown(workItemId, sandbox.Id);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning(
+                "Stop exceeded {Timeout} for work item {WorkItemId} sandbox {SandboxId}; surfacing as needing operator attention",
+                timeout, workItemId, sandbox.Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Stop failed for work item {WorkItemId} sandbox {SandboxId}",
+                workItemId, sandbox.Id);
+        }
     }
 
     /// <summary>

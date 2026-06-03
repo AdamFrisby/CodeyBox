@@ -168,22 +168,21 @@ public interface ISuspendableSandbox : ISandbox
 
     /// <summary>
     /// True once the suspend-on-shutdown handler has taken ownership of this
-    /// VM's recovery path via Suspend (RAM frozen) or Dispose (delete --purge).
-    /// Stop mode deliberately leaves this false so PipelineRunner can create a
-    /// PreemptCheckpoint before calling StopAndPreserveAsync. PipelineRunner
-    /// reads this in its host-shutdown OCE catch block to short-circuit the
-    /// legacy in-VM preempt-checkpoint flow when that flow would hang (Suspend)
-    /// or fault (Dispose). Suspend mode flips this implicitly via
-    /// <see cref="IsSuspended"/>; Dispose mode calls
+    /// VM's teardown via Suspend (RAM frozen), Stop (clean shutdown), or Dispose
+    /// (delete --purge). PipelineRunner reads this in its host-shutdown OCE
+    /// catch block to short-circuit the legacy in-VM preempt-checkpoint flow
+    /// when that flow would hang (Suspend) or fault against a stopped/deleted VM
+    /// (Stop/Dispose). Suspend mode flips this implicitly via
+    /// <see cref="IsSuspended"/>; Stop and Dispose call
     /// <see cref="MarkOwnedByShutdownHandler"/>.
     /// </summary>
     bool IsOwnedByShutdownHandler => IsSuspended;
 
     /// <summary>
     /// Flips <see cref="IsOwnedByShutdownHandler"/> to true. Called by
-    /// <c>SandboxSuspendOnShutdownService</c> only for teardown modes that must
-    /// skip PipelineRunner's in-VM checkpoint path because the VM is already
-    /// frozen or being destroyed. Default no-op: fakes that don't track teardown
+    /// <c>SandboxSuspendOnShutdownService</c> before Stop/Dispose teardown begins
+    /// so PipelineRunner sees the "skip checkpoint" signal even though the
+    /// suspend path was not taken. Default no-op: fakes that don't track teardown
     /// ownership keep <see cref="IsOwnedByShutdownHandler"/> at the
     /// <see cref="IsSuspended"/> fallback.
     /// </summary>
@@ -298,9 +297,9 @@ public static class SuspendTimeoutPolicy
     /// <para>This is deliberately mode-and-capability-driven, not
     /// provider-name-driven: the caller folds together whether the configured
     /// provider implements <see cref="ISuspendingSandboxProvider"/> and whether
-    /// the selected shutdown mode will actually suspend. Core therefore stays
-    /// provider-agnostic — a new suspend-capable backend raises the ceiling in
-    /// Suspend mode without adding another magic string here.</para>
+    /// the selected or hot-reloadable shutdown path can suspend. Core therefore
+    /// stays provider-agnostic — a new suspend-capable backend can raise the
+    /// ceiling without adding another magic string here.</para>
     ///
     /// <para>Lives on the Core policy (rather than on the orchestrator suspend
     /// handler) so the API composition root can size the ceiling without

@@ -28,6 +28,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:Shutdown:SandboxResumeMode must be Background or Blocking");
         }
 
+        if (!Enum.IsDefined(options.Shutdown.SandboxTeardownMode))
+        {
+            failures.Add("CodeyBox:Shutdown:SandboxTeardownMode must be Suspend, Stop, or Dispose");
+        }
+
         if (options.Shutdown.SandboxResumeTimeout <= TimeSpan.Zero
             || options.Shutdown.SandboxResumeTimeout > SandboxStartupResumePolicy.MaximumResumeTimeout)
         {

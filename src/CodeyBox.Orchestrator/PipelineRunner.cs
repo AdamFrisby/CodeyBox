@@ -2094,11 +2094,9 @@ public sealed class PipelineRunner : IPipelineRunner
             // persisted while IsSuspended is left false (multipassd is still
             // writing the RAM snapshot). Gating only on IsSuspended would let
             // the legacy git-checkpoint + multipass-stop path race that
-            // in-flight suspend. Stop mode intentionally does NOT set shutdown
-            // ownership: the VM must stay available here so this catch block can
-            // write the preempt checkpoint before StopAndPreserveAsync runs.
-            // Dispose mode still sets the ownership flag because the VM is being
-            // destroyed and in-VM checkpoint commands would fault. We re-read the
+            // in-flight suspend. Stop / Dispose modes set the ownership flag
+            // before stopping or destroying the VM because in-VM checkpoint
+            // commands would fault after lifecycle teardown. We re-read the
             // store under CancellationToken.None (ct is already cancelled by host
             // shutdown): on the per-VM suspend-timeout path the handler has
             // persisted SuspendedVmName and returned while multipassd is still
@@ -2116,7 +2114,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (suspendHandled)
                 {
                     _log.LogInformation(
-                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen / disposed VM",
+                        "Work item {Id}: sandbox {SandboxId} was taken over by SandboxSuspendOnShutdownService; skipping preempt-checkpoint and preserve to avoid racing the frozen / stopped / disposed VM",
                         item.Id, sandbox.Id);
                     throw;
                 }
@@ -2153,6 +2151,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     _log.LogWarning(
                         "Timed out preserving sandbox {SandboxId} for work item {Id} after {Timeout}",
                         sandbox.Id, item.Id, _opts.SandboxPreserveDrain);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Failed preserving sandbox {SandboxId} for work item {Id} during host shutdown; leaving the checkpointed item recoverable and the VM for operator cleanup",
+                        sandbox.Id, item.Id);
                 }
             }
 

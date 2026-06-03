@@ -19,7 +19,7 @@ namespace CodeyBox.Tests;
 /// the callback that sets <c>HostOptions.ShutdownTimeout</c> must read the same
 /// inputs from <see cref="CodeyBoxOptions"/> that the orchestrator pool
 /// uses (via <see cref="OrchestratorOptionsFactory"/>) and feed them, together
-/// with the resolved provider's suspend capability and selected teardown mode, into
+/// with the resolved provider's suspend capability, into
 /// <see cref="SuspendTimeoutPolicy.ResolveHostShutdownTimeout"/>. A drift here
 /// (wrong property, inverted precedence, or a literal that bypasses the factory)
 /// would leave the host SIGKILL budget too small and reproduce the acceptance
@@ -58,29 +58,31 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public void StopMode_KeepsTheGraceWindow_ForSuspendingProvider()
+    public void StopMode_StillReservesSuspendCeiling_ForSuspendingProvider()
     {
-        // Multipass can suspend, but Stop mode does not write RAM snapshots, so
-        // the host ceiling stays at the configured graceful drain window.
+        // SandboxTeardownMode is hot-reloadable at shutdown time, while
+        // HostOptions.ShutdownTimeout is captured at startup. A suspend-capable
+        // provider therefore keeps the conservative suspend ceiling even when
+        // startup config says Stop.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Stop, maxWorkers: 32, graceSeconds: 45),
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
-    public void DisposeMode_KeepsTheGraceWindow_ForSuspendingProvider()
+    public void DisposeMode_StillReservesSuspendCeiling_ForSuspendingProvider()
     {
-        // Dispose does not write RAM snapshots either; it must not receive the
-        // long suspend reserve that only Suspend mode needs.
+        // Dispose itself does not write RAM snapshots, but a hot reload to
+        // Suspend before graceful shutdown would need the RAM-scaled budget.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Dispose, maxWorkers: 32, graceSeconds: 45),
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
@@ -151,8 +153,8 @@ public sealed class HostShutdownTimeoutWiringTests
     // --- DI-level wiring: the AddOptions<HostOptions>().Configure callback -------
     // The static-helper tests above pin ComputeHostShutdownTimeout, but the
     // production path also depends on the Configure delegate (Program.cs ~line 188)
-    // deriving provider support from `sandboxProvider is ISuspendingSandboxProvider`
-    // while also respecting CodeyBox:Shutdown:SandboxTeardownMode. These tests
+    // deriving provider support from `sandboxProvider is ISuspendingSandboxProvider`.
+    // These tests
     // build the host and read IOptions<HostOptions> from DI so a regression that
     // hard-codes the bool, drops the capability check, or mis-wires the delegate
     // is caught — none of which the static-helper tests would notice.
@@ -174,7 +176,7 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public void HostOptions_FromDi_DefaultStopMode_KeepsGrace_ForSuspendingProvider()
+    public void HostOptions_FromDi_DefaultStopMode_ReservesSuspendCeiling_ForSuspendingProvider()
     {
         using var factory = new HostOptionsWiringFactory(
             new FakeSuspendingProvider(),
@@ -183,7 +185,7 @@ public sealed class HostShutdownTimeoutWiringTests
 
         var hostOptions = factory.Services.GetRequiredService<IOptions<HostOptions>>().Value;
 
-        Assert.Equal(TimeSpan.FromSeconds(60), hostOptions.ShutdownTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(30) + TimeSpan.FromSeconds(60), hostOptions.ShutdownTimeout);
     }
 
     [Fact]
@@ -217,6 +219,7 @@ public sealed class HostShutdownTimeoutWiringTests
 
         Assert.True(sandbox.SuspendCalled);
         Assert.False(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.DisposeCalled);
         var after = await store.GetAsync(item.Id);
         Assert.Equal("vm-from-di", after!.SuspendedVmName);
         Assert.NotNull(after.SuspendedAt);
@@ -250,7 +253,8 @@ public sealed class HostShutdownTimeoutWiringTests
         await shutdownService.StoppingAsync(CancellationToken.None);
 
         Assert.False(sandbox.SuspendCalled);
-        Assert.False(sandbox.StopAndPreserveCalled);
+        Assert.True(sandbox.StopAndPreserveCalled);
+        Assert.False(sandbox.DisposeCalled);
         var after = await store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);

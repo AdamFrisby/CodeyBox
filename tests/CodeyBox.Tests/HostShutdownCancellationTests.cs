@@ -55,7 +55,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         string seedRepoUrl,
         IAgentRunner agent,
         PipelineOptions? options = null,
-        ILogger<PipelineRunner>? logger = null)
+        ILogger<PipelineRunner>? logger = null,
+        ISandboxProvider? sandboxProvider = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -64,7 +65,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
-        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var sandboxes = sandboxProvider
+            ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
 
@@ -146,6 +148,40 @@ public sealed class HostShutdownCancellationTests : IDisposable
                 && s == "RunAsync.host-shutdown");
         Assert.Equal(CancellationSources.HostShutdown, boundary.Properties["CancellationSource"]);
         Assert.Equal(true, boundary.Properties["HostShutdown"]);
+    }
+
+    [Fact]
+    public async Task HostShutdown_StopAndPreserveFailure_LeavesCheckpointedItemRecoverable()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            logger: logger,
+            sandboxProvider: new PreserveFailingSandboxProvider(
+                new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance)));
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var hostShutdownCts = new CancellationTokenSource();
+        using var operatorCancelCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, operatorCancelCts.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        Assert.Null(final.FailureKind);
+        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        Assert.Contains(logger.Entries, e =>
+            e.Message.Contains("Failed preserving sandbox", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1043,6 +1079,47 @@ internal sealed class CapturingSandboxProvider : ISandboxProvider
 
     public Task DisposeLeakedAsync(string name, CancellationToken ct)
         => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class PreserveFailingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public PreserveFailingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PreserveFailingSandbox(await _inner.CreateAsync(spec, ct));
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
+
+internal sealed class PreserveFailingSandbox : IPreemptibleSandbox
+{
+    private readonly ISandbox _inner;
+
+    public PreserveFailingSandbox(ISandbox inner)
+    {
+        _inner = inner;
+    }
+
+    public string Id => _inner.Id;
+
+    public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        => _inner.ExecAsync(exec, ct);
+
+    public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+    public Task StopAndPreserveAsync(CancellationToken ct = default)
+        => throw new InvalidOperationException("injected preserve failure");
 }
 
 /// <summary>

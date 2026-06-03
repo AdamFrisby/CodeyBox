@@ -2049,17 +2049,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         var stopCalls = 0;
         var infoCalls = 0;
+        var calls = new List<string>();
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             if (argv is [_, "stop", "codeybox-test"])
             {
+                calls.Add("stop");
                 stopCalls++;
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
             if (argv is [_, "info", "codeybox-test", "--format=csv"])
             {
+                calls.Add("info");
                 infoCalls++;
-                return Task.FromResult(new ProcessRunResult(0, "Stopped", ""));
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    stopCalls > 0 ? "Stopped" : "Running",
+                    ""));
             }
             return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
         });
@@ -2069,6 +2075,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Equal(1, stopCalls);
         Assert.True(infoCalls >= 1);
+        Assert.True(calls.IndexOf("stop") >= 0 && calls.IndexOf("stop") < calls.IndexOf("info"),
+            $"expected stop before info verification, got: {string.Join(", ", calls)}");
         Assert.True(File.Exists(Path.Combine(_workspace, ".codeybox-preempt")));
     }
 

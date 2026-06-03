@@ -255,13 +255,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     // ── Stop / Dispose teardown modes ────────────────────────────────────────
 
     [Fact]
-    public async Task ShutdownHandler_StopMode_DefersToPipelinePreemptCheckpoint_NotSuspend()
+    public async Task ShutdownHandler_StopMode_CallsStopAndPreserve_NotSuspendOrDispose()
     {
         // The R8.1 alternative teardown mode the post-incident review
         // recommended: multipass stop is faster and far less likely to wedge
-        // multipassd than suspend. The lifecycle service must leave the VM live
-        // for PipelineRunner's host-shutdown catch so it can write a
-        // PreemptCheckpoint before StopAndPreserveAsync runs.
+        // multipassd than suspend. The suspend and dispose paths are skipped
+        // entirely when the sandbox exposes the preemptible stop capability.
         var item = MakeItem();
         await _store.CreateAsync(item);
 
@@ -277,12 +276,16 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         await svc.SuspendAllAsync();
 
         Assert.False(sandbox.SuspendCalled, "Stop mode must not call SuspendAsync");
-        Assert.False(sandbox.StopAndPreserveCalled,
-            "Stop mode must leave StopAndPreserveAsync to PipelineRunner after preempt checkpoint");
-        Assert.False(sandbox.OwnedByShutdownHandler,
-            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path");
-        // Stop mode does not persist SuspendedVmName: the work item recovers via
-        // its preempt-checkpoint, same as a non-suspending provider would.
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Stop mode should call IPreemptibleSandbox.StopAndPreserveAsync");
+        Assert.False(sandbox.DisposeCalled,
+            "Stop mode must not delete/purge a sandbox that supports StopAndPreserveAsync");
+        Assert.True(sandbox.OwnedByShutdownHandler,
+            "Stop mode must suppress PipelineRunner's later in-VM checkpoint path after the VM has been stopped");
+        Assert.True(sandbox.MarkOwnedOrder > 0 && sandbox.MarkOwnedOrder < sandbox.StopAndPreserveOrder,
+            "Stop mode must mark shutdown ownership before stopping the VM");
+        // Stop mode does not persist SuspendedVmName; that field is reserved for
+        // opt-in RAM-snapshot suspend/resume.
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
     }
@@ -315,10 +318,10 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
 
         Assert.False(sandbox.SuspendCalled,
             "shutdown must not use the startup SandboxTeardownMode after a hot reload");
-        Assert.False(sandbox.StopAndPreserveCalled,
-            "shutdown must use the current SandboxTeardownMode from IOptionsMonitor; Stop mode defers StopAndPreserveAsync to PipelineRunner");
-        Assert.False(sandbox.OwnedByShutdownHandler,
-            "Stop mode must not suppress PipelineRunner's preempt-checkpoint path after hot reload");
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "shutdown must use the current SandboxTeardownMode from IOptionsMonitor");
+        Assert.True(sandbox.OwnedByShutdownHandler,
+            "hot-reloaded Stop mode must mark shutdown ownership before stopping");
     }
 
     [Fact]
@@ -350,6 +353,30 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             "Dispose mode must mark shutdown ownership before disposal");
         var after = await _store.GetAsync(item.Id);
         Assert.Null(after!.SuspendedVmName);
+    }
+
+    [Fact]
+    public async Task ShutdownHandler_DisposeMode_CancelsHungDisposeAtNonSuspendTimeout()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var provider = new OrderingFakeProvider();
+        var neverDisposed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sandbox = new OrderingFakeSandbox("vm-dispose-hung", disposeTask: neverDisposed.Task);
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxSuspendOnShutdownService(
+            provider, _store,
+            NullLogger<SandboxSuspendOnShutdownService>.Instance,
+            teardownMode: SandboxTeardownMode.Dispose,
+            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
+
+        await svc.SuspendAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(sandbox.DisposeCalled);
+        Assert.False(neverDisposed.Task.IsCompleted);
+        Assert.Equal(TimeSpan.FromMilliseconds(25), svc.NonSuspendTeardownTimeout);
     }
 
     [Fact]
@@ -878,10 +905,12 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     private sealed class OrderingFakeSandbox : IPreemptibleSandbox, ISuspendableSandbox
     {
         private readonly Func<bool>? _isDispatchPaused;
-        public OrderingFakeSandbox(string id, Func<bool>? isDispatchPaused = null)
+        private readonly Task? _disposeTask;
+        public OrderingFakeSandbox(string id, Func<bool>? isDispatchPaused = null, Task? disposeTask = null)
         {
             Id = id;
             _isDispatchPaused = isDispatchPaused;
+            _disposeTask = disposeTask;
         }
         public string Id { get; }
         public bool SuspendCalled { get; private set; }
@@ -899,7 +928,9 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         {
             DisposeCalled = true;
             DisposeOrder = ++_order;
-            return ValueTask.CompletedTask;
+            return _disposeTask is null
+                ? ValueTask.CompletedTask
+                : new ValueTask(_disposeTask);
         }
         public Task SuspendAsync(CancellationToken ct = default)
         {
@@ -1052,8 +1083,8 @@ public sealed class SandboxShutdownProgramWiringTests
 
         Assert.False(sandbox.SuspendCalled,
             "Program.cs must not capture the startup SandboxTeardownMode in the hosted-service registration");
-        Assert.False(sandbox.StopAndPreserveCalled,
-            "Program.cs must wire the shutdown service to read the current IOptionsMonitor value at teardown time; Stop mode defers StopAndPreserveAsync to PipelineRunner");
+        Assert.True(sandbox.StopAndPreserveCalled,
+            "Program.cs must wire the shutdown service to read the current IOptionsMonitor value at teardown time");
     }
 
     private static WorkItem MakeItem() => new()

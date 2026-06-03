@@ -1731,17 +1731,43 @@ test "$work" = present && test "$exec_wrapper" = present
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        var stopTimeout = opts.VmStopTimeout > TimeSpan.Zero
+        var stopTimeout = ResolveVmStopTimeout(opts);
+        await WaitForStoppedCoreAsync(
+            name,
+            stopTimeout,
+            ctInner => RunAsync(
+                opts,
+                [opts.MultipassBinary, "info", name, "--format=csv"],
+                stdin: null,
+                ct: ctInner,
+                workItemId: workItemId),
+            ct);
+    }
+
+    internal static TimeSpan ResolveVmStopTimeout(MultipassSandboxOptions opts) =>
+        opts.VmStopTimeout > TimeSpan.Zero
             ? opts.VmStopTimeout
             : MultipassSandboxOptions.DefaultVmStopTimeout;
+
+    internal static async Task WaitForStoppedCoreAsync(
+        string name,
+        TimeSpan stopTimeout,
+        Func<CancellationToken, Task<ProcessRunResult>> readInfoAsync,
+        CancellationToken ct)
+    {
         var deadline = DateTime.UtcNow + stopTimeout;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+            var info = await readInfoAsync(ct);
             if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
                 return;
-            await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                break;
+            await Task.Delay(
+                remaining < TimeSpan.FromMilliseconds(500) ? remaining : TimeSpan.FromMilliseconds(500),
+                ct);
         }
         throw new InvalidOperationException(
             $"multipass VM {name} did not reach Stopped state within {stopTimeout}");
@@ -3209,14 +3235,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// <see cref="IsSuspended"/>; set explicitly by
     /// <see cref="MarkOwnedByShutdownHandler"/> for teardown modes whose
     /// recovery path does not go through SuspendAsync but still cannot run the
-    /// in-VM checkpoint flow. Stop mode deliberately leaves this false so
-    /// PipelineRunner can write a PreemptCheckpoint before stopping the VM.
+    /// in-VM checkpoint flow after the lifecycle service has stopped or deleted
+    /// the VM.
     /// </summary>
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
 
     /// <summary>
-    /// Called by <c>SandboxSuspendOnShutdownService</c> before destructive
-    /// teardown modes begin so PipelineRunner's shutdown catch sees the
+    /// Called by <c>SandboxSuspendOnShutdownService</c> before Stop/Dispose
+    /// teardown begins so PipelineRunner's shutdown catch sees the
     /// "skip in-VM checkpoint" signal even though the suspend path was not
     /// taken. Idempotent; safe to call multiple times.
     /// </summary>
@@ -3682,29 +3708,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
     private async Task WaitForStoppedAfterPreserveAsync(CancellationToken ct)
     {
-        var stopTimeout = _opts.VmStopTimeout > TimeSpan.Zero
-            ? _opts.VmStopTimeout
-            : MultipassSandboxOptions.DefaultVmStopTimeout;
-        var deadline = DateTime.UtcNow + stopTimeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            ct.ThrowIfCancellationRequested();
-            var info = await RunMultipassAsync(
+        var stopTimeout = MultipassSandboxProvider.ResolveVmStopTimeout(_opts);
+        await MultipassSandboxProvider.WaitForStoppedCoreAsync(
+            _name,
+            stopTimeout,
+            ctInner => RunMultipassAsync(
                 [_opts.MultipassBinary, "info", _name, "--format=csv"],
                 stdin: null,
-                ct: ct);
-            if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
-                return;
-            var remaining = deadline - DateTime.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-                break;
-            await Task.Delay(
-                remaining < TimeSpan.FromMilliseconds(500) ? remaining : TimeSpan.FromMilliseconds(500),
-                ct);
-        }
-
-        throw new InvalidOperationException(
-            $"multipass VM {_name} did not reach Stopped state within {stopTimeout}");
+                ct: ctInner),
+            ct);
     }
 
     /// <summary>

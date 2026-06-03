@@ -244,9 +244,11 @@ builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptions
 // non-terminal work items. Adding new projects passes cleanly.
 builder.Services.AddSingleton<IValidateOptions<ProjectsOptions>, ProjectsOptionsRemovalValidator>();
 
-// Sized from the resolved sandbox provider's capability and the selected
-// teardown mode, not the provider config name: only actual Suspend teardown needs
-// the raised RAM-snapshot ceiling. Stop/Dispose keep the tighter grace window.
+// Sized from the resolved sandbox provider's capability, not the provider config
+// name. SandboxTeardownMode is intentionally hot-reloadable at shutdown time, but
+// HostOptions is captured at startup, so suspend-capable providers keep the
+// RAM-snapshot ceiling even when startup config says Stop/Dispose. It is only a
+// ceiling: shutdown still returns promptly when no suspend work is running.
 // Using the DI-resolved provider keeps the deployment knowledge (name → provider)
 // in the composition root and out of the Core policy. See ComputeHostShutdownTimeout.
 builder.Services.AddOptions<HostOptions>()
@@ -1982,8 +1984,8 @@ builder.Services.AddHostedService(sp =>
 });
 // R8-core/R8.1: tear down in-flight sandboxes on graceful shutdown using the
 // operator-selected SandboxTeardownMode. Suspend is opt-in and writes resume
-// bookkeeping so the next process can reattach; Stop is the default and leaves
-// active VMs to PipelineRunner's existing preempt-checkpoint + preserve path.
+// bookkeeping so the next process can reattach; Stop is the default and stops /
+// preserves active VMs instead of taking the unreliable RAM-snapshot path.
 // The shutdown half is lifecycle-bound (StoppingAsync). Startup resume defaults
 // to background mode so a wedged multipassd cannot keep Kestrel offline;
 // OrchestratorService waits for startup recovery input before its dead-worker
@@ -3065,8 +3067,7 @@ namespace CodeyBox.Api
         /// Hot-reloadable: read by the shutdown handler when graceful shutdown
         /// begins, so an operator can switch modes without restarting first.
         /// Default <see cref="SandboxTeardownMode.Stop"/>: avoid RAM snapshots
-        /// and recover through the preempt-checkpoint flow, which stops and
-        /// preserves the VM after the checkpoint is written. Operators who
+        /// and cleanly stop/preserve the VM on graceful shutdown. Operators who
         /// explicitly want RAM-state preservation can opt in to
         /// <see cref="SandboxTeardownMode.Suspend"/>; it freezes RAM via
         /// <c>multipass suspend</c> and resumes on next startup, but can hit the
@@ -3570,10 +3571,16 @@ public partial class Program
 {
     /// <summary>
     /// Resolve <c>HostOptions.ShutdownTimeout</c> from operator config, the
-    /// resolved provider's suspend capability, and the selected teardown mode.
+    /// resolved provider's suspend capability, and the hot-reloadable teardown
+    /// mode.
     /// Shutdown:GraceSeconds bounds the normal request-drain / preempt-checkpoint
-    /// window. Only opt-in Suspend teardown can legitimately need far longer to
-    /// let the host finish writing each VM's RAM snapshot (the RAM-scaled
+    /// window. Suspend-capable providers keep a conservative ceiling because
+    /// <c>Shutdown.SandboxTeardownMode</c> is read through
+    /// <c>IOptionsMonitor</c> when shutdown begins, while
+    /// <c>HostOptions.ShutdownTimeout</c> is captured once at startup. An
+    /// operator can therefore hot-reload Stop/Dispose to Suspend immediately
+    /// before stopping the process, and the host must still have enough time to
+    /// finish writing each VM's RAM snapshot (the RAM-scaled
     /// <see cref="SuspendTimeoutPolicy"/> budget — 30 min for the default 12 GiB
     /// VM) and drains in parallel batches, so a deployment with more in-flight
     /// VMs than the batch cap spans <c>ceil(N/batch)</c> sequential waves. The
@@ -3600,8 +3607,7 @@ public partial class Program
         var maxConcurrent = OrchestratorOptionsFactory
             .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
             .MaxConcurrentWorkers;
-        var suspendsOnShutdown = providerSupportsSuspend
-            && cbOpts.Shutdown.SandboxTeardownMode == SandboxTeardownMode.Suspend;
+        var suspendsOnShutdown = providerSupportsSuspend;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
             suspendsOnShutdown, grace, maxConcurrent);
     }
