@@ -514,6 +514,48 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxRequiredBuildVerifier_SandboxCreateAsyncThrows_ReturnsUnavailable()
+    {
+        // Coverage gap: VerifyAsync's catch-Exception arm at the sandbox
+        // provisioning boundary. If ISandboxProvider.CreateAsync itself
+        // throws (CI sandbox quota exhausted, hypervisor refused, image
+        // pull failed), the verifier must surface that as Unavailable so
+        // the item defers — never pass-by-default. Other tests drive
+        // failures inside the sandbox; this one drives failure BEFORE one
+        // ever materialises.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryFailingSandboxProvider("sandbox provisioning denied by quota"),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-throws") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("could not verify required build", result.Reason);
+        Assert.Contains("sandbox provisioning denied by quota", result.Reason);
+        Assert.NotEqual(RequiredBuildVerificationStatus.Passed, result.Status);
+    }
+
+    [Fact]
     public async Task RequiredBuildGate_FailingBuild_PersistsAuditReportWithErrorFindingViaOrchestrator()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -723,6 +765,53 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
         var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
         Assert.Contains(dotnetInvocations, line => line.Contains("nested/Nested.slnx"));
+    }
+
+    [Fact]
+    public async Task RequiredBuildGate_NestedSolutionOnly_StillBuildsUnregisteredTestProject()
+    {
+        // Regression: the build script's test-project enrichment must run
+        // whenever ANY solution (root or nested) drives target discovery.
+        // A nested .sln may not include every test project, so the gate
+        // has to append test/*tests/*.csproj or a broken test project
+        // would slip through. Prior gating on `root_solutions` skipped this
+        // step for nested-only repos and let a non-compiling unregistered
+        // test project still pass the required build.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddNestedSolutionWithUnregisteredTestProjectAsync(seed);
+        var fakeDotnet = await CreateFlexibleFakeDotnetAsync();
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/nested-solution-with-unregistered-tests") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            gitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "ok.txt",
+            "ok\n",
+            "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Passed, result.Status);
+        var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
+        Assert.Contains(dotnetInvocations, line => line.Contains("nested/Nested.slnx"));
+        Assert.Contains(dotnetInvocations, line => line.Contains("tests/Unregistered.Tests.csproj"));
     }
 
     [Fact]
@@ -1281,6 +1370,46 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalGitHost_ListFilesEndingWithAsync_Cancelled_KillsAndReapsChildProcess()
+    {
+        // Pin the cancellation cleanup path in ListFilesEndingWithAsync's
+        // streamed ls-tree reader. The catch arm has to Kill the child
+        // before rethrowing so the finally's WaitForExitAsync can reap it
+        // — without that, a cancelled probe would leave the git process
+        // wedged on its stdout pipe and the wait would hang. Because the
+        // finally drains stderr and waits for exit with CancellationToken.None,
+        // a regression that drops the kill turns this test into a hang
+        // (xUnit will time out) rather than a clean failure, so the
+        // existence of this test itself is what locks the invariant in.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const int markerCount = 16;
+        for (var i = 0; i < markerCount; i++)
+        {
+            var projectPath = Path.Combine(seed, $"proj-{i:D2}.csproj");
+            await File.WriteAllTextAsync(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+            await TestSupport.RunGit(seed, "add", $"proj-{i:D2}.csproj");
+        }
+        await TestSupport.RunGit(seed, "commit", "-m", "many marker files");
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-cancel-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var item = NewItem("feature/cancel-during-read") with { BaseBranch = "main" };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        // The pre-cancelled token surfaces inside ReadLineAsync, exercising
+        // the catch arm. If the method ever returns or throws, the finally
+        // already drained stderr and awaited the child — so reaching this
+        // assertion at all proves the kill+reap path is wired correctly.
+        var call = gitHost.ListFilesEndingWithAsync(
+            repoId, item.BaseBranch!, new[] { ".csproj" }, 1000, cts.Token);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await call);
+    }
+
+    [Fact]
     public async Task SandboxRequiredBuildVerifier_MarkerCapOverflow_ReportsUnavailable()
     {
         // End-to-end: when the underlying marker listing exceeds the per-branch
@@ -1698,6 +1827,27 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     /// <summary>
+    /// Adds a nested .slnx (no root solution) plus a test project that lives
+    /// under a top-level <c>tests/</c> directory and is intentionally NOT
+    /// listed in the nested solution. The build script's test-project
+    /// enrichment must still pick the test project up when nested-only
+    /// solutions drive target discovery.
+    /// </summary>
+    private static async Task AddNestedSolutionWithUnregisteredTestProjectAsync(string repoPath)
+    {
+        var nested = Path.Combine(repoPath, "nested");
+        Directory.CreateDirectory(nested);
+        await File.WriteAllTextAsync(Path.Combine(nested, "Nested.slnx"), "# nested solution marker\n");
+        var testsDir = Path.Combine(repoPath, "tests");
+        Directory.CreateDirectory(testsDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(testsDir, "Unregistered.Tests.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />\n");
+        await TestSupport.RunGit(repoPath, "add", "nested/Nested.slnx", "tests/Unregistered.Tests.csproj");
+        await TestSupport.RunGit(repoPath, "commit", "-m", "add nested solution plus unregistered test project");
+    }
+
+    /// <summary>
     /// Adds only a .csproj (no .slnx/.sln anywhere) so the verifier's
     /// csproj-only fallback branch is exercised.
     /// </summary>
@@ -1898,6 +2048,23 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
 
         public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
+    private sealed class SandboxFactoryFailingSandboxProvider(string message) : ISandboxProvider
+    {
+        public string Name => "sandbox-factory-failing";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            throw new InvalidOperationException(message);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(Array.Empty<ManagedSandboxInfo>());
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class GitFailingSandboxProvider(string stderr) : ISandboxProvider

@@ -46,18 +46,21 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         fi
 
         targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
-        root_solutions="${TMPDIR:-/tmp}/codeybox-required-build-root-solutions-$$"
-        cleanup() { rm -f "$targets_file" "$root_solutions"; }
+        cleanup() { rm -f "$targets_file"; }
         trap cleanup EXIT INT TERM
 
-        find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$root_solutions"
-        cat "$root_solutions" > "$targets_file"
+        find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
 
         if [ ! -s "$targets_file" ]; then
           find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f \( -name '*.slnx' -o -name '*.sln' \) -print \) | sort > "$targets_file"
         fi
 
-        if [ -s "$root_solutions" ]; then
+        # If we discovered any solution file (root or nested), append test
+        # projects: a nested .sln may not include every test project and the
+        # build gate must still cover the full test surface. When no solution
+        # exists at all, the csproj-only fallback below already picks up test
+        # projects.
+        if [ -s "$targets_file" ]; then
           find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f -name '*.csproj' -print \) | sort |
           while IFS= read -r project; do
             lower=$(printf '%s' "$project" | LC_ALL=C tr '[:upper:]' '[:lower:]')
