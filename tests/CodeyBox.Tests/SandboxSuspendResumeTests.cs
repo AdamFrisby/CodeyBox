@@ -667,6 +667,47 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_ProviderBlocksBeforeReturningTask_StillHonorsTimeout()
+    {
+        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-sync-blocking-provider",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var provider = new FakeSuspendingProvider { ResumeBlocksBeforeReturningTask = true };
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: configuredTimeout,
+            mode: SandboxStartupResumeMode.Blocking);
+
+        var sw = Stopwatch.StartNew();
+        var resumeTask = svc.StartingAsync(CancellationToken.None);
+        await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        try
+        {
+            await resumeTask.WaitAsync(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            provider.ReleaseBlockedResume();
+        }
+        sw.Stop();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Contains("timed out", after.LastError);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"startup resume did not honor configured {configuredTimeout} timeout around a synchronously blocking provider; elapsed {sw.Elapsed}");
+    }
+
+    [Fact]
     public async Task StartupResume_ModeReloadBetweenLifecycleCallbacks_UsesReloadedBlockingMode()
     {
         var item = MakeItem(WorkItemState.Working);
@@ -891,6 +932,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
         await svc.StopAsync(stopCts.Token);
         await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => provider.ResumeCancellationObserved);
 
         Assert.True(provider.ResumeCancellationObserved);
         var after = await _store.GetAsync(item.Id);
@@ -2081,19 +2123,23 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     {
         private readonly ConcurrentDictionary<WorkItemId, ISuspendableSandbox> _active = new();
         // Resume runs items in parallel (SandboxResumeOnStartupService fans out
-        // via Task.Run with a SemaphoreSlim gate), so the recording lists MUST
-        // be thread-safe — a plain List<T>.Add from two concurrent resumes
-        // intermittently loses one entry, which historically surfaced as a
-        // flaky "vm-1 not in ResumedNames" assertion.
+        // with a SemaphoreSlim gate), so the recording lists MUST be thread-safe
+        // — a plain List<T>.Add from two concurrent resumes intermittently loses
+        // one entry, which historically surfaced as a flaky "vm-1 not in
+        // ResumedNames" assertion.
         private readonly ConcurrentQueue<string> _resumedNames = new();
         private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
         private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
+        private readonly ManualResetEventSlim _resumeBlockRelease = new();
         public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
         public bool ResumeThrowsCancellation { get; set; }
         public bool ResumeHangs { get; set; }
+        public bool ResumeBlocksBeforeReturningTask { get; set; }
+        public TaskCompletionSource ResumeBlockEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
         public IDictionary<string, TaskCompletionSource> ResumeReleaseSources { get; set; } =
             new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal);
@@ -2118,6 +2164,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
 
         public IReadOnlyList<(WorkItemId WorkItemId, ISuspendableSandbox Sandbox)> SnapshotSuspendableActive()
         {
@@ -2131,6 +2178,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             if (ResumeThrowsCancellation) throw new OperationCanceledException("provider cancelled resume");
+            if (ResumeBlocksBeforeReturningTask)
+            {
+                ResumeBlockEntered.TrySetResult();
+                _resumeBlockRelease.Wait();
+            }
             if (ResumeReleaseSources.TryGetValue(name, out var resumeRelease))
                 return resumeRelease.Task;
             if (ResumeHangs || ResumeNamesToHang.Contains(name))

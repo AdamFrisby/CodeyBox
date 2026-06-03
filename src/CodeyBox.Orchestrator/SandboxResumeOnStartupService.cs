@@ -215,9 +215,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             {
                 var backgroundCts = new CancellationTokenSource();
                 _backgroundCts = backgroundCts;
-                _resumeTask = Task.Run(
-                    () => ResumeAllAndSignalAsync(backgroundCts.Token),
-                    CancellationToken.None);
+                _resumeTask = RunLongRunningAsync(
+                    () => ResumeAllAndSignalAsync(backgroundCts.Token));
                 return Task.CompletedTask;
             }
 
@@ -299,23 +298,25 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             foreach (var item in suspended)
             {
                 await gate.WaitAsync(ct);
-                tasks.Add(Task.Run(async () =>
-                {
-                    try
-                    {
-                        await ResumeOneAsync(suspending, item, ct);
-                    }
-                    finally
-                    {
-                        gate.Release();
-                    }
-                }, ct));
+                tasks.Add(ResumeOneWithGateAsync(item));
             }
         }
         finally
         {
             if (tasks.Count > 0)
                 await Task.WhenAll(tasks);
+        }
+
+        async Task ResumeOneWithGateAsync(WorkItem item)
+        {
+            try
+            {
+                await ResumeOneAsync(suspending, item, ct);
+            }
+            finally
+            {
+                gate.Release();
+            }
         }
     }
 
@@ -413,12 +414,14 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Task? resumeTask = null;
         try
         {
-            resumeTask = suspending.ResumeSandboxAsync(vmName, timeoutCts.Token);
+            resumeTask = RunLongRunningAsync(
+                () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
             await resumeTask.WaitAsync(timeout, ct);
             return (true, null);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            timeoutCts.Cancel();
             if (resumeTask is not null)
                 ObserveProviderTaskException(resumeTask);
             throw;
@@ -475,19 +478,21 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Task<int?> adoptionTask;
         try
         {
-            adoptionTask = suspending.WaitForAdoptedAgentCompletionAsync(
-                vmName,
-                agentLogPath,
-                chunk =>
-                {
-                    if (!string.IsNullOrEmpty(chunk))
-                        _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
-                },
-                adoptionDeadline,
-                timeoutCts.Token);
+            adoptionTask = RunLongRunningAsync(
+                () => suspending.WaitForAdoptedAgentCompletionAsync(
+                    vmName,
+                    agentLogPath,
+                    chunk =>
+                    {
+                        if (!string.IsNullOrEmpty(chunk))
+                            _log.LogInformation("[adopted {VmName}] {Chunk}", vmName, chunk.TrimEnd());
+                    },
+                    adoptionDeadline,
+                    timeoutCts.Token));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            timeoutCts.Cancel();
             throw;
         }
         catch (OperationCanceledException ex)
@@ -519,6 +524,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            timeoutCts.Cancel();
             throw;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
@@ -560,12 +566,13 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Task<bool>? promoteTask = null;
         try
         {
-            promoteTask = suspending.PushSuspendedVmCheckpointRefAsync(
-                vmName,
-                SandboxConventions.WorkDir,
-                refName,
-                $"codeybox: suspend-resume checkpoint {itemId}",
-                timeoutCts.Token);
+            promoteTask = RunLongRunningAsync(
+                () => suspending.PushSuspendedVmCheckpointRefAsync(
+                    vmName,
+                    SandboxConventions.WorkDir,
+                    refName,
+                    $"codeybox: suspend-resume checkpoint {itemId}",
+                    timeoutCts.Token));
 
             var pushed = await promoteTask.WaitAsync(timeoutCts.Token);
             if (pushed)
@@ -578,6 +585,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            timeoutCts.Cancel();
             throw;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
@@ -614,6 +622,20 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
     }
+
+    private static Task RunLongRunningAsync(Func<Task> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default).Unwrap();
+
+    private static Task<T> RunLongRunningAsync<T>(Func<Task<T>> work) =>
+        Task.Factory.StartNew(
+            work,
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
+            TaskScheduler.Default).Unwrap();
 
     /// <summary>
     /// Must stay in lockstep with <c>PipelineRunner.PreemptRefFor</c>: the
