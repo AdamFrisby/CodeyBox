@@ -1,8 +1,11 @@
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -1604,6 +1607,86 @@ public sealed class RequiredBuildGateTests : IDisposable
             host.ListFilesEndingWithAsync("repo", "tree", Array.Empty<string>(), maxResults: 1));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
             host.ListFilesEndingWithAsync("repo", "tree", new[] { ".cs" }, maxResults: 0));
+    }
+
+    [Fact]
+    public async Task LocalGitHost_ListFilesEndingWithAsync_RejectsInvalidArguments()
+    {
+        // Direct coverage of the LocalGitHost override's own argument
+        // validation. The IGitHost-default test above pins the fallback
+        // path; this one pins the streaming override so a regression that
+        // drops or inverts the LocalGitHost-side validation (including the
+        // whitespace/empty per-entry check at line 663) fails here rather
+        // than silently feeding an empty suffix into the git pipe and
+        // returning a partial or empty result set.
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = Path.Combine(_workspace, "repos-args-" + Guid.NewGuid().ToString("N")[..8]),
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            gitHost.ListFilesEndingWithAsync("repo", "tree", null!, maxResults: 1));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            gitHost.ListFilesEndingWithAsync("repo", "tree", Array.Empty<string>(), maxResults: 1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            gitHost.ListFilesEndingWithAsync("repo", "tree", new[] { ".cs" }, maxResults: 0));
+        // The whitespace/empty per-entry check is unique to the LocalGitHost
+        // override — the IGitHost default doesn't enforce it, so this is the
+        // only path that pins the invariant.
+        var emptyEntry = await Assert.ThrowsAsync<ArgumentException>(() =>
+            gitHost.ListFilesEndingWithAsync("repo", "tree", new[] { string.Empty }, maxResults: 1));
+        Assert.Contains("non-empty", emptyEntry.Message);
+        var whitespaceEntry = await Assert.ThrowsAsync<ArgumentException>(() =>
+            gitHost.ListFilesEndingWithAsync("repo", "tree", new[] { "   " }, maxResults: 1));
+        Assert.Contains("non-empty", whitespaceEntry.Message);
+    }
+
+    [Fact]
+    public void PipelineRunner_Constructor_ThrowsArgumentNullException_WhenRequiredBuildVerifierIsNull()
+    {
+        // The composition root MUST wire IRequiredBuildVerifier. A silent
+        // null-as-disabled fallback would let the AuditPassed gate decay
+        // back to the pre-gate behavior (a non-compiling branch could pass
+        // audit because no probe was wired), so the constructor enforces
+        // the contract at boot. Without this test, a future regression
+        // that swaps the throw for "if (verifier is null) skip the gate"
+        // would not be caught.
+        var gitRoot = Path.Combine(_workspace, "repos-ctor-null-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-ctor-null-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var registry = new AgentRegistry(new[] { new ScriptedAgent(new[] { MergeStrategy.RealMerge }) });
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "ctor-null test",
+            RepositoryUrl = "ignored",
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+        });
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(Array.Empty<IAuditor>()));
+
+        var ex = Assert.Throws<ArgumentNullException>(() => new PipelineRunner(
+            sandboxes,
+            gitHost,
+            registry,
+            new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            projects,
+            new TestUpstreamFactory(),
+            composer,
+            store,
+            new NullWebhookDispatcher(),
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: null));
+        Assert.Equal("requiredBuildVerifier", ex.ParamName);
+        Assert.Contains("composition root", ex.Message);
     }
 
     [Fact]
