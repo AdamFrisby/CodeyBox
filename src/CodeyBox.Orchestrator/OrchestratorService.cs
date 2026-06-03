@@ -816,7 +816,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
                 continue;
 
-            var recovered = TryBuildRecoveredState(item);
+            var recovered = await TryBuildRecoveredStateAsync(item, ct);
             if (recovered is not null)
             {
                 if (recovered.State == WorkItemState.AbandonedAfterRecoveryAttempts)
@@ -832,6 +832,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     await _store.UpdateAsync(recovered, ct);
                     _log.LogWarning(
                         "Work item {Id} was left Working without a preempt checkpoint; marked Failed as a crash case",
+                        item.Id);
+                }
+                else if (recovered.State == WorkItemState.Done)
+                {
+                    await _store.UpdateAsync(recovered, ct);
+                    if (item.Verdict is not null
+                        && item.Check is not null
+                        && item.Verdict.Answer == item.Check.ActionableAnswer
+                        && await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, item.Id, ct) is { } followup)
+                    {
+                        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _queue, followup, ct);
+                    }
+                    _log.LogInformation(
+                        "Work item {Id} check-and-act verdict was already persisted; completed startup recovery without replaying the check",
                         item.Id);
                 }
                 else
@@ -855,6 +869,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
         }
+    }
+
+    private async Task<WorkItem?> TryBuildRecoveredStateAsync(WorkItem item, CancellationToken ct)
+    {
+        if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var completed = await CheckAndActFollowupRecovery.TryBuildCompletedFromPersistedVerdictAsync(
+                _store, item, ct);
+            if (completed is not null)
+                return completed;
+        }
+
+        return TryBuildRecoveredState(item);
     }
 
     private async Task HeartbeatLoopAsync(string workerId, string currentWorkItemId, TimeSpan interval, CancellationToken ct)
@@ -920,6 +947,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     State = WorkItemState.AbandonedAfterRecoveryAttempts,
                     LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                    RecoveryAttempts = checkAttempts,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 };
             }

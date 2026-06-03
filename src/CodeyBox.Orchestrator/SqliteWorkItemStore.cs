@@ -202,6 +202,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
         RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
         RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+        RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_origin_check_unique ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
 
         // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
         // Populated only on follow-up items by the re-validation loop that re-runs

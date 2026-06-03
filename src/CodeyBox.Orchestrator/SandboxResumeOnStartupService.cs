@@ -513,7 +513,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
 
         try
         {
-            var adoptionExitCode = await adoptionTask.WaitAsync(timeoutCts.Token);
+            var adoptionExitCode = await adoptionTask.WaitAsync(adoptionDeadline, ct);
             if (adoptionExitCode is null)
             {
                 _log.LogWarning(
@@ -526,6 +526,15 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             throw;
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            ObserveProviderTaskException(adoptionTask);
+            _log.LogWarning(
+                "Startup adoption timed out for sandbox {VmName} (work item {WorkItemId}) after {Deadline}; falling through to recovery",
+                vmName, itemId, adoptionDeadline);
+            return null;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {

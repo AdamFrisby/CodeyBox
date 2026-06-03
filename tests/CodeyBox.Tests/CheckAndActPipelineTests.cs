@@ -82,6 +82,61 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task YesVerdict_ExistingOriginFollowup_IsReusedInsteadOfDuplicated()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "src/Foo.cs still needs remediation", "high"));
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for SQL injection",
+            Prompt = "evaluate the repo",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-idempotent",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is any user-facing SQL built via string concatenation?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Fix it",
+                    Prompt = "remediate",
+                },
+            },
+        };
+        var existingFollowup = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = check.ProjectId,
+            Title = "Fix it",
+            Prompt = "remediate",
+            BaseBranch = check.BaseBranch,
+            PushUpstream = check.PushUpstream,
+            OriginCheckWorkItemId = check.Id,
+            JobType = JobType.Normal,
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Store.CreateAsync(existingFollowup);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followups = allItems.Where(i => i.OriginCheckWorkItemId == check.Id).ToList();
+        var followup = Assert.Single(followups);
+        Assert.Equal(existingFollowup.Id, followup.Id);
+    }
+
+    [Fact]
     public async Task NoVerdict_NoFollowupEnqueued_VerdictRecorded_CheckDone()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

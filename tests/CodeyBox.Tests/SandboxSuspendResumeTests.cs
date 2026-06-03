@@ -473,6 +473,30 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Null(after!.SuspendedVmName);
     }
 
+    [Fact]
+    public async Task ShutdownHandler_SuspendMode_NonSuspendableActiveSandbox_LeavesNormalRecoveryPath()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+
+        var sandbox = new NonSuspendableShutdownSandbox("vm-no-suspend");
+        var provider = new FakeSuspendingProvider();
+        provider.Register(item.Id, sandbox);
+
+        var svc = new SandboxShutdownTeardownService(
+            provider, _store,
+            NullLogger<SandboxShutdownTeardownService>.Instance,
+            teardownMode: SandboxTeardownMode.Suspend);
+        await svc.TeardownAllAsync();
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Null(after!.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.AgentLogPath);
+        Assert.False(sandbox.DisposeCalled);
+        Assert.False(sandbox.IsOwnedByShutdownHandler);
+    }
+
     // ── Startup resume handler ───────────────────────────────────────────────
 
     [Fact]
@@ -2067,6 +2091,22 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             SuspendCalled = true;
             if (_shouldThrow) throw new InvalidOperationException("simulated suspend failure");
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class NonSuspendableShutdownSandbox : IShutdownTeardownSandbox
+    {
+        public NonSuspendableShutdownSandbox(string id) => Id = id;
+        public string Id { get; }
+        public bool DisposeCalled { get; private set; }
+        public bool IsOwnedByShutdownHandler { get; private set; }
+        public void MarkOwnedByShutdownHandler() => IsOwnedByShutdownHandler = true;
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => Task.FromResult(new SandboxExecResult(0, "", ""));
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalled = true;
+            return ValueTask.CompletedTask;
         }
     }
 

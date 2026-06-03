@@ -237,6 +237,44 @@ public sealed class DeadWorkerReaper : BackgroundService
 
         if (WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item))
         {
+            var completed = await CheckAndActFollowupRecovery.TryBuildCompletedFromPersistedVerdictAsync(
+                _store, item, ct);
+            if (completed is not null)
+            {
+                await _store.UpdateAsync(completed, ct);
+                if (item.Verdict is not null
+                    && item.Check is not null
+                    && item.Verdict.Answer == item.Check.ActionableAnswer
+                    && await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, item.Id, ct) is { } followup)
+                {
+                    await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _queue, followup, ct);
+                }
+                MarkRecoveredItem(itemId);
+                _log.LogInformation(
+                    "Recovery ({WorkerId}): check-and-act item {ItemId} already persisted a final verdict; completed without replaying the check",
+                    workerIdContext, itemId);
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "work_item.recovered",
+                        WorkItem = completed,
+                        Details = new
+                        {
+                            workItemId = itemId.ToString(),
+                            projectId = item.ProjectId.Value,
+                            fromState = item.State.ToString(),
+                            toState = completed.State.ToString(),
+                            reason = webhookReason,
+                            recoveryAttempt = item.RecoveryAttempts,
+                            maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                        },
+                    }, CancellationToken.None);
+                }
+                ReleaseRecoveredWorkerSlot(workerIdContext, itemId, "recovery completed check-and-act item from persisted verdict");
+                return;
+            }
+
             var checkAttempt = item.RecoveryAttempts + 1;
             WorkItem recovered;
             if (_opts.MaxRecoveryAttempts > 0 && checkAttempt > _opts.MaxRecoveryAttempts)

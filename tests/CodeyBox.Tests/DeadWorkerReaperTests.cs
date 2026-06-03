@@ -223,6 +223,90 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_CheckAndActAtRecoveryCap_MarksFailedAndReleasesWorkerSlot()
+    {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        var workerId = Guid.NewGuid().ToString();
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Equal(0, _queue.Count);
+
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+    }
+
+    [Fact]
+    public async Task Reaper_CheckAndActWithPersistedFollowup_CompletesWithoutDuplicateFollowup()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+            Verdict = new CheckVerdict
+            {
+                Answer = true,
+                Evidence = "actionable",
+            },
+        };
+        var followup = MakeItem(WorkItemState.Queued) with
+        {
+            JobType = JobType.Normal,
+            OriginCheckWorkItemId = item.Id,
+        };
+        await _store.CreateAsync(item);
+        await _store.CreateAsync(followup);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Equal(1, _queue.Count);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var stored in _store.ListAsync())
+            allItems.Add(stored);
+        var followups = allItems.Where(i => i.OriginCheckWorkItemId == item.Id).ToList();
+        Assert.Single(followups);
+    }
+
+    [Fact]
     public async Task Reaper_RedispatchedItem_DoesNotReleaseWorkerSlot()
     {
         var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();

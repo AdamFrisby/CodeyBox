@@ -115,6 +115,11 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         Assert.Null(after.PreemptCheckpoint);
         Assert.Null(after.LastError);
         Assert.Equal(1, _queue.Count);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.NotNull(evt.WorkItem);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
     }
 
     [Fact]

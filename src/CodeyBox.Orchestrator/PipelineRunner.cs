@@ -2575,6 +2575,16 @@ public sealed class PipelineRunner : IPipelineRunner
     private async Task EnqueueOnYesFollowupAsync(
         WorkItem checkItem, Project project, OnYesActionSpec onYes, CancellationToken ct)
     {
+        var existing = await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, checkItem.Id, ct);
+        if (existing is not null)
+        {
+            await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, existing, ct);
+            _log.LogInformation(
+                "Work item {Id} already has check-and-act follow-up {FollowupId}; not creating a duplicate",
+                checkItem.Id, existing.Id);
+            return;
+        }
+
         var newId = WorkItemId.New();
         var dependsOn = await ResolveOnYesDependsOnAsync(checkItem.ProjectId, onYes.DependsOn ?? [], ct);
         AgentKind? agentOverride = string.IsNullOrWhiteSpace(onYes.Agent) ? null : new AgentKind(onYes.Agent.Trim());
@@ -2600,20 +2610,29 @@ public sealed class PipelineRunner : IPipelineRunner
             JobType = JobType.Normal,
         };
 
-        await _store.CreateAsync(followup, ct);
+        try
+        {
+            await _store.CreateAsync(followup, ct);
+        }
+        catch (WorkItemExternalIdConflictException)
+        {
+            existing = await CheckAndActFollowupRecovery.FindExistingFollowupAsync(_store, checkItem.Id, ct);
+            if (existing is null)
+                throw;
+
+            await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, existing, ct);
+            _log.LogInformation(
+                "Work item {Id} lost a race creating check-and-act follow-up {FollowupId}; reusing the existing follow-up",
+                checkItem.Id, existing.Id);
+            return;
+        }
+
         AuditLog.WorkItemCreated(followup.Id, followup.ProjectId, followup.Title);
 
         // Enqueue iff all (zero-or-more) dependencies are already satisfied.
         // Same posture as POST /workitems: unsatisfied deps mean we persist
         // Queued but defer enqueue until they reach Done.
-        var depStates = new Dictionary<WorkItemId, WorkItemState>();
-        foreach (var depId in followup.DependsOn)
-        {
-            var dep = await _store.GetAsync(depId, ct);
-            if (dep is not null) depStates[depId] = dep.State;
-        }
-        if (_taskQueue is not null && WorkItemDependencies.AreSatisfied(followup.DependsOn, depStates))
-            await _taskQueue.EnqueueAsync(followup.Id, ct);
+        await CheckAndActFollowupRecovery.EnqueueIfReadyAsync(_store, _taskQueue, followup, ct);
 
         await _webhooks.PublishAsync(new WebhookEvent
         {

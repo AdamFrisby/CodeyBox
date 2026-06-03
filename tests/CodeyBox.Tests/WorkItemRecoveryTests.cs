@@ -99,6 +99,35 @@ public sealed class WorkItemRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task CheckAndActWorkingWithoutPreempt_AtRecoveryCap_TransitionsToAbandoned()
+    {
+        var item = Item(WorkItemState.Working, recoveryAttempts: 2) with
+        {
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is action needed?",
+                OnYes = new OnYesActionSpec
+                {
+                    Title = "Act",
+                    Prompt = "Act on the check.",
+                },
+            },
+        };
+        await _store.CreateAsync(item);
+
+        var svc = BuildOrchestrator(maxRecovery: 2);
+        await svc.ReplayPendingForTestAsync(CancellationToken.None);
+
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Contains("2 recovery attempts", recovered.LastError);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+    }
+
+    [Fact]
     public async Task PreemptedWorking_ReenqueuesWithoutRecoveryReset()
     {
         var item = Item(WorkItemState.Working) with
