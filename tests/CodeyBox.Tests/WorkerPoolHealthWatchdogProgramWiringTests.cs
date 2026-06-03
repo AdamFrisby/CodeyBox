@@ -33,6 +33,28 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
 
         Assert.Equal(TimeSpan.FromMinutes(3), accessor().StallTimeout);
 
+        var healthSource = Assert.IsType<WorkerPoolHealthCoordinator>(
+            factory.Services.GetRequiredService<IWorkerPoolHealthSource>());
+        Assert.Same(
+            healthSource,
+            factory.Services.GetRequiredService<IAgentCapacitySnapshot>());
+        Assert.Same(
+            healthSource,
+            typeof(WorkerPoolHealthWatchdog)
+                .GetField("_pool", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(watchdog));
+
+        var quotaRecovery = Assert.IsType<QuotaRetryScheduler>(
+            factory.Services.GetRequiredService<IWorkerPoolQuotaRecovery>());
+        Assert.Same(
+            quotaRecovery,
+            typeof(WorkerPoolHealthWatchdog)
+                .GetField("_quotaRecovery", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(watchdog));
+        Assert.Same(
+            factory.Services.GetRequiredService<AgentClassRouter>(),
+            factory.Services.GetRequiredService<IAgentRoutingReadiness>());
+
         monitor.Set(OptionsWithWatchdog(TimeSpan.FromMinutes(7)));
 
         Assert.Equal(TimeSpan.FromMinutes(7), accessor().StallTimeout);

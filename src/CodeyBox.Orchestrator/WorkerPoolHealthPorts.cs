@@ -4,8 +4,8 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Narrow dispatcher-health surface consumed by <see cref="WorkerPoolHealthWatchdog"/>.
-/// It intentionally exposes only the pool status, candidate scan, and recovery
-/// kick needed by the watchdog rather than the full orchestrator service.
+/// It intentionally exposes only pool status, runnable candidate identifiers,
+/// and recovery kicks rather than dispatcher internals or full persisted rows.
 /// </summary>
 public interface IWorkerPoolHealthSource
 {
@@ -13,10 +13,15 @@ public interface IWorkerPoolHealthSource
 
     Task<WorkerPoolStatus> GetStatusAsync(CancellationToken ct = default);
 
-    Task<IReadOnlyList<WorkItem>> ListPoolHealthCandidatesAsync(int scanLimit, CancellationToken ct);
+    Task<IReadOnlyList<WorkerPoolHealthCandidate>> ListRunnableCandidatesAsync(
+        int scanLimit,
+        CancellationToken ct);
 
     Task<int> TriggerDispatchRecoveryAsync(IEnumerable<WorkItemId> candidateIds, CancellationToken ct);
 }
+
+/// <summary>Runnable work item identity surfaced to the pool-health watchdog.</summary>
+public sealed record WorkerPoolHealthCandidate(WorkItemId Id, WorkItemState State);
 
 /// <summary>Read-side agent capacity check for watchdog routing probes.</summary>
 public interface IAgentCapacitySnapshot

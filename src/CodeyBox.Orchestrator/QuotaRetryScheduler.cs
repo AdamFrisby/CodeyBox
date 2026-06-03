@@ -783,7 +783,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _quotaUsableSweepCts.Cancel();
+        CancelQuotaUsableSweep();
         await base.StopAsync(cancellationToken);
 
         Task? wakeUpSweep;
@@ -799,7 +799,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         {
             await wakeUpSweep.WaitAsync(cancellationToken);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _quotaUsableSweepCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || IsQuotaUsableSweepCancellationRequested())
         {
         }
     }
@@ -809,7 +809,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         if (Interlocked.Exchange(ref _disposed, 1) == 1)
             return;
 
-        _quotaUsableSweepCts.Cancel();
+        CancelQuotaUsableSweep();
         Task? wakeUpSweep;
         lock (_quotaUsableSweepLock)
         {
@@ -822,7 +822,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             {
                 wakeUpSweep.GetAwaiter().GetResult();
             }
-            catch (OperationCanceledException) when (_quotaUsableSweepCts.IsCancellationRequested)
+            catch (OperationCanceledException) when (IsQuotaUsableSweepCancellationRequested())
             {
             }
         }
@@ -836,5 +836,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _targetedTimers.Clear();
         _quotaUsableSweepCts.Dispose();
         base.Dispose();
+    }
+
+    private void CancelQuotaUsableSweep()
+    {
+        try { _quotaUsableSweepCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    private bool IsQuotaUsableSweepCancellationRequested()
+    {
+        try { return _quotaUsableSweepCts.IsCancellationRequested; }
+        catch (ObjectDisposedException) { return true; }
     }
 }

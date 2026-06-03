@@ -14,12 +14,6 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
 {
     private readonly IWorkerPoolHealthSource _pool;
     private readonly Func<WorkerPoolHealthWatchdogOptions> _optsAccessor;
-    private readonly IAgentCapacitySnapshot _capacity;
-    private readonly IProjectRepository? _projects;
-    private readonly IQueueController? _queueController;
-    private readonly IAgentRegistry? _agents;
-    private readonly IAgentAvailabilityRegistry? _availability;
-    private readonly IAgentRoutingReadiness? _routingReadiness;
     private readonly IWorkerPoolQuotaRecovery? _quotaRecovery;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly ILogger<WorkerPoolHealthWatchdog> _log;
@@ -35,28 +29,16 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
 
     public WorkerPoolHealthWatchdog(
         IWorkerPoolHealthSource pool,
-        IAgentCapacitySnapshot capacity,
         Func<WorkerPoolHealthWatchdogOptions> optionsAccessor,
         ILogger<WorkerPoolHealthWatchdog> log,
-        IProjectRepository? projects = null,
-        IQueueController? queueController = null,
-        IAgentRegistry? agents = null,
-        IAgentAvailabilityRegistry? availability = null,
-        IAgentRoutingReadiness? routingReadiness = null,
         IWorkerPoolQuotaRecovery? quotaRecovery = null,
         IWebhookDispatcher? webhooks = null,
         TimeProvider? timeProvider = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
     {
         _pool = pool;
-        _capacity = capacity;
         _optsAccessor = optionsAccessor;
         _log = log;
-        _projects = projects;
-        _queueController = queueController;
-        _agents = agents;
-        _availability = availability;
-        _routingReadiness = routingReadiness;
         _quotaRecovery = quotaRecovery;
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
@@ -65,20 +47,13 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
 
     public WorkerPoolHealthWatchdog(
         IWorkerPoolHealthSource pool,
-        IAgentCapacitySnapshot capacity,
         WorkerPoolHealthWatchdogOptions opts,
         ILogger<WorkerPoolHealthWatchdog> log,
-        IProjectRepository? projects = null,
-        IQueueController? queueController = null,
-        IAgentRegistry? agents = null,
-        IAgentAvailabilityRegistry? availability = null,
-        IAgentRoutingReadiness? routingReadiness = null,
         IWorkerPoolQuotaRecovery? quotaRecovery = null,
         IWebhookDispatcher? webhooks = null,
         TimeProvider? timeProvider = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
-        : this(pool, capacity, () => opts, log, projects, queueController, agents, availability,
-            routingReadiness, quotaRecovery, webhooks, timeProvider, startupRecoveryBarrier)
+        : this(pool, () => opts, log, quotaRecovery, webhooks, timeProvider, startupRecoveryBarrier)
     { }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -175,28 +150,12 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         if (_pool.IsDispatchPaused)
             return null;
 
-        if (_queueController is not null && _queueController.State == QueueState.Paused)
-            return null;
-
         var status = await _pool.GetStatusAsync(ct);
         if (status.CurrentlyRunning >= status.MaxConcurrent)
             return null;
 
-        var candidates = await _pool.ListPoolHealthCandidatesAsync(
+        var runnable = await _pool.ListRunnableCandidatesAsync(
             opts.MaxHealthCheckCandidateScan, ct);
-        if (candidates.Count == 0)
-            return null;
-
-        var runnable = new List<WorkItem>();
-        foreach (var candidate in candidates)
-        {
-            if (await IsProjectPausedAsync(candidate, ct))
-                continue;
-
-            if (await HasEligibleAvailableAgentAsync(candidate, ct))
-                runnable.Add(candidate);
-        }
-
         if (runnable.Count == 0)
             return null;
 
@@ -205,50 +164,6 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             status.CurrentlyRunning,
             status.LastSpawnAt,
             runnable);
-    }
-
-    private async Task<bool> IsProjectPausedAsync(WorkItem item, CancellationToken ct)
-    {
-        if (_queueController is null)
-            return false;
-
-        var state = await _queueController.GetProjectStateAsync(item.ProjectId, ct);
-        return state is { Paused: true };
-    }
-
-    private async Task<bool> HasEligibleAvailableAgentAsync(WorkItem item, CancellationToken ct)
-    {
-        Project? project = null;
-        if (_projects is not null)
-        {
-            project = await _projects.GetAsync(item.ProjectId, ct);
-            if (project is null)
-                return false;
-        }
-
-        if (_routingReadiness is not null)
-        {
-            var readiness = await _routingReadiness.CheckReadinessAsync(item, project, _capacity, ct);
-            if (readiness.State == AgentRoutingReadinessState.Available)
-                return true;
-            if (readiness.State == AgentRoutingReadinessState.Unavailable)
-                return false;
-        }
-
-        var directAgent = item.Agent ?? project?.DefaultAgent;
-        return directAgent is { } agent && IsDirectAgentAvailable(agent);
-    }
-
-    private bool IsDirectAgentAvailable(AgentKind agent)
-    {
-        if (_agents is not null && !_agents.Available.Contains(agent))
-            return false;
-
-        var availability = _availability?.GetAvailability(agent);
-        if (availability is { Available: false })
-            return false;
-
-        return _capacity.HasCapacity(agent);
     }
 
     private async Task RecoverOrEscalateAsync(
@@ -420,7 +335,7 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
         int MaxConcurrent,
         int CurrentlyRunning,
         DateTimeOffset? LastSpawnAt,
-        IReadOnlyList<WorkItem> RunnableCandidates)
+        IReadOnlyList<WorkerPoolHealthCandidate> RunnableCandidates)
     {
         public int FreeSlots => Math.Max(0, MaxConcurrent - CurrentlyRunning);
     }

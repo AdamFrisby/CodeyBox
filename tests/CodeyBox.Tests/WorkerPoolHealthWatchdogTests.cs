@@ -114,20 +114,14 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         await orchestrator.StartAsync(CancellationToken.None);
         await blocking.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        var watchdog = new WorkerPoolHealthWatchdog(
-            orchestrator,
-            orchestrator,
+        var watchdog = BuildWatchdog(
             new WorkerPoolHealthWatchdogOptions
             {
                 StallTimeout = TimeSpan.FromMinutes(1),
                 CheckInterval = TimeSpan.FromMinutes(1),
                 RecoveryVerificationDelay = TimeSpan.Zero,
             },
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            webhooks: _webhooks,
-            timeProvider: _time);
+            BuildHealthSource(orchestrator: orchestrator));
 
         _time.Advance(TimeSpan.FromMinutes(2));
         await watchdog.RunOnceAsync(CancellationToken.None);
@@ -169,117 +163,117 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     [InlineData("router-unavailable")]
     public async Task IntentionalBlockers_DoNotEmitFalseStallAlert(string scenario)
     {
-        var source = new FakePoolHealthSource
-        {
-            Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item()],
-        };
-        IQueueController? queueController = null;
-        IAgentRegistry? agents = new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]);
-        IAgentAvailabilityRegistry? availability = null;
-        IAgentRoutingReadiness? routingReadiness = null;
+        IWorkerPoolHealthSource source;
+        FakePoolHealthSource? fakeSource = null;
+        OrchestratorService? localOrchestrator = null;
 
         switch (scenario)
         {
             case "dispatch-paused":
-                source.DispatchPaused = true;
-                break;
-            case "queue-paused":
-                queueController = new FakeQueueController(globalPaused: true);
+                fakeSource = new FakePoolHealthSource
+                {
+                    DispatchPaused = true,
+                    Status = new WorkerPoolStatus(2, 0, 1, null),
+                    Candidates = [Candidate(Item())],
+                };
+                source = fakeSource;
                 break;
             case "pool-full":
-                source.Status = source.Status with { CurrentlyRunning = 2 };
+                fakeSource = new FakePoolHealthSource
+                {
+                    Status = new WorkerPoolStatus(2, 2, 1, null),
+                    Candidates = [Candidate(Item())],
+                };
+                source = fakeSource;
+                break;
+            case "queue-paused":
+                await _store.CreateAsync(Item());
+                source = BuildHealthSource(queueController: new FakeQueueController(globalPaused: true));
                 break;
             case "project-paused":
-                queueController = new FakeQueueController(projectPaused: true);
+                await _store.CreateAsync(Item());
+                source = BuildHealthSource(queueController: new FakeQueueController(projectPaused: true));
                 break;
             case "missing-agent":
-                agents = new AgentRegistry([]);
+                await _store.CreateAsync(Item());
+                source = BuildHealthSource(agents: new AgentRegistry([]));
                 break;
             case "unavailable-agent":
-                availability = new FakeAvailabilityRegistry(available: false);
+                await _store.CreateAsync(Item());
+                source = BuildHealthSource(availability: new FakeAvailabilityRegistry(available: false));
                 break;
             case "agent-cap":
-                source.HasAgentCapacity = false;
+                await _store.CreateAsync(Item());
+                localOrchestrator = new OrchestratorService(
+                    _queue,
+                    _store,
+                    new NoopPipeline(_store),
+                    new CancellationRegistry(CancellationToken.None),
+                    new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+                    NullLogger<OrchestratorService>.Instance,
+                    agentConcurrency: new AgentConcurrencyOptions
+                    {
+                        Members = { ["claude"] = new AgentConcurrencyEntry { MaxConcurrent = 1 } },
+                    });
+                Assert.True(localOrchestrator.TryReserveAgentSlotForTest(AgentKind.Claude));
+                source = BuildHealthSource(orchestrator: localOrchestrator);
                 break;
             case "router-unavailable":
-                routingReadiness = new FixedRoutingReadiness(AgentRoutingReadiness.Unavailable("should wait"));
+                await _store.CreateAsync(Item());
+                source = BuildHealthSource(
+                    routingReadiness: new FixedRoutingReadiness(
+                        AgentRoutingReadiness.Unavailable("should wait")));
                 break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
         }
 
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
-            StandardOptions(),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            queueController,
-            agents,
-            availability,
-            routingReadiness,
-            webhooks: _webhooks,
-            timeProvider: _time);
+        var watchdog = BuildWatchdog(StandardOptions(), source);
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         Assert.Empty(_webhooks.Events);
-        Assert.Equal(0, source.EnqueueCalls);
+        Assert.Equal(0, fakeSource?.EnqueueCalls ?? _queue.Count);
+        localOrchestrator?.Dispose();
     }
 
     [Fact]
     public async Task RoutingReadinessAvailable_MarksCandidateRunnable()
     {
-        var source = new FakePoolHealthSource
-        {
-            Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item() with { Agent = null }],
-        };
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
+        await _store.CreateAsync(Item() with { Agent = null });
+        var watchdog = BuildWatchdog(
             StandardOptions(),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([]),
-            routingReadiness: new FixedRoutingReadiness(AgentRoutingReadiness.Available(AgentKind.Codex)),
-            webhooks: _webhooks,
-            timeProvider: _time);
+            BuildHealthSource(
+                agents: new AgentRegistry([]),
+                routingReadiness: new FixedRoutingReadiness(
+                    AgentRoutingReadiness.Available(AgentKind.Codex))));
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
-        Assert.Equal(1, source.EnqueueCalls);
+        Assert.Equal(1, _queue.Count);
     }
 
     [Fact]
     public async Task RoutingReadinessNotApplicable_FallsBackToProjectDefaultAgent()
     {
-        var source = new FakePoolHealthSource
-        {
-            Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item() with { Agent = null }],
-        };
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
+        await _store.CreateAsync(Item() with { Agent = null });
+        var watchdog = BuildWatchdog(
             StandardOptions(),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            routingReadiness: new FixedRoutingReadiness(AgentRoutingReadiness.NotApplicable("direct agent")),
-            webhooks: _webhooks,
-            timeProvider: _time);
+            BuildHealthSource(
+                routingReadiness: new FixedRoutingReadiness(
+                    AgentRoutingReadiness.NotApplicable("direct agent"))));
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
-        Assert.Equal(1, source.EnqueueCalls);
+        Assert.Equal(1, _queue.Count);
     }
 
     [Fact]
@@ -288,18 +282,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         var source = new FakePoolHealthSource
         {
             Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item()],
+            Candidates = [Candidate(Item())],
             ThrowOnRecovery = true,
         };
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
-            StandardOptions(maxAttempts: 1),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            webhooks: _webhooks,
-            timeProvider: _time);
+        var watchdog = BuildWatchdog(StandardOptions(maxAttempts: 1), source);
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
@@ -315,18 +301,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         var source = new FakePoolHealthSource
         {
             Status = new WorkerPoolStatus(2, 0, 1, null),
-            Candidates = [Item()],
+            Candidates = [Candidate(Item())],
             AdvanceLastSpawnOnRecovery = true,
         };
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
-            StandardOptions(maxAttempts: 1),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            webhooks: _webhooks,
-            timeProvider: _time);
+        var watchdog = BuildWatchdog(StandardOptions(maxAttempts: 1), source);
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
@@ -388,16 +366,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             router,
             _projects,
             timeProvider: _time);
-        var watchdog = new WorkerPoolHealthWatchdog(
-            _orchestrator,
-            _orchestrator,
+        var watchdog = BuildWatchdog(
             StandardOptions(),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            quotaRecovery: quotaRecovery,
-            webhooks: _webhooks,
-            timeProvider: _time);
+            BuildHealthSource(),
+            quotaRecovery);
 
         await watchdog.RunOnceAsync(CancellationToken.None);
         _time.Advance(TimeSpan.FromMinutes(2));
@@ -460,15 +432,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         {
             ThrowOnStatus = true,
         };
-        var watchdog = new WorkerPoolHealthWatchdog(
-            source,
-            source,
-            StandardOptions(),
-            NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            webhooks: _webhooks,
-            timeProvider: _time);
+        var watchdog = BuildWatchdog(StandardOptions(), source);
 
         await watchdog.RunOnceAsync(CancellationToken.None);
 
@@ -492,7 +456,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         await _store.CreateAsync(satisfiedChild);
         await _store.CreateAsync(blockedChild);
 
-        var candidates = await _orchestrator.ListRunnableCandidatesForHealthCheckAsync(
+        var candidates = await BuildHealthSource().ListRunnableCandidatesAsync(
             10,
             CancellationToken.None);
 
@@ -524,7 +488,8 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         await _store.CreateAsync(inFlight);
         await _store.CreateAsync(candidate);
 
-        var candidates = await orchestrator.ListRunnableCandidatesForHealthCheckAsync(
+        var health = BuildHealthSource(orchestrator: orchestrator, projects: projects);
+        var candidates = await health.ListRunnableCandidatesAsync(
             10,
             CancellationToken.None);
 
@@ -548,15 +513,37 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     private WorkerPoolHealthWatchdog BuildWatchdog(WorkerPoolHealthWatchdogOptions opts)
+        => BuildWatchdog(opts, BuildHealthSource());
+
+    private WorkerPoolHealthWatchdog BuildWatchdog(
+        WorkerPoolHealthWatchdogOptions opts,
+        IWorkerPoolHealthSource source,
+        IWorkerPoolQuotaRecovery? quotaRecovery = null)
         => new(
-            _orchestrator,
-            _orchestrator,
+            source,
             opts,
             NullLogger<WorkerPoolHealthWatchdog>.Instance,
-            _projects,
-            agents: new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
+            quotaRecovery: quotaRecovery,
             webhooks: _webhooks,
             timeProvider: _time);
+
+    private WorkerPoolHealthCoordinator BuildHealthSource(
+        OrchestratorService? orchestrator = null,
+        IProjectRepository? projects = null,
+        IQueueController? queueController = null,
+        IAgentRegistry? agents = null,
+        IAgentAvailabilityRegistry? availability = null,
+        IAgentRoutingReadiness? routingReadiness = null)
+        => new(
+            orchestrator ?? _orchestrator,
+            _store,
+            _queue,
+            NullLogger<WorkerPoolHealthCoordinator>.Instance,
+            projects ?? _projects,
+            queueController,
+            agents ?? new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
+            availability,
+            routingReadiness);
 
     private static WorkerPoolHealthWatchdogOptions StandardOptions(int maxAttempts = 2) => new()
     {
@@ -582,6 +569,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         Prompt = "p",
         State = WorkItemState.Queued,
     };
+
+    private static WorkerPoolHealthCandidate Candidate(WorkItem item) =>
+        new(item.Id, item.State);
 
     private sealed class NoopPipeline : IPipelineRunner
     {
@@ -623,15 +613,14 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         }
     }
 
-    private sealed class FakePoolHealthSource : IWorkerPoolHealthSource, IAgentCapacitySnapshot
+    private sealed class FakePoolHealthSource : IWorkerPoolHealthSource
     {
         public bool DispatchPaused { get; set; }
-        public bool HasAgentCapacity { get; set; } = true;
         public bool AdvanceLastSpawnOnRecovery { get; set; }
         public bool ThrowOnStatus { get; set; }
         public bool ThrowOnRecovery { get; set; }
         public WorkerPoolStatus Status { get; set; } = new(2, 0, 0, null);
-        public IReadOnlyList<WorkItem> Candidates { get; set; } = [];
+        public IReadOnlyList<WorkerPoolHealthCandidate> Candidates { get; set; } = [];
         public int EnqueueCalls { get; private set; }
 
         public bool IsDispatchPaused => DispatchPaused;
@@ -643,10 +632,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             return Task.FromResult(Status);
         }
 
-        public Task<IReadOnlyList<WorkItem>> ListPoolHealthCandidatesAsync(
+        public Task<IReadOnlyList<WorkerPoolHealthCandidate>> ListRunnableCandidatesAsync(
             int scanLimit,
             CancellationToken ct) =>
-            Task.FromResult<IReadOnlyList<WorkItem>>(Candidates.Take(scanLimit).ToList());
+            Task.FromResult<IReadOnlyList<WorkerPoolHealthCandidate>>(Candidates.Take(scanLimit).ToList());
 
         public Task<int> TriggerDispatchRecoveryAsync(
             IEnumerable<WorkItemId> candidateIds,
@@ -662,7 +651,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             return Task.FromResult(ids.Count);
         }
 
-        public bool HasCapacity(AgentKind agent) => HasAgentCapacity;
     }
 
     private sealed class FixedRoutingReadiness : IAgentRoutingReadiness

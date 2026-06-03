@@ -1702,16 +1702,10 @@ builder.Services.AddSingleton<WorkerPoolHealthWatchdog>(sp =>
     sp.GetRequiredService<WorkerPoolHealthWatchdogOptions>();
     return new WorkerPoolHealthWatchdog(
         sp.GetRequiredService<IWorkerPoolHealthSource>(),
-        sp.GetRequiredService<IAgentCapacitySnapshot>(),
         () => monitor.CurrentValue.WorkerPoolHealthWatchdog,
         sp.GetRequiredService<ILogger<WorkerPoolHealthWatchdog>>(),
-        sp.GetService<IProjectRepository>(),
-        sp.GetService<IQueueController>(),
-        sp.GetService<IAgentRegistry>(),
-        sp.GetService<IAgentAvailabilityRegistry>(),
-        sp.GetService<IAgentRoutingReadiness>(),
-        sp.GetService<IWorkerPoolQuotaRecovery>(),
-        sp.GetService<IWebhookDispatcher>(),
+        quotaRecovery: sp.GetRequiredService<IWorkerPoolQuotaRecovery>(),
+        webhooks: sp.GetService<IWebhookDispatcher>(),
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
 });
 
@@ -2022,10 +2016,20 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>()));
+builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(
+    sp.GetRequiredService<OrchestratorService>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<ILogger<WorkerPoolHealthCoordinator>>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IQueueController>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
+    sp.GetRequiredService<IAgentRoutingReadiness>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
-    sp.GetRequiredService<OrchestratorService>());
+    sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>
-    sp.GetRequiredService<OrchestratorService>());
+    sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorService>());
 // R8.1: expose the orchestrator as IShutdownDispatchGate so the
 // SandboxShutdownTeardownService can pause new dispatch before the per-VM

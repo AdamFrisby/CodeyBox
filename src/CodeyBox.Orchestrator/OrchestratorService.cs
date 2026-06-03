@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IWorkerPoolHealthSource, IAgentCapacitySnapshot
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
 {
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -674,9 +674,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         // Drain in-flight tasks before the hosted service exits, but do not
         // let a host-shutdown path wait forever on a worker that ignores the
-        // shutdown token. If the drain window expires, rewrite active items to
-        // recoverable states so a restart does not classify graceful shutdown
-        // as "worker died without a preempt checkpoint".
+        // shutdown token. Recovery writes are only safe once the worker task has
+        // stopped; startup recovery handles rows left live past this bounded
+        // drain after the previous process is gone.
         await DrainInFlightWorkersAsync(inFlight).ConfigureAwait(false);
     }
 
@@ -708,36 +708,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         _log.LogCritical(
-            "OrchestratorService shutdown drain timed out after {Timeout} with {Count} worker(s) still active; re-queueing recoverable in-flight items before service exit",
+            "OrchestratorService shutdown drain timed out after {Timeout} with {Count} worker(s) still active; not re-queueing active items until the workers stop or startup recovery proves they are gone",
             drain,
             inFlight.Count(t => !t.IsCompleted));
-
-        await RequeueActiveItemsForShutdownDrainTimeoutAsync(CancellationToken.None).ConfigureAwait(false);
-    }
-
-    private async Task RequeueActiveItemsForShutdownDrainTimeoutAsync(CancellationToken ct)
-    {
-        var failures = new List<Exception>();
-        foreach (var id in _activeItems.Keys.ToList())
-        {
-            try
-            {
-                await TryRecoverActiveItemForGracefulShutdownAsync(
-                    id,
-                    "graceful shutdown drain timed out",
-                    ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                failures.Add(new InvalidOperationException(
-                    $"Shutdown drain recovery failed for active work item {id}", ex));
-            }
-        }
-
-        if (failures.Count > 0)
-            throw new AggregateException(
-                "Shutdown drain recovery failed for one or more active work items.",
-                failures);
     }
 
     private async Task RecoverHostShutdownAbortedItemAsync(WorkItemId id)
@@ -881,115 +854,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
 
-    internal Task<IReadOnlyList<WorkItem>> ListRunnableCandidatesForHealthCheckAsync(
-        int limit,
-        CancellationToken ct) =>
-        ListPoolHealthCandidatesAsync(limit, ct);
+    internal IReadOnlyCollection<WorkItemId> ActiveWorkItemIdsForHealthCheck() =>
+        _activeItems.Keys.ToList();
 
-    public async Task<IReadOnlyList<WorkItem>> ListPoolHealthCandidatesAsync(
-        int scanLimit,
-        CancellationToken ct)
-    {
-        if (scanLimit <= 0) return [];
-
-        var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
-
-        Dictionary<WorkItemId, WorkItemState>? statesById = null;
-        var result = new List<WorkItem>(Math.Min(scanLimit, 16));
-
-        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
-        {
-            if (candidate.DependsOn.Count > 0)
-            {
-                if (statesById is null)
-                {
-                    var snapshot = new List<WorkItem>();
-                    await foreach (var i in _store.ListAsync(ct)) snapshot.Add(i);
-                    statesById = WorkItemDependencies.BuildStateMap(snapshot);
-                }
-
-                if (!WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
-                    continue;
-            }
-
-            if (await IsBudgetBlockedForPoolHealthAsync(candidate, ct))
-                continue;
-
-            result.Add(candidate);
-            if (result.Count >= scanLimit)
-                break;
-        }
-
-        if (result.Count >= scanLimit)
-            return result;
-
-        await foreach (var candidate in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
-        {
-            if (skipIds.Contains(candidate.Id))
-                continue;
-
-            if (candidate.DependsOn.Count > 0)
-            {
-                if (statesById is null)
-                {
-                    var snapshot = new List<WorkItem>();
-                    await foreach (var i in _store.ListAsync(ct)) snapshot.Add(i);
-                    statesById = WorkItemDependencies.BuildStateMap(snapshot);
-                }
-
-                if (!WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById))
-                    continue;
-            }
-
-            if (await IsBudgetBlockedForPoolHealthAsync(candidate, ct))
-                continue;
-
-            result.Add(candidate);
-            if (result.Count >= scanLimit)
-                break;
-        }
-
-        return result;
-    }
-
-    private async Task<bool> IsBudgetBlockedForPoolHealthAsync(WorkItem item, CancellationToken ct)
-    {
-        if (_projects is null)
-            return false;
-
-        var project = await _projects.GetAsync(item.ProjectId, ct);
-        if (project is null)
-            return false;
-
-        var defer = await CheckBudgetAsync(item, project.Budget, ct);
-        if (defer is null)
-            return false;
-
-        _log.LogDebug(
-            "Worker-pool health skip {Id}: project budget gate is active ({Reason})",
-            item.Id,
-            defer.Reason);
-        return true;
-    }
-
-    public async Task<int> TriggerDispatchRecoveryAsync(
-        IEnumerable<WorkItemId> candidateIds,
-        CancellationToken ct)
-    {
-        var enqueued = 0;
-        var seen = new HashSet<WorkItemId>();
-        foreach (var id in candidateIds)
-        {
-            if (!seen.Add(id))
-                continue;
-
-            _deferredItems.TryRemove(id, out _);
-            await _queue.EnqueueAsync(id, ct);
-            enqueued++;
-        }
-
-        return enqueued;
-    }
+    internal void ClearDeferredForHealthRecovery(WorkItemId id) =>
+        _deferredItems.TryRemove(id, out _);
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.

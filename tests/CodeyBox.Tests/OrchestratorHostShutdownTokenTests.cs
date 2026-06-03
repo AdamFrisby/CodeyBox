@@ -93,7 +93,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
     }
 
     [Fact]
-    public async Task ServiceStop_DrainTimeout_RequeuesInFlightWorkInsteadOfFailingIt()
+    public async Task ServiceStop_DrainTimeout_DoesNotRequeueWhileWorkerStillRunning()
     {
         var item = new WorkItem
         {
@@ -106,8 +106,9 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         await _store.CreateAsync(item);
 
         var pipeline = new ShutdownIgnoringWorkingPipeline(_store);
+        var queue = new InMemoryTaskQueue();
         var service = new OrchestratorService(
-            new InMemoryTaskQueue(),
+            queue,
             _store,
             pipeline,
             new CancellationRegistry(CancellationToken.None),
@@ -132,13 +133,16 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         Assert.True(pipeline.HostShutdownWasCancelled);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
-        Assert.Equal(WorkItemState.Queued, after.State);
-        Assert.Null(after.StartedAt);
+        Assert.Equal(WorkItemState.Working, after.State);
+        Assert.NotNull(after.StartedAt);
         Assert.Null(after.PreemptCheckpoint);
-        Assert.Contains("graceful shutdown drain timed out", after.LastError);
+        Assert.Null(after.LastError);
+        Assert.Equal(0, queue.Count);
 
         pipeline.Release.SetResult();
         await pipeline.Exited.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var final = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
+        Assert.Equal(WorkItemState.Done, final.State);
         service.Dispose();
     }
 
@@ -214,6 +218,8 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
                 {
                     HostShutdownWasCancelled = true;
                     await Release.Task;
+                    var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
+                    await _store.UpdateAsync(current.With(WorkItemState.Done), CancellationToken.None);
                 }
             }
             finally

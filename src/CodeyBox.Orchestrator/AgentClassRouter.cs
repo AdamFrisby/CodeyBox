@@ -454,7 +454,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (availability is { Available: false })
             {
                 var smokeReason = $"smoke gate: {availability.Reason}";
-                _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
+                if (commitDispatchSideEffects)
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
                 smokeExcluded.Add((member.Agent, member.ModelId));
                 if (member.Billing == AgentBilling.Subscription)
@@ -471,7 +472,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 if (observedAt is { } seenAt)
                 {
                     var reason = FormatObservedFailureReason(member, seenAt, _time.GetUtcNow());
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, reason);
+                    if (commitDispatchSideEffects)
+                        _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, reason);
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
                     continue;
                 }
@@ -491,7 +493,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 var cap = GetAgentCap(member.Agent);
                 var running = _runningCounters?.GetRunning(member.Agent) ?? 0;
                 var capReason = $"per-agent cap: running={running} cap={cap}";
-                _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
+                if (commitDispatchSideEffects)
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                 capSaturatedMembers.Add(member);
                 if (commitDispatchSideEffects)
@@ -552,8 +555,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 if (slotGate is not null && !slotGate.TryReserve(member.Agent))
                 {
                     var capReason = "per-agent cap reached";
-                    _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
-                        item.Id, member.Agent, member.ModelId ?? "(default)", capReason);
+                    if (commitDispatchSideEffects)
+                    {
+                        _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
+                            item.Id, member.Agent, member.ModelId ?? "(default)", capReason);
+                    }
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                     atCapAgents.Add(member.Agent);
                     continue;
@@ -573,12 +579,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                         rejected);
                 }
 
-                _log.LogInformation(
-                    "Work item {Id}: routed to {Agent}/{Billing} model={Model} " +
-                    "baseScore={Base} effectiveScore={Eff} (available={Avail:F1}%)",
-                    item.Id, member.Agent, member.Billing,
-                    member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
-                    quota.AvailablePct);
+                if (commitDispatchSideEffects)
+                {
+                    _log.LogInformation(
+                        "Work item {Id}: routed to {Agent}/{Billing} model={Model} " +
+                        "baseScore={Base} effectiveScore={Eff} (available={Avail:F1}%)",
+                        item.Id, member.Agent, member.Billing,
+                        member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
+                        quota.AvailablePct);
+                }
 
                 if (commitDispatchSideEffects)
                     ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
@@ -686,9 +695,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 continue;
             }
 
-            _log.LogWarning(
-                "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
-                item.Id, classId, fallback.Agent);
+            if (commitDispatchSideEffects)
+            {
+                _log.LogWarning(
+                    "Work item {Id}: all members below threshold but class '{ClassId}' has no Subscription members; firing {Agent} anyway",
+                    item.Id, classId, fallback.Agent);
+            }
             if (commitDispatchSideEffects)
                 ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
             return new AgentRoutingDecision
@@ -727,9 +739,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
         else
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted";
-        _log.LogInformation(
-            "Work item {Id}: class '{ClassId}' parking — {Reason}",
-            item.Id, classId, parkReason);
+        if (commitDispatchSideEffects)
+        {
+            _log.LogInformation(
+                "Work item {Id}: class '{ClassId}' parking — {Reason}",
+                item.Id, classId, parkReason);
+        }
         if (commitDispatchSideEffects)
             AuditLog.QuotaRouterWaiting(classId, item.Id, budgetRecheck);
         return new AgentRoutingDecision
