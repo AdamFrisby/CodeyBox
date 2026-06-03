@@ -63,6 +63,47 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task SlotReleaseWake_DoesNotClearDeferredBacklogItem()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var running = MakeItem(createdAt: now);
+        var deferred = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(running);
+        await _store.CreateAsync(deferred);
+        svc.MarkDeferredForTest(deferred.Id);
+
+        await queue.EnqueueAsync(running.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+
+        pipeline.Release(running.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
+        Assert.True(
+            await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
+            "The slot-release wake should be consumed as a generic rescan.");
+
+        await Task.Delay(500);
+
+        Assert.True(
+            svc.IsDeferredForTest(deferred.Id),
+            "A generic slot-release wake must not clear deferred items as retry-now signals.");
+        Assert.False(pipeline.HasEntered(deferred.Id));
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotDispatchWhileQueuePaused()
     {
         using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
@@ -91,7 +132,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         pipeline.Release(running.Id);
         Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
         Assert.True(
-            await WaitUntilAsync(() => queue.EnqueueCount(running.Id) >= 2, DispatchWaitTimeout),
+            await WaitUntilAsync(() => queue.TotalEnqueueCount >= 2, DispatchWaitTimeout),
             "The slot-release wake should be enqueued even when the queue is paused.");
 
         await Task.Delay(500);
@@ -126,19 +167,66 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await queue.EnqueueAsync(running.Id);
 
         Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+        Assert.True(
+            await queue.WaitForDequeueCallsAsync(2, DispatchWaitTimeout),
+            "The dispatch loop should be blocked on the next queue wake before shutdown is paused.");
 
+        queue.DropDefaultEnqueues = true;
         svc.PauseDispatch();
         pipeline.Release(running.Id);
         Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
         Assert.True(
-            await WaitUntilAsync(() => queue.EnqueueCount(running.Id) >= 2, DispatchWaitTimeout),
+            await WaitUntilAsync(() => queue.TotalEnqueueCount >= 3, DispatchWaitTimeout),
             "The slot-release wake should be enqueued even after shutdown dispatch is paused.");
+        Assert.True(
+            await queue.WaitForCompletedDequeuesAsync(2, DispatchWaitTimeout),
+            "The slot-release wake should be delivered to the loop and suppressed by IsDispatchPaused.");
 
         await Task.Delay(500);
 
         Assert.False(pipeline.HasEntered(readyBacklog.Id));
         var stored = await _store.GetAsync(readyBacklog.Id);
         Assert.Equal(WorkItemState.Queued, stored!.State);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(EnqueueFailureMode.ThrowSynchronously, "threw synchronously")]
+    [InlineData(EnqueueFailureMode.FaultAsynchronously, "faulted")]
+    public async Task SlotReleaseWake_EnqueueFailure_DoesNotFaultWorkerOrHostedService(
+        EnqueueFailureMode failureMode,
+        string expectedLogText)
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        var logger = new CapturingLogger<OrchestratorService>();
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            logger);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var running = MakeItem(DateTimeOffset.UtcNow);
+        await _store.CreateAsync(running);
+        await queue.EnqueueAsync(running.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(running.Id, DispatchWaitTimeout));
+
+        queue.FailureMode = failureMode;
+        pipeline.Release(running.Id);
+
+        Assert.True(await pipeline.WaitForDoneAsync(running.Id, DispatchWaitTimeout));
+        Assert.True(
+            await WaitUntilAsync(
+                () => logger.Entries.Any(e =>
+                    e.Message.Contains("slot-release wake-up kick", StringComparison.Ordinal)
+                    && e.Message.Contains(expectedLogText, StringComparison.Ordinal)),
+                DispatchWaitTimeout),
+            "A slot-release enqueue failure should be caught and logged without faulting the worker task.");
 
         await svc.StopAsync(CancellationToken.None);
     }
@@ -169,16 +257,34 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     {
         private readonly InMemoryTaskQueue _inner = new();
         private readonly ConcurrentQueue<WorkItemId> _enqueued = new();
+        private readonly ConcurrentQueue<WorkItemId> _dequeued = new();
         private readonly TaskCompletionSource _firstDequeue =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _dequeueCalls;
+
+        public bool DropDefaultEnqueues { get; set; }
+        public EnqueueFailureMode FailureMode { get; set; } = EnqueueFailureMode.None;
 
         public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
         {
             _enqueued.Enqueue(id);
-            return _inner.EnqueueAsync(id, ct);
+            if (DropDefaultEnqueues && id == default)
+                return ValueTask.CompletedTask;
+
+            return FailureMode switch
+            {
+                EnqueueFailureMode.ThrowSynchronously =>
+                    throw new InvalidOperationException("synthetic synchronous enqueue failure"),
+                EnqueueFailureMode.FaultAsynchronously =>
+                    new ValueTask(Task.FromException(new InvalidOperationException("synthetic asynchronous enqueue failure"))),
+                _ => _inner.EnqueueAsync(id, ct),
+            };
         }
 
         public int Count => _inner.Count;
+        public int TotalEnqueueCount => _enqueued.Count;
+        public int CompletedDequeueCount => _dequeued.Count;
+        public int DequeueCallCount => Volatile.Read(ref _dequeueCalls);
 
         public int EnqueueCount(WorkItemId id)
         {
@@ -190,12 +296,29 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         public async ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default)
         {
+            Interlocked.Increment(ref _dequeueCalls);
             _firstDequeue.TrySetResult();
-            return await _inner.DequeueAsync(ct);
+            var id = await _inner.DequeueAsync(ct);
+            if (id is { } actual)
+                _dequeued.Enqueue(actual);
+            return id;
         }
 
         public Task WaitForFirstDequeueAsync(TimeSpan timeout) =>
             _firstDequeue.Task.WaitAsync(timeout);
+
+        public Task<bool> WaitForDequeueCallsAsync(int count, TimeSpan timeout) =>
+            WaitUntilAsync(() => DequeueCallCount >= count, timeout);
+
+        public Task<bool> WaitForCompletedDequeuesAsync(int count, TimeSpan timeout) =>
+            WaitUntilAsync(() => CompletedDequeueCount >= count, timeout);
+    }
+
+    public enum EnqueueFailureMode
+    {
+        None,
+        ThrowSynchronously,
+        FaultAsynchronously,
     }
 
     private sealed class ReleaseControlledPipeline : IPipelineRunner

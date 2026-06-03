@@ -745,7 +745,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store, new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            logger);
+            logger,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         var item = NewItem();
         await store.CreateAsync(item);

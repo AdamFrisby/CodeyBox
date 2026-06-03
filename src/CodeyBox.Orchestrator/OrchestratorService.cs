@@ -159,6 +159,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     private static readonly TimeSpan DefaultCapRetryRecheckInterval = TimeSpan.FromSeconds(15);
 
+    // Generic dispatch wake used when a worker slot frees up. It intentionally
+    // is not a real work-item id: item-specific kicks clear _deferredItems as an
+    // explicit retry-now signal, while this token only asks the loop to rescan
+    // the durable queue for any currently eligible work.
+    private static readonly WorkItemId SlotReleasedDispatchWakeId =
+        new(new Guid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
     // any of them has committed StartedAt to the database.
@@ -479,9 +486,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         try
         {
-            // Use a real ID as the kick: default(WorkItemId) is reserved for the
-            // shutdown wake sentinel and is discarded before pickup.
-            var wakeTask = _queue.EnqueueAsync(lease.WorkItemId, CancellationToken.None);
+            // Use the generic rescan token rather than the completed item id:
+            // item-specific kicks clear _deferredItems as retry-now signals.
+            var wakeTask = _queue.EnqueueAsync(SlotReleasedDispatchWakeId, CancellationToken.None);
             if (!wakeTask.IsCompletedSuccessfully)
             {
                 wakeTask.AsTask().ContinueWith(
@@ -577,12 +584,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // store item against the contract.
             if (kick.Value == default) continue;
 
-            // A kick for an item currently sleeping in a defer-requeue delay is
-            // treated as an explicit "retry now" signal: clear the deferred mark
-            // so the priority pickup considers the item again on this tick. In
-            // production this lines up with ScheduleDeferredRequeue's own
-            // TryRemove that runs just before it sends this kick.
-            _deferredItems.TryRemove(kick.Value, out _);
+            // A work-item-specific kick for an item currently sleeping in a
+            // defer-requeue delay is treated as an explicit "retry now" signal:
+            // clear the deferred mark so pickup considers the item on this
+            // tick. Generic slot-release wakes only rescan the queue and must
+            // not collapse quota/budget/disk recheck delays.
+            if (kick.Value != SlotReleasedDispatchWakeId)
+                _deferredItems.TryRemove(kick.Value, out _);
 
             // Post-dequeue pause check: handles the race where the queue was paused
             // while we were blocked in DequeueAsync. Just loop; we'll re-check
@@ -775,11 +783,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     // Exposed as internal so tests can verify the deferred-pickup contract
     // without spinning the BackgroundService: PickNextEligibleAsync must skip
-    // items in _deferredItems, and a kick on the queue must clear the deferral.
+    // items in _deferredItems, and an item-specific kick on the queue must
+    // clear the deferral.
     internal Task<WorkItemId?> PickNextEligibleForTestAsync(CancellationToken ct)
         => PickNextEligibleAsync(ct);
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
+    internal static bool IsSlotReleasedDispatchWakeForTest(WorkItemId id) =>
+        id == SlotReleasedDispatchWakeId;
 
     // Exposed as internal so tests can directly exercise the per-agent cap
     // reservation/release cycle without spinning the full BackgroundService.

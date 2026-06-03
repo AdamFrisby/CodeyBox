@@ -9,7 +9,7 @@ namespace CodeyBox.Tests;
 ///   (a) PickNextEligibleAsync skips items currently in _deferredItems even
 ///       though their store state is still Queued.
 ///   (b) An explicit kick on the queue clears the deferred mark immediately
-///       (the dispatch loop calls _deferredItems.TryRemove on every kick),
+///       (the dispatch loop calls _deferredItems.TryRemove on work-item kicks),
 ///       so a 'retry now' EnqueueAsync does not have to wait for the deferral
 ///       timer to fire.
 /// </summary>
@@ -88,7 +88,7 @@ public sealed class DeferredPickupTests : IDisposable
     {
         // Mark an item deferred (simulating ScheduleDeferredRequeue's pre-sleep mark),
         // then send an explicit kick on the queue. The dispatch loop must TryRemove the
-        // ID from _deferredItems on every kick, so the next pickup tick selects it
+        // ID from _deferredItems on item-specific kicks, so the next pickup tick selects it
         // without waiting for any deferral timer.
         var item = QueuedItem("p");
         await _store.CreateAsync(item);
