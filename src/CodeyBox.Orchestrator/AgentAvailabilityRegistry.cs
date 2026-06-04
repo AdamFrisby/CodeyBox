@@ -60,22 +60,22 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     /// </summary>
     public AgentAvailability GetAvailability(AgentKind kind)
     {
-        return GetAvailability(kind, AgentAvailabilityReadMode.AllExclusions);
+        return GetAvailability(kind, static _ => true);
     }
 
-    public AgentAvailability GetAvailability(AgentKind kind, AgentAvailabilityReadMode mode)
+    public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind)
+    {
+        return GetAvailability(kind, IsNonSmokeExclusion);
+    }
+
+    private AgentAvailability GetAvailability(AgentKind kind, Func<SmokeExclusionSource, bool> include)
     {
         if (!_entries.TryGetValue(kind, out var entry))
             return new AgentAvailability(true, null, null);
 
         lock (entry.Sync)
         {
-            var reason = mode switch
-            {
-                AgentAvailabilityReadMode.AllExclusions => entry.CombinedReason(),
-                AgentAvailabilityReadMode.IgnoreSmokeGateExclusions => entry.CombinedReason(IsNonSmokeExclusion),
-                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown availability read mode."),
-            };
+            var reason = entry.CombinedReason(include);
             return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
@@ -382,6 +382,13 @@ public interface ISmokeAvailabilityRegistry
 {
     /// <summary>Current routable verdict for an agent (shared with the read port).</summary>
     AgentAvailability GetAvailability(AgentKind kind);
+
+    /// <summary>
+    /// Current verdict with smoke-gate exclusions ignored. Used by the dispatch
+    /// smoke policy when the master smoke switch is disabled; non-smoke
+    /// exclusions such as the fast-fail circuit breaker still apply.
+    /// </summary>
+    AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind);
 
     /// <summary>Feeds a smoke-probe outcome from a specific source into availability.</summary>
     AvailabilityTransition MarkSmokeResult(

@@ -1022,7 +1022,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<AgentConcurrencySnapshot>(),
         sp.GetService<IInVmSmokeGate>(),
         configuredSmokeTarget,
-        sp.GetService<SmokeOptionsSnapshot>());
+        sp.GetService<SmokeOptionsSnapshot>(),
+        sp.GetService<IAgentDispatchAvailability>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1284,6 +1285,11 @@ builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
 builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
+    sp.GetService<IAgentAvailabilityRegistry>(),
+    sp.GetService<ISmokeAvailabilityRegistry>(),
+    sp.GetService<IInVmSmokeGate>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1934,7 +1940,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
-    smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    dispatchAvailability: sp.GetService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2050,7 +2057,8 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<IAgentAvailabilityRegistry>(),
     sp.GetRequiredService<IAgentRoutingReadiness>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>

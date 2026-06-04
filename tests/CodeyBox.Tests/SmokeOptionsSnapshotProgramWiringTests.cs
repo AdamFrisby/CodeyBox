@@ -21,15 +21,19 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
     {
         using var factory = new SmokeOptionsSnapshotWiringFactory();
         var snapshot = factory.Services.GetRequiredService<SmokeOptionsSnapshot>();
+        var dispatchAvailability = factory.Services.GetRequiredService<IAgentDispatchAvailability>();
 
-        Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
+        Assert.Same(dispatchAvailability, FieldValue(
             factory.Services.GetRequiredService<AgentClassRouter>(),
-            "_smokeOptions"));
-        Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
+            "_dispatchAvailability"));
+        Assert.Same(dispatchAvailability, FieldValue(
             factory.Services.GetRequiredService<PipelineRunner>(),
-            "_smokeOptions"));
-        Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
+            "_dispatchAvailability"));
+        Assert.Same(dispatchAvailability, FieldValue(
             factory.Services.GetRequiredService<WorkerPoolHealthCoordinator>(),
+            "_dispatchAvailability"));
+        Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
+            dispatchAvailability,
             "_smokeOptions"));
         Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
             factory.Services.GetRequiredService<CredentialSmokeGate>(),
@@ -53,6 +57,13 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
         var field = instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(field);
         return Assert.IsType<T>(field.GetValue(instance));
+    }
+
+    private static object? FieldValue(object instance, string name)
+    {
+        var field = instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        return field.GetValue(instance);
     }
 
     private sealed class SmokeOptionsSnapshotWiringFactory : WebApplicationFactory<Program>

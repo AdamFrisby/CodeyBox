@@ -200,9 +200,14 @@ public sealed class AgentAvailabilityRegistryTests
     }
 
     [Fact]
-    public void SmokeDisabledView_IgnoresSmokeSourcesButKeepsFastFail()
+    public void DispatchAvailability_WhenSmokeDisabled_IgnoresSmokeSourcesButKeepsFastFail()
     {
         var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        var dispatchAvailability = new AgentDispatchAvailability(
+            reg,
+            reg,
+            inVmSmokeGate: null,
+            new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
 
         reg.MarkSmokeResult(
             Claude,
@@ -215,12 +220,12 @@ public sealed class AgentAvailabilityRegistryTests
         reg.ExcludeForMissingProbe(Claude, "no in-VM smoke probe registered");
 
         Assert.False(reg.GetAvailability(Claude).Available);
-        Assert.True(reg.GetAvailability(Claude, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions).Available);
+        Assert.True(dispatchAvailability.GetAvailability(Claude)!.Available);
 
         for (var i = 0; i < 3; i++)
             reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
 
-        var av = reg.GetAvailability(Claude, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions);
+        var av = dispatchAvailability.GetAvailability(Claude)!;
         Assert.False(av.Available);
         Assert.Contains("fast-fail circuit breaker", av.Reason);
         Assert.DoesNotContain("smoke failed", av.Reason);

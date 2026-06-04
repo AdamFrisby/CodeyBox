@@ -375,6 +375,42 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task MasterSmokeDisabled_EnsureAvailableAsync_IgnoresSmokeSourcesButKeepsFastFail()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
+        var registry = NewRegistry();
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var prober = Build(
+            provider,
+            registry,
+            NewCache(),
+            new FakeBaselineResolver("base-A"),
+            smokeOptions: smokeOptions);
+
+        registry.MarkSmokeResult(
+            AgentKind.Cursor,
+            new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient),
+            SmokeExclusionSource.InVmSmoke);
+        registry.ExcludeForMissingProbe(AgentKind.Cursor, "no in-VM smoke probe registered");
+
+        var smokeOnly = await prober.EnsureAvailableAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None);
+
+        Assert.True(smokeOnly.Available);
+        Assert.Equal(0, provider.CreateCount);
+
+        for (var i = 0; i < 3; i++)
+            registry.RecordRunOutcome(AgentKind.Cursor, success: false, duration: TimeSpan.FromSeconds(1));
+
+        var fastFail = await prober.EnsureAvailableAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None);
+
+        Assert.False(fastFail.Available);
+        Assert.Contains("fast-fail circuit breaker", fastFail.Reason);
+        Assert.DoesNotContain("transient: try later", fastFail.Reason);
+        Assert.DoesNotContain("no in-VM smoke probe", fastFail.Reason);
+        Assert.Equal(0, provider.CreateCount);
+    }
+
+    [Fact]
     public async Task NullCredential_StillRunsVersionStep_AndExcludesOnExit127()
     {
         // No credential bundle at all: the prober must still exec the

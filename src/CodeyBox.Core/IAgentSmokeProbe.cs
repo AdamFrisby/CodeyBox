@@ -87,8 +87,10 @@ public interface IHostSmokeProbeRunner
     /// <summary>
     /// Runs the host credential probe registered for <paramref name="kind"/>,
     /// if any, and returns its result. Returns <c>null</c> when no probe is
-    /// registered for the kind (the caller treats that as "this layer does not
-    /// know the agent").
+    /// registered for the kind, or when the master smoke switch is disabled.
+    /// Callers that need to distinguish those cases should inspect the smoke
+    /// configuration before treating <c>null</c> as "this layer does not know
+    /// the agent".
     /// </summary>
     Task<AgentSmokeResult?> ProbeAsync(AgentKind kind, CancellationToken ct);
 }

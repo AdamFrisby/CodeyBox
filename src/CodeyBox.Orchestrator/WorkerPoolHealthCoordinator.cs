@@ -16,9 +16,8 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IAgentRegistry? _agents;
-    private readonly IAgentAvailabilityRegistry? _availability;
+    private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentRoutingReadiness? _routingReadiness;
-    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly ILogger<WorkerPoolHealthCoordinator> _log;
 
     public WorkerPoolHealthCoordinator(
@@ -31,7 +30,8 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IAgentRegistry? agents = null,
         IAgentAvailabilityRegistry? availability = null,
         IAgentRoutingReadiness? routingReadiness = null,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _dispatcher = dispatcher;
         _store = store;
@@ -39,9 +39,9 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _projects = projects;
         _queueController = queueController;
         _agents = agents;
-        _availability = availability;
+        _dispatchAvailability = dispatchAvailability
+            ?? AgentDispatchAvailability.CreateIfConfigured(availability, inVmSmokeGate: null, smokeOptions);
         _routingReadiness = routingReadiness;
-        _smokeOptions = smokeOptions;
         _log = log;
     }
 
@@ -238,9 +238,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
 
-        var availability = _smokeOptions?.Enabled == false
-            ? _availability?.GetAvailability(agent, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions)
-            : _availability?.GetAvailability(agent);
+        var availability = _dispatchAvailability?.GetAvailability(agent);
         if (availability is { Available: false })
             return false;
 

@@ -177,9 +177,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this
-    /// one call. Returns the agent's prior availability untouched when the gate
-    /// is disabled; otherwise probes and returns the reconciled availability. A
-    /// cache hit is free.
+    /// one call. Returns the smoke-disabled effective availability when the
+    /// master smoke switch is off, the agent's prior availability untouched
+    /// when only the in-VM gate is disabled, and otherwise probes and returns
+    /// the reconciled availability. A cache hit is free.
     /// <paramref name="target"/> carries the sandbox profile/flavor and optional
     /// pinned baseline ref; the probe runs against the image the dispatch will
     /// actually clone, not just whatever baseline is active now.
@@ -203,6 +204,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
+        if (_smokeOptions?.Enabled == false)
+            return _availability.GetAvailabilityWithoutSmokeGateExclusions(kind);
+
         var current = _availability.GetAvailability(kind);
         if (!Enabled)
             return current;
