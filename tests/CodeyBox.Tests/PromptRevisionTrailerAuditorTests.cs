@@ -1,5 +1,6 @@
 using CodeyBox.Audit;
 using CodeyBox.Core;
+using System.Diagnostics;
 
 namespace CodeyBox.Tests;
 
@@ -37,6 +38,38 @@ public sealed class PromptRevisionTrailerAuditorTests
         var result = await new PromptRevisionTrailerAuditor()
             .RunAsync(sandbox, "/work", Ctx(dispatched: 5));
         Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task PriorCommitMissingTrailer_HeadMatchingTrailerPasses()
+    {
+        // The deterministic auditor must be satisfiable by amending or adding
+        // a correct HEAD commit. Earlier branch history may predate the prompt
+        // trailer requirement and must not keep the item blocked forever.
+        var repo = Directory.CreateTempSubdirectory("codeybox-prompt-rev-audit-").FullName;
+        try
+        {
+            await TestSupport.RunGit(repo, "init", "-b", "main");
+            await TestSupport.RunGit(repo, "config", "user.email", "test@example.invalid");
+            await TestSupport.RunGit(repo, "config", "user.name", "Test");
+            await File.WriteAllTextAsync(Path.Combine(repo, "old.txt"), "old\n");
+            await TestSupport.RunGit(repo, "add", "old.txt");
+            await TestSupport.RunGit(repo, "commit", "-m", "old commit without prompt trailer");
+
+            await File.WriteAllTextAsync(Path.Combine(repo, "new.txt"), "new\n");
+            await TestSupport.RunGit(repo, "add", "new.txt");
+            await TestSupport.RunGit(repo, "commit", "-m",
+                $"new commit with prompt trailer\n\n{CodeyBoxTrailers.PromptRevisionTrailerKey}: 7\n{CodeyBoxTrailers.CoAuthoredBy}");
+
+            var result = await new PromptRevisionTrailerAuditor()
+                .RunAsync(new ProcessExecSandbox(), repo, Ctx(dispatched: 7));
+
+            Assert.True(result.Passed);
+        }
+        finally
+        {
+            try { Directory.Delete(repo, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -93,6 +126,40 @@ public sealed class PromptRevisionTrailerAuditorTests
         public string Id => "stub";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(_handler(exec));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ProcessExecSandbox : ISandbox
+    {
+        public string Id => "process";
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exec.Argv[0],
+                WorkingDirectory = exec.WorkingDirectory ?? Directory.GetCurrentDirectory(),
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                RedirectStandardInput = exec.Stdin is not null,
+                UseShellExecute = false,
+            };
+            foreach (var arg in exec.Argv.Skip(1))
+                psi.ArgumentList.Add(arg);
+
+            using var process = Process.Start(psi)!;
+            if (exec.Stdin is not null)
+            {
+                await process.StandardInput.WriteAsync(exec.Stdin);
+                await process.StandardInput.DisposeAsync();
+            }
+
+            var stdout = await process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = await process.StandardError.ReadToEndAsync(ct);
+            await process.WaitForExitAsync(ct);
+            return new SandboxExecResult(process.ExitCode, stdout, stderr);
+        }
+
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

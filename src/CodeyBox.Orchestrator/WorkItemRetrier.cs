@@ -4,8 +4,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Consolidates retry logic for terminal work items, ensuring consistent state
-/// transitions, audit logs, and side effects (e.g. stream summary deletion).
+/// Consolidates retry logic for terminal and operator-parked work items,
+/// ensuring consistent state transitions, audit logs, and side effects (e.g.
+/// stream summary deletion).
 /// </summary>
 public sealed class WorkItemRetrier
 {
@@ -114,7 +115,10 @@ public sealed class WorkItemRetrier
         };
 
         // Atomic conditional update to prevent race conditions.
-        // We retry from Failed, AuditFailed, MergeConflictResolutionFailed, Cancelled, or AbandonedAfterRecoveryAttempts.
+        // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
+        // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
+        // WaitingForQuotaReset. The API is the public gate; this method stays
+        // reusable for scheduler/operator paths that pass an already-vetted item.
         var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {

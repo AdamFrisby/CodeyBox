@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Audit.Presets;
+using CodeyBox.Orchestrator;
 using Serilog;
 using Serilog.Events;
 
@@ -79,6 +80,103 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("did not pass after 3 iterations", final.LastError);
+    }
+
+    [Fact]
+    public async Task AuditReachesMaxIterations_WithProgress_ParksForOperatorAndPreservesWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false,
+            [
+                new AuditFinding("Lint", AuditSeverity.Error, "first remaining gap", "x", "tests/A.cs:1"),
+                new AuditFinding("Lint", AuditSeverity.Error, "second remaining gap", "x", "tests/B.cs:2"),
+            ]),
+            new AuditOutcome(false,
+            [
+                new AuditFinding("Lint", AuditSeverity.Error, "second remaining gap", "x", "tests/B.cs:2"),
+            ]),
+        ]);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            webhookDispatcher: webhooks);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "work iteration\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "rework iteration\n"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal(item.WorkBranch, final.WorkBranch);
+        Assert.Contains("parked for operator review", final.LastError);
+
+        var escalation = Assert.Single(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        var details = Assert.IsType<AuditMaxIterationsEscalationDetails>(escalation.Details);
+        Assert.True(details.ProgressObserved);
+        Assert.Contains("blocking_findings_decreased", details.ProgressSignals);
+        Assert.Equal(2, details.History.Count);
+        Assert.Equal(2, details.History[0].Findings.Count);
+        Assert.Single(details.History[1].Findings);
+        Assert.Single(details.RemainingBlockingFindings);
+
+        var bareRepo = tp.GitHost.GetRepoPath(await tp.GitHost.EnsureRepositoryAsync(item.Id, seed));
+        var (_, branchFile, _) = await TestSupport.RunGit(bareRepo, "show", $"{final.WorkBranch}:slow.txt");
+        Assert.Equal("rework iteration\n", branchFile);
+    }
+
+    [Fact]
+    public async Task RetryParkedAuditMaxIterations_AutoPicksAuditAndKeepsWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false,
+            [
+                new AuditFinding("Lint", AuditSeverity.Error, "first remaining gap", "x", "tests/A.cs:1"),
+                new AuditFinding("Lint", AuditSeverity.Error, "second remaining gap", "x", "tests/B.cs:2"),
+            ]),
+            new AuditOutcome(false,
+            [
+                new AuditFinding("Lint", AuditSeverity.Error, "second remaining gap", "x", "tests/B.cs:2"),
+            ]),
+        ]);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            webhookDispatcher: new CapturingWebhookDispatcher());
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "work iteration\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "rework iteration\n"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, parked!.State);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            queue,
+            tp.GitHost,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(parked, from: null);
+
+        Assert.True(retry.Success, retry.Error);
+        Assert.Equal("audit", retry.ActualFrom);
+        Assert.Equal(WorkItemState.WorkComplete, retry.ResumeState);
+        var resumed = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+        Assert.Equal(parked.WorkBranch, resumed.WorkBranch);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]

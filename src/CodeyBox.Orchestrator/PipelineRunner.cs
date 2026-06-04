@@ -3341,6 +3341,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken hostShutdownToken)
     {
         var maxIterations = Math.Max(1, project.Audit.MaxIterations);
+        var auditHistory = new List<AuditProgressSnapshot>(maxIterations);
         for (var iteration = 1; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
@@ -3407,6 +3408,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
+            var progressSnapshot = BuildAuditProgressSnapshot(
+                iteration, maxIterations, findings, blocking, nonBlocking);
+            auditHistory.Add(progressSnapshot);
 
             AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
@@ -3444,8 +3448,16 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (iteration == maxIterations)
             {
-                AuditLog.AuditFailed(iteration, blocking.Count);
+                if (HasAuditConvergenceProgress(auditHistory))
+                {
+                    CodeyBoxMeters.AuditIterations.Add(1,
+                        new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+                    await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+                    return true;
+                }
+
                 CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+                AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
@@ -3530,6 +3542,157 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
         return false;
+    }
+
+    private async Task ParkAuditMaxIterationsForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        CancellationToken ct)
+    {
+        var last = history[^1];
+        var message = BuildAuditMaxIterationEscalationMessage(history);
+        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+
+        await RunBoundedPostAgentAsync(item.Id, "audit-max-iterations-escalate", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var parked = current.With(WorkItemState.NeedsOperatorInput, message);
+            var updated = await _store.TryUpdateIfStateAsync(parked, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation(
+                    "Work item {Id} state changed concurrently; skipping audit max-iteration escalation",
+                    item.Id);
+                return;
+            }
+
+            _log.LogWarning(
+                "Work item {Id} reached audit iteration ceiling {Iteration}/{MaxIterations} while still showing progress; parked for operator review",
+                item.Id, last.Iteration, last.MaxIterations);
+            AuditLog.WorkItemTransitioned(item.Id, "NeedsOperatorInput (audit max iterations with progress)");
+            CodeyBoxMeters.PipelineTransitions.Add(1,
+                new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
+
+            var usage = await TryGetUsageSummaryAsync(item.Id);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.needs_operator_input",
+                WorkItem = parked,
+                Project = project,
+                Details = details,
+                Usage = usage?.Iteration,
+                UsageTotal = usage?.Total,
+            }, CancellationToken.None);
+        });
+    }
+
+    private static AuditProgressSnapshot BuildAuditProgressSnapshot(
+        int iteration,
+        int maxIterations,
+        IReadOnlyList<AuditFinding> findings,
+        IReadOnlyList<AuditFinding> blocking,
+        int nonBlocking)
+    {
+        return new AuditProgressSnapshot(
+            iteration,
+            maxIterations,
+            blocking.Count,
+            nonBlocking,
+            FingerprintFindings(blocking),
+            blocking.Select(ToSnapshotFinding).ToList(),
+            findings.Select(ToSnapshotFinding).ToList());
+    }
+
+    private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        if (history.Count < 2)
+            return false;
+
+        var last = history[^1];
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
+            return true;
+
+        var lastTotal = last.BlockingFindings + last.NonBlockingFindings;
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings + h.NonBlockingFindings > lastTotal))
+            return true;
+
+        var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
+        return history.Take(history.Count - 1)
+            .Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds));
+    }
+
+    private static IReadOnlyList<string> FingerprintFindings(IReadOnlyList<AuditFinding> findings)
+        => findings
+            .Select(f =>
+            {
+                var (files, _) = ParseLocation(f.Location);
+                return FindingIdComputer.Compute(f.AuditorName, f.Title, files);
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToList();
+
+    private static AuditFindingSnapshot ToSnapshotFinding(AuditFinding finding) => new(
+        finding.AuditorName,
+        finding.Severity.ToString(),
+        finding.Title,
+        finding.Description,
+        finding.Location);
+
+    private static string BuildAuditMaxIterationEscalationMessage(
+        IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var summary = string.Join("; ", last.BlockingFindingsDetails
+            .Take(5)
+            .Select(f => $"[{f.Auditor}] {f.Title}"));
+
+        return
+            $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
+            $"{last.BlockingFindings} blocking finding(s) remain: {summary}";
+    }
+
+    private static AuditMaxIterationsEscalationDetails BuildAuditMaxIterationEscalationDetails(
+        WorkItemId workItemId,
+        IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var signals = BuildAuditProgressSignals(history);
+        return new AuditMaxIterationsEscalationDetails(
+            WorkItemId: workItemId.ToString(),
+            Iteration: last.Iteration,
+            MaxIterations: last.MaxIterations,
+            BlockingFindings: last.BlockingFindings,
+            NonBlockingFindings: last.NonBlockingFindings,
+            ProgressObserved: signals.Count > 0,
+            ProgressSignals: signals,
+            History: history.Select(h => new AuditProgressIterationDetails(
+                h.Iteration,
+                h.BlockingFindings,
+                h.NonBlockingFindings,
+                h.BlockingFindingsDetails,
+                h.Findings)).ToList(),
+            RemainingBlockingFindings: last.BlockingFindingsDetails,
+            ResumeHint: "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.");
+    }
+
+    private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var signals = new List<string>();
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
+            signals.Add("blocking_findings_decreased");
+
+        var lastTotal = last.BlockingFindings + last.NonBlockingFindings;
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings + h.NonBlockingFindings > lastTotal))
+            signals.Add("total_findings_decreased");
+
+        var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
+        if (history.Take(history.Count - 1).Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds)))
+            signals.Add("blocking_findings_changed");
+
+        return signals;
     }
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
@@ -9301,6 +9464,41 @@ internal sealed record AuditIterationDetails(
     /// Receivers that do not care about this field ignore it safely.
     /// </summary>
     string? AuditAgentKind = null);
+
+internal sealed record AuditMaxIterationsEscalationDetails(
+    string WorkItemId,
+    int Iteration,
+    int MaxIterations,
+    int BlockingFindings,
+    int NonBlockingFindings,
+    bool ProgressObserved,
+    IReadOnlyList<string> ProgressSignals,
+    IReadOnlyList<AuditProgressIterationDetails> History,
+    IReadOnlyList<AuditFindingSnapshot> RemainingBlockingFindings,
+    string ResumeHint);
+
+internal sealed record AuditProgressIterationDetails(
+    int Iteration,
+    int BlockingFindings,
+    int NonBlockingFindings,
+    IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails,
+    IReadOnlyList<AuditFindingSnapshot> Findings);
+
+internal sealed record AuditFindingSnapshot(
+    string Auditor,
+    string Severity,
+    string Title,
+    string Description,
+    string? Location);
+
+internal sealed record AuditProgressSnapshot(
+    int Iteration,
+    int MaxIterations,
+    int BlockingFindings,
+    int NonBlockingFindings,
+    IReadOnlyList<string> BlockingFindingIds,
+    IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails,
+    IReadOnlyList<AuditFindingSnapshot> Findings);
 
 internal sealed record SuggestionWebhookDetails(
     string Id,

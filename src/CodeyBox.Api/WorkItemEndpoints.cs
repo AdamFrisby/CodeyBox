@@ -343,7 +343,7 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Retry a terminal-failed work item from a specific phase. Resets the
+    /// Retry a terminal-failed or operator-parked work item from a specific phase. Resets the
     /// state to the matching pre-phase marker and re-enqueues; the pipeline
     /// runner gates each phase by entry state, so earlier phases are
     /// skipped (their output — branch / merged base — is still in the bare
@@ -359,15 +359,17 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Only resume from terminal-failed states or the parked
-        // WaitingForQuotaReset state (operator override of the scheduler).
+        // Only resume from terminal-failed states or parked states
+        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset for
+        // operator override of the scheduler).
         // Done items have nothing to retry; other non-terminal states would
         // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.NeedsOperatorInput
             or WorkItemState.WaitingForQuotaReset))
-            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
+            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
 
         // Pass body.From through verbatim (including null) so the retrier can
         // auto-pick when the operator didn't specify a phase — defaulting at
