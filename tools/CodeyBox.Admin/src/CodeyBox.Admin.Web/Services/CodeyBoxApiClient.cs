@@ -147,7 +147,12 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             new { },
             JsonOptions,
             ct);
-        return resp.IsSuccessStatusCode;
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"Resume agent failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
+        }
+        return true;
     }
 
     public async Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)

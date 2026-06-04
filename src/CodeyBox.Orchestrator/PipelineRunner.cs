@@ -1820,7 +1820,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // conflict failure — let it propagate so the catch in RunAsync
                 // surfaces failureKind=agent_unavailable instead of overwriting
                 // it as MergeConflictResolutionFailed.
-                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException)
+                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",

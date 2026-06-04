@@ -502,6 +502,36 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             c.Target.NetworkProfile == "audit-agent-profile");
     }
 
+    [Fact]
+    public async Task OnlyPausedResolver_ThrowsAgentPaused()
+    {
+        var primary = new FakeAgentRunner(AgentKind.Claude);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Claude, "audit-agent-profile");
+
+        var fixture = BuildFixture(
+            runners: [primary],
+            members:
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                AuditAgent = "audit-agent-profile",
+            },
+            inVmSmokeGate: pauseGate);
+
+        var item = NewItem(AgentKind.Claude);
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<AgentPausedException>(() =>
+            fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+                item, fixture.Project, primary, CancellationToken.None));
+
+        Assert.Equal("rebase", ex.Phase);
+        Assert.Equal(AgentKind.Claude, ex.Agent);
+        Assert.Contains("paused by operator: maintenance", ex.PauseReason, StringComparison.Ordinal);
+    }
+
     // ── Fixture and helpers ────────────────────────────────────────────────
 
     private Fixture BuildFixture(

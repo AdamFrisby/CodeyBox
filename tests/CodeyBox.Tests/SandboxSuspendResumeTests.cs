@@ -1368,7 +1368,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             && string.Equals(vmName?.ToString(), "vm-adoption-hang", StringComparison.Ordinal)
             && entry.Properties.TryGetValue("WorkItemId", out var workItemId)
             && string.Equals(workItemId?.ToString(), item.Id.ToString(), StringComparison.Ordinal));
-        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(500),
+        Assert.True(sw.Elapsed < configuredDeadline + TimeSpan.FromSeconds(1),
             $"configured {configuredDeadline} adoption deadline was not honored; elapsed {sw.Elapsed}");
     }
 

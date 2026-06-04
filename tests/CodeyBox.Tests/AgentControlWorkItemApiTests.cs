@@ -153,6 +153,58 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
     }
 
     [Fact]
+    public async Task Create_CheckAndAgentControlTogether_IsRejected()
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "mixed controls",
+            prompt = "mixed controls",
+            check = new
+            {
+                question = "Proceed?",
+                onYes = new
+                {
+                    title = "Do work",
+                    prompt = "Do the work.",
+                },
+            },
+            agentControl = new
+            {
+                action = "pause",
+                agent = "claude",
+                reason = "reserve quota",
+            },
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("check and agentControl", await resp.Content.ReadAsStringAsync());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Create_AgentControlPause_RequiresReason(string? reason)
+    {
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "pause without reason",
+            prompt = "pause without reason",
+            agentControl = new
+            {
+                action = "pause",
+                agent = "claude",
+                reason,
+            },
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("agentControl.reason is required for pause", await resp.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task Create_AgentControlValidatesAgentAndDuration()
     {
         var missingAgent = await _client.PostAsJsonAsync("/workitems", new

@@ -199,6 +199,71 @@ public sealed class CodeyBoxApiClientTests
         var ids = body.GetProperty("ids").EnumerateArray().Select(e => e.GetString()).ToList();
         Assert.Equal(["id1", "id2"], ids);
     }
+
+    [Fact]
+    public async Task GetPausedAgentsAsync_CallsEndpointAndParsesStates()
+    {
+        var (client, handler) = Build("""
+            [{"agent":"claude","paused":true,"pausedAt":"2026-06-04T12:00:00Z",
+              "pausedReason":"outage","pausedBy":"api","updatedAt":"2026-06-04T12:00:01Z"}]
+            """);
+
+        var paused = await client.GetPausedAgentsAsync();
+
+        Assert.Equal(HttpMethod.Get, handler.LastMethod);
+        Assert.Equal("/agents/paused", handler.LastPath);
+        var state = Assert.Single(paused);
+        Assert.Equal("claude", state.Agent);
+        Assert.True(state.Paused);
+        Assert.Equal("outage", state.PausedReason);
+        Assert.Equal("api", state.PausedBy);
+    }
+
+    [Fact]
+    public async Task PauseAgentAsync_PostsEscapedAgentAndBody()
+    {
+        var (client, handler) = Build("""
+            {"agent":"claude/pro","paused":true,"pausedAt":"2026-06-04T12:00:00Z",
+             "pausedReason":"reserve quota","pausedBy":"api","expiresAt":"2026-06-04T13:00:00Z",
+             "updatedAt":"2026-06-04T12:00:00Z"}
+            """);
+
+        var state = await client.PauseAgentAsync("claude/pro", "reserve quota", 3600);
+
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/agents/claude%2Fpro/pause", handler.LastPath);
+        var body = JsonSerializer.Deserialize<JsonElement>(handler.LastBody ?? "{}");
+        Assert.Equal("reserve quota", body.GetProperty("reason").GetString());
+        Assert.Equal(3600, body.GetProperty("durationSeconds").GetDouble());
+        Assert.NotNull(state);
+        Assert.Equal("claude/pro", state!.Agent);
+        Assert.Equal("reserve quota", state.PausedReason);
+    }
+
+    [Fact]
+    public async Task ResumeAgentAsync_PostsEscapedAgent()
+    {
+        var (client, handler) = Build("""{"agent":"claude/pro","paused":false}""");
+
+        var resumed = await client.ResumeAgentAsync("claude/pro");
+
+        Assert.True(resumed);
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        Assert.Equal("/agents/claude%2Fpro/resume", handler.LastPath);
+        Assert.NotNull(handler.LastBody);
+    }
+
+    [Fact]
+    public async Task ResumeAgentAsync_NonSuccess_ThrowsWithResponseBody()
+    {
+        var (client, _) = Build("""{"error":"bad agent"}""", HttpStatusCode.BadRequest);
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(
+            () => client.ResumeAgentAsync("claude"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, ex.StatusCode);
+        Assert.Contains("bad agent", ex.Message);
+    }
 }
 
 /// <summary>

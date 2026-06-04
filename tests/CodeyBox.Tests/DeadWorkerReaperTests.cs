@@ -365,6 +365,78 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_AgentControlWorkingWithoutPreempt_RequeuesAndPreservesControlSpec()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.AgentControl,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Resume,
+                Agent = AgentKind.Claude.Value,
+                Reason = "provider recovered",
+            },
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.LastError);
+        Assert.NotNull(after.AgentControl);
+        Assert.Equal(AgentControlAction.Resume, after.AgentControl!.Action);
+        Assert.Equal(AgentKind.Claude.Value, after.AgentControl.Agent);
+        Assert.Equal("provider recovered", after.AgentControl.Reason);
+        Assert.Equal(1, _queue.Count);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+        Assert.Equal(WorkItemState.Queued, evt.WorkItem.State);
+    }
+
+    [Fact]
+    public async Task Reaper_AgentControlAtRecoveryCap_MarksFailedAndReleasesWorkerSlot()
+    {
+        var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
+        _reaper.AttachWorkerPoolSlotReleaser(slotReleaser);
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.AgentControl,
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "maintenance",
+            },
+        };
+        var workerId = Guid.NewGuid().ToString();
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(workerId, item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Equal(0, _queue.Count);
+
+        var release = Assert.Single(slotReleaser.Releases);
+        Assert.Equal(workerId, release.WorkerId);
+        Assert.Equal(item.Id, release.WorkItemId);
+    }
+
+    [Fact]
     public async Task Reaper_CheckAndActWithPersistedFollowup_CompletesWithoutDuplicateFollowup()
     {
         var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();

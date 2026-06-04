@@ -174,6 +174,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan SpawnPacingPausePollInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan SpawnPacingPauseObservationWindow = TimeSpan.FromMilliseconds(250);
 
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
@@ -587,6 +588,25 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private ValueTask RequeueDispatchWakeAsync(CancellationToken ct)
         => _queue.EnqueueDispatchWakeAsync(ct);
 
+    private async Task<bool> WaitForSpawnPacingOrPauseAsync(TimeSpan wait, CancellationToken stoppingToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + wait;
+        while (true)
+        {
+            if (IsQueuePaused || IsDispatchPaused)
+                return false;
+
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                return true;
+
+            var slice = remaining < SpawnPacingPausePollInterval
+                ? remaining
+                : SpawnPacingPausePollInterval;
+            await Task.Delay(slice, stoppingToken);
+        }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // R8-core suspend/resume: SandboxResumeOnStartupService now runs in the
@@ -757,10 +777,33 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         var lastSpawnAt = new DateTimeOffset(lastTicks, TimeSpan.Zero);
                         var nextEligible = lastSpawnAt + _opts.MinSpawnInterval;
                         var wait = nextEligible - DateTimeOffset.UtcNow;
+                        if (wait <= TimeSpan.Zero && _queueController is not null)
+                        {
+                            wait = _opts.MinSpawnInterval < SpawnPacingPauseObservationWindow
+                                ? _opts.MinSpawnInterval
+                                : SpawnPacingPauseObservationWindow;
+                        }
                         if (wait > TimeSpan.Zero)
                         {
-                            AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
-                            try { await WaitForSpawnPacingDelayAsync(wait, stoppingToken); }
+                            if (nextEligible > DateTimeOffset.UtcNow)
+                                AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
+                            try
+                            {
+                                if (!await WaitForSpawnPacingOrPauseAsync(wait, stoppingToken))
+                                {
+                                    _activeItems.TryRemove(id.Value, out _);
+                                    TryReleaseConcurrencyGate();
+                                    if (IsDispatchPaused)
+                                    {
+                                        stopDispatchLoop = true;
+                                    }
+                                    else
+                                    {
+                                        await RequeueDispatchWakeAsync(stoppingToken);
+                                    }
+                                    break;
+                                }
+                            }
                             catch (OperationCanceledException)
                             {
                                 _activeItems.TryRemove(id.Value, out _);
@@ -993,27 +1036,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             catch (OperationCanceledException) { return false; }
         }
         return true;
-    }
-
-    private async Task WaitForSpawnPacingDelayAsync(TimeSpan wait, CancellationToken stoppingToken)
-    {
-        var deadline = DateTimeOffset.UtcNow + wait;
-        while (true)
-        {
-            if (IsDispatchPaused || IsQueuePaused)
-                return;
-
-            var remaining = deadline - DateTimeOffset.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-                return;
-
-            // Poll often enough for pause/shutdown to preempt spawn pacing,
-            // while keeping the loop idle between checks.
-            var delay = remaining < SpawnPacingPausePollInterval
-                ? remaining
-                : SpawnPacingPausePollInterval;
-            await Task.Delay(delay, stoppingToken);
-        }
     }
 
     // Exposed as internal so tests can invoke recovery in isolation without

@@ -264,7 +264,11 @@ else
     {
         try
         {
-            await ApiClient.ResumeAgentAsync(agent);
+            if (!await ApiClient.ResumeAgentAsync(agent))
+            {
+                _error = "Failed to resume agent. Check server logs for details.";
+                return;
+            }
             await LoadAsync();
         }
         catch (Exception ex)

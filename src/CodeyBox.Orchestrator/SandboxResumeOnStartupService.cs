@@ -441,7 +441,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (resumeTask is not null)
-                ObserveProviderTaskException(resumeTask);
+                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -639,7 +639,6 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                     refName,
                     $"codeybox: suspend-resume checkpoint {itemId}",
                     timeoutCts.Token));
-
             var pushed = await promoteTask.WaitAsync(timeout, ct);
             if (pushed)
                 return true;
@@ -660,7 +659,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (promoteTask is not null)
-                ObserveProviderTaskException(promoteTask);
+                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -670,7 +669,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (promoteTask is not null)
-                ObserveProviderTaskException(promoteTask);
+                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -700,6 +699,24 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+    }
+
+    private static async Task ObserveProviderTaskAfterCancellationAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromMilliseconds(100));
+        }
+        catch (TimeoutException)
+        {
+            ObserveProviderTaskException(task);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+        }
     }
 
     private static Task RunLongRunningAsync(Func<Task> work) =>
