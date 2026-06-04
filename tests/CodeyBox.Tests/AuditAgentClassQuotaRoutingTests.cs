@@ -242,11 +242,13 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task PreferredBudgetWithResetBelowRampedFloor_AuditFallsThroughToClassMember()
+    public async Task PreferredBudgetWithSoonerResetBelowProviderRamp_AuditFallsThroughToClassMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
-        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var now = DateTimeOffset.UtcNow;
+        var providerReset = now + TimeSpan.FromDays(7);
+        var budgetReset = now + TimeSpan.FromMinutes(1);
         var quotaOptions = new QuotaRouterOptions
         {
             MinQuotaPct = 10.0,
@@ -258,10 +260,10 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             classMembers: [AgentKind.Gemini, AgentKind.Codex],
             quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
             quotaOptions: quotaOptions,
-            quotaResetAt: reset,
+            quotaResetAt: providerReset,
             budgetProvider: new FakeBudgetProvider(
                 new() { [AgentKind.Gemini] = 20.0 },
-                resetAt: reset));
+                resetAt: budgetReset));
         fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
 
         var item = NewItem(AgentKind.Codex);

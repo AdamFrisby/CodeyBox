@@ -140,13 +140,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// same (agent, model): takes MIN of the two available percentages so the
     /// stronger constraint gates. When the probe reading is unknown (-1) the
     /// budget percentage stands alone; when no budget is configured the probe
-    /// reading is returned unchanged. <c>ResetAt</c> becomes the earlier of the
-    /// two known resets so the retry scheduler wakes at the soonest opportunity.
+    /// reading is returned unchanged. <c>ResetAt</c> stays probe-derived so the
+    /// quota ramp never interprets a local budget reset as the provider quota
+    /// window reset; the budget reset is carried separately for retry scheduling.
     /// </summary>
     private async Task<BudgetAdjustedQuota> ApplyBudgetAsync(
         AgentMembership member, EffectiveQuota probeQuota, CancellationToken ct)
     {
-        if (_budgetProvider is null) return new BudgetAdjustedQuota(probeQuota, false, null);
+        if (_budgetProvider is null) return new BudgetAdjustedQuota(probeQuota, false, null, false);
 
         AgentQuotaSnapshot? budget;
         try
@@ -166,27 +167,26 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             _log.LogWarning(ex,
                 "Budget gate: provider threw for {Agent}/{Model}; failing closed",
                 member.Agent.Value, member.ModelId ?? "(default)");
-            return new BudgetAdjustedQuota(probeQuota with { AvailablePct = 0.0, Unknown = null }, true, null);
+            return new BudgetAdjustedQuota(probeQuota with { AvailablePct = 0.0, Unknown = null }, true, null, true);
         }
 
-        if (budget is null) return new BudgetAdjustedQuota(probeQuota, false, null);
+        if (budget is null) return new BudgetAdjustedQuota(probeQuota, false, null, false);
 
         var combinedPct = !probeQuota.IsKnown
             ? budget.AvailablePct
             : Math.Min(probeQuota.AvailablePct, budget.AvailablePct);
-
-        var reset = probeQuota.ResetAt;
-        if (budget.ResetAt is { } br && (reset is null || br < reset))
-            reset = br;
+        var budgetConstrained = probeQuota.AvailablePct < 0
+                                || budget.AvailablePct <= probeQuota.AvailablePct;
 
         // A configured budget that is itself below the gate threshold is a real
         // operator spend cap, not a transient probe quirk: callers use this flag to
         // refuse the PayPerApi fire-anyway fallthrough that otherwise fail-opens.
         var budgetExhausted = budget.AvailablePct < _opts.MinQuotaPct;
         return new BudgetAdjustedQuota(
-            probeQuota with { AvailablePct = combinedPct, ResetAt = reset, Unknown = null },
+            probeQuota with { AvailablePct = combinedPct, Unknown = null },
             budgetExhausted,
-            budget.ResetAt);
+            budget.ResetAt,
+            budgetConstrained);
     }
 
     /// <summary>
@@ -1589,7 +1589,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
 
             var quota = ResolveMemberQuota(snapshot, member);
-            quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
+            var budgeted = await ApplyBudgetAsync(member, quota, ct);
+            quota = budgeted.Quota;
             // Skip unknown (probe failed / no data) and members above their
             // effective floor (they would be routable, so they don't need to
             // gate park-time). Use the same per-agent/window policy as dispatch
@@ -1598,7 +1599,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (!quota.IsKnown) continue;
             var gate = _quotaGatePolicy.Evaluate(member, quota, nowUtc);
             if (gate.Allow) continue;
-            if (QuotaGatePolicy.ResolveResetHint(quota, gate) is not { } resetAt) continue;
+            var resetAt = QuotaGatePolicy.ResolveResetHint(quota, gate);
+            if (string.IsNullOrEmpty(gate.WindowName)
+                && budgeted.BudgetConstrained
+                && budgeted.BudgetReset is { } budgetReset
+                && (resetAt is null || budgetReset < resetAt))
+                resetAt = budgetReset;
+            if (resetAt is null) continue;
 
             if (earliest is null || resetAt < earliest.Value)
                 earliest = resetAt;
@@ -2115,7 +2122,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// closed), distinguishing a real spend-cap stop from a transient probe quirk.
     /// </summary>
     private readonly record struct BudgetAdjustedQuota(
-        EffectiveQuota Quota, bool BudgetExhausted, DateTimeOffset? BudgetReset);
+        EffectiveQuota Quota,
+        bool BudgetExhausted,
+        DateTimeOffset? BudgetReset,
+        bool BudgetConstrained);
 }
 
 public sealed record EffectiveQuota(

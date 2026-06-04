@@ -5621,15 +5621,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 ? probeQuota.AvailablePct
                 : Math.Min(probeQuota.AvailablePct, budgetPct);
 
-        var combinedResetAt = probeQuota.ResetAt;
-        if (budget?.ResetAt is { } budgetReset
-            && (combinedResetAt is null || budgetReset < combinedResetAt))
-            combinedResetAt = budgetReset;
-
         var combinedQuota = probeQuota with
         {
             AvailablePct = combinedPct,
-            ResetAt = combinedResetAt,
         };
 
         return EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);

@@ -74,6 +74,39 @@ public sealed class AgentClassRouterBudgetTests
     }
 
     [Fact]
+    public async Task BudgetReset_DoesNotCollapseRampedProviderQuotaFloor()
+    {
+        var now = new DateTimeOffset(2026, 5, 31, 12, 0, 0, TimeSpan.Zero);
+        var budgetReset = now.AddMinutes(1);
+        var probeReset = now.AddDays(7);
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = [new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 }],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 20.0, ResetAt = probeReset })],
+            new QuotaRouterOptions
+            {
+                MinQuotaPct = 10.0,
+                StartFloorPct = 25.0,
+                EndFloorPct = 3.0,
+                RampWindow = TimeSpan.FromDays(7),
+                UnknownPolicy = QuotaUnknownPolicy.FailCautious,
+            },
+            NullLogger<AgentClassRouter>.Instance,
+            timeProvider: new FakeTimeProvider(now),
+            budgetProvider: new ResetBudgetProvider(20.0, budgetReset));
+
+        var decision = await router.ResolveAsync(Item(), null, CancellationToken.None);
+
+        Assert.Null(decision.Chosen);
+        Assert.True(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task ProbeUnknown_BudgetStandsAlone_Allows()
     {
         // Probe -1 (unknown) + FailCautious would normally deny, but a healthy
@@ -259,8 +292,9 @@ public sealed class AgentClassRouterBudgetTests
     public async Task EarliestExhaustedReset_PrefersEarlierBudgetReset()
     {
         // Both probe and budget are exhausted; the budget's reset is sooner.
-        // ApplyBudgetAsync must merge ResetAt to the earlier of the two so the
-        // retry scheduler wakes at the soonest opportunity.
+        // ApplyBudgetAsync must keep the provider reset for ramp math while still
+        // carrying the budget reset separately so the retry scheduler wakes at the
+        // soonest opportunity.
         var now = DateTimeOffset.UtcNow;
         var budgetReset = now.AddDays(6);
         var probeReset = budgetReset.AddHours(1);
@@ -286,8 +320,8 @@ public sealed class AgentClassRouterBudgetTests
     public async Task EarliestExhaustedReset_PrefersEarlierProbeReset()
     {
         // Mirror image of the previous test: the probe reset is sooner, so the
-        // merge must keep it rather than the later budget reset. Guards against an
-        // inverted comparison in ApplyBudgetAsync's ResetAt merge.
+        // retry hint must keep it rather than the later budget reset. Guards
+        // against an inverted comparison in the separate reset scheduling path.
         var now = DateTimeOffset.UtcNow;
         var probeReset = now.AddDays(6);
         var budgetReset = probeReset.AddHours(1);
