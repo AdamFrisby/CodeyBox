@@ -15,20 +15,20 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
     private static readonly TimeSpan PeriodicSweepInterval = TimeSpan.FromMinutes(1);
 
     private readonly IWorkItemStore _store;
-    private readonly ITaskQueue _queue;
+    private readonly WorkItemRetrier _retrier;
     private readonly IAgentPauseController _pauses;
     private readonly ILogger<AgentPauseRetryScheduler> _log;
     private readonly SemaphoreSlim _wake = new(0);
 
     public AgentPauseRetryScheduler(
         IWorkItemStore store,
-        ITaskQueue queue,
+        WorkItemRetrier retrier,
         IAgentPauseController pauses,
         ILogger<AgentPauseRetryScheduler> log,
         IAgentPauseSignal? signal = null)
     {
         _store = store;
-        _queue = queue;
+        _retrier = retrier;
         _pauses = pauses;
         _log = log;
         if (signal is not null)
@@ -124,32 +124,17 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
                 continue;
             }
 
-            var retryFrom = NormaliseRetryFrom(item.QuotaRetryFrom);
-            var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
-            var resumed = item.With(resumeState, error: null) with
-            {
-                FailureKind = null,
-                QuotaResetAt = null,
-                NextQuotaRetryAt = null,
-                QuotaRetryFrom = null,
-                StartedAt = null,
-            };
-
-            var updated = await _store.TryUpdateIfStateAsync(
-                    resumed,
-                    WorkItemState.WaitingForAgentResume,
-                    ct)
+            var outcome = await _retrier.ResumeAfterAgentPauseAsync(item, source, ct)
                 .ConfigureAwait(false);
-            if (!updated)
+            if (!outcome.Success)
             {
                 _log.LogInformation(
-                    "Agent pause retry skipped {Id}: state changed before retry",
-                    item.Id);
+                    "Agent pause retry skipped {Id}: {Reason}",
+                    item.Id,
+                    outcome.Error);
                 continue;
             }
 
-            await _queue.EnqueueAsync(item.Id, ct).ConfigureAwait(false);
-            AuditLog.AgentPauseWaitingItemResumed(item.Id, source, retryFrom);
             retried++;
         }
 
@@ -176,14 +161,4 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
         // pickup will park the item again with the current blocker set.
         return false;
     }
-
-    private static string NormaliseRetryFrom(string? retryFrom) =>
-        retryFrom?.Trim().ToLowerInvariant() switch
-        {
-            "audit" => "audit",
-            "conflict_rework" => "conflict_rework",
-            "merge" => "merge",
-            "upstream" => "upstream",
-            _ => "work",
-        };
 }

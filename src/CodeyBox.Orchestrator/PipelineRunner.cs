@@ -1877,6 +1877,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
         (AgentKind Agent, string Reason)? pausedCandidate = null;
+        var quotaRejectedCount = 0;
         var resolverSmokePhase = operation == AgenticConflictResolverOperation.Merge ? "merge" : "rebase";
         var resolverSmokeTarget = ResolvePhaseSmokeTarget(project, resolverSmokePhase, item.BaselineImageRef);
 
@@ -1933,7 +1934,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (collected.Count == 0)
         {
-            if (pausedCandidate is { } paused)
+            if (pausedCandidate is { } paused && quotaRejectedCount == 0)
                 throw new AgentPausedException(resolverSmokePhase, paused.Agent, paused.Reason);
 
             var reasons = skipReasons.Count == 0
@@ -2016,6 +2017,7 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
                 skipReasons.Add(reason);
+                quotaRejectedCount++;
                 return reason;
             }
 
@@ -3048,8 +3050,24 @@ public sealed class PipelineRunner : IPipelineRunner
                 throw new OperationCanceledException(hostShutdownToken);
 
             var prompt = CheckAndActPipeline.BuildPrompt(checkSpec);
-            var stdout = await RunPostActReCheckAgentAsync(
-                item, project, agentRunner, repoId, workBranch, prompt, ct);
+            var recheckSmokeTarget = SandboxTargetResolver.ToInVmSmokeTarget(
+                project,
+                new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
+                item.BaselineImageRef);
+            var stdout = await InvokeAgentWithQuotaFallbackAsync(
+                item,
+                project,
+                "post-act-recheck",
+                iteration,
+                (runner, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
+                    trialItem, project, runner, repoId, workBranch, prompt, attemptCt),
+                ct,
+                initialRunnerOverride: agentRunner,
+                initialMemberOverride: _classRouter?.FindMember(
+                    item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
+                    agentRunner.Kind,
+                    item.ModelId),
+                smokeTarget: recheckSmokeTarget);
 
             if (!CheckAndActPipeline.TryParseVerdict(stdout, out var verdict, out var parseError))
             {
@@ -4879,7 +4897,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // exhausted, falling back to workRunner doesn't help. Skip the
         // auditor for this iteration — the rest of the audit set still runs
         // and the work item keeps progressing.
-        if (preferredPauseReason is not null)
+        if (preferredPauseReason is not null && quotaRejectedCount == 0)
             throw new AgentPausedException("audit", preferredKind.Value, preferredPauseReason);
 
         AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
@@ -4968,7 +4986,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // every member is filtered for missing runner/credentials, the cause
         // is misconfiguration, not a quota crunch; surfacing it as quota would
         // misdirect operators investigating the skip.
-        if (await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
+        if (quotaRejectedCount == 0
+            && await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
             throw new AgentPausedException("audit", paused.Agent, paused.Reason);
         if (quotaRejectedCount > 0)
             AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
@@ -5393,6 +5412,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var triedKeys = new HashSet<(AgentKind, string)>();
         var triedCount = 0;
         DateTimeOffset? earliestReset = null;
+        var sawQuotaBlockedCandidate = false;
         var currentRunner = initialRunner;
         var currentItem = initialItem;
         // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
@@ -5421,6 +5441,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var fallbackKind = quotaExhausted ? "quota" : pausedRejected ? "paused" : smokeRejected ? "smoke" : "timeout";
             if (quotaExhausted)
             {
+                sawQuotaBlockedCandidate = true;
                 // Cap the reset hint against a sane operator-visible ceiling. Reset
                 // windows are extracted from attacker-influenceable agent output;
                 // a maliciously-crafted Retry-After could otherwise park an item
@@ -5490,6 +5511,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         _auditQuotaOptions.ObservedFailureWindow,
                         DateTimeOffset.UtcNow, ct))
                 {
+                    sawQuotaBlockedCandidate = true;
                     _log.LogInformation(
                         "Class '{ClassId}' member {Agent}/{Model} has a recent observed quota failure; skipping for fallback (work item {WorkItemId})",
                         classId, candidate.Agent.Value, candidate.ModelId ?? "(default)", item.Id);
@@ -5506,6 +5528,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (budgetFailedClosed
                     || (budgetPct >= 0 && budgetPct < _auditQuotaOptions.MinQuotaPct))
                 {
+                    sawQuotaBlockedCandidate = true;
                     _log.LogInformation(
                         "Class '{ClassId}' member {Agent}/{Model} local budget exhausted ({Pct}); skipping for fallback (work item {WorkItemId})",
                         classId, candidate.Agent.Value, candidate.ModelId ?? "(default)",
@@ -5556,6 +5579,13 @@ public sealed class PipelineRunner : IPipelineRunner
                     throw new AgentUnavailableException(
                         $"all eligible member(s) of class '{classId}' were rejected by the in-VM smoke gate in phase '{phase}'; last rejection: {safeReason}",
                         safeReason);
+
+                if (pausedRejected && sawQuotaBlockedCandidate)
+                {
+                    var msg = $"All {triedCount} eligible member(s) of class '{classId}' exhausted or paused mid-{phase}; " +
+                              $"last paused rejection: {safeReason}";
+                    throw new AgentClassExhaustedException(classId, phase, triedCount, earliestReset, msg);
+                }
 
                 if (pausedRejected)
                     throw new AgentPausedException(phase, currentMember.Agent, safeReason);
@@ -7292,7 +7322,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 // orchestrator requeue path; retrying them here would hard-fail
                 // infrastructure flaps after the upstream attempt budget.
                 catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
-                    && ex is not SandboxProvisioningDeferredException)
+                    && ex is not SandboxProvisioningDeferredException
+                    && ex is not AgentPausedException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {

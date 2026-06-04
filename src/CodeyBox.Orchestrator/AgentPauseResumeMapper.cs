@@ -4,6 +4,16 @@ namespace CodeyBox.Orchestrator;
 
 internal static class AgentPauseResumeMapper
 {
+    public static string NormalizeRetryFrom(string? retryFrom) =>
+        retryFrom?.Trim().ToLowerInvariant() switch
+        {
+            "audit" => "audit",
+            "conflict_rework" => "conflict_rework",
+            "merge" => "merge",
+            "upstream" => "upstream",
+            _ => "work",
+        };
+
     public static string RetryFromForState(WorkItemState state) => state switch
     {
         WorkItemState.WorkComplete => "audit",
@@ -19,7 +29,7 @@ internal static class AgentPauseResumeMapper
     };
 
     public static WorkItemState ResumeStateForRetryFrom(string? retryFrom) =>
-        retryFrom?.Trim().ToLowerInvariant() switch
+        NormalizeRetryFrom(retryFrom) switch
         {
             "audit" => WorkItemState.WorkComplete,
             "conflict_rework" => WorkItemState.ReworkingForConflict,

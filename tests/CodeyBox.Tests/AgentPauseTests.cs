@@ -136,7 +136,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForAgentResume()
+    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForQuotaRecovery()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
@@ -159,9 +159,9 @@ public sealed class AgentPauseTests : IDisposable
         var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
 
         Assert.True(decision.ShouldWait);
-        Assert.True(decision.WaitingForPausedAgent);
-        Assert.Contains("paused by operator", decision.Reason);
-        Assert.Equal([AgentKind.Codex], decision.PausedAgents);
+        Assert.False(decision.WaitingForPausedAgent);
+        Assert.Contains("quota", decision.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(decision.PausedAgents);
     }
 
     [Fact]
@@ -232,11 +232,7 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
         await pauses.ResumeAsync(AgentKind.Claude, "test");
 
-        var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
         var retried = await scheduler.RetryWaitingItemsForTestAsync("test");
 
         Assert.Equal(1, retried);
@@ -293,11 +289,7 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
         await pauses.ResumeAsync(AgentKind.Codex, "test");
 
-        var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
         var retried = await scheduler.RetryWaitingItemsForTestAsync("test");
 
         Assert.Equal(1, retried);
@@ -592,12 +584,7 @@ public sealed class AgentPauseTests : IDisposable
         await pauses.PauseAsync(AgentKind.Claude, "operator reserve", "test");
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        using var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance,
-            signal: pauses);
+        using var scheduler = NewPauseRetryScheduler(store, queue, pauses, pauses);
 
         await scheduler.StartAsync(CancellationToken.None);
         try
@@ -639,11 +626,7 @@ public sealed class AgentPauseTests : IDisposable
             QuotaRetryFrom = "work",
         };
         await store.CreateAsync(item);
-        var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
 
         Assert.Equal(0, await scheduler.RetryWaitingItemsForTestAsync("still-paused"));
         var stillParked = await store.GetAsync(item.Id);
@@ -673,11 +656,7 @@ public sealed class AgentPauseTests : IDisposable
             QuotaRetryFrom = "work",
         };
         await store.CreateAsync(item);
-        var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
 
         await pauses.ResumeAsync(AgentKind.Codex, "test", "operator ready");
         var retried = await scheduler.RetryWaitingItemsForTestAsync("resumed-one");
@@ -705,11 +684,7 @@ public sealed class AgentPauseTests : IDisposable
             QuotaRetryFrom = "work",
         };
         await store.CreateAsync(item);
-        var scheduler = new AgentPauseRetryScheduler(
-            store,
-            queue,
-            pauses,
-            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
 
         time.Advance(TimeSpan.FromHours(1));
         var retried = await scheduler.RunPeriodicExpirySweepForTestAsync();
@@ -718,6 +693,31 @@ public sealed class AgentPauseTests : IDisposable
         var resumed = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, resumed!.State);
         Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
+    public async Task AgentPauseRetryScheduler_QueueKickFailure_RollsBackWaitingItem()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: paused by operator: maintenance",
+            QuotaRetryFrom = "work",
+        };
+        await store.CreateAsync(item);
+        var queue = new ThrowingForWorkItemQueue(item.Id);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
+
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("queue-failure");
+
+        Assert.Equal(0, retried);
+        var after = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, after!.State);
+        Assert.Equal("work", after.QuotaRetryFrom);
+        Assert.Equal(0, queue.Count);
     }
 
     [Theory]
@@ -762,6 +762,25 @@ public sealed class AgentPauseTests : IDisposable
 
     private SqliteAgentPauseController MakeController(TimeProvider? timeProvider = null) =>
         new(_dbPath, NullLogger<SqliteAgentPauseController>.Instance, timeProvider);
+
+    private static AgentPauseRetryScheduler NewPauseRetryScheduler(
+        IWorkItemStore store,
+        ITaskQueue queue,
+        IAgentPauseController pauses,
+        IAgentPauseSignal? signal = null)
+    {
+        var retrier = new WorkItemRetrier(
+            store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        return new AgentPauseRetryScheduler(
+            store,
+            retrier,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance,
+            signal);
+    }
 
     private static AgentClassRouter BuildRouter(
         IAgentPauseController pauses,
@@ -809,6 +828,33 @@ public sealed class AgentPauseTests : IDisposable
         Prompt = "do work",
         AgentClassId = classId,
     };
+
+    private sealed class ThrowingForWorkItemQueue : ITaskQueue
+    {
+        private readonly WorkItemId _throwFor;
+        private readonly InMemoryTaskQueue _inner = new();
+
+        public ThrowingForWorkItemQueue(WorkItemId throwFor) => _throwFor = throwFor;
+
+        public int Count => _inner.Count;
+
+        public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+        {
+            if (id == _throwFor)
+                throw new InvalidOperationException("queue enqueue failed");
+
+            return _inner.EnqueueAsync(id, ct);
+        }
+
+        public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default) =>
+            _inner.EnqueueDispatchWakeAsync(ct);
+
+        public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default) =>
+            _inner.DequeueAsync(ct);
+
+        public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default) =>
+            _inner.DequeueDispatchSignalAsync(ct);
+    }
 
     private static IProjectRepository ProjectRepo() =>
         new InMemoryProjectRepository(new Project

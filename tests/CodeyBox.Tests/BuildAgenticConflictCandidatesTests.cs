@@ -532,6 +532,42 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         Assert.Contains("paused by operator: maintenance", ex.PauseReason, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task PausedPrimaryAndBudgetBlockedFallback_ThrowsAgentUnavailableNotPaused()
+    {
+        var primary = new FakeAgentRunner(AgentKind.Claude);
+        var codex = new FakeAgentRunner(AgentKind.Codex);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Claude, "audit-agent-profile");
+        var budgets = new StubBudgetProvider
+        {
+            [AgentKind.Codex] = 5.0,
+        };
+
+        var fixture = BuildFixture(
+            runners: [primary, codex],
+            members:
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+            budgetProvider: budgets,
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                AuditAgent = "audit-agent-profile",
+            },
+            inVmSmokeGate: pauseGate);
+
+        var item = NewItem(AgentKind.Claude);
+        await fixture.Store.CreateAsync(item);
+
+        var ex = await Assert.ThrowsAsync<AgentUnavailableException>(() =>
+            fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+                item, fixture.Project, primary, CancellationToken.None));
+
+        Assert.Contains("paused by operator", ex.CandidateReasons, StringComparison.Ordinal);
+        Assert.Contains("local budget exhausted", ex.CandidateReasons, StringComparison.Ordinal);
+    }
+
     // ── Fixture and helpers ────────────────────────────────────────────────
 
     private Fixture BuildFixture(

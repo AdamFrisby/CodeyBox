@@ -653,8 +653,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             };
         }
 
-        if (pausedRejected.Count > 0
-            && (hasSubscription || atCapAgents.Count > 0 || capSaturatedMembers.Count > 0))
+        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
             return BuildPausedWaitDecision();
 
         if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
@@ -765,7 +764,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             };
         }
 
-        if (pausedRejected.Count > 0)
+        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
             return BuildPausedWaitDecision();
 
         // Build the park interval from whichever blocker is the soonest to clear.

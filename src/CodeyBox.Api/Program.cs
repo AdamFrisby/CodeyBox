@@ -1995,7 +1995,7 @@ builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
-    sp.GetRequiredService<ITaskQueue>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
     sp.GetRequiredService<IAgentPauseController>(),
     sp.GetRequiredService<ILogger<AgentPauseRetryScheduler>>(),
     sp.GetRequiredService<IAgentPauseSignal>()));

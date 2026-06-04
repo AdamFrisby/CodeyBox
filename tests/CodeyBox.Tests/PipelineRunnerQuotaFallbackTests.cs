@@ -2207,13 +2207,19 @@ internal sealed class FlakyInvolvementStore : IAgentInvolvementStore
 /// </summary>
 internal sealed class RecordingProbe : IAgentQuotaProbe
 {
+    private readonly double _availablePct;
+
     public AgentKind Kind { get; }
     public List<AgentKind> MarkedExhausted { get; } = new();
 
-    public RecordingProbe(AgentKind kind) { Kind = kind; }
+    public RecordingProbe(AgentKind kind, double availablePct = 80.0)
+    {
+        Kind = kind;
+        _availablePct = availablePct;
+    }
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = 80.0 });
+        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
 
     public Task MarkExhaustedAsync(
         AgentMembership member,

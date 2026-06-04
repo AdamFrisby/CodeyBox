@@ -172,6 +172,42 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditRouting_PausedPreferredAndQuotaBlockedFallback_DoesNotParkForAgentResume()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Codex, "audit subscription reserved", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Codex],
+            pauses: pauses,
+            auditAgent: AgentKind.Codex,
+            auditProbeAvailablePct: new Dictionary<AgentKind, double>
+            {
+                [AgentKind.Gemini] = 0.0,
+                [AgentKind.Codex] = 80.0,
+            });
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForAgentResume, final.State);
+        Assert.Empty(auditor.Invocations);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_agent_resume");
+    }
+
+    [Fact]
     public async Task AuditRouting_AllAuditCapableAgentsPaused_ParksForAgentResume()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -249,7 +285,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
         IAgentPauseController? pauses = null,
         AgentKind? auditAgent = null,
         IReadOnlyDictionary<AgentKind, IReadOnlyList<string>>? capabilities = null,
-        IReadOnlySet<AgentKind>? missingCredentials = null)
+        IReadOnlySet<AgentKind>? missingCredentials = null,
+        IReadOnlyDictionary<AgentKind, double>? auditProbeAvailablePct = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -291,13 +328,21 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 })
                 .ToList(),
         };
-        var probes = classMembers.Select(kind => new RecordingProbe(kind)).ToList();
+        var routeProbes = classMembers.Select(kind => new RecordingProbe(kind)).ToList();
+        var auditProbes = classMembers
+            .Select(kind => new RecordingProbe(
+                kind,
+                auditProbeAvailablePct is not null
+                    && auditProbeAvailablePct.TryGetValue(kind, out var pct)
+                    ? pct
+                    : 80.0))
+            .ToList();
         var dispatchAvailability = pauses is null
             ? null
             : new AgentDispatchAvailability(pauses: pauses);
         var router = new AgentClassRouter(
             [frontier],
-            probes,
+            routeProbes,
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
             time,
@@ -355,7 +400,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
-            auditQuotaProbes: probes,
+            auditQuotaProbes: auditProbes,
             retryScheduler: scheduler,
             classRouter: router,
             fallbackHistory: fallbackHistory,
