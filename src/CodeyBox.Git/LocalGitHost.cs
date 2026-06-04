@@ -592,18 +592,36 @@ public sealed class LocalGitHost : IGitHost
                     workBranch, repositoryId, oldSha, baseBranch, baseSha);
             }
         }
+        else
+        {
+            var update = await RunGitAsync(
+                workdir: path, ct,
+                "update-ref", $"refs/heads/{workBranch}", baseSha, new string('0', 40));
+            if (update.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"git update-ref to create '{workBranch}' at base '{baseBranch}' ({baseSha}) failed: {update.Stderr}");
+            }
+
+            _log.LogInformation(
+                "Created work branch '{WorkBranch}' in bare repo {RepoId} at base '{BaseBranch}' tip {BaseTip} for fresh work-phase entry",
+                workBranch, repositoryId, baseBranch, baseSha);
+        }
 
         var verify = await RunGitAsync(
             workdir: path, ct,
             "rev-parse", "--verify", $"refs/heads/{workBranch}^{{commit}}");
-        if (verify.ExitCode == 0)
+        if (verify.ExitCode != 0)
         {
-            var verifiedSha = verify.Stdout.Trim();
-            if (!string.Equals(verifiedSha, baseSha, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"work branch '{workBranch}' tip after reset is {verifiedSha}, expected base '{baseBranch}' tip {baseSha}");
-            }
+            throw new InvalidOperationException(
+                $"work branch '{workBranch}' did not resolve after reset to base '{baseBranch}': {verify.Stderr}");
+        }
+
+        var verifiedSha = verify.Stdout.Trim();
+        if (!string.Equals(verifiedSha, baseSha, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"work branch '{workBranch}' tip after reset is {verifiedSha}, expected base '{baseBranch}' tip {baseSha}");
         }
     }
 

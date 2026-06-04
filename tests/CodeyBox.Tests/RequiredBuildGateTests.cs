@@ -47,7 +47,7 @@ public sealed class RequiredBuildGateTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("work left the branch non-compiling", final.LastError);
+        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
         Assert.Contains("error CS1061", final.LastError);
         Assert.Equal("build", final.FailureKind);
         Assert.DoesNotContain("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);

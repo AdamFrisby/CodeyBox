@@ -500,8 +500,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // compile error nor reporting it.
             using (BeginPhaseScope(item, "pickup"))
             {
-                if (entry is WorkItemState.Queued
-                    && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+                if (entry is WorkItemState.Queued)
                 {
                     await _requiredBuildGate.EnforceBeforePickupResetAsync(
                         item, project, _gitHost, repoId, baseBranch, workBranch, ct);
