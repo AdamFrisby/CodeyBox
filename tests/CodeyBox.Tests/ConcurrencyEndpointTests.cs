@@ -109,6 +109,20 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
     }
 
     [Fact]
+    public async Task GetConcurrency_MemberFits_NoWindowBudgetFit_ProjectedAsNullWithStatus()
+    {
+        var client = _factory.CreateClient();
+
+        var body = await client.GetFromJsonAsync<JsonElement>("/concurrency");
+        var codexFit = Assert.Single(body.GetProperty("memberFits").EnumerateArray(), f =>
+            string.Equals(f.GetProperty("agent").GetString(), "codex", StringComparison.OrdinalIgnoreCase));
+
+        Assert.Equal("NoWindowBudget", codexFit.GetProperty("status").GetString());
+        Assert.Equal(10, codexFit.GetProperty("sampleCount").GetInt32());
+        Assert.Equal(JsonValueKind.Null, codexFit.GetProperty("fitInWindow").ValueKind);
+    }
+
+    [Fact]
     public async Task GetConcurrency_MemberFits_ExcludePayPerApi()
     {
         // PayPerApi members must not appear in the fits list (never gated).
@@ -171,6 +185,12 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
                 // tests can pin the fitInWindow projection.
                 services.RemoveAll<IAgentBurnEstimator>();
                 services.AddSingleton<IAgentBurnEstimator>(new StubBurnEstimator());
+
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, 100.0));
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Codex, 81.0));
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Cursor, 100.0));
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Gemini, 100.0));
             });
         }
 
@@ -187,11 +207,24 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
 
     private sealed class StubBurnEstimator : IAgentBurnEstimator
     {
-        public Task<AgentBurnEstimate> GetEstimateAsync(AgentKind agent, CancellationToken ct = default) =>
-            Task.FromResult(new AgentBurnEstimate
+        public Task<AgentBurnEstimate> GetEstimateAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            if (agent == AgentKind.Codex)
             {
-                AvgBurnPctPerItem = agent == AgentKind.Codex ? 90.0 : 4.0,
+                return Task.FromResult(new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = -1,
+                    SampleCount = 10,
+                    Status = AgentBurnEstimateStatus.NoWindowBudget,
+                });
+            }
+
+            return Task.FromResult(new AgentBurnEstimate
+            {
+                AvgBurnPctPerItem = 4.0,
                 SampleCount = 10,
+                Status = AgentBurnEstimateStatus.Measured,
             });
+        }
     }
 }

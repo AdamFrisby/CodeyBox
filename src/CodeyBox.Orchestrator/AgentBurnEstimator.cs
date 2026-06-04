@@ -155,7 +155,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
             {
                 AvgBurnPctPerItem = opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var fallback) ? fallback : -1,
                 SampleCount = 0,
-                Status = AgentBurnEstimateStatus.CostStoreUnavailable,
+                Status = AgentBurnEstimateStatus.SampleSourceUnavailable,
             };
         }
 
@@ -189,7 +189,7 @@ public sealed class AgentBurnEstimator : IAgentBurnEstimator
             avgBurnPct = opts.DefaultBurnPercentPerItem.TryGetValue(agent.Value, out var d) ? d : -1;
             reportedSamples = 0;
             status = costStoreUnavailable
-                ? AgentBurnEstimateStatus.CostStoreUnavailable
+                ? AgentBurnEstimateStatus.SampleSourceUnavailable
                 : AgentBurnEstimateStatus.NoHistory;
         }
         else if (opts.WindowTokenBudget.TryGetValue(agent.Value, out var budget) && budget > 0)

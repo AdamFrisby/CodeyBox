@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -126,6 +127,56 @@ public sealed class AgentBurnEstimatorTests
     }
 
     [Fact]
+    public void Constructor_NoPositiveWindowBudgets_EmitsStartupWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+
+        _ = new AgentBurnEstimator(
+            new FakeCostStore(),
+            new AgentBurnEstimatorOptions(),
+            logger);
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("startup", warning.Properties["Reason"]);
+    }
+
+    [Fact]
+    public void Constructor_PositiveWindowBudget_SuppressesStartupWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var opts = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["codex"] = 1L },
+        };
+
+        _ = new AgentBurnEstimator(new FakeCostStore(), opts, logger);
+
+        Assert.DoesNotContain(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ApplyConfigReload_NoPositiveWindowBudgets_EmitsReloadWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var initial = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["codex"] = 1L },
+        };
+        var est = new AgentBurnEstimator(new FakeCostStore(), initial, logger);
+
+        est.ApplyConfigReload(new AgentBurnEstimatorOptions());
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("config reload", warning.Properties["Reason"]);
+    }
+
+    [Fact]
     public async Task CostStoreThrows_ReturnsDefaultWithSampleCountZero_NoThrow()
     {
         // Spec: implementations MUST surface "no data" rather than throwing,
@@ -137,7 +188,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
-        Assert.Equal(AgentBurnEstimateStatus.CostStoreUnavailable, result.Status);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]
@@ -155,7 +206,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
-        Assert.Equal(AgentBurnEstimateStatus.CostStoreUnavailable, result.Status);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]
@@ -173,7 +224,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
-        Assert.Equal(AgentBurnEstimateStatus.CostStoreUnavailable, result.Status);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]

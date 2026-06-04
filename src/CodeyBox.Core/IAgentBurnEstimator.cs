@@ -77,6 +77,6 @@ public enum AgentBurnEstimateStatus
     /// <summary>Historical samples exist, but no positive window budget is configured.</summary>
     NoWindowBudget = 3,
 
-    /// <summary>The cost store could not provide historical samples.</summary>
-    CostStoreUnavailable = 4,
+    /// <summary>The estimator's historical sample source could not provide samples.</summary>
+    SampleSourceUnavailable = 4,
 }

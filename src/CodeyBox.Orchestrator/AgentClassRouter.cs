@@ -1356,7 +1356,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             {
                 AvgBurnPctPerItem = -1,
                 SampleCount = 0,
-                Status = AgentBurnEstimateStatus.CostStoreUnavailable,
+                Status = AgentBurnEstimateStatus.SampleSourceUnavailable,
             };
         }
 
@@ -1421,7 +1421,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 {
                     AvgBurnPctPerItem = -1,
                     SampleCount = 0,
-                    Status = AgentBurnEstimateStatus.CostStoreUnavailable,
+                    Status = AgentBurnEstimateStatus.SampleSourceUnavailable,
                 };
             }
 
