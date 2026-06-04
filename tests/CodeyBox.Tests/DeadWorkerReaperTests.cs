@@ -191,26 +191,33 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item);
         var workerId = Guid.NewGuid().ToString();
+        var seededHeartbeatAt = DateTimeOffset.UtcNow - _opts.DeadWorkerThreshold + TimeSpan.FromSeconds(5);
         await _registry.RegisterAsync(new WorkerRegistration
         {
             WorkerId = workerId,
             HostName = "host",
             ProcessId = 1,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
-            LastHeartbeatAt = DateTimeOffset.UtcNow - _opts.HeartbeatInterval - TimeSpan.FromMilliseconds(100),
+            LastHeartbeatAt = seededHeartbeatAt,
             CurrentWorkItemId = item.Id.ToString(),
         });
 
+        var replacementWorkItemId = WorkItemId.New().ToString();
         using var heartbeatRegistry = new SqliteWorkerRegistry(_dbPath, busyTimeoutMilliseconds: 1);
         var writerLock = await OpenExternalWriterLockAsync(_dbPath);
         try
         {
-            await heartbeatRegistry.HeartbeatAsync(workerId, item.Id.ToString());
+            await heartbeatRegistry.HeartbeatAsync(workerId, replacementWorkItemId);
         }
         finally
         {
             await ReleaseExternalWriterLockAsync(writerLock);
         }
+
+        var staleWorker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, staleWorker.WorkerId);
+        Assert.Equal(seededHeartbeatAt, staleWorker.LastHeartbeatAt);
+        Assert.Equal(item.Id.ToString(), staleWorker.CurrentWorkItemId);
 
         await _reaper.RunOnceAsync(CancellationToken.None);
 
