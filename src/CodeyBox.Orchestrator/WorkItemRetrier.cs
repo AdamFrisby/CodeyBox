@@ -26,7 +26,6 @@ public sealed class WorkItemRetrier
         IGitHost gitHost,
         ILogger<WorkItemRetrier> log,
         IAgentStreamSummaryStore? streamSummaries = null,
-        IAuditReportStore? auditReports = null,
         IProjectRepository? projects = null,
         IReleaseStore? releases = null,
         IWorkItemQuestionStore? questions = null,
@@ -36,7 +35,12 @@ public sealed class WorkItemRetrier
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
-        _auditProgress = auditProgress ?? store as IAuditProgressStore;
+        // Explicit DI registration is required (see Program.cs). The runtime
+        // `as` cast that used to silently sniff IAuditProgressStore off the
+        // IWorkItemStore parameter has been removed: null here means audit
+        // progress is intentionally disabled (test fixtures that don't
+        // exercise audit-progress paths), not a misconfigured production graph.
+        _auditProgress = auditProgress;
         _projects = projects;
         _releases = releases;
         _questions = questions;

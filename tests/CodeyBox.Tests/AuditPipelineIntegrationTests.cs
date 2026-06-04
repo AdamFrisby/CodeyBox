@@ -661,6 +661,69 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditProgressLoadFailure_TransitionsToFailedWithInfrastructureKind()
+    {
+        // Durable audit-progress history is the convergence-preservation
+        // primitive: if loading it throws (disk fault, corruption, missing
+        // table), restarting the audit loop from iteration 1 would silently
+        // discard prior trajectory. PipelineRunner.RunAsync therefore wraps the
+        // load failure in AuditHistoryLoadFailedException and routes the work
+        // item to Failed/failureKind=infrastructure so the operator can
+        // intervene rather than silently re-pay the iteration budget.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            auditProgressOverride: new ThrowingGetAuditProgressStore());
+
+        var item = NewItem();
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("audit", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AuditProgressPersistenceFailure_TransitionsToFailedWithInfrastructureKind()
+    {
+        // Persistence is the durability boundary: an iteration that ran but
+        // never recorded its progress would re-run on retry with stale history,
+        // wasting the iteration the operator was already charged for. Wrap the
+        // persistence failure in AuditHistoryPersistenceFailedException so the
+        // pipeline transitions the work item to Failed/failureKind=infrastructure
+        // and the operator knows the trajectory was lost.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            auditProgressOverride: new ThrowingRecordAuditProgressStore());
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "work complete\n"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("audit", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task WorkItemAuditMaxIterations_ExtendsProjectAuditIterationBudget()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1102,6 +1165,39 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
             => Task.FromResult(0);
+    }
+
+    private sealed class ThrowingGetAuditProgressStore : IAuditProgressStore
+    {
+        public Task RecordAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            AuditProgressRecord progress,
+            DateTimeOffset recordedAt,
+            CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException("audit progress store unavailable");
+    }
+
+    private sealed class ThrowingRecordAuditProgressStore : IAuditProgressStore
+    {
+        public Task RecordAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            AuditProgressRecord progress,
+            DateTimeOffset recordedAt,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException("audit progress insert failed");
+
+        public Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+            WorkItemId workItemId,
+            DateTimeOffset? workAttemptStartedAt,
+            CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<AuditProgressRecord>>([]);
     }
 
     private sealed class DrainingAuditor : IAuditor

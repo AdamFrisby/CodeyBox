@@ -254,7 +254,12 @@ public sealed class PipelineRunner : IPipelineRunner
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;
-        _auditProgress = auditProgress ?? store as IAuditProgressStore;
+        // Explicit DI registration is required (see Program.cs). The runtime
+        // `as` cast that used to silently sniff IAuditProgressStore off the
+        // IWorkItemStore parameter has been removed: null here means audit
+        // progress is intentionally disabled (test fixtures that don't
+        // exercise audit-progress paths), not a misconfigured production graph.
+        _auditProgress = auditProgress;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent
         // and only genuine subscription probes receive mid-iteration write-back.

@@ -79,6 +79,39 @@ public sealed class ResumeEndpointTests : IDisposable
         Findings = Array.Empty<AuditReportFinding>(),
     };
 
+    /// <summary>
+    /// Seeds a durable audit-progress row for the work item under the same
+    /// work-attempt key the resume endpoint resolves through
+    /// IWorkItemStore.GetIterationsAsync. Resume's from=audit / from=merge
+    /// precondition checks IAuditProgressStore — diagnostic AuditReport rows
+    /// are not consulted because they may be retention-swept.
+    /// </summary>
+    private async Task SeedAuditProgressAsync(WorkItem item)
+    {
+        // Iteration 1 is the work-phase dispatch; its DispatchedAt is the
+        // attempt key the resume code reads (PipelineRunner /
+        // WorkItemRetrier both derive the key from the latest iteration==1).
+        var workAttemptStartedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await _factory.Store.RecordIterationDispatchAsync(
+            item.Id,
+            iteration: 1,
+            promptRevisionAtDispatch: 0,
+            dispatchedAt: workAttemptStartedAt);
+        await ((IAuditProgressStore)_factory.Store).RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 3,
+                BlockingFindings: 0,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: Array.Empty<string>(),
+                BlockingFindingsDetails: Array.Empty<AuditFindingPayload>(),
+                Findings: Array.Empty<AuditFindingPayload>(),
+                WorkBranchTip: "deadbeef"),
+            DateTimeOffset.UtcNow);
+    }
+
     // ── Happy path: from=work (default) ───────────────────────────────────────
 
     [Fact]
@@ -143,6 +176,7 @@ public sealed class ResumeEndpointTests : IDisposable
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
         await _factory.AuditReports.CreateAsync(MakeAuditedOnceReport(item.Id));
+        await SeedAuditProgressAsync(item);
         _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
 
         var resp = await _client.PostAsJsonAsync(
@@ -168,6 +202,7 @@ public sealed class ResumeEndpointTests : IDisposable
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
         await _factory.AuditReports.CreateAsync(MakeAuditedOnceReport(item.Id));
+        await SeedAuditProgressAsync(item);
         _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
 
         var resp = await _client.PostAsJsonAsync(
@@ -186,15 +221,17 @@ public sealed class ResumeEndpointTests : IDisposable
     // ── 409 when from=audit but the work-branch was never audited ─────────────
 
     [Fact]
-    public async Task Resume_FromAudit_NoPriorAuditReports_Returns409()
+    public async Task Resume_FromAudit_NoPriorAuditProgress_Returns409()
     {
         // Spec: from=audit is meaningful only if we trust the existing commits
-        // to be auditable. Cheapest signal that the work-branch reached an
-        // auditable state is the presence of at least one audit report.
+        // to be auditable. Cheapest workflow-owned signal that the work-branch
+        // reached an auditable state is the presence of at least one durable
+        // audit-progress row (IAuditProgressStore). Diagnostic AuditReport rows
+        // are intentionally NOT consulted — they may be retention-swept.
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
         _factory.GitHost.MarkRepoAndBranchPresent(item.Id, item.WorkBranch!);
-        // Deliberately do NOT seed any audit reports.
+        // Deliberately do NOT seed any audit progress.
 
         var resp = await _client.PostAsJsonAsync(
             $"/workitems/{item.Id}/resume",
@@ -207,7 +244,7 @@ public sealed class ResumeEndpointTests : IDisposable
     }
 
     [Fact]
-    public async Task Resume_FromMerge_NoPriorAuditReports_Returns409()
+    public async Task Resume_FromMerge_NoPriorAuditProgress_Returns409()
     {
         var item = CancelledItem();
         await _factory.Store.CreateAsync(item);
@@ -462,6 +499,15 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
 
             services.RemoveAll<IWorkItemStore>();
             services.AddSingleton<IWorkItemStore>(Store);
+
+            // The resume precondition reads durable audit progress from
+            // IAuditProgressStore (workflow-owned), not IAuditReportStore
+            // (diagnostic / retention-swept). SqliteWorkItemStore implements
+            // both; register the same instance under IAuditProgressStore so
+            // PipelineRunner / WorkItemRetrier get an explicit binding (the
+            // production composition root does the same — see Program.cs).
+            services.RemoveAll<IAuditProgressStore>();
+            services.AddSingleton<IAuditProgressStore>(Store);
 
             services.RemoveAll<IAuditReportStore>();
             services.AddSingleton<IAuditReportStore>(AuditReports);
