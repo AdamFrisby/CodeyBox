@@ -2116,6 +2116,9 @@ public sealed class QuotaAutoRetryTests : IDisposable
         }
 
         var latest = await store.GetAsync(id);
+        if (latest is not null && latest.QuotaRetryAttempts >= expectedAttempts)
+            return latest;
+
         throw new TimeoutException(
             $"Work item {id} did not reach quotaRetryAttempts={expectedAttempts}; latest={latest?.QuotaRetryAttempts}");
     }

@@ -188,10 +188,15 @@ public sealed class DeadWorkerReaperTests : IDisposable
     [Fact]
     public async Task TransientlyFailedHeartbeat_DoesNotCauseWorkerToBeReaped()
     {
+        _opts.DeadWorkerThreshold = TimeSpan.FromMinutes(5);
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item);
         var workerId = Guid.NewGuid().ToString();
-        var seededHeartbeatAt = DateTimeOffset.UtcNow - _opts.DeadWorkerThreshold + TimeSpan.FromSeconds(5);
+        // Keep the row comfortably inside the stale threshold. The external
+        // SQLite writer-lock path intentionally exercises a transient heartbeat
+        // failure, and a full-suite run can spend several seconds in that setup
+        // before the reaper sweep runs.
+        var seededHeartbeatAt = DateTimeOffset.UtcNow - _opts.HeartbeatInterval;
         await _registry.RegisterAsync(new WorkerRegistration
         {
             WorkerId = workerId,
