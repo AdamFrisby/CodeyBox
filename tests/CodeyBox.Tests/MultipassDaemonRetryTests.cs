@@ -91,6 +91,16 @@ public sealed class MultipassDaemonRetryTests
     }
 
     [Fact]
+    public void ClassifyTransient_DetectsStartArgumentNotFound()
+    {
+        var classification = MultipassDaemonRetry.ClassifyTransient(
+            Argv("start", "codeybox-x"),
+            new ProcessRunResult(1, "", "start failed: argument not found"));
+
+        Assert.Equal("multipass-start-argument-not-found", classification);
+    }
+
+    [Fact]
     public void ClassifyTransient_DoesNotMatchDaemonUnreachable_OnExecOrInfo()
     {
         // The "cannot connect to" (no 'socket' substring) branch is gated
@@ -225,6 +235,22 @@ public sealed class MultipassDaemonRetryTests
 
         Assert.Contains("multipass transient daemon error after 2 retries", result.Stderr);
         Assert.DoesNotContain("daemon unreachable", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunWithRetry_ExhaustedStartArgumentNotFound_IsExtractableForProvisioningDeferral()
+    {
+        var result = await MultipassDaemonRetry.RunWithRetryAsync(
+            Argv("start", "codeybox-x"),
+            _ => Task.FromResult(new ProcessRunResult(1, "", "start failed: argument not found")),
+            Healthy,
+            NullLogger.Instance,
+            WorkItemId.New(),
+            CancellationToken.None,
+            InstantPolicy());
+
+        Assert.True(MultipassDaemonRetry.TryGetRetryExhaustedErrorClass(result, out var errorClass));
+        Assert.Equal("multipass-start-argument-not-found", errorClass);
     }
 
     [Fact]

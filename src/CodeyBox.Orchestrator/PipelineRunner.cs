@@ -1001,6 +1001,14 @@ public sealed class PipelineRunner : IPipelineRunner
             // below would mark the item terminally Failed.
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            // Host-side sandbox provisioning exhausted a transient retry
+            // budget. Re-throw so OrchestratorService can move the item back
+            // to a durable pre-phase state and re-enqueue it instead of
+            // treating the infrastructure flap as an agent failure.
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);

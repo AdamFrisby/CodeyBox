@@ -176,6 +176,80 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMounted_TreatsAsSuccess()
+    {
+        var hostSource = Path.Combine(_workspace, "already-mounted-source");
+        Directory.CreateDirectory(hostSource);
+
+        var mountAttempts = 0;
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                mountAttempts++;
+                return new ProcessRunResult(1, "", "\"/repo\" is already mounted");
+            }
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+                return new ProcessRunResult(0, "", "");
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            ct: CancellationToken.None);
+
+        Assert.Equal(1, mountAttempts);
+    }
+
+    [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMountedWithDifferentSource_UnmountsAndRemounts()
+    {
+        var hostSource = Path.Combine(_workspace, "correct-source");
+        Directory.CreateDirectory(hostSource);
+        var calls = new List<string>();
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                calls.Add("mount");
+                return calls.Count(c => c == "mount") == 1
+                    ? new ProcessRunResult(1, "", "\"/repo\" is already mounted")
+                    : new ProcessRunResult(0, "", "");
+            }
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+            {
+                var stdout = """
+                    {"info":{"codeybox-test":{"mounts":{"/repo":{"source_path":"/old/source"}}}}}
+                    """;
+                return new ProcessRunResult(0, stdout, "");
+            }
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                calls.Add("umount");
+                return new ProcessRunResult(0, "", "");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            ct: CancellationToken.None);
+
+        Assert.Equal(["mount", "umount", "mount"], calls);
+    }
+
+    [Fact]
     public async Task MountSingleBindWithRetry_HostSourceMissing_ThrowsTypedExceptionWithoutRetry()
     {
         // If the source doesn't exist on the host filesystem, no number of

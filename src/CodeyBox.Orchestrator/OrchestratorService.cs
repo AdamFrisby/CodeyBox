@@ -1627,13 +1627,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // disk.deferred webhook so existing alerting fires, then
                 // schedule a re-pickup. In-flight items already running on
                 // other workers are not touched.
-                AuditLog.DiskDeferred(item.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
+                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+                AuditLog.DiskDeferred(deferredItem.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
                 if (_webhooks is not null)
                 {
                     _ = _webhooks.PublishAsync(new WebhookEvent
                     {
                         Event = "disk.deferred",
-                        WorkItem = item,
+                        WorkItem = deferredItem,
                         Project = project,
                         Details = new
                         {
@@ -1645,6 +1646,41 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     }, CancellationToken.None);
                 }
                 ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, ct);
+                return;
+            }
+            catch (SandboxProvisioningDeferredException provEx)
+            {
+                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+                AuditLog.SandboxProvisioningDeferred(
+                    deferredItem.Id,
+                    provEx.Provider,
+                    provEx.Operation,
+                    provEx.ErrorClass,
+                    deferredItem.State.ToString(),
+                    provEx.RecheckIn);
+
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "sandbox.provisioning_deferred",
+                        WorkItem = deferredItem,
+                        Project = project,
+                        Details = new
+                        {
+                            provider = provEx.Provider,
+                            operation = provEx.Operation,
+                            errorClass = provEx.ErrorClass,
+                            resumeState = deferredItem.State.ToString(),
+                            suggestedRetryAt = DateTimeOffset.UtcNow + provEx.RecheckIn,
+                        },
+                    }, CancellationToken.None);
+                }
+
+                _log.LogWarning(
+                    "Worker {WorkerId} deferring {Id}: sandbox provisioning transient ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
+                    workerIndex, id, provEx.Provider, provEx.Operation, provEx.ErrorClass, deferredItem.State);
+                ScheduleDeferredRequeue(item.Id, provEx.RecheckIn, ct);
                 return;
             }
             catch (Exception ex)
@@ -1806,6 +1842,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return null;
         }
     }
+
+    private async Task<WorkItem> ResetInfrastructureDeferredItemAsync(WorkItem item, CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        var target = InfrastructureDeferredResumeState(current.State);
+        if (target is null)
+            return current;
+
+        var reset = current.With(target.Value);
+        if (reset.State == current.State
+            && reset.LastError == current.LastError
+            && reset.FailureKind == current.FailureKind
+            && reset.StartedAt == current.StartedAt)
+            return current;
+
+        var updated = await _store.TryUpdateIfStateAsync(reset, current.State, ct).ConfigureAwait(false);
+        if (updated)
+            return reset;
+
+        return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? current;
+    }
+
+    private static WorkItemState? InfrastructureDeferredResumeState(WorkItemState state)
+        => state == WorkItemState.Queued
+            ? WorkItemState.Queued
+            : state == WorkItemState.Working
+                ? WorkItemState.Queued
+                : WorkItemRecoveryPolicy.MapToRecoveryState(state);
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after
