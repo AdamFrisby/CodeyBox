@@ -1352,7 +1352,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             _log.LogWarning(ex,
                 "Rate-aware gate: burn estimator threw for {Agent}; treating as no-data fallback",
                 member.Agent.Value);
-            estimate = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 };
+            estimate = new AgentBurnEstimate
+            {
+                AvgBurnPctPerItem = -1,
+                SampleCount = 0,
+                Status = AgentBurnEstimateStatus.CostStoreUnavailable,
+            };
+        }
+
+        if (estimate.Status == AgentBurnEstimateStatus.NoWindowBudget)
+        {
+            _log.LogDebug(
+                "Rate-aware gate: no WindowTokenBudget for {Agent}; skipping throttle (samples={Samples})",
+                member.Agent.Value, estimate.SampleCount);
+            return null;
         }
 
         double fit;
@@ -1370,8 +1383,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var reason =
             $"rate-aware gate: running={running} >= fit={fit:F2} " +
-            $"(avgBurn={estimate.AvgBurnPctPerItem:F1}% available={availablePct:F1}% samples={estimate.SampleCount})";
-        AuditLog.RateAwareGated(member.Agent, member.ModelId, running, fit, estimate.AvgBurnPctPerItem, availablePct, estimate.SampleCount);
+            $"(avgBurn={estimate.AvgBurnPctPerItem:F1}% available={availablePct:F1}% samples={estimate.SampleCount} status={estimate.Status})";
+        AuditLog.RateAwareGated(
+            member.Agent, member.ModelId, running, fit,
+            estimate.AvgBurnPctPerItem, availablePct, estimate.SampleCount, estimate.Status);
         return new QuotaGateDecision(false, reason);
     }
 
@@ -1400,10 +1415,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             AgentBurnEstimate est;
             try { est = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
-            catch { est = new AgentBurnEstimate { AvgBurnPctPerItem = -1, SampleCount = 0 }; }
+            catch
+            {
+                est = new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = -1,
+                    SampleCount = 0,
+                    Status = AgentBurnEstimateStatus.CostStoreUnavailable,
+                };
+            }
 
             double fit;
-            if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = _opts.ColdStartFitInWindow;
+            if (est.Status == AgentBurnEstimateStatus.NoWindowBudget) fit = double.PositiveInfinity;
+            else if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = _opts.ColdStartFitInWindow;
             else if (quota.AvailablePct < 0) fit = double.NaN;
             else fit = quota.AvailablePct / est.AvgBurnPctPerItem;
 
@@ -1414,6 +1438,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 AvailablePct: quota.AvailablePct,
                 AvgBurnPctPerItem: est.AvgBurnPctPerItem,
                 SampleCount: est.SampleCount,
+                BurnEstimateStatus: est.Status,
                 FitInWindow: fit,
                 RunningOnAgent: _runningCounters?.GetRunning(member.Agent) ?? 0));
         }
@@ -1625,6 +1650,7 @@ public sealed record MemberFitView(
     double AvailablePct,
     double AvgBurnPctPerItem,
     int SampleCount,
+    AgentBurnEstimateStatus BurnEstimateStatus,
     double FitInWindow,
     int RunningOnAgent);
 

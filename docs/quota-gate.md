@@ -87,6 +87,19 @@ Unexpected JSON fields are ignored. Missing fields make only that part unknown.
 - `FailCautious`. Treat unknown as exhausted.
 - `FailOpen`. Preserve the old behavior; unknown is treated as available.
 
+## Rate-Aware Burn Gate
+
+For subscription-billed members with known quota, the router can also compare
+the live in-flight count with how many recent average work-item burns fit in
+the remaining window: `fit = AvailablePct / AvgBurnPctPerItem`.
+`AvgBurnPctPerItem` is computed only when recent token-cost samples exist and
+`CodeyBox:AgentBurnEstimator:WindowTokenBudget:<agent>` is configured to a
+positive token budget. If samples exist but that budget is missing or zero, the
+router fails open for that agent rather than throttling on the hardcoded
+cold-start default. The `/concurrency` surface reports the sample count with
+status `NoWindowBudget` so operators can tell this apart from true no-history
+cold start.
+
 ## Observed-Failure Breaker
 
 When an agent exits unsuccessfully and stderr **or** stdout contains one of
