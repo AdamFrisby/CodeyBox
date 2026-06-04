@@ -162,9 +162,13 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
-    public async Task ResumeAdmissionLease_IsHeldUntilStartupResumeReleasesIt()
+    public async Task ResumeAdmissionLease_IsHeldUntilResumedVmIsDisposed()
     {
         var inner = new CountingSandboxProvider();
+        inner.ManagedSandboxes =
+        [
+            new ManagedSandboxInfo("codeybox-resume", DateTimeOffset.UtcNow, DiskBytes: null, IsTrackedActive: false),
+        ];
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
         var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
@@ -180,9 +184,84 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.False(queuedCreate.IsCompleted);
 
         resumeTracker.ReleaseResumeAdmission("codeybox-resume");
+        await Task.Delay(50);
+        Assert.False(queuedCreate.IsCompleted);
+
+        await provider.DisposeLeakedAsync("codeybox-resume", CancellationToken.None);
         await using var sandbox = await queuedCreate.WaitAsync(TestDeadline);
 
         Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task ResumeAdmissionReleaseBeforeProviderCompletes_RetainsLeaseIfResumeEventuallySucceeds()
+    {
+        var inner = new CountingSandboxProvider { BlockResume = true };
+        inner.ManagedSandboxes =
+        [
+            new ManagedSandboxInfo("codeybox-slow-resume", DateTimeOffset.UtcNow, DiskBytes: null, IsTrackedActive: false),
+        ];
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
+        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
+        using var resumeCts = new CancellationTokenSource();
+
+        var resume = suspending.ResumeSandboxAsync("codeybox-slow-resume", resumeCts.Token);
+        await inner.ResumeStarted.Task.WaitAsync(TestDeadline);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        resumeTracker.ReleaseResumeAdmission("codeybox-slow-resume");
+        await resumeCts.CancelAsync();
+        inner.AllowResume.SetResult();
+        await resume.WaitAsync(TestDeadline);
+
+        var queuedCreate = provider.CreateAsync(Spec(), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queuedCreate.IsCompleted);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        await provider.DisposeLeakedAsync("codeybox-slow-resume", CancellationToken.None);
+        await using var sandbox = await queuedCreate.WaitAsync(TestDeadline);
+    }
+
+    [Fact]
+    public async Task ResumeAdmissionLease_IsReleasedWhenManagedVmDisappears()
+    {
+        var inner = new CountingSandboxProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
+
+        await suspending.ResumeSandboxAsync("codeybox-missing-resume", CancellationToken.None);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Empty(managed);
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task LeakManagementCalls_AreDelegatedThroughWrapper()
+    {
+        var createdAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var inner = new CountingSandboxProvider
+        {
+            ManagedSandboxes =
+            [
+                new ManagedSandboxInfo("codeybox-leak", createdAt, DiskBytes: 4096, IsTrackedActive: false),
+            ],
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+        await provider.DisposeLeakedAsync("codeybox-leak", CancellationToken.None);
+
+        var info = Assert.Single(managed);
+        Assert.Equal("codeybox-leak", info.Name);
+        Assert.Equal(1, inner.ListManagedCalls);
+        Assert.Equal(["codeybox-leak"], inner.DisposedLeaks);
     }
 
     [Fact]
@@ -322,10 +401,25 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         await suspending.ResumeSandboxAsync("codeybox-active-suspending", CancellationToken.None);
         resumeTracker.ReleaseResumeAdmission("codeybox-active-suspending");
+        await provider.DisposeLeakedAsync("codeybox-active-suspending", CancellationToken.None);
         await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
 
         Assert.Single(active.SnapshotActiveSandboxes());
         Assert.Equal(1, inner.ResumeCalls);
+    }
+
+    [Fact]
+    public void Wrap_ActiveDiskGuardProvider_PreservesBothCapabilities()
+    {
+        var inner = new ActiveDiskGuardProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        Assert.IsAssignableFrom<IActiveSandboxProvider>(provider);
+        var disk = Assert.IsAssignableFrom<IDiskGuardedSandboxProvider>(provider);
+
+        Assert.Single(disk.SampleDiskGuardState());
+        Assert.Equal(1, inner.DiskSampleCalls);
+        Assert.False(provider is ISuspendingSandboxProvider);
     }
 
     private static SandboxSpec Spec(int item = 0, int auditor = -1) => new()
@@ -340,12 +434,23 @@ public sealed class SandboxAdmissionControlledProviderTests
         private int _active;
         private int _created;
         private int _createAttempts;
+        private int _listManagedCalls;
         private int _peakActive;
+        private readonly List<string> _disposedLeaks = [];
 
         public int Active => Volatile.Read(ref _active);
         public int Created => Volatile.Read(ref _created);
         public int CreateAttempts => Volatile.Read(ref _createAttempts);
+        public int ListManagedCalls => Volatile.Read(ref _listManagedCalls);
         public int PeakActive => Volatile.Read(ref _peakActive);
+        public IReadOnlyList<string> DisposedLeaks
+        {
+            get
+            {
+                lock (_disposedLeaks) return _disposedLeaks.ToArray();
+            }
+        }
+        public IReadOnlyList<ManagedSandboxInfo> ManagedSandboxes { get; set; } = [];
         public bool FailNextCreate { get; set; }
         public bool ThrowOnNextSandboxDispose { get; set; }
 
@@ -369,10 +474,17 @@ public sealed class SandboxAdmissionControlledProviderTests
             return Task.FromResult<ISandbox>(new CountingSandbox(this, $"sandbox-{created}", disposeThrows));
         }
 
-        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
-            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _listManagedCalls);
+            return Task.FromResult(ManagedSandboxes);
+        }
 
-        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        {
+            lock (_disposedLeaks) _disposedLeaks.Add(name);
+            return Task.CompletedTask;
+        }
 
         public void Release()
         {
@@ -430,6 +542,22 @@ public sealed class SandboxAdmissionControlledProviderTests
         }
     }
 
+    private sealed class ActiveDiskGuardProvider : PlainCountingProvider, IActiveSandboxProvider, IDiskGuardedSandboxProvider
+    {
+        private int _diskSampleCalls;
+
+        public int DiskSampleCalls => Volatile.Read(ref _diskSampleCalls);
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+            [];
+
+        public IReadOnlyList<DiskGuardSample> SampleDiskGuardState()
+        {
+            Interlocked.Increment(ref _diskSampleCalls);
+            return [new DiskGuardSample("/tmp", 1024, 512)];
+        }
+    }
+
     private sealed class CountingSandboxProvider :
         PlainCountingProvider,
         IActiveSandboxProvider,
@@ -464,6 +592,11 @@ public sealed class SandboxAdmissionControlledProviderTests
         public int SuspendCalls => Volatile.Read(ref _suspendCalls);
         public int MarkOwnedCalls => Volatile.Read(ref _markOwnedCalls);
         public bool BlockEnsureBaseline { get; init; }
+        public bool BlockResume { get; init; }
+        public TaskCompletionSource ResumeStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource AllowResume { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource EnsureBaselineStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource AllowEnsureBaseline { get; } =
@@ -482,10 +615,14 @@ public sealed class SandboxAdmissionControlledProviderTests
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
             [];
 
-        public Task ResumeSandboxAsync(string name, CancellationToken ct)
+        public async Task ResumeSandboxAsync(string name, CancellationToken ct)
         {
             Interlocked.Increment(ref _resumeCalls);
-            return Task.CompletedTask;
+            if (BlockResume)
+            {
+                ResumeStarted.SetResult();
+                await AllowResume.Task;
+            }
         }
 
         public Task<int?> WaitForAdoptedAgentCompletionAsync(

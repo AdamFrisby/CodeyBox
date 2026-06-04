@@ -377,21 +377,14 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
     };
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
-    if (kind == "multipass")
-    {
-        startupLog.LogInformation(
-            "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
-            inner.Name,
-            orchestratorOptions.MaxConcurrentSandboxes);
-        return SandboxAdmissionControlledProvider.Wrap(
-            inner,
-            orchestratorOptions.MaxConcurrentSandboxes,
-            loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
-    }
     startupLog.LogInformation(
-        "Sandbox admission control: provider={Provider}, not applied to non-VM provider",
-        inner.Name);
-    return inner;
+        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
+    return SandboxAdmissionControlledProvider.Wrap(
+        inner,
+        orchestratorOptions.MaxConcurrentSandboxes,
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
 }
 
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)

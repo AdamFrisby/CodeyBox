@@ -222,6 +222,14 @@ public sealed class DeadWorkerReaper : BackgroundService
     {
         var itemId = item.Id;
 
+        if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
+        {
+            _log.LogInformation(
+                "Recovery ({WorkerId}): work item {ItemId} still references suspended sandbox {VmName}; startup resume owns this item, skipping recovery",
+                workerIdContext, itemId, item.SuspendedVmName);
+            return;
+        }
+
         if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {

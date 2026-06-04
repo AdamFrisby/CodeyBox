@@ -4,7 +4,6 @@ using System.Net.Http.Json;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
-using CodeyBox.Sandbox.Process;
 using CodeyBox.Tests;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -161,8 +160,10 @@ public sealed class SandboxStartupConfigurationUatTests
             projects: new InMemoryProjectRepository());
 
         var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
 
-        Assert.IsType<ProcessSandboxProvider>(provider);
+        Assert.Equal("process", provider.Name);
+        Assert.True(admission.MaxConcurrentSandboxes >= 1);
     }
 
     [Fact]

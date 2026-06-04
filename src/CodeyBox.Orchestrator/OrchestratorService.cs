@@ -798,7 +798,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (IsQueuePaused)
                 {
                     TryReleaseConcurrencyGate();
-                    await RequeueDispatchWakeAsync(stoppingToken);
+                    await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
 
@@ -900,7 +900,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     _activeItems.TryRemove(id.Value, out _);
                     TryReleaseConcurrencyGate();
-                    await _queue.EnqueueDispatchWakeAsync(stoppingToken);
+                    await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
 

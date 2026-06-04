@@ -552,6 +552,48 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_RetainsSuccessfulResumeUntilLeakDisposal()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with { SuspendedVmName = "vm-retained", SuspendedAt = DateTimeOffset.UtcNow });
+
+        var inner = new FakeSuspendingProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var queuedCreate = provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queuedCreate.IsCompleted);
+
+        await provider.DisposeLeakedAsync("vm-retained", CancellationToken.None);
+        await using var sandbox = await queuedCreate.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_ReleasesFailedResumeAdmission()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with { SuspendedVmName = "vm-failed-release", SuspendedAt = DateTimeOffset.UtcNow });
+
+        var inner = new FakeSuspendingProvider { ResumeThrows = true };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
     public async Task StartupResume_ResumeFailure_StillClearsBookkeeping()
     {
         // If multipassd is unavailable or the VM was operator-deleted, we
@@ -2311,7 +2353,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         public string Name => "fake-suspending";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new NoopSandbox());
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
@@ -2386,6 +2428,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
                 return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);
         }
+    }
+
+    private sealed class NoopSandbox : ISandbox
+    {
+        public string Id { get; } = $"sandbox-{Guid.NewGuid():N}";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed record AdoptionCall(string VmName, string AgentLogPath, TimeSpan? Deadline);
