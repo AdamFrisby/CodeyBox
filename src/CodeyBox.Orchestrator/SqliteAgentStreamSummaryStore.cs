@@ -19,7 +19,7 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _path;
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     public SqliteAgentStreamSummaryStore(string path)
     {
@@ -28,38 +28,47 @@ public sealed class SqliteAgentStreamSummaryStore : IAgentStreamSummaryStore, ID
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragma = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            pragma.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var create = _conn.CreateCommand();
-        create.CommandText = """
-            CREATE TABLE IF NOT EXISTS agent_stream_summaries (
-                work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                file_name       TEXT NOT NULL,
-                phase           TEXT NOT NULL,
-                iteration       INTEGER,
-                agent_kind      TEXT NOT NULL,
-                total_duration_ms INTEGER NOT NULL,
-                time_to_first_token_ms INTEGER,
-                input_tokens    INTEGER,
-                output_tokens   INTEGER,
-                cached_input_tokens INTEGER,
-                estimated_usd   REAL,
-                tool_calls_json TEXT NOT NULL,
-                stalls_json     TEXT NOT NULL,
-                final_assistant_message TEXT,
-                summarised_at   TEXT NOT NULL,
-                PRIMARY KEY (work_item_id, file_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_summaries_work_item ON agent_stream_summaries(work_item_id);
-            """;
-        create.ExecuteNonQuery();
-        AddFinalAssistantMessageColumn();
+            using (var pragma = _conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                pragma.ExecuteNonQuery();
+            }
+
+            using var create = _conn.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE IF NOT EXISTS agent_stream_summaries (
+                    work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    file_name       TEXT NOT NULL,
+                    phase           TEXT NOT NULL,
+                    iteration       INTEGER,
+                    agent_kind      TEXT NOT NULL,
+                    total_duration_ms INTEGER NOT NULL,
+                    time_to_first_token_ms INTEGER,
+                    input_tokens    INTEGER,
+                    output_tokens   INTEGER,
+                    cached_input_tokens INTEGER,
+                    estimated_usd   REAL,
+                    tool_calls_json TEXT NOT NULL,
+                    stalls_json     TEXT NOT NULL,
+                    final_assistant_message TEXT,
+                    summarised_at   TEXT NOT NULL,
+                    PRIMARY KEY (work_item_id, file_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_summaries_work_item ON agent_stream_summaries(work_item_id);
+                """;
+            create.ExecuteNonQuery();
+            AddFinalAssistantMessageColumn();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task UpsertAsync(AgentStreamSummaryRow row, CancellationToken ct = default)

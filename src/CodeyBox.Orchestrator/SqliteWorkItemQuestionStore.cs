@@ -11,7 +11,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteWorkItemQuestionStore : IWorkItemQuestionStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     public SqliteWorkItemQuestionStore(string path)
     {
@@ -19,35 +19,44 @@ public sealed class SqliteWorkItemQuestionStore : IWorkItemQuestionStore, IDispo
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragmaCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            pragmaCmd.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS work_item_questions (
-                id            TEXT PRIMARY KEY,
-                work_item_id  TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                question_id   TEXT NOT NULL,
-                question_text TEXT NOT NULL,
-                asked_at      TEXT NOT NULL,
-                answered_at   TEXT,
-                answer_text   TEXT,
-                answered_by   TEXT,
-                dismissed_at  TEXT,
-                dismiss_reason TEXT,
-                state         TEXT NOT NULL DEFAULT 'open'
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_unique
-                ON work_item_questions(work_item_id, question_id);
-            CREATE INDEX IF NOT EXISTS idx_questions_work_item
-                ON work_item_questions(work_item_id);
-            """;
-        cmd.ExecuteNonQuery();
+            using (var pragmaCmd = _conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_item_questions (
+                    id            TEXT PRIMARY KEY,
+                    work_item_id  TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    question_id   TEXT NOT NULL,
+                    question_text TEXT NOT NULL,
+                    asked_at      TEXT NOT NULL,
+                    answered_at   TEXT,
+                    answer_text   TEXT,
+                    answered_by   TEXT,
+                    dismissed_at  TEXT,
+                    dismiss_reason TEXT,
+                    state         TEXT NOT NULL DEFAULT 'open'
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_unique
+                    ON work_item_questions(work_item_id, question_id);
+                CREATE INDEX IF NOT EXISTS idx_questions_work_item
+                    ON work_item_questions(work_item_id);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<bool> CreateIfNotExistsAsync(WorkItemQuestion question, CancellationToken ct = default)
