@@ -32,4 +32,40 @@ public sealed class WorkItemTests
         var failed = item.With(WorkItemState.Failed, "boom");
         Assert.Equal("boom", failed.LastError);
     }
+
+    [Fact]
+    public void With_QueuedToQueuedPreservesResumeBranchAndFlag()
+    {
+        var item = Sample() with
+        {
+            State = WorkItemState.Queued,
+            WorkBranch = "feature/operator-resume",
+            PreserveWorkBranchOnQueuedPickup = true,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+
+        var requeued = item.With(WorkItemState.Queued);
+
+        Assert.Equal(WorkItemState.Queued, requeued.State);
+        Assert.Equal("feature/operator-resume", requeued.WorkBranch);
+        Assert.True(requeued.PreserveWorkBranchOnQueuedPickup);
+        Assert.Null(requeued.StartedAt);
+    }
+
+    [Fact]
+    public void With_RequeueClearsPreserveFlagWhenWorkBranchIsCleared()
+    {
+        var item = Sample() with
+        {
+            State = WorkItemState.Working,
+            WorkBranch = "feature/operator-resume",
+            PreserveWorkBranchOnQueuedPickup = true,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+
+        var requeued = item.With(WorkItemState.Queued);
+
+        Assert.Null(requeued.WorkBranch);
+        Assert.False(requeued.PreserveWorkBranchOnQueuedPickup);
+    }
 }

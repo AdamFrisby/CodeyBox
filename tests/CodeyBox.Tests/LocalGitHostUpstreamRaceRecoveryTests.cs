@@ -331,6 +331,64 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         Assert.Equal(8, starts);
     }
 
+    [Fact]
+    public async Task ListFilesEndingWithAsync_RetriesTextFileBusyProcessStartAndUsesConfiguredGitExecutable()
+    {
+        var starts = 0;
+        var disposals = 0;
+        ProcessStartInfo? observedStartInfo = null;
+        var gitExecutable = Path.Combine(_workspace, "custom-git");
+        var gitHost = CreateGitHost(
+            gitExecutable,
+            processFactory: psi =>
+            {
+                starts++;
+                observedStartInfo = psi;
+                return starts == 1
+                    ? new FakeLocalGitProcess(
+                        startException: new Win32Exception(26, "Text file busy"),
+                        onDispose: () => disposals++)
+                    : new FakeLocalGitProcess(
+                        stdout: "src/App.cs\nREADME.md\n",
+                        exitCode: 0,
+                        onDispose: () => disposals++);
+            });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var matches = await gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10);
+
+        Assert.Equal(["src/App.cs"], matches);
+        Assert.Equal(2, starts);
+        Assert.Equal(2, disposals);
+        Assert.NotNull(observedStartInfo);
+        Assert.Equal(gitExecutable, observedStartInfo.FileName);
+        Assert.Contains("ls-tree", observedStartInfo.ArgumentList);
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_TextFileBusyProcessStartAfterRetryCap_DisposesAndPropagates()
+    {
+        var starts = 0;
+        var disposals = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return new FakeLocalGitProcess(
+                startException: new Win32Exception(26, "Text file busy"),
+                onDispose: () => disposals++);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var ex = await Assert.ThrowsAsync<Win32Exception>(
+            () => gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10));
+
+        Assert.Equal(26, ex.NativeErrorCode);
+        Assert.Equal(8, starts);
+        Assert.Equal(8, disposals);
+    }
+
     // -------------------------------------------------------------------------
     // helpers
     // -------------------------------------------------------------------------
@@ -382,7 +440,8 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         int exitCode = 0,
         string stdout = "",
         string stderr = "",
-        Win32Exception? startException = null) : ILocalGitProcess
+        Win32Exception? startException = null,
+        Action? onDispose = null) : ILocalGitProcess
     {
         private readonly StringReader _stdout = new(stdout);
         private readonly StringReader _stderr = new(stderr);
@@ -405,6 +464,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         {
             _stdout.Dispose();
             _stderr.Dispose();
+            onDispose?.Invoke();
         }
     }
 }

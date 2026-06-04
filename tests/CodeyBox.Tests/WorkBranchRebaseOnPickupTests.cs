@@ -174,6 +174,41 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
+    public async Task QueuedResume_MissingPreservedWorkBranchResetsAndRunsWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-resume-missing") with
+        {
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
+        Assert.False(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+
+        var beforeWorkCalls = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            beforeWorkCalls++;
+            await AssertSandboxSeesResetOriginWorkBranchAsync(
+                sandbox, workingDirectory, item.WorkBranch!, expectPriorFileAbsent: false, ct);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work after missing preserved branch\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(final.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(1, beforeWorkCalls);
+        Assert.True(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("work after missing preserved branch\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
     public async Task QueuedExplicitNonOwnedExistingWorkBranchWithoutRecoveryIsPreserved()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
