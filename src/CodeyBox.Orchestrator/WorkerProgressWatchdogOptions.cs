@@ -8,22 +8,23 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>
 /// Failure mode covered: a worker keeps heartbeating yet its work item makes
-/// no progress (item.updatedAt frozen AND no new agent-stream activity). The
-/// dead-worker reaper only catches workers whose heartbeat went stale, and
-/// <c>WorkTimeout</c> only fences the agent subprocess — neither covers the
-/// post-agent commit/transition step, nor the pre-agent provisioning step.
+/// no progress (item.updatedAt frozen, no new agent-stream activity, and no
+/// worker-side activity signal). The dead-worker reaper only catches workers
+/// whose heartbeat went stale, and <c>WorkTimeout</c> only fences the agent
+/// subprocess — neither covers the post-agent commit/transition step, nor the
+/// pre-agent provisioning step.
 /// </para>
 /// </summary>
 public sealed class WorkerProgressWatchdogOptions
 {
     /// <summary>
     /// Wall-clock window without observed progress (item.updatedAt advancing
-    /// OR the newest agent-stream <c>*.jsonl</c> mtime advancing) before a
-    /// bound worker is considered wedged. Heartbeat does NOT count as
-    /// progress. Default 30 min. Set to <see cref="TimeSpan.Zero"/> to
-    /// disable the watchdog entirely.
+    /// OR the newest agent-stream <c>*.jsonl</c> mtime advancing OR a configured
+    /// worker activity signal firing) before a bound worker is considered
+    /// wedged. Heartbeat does NOT count as progress. Default 60 min. Set to
+    /// <see cref="TimeSpan.Zero"/> to disable the watchdog entirely.
     /// </summary>
-    public TimeSpan ProgressTimeout { get; set; } = TimeSpan.FromMinutes(30);
+    public TimeSpan ProgressTimeout { get; set; } = TimeSpan.FromMinutes(60);
 
     /// <summary>How often the watchdog sweep runs. Default 60 s.</summary>
     public TimeSpan CheckInterval { get; set; } = TimeSpan.FromSeconds(60);
@@ -36,6 +37,25 @@ public sealed class WorkerProgressWatchdogOptions
     /// true — autonomous-delivery posture; the dispatch queue keeps moving.
     /// </summary>
     public bool AutoRecover { get; set; } = true;
+
+    /// <summary>
+    /// When true, the watchdog treats item-owned host processes whose CPU tick
+    /// counters advance between observations as progress. Merely seeing a
+    /// tagged process is not enough. Sandbox providers derive
+    /// <c>CODEYBOX_WORK_ITEM_ID</c> from timing work-item context so this
+    /// signal is scoped to the work item instead of all agent CLIs on the host.
+    /// Default true. Hot-reloadable on the next sweep.
+    /// </summary>
+    public bool ProcessCpuProgressSignalEnabled { get; set; } = true;
+
+    /// <summary>
+    /// When true, the watchdog can treat provider-reported sandbox activity
+    /// transitions as progress. Static ownership of a live sandbox is not
+    /// enough: providers whose guest CPU is not visible from host <c>/proc</c>
+    /// must report a changing activity projection for this signal to fire.
+    /// Default true. Hot-reloadable on the next sweep.
+    /// </summary>
+    public bool ActiveSandboxProgressSignalEnabled { get; set; } = true;
 
     /// <summary>
     /// Bounded timeout for the post-agent commit/branch-push/state-transition

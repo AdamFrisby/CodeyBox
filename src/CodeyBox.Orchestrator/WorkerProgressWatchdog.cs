@@ -16,10 +16,10 @@ namespace CodeyBox.Orchestrator;
 /// (commit, branch push, state transition WorkComplete/Auditing). In both
 /// cases the worker holds its pool slot indefinitely, starving Queued and
 /// finishing-phase items behind it. The watchdog observes
-/// <c>item.UpdatedAt</c> + agent-stream file mtimes: when neither advances
-/// for <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/> the
-/// worker is recycled and (when configured) the item auto-retries from its
-/// nearest recoverable resume state — without cascade-cancelling healthy
+/// <c>item.UpdatedAt</c> + agent-stream file mtimes + worker-side activity:
+/// when none advances for <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/>
+/// the worker is recycled and (when configured) the item auto-retries from
+/// its nearest recoverable resume state — without cascade-cancelling healthy
 /// dependents.
 /// </para>
 ///
@@ -35,6 +35,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IAgentStreamStore? _streams;
+    private readonly IWorkerProgressActivitySource? _activitySource;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
@@ -45,6 +46,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     // process so the next sweep does not re-recover an item that was correctly
     // re-queued and is now waiting on the dispatcher.
     private readonly ConcurrentDictionary<string, byte> _recoveredWorkers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<WorkerActivityKey, WorkerActivityProgress> _workerActivityProgress = new();
 
     private WorkerProgressWatchdogOptions _opts => _optsAccessor();
 
@@ -57,7 +59,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        IWorkerProgressActivitySource? activitySource = null)
     {
         _registry = registry;
         _store = store;
@@ -65,6 +68,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _optsAccessor = optionsAccessor;
         _log = log;
         _streams = streams;
+        _activitySource = activitySource;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
@@ -79,8 +83,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier) { }
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        IWorkerProgressActivitySource? activitySource = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -144,10 +149,17 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (!IsWatchedState(item.State)) continue;
                 if (_recoveredWorkers.ContainsKey(worker.WorkerId)) continue;
 
+                var activityKey = new WorkerActivityKey(worker.WorkerId, itemId);
                 var lastStreamAt = await GetLastStreamActivityAsync(itemId, ct);
-                var lastProgress = lastStreamAt is { } streamAt && streamAt > item.UpdatedAt
-                    ? streamAt
-                    : item.UpdatedAt;
+                DateTimeOffset? lastActivityAt = null;
+                if (_workerActivityProgress.TryGetValue(activityKey, out var activityProgress))
+                {
+                    if (IsActivityReasonEnabled(activityProgress.Reason, opts))
+                        lastActivityAt = activityProgress.ObservedAt;
+                    else
+                        _workerActivityProgress.TryRemove(activityKey, out _);
+                }
+                var lastProgress = MaxProgressAt(item.UpdatedAt, lastStreamAt, lastActivityAt);
 
                 // Items that have not run long enough yet (StartedAt newer than
                 // cutoff) cannot have stalled for the configured window even if
@@ -156,6 +168,16 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (item.StartedAt is { } startedAt && startedAt > cutoff) continue;
 
                 if (lastProgress > cutoff) continue;
+
+                var workerActivity = await GetWorkerActivityAsync(worker, itemId, opts, ct);
+                if (workerActivity is not null)
+                {
+                    _workerActivityProgress[activityKey] = new WorkerActivityProgress(now, workerActivity.Reason);
+                    _log.LogDebug(
+                        "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
+                        worker.WorkerId, itemId, workerActivity.Reason);
+                    continue;
+                }
 
                 var sinceProgress = (long)(now - lastProgress).TotalSeconds;
                 AuditLog.WorkItemWatchdogStuck(
@@ -178,6 +200,59 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             _log.LogWarning(ex, "Worker-progress watchdog sweep failed");
         }
     }
+
+    private async ValueTask<WorkerProgressActivity?> GetWorkerActivityAsync(
+        WorkerRegistration worker,
+        WorkItemId itemId,
+        WorkerProgressWatchdogOptions opts,
+        CancellationToken ct)
+    {
+        if (_activitySource is null)
+            return null;
+        if (!opts.ProcessCpuProgressSignalEnabled && !opts.ActiveSandboxProgressSignalEnabled)
+            return null;
+
+        var probe = new WorkerProgressActivityProbe(
+            opts.ProcessCpuProgressSignalEnabled,
+            opts.ActiveSandboxProgressSignalEnabled);
+
+        try
+        {
+            return await _activitySource.ObserveAsync(worker, itemId, probe, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Watchdog: failed to read worker activity for {ItemId}; treating as no activity", itemId);
+            return null;
+        }
+    }
+
+    private static DateTimeOffset MaxProgressAt(
+        DateTimeOffset itemUpdatedAt,
+        DateTimeOffset? streamAt,
+        DateTimeOffset? activityAt)
+    {
+        var max = itemUpdatedAt;
+        if (streamAt is { } stream && stream > max)
+            max = stream;
+        if (activityAt is { } activity && activity > max)
+            max = activity;
+        return max;
+    }
+
+    private static bool IsActivityReasonEnabled(string reason, WorkerProgressWatchdogOptions opts)
+    {
+        if (string.Equals(reason, "process-cpu", StringComparison.Ordinal))
+            return opts.ProcessCpuProgressSignalEnabled;
+        if (reason.StartsWith("active-sandbox", StringComparison.Ordinal))
+            return opts.ActiveSandboxProgressSignalEnabled;
+
+        return opts.ProcessCpuProgressSignalEnabled || opts.ActiveSandboxProgressSignalEnabled;
+    }
+
+    private readonly record struct WorkerActivityKey(string WorkerId, WorkItemId ItemId);
+    private sealed record WorkerActivityProgress(DateTimeOffset ObservedAt, string Reason);
 
     private async Task<DateTimeOffset?> GetLastStreamActivityAsync(WorkItemId itemId, CancellationToken ct)
     {

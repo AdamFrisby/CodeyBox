@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.Sandbox;
 
 /// <summary>
@@ -33,6 +35,14 @@ public static class SandboxConventions
     /// </summary>
     public const string AgentLogFileEnv = "CODEYBOX_AGENT_LOG_FILE";
 
+    /// <summary>
+    /// Environment variable used to mark sandbox-owned host processes with the
+    /// work item that caused them. Providers derive it from
+    /// <see cref="SandboxSpec.TimingWorkItemId"/> so watchdog process probes
+    /// are scoped to the item instead of every agent process on the host.
+    /// </summary>
+    public const string WorkItemIdEnvironmentVariable = "CODEYBOX_WORK_ITEM_ID";
+
     /// <summary>Logical network profile used by opt-in graphical sandboxes.</summary>
     public const string GraphicalNetworkProfile = "graphical";
 
@@ -41,4 +51,21 @@ public static class SandboxConventions
 
     /// <summary>Known VNC port exposed by the graphical Multipass flavor.</summary>
     public const int GraphicalVncPort = 5900;
+
+    /// <summary>
+    /// Returns a spec whose environment includes the work-item marker implied
+    /// by <see cref="SandboxSpec.TimingWorkItemId"/>. Explicit caller-provided
+    /// environment values are otherwise preserved.
+    /// </summary>
+    public static SandboxSpec WithTimingEnvironment(SandboxSpec spec)
+    {
+        if (spec.TimingWorkItemId is not { } workItemId || workItemId.Value == Guid.Empty)
+            return spec;
+
+        var env = new Dictionary<string, string>(spec.Environment, StringComparer.Ordinal)
+        {
+            [WorkItemIdEnvironmentVariable] = workItemId.ToString(),
+        };
+        return spec with { Environment = env };
+    }
 }

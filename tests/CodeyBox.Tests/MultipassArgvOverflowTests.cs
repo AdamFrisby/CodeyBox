@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -107,15 +108,46 @@ public sealed class MultipassArgvOverflowTests : IDisposable
         Assert.Contains(largeArg, scriptTransfer.Content);
     }
 
-    private MultipassSandbox NewSandbox(RecordingProcessRunner runner) => new(
+    [Fact]
+    public async Task ExecAsync_WithTimingWorkItemId_TagsHostExecAndTransferCalls()
+    {
+        var workItemId = WorkItemId.New();
+        var runner = new RecordingProcessRunner();
+        var sandbox = NewSandbox(runner, workItemId);
+        var largeEnv = Enumerable.Range(0, 120)
+            .ToDictionary(i => $"BIG_{i:000}", i => new string((char)('a' + i % 26), 700));
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv", "BIG_000"],
+            ExtraEnvironment = largeEnv,
+        });
+
+        Assert.True(result.Success);
+        Assert.Contains(runner.Calls, c => c.Argv is ["multipass", "transfer", ..]);
+        Assert.Contains(runner.Calls, c => c.Argv is ["multipass", "exec", "codeybox-test", "--", "/usr/local/bin/codeybox-exec", ..]);
+        Assert.All(runner.Calls, c =>
+        {
+            Assert.NotNull(c.Environment);
+            Assert.Equal(
+                workItemId.ToString(),
+                c.Environment![SandboxConventions.WorkItemIdEnvironmentVariable]);
+        });
+    }
+
+    private MultipassSandbox NewSandbox(RecordingProcessRunner runner, WorkItemId? workItemId = null) => new(
         "codeybox-test",
         _sandboxRoot,
         new SandboxSpec { ImageReference = "ignored", WorkingDirectory = "/work" },
         new MultipassSandboxOptions(),
         NullLogger.Instance,
+        timingItemId: workItemId.GetValueOrDefault(),
         runner: runner);
 
-    private sealed record RecordedCall(IReadOnlyList<string> Argv, string? Stdin);
+    private sealed record RecordedCall(
+        IReadOnlyList<string> Argv,
+        string? Stdin,
+        IReadOnlyDictionary<string, string>? Environment);
     private sealed record RecordedTransfer(string Source, string Destination, string Content);
 
     private sealed class RecordingProcessRunner : IProcessRunner
@@ -133,7 +165,10 @@ public sealed class MultipassArgvOverflowTests : IDisposable
             int? maxStderrBytes = null,
             IReadOnlyDictionary<string, string>? environment = null)
         {
-            Calls.Add(new RecordedCall(argv.ToArray(), stdin));
+            Calls.Add(new RecordedCall(
+                argv.ToArray(),
+                stdin,
+                environment is null ? null : new Dictionary<string, string>(environment, StringComparer.Ordinal)));
             if (argv is ["multipass", "transfer", var source, var destination])
                 Transfers.Add(new RecordedTransfer(source, destination, File.ReadAllText(source)));
             stdoutChunkCallback?.Invoke("ok\n");

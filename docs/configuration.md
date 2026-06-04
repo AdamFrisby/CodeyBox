@@ -46,6 +46,14 @@ Hot-reloadable today:
   before the swap; rejected reloads keep the prior pricing.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
+- `WorkerProgressWatchdog.ProgressTimeout`,
+  `WorkerProgressWatchdog.AutoRecover`,
+  `WorkerProgressWatchdog.MaxRecoveryAttempts`,
+  `WorkerProgressWatchdog.PostAgentTransitionTimeout`,
+  `WorkerProgressWatchdog.ProcessCpuProgressSignalEnabled`, and
+  `WorkerProgressWatchdog.ActiveSandboxProgressSignalEnabled` — re-read on
+  every watchdog sweep. `WorkerProgressWatchdog.CheckInterval` is sampled once
+  at startup.
 - `Shutdown.SandboxResumeMode`, `Shutdown.SandboxResumeTimeout`, and
   `Shutdown.SandboxAdoptionDeadlineSeconds` — re-read by the startup resume
   service. In the default background mode, the API listener is not held offline
@@ -179,6 +187,38 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 | `MaxRecoveryAttempts` | `2` | Bounded self-recovery attempts before `worker_pool.restart_required`. |
 | `MaxRecoveryEnqueueBatchSize` | `32` | Max runnable work IDs re-kicked per recovery attempt. |
 | `RecoveryVerificationDelay` | `00:00:05` | Delay before checking whether recovery cleared the stall. |
+
+---
+
+## `WorkerProgressWatchdog`
+
+Detects a bound worker that has stopped making lifecycle progress while its
+heartbeat may still be fresh. Heartbeat alone is ignored. The watchdog recycles
+only when the work item timestamp, agent stream timestamp, item-owned process
+CPU signal, and active sandbox ownership signal are all stale for
+`ProgressTimeout`.
+
+```json
+"WorkerProgressWatchdog": {
+  "ProgressTimeout": "01:00:00",
+  "CheckInterval": "00:01:00",
+  "AutoRecover": true,
+  "ProcessCpuProgressSignalEnabled": true,
+  "ActiveSandboxProgressSignalEnabled": true,
+  "PostAgentTransitionTimeout": "00:10:00",
+  "MaxRecoveryAttempts": 10
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ProgressTimeout` | `01:00:00` | Window without item, stream, process CPU, or active sandbox progress before a worker is considered wedged. Set `00:00:00` to disable the watchdog. |
+| `CheckInterval` | `00:01:00` | Sweep cadence. Sampled at startup; restart to change. |
+| `AutoRecover` | `true` | Recycle the worker and requeue the item from the nearest recoverable state. When false, park the item at `NeedsOperatorInput`. |
+| `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between observations as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
+| `ActiveSandboxProgressSignalEnabled` | `true` | Count provider-tracked active sandbox ownership as progress. This covers VM-backed providers whose guest CPU is not visible from host `/proc`; providers should omit sandboxes no longer actively owned by a work item. |
+| `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. |
+| `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `Failed`; `0` means unlimited. |
 
 ---
 
