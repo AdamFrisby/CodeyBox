@@ -373,6 +373,26 @@ public sealed class AgentClassRouterRateAwareTests
     }
 
     [Fact]
+    public async Task SummariseFitsAsync_BurnEstimatorThrows_ReportsSampleSourceUnavailable()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var router = BuildRouter(
+            [cls],
+            [new FakeProbe(Codex, 100.0)],
+            new ThrowingBurnEstimator(),
+            counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, view.BurnEstimateStatus);
+        Assert.Equal(0, view.SampleCount);
+        Assert.Equal(-1, view.AvgBurnPctPerItem);
+        Assert.Equal(AgentClassRouter.DefaultColdStartFitInWindow, view.FitInWindow);
+    }
+
+    [Fact]
     public async Task SummariseFitsAsync_NoBurnEstimator_ReturnsEmpty()
     {
         // /concurrency must not crash on a router with no burn estimator wired.

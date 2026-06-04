@@ -82,11 +82,15 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
         // configured-but-quiet agent still surfaces its avg-burn for the operator.
         var client = _factory.CreateClient();
         var body = await client.GetFromJsonAsync<JsonElement>("/concurrency");
-        var names = body.GetProperty("burnEstimates").EnumerateArray()
-            .Select(e => e.GetProperty("agent").GetString())
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        Assert.Contains("codex", names);
-        Assert.Contains("claude", names);
+        var burns = body.GetProperty("burnEstimates").EnumerateArray()
+            .ToDictionary(
+                e => e.GetProperty("agent").GetString()!,
+                StringComparer.OrdinalIgnoreCase);
+
+        Assert.Contains("codex", burns.Keys);
+        Assert.Contains("claude", burns.Keys);
+        Assert.Equal("NoWindowBudget", burns["codex"].GetProperty("status").GetString());
+        Assert.Equal("Measured", burns["claude"].GetProperty("status").GetString());
     }
 
     [Fact]

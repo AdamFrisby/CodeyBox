@@ -79,14 +79,24 @@ public sealed class AgentBurnEstimatorTests
         // hardcoded default as a measured burn. It preserves the real sample
         // count and marks the burn as unknown so the router can fail open.
         var costs = new FakeCostStore { TokensByAgent = { ["codex"] = (50_000_000L, 7) } };
-        var opts = new AgentBurnEstimatorOptions(); // no WindowTokenBudget for codex
-        var est = BuildEstimator(costs, opts);
+        var opts = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["claude"] = 1L }, // no WindowTokenBudget for codex
+        };
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var est = new AgentBurnEstimator(costs, opts, logger);
 
         var result = await est.GetEstimateAsync(Codex);
 
         Assert.Equal(7, result.SampleCount);
         Assert.True(result.AvgBurnPctPerItem < 0);
         Assert.Equal(AgentBurnEstimateStatus.NoWindowBudget, result.Status);
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("token samples but no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("codex", warning.Properties["Agent"]);
+        Assert.Equal(7, warning.Properties["Samples"]);
     }
 
     [Fact]

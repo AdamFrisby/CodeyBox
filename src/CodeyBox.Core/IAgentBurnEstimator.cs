@@ -36,8 +36,10 @@ public sealed record AgentBurnEstimate
 {
     /// <summary>
     /// Historical avg fraction of the agent's primary window that a single
-    /// item is expected to consume, as a percentage 0–100. Negative means
-    /// unknown (no samples).
+    /// item is expected to consume, as a percentage 0-100. Negative means
+    /// unknown; use <see cref="Status"/> and <see cref="SampleCount"/> to
+    /// distinguish no-history from samples that cannot be converted because no
+    /// positive window budget is configured.
     /// </summary>
     public double AvgBurnPctPerItem { get; init; }
 

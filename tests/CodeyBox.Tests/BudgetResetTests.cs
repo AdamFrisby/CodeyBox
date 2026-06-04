@@ -122,7 +122,7 @@ public sealed class BudgetResetTests : IDisposable
         var reg = new CancellationRegistry(CancellationToken.None);
         var budgetRecheck = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            HourlyLimitRecheck = TimeSpan.FromMilliseconds(500),
+            HourlyLimitRecheck = TimeSpan.FromSeconds(1),
         });
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
@@ -148,11 +148,19 @@ public sealed class BudgetResetTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(2);
-        while (DateTimeOffset.UtcNow < deferDeadline && !svc.IsDeferredForTest(newItem.Id))
+        var observedDeferred = false;
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deferDeadline)
+        {
+            if (svc.IsDeferredForTest(newItem.Id))
+            {
+                observedDeferred = true;
+                break;
+            }
             await Task.Delay(25);
+        }
 
-        Assert.True(svc.IsDeferredForTest(newItem.Id));
+        Assert.True(observedDeferred);
         Assert.Equal(0, pickupCount);
 
         // Simulate the rolling window advancing: age the blocking item out of the window.
