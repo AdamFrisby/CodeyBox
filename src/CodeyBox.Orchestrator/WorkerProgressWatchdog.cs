@@ -46,7 +46,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     // process so the next sweep does not re-recover an item that was correctly
     // re-queued and is now waiting on the dispatcher.
     private readonly ConcurrentDictionary<string, byte> _recoveredWorkers = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<WorkerActivityKey, DateTimeOffset> _workerActivityProgress = new();
+    private readonly ConcurrentDictionary<WorkerActivityKey, WorkerActivityProgress> _workerActivityProgress = new();
 
     private WorkerProgressWatchdogOptions _opts => _optsAccessor();
 
@@ -151,9 +151,14 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
                 var activityKey = new WorkerActivityKey(worker.WorkerId, itemId);
                 var lastStreamAt = await GetLastStreamActivityAsync(itemId, ct);
-                var lastActivityAt = _workerActivityProgress.TryGetValue(activityKey, out var activityAt)
-                    ? activityAt
-                    : (DateTimeOffset?)null;
+                DateTimeOffset? lastActivityAt = null;
+                if (_workerActivityProgress.TryGetValue(activityKey, out var activityProgress))
+                {
+                    if (IsActivityReasonEnabled(activityProgress.Reason, opts))
+                        lastActivityAt = activityProgress.ObservedAt;
+                    else
+                        _workerActivityProgress.TryRemove(activityKey, out _);
+                }
                 var lastProgress = MaxProgressAt(item.UpdatedAt, lastStreamAt, lastActivityAt);
 
                 // Items that have not run long enough yet (StartedAt newer than
@@ -167,7 +172,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 var workerActivity = await GetWorkerActivityAsync(worker, itemId, opts, ct);
                 if (workerActivity is not null)
                 {
-                    _workerActivityProgress[activityKey] = now;
+                    _workerActivityProgress[activityKey] = new WorkerActivityProgress(now, workerActivity.Reason);
                     _log.LogDebug(
                         "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
                         worker.WorkerId, itemId, workerActivity.Reason);
@@ -236,7 +241,18 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         return max;
     }
 
+    private static bool IsActivityReasonEnabled(string reason, WorkerProgressWatchdogOptions opts)
+    {
+        if (string.Equals(reason, "process-cpu", StringComparison.Ordinal))
+            return opts.ProcessCpuProgressSignalEnabled;
+        if (reason.StartsWith("active-sandbox", StringComparison.Ordinal))
+            return opts.ActiveSandboxProgressSignalEnabled;
+
+        return opts.ProcessCpuProgressSignalEnabled || opts.ActiveSandboxProgressSignalEnabled;
+    }
+
     private readonly record struct WorkerActivityKey(string WorkerId, WorkItemId ItemId);
+    private sealed record WorkerActivityProgress(DateTimeOffset ObservedAt, string Reason);
 
     private async Task<DateTimeOffset?> GetLastStreamActivityAsync(WorkItemId itemId, CancellationToken ct)
     {

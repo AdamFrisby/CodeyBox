@@ -1689,7 +1689,7 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
 // Lifecycle-wide progress enforcer that complements the dead-worker reaper
 // (heartbeat-stale path) and WorkTimeout (agent subprocess only). Trips when
 // a bound worker is heartbeating but its item shows no progress: item.updatedAt,
-// agent-stream mtime, process CPU, and active sandbox signals are all stale.
+// agent-stream mtime, process CPU, and sandbox activity signals are all stale.
 builder.Services.AddSingleton<WorkerProgressWatchdogOptions>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.WorkerProgressWatchdog;

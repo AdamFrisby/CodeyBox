@@ -36,9 +36,9 @@ public interface IWorkerProgressActivitySource
 /// <summary>
 /// Default watchdog activity source. It combines exact host-side process CPU
 /// sampling for sandbox processes that carry
-/// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with a
-/// provider-owned active sandbox signal for VM-backed providers whose guest
-/// processes are not visible from host <c>/proc</c>.
+/// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with
+/// provider-owned sandbox activity transitions. Static sandbox ownership is
+/// tracked only as a baseline and is not progress by itself.
 /// </summary>
 public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivitySource
 {
@@ -48,6 +48,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
+    private readonly ConcurrentDictionary<WorkItemId, string> _activeSandboxSignatures = new();
 
     public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
         => _activeSandboxProvider = activeSandboxProvider;
@@ -95,14 +96,32 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return false;
         }
 
-        var hasActiveSandbox = snapshot.Any(entry =>
-            entry.WorkItemId == itemId &&
-            !string.IsNullOrWhiteSpace(entry.SandboxId));
+        var signatureParts = snapshot
+            .Where(entry =>
+                entry.WorkItemId == itemId &&
+                !string.IsNullOrWhiteSpace(entry.SandboxId))
+            .Select(entry => $"{entry.SandboxId}\0{entry.Status ?? ""}")
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
-        if (!hasActiveSandbox)
+        if (signatureParts.Length == 0)
+        {
+            _activeSandboxSignatures.TryRemove(itemId, out _);
+            return false;
+        }
+
+        var signature = string.Join("\0\0", signatureParts);
+        if (!_activeSandboxSignatures.TryGetValue(itemId, out var previous))
+        {
+            _activeSandboxSignatures[itemId] = signature;
+            return false;
+        }
+
+        _activeSandboxSignatures[itemId] = signature;
+        if (string.Equals(signature, previous, StringComparison.Ordinal))
             return false;
 
-        reason = "active-sandbox";
+        reason = "active-sandbox-change";
         return true;
     }
 
