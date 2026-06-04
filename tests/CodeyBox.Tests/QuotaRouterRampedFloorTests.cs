@@ -260,7 +260,7 @@ public sealed class QuotaRouterRampedFloorTests
     }
 
     [Fact]
-    public async Task ResolveAsync_PerAgentNearZeroFloorAdmitsBurnAgentWhileReservedAgentWaits()
+    public async Task ResolveAndFallback_PerAgentNearZeroFloorAdmitsBurnAgentWhileReservedAgentKeepsFloor()
     {
         var opts = DefaultOpts();
         opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
@@ -308,6 +308,27 @@ public sealed class QuotaRouterRampedFloorTests
 
         Assert.Equal(Codex, decision.Chosen!.Agent);
         Assert.Equal(1, claudeProbe.CallCount);
+        Assert.Equal(1, codexProbe.CallCount);
+
+        router.MarkExhausted(decision.Chosen, TimeSpan.FromMinutes(30), reset);
+
+        var reservedCandidates = await router.OrderedFallbackCandidatesAsync(
+            item, project: null, CancellationToken.None);
+
+        Assert.Empty(reservedCandidates);
+
+        claudeProbe.SetSnapshot(new AgentQuotaSnapshot
+        {
+            AvailablePct = 30.0,
+            ResetAt = reset,
+        });
+
+        var availableCandidates = await router.OrderedFallbackCandidatesAsync(
+            item, project: null, CancellationToken.None);
+
+        var fallback = Assert.Single(availableCandidates);
+        Assert.Equal(Claude, fallback.Agent);
+        Assert.Equal(3, claudeProbe.CallCount);
         Assert.Equal(1, codexProbe.CallCount);
     }
 

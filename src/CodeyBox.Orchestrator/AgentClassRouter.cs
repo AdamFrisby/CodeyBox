@@ -1043,7 +1043,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// Returns an empty list when no class is configured, no class member is
     /// eligible (fails the <see cref="WorkItem.MinModelScore"/> floor or does
     /// not cover the work item's <see cref="WorkItem.RequiredCapabilities"/>),
-    /// or every eligible member is currently marked exhausted in this process.
+    /// every eligible member is currently marked exhausted in this process, or
+    /// every remaining candidate fails the same quota gate used by fresh
+    /// routing.
     /// </para>
     /// <para>
     /// Like <see cref="ResolveAsync"/>, this gates each apparently-available
@@ -1072,9 +1074,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
 
         // Score + order the eligible, non-exhausted members first. Availability
-        // (and the in-VM gate) is applied last, in score order, so we only probe
-        // members we would actually return — and never burn a probe on a member
-        // already filtered out by score or in-process exhaustion.
+        // and quota are applied last, in score order, so we never burn a probe
+        // on a member already filtered out by score or in-process exhaustion.
         var ordered = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
@@ -1095,17 +1096,40 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .Select(x => x.Member)
             .ToList();
 
-        if (_dispatchAvailability is null)
-            return ordered;
-
-        // Apply the same gate-or-registry verdict ResolveAsync uses, so a
-        // mid-iteration / audit / rebase fallback never hands work to an agent
-        // whose CLI was never in-VM smoke-checked (cache hit = free).
+        // Apply the same availability and quota verdict ResolveAsync uses, so
+        // a mid-iteration / audit / rebase fallback never hands work to an agent
+        // whose CLI was never in-VM smoke-checked or whose remaining quota is
+        // below its effective per-agent floor.
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
             var av = await GetGatedAvailabilityAsync(member, target, ct);
-            if (av is null || av.Available)
+            if (av is { Available: false })
+                continue;
+
+            AgentQuotaSnapshot snapshot;
+            try
+            {
+                snapshot = await ProbeAsync(member, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex,
+                    "Quota probe for fallback candidate {Agent}/{Model} threw; treating as unknown",
+                    member.Agent.Value, member.ModelId ?? "(default)");
+                snapshot = new AgentQuotaSnapshot
+                {
+                    AvailablePct = -1,
+                    Notes = $"probe threw: {ex.GetType().Name}",
+                };
+            }
+
+            var quota = ResolveMemberQuota(snapshot, member);
+            quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
+            RecordObservedAvailability(member, quota);
+
+            var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            if (gate.Allow)
                 result.Add(member);
         }
         return result;
