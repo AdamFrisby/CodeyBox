@@ -34,7 +34,10 @@ namespace CodeyBox.Orchestrator;
 /// <para><b>What excludes vs. what is transient.</b> A <em>clean</em> negative
 /// signal — a step that exits non-zero — always excludes an agent. Provisioning
 /// failures, exec exceptions, and step timeouts are transient infrastructure
-/// problems; how they are handled depends on the call path. On the background
+/// problems; how they are handled depends on the call path. Typed provisioning
+/// deferrals are allowed to bubble from the dispatch gate so the orchestrator can
+/// requeue the work item instead of converting host provisioning exhaustion into
+/// agent unavailability. On the background
 /// sweep (<see cref="ProbeAllAsync"/>) they are always logged and skipped
 /// without mutating availability or the cache, so a flaky host never wrongly
 /// benches a working agent. On the dispatch gate
@@ -313,6 +316,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // handled as transient inside ProbeAgentAsync; those never reach here.
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             // The gate runs on the router hot path and must never throw. The
@@ -387,6 +394,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogWarning(ex,
@@ -431,6 +442,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
         {
             throw;
         }
@@ -504,6 +519,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // A step timed out — treat as transient infra, not an agent fault.
             _log.LogWarning("In-VM smoke for {Agent}: timed out; treating as transient", probe.Kind.Value);
             return BenchTransientFaultIfRequested(probe.Kind, "probe step timed out", benchOnTransientFault);
+        }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

@@ -2445,6 +2445,123 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(3, startCalls);
     }
 
+    [Theory]
+    [InlineData("stop-before-mount", "stop")]
+    [InlineData("cloud-init-exec", "exec")]
+    [InlineData("env-transfer", "transfer")]
+    [InlineData("env-chmod-exec", "exec")]
+    [InlineData("baseline-install-exec", "exec")]
+    [InlineData("baseline-stop", "stop")]
+    [InlineData("clone-source-stop", "stop")]
+    public async Task CreateAsync_ProvisioningRetryExhaustionAcrossLifecycleOperations_Defers(
+        string failurePoint,
+        string expectedOperation)
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var failingCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", var csvName, "--format=csv"])
+            {
+                if (states.TryGetValue(csvName, out var current))
+                    return Task.FromResult(new ProcessRunResult(0, current, ""));
+                if (csvName.StartsWith("cb-baseline-", StringComparison.Ordinal)
+                    && failurePoint == "clone-source-stop")
+                    return Task.FromResult(new ProcessRunResult(0, "Stopped", ""));
+                return Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+            {
+                if (failurePoint == "cloud-init-exec")
+                    return Task.FromResult(FailTransient(ref failingCalls));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", _]
+                && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
+            {
+                if (failurePoint == "baseline-install-exec")
+                    return Task.FromResult(FailTransient(ref failingCalls));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                var isBaseline = stopName.StartsWith("cb-baseline-", StringComparison.Ordinal);
+                if (failurePoint == "stop-before-mount"
+                    || (isBaseline && failurePoint is "baseline-stop" or "clone-source-stop"))
+                    return Task.FromResult(FailTransient(ref failingCalls));
+
+                states[stopName] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+            {
+                if (failurePoint == "env-transfer")
+                    return Task.FromResult(FailTransient(ref failingCalls));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+            {
+                if (failurePoint == "env-chmod-exec")
+                    return Task.FromResult(FailTransient(ref failingCalls));
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var useBaseline = failurePoint is "baseline-install-exec" or "baseline-stop" or "clone-source-stop";
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-" + failurePoint),
+            networkProfiles: useBaseline ? new Dictionary<string, string> { ["claude"] = "cb-claude" } : null,
+            useBaselineImages: useBaseline,
+            extraRuncmd: failurePoint == "baseline-install-exec" ? ["touch /opt/codeybox-baseline"] : null,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Network = useBaseline ? new SandboxNetworkPolicy { ProfileName = "claude" } : new SandboxNetworkPolicy(),
+                TimingWorkItemId = WorkItemId.New(),
+            }));
+
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal(expectedOperation, ex.Operation);
+        Assert.Equal("multipass-instance-lock-contention", ex.ErrorClass);
+        Assert.Equal(InstantDaemonRetryPolicy().ExhaustedRequeueDelay, ex.RecheckIn);
+        Assert.Equal(3, failingCalls);
+    }
+
     [Fact]
     public async Task CreateAsync_TransientMultipassSocketLaunchFailureExhaustsRetriesWithClearMessage()
     {
@@ -3218,6 +3335,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(InstantDaemonRetryPolicy().ExhaustedRequeueDelay, ex.RecheckIn);
         Assert.Equal(3, startCalls);
         Assert.Equal(3, versionCalls);
+    }
+
+    private static ProcessRunResult FailTransient(ref int calls)
+    {
+        calls++;
+        return new ProcessRunResult(
+            1,
+            "",
+            "operation failed: Could not acquire lock for '/var/snap/multipass/common/data/multipassd/multipassd-vm-instances.json'");
     }
 
     [Fact]

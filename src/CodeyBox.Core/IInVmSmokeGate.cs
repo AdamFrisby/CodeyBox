@@ -62,8 +62,10 @@ public interface IInVmSmokeGate
     /// the agent is benched and a <em>new excluded</em> availability is returned
     /// (the failing verdict is never cached, so it self-heals on the next clean
     /// probe); under the opt-out fail-open policy the prior availability is
-    /// returned unchanged. Never throws — a probe fault must not take down
-    /// dispatch.</para>
+    /// returned unchanged. A <see cref="SandboxProvisioningDeferredException"/>
+    /// is the exception to that non-throwing contract: it must bubble so the
+    /// orchestrator can requeue the work item rather than hard-failing it as
+    /// agent unavailability.</para>
     ///
     /// <para><paramref name="target"/> is the resolved sandbox target for the
     /// dispatch phase being gated. The implementation must use this target's

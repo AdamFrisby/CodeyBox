@@ -1025,6 +1025,58 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task EnsureAvailableAsync_ProvisioningDeferredFromCreate_PropagatesWithoutBenching()
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "clone",
+            errorClass: "multipass-instance-lock-contention",
+            detail: "clone retry exhausted",
+            recheckIn: TimeSpan.FromSeconds(30));
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""))
+        {
+            ThrowOnCreate = deferred,
+        };
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var prober = Build(provider, registry, cache, new FakeBaselineResolver("base-A"));
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            prober.EnsureAvailableAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
+    public async Task EnsureAvailableAsync_ProvisioningDeferredFromBaselineWarmup_PropagatesWithoutBenching()
+    {
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "baseline-launch",
+            errorClass: "multipass-instance-lock-contention",
+            detail: "baseline launch retry exhausted",
+            recheckIn: TimeSpan.FromSeconds(30));
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(0, "", ""));
+        var registry = NewRegistry();
+        var cache = NewCache();
+        var resolver = new FakeBaselineResolver("base-A")
+        {
+            ThrowOnEnsureException = deferred,
+        };
+        var prober = Build(provider, registry, cache, resolver);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            prober.EnsureAvailableAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Null(cache.TryGet(AgentKind.Cursor, "base-A"));
+    }
+
+    [Fact]
     public async Task FastFailBench_CacheHitDoesNotClear_FreshPassClears()
     {
         // End-to-end pin for the clearsFastFail wiring at the prober's two call
@@ -1825,6 +1877,7 @@ public sealed class InVmSmokeProberTests
         public bool CanEnsure { get; set; } = true;
         public bool ThrowOnResolve { get; set; }
         public bool ThrowOnEnsure { get; set; }
+        public Exception? ThrowOnEnsureException { get; set; }
         public List<(string Profile, SandboxProfileFlavor Flavor, string? PinnedRef)> EnsureCalls { get; } = [];
         public FakeBaselineResolver(string? r) => Ref = r;
 
@@ -1840,6 +1893,7 @@ public sealed class InVmSmokeProberTests
             string? pinnedBaselineRef,
             CancellationToken ct)
         {
+            if (ThrowOnEnsureException is not null) throw ThrowOnEnsureException;
             if (ThrowOnEnsure) throw new InvalidOperationException("baseline provisioner failed");
             EnsureCalls.Add((profileName, flavor, pinnedBaselineRef));
             return Task.FromResult(CanEnsure ? pinnedBaselineRef ?? Ref : null);
