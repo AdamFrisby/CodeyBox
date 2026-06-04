@@ -7855,6 +7855,10 @@ Original merge-phase failure (for context):
             foreach (var (k, v) in extraEnvironment)
                 env[k] = v;
         }
+        if (timingWorkItemId is { } workItemId && workItemId.Value != Guid.Empty)
+        {
+            env[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable] = workItemId.ToString();
+        }
 
         var allowedHosts = allowAgentNetwork
             ? includeAgentCredential is null

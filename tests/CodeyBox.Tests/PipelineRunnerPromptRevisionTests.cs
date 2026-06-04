@@ -144,6 +144,8 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         Assert.True(workSpec.Environment.ContainsKey(CodeyBoxTrailers.PromptRevisionEnvVar),
             $"work-phase sandbox spec missing {CodeyBoxTrailers.PromptRevisionEnvVar}");
         Assert.Equal("1", workSpec.Environment[CodeyBoxTrailers.PromptRevisionEnvVar]);
+        Assert.Equal(item.Id.ToString(),
+            workSpec.Environment[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable]);
 
         var reworkSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework");
         Assert.True(reworkSpec.Environment.ContainsKey(CodeyBoxTrailers.PromptRevisionEnvVar),
@@ -152,6 +154,8 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         // is sourced from the freshly-read store row, not the orchestrator's
         // pickup-time snapshot.
         Assert.Equal("2", reworkSpec.Environment[CodeyBoxTrailers.PromptRevisionEnvVar]);
+        Assert.Equal(item.Id.ToString(),
+            reworkSpec.Environment[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable]);
     }
 
     // ── Commit-trailer wiring ──────────────────────────────────────────────

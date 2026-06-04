@@ -1688,14 +1688,16 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
 // --- Worker progress watchdog -----------------------------------------------
 // Lifecycle-wide progress enforcer that complements the dead-worker reaper
 // (heartbeat-stale path) and WorkTimeout (agent subprocess only). Trips when
-// a bound worker is heartbeating but its item shows no progress
-// (item.updatedAt + agent-stream mtime both stale) for ProgressTimeout.
+// a bound worker is heartbeating but its item shows no progress: item.updatedAt,
+// agent-stream mtime, process CPU, and active sandbox signals are all stale.
 builder.Services.AddSingleton<WorkerProgressWatchdogOptions>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.WorkerProgressWatchdog;
     opts.Validate();
     return opts;
 });
+builder.Services.AddSingleton<IWorkerProgressActivitySource>(sp =>
+    new DefaultWorkerProgressActivitySource(sp.GetService<ISandboxProvider>()));
 builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
@@ -1710,7 +1712,8 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         sp.GetRequiredService<ILogger<WorkerProgressWatchdog>>(),
         sp.GetService<IAgentStreamStore>(),
         sp.GetService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
+        activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>());
 });
 
 // --- Worker pool health watchdog --------------------------------------------
@@ -2804,10 +2807,12 @@ namespace CodeyBox.Api
         /// "heartbeating-but-no-progress" wedge (pre-agent setup hang OR
         /// post-agent commit/transition hang) that neither the dead-worker
         /// reaper nor <c>WorkTimeout</c> covers. Hot-reloadable: edits to
-        /// <c>ProgressTimeout</c>, <c>AutoRecover</c>, and
+        /// <c>ProgressTimeout</c>, <c>AutoRecover</c>,
+        /// <c>ProcessCpuProgressSignalEnabled</c>,
+        /// <c>ActiveSandboxProgressSignalEnabled</c>, and
         /// <c>PostAgentTransitionTimeout</c> take effect on the next sweep
-        /// without restart. <c>CheckInterval</c> is sampled at PeriodicTimer
-        /// construction and requires a restart to change.
+        /// without restart. <c>CheckInterval</c> is sampled at
+        /// PeriodicTimer construction and requires a restart to change.
         /// </summary>
         public WorkerProgressWatchdogOptions WorkerProgressWatchdog { get; set; } = new();
 

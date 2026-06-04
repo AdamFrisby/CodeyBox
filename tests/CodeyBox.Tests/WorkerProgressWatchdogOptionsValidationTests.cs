@@ -17,7 +17,11 @@ public sealed class WorkerProgressWatchdogOptionsValidationTests
         // Sanity: an out-of-the-box options instance must pass Validate so
         // operators that never touch the config block don't get a startup
         // exception.
-        new WorkerProgressWatchdogOptions().Validate();
+        var opts = new WorkerProgressWatchdogOptions();
+        opts.Validate();
+        Assert.Equal(TimeSpan.FromMinutes(60), opts.ProgressTimeout);
+        Assert.True(opts.ProcessCpuProgressSignalEnabled);
+        Assert.True(opts.ActiveSandboxProgressSignalEnabled);
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using DiagProcess = System.Diagnostics.Process;
 
 namespace CodeyBox.Tests;
 
@@ -205,6 +206,158 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
         Assert.Empty(_slotReleaser.Releases);
         Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task Watchdog_BusyButQuietProcessActivity_LeavesWorkerAlone()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        var activity = new ScriptedWorkerProgressActivitySource(new WorkerProgressActivity("process-cpu"));
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: activity);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(1, activity.Calls);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_TrulyHungWithNoActivity_Recovers()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        var activity = new ScriptedWorkerProgressActivitySource(null);
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: activity);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, activity.Calls);
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_ActivitySignalsDisabled_RecoversWithoutCallingActivitySource()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            ProcessCpuProgressSignalEnabled = false,
+            ActiveSandboxProgressSignalEnabled = false,
+        };
+        var activity = new ScriptedWorkerProgressActivitySource(new WorkerProgressActivity("process-cpu"));
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: activity);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(0, activity.Calls);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_ActiveSandboxSignal_LeavesWorkerAlone()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        var provider = new ActiveSandboxProviderStub(item.Id);
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            activitySource: new DefaultWorkerProgressActivitySource(provider));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task DefaultActivitySource_WorkItemProcessCpuDelta_CountsAsProgress()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var itemId = WorkItemId.New();
+        using var process = StartBusyProcess(itemId);
+        try
+        {
+            var source = new DefaultWorkerProgressActivitySource();
+            var opts = new WorkerProgressWatchdogOptions
+            {
+                ProcessCpuProgressSignalEnabled = true,
+                ActiveSandboxProgressSignalEnabled = false,
+            };
+            var worker = new WorkerRegistration
+            {
+                WorkerId = "cpu-test",
+                HostName = Environment.MachineName,
+                ProcessId = Environment.ProcessId,
+                StartedAt = DateTimeOffset.UtcNow,
+                LastHeartbeatAt = DateTimeOffset.UtcNow,
+                CurrentWorkItemId = itemId.ToString(),
+            };
+
+            var first = await WaitForActivityAsync(source, worker, itemId, opts);
+            Assert.NotNull(first);
+
+            await Task.Delay(TimeSpan.FromMilliseconds(150));
+
+            var second = await WaitForActivityAsync(source, worker, itemId, opts);
+            Assert.NotNull(second);
+            Assert.Equal("process-cpu", second!.Reason);
+        }
+        finally
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+                process.WaitForExit(1000);
+            }
+            catch { }
+        }
     }
 
     // ── State recovery mapping (mirrors DeadWorkerReaper) ────────────────────
@@ -685,6 +838,89 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     // ── Test doubles ─────────────────────────────────────────────────────────
+
+    private static DiagProcess StartBusyProcess(WorkItemId itemId)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "/bin/sh",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("while :; do :; done");
+        psi.Environment[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable] = itemId.ToString();
+        return DiagProcess.Start(psi)
+            ?? throw new InvalidOperationException("failed to start busy test process");
+    }
+
+    private static async Task<WorkerProgressActivity?> WaitForActivityAsync(
+        IWorkerProgressActivitySource source,
+        WorkerRegistration worker,
+        WorkItemId itemId,
+        WorkerProgressWatchdogOptions opts,
+        string? requiredReason = null)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        WorkerProgressActivity? last = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            last = await source.ObserveAsync(worker, itemId, opts, CancellationToken.None);
+            if (last is not null
+                && (requiredReason is null || string.Equals(last.Reason, requiredReason, StringComparison.Ordinal)))
+            {
+                return last;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
+
+        return last;
+    }
+
+    private sealed class ScriptedWorkerProgressActivitySource(WorkerProgressActivity? activity) : IWorkerProgressActivitySource
+    {
+        public int Calls { get; private set; }
+
+        public ValueTask<WorkerProgressActivity?> ObserveAsync(
+            WorkerRegistration worker,
+            WorkItemId itemId,
+            WorkerProgressWatchdogOptions opts,
+            CancellationToken ct)
+        {
+            Calls++;
+            return ValueTask.FromResult(activity);
+        }
+    }
+
+    private sealed class ActiveSandboxProviderStub(WorkItemId itemId) : ISandboxProvider, IActiveSandboxProvider
+    {
+        private static readonly NoopShutdownSandbox Sandbox = new();
+
+        public string Name => "active-sandbox-test";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
+            => [(itemId, Sandbox)];
+    }
+
+    private sealed class NoopShutdownSandbox : IShutdownTeardownSandbox
+    {
+        public string Id => "noop";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// Lets the test stamp synthetic stream-file activity per work item.

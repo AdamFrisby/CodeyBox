@@ -16,10 +16,10 @@ namespace CodeyBox.Orchestrator;
 /// (commit, branch push, state transition WorkComplete/Auditing). In both
 /// cases the worker holds its pool slot indefinitely, starving Queued and
 /// finishing-phase items behind it. The watchdog observes
-/// <c>item.UpdatedAt</c> + agent-stream file mtimes: when neither advances
-/// for <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/> the
-/// worker is recycled and (when configured) the item auto-retries from its
-/// nearest recoverable resume state — without cascade-cancelling healthy
+/// <c>item.UpdatedAt</c> + agent-stream file mtimes + worker-side activity:
+/// when none advances for <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/>
+/// the worker is recycled and (when configured) the item auto-retries from
+/// its nearest recoverable resume state — without cascade-cancelling healthy
 /// dependents.
 /// </para>
 ///
@@ -35,6 +35,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly IWorkItemStore _store;
     private readonly ITaskQueue _queue;
     private readonly IAgentStreamStore? _streams;
+    private readonly IWorkerProgressActivitySource? _activitySource;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
@@ -57,7 +58,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        IWorkerProgressActivitySource? activitySource = null)
     {
         _registry = registry;
         _store = store;
@@ -65,6 +67,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _optsAccessor = optionsAccessor;
         _log = log;
         _streams = streams;
+        _activitySource = activitySource;
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
@@ -79,8 +82,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IAgentStreamStore? streams = null,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier) { }
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        IWorkerProgressActivitySource? activitySource = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -157,6 +161,15 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
                 if (lastProgress > cutoff) continue;
 
+                var workerActivity = await GetWorkerActivityAsync(worker, itemId, opts, ct);
+                if (workerActivity is not null)
+                {
+                    _log.LogDebug(
+                        "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
+                        worker.WorkerId, itemId, workerActivity.Reason);
+                    continue;
+                }
+
                 var sinceProgress = (long)(now - lastProgress).TotalSeconds;
                 AuditLog.WorkItemWatchdogStuck(
                     itemId, worker.WorkerId, item.State, sinceProgress,
@@ -176,6 +189,29 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Worker-progress watchdog sweep failed");
+        }
+    }
+
+    private async ValueTask<WorkerProgressActivity?> GetWorkerActivityAsync(
+        WorkerRegistration worker,
+        WorkItemId itemId,
+        WorkerProgressWatchdogOptions opts,
+        CancellationToken ct)
+    {
+        if (_activitySource is null)
+            return null;
+        if (!opts.ProcessCpuProgressSignalEnabled && !opts.ActiveSandboxProgressSignalEnabled)
+            return null;
+
+        try
+        {
+            return await _activitySource.ObserveAsync(worker, itemId, opts, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Watchdog: failed to read worker activity for {ItemId}; treating as no activity", itemId);
+            return null;
         }
     }
 
