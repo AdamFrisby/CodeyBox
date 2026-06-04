@@ -101,37 +101,70 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     {
         var item = Item();
         await _store.CreateAsync(item);
-        var blocking = new BlockingPipeline(_store);
+        var blocking = new BlockingPipeline();
         var orchestrator = new OrchestratorService(
             _queue,
             _store,
             blocking,
             new CancellationRegistry(CancellationToken.None),
-            new OrchestratorOptions { MaxConcurrentWorkers = 2 },
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 2,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+            },
             NullLogger<OrchestratorService>.Instance);
 
-        await _queue.EnqueueAsync(item.Id);
-        await orchestrator.StartAsync(CancellationToken.None);
-        await blocking.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            await _queue.EnqueueAsync(item.Id);
+            await orchestrator.StartAsync(CancellationToken.None);
+            await blocking.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        var watchdog = BuildWatchdog(
-            new WorkerPoolHealthWatchdogOptions
+            var health = BuildHealthSource(orchestrator: orchestrator);
+            var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
+            Assert.DoesNotContain(candidates, c => c.Id == item.Id);
+
+            var watchdog = BuildWatchdog(
+                new WorkerPoolHealthWatchdogOptions
+                {
+                    StallTimeout = TimeSpan.FromMinutes(1),
+                    CheckInterval = TimeSpan.FromMinutes(1),
+                    RecoveryVerificationDelay = TimeSpan.Zero,
+                },
+                health);
+
+            _time.Advance(TimeSpan.FromMinutes(2));
+            await watchdog.RunOnceAsync(CancellationToken.None);
+
+            Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+        }
+        finally
+        {
+            blocking.Release.TrySetResult();
+            try
             {
-                StallTimeout = TimeSpan.FromMinutes(1),
-                CheckInterval = TimeSpan.FromMinutes(1),
-                RecoveryVerificationDelay = TimeSpan.Zero,
-            },
-            BuildHealthSource(orchestrator: orchestrator));
+                await WaitUntilAsync(
+                    () => orchestrator.CurrentlyRunningTotal == 0,
+                    TimeSpan.FromSeconds(10));
+                using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await orchestrator.StopAsync(stopCts.Token);
+            }
+            finally
+            {
+                orchestrator.Dispose();
+            }
+        }
+    }
 
-        _time.Advance(TimeSpan.FromMinutes(2));
-        await watchdog.RunOnceAsync(CancellationToken.None);
-
-        Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.stalled");
-
-        blocking.Release.SetResult();
-        await blocking.Exited.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await orchestrator.StopAsync(CancellationToken.None);
-        orchestrator.Dispose();
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (!condition())
+        {
+            if (DateTimeOffset.UtcNow >= deadline)
+                throw new TimeoutException("Timed out waiting for condition.");
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
     }
 
     [Fact]
@@ -631,31 +664,15 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
     private sealed class BlockingPipeline : IPipelineRunner
     {
-        private readonly IWorkItemStore _store;
-
-        public BlockingPipeline(IWorkItemStore store) => _store = store;
-
         public TaskCompletionSource Started { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public TaskCompletionSource Exited { get; } =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
-            await _store.UpdateAsync(item.With(WorkItemState.Working), CancellationToken.None);
-            Started.SetResult();
-            try
-            {
-                await Release.Task;
-                var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-                await _store.UpdateAsync(current.With(WorkItemState.Done), CancellationToken.None);
-            }
-            finally
-            {
-                Exited.SetResult();
-            }
+            Started.TrySetResult();
+            await Release.Task.WaitAsync(ct);
         }
     }
 
