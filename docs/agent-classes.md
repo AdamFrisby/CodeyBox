@@ -75,6 +75,22 @@ only a tiebreaker when scores are equal. Keep the obvious order for readability
 | `DisplayName` | no | Human label for logs. Defaults to `Id`. |
 | `Members` | yes | One or more members. Order is a last-resort tiebreaker; `QualityScore` drives selection. |
 
+### Override layering (extra-config)
+
+`CodeyBox:AgentClasses` uses **REPLACE-on-override** semantics, not the
+standard .NET positional array merge. If `codeybox-extra.json` (or any
+higher-precedence configuration source) supplies any key under
+`CodeyBox:AgentClasses`, that layer's view fully replaces the base — there
+is no element-by-index blend. An operator override is free to remove a
+member, drop a class, or reorder members without re-introducing the
+trailing element of the base array. The resolved member list for each
+class is logged at `Information` on startup and on every hot-reload so the
+applied set is visible:
+
+```
+AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscription), codex/gpt-5.5(Subscription)]
+```
+
 ### Member fields
 
 | Field | Required | Description |

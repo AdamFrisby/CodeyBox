@@ -92,6 +92,18 @@ public static class AgentClassesConfigBuilder
                     "AgentClass '{ClassId}' has no PayPerApi fallback — items may wait indefinitely if all subscriptions are exhausted",
                     classOpts.Id);
 
+            // Surface the resolved member list so operators can audit exactly
+            // what their extra-config override produced. Without this log, a
+            // positional-merge accident (or an off-by-one in a member edit)
+            // can quietly enable an agent the operator never named.
+            log.LogInformation(
+                "AgentClass '{ClassId}' resolved members: [{Members}]",
+                classOpts.Id,
+                string.Join(", ", members.Select(m =>
+                    string.IsNullOrEmpty(m.ModelId)
+                        ? $"{m.Agent.Value}({m.Billing})"
+                        : $"{m.Agent.Value}/{m.ModelId}({m.Billing})")));
+
             result.Add(new AgentClass
             {
                 Id = classOpts.Id,

@@ -211,7 +211,15 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     }
 }
 
-builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
+// AddOptions + PostConfigure instead of plain Configure so the AgentClasses
+// override resolver runs after the binder. The default ConfigurationBinder
+// merges arrays positionally — for AgentClasses that's a silent footgun
+// (a shorter operator override exposes the base array's trailing element).
+// The post-configure step REPLACES AgentClasses with the highest-precedence
+// provider's view, and re-runs on every IOptionsMonitor reload.
+builder.Services.AddOptions<CodeyBoxOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox"))
+    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
