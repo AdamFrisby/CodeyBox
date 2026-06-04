@@ -60,9 +60,14 @@ public static class AgentClassesOverrideResolver
         var winner = FindHighestPrecedenceProvider(root);
         if (winner is null) return;
 
+        // Empty snapshot can mean the winning provider stored the section key
+        // with no children — e.g. JSON "AgentClasses": [] or "AgentClasses":
+        // null — which is an OPERATOR INTENT to clear the list. We REPLACE
+        // with an empty list rather than falling back to lower layers; the
+        // alternative would silently keep the base classes active and defeat
+        // the same footgun this resolver exists to prevent.
         var snapshot = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         EnumerateInto(winner, SectionPath, snapshot);
-        if (snapshot.Count == 0) return;
 
         var subRoot = new ConfigurationBuilder()
             .Add(new MemoryConfigurationSource { InitialData = snapshot })
@@ -79,10 +84,22 @@ public static class AgentClassesOverrideResolver
         // order; iterate in reverse so the highest-precedence supplier wins.
         foreach (var provider in root.Providers.Reverse())
         {
-            if (provider.GetChildKeys(Array.Empty<string>(), SectionPath).Any())
+            if (ProviderSuppliesSection(provider))
                 return provider;
         }
         return null;
+    }
+
+    private static bool ProviderSuppliesSection(IConfigurationProvider provider)
+    {
+        // Populated case: provider has indexed child keys under AgentClasses.
+        if (provider.GetChildKeys(Array.Empty<string>(), SectionPath).Any())
+            return true;
+        // Explicit-empty case: provider stored the section key itself (JSON
+        // "AgentClasses": [] / null records a key with no children). Without
+        // this branch a deliberate clear is silently ignored — the original
+        // 2026-06-04 footgun in inverted form.
+        return provider.TryGet(SectionPath, out _);
     }
 
     private static void EnumerateInto(
