@@ -784,28 +784,32 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private static string SerializeSanitizer(ClaudeThinkingBlockSanitizerOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
 
-    private static string SerializeQuotaRouter(QuotaRouterConfig opts) =>
-        JsonSerializer.Serialize(
+    private static string SerializeQuotaRouter(QuotaRouterConfig opts)
+    {
+        var mapped = QuotaRouterConfigMapper.ToOptions(opts);
+        return JsonSerializer.Serialize(
             new
             {
                 opts.MinQuotaPct,
-                MinQuotaPctByWindow = opts.MinQuotaPctByWindow
+                MinQuotaPctByWindow = mapped.MinQuotaPctByWindow
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(kv => kv.Key, kv => kv.Value),
                 opts.StartFloorPct,
                 opts.EndFloorPct,
                 opts.RampWindowSeconds,
-                RampWindowByAgentSeconds = opts.RampWindowByAgentSeconds
+                RampWindowByAgentSeconds = mapped.RampWindowByAgent
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
-                    .ToDictionary(kv => kv.Key, kv => kv.Value),
-                FloorByAgent = opts.FloorByAgent
+                    .ToDictionary(kv => kv.Key, kv => (int)kv.Value.TotalSeconds),
+                FloorByAgent = mapped.FloorByAgent
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(kv => kv.Key, kv => new
                     {
                         kv.Value.MinQuotaPct,
                         kv.Value.StartFloorPct,
                         kv.Value.EndFloorPct,
-                        kv.Value.RampWindowSeconds,
+                        RampWindowSeconds = kv.Value.RampWindow is { } rampWindow
+                            ? checked((int)rampWindow.TotalSeconds)
+                            : (int?)null,
                     }),
                 opts.QuotaRecheckIntervalSeconds,
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
@@ -816,6 +820,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);
+    }
 
     private void ApplyPipelineTuningIfChanged(CodeyBoxOptions opts)
     {

@@ -14,7 +14,7 @@ namespace CodeyBox.Orchestrator;
 ///   <item>If no member is eligible, fail with <c>ROUTING_NO_ELIGIBLE</c> — no silent downgrade.</item>
 ///   <item>Compute each eligible member's effective score: base + sum of applicable time-of-day modifiers.</item>
 ///   <item>Sort descending by effective score; ties broken by Subscription before PayPerApi, then original config order.</item>
-///   <item>Probe quota in sorted order; pick the first member at or above <see cref="QuotaRouterOptions.MinQuotaPct"/>.</item>
+///   <item>Probe quota in sorted order; pick the first member allowed by <see cref="QuotaGatePolicy"/> (per-agent ramp floors, per-window floors, unknown-policy handling, and budget MIN-gating).</item>
 ///   <item>When the caller supplies an <see cref="IAgentSlotGate"/>, each candidate that passes quota must also fit under its per-agent concurrency cap (the gate atomically test-and-reserves); if not, spill to the next eligible member instead of pinning the item to a saturated agent.</item>
 ///   <item>PayPerApi members use <see cref="PayPerApiQuotaProbe"/> (always 100%).</item>
 ///   <item>Subscription members with no registered probe fall back to <see cref="NullQuotaProbe"/> and follow the configured unknown policy.</item>
@@ -45,6 +45,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
     private readonly IAgentBudgetProvider? _budgetProvider;
+    private readonly QuotaGatePolicy _quotaGatePolicy;
     // Shared swappable holder for per-agent operator caps. Same instance is
     // held by OrchestratorService and PipelineRunner so hot-reload writes
     // propagate through one snapshot. Null when no concurrency state is wired
@@ -126,10 +127,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _burnEstimator = burnEstimator;
         _runningCounters = runningCounters;
         _budgetProvider = budgetProvider;
+        _quotaGatePolicy = new QuotaGatePolicy(opts);
         _concurrencySnapshot = concurrencySnapshot;
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
     }
+
+    public QuotaRouterOptions QuotaOptions => _opts;
+
+    public QuotaGatePolicy QuotaGatePolicy => _quotaGatePolicy;
 
     /// <summary>
     /// Combines a probe-derived quota with the operator's local budget for the
@@ -1577,19 +1583,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             var quota = ResolveMemberQuota(snapshot, member);
             quota = (await ApplyBudgetAsync(member, quota, ct)).Quota;
-            // Skip unknown (probe failed / no data) and members above the
-            // threshold (would have been chosen by the router and so don't
-            // need to gate park-time). Uses the fixed MinQuotaPct fallback
-            // here — this path computes retry-scheduling park time, not the
-            // dispatch gate, and a stable threshold keeps the retry hint
-            // independent of where in the ramp the member happens to be.
+            // Skip unknown (probe failed / no data) and members above their
+            // effective floor (they would be routable, so they don't need to
+            // gate park-time). Use the same per-agent/window policy as dispatch
+            // so reset hints don't drift from the router's actual availability
+            // decision.
             if (!quota.IsKnown) continue;
-            if (quota.AvailablePct >= _opts.MinQuotaPct) continue;
-            var resetAt = EarliestKnownWindowReset(quota, nowUtc, futureOnly: false);
-            if (resetAt is null) continue;
+            var gate = _quotaGatePolicy.Evaluate(member, quota, nowUtc);
+            if (gate.Allow) continue;
+            if (QuotaGatePolicy.ResolveResetHint(quota, gate) is not { } resetAt) continue;
 
-            if (earliest is null || resetAt.Value < earliest.Value)
-                earliest = resetAt.Value;
+            if (earliest is null || resetAt < earliest.Value)
+                earliest = resetAt;
         }
         return earliest;
     }
@@ -1601,64 +1606,21 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         DateTimeOffset nowUtc,
         CancellationToken ct)
     {
-        // No real reading: the configured unknown policy decides (fail-open,
-        // fail-cautious, or gate on recently-observed runtime failures). The
-        // last-known-good layer has already had its chance to substitute a
-        // recent reading before we get here.
-        if (!quota.IsKnown)
-        {
-            return _opts.UnknownPolicy switch
-            {
-                QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
-                QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
-                _ => await EvaluateObservedFailuresAsync(member, ct),
-            };
-        }
+        var recentObservedFailureReason = !quota.IsKnown
+            && _opts.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures
+            ? await ResolveRecentObservedFailureReasonAsync(member, ct)
+            : null;
+        var gate = _quotaGatePolicy.Evaluate(
+            member,
+            quota,
+            nowUtc,
+            recentObservedFailure: recentObservedFailureReason is not null,
+            observedFailureReason: recentObservedFailureReason);
+        if (!gate.Allow || !quota.IsKnown)
+            return gate;
 
-        var availablePct = quota.AvailablePct;
-        var resetAt = quota.ResetAt;
-
-        // The time-based ramp is only meaningful for Subscription members:
-        // their AvailablePct is driven by the agent's quota window, and
-        // <paramref name="resetAt"/> is that window's reset. PayPerApi has
-        // no agent quota window — its AvailablePct is either 100% (probe)
-        // or the operator's local-budget MIN, and the budget defines its
-        // own reset cycle. Falling back to the fixed MinQuotaPct keeps the
-        // operator's spend cap honest regardless of where in the agent
-        // window we happen to be.
-        var floor = member.Billing == AgentBilling.Subscription
-            ? ComputeEffectiveFloorPct(member.Agent, resetAt, nowUtc)
-            : _opts.MinQuotaPct;
-        if (availablePct >= floor)
-        {
-            // Per-window floor check sits alongside the aggregated/time-ramp
-            // floor: a small window (e.g. claude five_hour) can be the binding
-            // constraint during a burst even when the aggregated reading is
-            // healthy, because 10 % of a 5 h window is thin headroom relative
-            // to MaxConcurrent + cache-staleness overshoot. Only applies to
-            // Subscription members — PayPerApi has no provider window concept.
-            if (member.Billing == AgentBilling.Subscription
-                && quota.Windows is { Count: > 0 } windows)
-            {
-                foreach (var w in windows)
-                {
-                    if (w.AvailablePct < 0) continue; // unknown — gated by aggregated check above
-                    var windowFloor = ResolveWindowFloorPct(member.Agent, w.Name);
-                    if (w.AvailablePct < windowFloor)
-                    {
-                        return new QuotaGateDecision(
-                            false,
-                            $"quota below window floor ({w.Name}: {w.AvailablePct:F1}% < {windowFloor:F1}%)");
-                    }
-                }
-            }
-
-            var rateAware = await EvaluateRateAwareGateAsync(member, availablePct, ct);
-            return rateAware ?? new QuotaGateDecision(true, "quota available");
-        }
-
-        // Known and below floor.
-        return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)");
+        var rateAware = await EvaluateRateAwareGateAsync(member, quota.AvailablePct, ct);
+        return rateAware ?? gate;
     }
 
     private void RecordAvailabilityAndMaybeNotify(
@@ -1800,19 +1762,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// still held back by a global per-window reserve meant for an oversight
     /// agent.
     /// </summary>
-    internal double ResolveWindowFloorPct(AgentKind agent, string windowName)
-    {
-        var settings = ResolveFloorSettings(_opts, agent);
-        if (TryGetFloorOverride(_opts, agent, out var perAgent)
-            && perAgent?.MinQuotaPct is { } agentMin)
-            return agentMin;
-
-        if (string.IsNullOrEmpty(windowName)) return settings.MinQuotaPct;
-        if (_opts.MinQuotaPctByWindow is { } overrides
-            && overrides.TryGetValue(windowName, out var perWindow))
-            return perWindow;
-        return settings.MinQuotaPct;
-    }
+    internal double ResolveWindowFloorPct(AgentKind agent, string windowName) =>
+        _quotaGatePolicy.ResolveWindowFloorPct(agent, windowName);
 
     /// <summary>
     /// Returns the effective quota floor for <paramref name="agent"/> at
@@ -1836,95 +1787,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// </para>
     /// </summary>
     internal double ComputeEffectiveFloorPct(AgentKind agent, DateTimeOffset? resetAt, DateTimeOffset nowUtc)
-        => ComputeEffectiveFloorPct(_opts, agent, resetAt, nowUtc);
+        => _quotaGatePolicy.ComputeEffectiveFloorPct(agent, resetAt, nowUtc);
 
     internal static double ComputeEffectiveFloorPct(
         QuotaRouterOptions opts,
         AgentKind agent,
         DateTimeOffset? resetAt,
         DateTimeOffset nowUtc)
-    {
-        var settings = ResolveFloorSettings(opts, agent);
-        if (resetAt is not { } reset) return settings.MinQuotaPct;
-        if (settings.RampWindow <= TimeSpan.Zero) return settings.MinQuotaPct;
-
-        var untilReset = reset - nowUtc;
-        var fractionElapsed = 1.0 - untilReset.TotalSeconds / settings.RampWindow.TotalSeconds;
-        if (double.IsNaN(fractionElapsed) || double.IsInfinity(fractionElapsed))
-            return settings.MinQuotaPct;
-        fractionElapsed = Math.Clamp(fractionElapsed, 0.0, 1.0);
-
-        var floor = settings.StartFloorPct + (settings.EndFloorPct - settings.StartFloorPct) * fractionElapsed;
-        var lo = Math.Min(settings.StartFloorPct, settings.EndFloorPct);
-        var hi = Math.Max(settings.StartFloorPct, settings.EndFloorPct);
-        return Math.Clamp(floor, lo, hi);
-    }
+        => QuotaGatePolicy.ComputeEffectiveFloorPct(opts, agent, resetAt, nowUtc);
 
     internal static double ResolveWindowFloorPct(
         QuotaRouterOptions opts,
         AgentKind agent,
         string windowName)
-    {
-        var settings = ResolveFloorSettings(opts, agent);
-        if (TryGetFloorOverride(opts, agent, out var perAgent)
-            && perAgent?.MinQuotaPct is { } agentMin)
-            return agentMin;
-
-        if (string.IsNullOrEmpty(windowName)) return settings.MinQuotaPct;
-        if (opts.MinQuotaPctByWindow is { } overrides
-            && overrides.TryGetValue(windowName, out var perWindow))
-            return perWindow;
-        return settings.MinQuotaPct;
-    }
-
-    private static AgentFloorSettings ResolveFloorSettings(QuotaRouterOptions opts, AgentKind agent)
-    {
-        var perAgent = TryGetFloorOverride(opts, agent, out var overrideOptions)
-            ? overrideOptions
-            : null;
-        return new AgentFloorSettings(
-            MinQuotaPct: perAgent?.MinQuotaPct ?? opts.MinQuotaPct,
-            StartFloorPct: perAgent?.StartFloorPct ?? opts.StartFloorPct,
-            EndFloorPct: perAgent?.EndFloorPct ?? opts.EndFloorPct,
-            RampWindow: ResolveRampWindow(opts, agent, perAgent));
-    }
-
-    private static TimeSpan ResolveRampWindow(
-        QuotaRouterOptions opts,
-        AgentKind agent,
-        QuotaFloorOverrideOptions? perAgent)
-    {
-        if (perAgent?.RampWindow is { } rampWindow)
-            return rampWindow;
-        return GetRampWindow(opts, agent);
-    }
-
-    private static bool TryGetFloorOverride(
-        QuotaRouterOptions opts,
-        AgentKind agent,
-        out QuotaFloorOverrideOptions? overrideOptions)
-    {
-        overrideOptions = null;
-        if (string.IsNullOrEmpty(agent.Value)) return false;
-        return opts.FloorByAgent is { } overrides
-            && overrides.TryGetValue(agent.Value, out overrideOptions);
-    }
-
-    private static TimeSpan GetRampWindow(QuotaRouterOptions opts, AgentKind agent)
-    {
-        if (!string.IsNullOrEmpty(agent.Value)
-            && opts.RampWindowByAgent is { } overrides
-            && overrides.TryGetValue(agent.Value, out var perAgent)
-            && perAgent > TimeSpan.Zero)
-            return perAgent;
-        return opts.RampWindow;
-    }
-
-    private readonly record struct AgentFloorSettings(
-        double MinQuotaPct,
-        double StartFloorPct,
-        double EndFloorPct,
-        TimeSpan RampWindow);
+        => QuotaGatePolicy.ResolveWindowFloorPct(opts, agent, windowName);
 
     /// <summary>
     /// Rate-aware gate: returns a denying <see cref="QuotaGateDecision"/> when
@@ -2052,17 +1928,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// <summary>Returns every class id known to the router. Used by /concurrency to enumerate fits.</summary>
     public IReadOnlyCollection<string> ClassIds => Volatile.Read(ref _routingConfig).Catalog.Keys.ToList();
 
-    private async Task<QuotaGateDecision> EvaluateObservedFailuresAsync(AgentMembership member, CancellationToken ct)
+    private async Task<string?> ResolveRecentObservedFailureReasonAsync(AgentMembership member, CancellationToken ct)
     {
         if (_quotaFailures is null)
-            return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+            return null;
 
         var observedAt = await _quotaFailures.GetMostRecentAsync(
             member.Agent, member.ModelId, _opts.ObservedFailureWindow, _time.GetUtcNow(), ct);
         if (observedAt is { } seenAt)
-            return new QuotaGateDecision(false, $"quota unknown; {FormatObservedFailureReason(member, seenAt, _time.GetUtcNow())}");
+            return $"quota unknown; {FormatObservedFailureReason(member, seenAt, _time.GetUtcNow())}";
 
-        return new QuotaGateDecision(true, "quota unknown; no recent quota-shaped failure");
+        return null;
     }
 
     /// <summary>
@@ -2088,52 +1964,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// <summary>Sentinel ModelId meaning "any model in the bucket list is acceptable".</summary>
     internal const string AutoModelSentinel = "auto";
 
-    internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
-    {
-        if (string.IsNullOrWhiteSpace(member.ModelId))
-            return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
-
-        if (snapshot.PerModel.TryGetValue(member.ModelId, out var modelQuota))
-            return new EffectiveQuota(
-                modelQuota.AvailablePct, modelQuota.ResetAt, modelQuota.Window,
-                modelQuota.Windows.Count > 0 ? modelQuota.Windows : snapshot.Windows);
-
-        // ModelId is set but not in PerModel.
-        //
-        // For the "auto" sentinel (gemini ModelRouterService picks per-turn from the
-        // available pool), best-of-fleet across the bucket list is the right reading —
-        // any single model with quota is enough for auto-routing to succeed.
-        if (string.Equals(member.ModelId, AutoModelSentinel, StringComparison.OrdinalIgnoreCase)
-            && snapshot.PerModel.Count > 0)
-        {
-            ModelQuota? best = null;
-            foreach (var q in snapshot.PerModel.Values)
-            {
-                if (best is null || q.AvailablePct > best.AvailablePct)
-                    best = q;
-            }
-            // ResetAt is the earliest reset across all bucket entries (the soonest a
-            // currently-walled member will become available again).
-            DateTimeOffset? earliestReset = null;
-            foreach (var q in snapshot.PerModel.Values)
-            {
-                if (q.ResetAt is { } r && (earliestReset is null || r < earliestReset))
-                    earliestReset = r;
-            }
-            return new EffectiveQuota(best!.AvailablePct, earliestReset, best.Window, snapshot.Windows);
-        }
-
-        // Unknown model id on a probe that DOES provide per-model data — the operator
-        // configured a model the probe has no signal for. Fail safe: surface as
-        // unknown so QuotaUnknownPolicy gates it, rather than silently falling back
-        // to the overall account percentage.
-        if (snapshot.PerModel.Count > 0)
-            return new EffectiveQuota(-1, null, null, Unknown: QuotaUnknownReason.Permanent);
-
-        // Probe returned no per-model breakdown at all (e.g. NullQuotaProbe, or a
-        // provider whose API has no per-model dimension). Fall back to overall.
-        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
-    }
+    internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member) =>
+        QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
 
     /// <summary>
     /// Returns true when <paramref name="member"/> declares every tag in
@@ -2271,8 +2103,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         int BaseScore,
         int EffectiveScore,
         int ConfigIndex);
-
-    private sealed record QuotaGateDecision(bool Allow, string Reason);
 
     /// <summary>
     /// Result of MIN-combining a probe quota with the local operator budget.
@@ -2430,7 +2260,7 @@ public sealed class QuotaRouterOptions
     /// <para>
     /// When the ramp IS computable, <see cref="StartFloorPct"/> /
     /// <see cref="EndFloorPct"/> drive the effective floor instead — see
-    /// <see cref="AgentClassRouter.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>.
+    /// <see cref="QuotaGatePolicy.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>.
     /// </para>
     /// </summary>
     public double MinQuotaPct { get; set; } = 10.0;
@@ -2442,7 +2272,7 @@ public sealed class QuotaRouterOptions
     /// <see cref="WindowQuota.AvailablePct"/> to be at or above its window's
     /// floor; an unlisted window falls back to <see cref="MinQuotaPct"/>.
     /// Sits alongside (not under) the time-ramped floor computed in
-    /// <see cref="AgentClassRouter.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>:
+    /// <see cref="QuotaGatePolicy.ComputeEffectiveFloorPct(AgentKind, DateTimeOffset?, DateTimeOffset)"/>:
     /// the ramp governs the aggregated min-across-windows reading, while this
     /// map governs each window independently so a small window like
     /// <c>five_hour</c> can hold more headroom than its share of the aggregate

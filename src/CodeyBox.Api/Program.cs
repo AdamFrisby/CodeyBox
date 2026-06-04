@@ -893,6 +893,8 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return QuotaRouterConfigMapper.ToOptions(cbOpts.QuotaRouter);
 });
+builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
+    new QuotaGatePolicy(sp.GetRequiredService<QuotaRouterOptions>()));
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2533,6 +2535,7 @@ app.MapGet("/quota", async (
     AgentClassRouter? router,
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
+    QuotaGatePolicy quotaGatePolicy,
     IAgentBudgetProvider? budgetProvider,
     IAgentPauseController? agentPauses,
     ILoggerFactory loggerFactory,
@@ -2573,12 +2576,18 @@ app.MapGet("/quota", async (
         var recentFailure = recentFailuresForProbe.Count > 0;
         var paused = pausedByKey.TryGetValue(member.RouteKey, out var pause)
             || pausedByAgent.TryGetValue(member.Agent, out pause);
-        var quotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options);
-        var defaultQuotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options);
         var modelKeys = snapshot.PerModel.Keys
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var accountQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+        bool WouldAllow(AgentMembership gateMember, EffectiveQuota quota, bool hasRecentFailure) =>
+            quotaGatePolicy.Evaluate(
+                gateMember,
+                quota,
+                now,
+                recentObservedFailure: hasRecentFailure,
+                observedFailureReason: "recent observed quota failure").Allow;
         snapshots.Add(new
         {
             agent = member.Agent.Value,
@@ -2608,16 +2617,20 @@ app.MapGet("/quota", async (
             pauseExpiresAt = pause?.ExpiresAt,
             dispatchStatus = paused ? "paused" : "quota",
             dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
-            wouldAllow = !paused && quotaWouldAllow,
-            defaultModelWouldAllow = !paused && defaultQuotaWouldAllow,
+            wouldAllow = !paused && WouldAllow(member, accountQuota, recentFailure),
+            defaultModelWouldAllow = !paused && WouldAllow(member, accountQuota, recentDefaultFailure),
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
-                modelId => !paused && QuotaRouter.WouldAllow(
-                        snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
-                        recentFailuresForProbe.Any(f =>
-                            f.Agent == member.Agent &&
-                            string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
-                        options),
+                modelId =>
+                {
+                    if (paused) return false;
+                    var modelMember = member with { ModelId = modelId };
+                    var modelQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, modelMember);
+                    var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
+                        f.Agent == probe.Kind &&
+                        string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
+                    return WouldAllow(modelMember, modelQuota, modelHasRecentFailure);
+                },
                 StringComparer.OrdinalIgnoreCase),
         });
         kindAggregateCounts[member.Agent.Value] =

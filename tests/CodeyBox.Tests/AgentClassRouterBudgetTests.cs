@@ -261,8 +261,9 @@ public sealed class AgentClassRouterBudgetTests
         // Both probe and budget are exhausted; the budget's reset is sooner.
         // ApplyBudgetAsync must merge ResetAt to the earlier of the two so the
         // retry scheduler wakes at the soonest opportunity.
-        var probeReset = new DateTimeOffset(2026, 5, 29, 15, 0, 0, TimeSpan.Zero);
-        var budgetReset = new DateTimeOffset(2026, 5, 29, 14, 0, 0, TimeSpan.Zero);
+        var now = DateTimeOffset.UtcNow;
+        var budgetReset = now.AddDays(6);
+        var probeReset = budgetReset.AddHours(1);
         var cls = new AgentClass
         {
             Id = "frontier",
@@ -287,8 +288,9 @@ public sealed class AgentClassRouterBudgetTests
         // Mirror image of the previous test: the probe reset is sooner, so the
         // merge must keep it rather than the later budget reset. Guards against an
         // inverted comparison in ApplyBudgetAsync's ResetAt merge.
-        var probeReset = new DateTimeOffset(2026, 5, 29, 14, 0, 0, TimeSpan.Zero);
-        var budgetReset = new DateTimeOffset(2026, 5, 29, 15, 0, 0, TimeSpan.Zero);
+        var now = DateTimeOffset.UtcNow;
+        var probeReset = now.AddDays(6);
+        var budgetReset = probeReset.AddHours(1);
         var cls = new AgentClass
         {
             Id = "frontier",

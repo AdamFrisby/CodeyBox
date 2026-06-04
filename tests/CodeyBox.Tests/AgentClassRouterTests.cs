@@ -27,6 +27,15 @@ public sealed class AgentClassRouterTests
             QuotaRecheckInterval = TimeSpan.FromMinutes(5),
             IntraKindRoutingPolicy = policy,
         };
+        return BuildRouter(catalog, probes, opts, dispatchAvailability);
+    }
+
+    private static AgentClassRouter BuildRouter(
+        IEnumerable<AgentClass> catalog,
+        IEnumerable<IAgentQuotaProbe> probes,
+        QuotaRouterOptions opts,
+        IAgentDispatchAvailability? dispatchAvailability = null)
+    {
         return new AgentClassRouter(
             catalog.ToList(),
             probes,
@@ -425,6 +434,39 @@ public sealed class AgentClassRouterTests
             MakeItem("frontier"), null, CancellationToken.None);
 
         Assert.Equal(activeReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_UsesPerAgentEffectiveFloors()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var codexReset = now.AddHours(1);
+        var claudeReset = now.AddDays(7);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 20, ResetAt = claudeReset }),
+            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 5, ResetAt = codexReset }),
+        ], opts);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(claudeReset, earliest);
     }
 
     [Fact]

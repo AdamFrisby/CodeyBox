@@ -14,7 +14,7 @@ public sealed class WebAppHarnessTests
 {
     // Same fixtures as GraphicalSandboxTests — non-uniform vs uniform PNGs.
     private static readonly byte[] NonUniformPng = Convert.FromBase64String(
-        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGNgYGD4//8/AAYBAv4CsjmuAAAAAElFTkSuQmCC");
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFklEQVR4nGNgYGD4//8/lESwIAC7DABt4hfpRWPJuwAAAABJRU5ErkJggg==");
 
     private static readonly byte[] UniformPng = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAC0lEQVR4nGNgAAMAAAcAAbKGrPQAAAAASUVORK5CYII=");

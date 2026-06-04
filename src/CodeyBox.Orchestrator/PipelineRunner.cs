@@ -137,6 +137,7 @@ public sealed class PipelineRunner : IPipelineRunner
     // IAgentQuotaProbe singleton per agent kind regardless of caller.
     private readonly IReadOnlyDictionary<AgentKind, IAgentQuotaProbe>? _quotaProbesByKind;
     private readonly QuotaRouterOptions _auditQuotaOptions;
+    private readonly QuotaGatePolicy _auditQuotaGatePolicy;
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
@@ -273,7 +274,8 @@ public sealed class PipelineRunner : IPipelineRunner
             : auditQuotaProbes
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
-        _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
+        _auditQuotaOptions = auditQuotaOptions ?? classRouter?.QuotaOptions ?? new QuotaRouterOptions();
+        _auditQuotaGatePolicy = classRouter?.QuotaGatePolicy ?? new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
@@ -5570,9 +5572,15 @@ public sealed class PipelineRunner : IPipelineRunner
         // decision until the probe contributes the quota-window reset; near the
         // end of a ramped window the effective floor may be below the global
         // fallback.
-        var earlyBudgetFloor = ComputeAuditCandidateFloor(member, budget?.ResetAt);
-        if (budgetPct >= 0 && budget?.ResetAt is not null && budgetPct < earlyBudgetFloor)
-            return (false, $"local budget exhausted ({budgetPct:F1}% < {earlyBudgetFloor:F1}%)");
+        if (budgetPct >= 0 && budget is { ResetAt: { } budgetResetAt })
+        {
+            var earlyBudgetGate = _auditQuotaGatePolicy.Evaluate(
+                member,
+                new EffectiveQuota(budgetPct, budgetResetAt, null, budget.Windows),
+                DateTimeOffset.UtcNow);
+            if (!earlyBudgetGate.Allow)
+                return (false, FormatLocalBudgetRejected(budgetPct, earlyBudgetGate));
+        }
 
         if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
         {
@@ -5590,7 +5598,7 @@ public sealed class PipelineRunner : IPipelineRunner
         try
         {
             var snapshot = await probe.GetAvailabilityAsync(member, ct);
-            probeQuota = AgentClassRouter.ResolveMemberQuota(snapshot, member);
+            probeQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -5625,57 +5633,36 @@ public sealed class PipelineRunner : IPipelineRunner
         return EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);
     }
 
-    private double ComputeAuditCandidateFloor(AgentMembership member, DateTimeOffset? resetAt)
-        => member.Billing == AgentBilling.Subscription
-            ? AgentClassRouter.ComputeEffectiveFloorPct(
-                _auditQuotaOptions,
-                member.Agent,
-                resetAt,
-                DateTimeOffset.UtcNow)
-            : _auditQuotaOptions.MinQuotaPct;
-
     private (bool Allowed, string Reason) EvaluateAuditQuotaGate(
         AgentMembership member,
         EffectiveQuota quota,
         bool budgetOnly)
     {
         var combinedPct = quota.AvailablePct;
-        var floor = ComputeAuditCandidateFloor(member, quota.ResetAt);
-
-        if (combinedPct >= floor)
+        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, DateTimeOffset.UtcNow);
+        if (gate.Allow)
         {
-            if (member.Billing == AgentBilling.Subscription
-                && quota.Windows is { Count: > 0 } windows)
-            {
-                foreach (var w in windows)
-                {
-                    if (w.AvailablePct < 0) continue;
-                    var windowFloor = AgentClassRouter.ResolveWindowFloorPct(
-                        _auditQuotaOptions, member.Agent, w.Name);
-                    if (w.AvailablePct < windowFloor)
-                    {
-                        return (false,
-                            $"quota below window floor ({w.Name}: {w.AvailablePct:F1}% < {windowFloor:F1}%)");
-                    }
-                }
-            }
-
             return budgetOnly
                 ? (true, $"available (budget {combinedPct:F1}%)")
                 : (true, $"available ({combinedPct:F1}%)");
         }
 
-        if (combinedPct >= 0)
+        if (combinedPct >= 0 && gate.FloorPct is { } floor && string.IsNullOrEmpty(gate.WindowName))
             return (false, $"quota exhausted ({combinedPct:F1}% < {floor:F1}%)");
 
-        return _auditQuotaOptions.UnknownPolicy switch
-        {
-            QuotaUnknownPolicy.FailOpen => (true, "quota unknown; fail-open"),
-            QuotaUnknownPolicy.FailCautious => (false, "quota unknown; fail-cautious"),
-            // UseObservedFailures with no recent failure (we already checked
-            // above) means we have no evidence the candidate is unavailable.
-            _ => (true, "quota unknown; no recent observed failure"),
-        };
+        return (false, gate.Reason);
+    }
+
+    private static string FormatLocalBudgetRejected(double budgetPct, QuotaGateDecision gate)
+    {
+        return $"local budget exhausted ({FormatBudgetGateComparison(budgetPct, gate)})";
+    }
+
+    private static string FormatBudgetGateComparison(double budgetPct, QuotaGateDecision gate)
+    {
+        if (gate.FloorPct is { } floor && string.IsNullOrEmpty(gate.WindowName))
+            return $"{budgetPct:F1}% < {floor:F1}%";
+        return gate.Reason;
     }
 
     /// <summary>
@@ -6111,15 +6098,27 @@ public sealed class PipelineRunner : IPipelineRunner
                 var (budget, budgetFailedClosed) =
                     await ReadCandidateBudgetAsync(candidate.Agent, candidate.ModelId, ct);
                 var budgetPct = budget?.AvailablePct ?? -1;
-                var budgetFloor = ComputeAuditCandidateFloor(candidate, budget?.ResetAt);
-                if (budgetFailedClosed
-                    || (budgetPct >= 0 && budgetPct < budgetFloor))
+                string? budgetRejectedReason = null;
+                if (budgetPct >= 0 && budget is { } budgetSnapshot)
+                {
+                    var budgetGate = _auditQuotaGatePolicy.Evaluate(
+                        candidate,
+                        new EffectiveQuota(
+                            budgetPct,
+                            budgetSnapshot.ResetAt,
+                            null,
+                            budgetSnapshot.Windows),
+                        DateTimeOffset.UtcNow);
+                    if (!budgetGate.Allow)
+                        budgetRejectedReason = FormatBudgetGateComparison(budgetPct, budgetGate);
+                }
+                if (budgetFailedClosed || budgetRejectedReason is not null)
                 {
                     sawQuotaBlockedCandidate = true;
                     _log.LogInformation(
                         "Class '{ClassId}' member {Agent}/{Model} local budget exhausted ({Pct}); skipping for fallback (work item {WorkItemId})",
                         classId, candidate.Agent.Value, candidate.ModelId ?? "(default)",
-                        budgetFailedClosed ? "provider error" : $"{budgetPct:F1}% < {budgetFloor:F1}%", item.Id);
+                        budgetFailedClosed ? "provider error" : budgetRejectedReason, item.Id);
                     continue;
                 }
                 nextMember = candidate;
