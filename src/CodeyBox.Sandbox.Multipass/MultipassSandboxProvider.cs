@@ -2083,7 +2083,14 @@ test "$work" = present && test "$exec_wrapper" = present
         // not the pre-mount state; label it so a reader of the exception text
         // doesn't misread it as "this is what we saw before issuing mount".
         if (lastFailure is { } exhausted)
+        {
             ThrowIfProvisioningRetryExhausted("mount", exhausted);
+            ThrowProvisioningDeferred(
+                "mount",
+                "multipass-mount-retry-exhausted",
+                $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
+                $"{exhausted.Stderr.Trim()} (post-failure host source state: {lastFailureState})");
+        }
         throw new InvalidOperationException(
             $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
             $"{lastFailure?.Stderr.Trim()} (post-failure host source state: {lastFailureState})");
@@ -2098,7 +2105,7 @@ test "$work" = present && test "$exec_wrapper" = present
         CancellationToken ct)
     {
         var match = await TryReadExistingMountMatchesAsync(opts, name, host, sandbox, workItemId, ct);
-        if (match is not false)
+        if (match is true)
         {
             _log.LogWarning(
                 "multipass mount {Host} -> {Name}:{Sandbox} reported already-mounted; treating mount as successful partial completion",
@@ -2107,8 +2114,11 @@ test "$work" = present && test "$exec_wrapper" = present
         }
 
         _log.LogWarning(
-            "multipass mount target {Name}:{Sandbox} is already mounted from a different source; unmounting stale target before remount",
-            name, sandbox);
+            match is false
+                ? "multipass mount target {Name}:{Sandbox} is already mounted from a different source; unmounting stale target before remount"
+                : "multipass mount target {Name}:{Sandbox} reported already-mounted but existing source could not be verified; unmounting before remount",
+            name,
+            sandbox);
         var unmount = await RunAsync(
             opts,
             [opts.MultipassBinary, "umount", $"{name}:{sandbox}"],
@@ -2130,8 +2140,20 @@ test "$work" = present && test "$exec_wrapper" = present
             stdin: null,
             ct: ct,
             workItemId: workItemId);
-        if (remount.ExitCode == 0 || IsMountAlreadyMounted(remount, sandbox))
+        if (remount.ExitCode == 0)
             return true;
+
+        if (IsMountAlreadyMounted(remount, sandbox))
+        {
+            var remountMatch = await TryReadExistingMountMatchesAsync(opts, name, host, sandbox, workItemId, ct);
+            if (remountMatch is true)
+                return true;
+
+            _log.LogWarning(
+                "multipass remount {Host} -> {Name}:{Sandbox} still reports already-mounted without a verified source match; mount will retry",
+                host, name, sandbox);
+            return false;
+        }
 
         ThrowIfProvisioningRetryExhausted("mount", remount);
         return false;
@@ -2152,7 +2174,10 @@ test "$work" = present && test "$exec_wrapper" = present
             ct: ct,
             workItemId: workItemId);
         if (info.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("info", info);
             return null;
+        }
 
         try
         {
@@ -2183,12 +2208,13 @@ test "$work" = present && test "$exec_wrapper" = present
                     var keyIsHost = string.Equals(mount.Name, host, StringComparison.Ordinal);
                     var sourceIsHost = string.Equals(source, host, StringComparison.Ordinal);
 
-                    if (keyIsSandbox || targetIsSandbox)
-                        return source is null || sourceIsHost;
-                    if ((keyIsHost || sourceIsHost) && target is null)
-                        return true;
-                    if ((keyIsHost || sourceIsHost) && targetIsSandbox)
-                        return true;
+                    var targetMatches = keyIsSandbox || targetIsSandbox;
+                    var sourceMatches = keyIsHost || sourceIsHost;
+
+                    if (targetMatches)
+                        return sourceMatches;
+                    if (sourceMatches)
+                        return targetMatches;
                 }
             }
         }
@@ -2878,11 +2904,19 @@ test "$work" = present && test "$exec_wrapper" = present
         if (!MultipassDaemonRetry.TryGetRetryExhaustedErrorClass(result, out var errorClass))
             return;
 
+        ThrowProvisioningDeferred(
+            operation,
+            string.IsNullOrWhiteSpace(errorClass) ? "multipass-transient" : errorClass,
+            result.Stderr.Trim());
+    }
+
+    private void ThrowProvisioningDeferred(string operation, string errorClass, string detail)
+    {
         throw new SandboxProvisioningDeferredException(
             Name,
             operation,
-            string.IsNullOrWhiteSpace(errorClass) ? "multipass-transient" : errorClass,
-            result.Stderr.Trim(),
+            errorClass,
+            detail.Trim(),
             _daemonRetryPolicy.ExhaustedRequeueDelay);
     }
 

@@ -1120,6 +1120,99 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BaselineImages_CloneAlreadyExistsRunningTarget_PurgesBeforeRetry()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var cloneCalls = 0;
+        string? cloneName = null;
+        var purged = new List<string>();
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                if (infoName.StartsWith("cb-baseline-", StringComparison.Ordinal))
+                    return Task.FromResult(new ProcessRunResult(0, "Stopped", ""));
+                return Task.FromResult(states.TryGetValue(infoName, out var state)
+                    ? new ProcessRunResult(0, state, "")
+                    : new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "clone", var source, "--name", var target])
+            {
+                Assert.StartsWith("cb-baseline-", source, StringComparison.Ordinal);
+                cloneName = target;
+                cloneCalls++;
+                if (cloneCalls == 1)
+                {
+                    states[target] = "Running";
+                    return Task.FromResult(new ProcessRunResult(
+                        1,
+                        "",
+                        $"multipass clone failed: instance \"{target}\" already exists"));
+                }
+
+                states[target] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                purged.Add(deleteName);
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                states[startName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-clone-stale-running"),
+            networkProfiles: new Dictionary<string, string> { ["claude"] = "cb-claude" },
+            useBaselineImages: true,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+            WorkingDirectory = "/work",
+        };
+
+        await using var sandbox = await provider.CreateAsync(spec, CancellationToken.None);
+
+        Assert.Equal(2, cloneCalls);
+        Assert.Equal(cloneName, sandbox.Id);
+        var purgedName = Assert.Single(purged);
+        Assert.Equal(cloneName, purgedName);
+        Assert.NotNull(cloneName);
+        Assert.Equal("Running", states[cloneName!]);
+    }
+
+    [Fact]
     public async Task BaselineImages_GraphicalFlavorUsesSharedGraphicalBaselineAndInstallsDesktop()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -1946,6 +2039,77 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_StartAlreadyRunning_TreatsAsSuccess()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var startCalls = 0;
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                states[argv[3]] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "info", var name, "--format=csv"])
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    states.TryGetValue(name, out var current) ? current : "Running",
+                    ""));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                startCalls++;
+                states[startName] = "Running";
+                return Task.FromResult(new ProcessRunResult(1, "", $"instance \"{startName}\" already running"));
+            }
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-start-already-running"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = WorkItemId.New(),
+        });
+
+        Assert.Equal(1, startCalls);
+        Assert.Equal("Running", states[sandbox.Id]);
+    }
+
+    [Fact]
     public async Task CreateAsync_TransientMultipassSocketLaunchFailureExhaustsRetriesWithClearMessage()
     {
         var launchCalls = 0;
@@ -1979,14 +2143,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             logger: logger,
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(new SandboxSpec
             {
                 ImageReference = "ignored",
                 TimingWorkItemId = WorkItemId.New(),
             }));
 
-        Assert.Contains("multipass daemon unreachable after 2 retries", ex.Message);
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("launch", ex.Operation);
+        Assert.Equal("multipass-socket-unreachable", ex.ErrorClass);
+        Assert.Equal(InstantDaemonRetryPolicy().ExhaustedRequeueDelay, ex.RecheckIn);
+        Assert.Contains("multipass daemon unreachable after 2 retries", ex.Detail);
         Assert.Equal(3, launchCalls);
         Assert.Equal(3, versionCalls);
         Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning);
@@ -2642,6 +2810,26 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-abc123", CancellationToken.None);
 
         Assert.Equal(["codeybox-abc123"], startCalls);
+    }
+
+    [Fact]
+    public async Task ResumeSandboxAsync_StartAlreadyRunning_TreatsAsSuccess()
+    {
+        var startCalls = new List<string>();
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "start", var name])
+            {
+                startCalls.Add(name);
+                return Task.FromResult(new ProcessRunResult(1, "", $"instance \"{name}\" already started"));
+            }
+            return Task.FromResult(new ProcessRunResult(0, "", ""));
+        });
+        var provider = NewProvider(runner: runner, stagingDirectory: Path.Combine(_workspace, "staging"));
+
+        await ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-already-running", CancellationToken.None);
+
+        Assert.Equal(["codeybox-already-running"], startCalls);
     }
 
     [Fact]

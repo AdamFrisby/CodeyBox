@@ -176,7 +176,7 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
-    public async Task MountSingleBindWithRetry_AlreadyMounted_TreatsAsSuccess()
+    public async Task MountSingleBindWithRetry_AlreadyMountedWithMatchingSource_TreatsAsSuccess()
     {
         var hostSource = Path.Combine(_workspace, "already-mounted-source");
         Directory.CreateDirectory(hostSource);
@@ -190,7 +190,12 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
                 return new ProcessRunResult(1, "", "\"/repo\" is already mounted");
             }
             if (call.Argv.Count >= 2 && call.Argv[1] == "info")
-                return new ProcessRunResult(0, "", "");
+            {
+                var stdout = "{\"info\":{\"codeybox-test\":{\"mounts\":{\"/repo\":{\"source_path\":"
+                    + JsonString(hostSource)
+                    + "}}}}}";
+                return new ProcessRunResult(0, stdout, "");
+            }
             return new ProcessRunResult(0, "", "");
         });
         var provider = NewProvider(runner);
@@ -211,14 +216,14 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     {
         var hostSource = Path.Combine(_workspace, "correct-source");
         Directory.CreateDirectory(hostSource);
-        var calls = new List<string>();
+        var calls = new List<IReadOnlyList<string>>();
 
         var runner = new SequencedRunner(call =>
         {
             if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
             {
-                calls.Add("mount");
-                return calls.Count(c => c == "mount") == 1
+                calls.Add(call.Argv);
+                return calls.Count(c => c.Count >= 2 && c[1] == "mount") == 1
                     ? new ProcessRunResult(1, "", "\"/repo\" is already mounted")
                     : new ProcessRunResult(0, "", "");
             }
@@ -231,7 +236,7 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             }
             if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
             {
-                calls.Add("umount");
+                calls.Add(call.Argv);
                 return new ProcessRunResult(0, "", "");
             }
             return new ProcessRunResult(0, "", "");
@@ -246,7 +251,55 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             workItemId: null,
             ct: CancellationToken.None);
 
-        Assert.Equal(["mount", "umount", "mount"], calls);
+        var mountCalls = calls.Where(c => c.Count >= 2 && c[1] == "mount").ToList();
+        var unmount = Assert.Single(calls, c => c.Count >= 2 && c[1] == "umount");
+        Assert.Equal(2, mountCalls.Count);
+        Assert.Equal([ "multipass", "umount", "codeybox-test:/repo" ], unmount);
+        Assert.Equal(hostSource, mountCalls[1][3]);
+        Assert.Equal("codeybox-test:/repo", mountCalls[1][4]);
+    }
+
+    [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMountedWithUnverifiedInfo_UnmountsAndRemounts()
+    {
+        var hostSource = Path.Combine(_workspace, "unverified-source");
+        Directory.CreateDirectory(hostSource);
+        var calls = new List<IReadOnlyList<string>>();
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                calls.Add(call.Argv);
+                return calls.Count(c => c.Count >= 2 && c[1] == "mount") == 1
+                    ? new ProcessRunResult(1, "", "\"/repo\" is already mounted")
+                    : new ProcessRunResult(0, "", "");
+            }
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+                return new ProcessRunResult(0, """{"info":{"codeybox-test":{"mounts":{}}}}""", "");
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                calls.Add(call.Argv);
+                return new ProcessRunResult(0, "", "");
+            }
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            ct: CancellationToken.None);
+
+        var mountCalls = calls.Where(c => c.Count >= 2 && c[1] == "mount").ToList();
+        var unmount = Assert.Single(calls, c => c.Count >= 2 && c[1] == "umount");
+        Assert.Equal(2, mountCalls.Count);
+        Assert.Equal([ "multipass", "umount", "codeybox-test:/repo" ], unmount);
+        Assert.Equal(hostSource, mountCalls[1][3]);
+        Assert.Equal("codeybox-test:/repo", mountCalls[1][4]);
     }
 
     [Fact]
@@ -294,16 +347,12 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
-    public async Task MountSingleBindWithRetry_PersistentFailure_ThrowsWithSourceStateAndStderr()
+    public async Task MountSingleBindWithRetry_PersistentFailure_DefersWithSourceStateAndStderr()
     {
-        // After exhausting retries on a non-missing-source failure (e.g.
-        // exists=dir but the daemon's AppArmor profile denies the read),
-        // the thrown InvalidOperationException must carry both the multipass
-        // stderr and the host-side source state at mount time. Without
-        // that, future incidents would need a manual reproduction step to
-        // attribute the failure. This path is distinct from the
-        // missing-source path (which throws SandboxMountSourceMissingException
-        // immediately) because re-cloning would not heal it.
+        // After exhausting retries on a non-missing-source failure, the
+        // provider must defer the work item instead of hard-failing it. The
+        // deferred exception still carries stderr and host-side state so the
+        // next audit trail names the reason for the automatic re-drive.
         var hostSource = Path.Combine(_workspace, "live-but-mount-rejected");
         Directory.CreateDirectory(hostSource);
 
@@ -317,9 +366,13 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             }
             return new ProcessRunResult(0, "", "");
         });
-        var provider = NewProvider(runner);
+        var recheckIn = TimeSpan.FromMilliseconds(123);
+        var provider = NewProvider(runner, new MultipassDaemonRetryPolicy
+        {
+            ExhaustedRequeueDelay = recheckIn,
+        });
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.MountSingleBindWithRetryAsync(
                 new MultipassSandboxOptions(),
                 name: "codeybox-test",
@@ -329,16 +382,25 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
                 ct: CancellationToken.None));
 
         Assert.Equal(3, attempts);
-        Assert.Contains("exists=dir", ex.Message);
-        Assert.Contains("Source path does not exist", ex.Message);
-        Assert.Contains(hostSource, ex.Message);
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("mount", ex.Operation);
+        Assert.Equal("multipass-mount-retry-exhausted", ex.ErrorClass);
+        Assert.Equal(recheckIn, ex.RecheckIn);
+        Assert.Contains("exists=dir", ex.Detail);
+        Assert.Contains("Source path does not exist", ex.Detail);
+        Assert.Contains(hostSource, ex.Detail);
     }
 
-    private static MultipassSandboxProvider NewProvider(IProcessRunner runner) => new(
+    private static MultipassSandboxProvider NewProvider(
+        IProcessRunner runner,
+        MultipassDaemonRetryPolicy? daemonRetryPolicy = null) => new(
         new MultipassSandboxOptions { StagingDirectory = Path.GetTempPath() },
         NullLogger<MultipassSandboxProvider>.Instance,
         timings: null,
-        runner: runner);
+        runner: runner,
+        daemonRetryPolicy: daemonRetryPolicy);
+
+    private static string JsonString(string value) => System.Text.Json.JsonSerializer.Serialize(value);
 
     private sealed record RecordedCall(IReadOnlyList<string> Argv, string? Stdin);
 

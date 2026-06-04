@@ -1850,7 +1850,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (target is null)
             return current;
 
-        var reset = current.With(target.Value);
+        var reset = BuildInfrastructureDeferredReset(current, target.Value);
         if (reset.State == current.State
             && reset.LastError == current.LastError
             && reset.FailureKind == current.FailureKind
@@ -1864,12 +1864,37 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? current;
     }
 
-    private static WorkItemState? InfrastructureDeferredResumeState(WorkItemState state)
-        => state == WorkItemState.Queued
-            ? WorkItemState.Queued
-            : state == WorkItemState.Working
-                ? WorkItemState.Queued
-                : WorkItemRecoveryPolicy.MapToRecoveryState(state);
+    private static WorkItem BuildInfrastructureDeferredReset(WorkItem current, WorkItemState target)
+        => current with
+        {
+            State = target,
+            LastError = null,
+            FailureKind = null,
+            QuotaResetAt = null,
+            NextQuotaRetryAt = null,
+            QuotaRetryFrom = null,
+            CancellationReason = null,
+            CancellationSource = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            StartedAt = target == WorkItemState.Queued ? null : current.StartedAt,
+            PreemptedAt = target is WorkItemState.Working or WorkItemState.Reworking ? current.PreemptedAt : null,
+            PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? current.PreemptCheckpoint : null,
+        };
+
+    private static WorkItemState? InfrastructureDeferredResumeState(WorkItemState state) => state switch
+    {
+        WorkItemState.Queued => WorkItemState.Queued,
+        WorkItemState.Working => WorkItemState.Queued,
+        WorkItemState.Reworking => WorkItemState.Reworking,
+        WorkItemState.WorkComplete => WorkItemState.WorkComplete,
+        WorkItemState.Auditing => WorkItemState.WorkComplete,
+        WorkItemState.AuditPassed => WorkItemState.AuditPassed,
+        WorkItemState.Merging => WorkItemState.AuditPassed,
+        WorkItemState.Merged => WorkItemState.Merged,
+        WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
+        WorkItemState.UpstreamPushing => WorkItemState.Merged,
+        _ => null,
+    };
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after
