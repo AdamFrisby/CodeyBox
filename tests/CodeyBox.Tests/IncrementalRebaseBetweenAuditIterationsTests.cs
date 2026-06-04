@@ -1,6 +1,8 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -283,6 +285,45 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
         Assert.Single(tp.Agent.WorkPlan);
     }
 
+    [Fact]
+    public async Task ProvisioningDeferredDuringRebase_Propagates()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var advancingAuditor = new MainAdvancingAuditor(seed, blockingFirstThenPass: true);
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "clone",
+            errorClass: "multipass-clone-target-already-exists",
+            detail: "clone target collision exhausted",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var sandboxes = new ThrowingTimingPhaseSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            "incremental-rebase",
+            deferAt);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [advancingAuditor],
+            incrementalRebase: new IncrementalRebaseSnapshot(new IncrementalRebaseOptions { Enabled = true }),
+            sandboxProvider: sandboxes);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "rework should not start"));
+
+        var item = NewItem();
+        advancingAuditor.BarePath = tp.GitHost.GetRepoPath(item.Id.ToString());
+        await tp.Store.CreateAsync(item);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+        Assert.Single(tp.Agent.WorkPlan);
+        var persisted = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+    }
+
     private static WorkItem NewItem(string? workBranch = null)
     {
         var id = WorkItemId.New();
@@ -296,6 +337,39 @@ public sealed class IncrementalRebaseBetweenAuditIterationsTests : IDisposable
             WorkBranch = workBranch ?? $"codeybox/{id.ToString()[..8]}",
             PushUpstream = false,
         };
+    }
+
+    private sealed class ThrowingTimingPhaseSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private readonly string _timingPhase;
+        private readonly SandboxProvisioningDeferredException _exception;
+
+        public ThrowingTimingPhaseSandboxProvider(
+            ISandboxProvider inner,
+            string timingPhase,
+            SandboxProvisioningDeferredException exception)
+        {
+            _inner = inner;
+            _timingPhase = timingPhase;
+            _exception = exception;
+        }
+
+        public string Name => _inner.Name;
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            if (string.Equals(spec.TimingPhase, _timingPhase, StringComparison.Ordinal))
+                throw _exception;
+
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
     }
 
     private sealed class MainShaCapture

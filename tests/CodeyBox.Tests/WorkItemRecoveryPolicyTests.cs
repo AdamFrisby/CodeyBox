@@ -36,7 +36,7 @@ public sealed class WorkItemRecoveryPolicyTests
 
     [Theory]
     [InlineData(WorkItemState.Working, WorkItemState.Queued, true)]
-    [InlineData(WorkItemState.Reworking, WorkItemState.Queued, true)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete, false)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete, false)]
     [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed, false)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed, false)]
@@ -76,6 +76,58 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(WorkItemState.Working, recovered!.State);
         Assert.Null(recovered.StartedAt);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public void InfrastructureDeferral_WithPreemptCheckpoint_PreservesCheckpointResumeState(
+        WorkItemState state)
+    {
+        var item = MakeItem(state) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+            PreemptCheckpoint = "refs/heads/codeybox/preempt/test",
+            LastError = "prior error",
+            FailureKind = "other",
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            item,
+            DateTimeOffset.UtcNow);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(state, recovered!.State);
+        Assert.Null(recovered.StartedAt);
+        Assert.Equal(item.PreemptedAt, recovered.PreemptedAt);
+        Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.FailureKind);
+    }
+
+    [Fact]
+    public void InfrastructureDeferral_NormalReworking_ResumesFromWorkComplete()
+    {
+        var item = MakeItem(WorkItemState.Reworking) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            WorkBranch = "codeybox/work",
+            LastError = "prior error",
+            FailureKind = "other",
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            item,
+            DateTimeOffset.UtcNow);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.WorkComplete, recovered!.State);
+        Assert.Equal(item.WorkBranch, recovered.WorkBranch);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.PreemptCheckpoint);
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.FailureKind);
     }
 
     [Fact]

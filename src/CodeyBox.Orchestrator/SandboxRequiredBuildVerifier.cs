@@ -314,6 +314,10 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             return RequiredBuildVerificationResult.Unavailable(

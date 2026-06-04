@@ -39,20 +39,95 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
     [Fact]
     public async Task RunAsync_RethrowsSandboxDiskDeferredException_AndLeavesItemInQueued()
     {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
-        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
-
-        using var store = new SqliteWorkItemStore(stateDb);
-        var gitHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = gitRoot },
-            NullLogger<LocalGitHost>.Instance);
         var deferAt = new SandboxDiskDeferredException(
             mountPath: "/fake/mp",
             freeBytes: 1L * 1024 * 1024 * 1024,
             thresholdBytes: 10L * 1024 * 1024 * 1024,
             recheckIn: TimeSpan.FromMinutes(1));
-        var sandboxes = new ThrowingDiskDeferSandboxProvider(deferAt);
+        var fixture = await BuildPipelineAsync(new ThrowingDiskDeferSandboxProvider(deferAt));
+        using var store = fixture.Store;
+
+        var thrown = await Assert.ThrowsAsync<SandboxDiskDeferredException>(
+            () => fixture.Pipeline.RunAsync(fixture.Item, CancellationToken.None, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+
+        // The catch-all below the SandboxDiskDeferredException catch would have
+        // transitioned the item to Failed via TransitionFailed. Asserting the
+        // item is still in a non-terminal pre-defer state proves the re-throw
+        // ran instead of the demotion path.
+        var persisted = await store.GetAsync(fixture.Item.Id);
+        Assert.NotNull(persisted);
+        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+    }
+
+    [Fact]
+    public async Task RunAsync_RethrowsSandboxProvisioningDeferredException_AndLeavesItemNonFailed()
+    {
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "start",
+            errorClass: "multipass-start-argument-not-found",
+            detail: "multipass start failed after retries",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var fixture = await BuildPipelineAsync(new ThrowingProvisioningDeferSandboxProvider(deferAt));
+        using var store = fixture.Store;
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => fixture.Pipeline.RunAsync(fixture.Item, CancellationToken.None, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+
+        var persisted = await store.GetAsync(fixture.Item.Id);
+        Assert.NotNull(persisted);
+        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+    }
+
+    [Fact]
+    public async Task RunAsync_CheckAndActRethrowsSandboxProvisioningDeferredException_AndLeavesItemNonFailed()
+    {
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "mount",
+            errorClass: "multipass-mount-retry-exhausted",
+            detail: "multipass mount failed after retries",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var fixture = await BuildPipelineAsync(
+            new ThrowingProvisioningDeferSandboxProvider(deferAt),
+            item => item with
+            {
+                JobType = JobType.CheckAndAct,
+                Check = new CheckAndActSpec
+                {
+                    Question = "Does the repo need work?",
+                    ActionableAnswer = true,
+                    OnYes = new OnYesActionSpec { Title = "Fix it", Prompt = "go" },
+                },
+            });
+        using var store = fixture.Store;
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => fixture.Pipeline.RunAsync(fixture.Item, CancellationToken.None, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+
+        var persisted = await store.GetAsync(fixture.Item.Id);
+        Assert.NotNull(persisted);
+        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+    }
+
+    private async Task<(PipelineRunner Pipeline, SqliteWorkItemStore Store, WorkItem Item)> BuildPipelineAsync(
+        ISandboxProvider sandboxes,
+        Func<WorkItem, WorkItem>? configureItem = null)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
         var registry = new AgentRegistry(new IAgentRunner[] { new UnreachableAgent() });
         var projects = new InMemoryProjectRepository(new Project
         {
@@ -86,20 +161,9 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
             Prompt = "p",
             State = WorkItemState.Queued,
         };
+        item = configureItem?.Invoke(item) ?? item;
         await store.CreateAsync(item);
-
-        var thrown = await Assert.ThrowsAsync<SandboxDiskDeferredException>(
-            () => pipeline.RunAsync(item, CancellationToken.None, CancellationToken.None));
-
-        Assert.Same(deferAt, thrown);
-
-        // The catch-all below the SandboxDiskDeferredException catch would have
-        // transitioned the item to Failed via TransitionFailed. Asserting the
-        // item is still in a non-terminal pre-defer state proves the re-throw
-        // ran instead of the demotion path.
-        var persisted = await store.GetAsync(item.Id);
-        Assert.NotNull(persisted);
-        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+        return (pipeline, store, item);
     }
 
     /// <summary>
@@ -112,6 +176,18 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
         private readonly SandboxDiskDeferredException _ex;
         public ThrowingDiskDeferSandboxProvider(SandboxDiskDeferredException ex) => _ex = ex;
         public string Name => "throwing-disk-defer";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw _ex;
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingProvisioningDeferSandboxProvider : ISandboxProvider
+    {
+        private readonly SandboxProvisioningDeferredException _ex;
+        public ThrowingProvisioningDeferSandboxProvider(SandboxProvisioningDeferredException ex) => _ex = ex;
+        public string Name => "throwing-provisioning-defer";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
             => throw _ex;
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)

@@ -50,6 +50,7 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
 
         var recheckIn = TimeSpan.FromMilliseconds(150);
         var pipeline = new DiskDeferThrowingPipeline(
+            _store,
             mountPath: "/fake/mp",
             freeBytes: 1024 * 1024,
             thresholdBytes: 10L * 1024 * 1024 * 1024,
@@ -86,6 +87,10 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
             var evt = Assert.Single(webhooks.Events);
             Assert.Equal("disk.deferred", evt.Event);
             Assert.Equal(item.Id, evt.WorkItem!.Id);
+            Assert.Equal(WorkItemState.WorkComplete, evt.WorkItem.State);
+            Assert.Equal(pipeline.WorkBranch, evt.WorkItem.WorkBranch);
+            Assert.Null(evt.WorkItem.LastError);
+            Assert.Null(evt.WorkItem.FailureKind);
             // Details: anonymous object with mountPath / freeBytes / thresholdBytes / suggestedRetryAt.
             Assert.NotNull(evt.Details);
             var d = evt.Details!.GetType();
@@ -110,6 +115,8 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
 
             Assert.True(pipeline.CallCount >= 2,
                 $"expected re-enqueue after recheckIn={recheckIn}, but pipeline was called {pipeline.CallCount} time(s)");
+            Assert.Equal(WorkItemState.WorkComplete, pipeline.SecondCallState);
+            Assert.Equal(pipeline.WorkBranch, pipeline.SecondCallWorkBranch);
         }
         finally
         {
@@ -124,14 +131,22 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
     /// </summary>
     private sealed class DiskDeferThrowingPipeline : IPipelineRunner
     {
+        private readonly IWorkItemStore _store;
         private readonly string _mountPath;
         private readonly long _freeBytes;
         private readonly long _thresholdBytes;
         private readonly TimeSpan _recheckIn;
         private int _callCount;
+        private readonly string _workBranch = "codeybox/disk-deferred";
 
-        public DiskDeferThrowingPipeline(string mountPath, long freeBytes, long thresholdBytes, TimeSpan recheckIn)
+        public DiskDeferThrowingPipeline(
+            IWorkItemStore store,
+            string mountPath,
+            long freeBytes,
+            long thresholdBytes,
+            TimeSpan recheckIn)
         {
+            _store = store;
             _mountPath = mountPath;
             _freeBytes = freeBytes;
             _thresholdBytes = thresholdBytes;
@@ -139,11 +154,33 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
         }
 
         public int CallCount => _callCount;
+        public string WorkBranch => _workBranch;
+        public WorkItemState? SecondCallState { get; private set; }
+        public string? SecondCallWorkBranch { get; private set; }
 
-        public Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
-            Interlocked.Increment(ref _callCount);
-            throw new SandboxDiskDeferredException(_mountPath, _freeBytes, _thresholdBytes, _recheckIn);
+            var call = Interlocked.Increment(ref _callCount);
+            if (call == 1)
+            {
+                await _store.UpdateAsync(item with
+                {
+                    State = WorkItemState.Auditing,
+                    WorkBranch = _workBranch,
+                    StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+                    LastError = "previous transient error",
+                    FailureKind = "other",
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                }, ct);
+                throw new SandboxDiskDeferredException(_mountPath, _freeBytes, _thresholdBytes, _recheckIn);
+            }
+
+            if (call == 2)
+            {
+                SecondCallState = item.State;
+                SecondCallWorkBranch = item.WorkBranch;
+                await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+            }
         }
     }
 

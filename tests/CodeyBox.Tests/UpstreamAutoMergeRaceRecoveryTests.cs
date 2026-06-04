@@ -1,5 +1,8 @@
 using CodeyBox.Core;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -146,6 +149,60 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
         Assert.Equal(1, remote.Requests[1].ExistingPullRequestNumber);
         // UpstreamPushAttempts reflects retry count on the operator surface.
         Assert.Equal(2, final.UpstreamPushAttempts);
+    }
+
+    [Fact]
+    public async Task AutoMergeRace_ProvisioningDeferredDuringMergeRerun_Rethrows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var remote = new RacingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ResponsePlan =
+            {
+                new RacingResponse(AutoMergeRaced: true, AdvanceSeedBeforeReturning: false),
+            },
+        };
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "start",
+            errorClass: "multipass-start-argument-not-found",
+            detail: "merge rerun start retry exhausted",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var sandboxes = new ThrowingNthTimingPhaseSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            "merge",
+            throwOnOccurrence: 2,
+            deferAt);
+        var factory = new SingleRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "racing-upstream",
+                AutoMerge = true,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge],
+            sandboxProvider: sandboxes);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("race-fix.txt", "fixes race\n"));
+
+        var item = NewItem("feature/race-recovery-defer");
+        await tp.Store.CreateAsync(item);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+        Assert.Equal(1, remote.CompleteCalls);
+        Assert.Equal(2, sandboxes.MatchingCreateCalls);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Failed, final!.State);
+        Assert.NotEqual(WorkItemState.MergeConflictResolutionFailed, final.State);
     }
 
     [Fact]
@@ -601,6 +658,47 @@ internal sealed record RacingResponse(
     bool OmitPullRequestNumber = false,
     string? AdvanceSeedFilePath = null,
     string? AdvanceSeedFileContent = null);
+
+internal sealed class ThrowingNthTimingPhaseSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+    private readonly string _timingPhase;
+    private readonly int _throwOnOccurrence;
+    private readonly SandboxProvisioningDeferredException _exception;
+    private int _matchingCreateCalls;
+
+    public ThrowingNthTimingPhaseSandboxProvider(
+        ISandboxProvider inner,
+        string timingPhase,
+        int throwOnOccurrence,
+        SandboxProvisioningDeferredException exception)
+    {
+        _inner = inner;
+        _timingPhase = timingPhase;
+        _throwOnOccurrence = throwOnOccurrence;
+        _exception = exception;
+    }
+
+    public string Name => _inner.Name;
+    public int MatchingCreateCalls => Volatile.Read(ref _matchingCreateCalls);
+
+    public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+    {
+        if (string.Equals(spec.TimingPhase, _timingPhase, StringComparison.Ordinal)
+            && Interlocked.Increment(ref _matchingCreateCalls) == _throwOnOccurrence)
+        {
+            throw _exception;
+        }
+
+        return _inner.CreateAsync(spec, ct);
+    }
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+}
 
 /// <summary>
 /// Fake upstream remote that pre-programmes a sequence of CompleteAsync

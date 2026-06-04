@@ -1001,6 +1001,14 @@ public sealed class PipelineRunner : IPipelineRunner
             // below would mark the item terminally Failed.
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            // Host-side sandbox provisioning exhausted a transient retry
+            // budget. Re-throw so OrchestratorService can move the item back
+            // to a durable pre-phase state and re-enqueue it instead of
+            // treating the infrastructure flap as an agent failure.
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} failed", item.Id);
@@ -1453,6 +1461,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 ct);
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
         {
             throw;
         }
@@ -2548,6 +2560,10 @@ public sealed class PipelineRunner : IPipelineRunner
             await Transition(item, WorkItemState.Done, ct, project);
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
         {
             throw;
         }
@@ -6506,7 +6522,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 // handler to be attributed correctly. If we caught it here we
                 // would relabel it as "infrastructure" and (worse) on success
                 // backoffs misclassify the next iteration's terminal state.
-                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException)
+                // Sandbox provisioning deferrals must also bubble out to the
+                // orchestrator requeue path; retrying them here would hard-fail
+                // infrastructure flaps after the upstream attempt budget.
+                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
+                    && ex is not SandboxProvisioningDeferredException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
@@ -6883,7 +6903,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 priorWorkTip, baseTip, conflictFiles, originalFailure,
                 ct, hostShutdownToken);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException
+            && ex is not SandboxProvisioningDeferredException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",

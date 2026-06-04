@@ -210,7 +210,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     // ── State recovery mapping (mirrors DeadWorkerReaper) ────────────────────
 
     [Theory]
-    [InlineData(WorkItemState.Reworking, WorkItemState.Queued)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.UpstreamPushing, WorkItemState.Merged)]

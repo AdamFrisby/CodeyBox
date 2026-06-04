@@ -606,6 +606,45 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxRequiredBuildVerifier_SandboxCreateAsyncProvisioningDeferred_Rethrows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "clone",
+            errorClass: "multipass-instance-lock-contention",
+            detail: "clone retry exhausted",
+            recheckIn: TimeSpan.FromMilliseconds(50));
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryProvisioningDeferredProvider(deferred),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-deferred") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            verifier.VerifyAsync(new RequiredBuildVerificationRequest
+            {
+                WorkItemId = item.Id,
+                ProjectId = item.ProjectId,
+                SandboxPolicy = new RequiredBuildSandboxPolicy(),
+                RepositoryId = repoId,
+                BaseBranch = item.BaseBranch,
+                WorkBranch = item.WorkBranch!,
+                Phase = "audit",
+            }, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+    }
+
+    [Fact]
     public async Task RequiredBuildGate_FailingBuild_PersistsAuditReportWithErrorFindingViaOrchestrator()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2481,6 +2520,23 @@ public sealed class RequiredBuildGateTests : IDisposable
             _ = spec;
             _ = ct;
             throw new InvalidOperationException(message);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>(Array.Empty<ManagedSandboxInfo>());
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class SandboxFactoryProvisioningDeferredProvider(SandboxProvisioningDeferredException exception) : ISandboxProvider
+    {
+        public string Name => "sandbox-factory-provisioning-deferred";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            _ = spec;
+            _ = ct;
+            throw exception;
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)

@@ -345,9 +345,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     }
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
-                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
+                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct, workItemId: workItemId);
                 if (stop.ExitCode != 0)
+                {
+                    ThrowIfProvisioningRetryExhausted("stop", stop);
                     throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
+                }
                 await WaitForStoppedAsync(opts, name, workItemId, ct);
             }
 
@@ -451,15 +454,24 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         {
             run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         }
-        // Treat "instance not running" / "already started" as success: the goal
-        // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
-        // start on an already-Running VM is the same desired postcondition. We
-        // do not parse stderr for VM-not-found vs other failures here because
-        // the orchestrator's caller treats any failure as "fall through to the
-        // stranded-item recovery path" — preserving the explicit signal.
+        // Treat "already running" / "already started" as success: the goal of
+        // ResumeSandboxAsync is "VM is Running afterwards", and multipass start
+        // on an already-Running VM is the same desired postcondition. Exhausted
+        // transient start retries are promoted to SandboxProvisioningDeferredException
+        // so startup resume uses the same delayed requeue path as provisioning.
         if (run.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"multipass start {name} failed (exit {run.ExitCode}): {run.Stderr}");
+        {
+            if (IsStartAlreadyRunning(run))
+            {
+                _log.LogInformation("multipass start {Name} reported already-running; treating resume as successful", name);
+            }
+            else
+            {
+                ThrowIfProvisioningRetryExhausted("start", run);
+                throw new InvalidOperationException(
+                    $"multipass start {name} failed (exit {run.ExitCode}): {run.Stderr}");
+            }
+        }
         _listCacheExpiry = DateTimeOffset.MinValue;
         _log.LogInformation("Resumed suspended multipass VM {Name}", name);
     }
@@ -1392,6 +1404,7 @@ git push origin HEAD:{refName}";
         CancellationToken ct)
     {
         var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+        ThrowIfProvisioningRetryExhausted("info", info);
         return info.ExitCode == 0;
     }
 
@@ -1452,7 +1465,10 @@ git push origin HEAD:{refName}";
             {
                 var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
                 if (run.ExitCode != 0)
+                {
+                    ThrowIfProvisioningRetryExhausted("baseline-launch", run);
                     throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
+                }
 
                 // Wait for the (now-minimal) cloud-init to finish — write_files
                 // and the route service install. Doesn't include the heavy
@@ -1473,17 +1489,23 @@ git push origin HEAD:{refName}";
                     [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
                     stdin: null, ct: ct, workItemId: workItemId);
                 if (execRun.ExitCode != 0)
+                {
+                    ThrowIfProvisioningRetryExhausted("exec", execRun);
                     throw new InvalidOperationException(
                         $"baseline install step {i + 1} failed (exit {execRun.ExitCode}):\n" +
                         $"stderr: {execRun.Stderr}\nstdout-tail: {(execRun.Stdout.Length > 1000 ? "…" + execRun.Stdout[^1000..] : execRun.Stdout)}");
+                }
             }
 
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped). Wait for the state to flip
             // so a subsequent clone doesn't race a still-Stopping VM.
-            var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+            var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct, workItemId: workItemId);
             if (stop.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("stop", stop);
                 throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
+            }
             await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
@@ -1511,7 +1533,9 @@ git push origin HEAD:{refName}";
         // auto-starts stopped instances). Stop is idempotent — exits 0 if
         // already stopped — and we wait for the state to flip because
         // `multipass stop` returns when the request is queued.
-        await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+        var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct, workItemId: workItemId);
+        if (stop.ExitCode != 0)
+            ThrowIfProvisioningRetryExhausted("stop", stop);
         await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
         _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
@@ -1520,13 +1544,96 @@ git push origin HEAD:{refName}";
             [opts.MultipassBinary, "clone", baselineName, "--name", newName],
             stdin: null, ct: ct, workItemId: workItemId);
         if (clone.ExitCode != 0)
+        {
+            if (IsCloneTargetAlreadyExists(clone, newName)
+                && await TryRecoverCloneTargetAlreadyExistsAsync(opts, newName, baselineName, workItemId, ct))
+                return;
+
+            ThrowIfProvisioningRetryExhausted("clone", clone);
             throw new InvalidOperationException($"multipass clone failed: {clone.Stderr}");
+        }
 
         // NOTE: deliberately do NOT start the clone here. multipass clone
         // creates the new VM in Stopped state, which is exactly what
         // SetUpMountsAsync's `mount --type=native` requires. Starting now
         // and stopping again later created a stop-state race where the
         // mount could fire before multipassd had fully released the VM.
+    }
+
+    private async Task<bool> TryRecoverCloneTargetAlreadyExistsAsync(
+        MultipassSandboxOptions opts,
+        string newName,
+        string baselineName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var info = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "info", newName, "--format=csv"],
+            stdin: null,
+            ct: ct,
+            workItemId: workItemId);
+        if (info.ExitCode == 0 && info.Stdout.Contains("Stopped", StringComparison.Ordinal))
+        {
+            _log.LogWarning(
+                "multipass clone target {Name} already exists in Stopped state after clone failure; treating clone as successful partial completion",
+                newName);
+            return true;
+        }
+
+        if (info.ExitCode == 0)
+        {
+            _log.LogWarning(
+                "multipass clone target {Name} already exists but is not Stopped; purging stale target before retry. info={Info}",
+                newName, SingleLine(info.Stdout));
+            await TryDeleteVmAsync(opts, newName);
+        }
+        else
+        {
+            ThrowIfProvisioningRetryExhausted("info", info);
+            _log.LogWarning(
+                "multipass clone reported target {Name} already exists, but info could not read it; retrying clone once. stderr={Stderr}",
+                newName, SingleLine(info.Stderr));
+        }
+
+        var retry = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "clone", baselineName, "--name", newName],
+            stdin: null,
+            ct: ct,
+            workItemId: workItemId);
+        if (retry.ExitCode == 0)
+            return true;
+
+        if (IsCloneTargetAlreadyExists(retry, newName))
+        {
+            var retryInfo = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "info", newName, "--format=csv"],
+                stdin: null,
+                ct: ct,
+                workItemId: workItemId);
+            if (retryInfo.ExitCode == 0 && retryInfo.Stdout.Contains("Stopped", StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "multipass clone target {Name} still reports already-exists but is now Stopped; treating clone as successful partial completion",
+                    newName);
+                return true;
+            }
+
+            ThrowIfProvisioningRetryExhausted("info", retryInfo);
+            var infoDetail = retryInfo.ExitCode == 0
+                ? $"target info after retry: {SingleLine(retryInfo.Stdout)}"
+                : $"target info after retry was unreadable: {SingleLine(retryInfo.Stderr)}";
+            ThrowProvisioningDeferred(
+                "clone",
+                "multipass-clone-target-already-exists",
+                $"multipass clone target {newName} still reported already-exists after stale-target recovery; " +
+                $"{infoDetail}; stderr={retry.Stderr.Trim()}");
+        }
+
+        ThrowIfProvisioningRetryExhausted("clone", retry);
+        throw new InvalidOperationException($"multipass clone failed after already-exists recovery: {retry.Stderr}");
     }
 
     internal IReadOnlyList<string> BuildLaunchArgv(string name, SandboxSpec spec, string cloudInitPath)
@@ -1586,7 +1693,10 @@ git push origin HEAD:{refName}";
         _log.LogInformation("Launching multipass VM {Name} (this takes 10-30s)", name);
         var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("launch", run);
             throw new InvalidOperationException($"multipass launch failed: {run.Stderr}");
+        }
     }
 
     private async Task WaitForRunningAsync(
@@ -1609,6 +1719,7 @@ git push origin HEAD:{refName}";
         {
             ct.ThrowIfCancellationRequested();
             var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+            ThrowIfProvisioningRetryExhausted("info", info);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
                 break;
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
@@ -1650,6 +1761,7 @@ git push origin HEAD:{refName}";
                 opts,
                 [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
                 stdin: null, ct: ct, workItemId: workItemId);
+            ThrowIfProvisioningRetryExhausted("exec", cloudInit);
 
             if (cloudInit.ExitCode is 0 or 2)
                 return;
@@ -1668,6 +1780,7 @@ git push origin HEAD:{refName}";
         }
 
         var probe = await ProbeCloudInitReadinessAsync(opts, name, workItemId, ct);
+        ThrowIfProvisioningRetryExhausted("exec", probe);
         if (probe.ExitCode == 0)
         {
             _log.LogWarning(
@@ -1734,9 +1847,10 @@ test "$work" = present && test "$exec_wrapper" = present
         await WaitForStoppedCoreAsync(
             name,
             stopTimeout,
-            ctInner => RunAsync(
+            ctInner => RunProvisioningAsync(
                 opts,
                 [opts.MultipassBinary, "info", name, "--format=csv"],
+                operation: "info",
                 stdin: null,
                 ct: ctInner,
                 workItemId: workItemId),
@@ -1833,6 +1947,7 @@ test "$work" = present && test "$exec_wrapper" = present
         CancellationToken ct)
     {
         var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=json"], stdin: null, ct: ct);
+        ThrowIfProvisioningRetryExhausted("info", info);
         if (info.ExitCode != 0) return (null, null);
         try
         {
@@ -1957,6 +2072,9 @@ test "$work" = present && test "$exec_wrapper" = present
                 stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode == 0)
                 return;
+            if (IsMountAlreadyMounted(run, sandbox)
+                && await TryRecoverAlreadyMountedAsync(opts, name, host, sandbox, workItemId, ct))
+                return;
 
             var postFailureState = await DescribeMountSourceStateAsync(host, ct);
             lastFailure = run;
@@ -1991,9 +2109,157 @@ test "$work" = present && test "$exec_wrapper" = present
         // lastFailureState is the post-failure orchestrator-side stat snapshot,
         // not the pre-mount state; label it so a reader of the exception text
         // doesn't misread it as "this is what we saw before issuing mount".
+        if (lastFailure is { } exhausted)
+        {
+            ThrowIfProvisioningRetryExhausted("mount", exhausted);
+            ThrowProvisioningDeferred(
+                "mount",
+                "multipass-mount-retry-exhausted",
+                $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
+                $"{exhausted.Stderr.Trim()} (post-failure host source state: {lastFailureState})");
+        }
         throw new InvalidOperationException(
             $"multipass mount {host} -> {name}:{sandbox} failed after {attemptsRun} attempt(s): " +
             $"{lastFailure?.Stderr.Trim()} (post-failure host source state: {lastFailureState})");
+    }
+
+    private async Task<bool> TryRecoverAlreadyMountedAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        string host,
+        string sandbox,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var match = await TryReadExistingMountMatchesAsync(opts, name, host, sandbox, workItemId, ct);
+        if (match is true)
+        {
+            _log.LogWarning(
+                "multipass mount {Host} -> {Name}:{Sandbox} reported already-mounted; treating mount as successful partial completion",
+                host, name, sandbox);
+            return true;
+        }
+
+        _log.LogWarning(
+            match is false
+                ? "multipass mount target {Name}:{Sandbox} is already mounted from a different source; unmounting stale target before remount"
+                : "multipass mount target {Name}:{Sandbox} reported already-mounted but existing source could not be verified; unmounting before remount",
+            name,
+            sandbox);
+        var unmount = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "umount", $"{name}:{sandbox}"],
+            stdin: null,
+            ct: ct,
+            workItemId: workItemId);
+        if (unmount.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("umount", unmount);
+            _log.LogWarning(
+                "multipass umount {Name}:{Sandbox} failed while repairing already-mounted target; mount will retry. stderr={Stderr}",
+                name, sandbox, SingleLine(unmount.Stderr));
+            return false;
+        }
+
+        var remount = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "mount", "--type=native", host, $"{name}:{sandbox}"],
+            stdin: null,
+            ct: ct,
+            workItemId: workItemId);
+        if (remount.ExitCode == 0)
+            return true;
+
+        if (IsMountAlreadyMounted(remount, sandbox))
+        {
+            var remountMatch = await TryReadExistingMountMatchesAsync(opts, name, host, sandbox, workItemId, ct);
+            if (remountMatch is true)
+                return true;
+
+            _log.LogWarning(
+                "multipass remount {Host} -> {Name}:{Sandbox} still reports already-mounted without a verified source match; mount will retry",
+                host, name, sandbox);
+            return false;
+        }
+
+        ThrowIfProvisioningRetryExhausted("mount", remount);
+        return false;
+    }
+
+    private async Task<bool?> TryReadExistingMountMatchesAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        string host,
+        string sandbox,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var info = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "info", name, "--format=json"],
+            stdin: null,
+            ct: ct,
+            workItemId: workItemId);
+        if (info.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("info", info);
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(info.Stdout);
+            if (!doc.RootElement.TryGetProperty("info", out var infoEl)
+                || infoEl.ValueKind != JsonValueKind.Object)
+                return null;
+            foreach (var vmEntry in infoEl.EnumerateObject())
+            {
+                if (!string.Equals(vmEntry.Name, name, StringComparison.Ordinal))
+                    continue;
+                if (!vmEntry.Value.TryGetProperty("mounts", out var mountsEl)
+                    || mountsEl.ValueKind != JsonValueKind.Object)
+                    return null;
+
+                foreach (var mount in mountsEl.EnumerateObject())
+                {
+                    var source = TryGetStringProperty(mount.Value, "source_path")
+                        ?? TryGetStringProperty(mount.Value, "source")
+                        ?? TryGetStringProperty(mount.Value, "SourcePath");
+                    var target = TryGetStringProperty(mount.Value, "target_path")
+                        ?? TryGetStringProperty(mount.Value, "target")
+                        ?? TryGetStringProperty(mount.Value, "mount_point")
+                        ?? TryGetStringProperty(mount.Value, "path");
+
+                    var keyIsSandbox = string.Equals(mount.Name, sandbox, StringComparison.Ordinal);
+                    var targetIsSandbox = string.Equals(target, sandbox, StringComparison.Ordinal);
+                    var keyIsHost = string.Equals(mount.Name, host, StringComparison.Ordinal);
+                    var sourceIsHost = string.Equals(source, host, StringComparison.Ordinal);
+
+                    var targetMatches = keyIsSandbox || targetIsSandbox;
+                    var sourceMatches = keyIsHost || sourceIsHost;
+
+                    if (targetMatches)
+                        return sourceMatches;
+                    if (sourceMatches)
+                        return targetMatches;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string? TryGetStringProperty(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object
+            || !element.TryGetProperty(propertyName, out var value)
+            || value.ValueKind != JsonValueKind.String)
+            return null;
+        return value.GetString();
     }
 
     /// <summary>
@@ -2090,7 +2356,17 @@ test "$work" = present && test "$exec_wrapper" = present
     {
         var start = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct, workItemId: workItemId);
         if (start.ExitCode != 0)
-            throw new InvalidOperationException($"multipass start failed: {start.Stderr}");
+        {
+            if (IsStartAlreadyRunning(start))
+            {
+                _log.LogInformation("multipass start {Name} reported already-running; treating start as successful", name);
+            }
+            else
+            {
+                ThrowIfProvisioningRetryExhausted("start", start);
+                throw new InvalidOperationException($"multipass start failed: {start.Stderr}");
+            }
+        }
         await WaitForRunningAsync(opts, name, workItemId, ct);
     }
 
@@ -2131,19 +2407,25 @@ test "$work" = present && test "$exec_wrapper" = present
             ctInner => RunAsync(
                 opts,
                 [opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
-                stdin: null, ct: ctInner),
+                stdin: null, ct: ctInner, workItemId: workItemId),
             _log,
             description: $"multipass transfer env file -> {name}",
             ct);
         if (tx.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("transfer", tx);
             throw new InvalidOperationException($"multipass transfer env file failed: {tx.Stderr}");
+        }
 
         var perms = await RunAsync(
             opts,
             [opts.MultipassBinary, "exec", name, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"],
             stdin: null, ct: ct, workItemId: workItemId);
         if (perms.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("exec", perms);
             throw new InvalidOperationException($"failed to chmod env file in VM: {perms.Stderr}");
+        }
 
         return "/home/ubuntu/.codeybox-env";
     }
@@ -2650,6 +2932,56 @@ test "$work" = present && test "$exec_wrapper" = present
             ct,
             _daemonRetryPolicy);
 
+    private async Task<ProcessRunResult> RunProvisioningAsync(
+        MultipassSandboxOptions opts,
+        IReadOnlyList<string> argv,
+        string operation,
+        string? stdin,
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
+    {
+        var result = await RunAsync(opts, argv, stdin, ct, workItemId);
+        ThrowIfProvisioningRetryExhausted(operation, result);
+        return result;
+    }
+
+    private void ThrowIfProvisioningRetryExhausted(string operation, ProcessRunResult result)
+    {
+        if (!MultipassDaemonRetry.TryGetRetryExhaustedErrorClass(result, out var errorClass))
+            return;
+
+        ThrowProvisioningDeferred(
+            operation,
+            string.IsNullOrWhiteSpace(errorClass) ? "multipass-transient" : errorClass,
+            result.Stderr.Trim());
+    }
+
+    private void ThrowProvisioningDeferred(string operation, string errorClass, string detail)
+    {
+        throw new SandboxProvisioningDeferredException(
+            Name,
+            operation,
+            errorClass,
+            detail.Trim(),
+            _daemonRetryPolicy.ExhaustedRequeueDelay);
+    }
+
+    private static bool IsCloneTargetAlreadyExists(ProcessRunResult result, string name) =>
+        result.ExitCode != 0
+        && result.Stderr.Contains("already exists", StringComparison.OrdinalIgnoreCase)
+        && result.Stderr.Contains(name, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsStartAlreadyRunning(ProcessRunResult result) =>
+        result.ExitCode != 0
+        && (result.Stderr.Contains("already running", StringComparison.OrdinalIgnoreCase)
+            || result.Stderr.Contains("already started", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsMountAlreadyMounted(ProcessRunResult result, string sandboxPath) =>
+        result.ExitCode != 0
+        && result.Stderr.Contains("already mounted", StringComparison.OrdinalIgnoreCase)
+        && (result.Stderr.Contains(sandboxPath, StringComparison.Ordinal)
+            || result.Stderr.Contains("is already mounted", StringComparison.OrdinalIgnoreCase));
+
     private async Task TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
     {
         try
@@ -2670,6 +3002,7 @@ internal sealed class MultipassDaemonRetryPolicy
     public IReadOnlyList<TimeSpan> Backoffs { get; init; } =
         [TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)];
     public TimeSpan HealthProbeTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan ExhaustedRequeueDelay { get; init; } = TimeSpan.FromSeconds(30);
     public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } =
         static (delay, ct) => Task.Delay(delay, ct);
 }
@@ -2696,7 +3029,9 @@ internal static class MultipassDaemonRetry
         "info",
         "clone",
         "mount",
+        "umount",
         "stop",
+        "transfer",
     };
 
     internal static async Task<ProcessRunResult> RunWithRetryAsync(
@@ -2721,6 +3056,7 @@ internal static class MultipassDaemonRetry
         ProcessRunResult result = default;
         string? errorClass = null;
         var description = Describe(argv);
+        var operation = argv.Count >= 2 ? argv[1] : "multipass";
 
         for (var attempt = 1; attempt <= policy.MaxAttempts; attempt++)
         {
@@ -2736,7 +3072,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, retryOrdinal, errorClass);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass);
 
             if (retryOrdinal == 1)
             {
@@ -2783,9 +3119,41 @@ internal static class MultipassDaemonRetry
         if ((command == "launch" || command == "start")
             && stderr.Contains("cannot connect to", StringComparison.OrdinalIgnoreCase))
             return "multipass-daemon-unreachable";
+        if (command == "start"
+            && stderr.Contains("argument not found", StringComparison.OrdinalIgnoreCase))
+            return "multipass-start-argument-not-found";
         if (stderr.Contains("socket", StringComparison.OrdinalIgnoreCase))
             return "multipass-socket-error";
         return null;
+    }
+
+    internal static bool TryGetRetryExhaustedErrorClass(ProcessRunResult result, out string errorClass)
+    {
+        errorClass = "";
+        if (result.ExitCode == 0)
+            return false;
+
+        var stderr = result.Stderr ?? "";
+        var exhausted =
+            stderr.StartsWith("multipass transient daemon error after ", StringComparison.Ordinal)
+            || stderr.StartsWith("multipass daemon unreachable after ", StringComparison.Ordinal);
+        if (!exhausted)
+            return false;
+
+        var open = stderr.IndexOf(" retries (", StringComparison.Ordinal);
+        if (open >= 0)
+        {
+            open += " retries (".Length;
+            var close = stderr.IndexOf(')', open);
+            if (close > open)
+            {
+                errorClass = stderr[open..close];
+                return true;
+            }
+        }
+
+        errorClass = "multipass-transient";
+        return true;
     }
 
     /// <summary>
@@ -2829,10 +3197,10 @@ internal static class MultipassDaemonRetry
         }
     }
 
-    private static void AuditTransientRetry(WorkItemId? workItemId, int attempt, string errorClass)
+    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass)
     {
         if (workItemId.HasValue)
-            AuditLog.SandboxLaunchTransientRetry(workItemId.Value, attempt, errorClass);
+            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass);
     }
 
     private static string Describe(IReadOnlyList<string> argv)

@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler
 {
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -1057,6 +1057,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         foreach (var item in allItems)
         {
+            if (_deferredItems.ContainsKey(item.Id))
+                continue;
+
             if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
                 continue;
 
@@ -1218,28 +1221,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State == WorkItemState.WaitingForQuotaReset)
             return null;
 
-        WorkItemState? targetState = item.State switch
-        {
-            WorkItemState.Auditing => WorkItemState.WorkComplete,
-            WorkItemState.Reworking => WorkItemState.WorkComplete,
-            // ReworkingForConflict resumes from AuditPassed so the merge phase
-            // re-runs. The ConflictReworkAttempts counter is preserved across
-            // the restart so the third-line fallback cannot fire a second
-            // time: if the re-run merge fails again the item parks at
-            // MergeConflictResolutionFailed instead of looping the agent.
-            WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
-            WorkItemState.Merging => WorkItemState.AuditPassed,
-            // WorkComplete / AuditPassed / Merged: pipeline resumes at the correct
-            // phase; no state change needed, just re-enqueue.
-            // UpstreamPushing → Merged: the skip flags in PipelineRunner treat Merged
-            // as "all phases done, go straight to RunUpstreamPushPhaseAsync". Keeping
-            // UpstreamPushing would leave skipWork/skipAudit/skipMerge all false and
-            // trigger a full pipeline replay from scratch.
-            WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
-                => item.State,
-            WorkItemState.UpstreamPushing => WorkItemState.Merged,
-            _ => null,
-        };
+        WorkItemState? targetState = WorkItemRecoveryPolicy.MapToRecoveryState(item.State);
 
         if (targetState is null) return null;
 
@@ -1641,13 +1623,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // disk.deferred webhook so existing alerting fires, then
                 // schedule a re-pickup. In-flight items already running on
                 // other workers are not touched.
-                AuditLog.DiskDeferred(item.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
+                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+                AuditLog.DiskDeferred(deferredItem.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
                 if (_webhooks is not null)
                 {
                     _ = _webhooks.PublishAsync(new WebhookEvent
                     {
                         Event = "disk.deferred",
-                        WorkItem = item,
+                        WorkItem = deferredItem,
                         Project = project,
                         Details = new
                         {
@@ -1659,6 +1642,41 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     }, CancellationToken.None);
                 }
                 ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, ct);
+                return;
+            }
+            catch (SandboxProvisioningDeferredException provEx)
+            {
+                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+                AuditLog.SandboxProvisioningDeferred(
+                    deferredItem.Id,
+                    provEx.Provider,
+                    provEx.Operation,
+                    provEx.ErrorClass,
+                    deferredItem.State.ToString(),
+                    provEx.RecheckIn);
+
+                if (_webhooks is not null)
+                {
+                    _ = _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "sandbox.provisioning_deferred",
+                        WorkItem = deferredItem,
+                        Project = project,
+                        Details = new
+                        {
+                            provider = provEx.Provider,
+                            operation = provEx.Operation,
+                            errorClass = provEx.ErrorClass,
+                            resumeState = deferredItem.State.ToString(),
+                            suggestedRetryAt = DateTimeOffset.UtcNow + provEx.RecheckIn,
+                        },
+                    }, CancellationToken.None);
+                }
+
+                _log.LogWarning(
+                    "Worker {WorkerId} deferring {Id}: sandbox provisioning transient ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
+                    workerIndex, id, provEx.Provider, provEx.Operation, provEx.ErrorClass, deferredItem.State);
+                ScheduleDeferredRequeue(item.Id, provEx.RecheckIn, ct);
                 return;
             }
             catch (Exception ex)
@@ -1869,21 +1887,42 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
+    private async Task<WorkItem> ResetInfrastructureDeferredItemAsync(WorkItem item, CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        var reset = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            current,
+            DateTimeOffset.UtcNow);
+        if (reset is null)
+            return current;
+
+        if (reset == current)
+            return current;
+
+        var updated = await _store.TryUpdateIfStateAsync(reset, current.State, ct).ConfigureAwait(false);
+        if (updated)
+            return reset;
+
+        return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? current;
+    }
+
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after
-    /// <paramref name="delay"/>. Used when the quota router defers a work item
-    /// because all subscription-billed members are exhausted. The item remains
-    /// in Queued state; the deferred task simply puts it back on the channel so
-    /// the next pickup attempt re-probes quota. On shutdown (stoppingToken
-    /// cancelled), the delayed task exits cleanly; the item is recovered via
-    /// ReplayPendingAsync on the next start.
+    /// <paramref name="delay"/>. Used for quota, budget, and infrastructure
+    /// deferrals. The item remains in its recoverable state; the deferred task
+    /// simply puts it back on the channel after the recheck window. On shutdown
+    /// (stoppingToken cancelled), the delayed task exits cleanly; the item is
+    /// recovered via ReplayPendingAsync on the next start.
     /// </summary>
+    public void ScheduleInfrastructureDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken = default)
+        => ScheduleDeferredRequeue(id, delay, stoppingToken);
+
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
         var count = Interlocked.Increment(ref _pendingDeferrals);
         if (count > DeferralWarningThreshold)
             _log.LogWarning(
-                "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
+                "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
 
         // Mark the item as currently-deferred so the priority pickup query skips it
@@ -1897,7 +1936,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try
             {
                 await Task.Delay(delay, stoppingToken);
-                _log.LogInformation("Re-enqueueing deferred work item {Id} after quota recheck interval", id);
+                _log.LogInformation("Re-enqueueing deferred work item {Id} after defer interval", id);
                 _deferredItems.TryRemove(id, out _);
                 await _queue.EnqueueAsync(id, stoppingToken);
             }
