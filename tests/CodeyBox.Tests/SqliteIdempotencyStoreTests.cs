@@ -130,4 +130,22 @@ public sealed class SqliteIdempotencyStoreTests : IDisposable
         var stillThere = await _store.LookupAsync("c", "h3", DateTimeOffset.UtcNow);
         Assert.Equal(IdempotencyLookupOutcome.Hit, stillThere.Outcome);
     }
+
+    [Fact]
+    public async Task DeleteExpiredAsync_ContinuesPastFirstBatch()
+    {
+        const int expiredCount = 501;
+        var now = DateTimeOffset.UtcNow;
+        for (var i = 0; i < expiredCount; i++)
+            await _store.PutAsync(Entry($"expired-{i}", "h", expires: now.AddMinutes(-10)));
+        await _store.PutAsync(Entry("fresh", "h", expires: now.AddHours(1)));
+
+        var deleted = await _store.DeleteExpiredAsync(now);
+
+        Assert.Equal(expiredCount, deleted);
+        Assert.Equal(IdempotencyLookupOutcome.Miss,
+            (await _store.LookupAsync("expired-500", "h", now)).Outcome);
+        Assert.Equal(IdempotencyLookupOutcome.Hit,
+            (await _store.LookupAsync("fresh", "h", now)).Outcome);
+    }
 }
