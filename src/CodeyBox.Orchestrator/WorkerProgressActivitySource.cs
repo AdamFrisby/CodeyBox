@@ -45,9 +45,9 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     public const string WorkItemIdEnvironmentVariable = SandboxConventions.WorkItemIdEnvironmentVariable;
 
     private const int MaxAncestorWalk = 32;
+    private static readonly TimeSpan InitialCpuSampleDelay = TimeSpan.FromMilliseconds(50);
     private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
-    private readonly ConcurrentDictionary<WorkItemId, ActiveSandboxSample> _activeSandboxSamples = new();
 
     public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
         => _activeSandboxProvider = activeSandboxProvider;
@@ -95,29 +95,15 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return false;
         }
 
-        var sandboxIds = snapshot
-            .Where(entry => entry.WorkItemId == itemId)
-            .Select(entry => entry.SandboxId)
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .OrderBy(id => id, StringComparer.Ordinal)
-            .ToArray();
+        var hasActiveSandbox = snapshot.Any(entry =>
+            entry.WorkItemId == itemId &&
+            !string.IsNullOrWhiteSpace(entry.SandboxId));
 
-        if (sandboxIds.Length == 0)
-        {
-            _activeSandboxSamples.TryRemove(itemId, out _);
+        if (!hasActiveSandbox)
             return false;
-        }
 
-        var sample = new ActiveSandboxSample(string.Join("\0", sandboxIds));
-        if (!_activeSandboxSamples.TryGetValue(itemId, out var previous)
-            || !string.Equals(sample.SandboxSetSignature, previous.SandboxSetSignature, StringComparison.Ordinal))
-        {
-            _activeSandboxSamples[itemId] = sample;
-            reason = "active-sandbox";
-            return true;
-        }
-
-        return false;
+        reason = "active-sandbox";
+        return true;
     }
 
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)
@@ -135,9 +121,15 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         if (!_processSamples.TryGetValue(itemId, out var previous)
             || !string.Equals(sample.ProcessSetSignature, previous.ProcessSetSignature, StringComparison.Ordinal))
         {
-            _processSamples[itemId] = sample;
-            reason = "process-observed";
-            return true;
+            if (TryConfirmImmediateCpuProgress(itemId, sample, out var observedSample))
+            {
+                _processSamples[itemId] = observedSample;
+                reason = "process-cpu";
+                return true;
+            }
+
+            _processSamples[itemId] = observedSample;
+            return false;
         }
 
         _processSamples[itemId] = sample;
@@ -148,6 +140,26 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         }
 
         return false;
+    }
+
+    private static bool TryConfirmImmediateCpuProgress(
+        WorkItemId itemId,
+        ProcessCpuSample baseline,
+        out ProcessCpuSample observedSample)
+    {
+        observedSample = baseline;
+
+        // Establish a CPU baseline for workers first observed after durable
+        // progress is already stale without treating mere process presence as
+        // progress.
+        Thread.Sleep(InitialCpuSampleDelay);
+
+        if (!TryReadWorkItemCpuTicks(itemId, out var next))
+            return false;
+
+        observedSample = next;
+        return string.Equals(next.ProcessSetSignature, baseline.ProcessSetSignature, StringComparison.Ordinal)
+            && next.CpuTicks > baseline.CpuTicks;
     }
 
     private static bool TryReadWorkItemCpuTicks(WorkItemId itemId, out ProcessCpuSample sample)
@@ -268,5 +280,4 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     }
 
     private readonly record struct ProcessCpuSample(long CpuTicks, string ProcessSetSignature);
-    private readonly record struct ActiveSandboxSample(string SandboxSetSignature);
 }

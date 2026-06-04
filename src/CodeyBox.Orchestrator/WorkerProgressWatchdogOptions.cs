@@ -40,20 +40,20 @@ public sealed class WorkerProgressWatchdogOptions
 
     /// <summary>
     /// When true, the watchdog treats item-owned host processes whose CPU tick
-    /// counters advance between sweeps as progress. Sandbox providers derive
+    /// counters advance between observations as progress. Merely seeing a
+    /// tagged process is not enough. Sandbox providers derive
     /// <c>CODEYBOX_WORK_ITEM_ID</c> from timing work-item context so this
-    /// signal is scoped to the work item instead of all agent CLIs on the
-    /// host. Default true. Hot-reloadable on the next sweep.
+    /// signal is scoped to the work item instead of all agent CLIs on the host.
+    /// Default true. Hot-reloadable on the next sweep.
     /// </summary>
     public bool ProcessCpuProgressSignalEnabled { get; set; } = true;
 
     /// <summary>
-    /// When true, the watchdog treats first observation of a provider-tracked
-    /// active sandbox, or a change in that work item's active sandbox set, as
-    /// progress. The signal is bounded: a stable active-sandbox snapshot is
-    /// lifecycle ownership, not proof of ongoing guest activity, so it does
-    /// not refresh progress forever. Default true. Hot-reloadable on the next
-    /// sweep.
+    /// When true, the watchdog treats provider-tracked active sandbox ownership
+    /// as progress. This covers VM-backed providers whose guest CPU is not
+    /// visible from host <c>/proc</c>; providers should omit sandboxes that are
+    /// no longer actively owned by a work item. Default true. Hot-reloadable on
+    /// the next sweep.
     /// </summary>
     public bool ActiveSandboxProgressSignalEnabled { get; set; } = true;
 

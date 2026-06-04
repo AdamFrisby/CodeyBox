@@ -195,7 +195,7 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 Detects a bound worker that has stopped making lifecycle progress while its
 heartbeat may still be fresh. Heartbeat alone is ignored. The watchdog recycles
 only when the work item timestamp, agent stream timestamp, item-owned process
-CPU signal, and bounded active sandbox generation signal are all stale for
+CPU signal, and active sandbox ownership signal are all stale for
 `ProgressTimeout`.
 
 ```json
@@ -212,11 +212,11 @@ CPU signal, and bounded active sandbox generation signal are all stale for
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ProgressTimeout` | `01:00:00` | Window without item, stream, process CPU, or active sandbox generation progress before a worker is considered wedged. Set `00:00:00` to disable the watchdog. |
+| `ProgressTimeout` | `01:00:00` | Window without item, stream, process CPU, or active sandbox progress before a worker is considered wedged. Set `00:00:00` to disable the watchdog. |
 | `CheckInterval` | `00:01:00` | Sweep cadence. Sampled at startup; restart to change. |
 | `AutoRecover` | `true` | Recycle the worker and requeue the item from the nearest recoverable state. When false, park the item at `NeedsOperatorInput`. |
-| `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between sweeps as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
-| `ActiveSandboxProgressSignalEnabled` | `true` | Count first observation of a provider-tracked active sandbox, or a change in that work item's active sandbox set, as progress. A stable active-sandbox snapshot is not refreshed forever. |
+| `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between observations as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
+| `ActiveSandboxProgressSignalEnabled` | `true` | Count provider-tracked active sandbox ownership as progress. This covers VM-backed providers whose guest CPU is not visible from host `/proc`; providers should omit sandboxes no longer actively owned by a work item. |
 | `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. |
 | `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `Failed`; `0` means unlimited. |
 

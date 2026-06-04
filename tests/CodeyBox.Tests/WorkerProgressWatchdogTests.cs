@@ -315,7 +315,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_StableActiveSandboxSignal_DoesNotRefreshProgressForever()
+    public async Task Watchdog_StableActiveSandboxSignal_ContinuesAsProgress()
     {
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
         var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
@@ -344,9 +344,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, after!.State);
-        Assert.Single(_slotReleaser.Releases);
-        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
     }
 
     [Fact]
@@ -410,9 +410,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
                 ActiveSandboxProgressSignalEnabled: false);
             var worker = WorkerForItem("idle-process-test", itemId);
 
-            var first = await WaitForActivityAsync(source, worker, itemId, probe);
-            Assert.NotNull(first);
-            Assert.Equal("process-observed", first!.Reason);
+            var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+            Assert.Null(first);
 
             WorkerProgressActivity? idleActivity = null;
             for (var i = 0; i < 5; i++)
@@ -432,7 +431,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_IdleTaggedProcess_AgesOutAndRecovers()
+    public async Task Watchdog_IdleTaggedProcess_Recovers()
     {
         if (!OperatingSystem.IsLinux())
             return;
@@ -458,13 +457,6 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
                 activitySource: new DefaultWorkerProgressActivitySource());
 
             await watchdog.RunOnceAsync(CancellationToken.None);
-            Assert.Empty(_slotReleaser.Releases);
-
-            for (var i = 0; i < 5 && _slotReleaser.Releases.Count == 0; i++)
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(40));
-                await watchdog.RunOnceAsync(CancellationToken.None);
-            }
 
             var after = await _store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Queued, after!.State);
@@ -537,7 +529,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultActivitySource_StableActiveSandboxSet_ReturnsNoActivity()
+    public async Task DefaultActivitySource_StableActiveSandboxSet_CountsAsProgress()
     {
         var itemId = WorkItemId.New();
         var provider = new ActiveSandboxProviderStub(itemId);
@@ -551,7 +543,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var second = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
 
         Assert.NotNull(first);
-        Assert.Null(second);
+        Assert.NotNull(second);
+        Assert.Equal("active-sandbox", second!.Reason);
     }
 
     [Fact]
@@ -670,7 +663,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         using var replacement = StartBusyProcess(itemId);
         try
         {
-            var observed = await WaitForActivityAsync(source, worker, itemId, probe, requiredReason: "process-observed");
+            var observed = await WaitForActivityAsync(source, worker, itemId, probe, requiredReason: "process-cpu");
             Assert.NotNull(observed);
         }
         finally
