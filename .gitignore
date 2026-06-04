@@ -21,3 +21,7 @@ obj/
 /logs/
 **/logs/*.json
 **/logs/agents/
+
+# `dotnet test --logger trx` writes per-run result files here; they're
+# time/machine-stamped and not meant to be committed.
+**/TestResults/

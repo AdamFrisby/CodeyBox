@@ -211,7 +211,15 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     }
 }
 
-builder.Services.Configure<CodeyBoxOptions>(builder.Configuration.GetSection("CodeyBox"));
+// AddOptions + PostConfigure instead of plain Configure so the AgentClasses
+// override resolver runs after the binder. The default ConfigurationBinder
+// merges arrays positionally — for AgentClasses that's a silent footgun
+// (a shorter operator override exposes the base array's trailing element).
+// The post-configure step REPLACES AgentClasses with the highest-precedence
+// provider's view, and re-runs on every IOptionsMonitor reload.
+builder.Services.AddOptions<CodeyBoxOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox"))
+    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
@@ -229,9 +237,19 @@ builder.Services.AddOptions<ProjectsOptions>()
 // The retaining monitor cache is deliberate: stock IOptionsMonitor drops its
 // prior cached value before validating a reload candidate, so a rejected edit
 // would make CurrentValue throw until the next successful reload.
-builder.Services.AddSingleton(sp => new CodeyBoxOptionsStartupSnapshot(
-    sp.GetRequiredService<IConfiguration>().GetSection("CodeyBox").Get<CodeyBoxOptions>()
-    ?? new CodeyBoxOptions()));
+//
+// AgentClassesOverrideResolver runs here AS WELL AS in the IOptions PostConfigure
+// pipeline: this snapshot pre-seeds the RetainingOptionsMonitorCache below, and
+// stock IOptionsMonitor returns that cached value without running the options
+// factory, so without this call IOptionsMonitor<CodeyBoxOptions>.CurrentValue
+// would observe the raw positional-merge AgentClasses until the first reload.
+builder.Services.AddSingleton(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    var snapshot = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
+    AgentClassesOverrideResolver.ApplyTo(snapshot, config);
+    return new CodeyBoxOptionsStartupSnapshot(snapshot);
+});
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));

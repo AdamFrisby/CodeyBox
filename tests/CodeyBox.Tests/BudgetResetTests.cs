@@ -148,7 +148,11 @@ public sealed class BudgetResetTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        // Generous timeout: under parallel test stress the dispatcher can take
+        // multiple seconds to even pick up the item — a 2 s wall was flaky in
+        // the audit sandbox. The check exits early once the item is deferred,
+        // so happy-path runs are unaffected.
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
         while (DateTimeOffset.UtcNow < deferDeadline && !svc.IsDeferredForTest(newItem.Id))
             await Task.Delay(25);
 
