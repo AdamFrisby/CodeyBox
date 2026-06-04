@@ -78,7 +78,7 @@ public sealed class PipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("fresh.txt", "fresh run\n"));
 
-        var item = NewItem("feature/retry");
+        var item = NewItem("feature/retry") with { RecoveryAttempts = 1 };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var baseTip = await RevParseAsync(barePath, "main");

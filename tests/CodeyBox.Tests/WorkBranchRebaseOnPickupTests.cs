@@ -101,7 +101,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
-        var item = NewItem("feature/recovered-anomalous-branch");
+        var item = NewItem("feature/recovered-anomalous-branch") with { RecoveryAttempts = 1 };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var baseTip = await RevParseAsync(barePath, "main");
@@ -126,6 +126,74 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         Assert.Equal("work after anomalous branch recovery\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
         var priorOnBranch = await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:prior.txt");
         Assert.NotEqual(0, priorOnBranch.code);
+    }
+
+    [Fact]
+    public async Task QueuedResume_PreservesExistingWorkBranchBeforeWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-resume") with
+        {
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var preservedTip = await CommitToBareBranchAsync(
+            barePath, item.WorkBranch!, "preserved.txt", "preserved work\n", "preserved work");
+
+        string? observedHead = null;
+        string? observedPreservedFile = null;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var head = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "HEAD"],
+            }, ct);
+            observedHead = head.Stdout.Trim();
+
+            var preserved = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/preserved.txt"],
+            }, ct);
+            observedPreservedFile = preserved.Stdout;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "continued work\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(final.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(preservedTip, observedHead);
+        Assert.Equal("preserved work\n", observedPreservedFile);
+        Assert.Equal(preservedTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("preserved work\n", await ShowAsync(barePath, $"{item.WorkBranch}:preserved.txt"));
+        Assert.Equal("continued work\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task QueuedExplicitNonOwnedExistingWorkBranchWithoutRecoveryIsPreserved()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-managed");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var existingTip = await CommitToBareBranchAsync(
+            barePath, item.WorkBranch!, "operator.txt", "operator work\n", "operator work");
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent continuation\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(existingTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("operator work\n", await ShowAsync(barePath, $"{item.WorkBranch}:operator.txt"));
+        Assert.Equal("agent continuation\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
     }
 
     [Fact]

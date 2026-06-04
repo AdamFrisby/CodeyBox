@@ -106,6 +106,7 @@ public sealed class ResumeEndpointTests : IDisposable
         // Critical: WorkBranch is preserved (the whole point of /resume vs
         // /retry — With(Queued) would have cleared it).
         Assert.Equal(item.WorkBranch, readBack.WorkBranch);
+        Assert.True(readBack.PreserveWorkBranchOnQueuedPickup);
         // Reset fields cleared.
         Assert.Null(readBack.LastError);
         Assert.Null(readBack.CancellationReason);

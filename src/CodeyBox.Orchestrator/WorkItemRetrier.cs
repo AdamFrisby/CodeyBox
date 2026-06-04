@@ -360,6 +360,7 @@ public sealed class WorkItemRetrier
             FailureKind = null,
             RecoveryAttempts = 0,
             StartedAt = null,
+            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued,
         };
 
         // Conditional update guards against a racing cascade-cancel or

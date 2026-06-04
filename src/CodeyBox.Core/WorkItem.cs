@@ -40,6 +40,13 @@ public sealed record WorkItem
     public string? WorkBranch { get; init; }
 
     /// <summary>
+    /// One-shot pickup policy for operator resume-from-work. When true and the
+    /// item is queued, the next work-phase pickup keeps an existing work branch
+    /// instead of resetting it to base. Normal state transitions clear it.
+    /// </summary>
+    public bool PreserveWorkBranchOnQueuedPickup { get; init; }
+
+    /// <summary>
     /// Agent preference for this work item. When no <see cref="AgentClassId"/> is set,
     /// overrides the project's default agent. When <see cref="AgentClassId"/> is set,
     /// this field is <b>not consulted</b> during class routing: members are chosen purely
@@ -466,6 +473,7 @@ public sealed record WorkItem
             // Clear WorkBranch when re-queuing from Working: the in-flight branch is
             // gone; the next pickup generates a fresh one.
             WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+            PreserveWorkBranchOnQueuedPickup = state == WorkItemState.Queued && PreserveWorkBranchOnQueuedPickup,
             PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
             PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
         };

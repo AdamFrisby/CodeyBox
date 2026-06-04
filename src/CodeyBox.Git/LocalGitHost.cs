@@ -1,5 +1,6 @@
-using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
@@ -1107,13 +1108,30 @@ public sealed class LocalGitHost : IGitHost
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
 
-        using var p = new System.Diagnostics.Process { StartInfo = psi };
-        p.Start();
-        var stdout = await p.StandardOutput.ReadToEndAsync(ct);
-        var stderr = await p.StandardError.ReadToEndAsync(ct);
-        await p.WaitForExitAsync(ct);
-        return (p.ExitCode, stdout, stderr);
+        const int maxStartAttempts = 8;
+        for (var attempt = 1; ; attempt++)
+        {
+            using var p = new System.Diagnostics.Process { StartInfo = psi };
+            try
+            {
+                p.Start();
+            }
+            catch (Win32Exception ex) when (attempt < maxStartAttempts && IsTextFileBusy(ex))
+            {
+                await Task.Delay(25 * attempt, ct);
+                continue;
+            }
+
+            var stdout = await p.StandardOutput.ReadToEndAsync(ct);
+            var stderr = await p.StandardError.ReadToEndAsync(ct);
+            await p.WaitForExitAsync(ct);
+            return (p.ExitCode, stdout, stderr);
+        }
     }
+
+    private static bool IsTextFileBusy(Win32Exception ex)
+        => ex.NativeErrorCode == 26
+            || ex.Message.Contains("Text file busy", StringComparison.Ordinal);
 
     private sealed class RepositoryLockState
     {

@@ -164,12 +164,12 @@ public sealed class RetryFromWorkResetTests : IDisposable
     }
 
     [Fact]
-    public async Task ExplicitNonOwnedWorkBranchIsResetOnQueuedEntry()
+    public async Task RecoveredExplicitNonOwnedWorkBranchIsResetOnQueuedEntry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
-        var item = NewItem("feature/operator-managed");
+        var item = NewItem("feature/operator-managed") with { RecoveryAttempts = 1 };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var baseTip = await RevParseAsync(barePath, "main");
