@@ -500,6 +500,137 @@ public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
     }
 
     [Fact]
+    public async Task RateAwareTopMemberGated_ReadyBacklogSpillsToFallbackAndFillsOpenSlots()
+    {
+        // Incident regression: codex is intentionally rate-aware gated with
+        // two codex workers already running, but the pool has two global slots
+        // free. Ready class-routed backlog must spill to the healthy fallback
+        // member instead of leaving those global slots idle.
+        var cls = new AgentClass
+        {
+            Id = "rate-spill",
+            DisplayName = "Rate spill",
+            Members =
+            [
+                new AgentMembership { Agent = Codex,  Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+        };
+
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = 90.0,
+                    SampleCount = 10,
+                    Status = AgentBurnEstimateStatus.Measured,
+                },
+                [Claude] = new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = 25.0,
+                    SampleCount = 10,
+                    Status = AgentBurnEstimateStatus.Measured,
+                },
+            },
+        };
+
+        OrchestratorService orchestrator = null!;
+        var router = new AgentClassRouter(
+            [cls],
+            [
+                new FakeProbe(Codex, 47.0),
+                new FakeProbe(Claude, 100.0),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            burnEstimator: estimator,
+            runningCounters: new DeferredAgentRunningCounters(() => orchestrator));
+
+        var pipeline = new PinnedPipelineRunner(_store);
+        var queue = new InMemoryTaskQueue();
+        using var reg = new CancellationRegistry(CancellationToken.None);
+        orchestrator = new OrchestratorService(
+            queue, _store, pipeline, reg,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router);
+
+        var codexA = Item("codex-a") with { AgentClassId = null, Agent = Codex };
+        var codexB = Item("codex-b") with { AgentClassId = null, Agent = Codex };
+        await _store.CreateAsync(codexA);
+        await _store.CreateAsync(codexB);
+
+        await orchestrator.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await queue.EnqueueAsync(codexA.Id);
+            await queue.EnqueueAsync(codexB.Id);
+
+            var codexDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < codexDeadline)
+            {
+                var snap = orchestrator.Snapshot();
+                if (snap.GetValueOrDefault(Codex) == 2
+                    && orchestrator.CurrentlyRunningTotal == 2)
+                    break;
+                await Task.Delay(25);
+            }
+
+            Assert.Equal(2, orchestrator.Snapshot().GetValueOrDefault(Codex));
+            Assert.Equal(2, orchestrator.CurrentlyRunningTotal);
+
+            var fallbackA = Item("fallback-a") with { AgentClassId = "rate-spill" };
+            var fallbackB = Item("fallback-b") with { AgentClassId = "rate-spill" };
+            await _store.CreateAsync(fallbackA);
+            await _store.CreateAsync(fallbackB);
+            await queue.EnqueueAsync(fallbackA.Id);
+            await queue.EnqueueAsync(fallbackB.Id);
+
+            var fillDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < fillDeadline)
+            {
+                var snap = orchestrator.Snapshot();
+                if (snap.GetValueOrDefault(Codex) == 2
+                    && snap.GetValueOrDefault(Claude) == 2
+                    && orchestrator.CurrentlyRunningTotal == 4)
+                    break;
+                await Task.Delay(25);
+            }
+
+            var filled = orchestrator.Snapshot();
+            Assert.Equal(2, filled.GetValueOrDefault(Codex));
+            Assert.Equal(2, filled.GetValueOrDefault(Claude));
+            Assert.Equal(4, orchestrator.CurrentlyRunningTotal);
+
+            WorkItem? storedA = null;
+            WorkItem? storedB = null;
+            var stampDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (DateTimeOffset.UtcNow < stampDeadline)
+            {
+                storedA = await _store.GetAsync(fallbackA.Id);
+                storedB = await _store.GetAsync(fallbackB.Id);
+                if (storedA?.Agent == Claude && storedB?.Agent == Claude)
+                    break;
+                await Task.Delay(25);
+            }
+
+            Assert.Equal(Claude, storedA!.Agent);
+            Assert.Equal(Claude, storedB!.Agent);
+        }
+        finally
+        {
+            pipeline.Release();
+            var drainDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (orchestrator.CurrentlyRunningTotal > 0 && DateTimeOffset.UtcNow < drainDeadline)
+                await Task.Delay(25);
+            await orchestrator.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task PerAgentCap_AllMembersAtCap_DefersWithoutChoosingASaturatedMember()
     {
         // When every class member is at its cap, the item defers — the router
