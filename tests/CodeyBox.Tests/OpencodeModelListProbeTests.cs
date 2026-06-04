@@ -53,13 +53,14 @@ public sealed class OpencodeModelListProbeTests
         var stdout = """
             INFO: cache hit
             opencode/big-pickle
+            deepseek-v4-flash
             Loading providers...
             opencode-go/glm-5
             """;
 
         var ids = OpencodeModelListProbe.ParseModelsOutput(stdout);
 
-        Assert.Equal(["opencode/big-pickle", "opencode-go/glm-5"], ids);
+        Assert.Equal(["opencode/big-pickle", "deepseek-v4-flash", "opencode-go/glm-5"], ids);
     }
 
     [Fact]

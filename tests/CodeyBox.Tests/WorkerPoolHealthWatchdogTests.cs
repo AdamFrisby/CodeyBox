@@ -707,6 +707,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
     private sealed class BlockingPipeline : IPipelineRunner
     {
+        private readonly IWorkItemStore? _store;
+
+        public BlockingPipeline(IWorkItemStore? store = null) => _store = store;
+
         public TaskCompletionSource Started { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } =
@@ -716,6 +720,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
+            if (_store is not null)
+                await _store.UpdateAsync(item.With(WorkItemState.Working), CancellationToken.None);
+
             Started.TrySetResult();
             try
             {

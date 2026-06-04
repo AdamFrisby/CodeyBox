@@ -46,7 +46,7 @@ public sealed class OpencodeAgentRunnerTests
         var defaults = new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["opencode"] = "deepseek/deepseek-coder",
+                ["opencode"] = "deepseek-v4-flash",
             });
         var runner = new OpencodeAgentRunner(defaults);
 
@@ -54,7 +54,7 @@ public sealed class OpencodeAgentRunnerTests
 
         var argv = sandbox.CapturedExec!.Argv;
         Assert.Contains("--model", argv);
-        Assert.Contains(argv, a => a.StartsWith("deepseek/", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("deepseek-v4-flash", argv);
     }
 
     [Fact]
@@ -384,7 +384,7 @@ public sealed class OpencodeAgentRunnerTests
         var defaults = new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["opencode"] = "deepseek/deepseek-coder",
+                ["opencode"] = "deepseek-v4-flash",
             });
         var runner = new OpencodeAgentRunner(defaults);
         var cred = OpencodeCred("""{"token":"x"}""");
@@ -397,7 +397,7 @@ public sealed class OpencodeAgentRunnerTests
         Assert.Equal("opencode", agentExec.Argv[0]);
         Assert.Equal("run", agentExec.Argv[1]);
         Assert.Contains("--model", agentExec.Argv);
-        Assert.Contains("deepseek/deepseek-coder", agentExec.Argv);
+        Assert.Contains("deepseek-v4-flash", agentExec.Argv);
         Assert.Equal(prompt, agentExec.Stdin);
     }
 

@@ -6,7 +6,7 @@ namespace CodeyBox.Agents.Opencode;
 
 /// <summary>
 /// Fetches opencode model identifiers by running <c>opencode models</c> on the
-/// host and parsing <c>provider/model</c> lines from stdout.
+/// host and parsing model id lines from stdout.
 /// </summary>
 public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
 {
@@ -86,8 +86,8 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
     }
 
     /// <summary>
-    /// Parses <c>provider/model</c> lines from CLI stdout. Ignores blank lines,
-    /// banners, and preamble such as "Loading providers...".
+    /// Parses model-id lines from CLI stdout. Ignores blank lines, banners,
+    /// and preamble such as "Loading providers...".
     /// </summary>
     internal static IReadOnlyList<string> ParseModelsOutput(string stdout, int maxIds = MaxModelIds)
     {
@@ -103,6 +103,6 @@ public sealed partial class OpencodeModelListProbe : IAgentModelListProbe
         return ids;
     }
 
-    [GeneratedRegex("^[a-z0-9_.-]+/[a-z0-9_.-]+$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("^[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?$", RegexOptions.CultureInvariant)]
     private static partial Regex ModelLineRegex();
 }

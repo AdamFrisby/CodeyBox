@@ -1441,7 +1441,7 @@ public sealed class AgentConfigHotReloadTests
     {
         var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["opencode"] = "deepseek/deepseek-coder",
+            ["opencode"] = "deepseek-v4-flash",
         };
         var snapshot = new AgentDefaultsSnapshot(initialDefaults);
         var runner = new OpencodeAgentRunner(snapshot);
@@ -1452,7 +1452,7 @@ public sealed class AgentConfigHotReloadTests
         var argv = sandbox.CapturedExec!.Argv.ToList();
         var modelIdx = argv.IndexOf("--model");
         Assert.True(modelIdx >= 0);
-        Assert.Equal("deepseek/deepseek-coder", argv[modelIdx + 1]);
+        Assert.Equal("deepseek-v4-flash", argv[modelIdx + 1]);
 
         var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {

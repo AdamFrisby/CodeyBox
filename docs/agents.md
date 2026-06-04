@@ -354,18 +354,17 @@ flows into the in-sandbox materialisation script as-is, so keep it under
 `$HOME` and avoid pointing at `/etc/*` or symlinks unless you intend to
 overwrite the target.
 
-**Default model.** The runner ships with `DefaultModelId` pointed at a
-DeepSeek-coder variant. DeepSeek is the differentiated capability opencode
-adds over the other registered agents (Claude / Codex / Gemini already
-cover Opus-class); DeepSeek's MoE economics fit the bulk audit-rework
-workload that consumes Codex's weekly quota. **Confirm the exact model id**
-with `opencode models` on the host and override `DefaultModelId` (or pin a
-specific id per agent-class member via `ModelId`) to whichever DeepSeek
-coder variant the operator's subscription tier surfaces as the best
-option.
+**Default model.** The shipped appsettings default points opencode at
+`deepseek-v4-flash`. DeepSeek is the differentiated capability opencode adds
+over the other registered agents (Claude / Codex / Gemini already cover
+Opus-class); DeepSeek's MoE economics fit the bulk audit-rework workload that
+consumes Codex's weekly quota. **Confirm the exact model id** with
+`opencode models` on the host and override `DefaultModelId` (or pin a specific
+id per agent-class member via `ModelId`) to whichever DeepSeek variant the
+operator's subscription tier surfaces as the best option.
 
 **Multi-provider routing.** opencode can be slotted multiple times into
-the same agent class with different `ModelId` values — `deepseek/…` as
+the same agent class with different `ModelId` values — `deepseek-v4-flash` as
 the bulk-volume cheap-tokens member, `anthropic/claude-sonnet-4-6` as a
 top-shelf fallback for items the DeepSeek path can't carry, etc. This
 turns opencode into a redundant high-quality fallback path that survives
