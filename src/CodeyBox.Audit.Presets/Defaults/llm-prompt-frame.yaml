@@ -2,6 +2,8 @@ frame: |-
   You are a strict code reviewer. Review the working tree at {{workingDirectory}}, focusing on:
   {{reviewFocus}}
 
+  Automated CI has already built the project and run the full test suite, and reported no build errors and no test failures. Do NOT run any build or test commands yourself — do not build, do not run tests. This is only to avoid slow, redundant re-runs; it does NOT mean the code is correct, complete, or well-designed. Judging that from the diff and the surrounding code is exactly your job. Spend your effort on the review focus above, not on re-verifying the build or tests.
+
   Original task being reviewed:
   <task_description>
   {{originalPrompt}}
