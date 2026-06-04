@@ -20,18 +20,21 @@ public sealed class InVmSmokeCoveragePolicy : IInVmSmokeCoveragePolicy
     private readonly IReadOnlyList<IInVmSmokeProbe> _probes;
     private readonly ISmokeAvailabilityRegistry _availability;
     private readonly InVmSmokeOptions _opts;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
 
     public InVmSmokeCoveragePolicy(
         IEnumerable<IInVmSmokeProbe> probes,
         ISmokeAvailabilityRegistry availability,
-        InVmSmokeOptions opts)
+        InVmSmokeOptions opts,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _probes = probes.ToList();
         _availability = availability;
         _opts = opts;
+        _smokeOptions = smokeOptions;
     }
 
-    private bool Enabled => _opts.Enabled && _probes.Count > 0;
+    private bool Enabled => (_smokeOptions?.Enabled ?? true) && _opts.Enabled && _probes.Count > 0;
 
     /// <inheritdoc />
     public IReadOnlyList<InVmSmokeCoverageOutcome> EnforceMissingProbeCoverage(

@@ -288,8 +288,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            inVmSmokeGate: prober,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, prober));
 
         var item = new WorkItem
         {
@@ -321,9 +321,104 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal("cursor", details.AgentKind);
     }
 
+    [Fact]
+    public async Task DirectAgentPickup_SmokeDisabledGlobally_SkipsInVmGate_AndInvokesRunner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var cursorAgent = new ScriptableAgent(AgentKind.Cursor);
+        var registry = new AgentRegistry([cursorAgent]);
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        availability.MarkSmokeResult(
+            AgentKind.Cursor,
+            new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient),
+            SmokeExclusionSource.InVmSmoke);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var gate = new RejectingInVmSmokeGate();
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var prs = new InMemoryPullRequestService();
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Cursor,
+            NetworkProfiles = new ProjectNetworkProfiles { Work = "work-profile" },
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+
+        var pipeline = new PipelineRunner(
+            sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
+            projects, new TestUpstreamFactory(), composer,
+            store, webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            availability: availability,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "smoke disabled",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            Agent = AgentKind.Cursor,
+            PushUpstream = false,
+        };
+        await store.CreateAsync(item);
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.DoesNotContain("in-VM smoke gate", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.True(cursorAgent.CallCount > 0);
+        Assert.Equal(0, gate.EnsureCalls);
+    }
+
+    [Fact]
+    public async Task DirectAgentPickup_SmokeDisabledGlobally_StillHonorsFastFailBreaker()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var gate = new RejectingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, inVmSmokeGate: gate);
+        for (var i = 0; i < 3; i++)
+            fix.Registry.RecordRunOutcome(
+                AgentKind.Codex,
+                success: false,
+                duration: TimeSpan.FromMilliseconds(500));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("fast-fail circuit breaker", final.LastError);
+        Assert.Equal(0, gate.EnsureCalls);
+        Assert.Equal(0, fix.Codex.CallCount);
+    }
+
     // ── Harness ──────────────────────────────────────────────────────────────
 
-    private TestFixture BuildPipeline(string seedRepoUrl, int maxConsecutiveFastFails = 3)
+    private TestFixture BuildPipeline(
+        string seedRepoUrl,
+        int maxConsecutiveFastFails = 3,
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -382,9 +477,31 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions));
 
         return new TestFixture(pipeline, store, codex, webhooks, availability);
+    }
+
+    private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
+    {
+        public int EnsureCalls { get; private set; }
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            EnsureCalls++;
+            return Task.FromResult(new AgentAvailability(false, "transient: try later", null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            Task.FromResult<AgentAvailability?>(new AgentAvailability(false, "transient: try later", null));
     }
 
     private static WorkItem NewItem(AgentKind initialAgent) => new()

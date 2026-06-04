@@ -187,11 +187,13 @@ internal static class TestSupport
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
             involvement: involvement,
-            inVmSmokeGate: inVmSmokeGate,
             requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
                 sandboxes,
                 gitHost,
-                resolvedOptions));
+                resolvedOptions),
+            dispatchAvailability: inVmSmokeGate is null
+                ? null
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

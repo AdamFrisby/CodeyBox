@@ -198,6 +198,26 @@ public sealed class PickupSmokeTests : IDisposable
     // ── Gate bypass (project opts out) ────────────────────────────────────────
 
     [Fact]
+    public async Task SmokeDisabledGlobally_BypassesCredentialPickupGate()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = true });
+        var (gate, probe) = SmokeGateFactory.Build(probePass: false, smokeOptions: smokeOptions);
+        smokeOptions.Replace(new SmokeOptions { Enabled = false });
+        using var r = BuildResources(seed, gate);
+
+        var item = NewItem(workTimeout: TimeSpan.FromMilliseconds(200));
+        await r.Store.CreateAsync(item);
+        await r.Pipeline.RunAsync(item, CancellationToken.None);
+
+        Assert.True(r.Agent.CallCount > 0);
+        Assert.Equal(0, probe.CallCount);
+        var final = await r.Store.GetAsync(item.Id);
+        Assert.DoesNotContain("credential smoke test failed", final!.LastError,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ProjectSkipsCredentialSmoke_AgentIsInvoked()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

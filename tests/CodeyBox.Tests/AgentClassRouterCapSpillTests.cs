@@ -82,7 +82,6 @@ public sealed class AgentClassRouterCapSpillTests
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: runningCounters,
-            availability: null,
             budgetProvider: budgetProvider,
             concurrencySnapshot: concurrencySnapshot);
     }
@@ -363,7 +362,6 @@ public sealed class AgentClassRouterCapSpillTests
             quotaFailures: failures,
             burnEstimator: null,
             runningCounters: counters,
-            availability: null,
             budgetProvider: null,
             concurrencySnapshot: caps);
 
@@ -409,7 +407,6 @@ public sealed class AgentClassRouterCapSpillTests
             quotaFailures: failures,
             burnEstimator: null,
             runningCounters: counters,
-            availability: null,
             budgetProvider: null,
             concurrencySnapshot: caps);
 
@@ -458,7 +455,6 @@ public sealed class AgentClassRouterCapSpillTests
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: counters,
-            availability: null,
             budgetProvider: null,
             concurrencySnapshot: null);
 

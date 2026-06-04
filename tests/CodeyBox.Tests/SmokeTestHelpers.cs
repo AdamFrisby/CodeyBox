@@ -121,7 +121,8 @@ internal static class SmokeGateFactory
     public static (CredentialSmokeGate Gate, FakeSmokeProbe Probe) Build(
         bool probePass = true,
         bool enabled = true,
-        ICredentialProvider? credentials = null)
+        ICredentialProvider? credentials = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         var probe = new FakeSmokeProbe(AgentKind.Claude, probePass);
         var cache = new AgentSmokeCache(TimeSpan.FromMinutes(15));
@@ -130,7 +131,7 @@ internal static class SmokeGateFactory
             credentials ?? new ConstantCredentialProvider(AnyCred),
             [probe],
             cache,
-            opts,
+            smokeOptions ?? new SmokeOptionsSnapshot(opts),
             NullLogger<CredentialSmokeGate>.Instance);
         return (gate, probe);
     }

@@ -24,3 +24,37 @@ public sealed record SmokeOptions
     /// </summary>
     public int StartupTimeoutSeconds { get; init; } = 10;
 }
+
+/// <summary>
+/// Shared, swappable holder for the current <see cref="SmokeOptions"/>.
+/// Registered as a DI singleton so dispatch gates read through the same
+/// reference the hot-reload coordinator writes to.
+/// </summary>
+public sealed class SmokeOptionsSnapshot
+{
+    private SmokeOptions _current;
+
+    public SmokeOptionsSnapshot(SmokeOptions initial)
+    {
+        ArgumentNullException.ThrowIfNull(initial);
+        _current = initial;
+    }
+
+    /// <summary>
+    /// Current snapshot. Volatile read so a concurrent <see cref="Replace"/>
+    /// cannot tear the reference. Callers should bind once into a local for any
+    /// compound read.
+    /// </summary>
+    public SmokeOptions Current => Volatile.Read(ref _current);
+
+    public bool Enabled => Current.Enabled;
+
+    /// <summary>
+    /// Atomically publishes <paramref name="next"/> as the new snapshot.
+    /// </summary>
+    public void Replace(SmokeOptions next)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        Volatile.Write(ref _current, next);
+    }
+}

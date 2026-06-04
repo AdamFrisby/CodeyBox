@@ -56,6 +56,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly IInVmSmokeCache _cache;
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly ILogger<InVmSmokeProber> _log;
 
     public InVmSmokeProber(
@@ -68,7 +69,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         IInVmSmokeCache cache,
         IWebhookDispatcher webhooks,
         InVmSmokeOptions opts,
-        ILogger<InVmSmokeProber> log)
+        ILogger<InVmSmokeProber> log,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _provider = provider;
         _resolver = resolver;
@@ -79,10 +81,11 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _cache = cache;
         _webhooks = webhooks;
         _opts = opts;
+        _smokeOptions = smokeOptions;
         _log = log;
     }
 
-    public bool Enabled => _opts.Enabled && _probes.Count > 0;
+    public bool Enabled => (_smokeOptions?.Enabled ?? true) && _opts.Enabled && _probes.Count > 0;
 
     /// <summary>
     /// Probes every registered agent against the active baseline. Sequential so
@@ -174,9 +177,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// <summary>
     /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/>. Owns the full
     /// read→probe→re-read sequence so routing consumers get a verdict from this
-    /// one call. Returns the agent's prior availability untouched when the gate
-    /// is disabled; otherwise probes and returns the reconciled availability. A
-    /// cache hit is free.
+    /// one call. Returns the smoke-disabled effective availability when the
+    /// master smoke switch is off, the agent's prior availability untouched
+    /// when only the in-VM gate is disabled, and otherwise probes and returns
+    /// the reconciled availability. A cache hit is free.
     /// <paramref name="target"/> carries the sandbox profile/flavor and optional
     /// pinned baseline ref; the probe runs against the image the dispatch will
     /// actually clone, not just whatever baseline is active now.
@@ -200,6 +204,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
+        if (_smokeOptions?.Enabled == false)
+            return _availability.GetAvailabilityWithoutSmokeGateExclusions(kind);
+
         var current = _availability.GetAvailability(kind);
         if (!Enabled)
             return current;

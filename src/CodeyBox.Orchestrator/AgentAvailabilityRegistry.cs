@@ -60,12 +60,22 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     /// </summary>
     public AgentAvailability GetAvailability(AgentKind kind)
     {
+        return GetAvailability(kind, static _ => true);
+    }
+
+    public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind)
+    {
+        return GetAvailability(kind, IsNonSmokeExclusion);
+    }
+
+    private AgentAvailability GetAvailability(AgentKind kind, Func<SmokeExclusionSource, bool> include)
+    {
         if (!_entries.TryGetValue(kind, out var entry))
             return new AgentAvailability(true, null, null);
 
         lock (entry.Sync)
         {
-            var reason = entry.CombinedReason();
+            var reason = entry.CombinedReason(include);
             return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
@@ -301,9 +311,31 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         public bool IsExcluded => Exclusions.Count > 0;
 
         /// <summary>Null when available; the joined reasons across sources otherwise.</summary>
-        public string? CombinedReason() =>
-            Exclusions.Count == 0 ? null : string.Join("; ", Exclusions.Values);
+        public string? CombinedReason() => CombinedReason(static _ => true);
+
+        public string? CombinedReason(Func<SmokeExclusionSource, bool> include)
+        {
+            if (Exclusions.Count == 0)
+                return null;
+
+            List<string>? reasons = null;
+            foreach (var exclusion in Exclusions)
+            {
+                if (!include(exclusion.Key))
+                    continue;
+
+                reasons ??= [];
+                reasons.Add(exclusion.Value);
+            }
+
+            return reasons is { Count: > 0 } ? string.Join("; ", reasons) : null;
+        }
     }
+
+    private static bool IsNonSmokeExclusion(SmokeExclusionSource source) =>
+        source is not SmokeExclusionSource.HostSmoke
+            and not SmokeExclusionSource.InVmSmoke
+            and not SmokeExclusionSource.MissingProbe;
 }
 
 /// <summary>
@@ -346,10 +378,17 @@ public enum SmokeExclusionSource
 /// exclusion model depend on this one — so neither side is pinned to the
 /// concrete registry type (interface segregation; loose coupling).</para>
 /// </summary>
-public interface ISmokeAvailabilityRegistry
+public interface ISmokeAvailabilityRegistry : IAgentEffectiveAvailabilityReader
 {
     /// <summary>Current routable verdict for an agent (shared with the read port).</summary>
-    AgentAvailability GetAvailability(AgentKind kind);
+    new AgentAvailability GetAvailability(AgentKind kind);
+
+    /// <summary>
+    /// Current verdict with smoke-gate exclusions ignored. Used by the dispatch
+    /// smoke policy when the master smoke switch is disabled; non-smoke
+    /// exclusions such as the fast-fail circuit breaker still apply.
+    /// </summary>
+    new AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind);
 
     /// <summary>Feeds a smoke-probe outcome from a specific source into availability.</summary>
     AvailabilityTransition MarkSmokeResult(

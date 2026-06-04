@@ -70,7 +70,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
-    private readonly IInVmSmokeGate? _inVmSmokeGate;
+    private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
@@ -203,10 +203,10 @@ public sealed class PipelineRunner : IPipelineRunner
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
         IAgentInvolvementStore? involvement = null,
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
-        IRequiredBuildVerifier? requiredBuildVerifier = null)
+        IRequiredBuildVerifier? requiredBuildVerifier = null,
+        IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -264,7 +264,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
-        _inVmSmokeGate = inVmSmokeGate;
+        _dispatchAvailability = dispatchAvailability;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -4401,11 +4401,10 @@ public sealed class PipelineRunner : IPipelineRunner
         // (legacy callers preserve their prior behaviour). target.BaselineRef
         // pins the probe to the image this work item will clone (B1), not just
         // the active baseline.
-        if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);
-        if (_availability is not null)
-            return _availability.GetAvailability(kind);
-        return new AgentAvailability(true, null, null);
+        return _dispatchAvailability is not null
+            ? await _dispatchAvailability.EnsureAvailableAsync(kind, target, ct)
+                ?? new AgentAvailability(true, null, null)
+            : new AgentAvailability(true, null, null);
     }
 
     private static InVmSmokeSandboxTarget ResolvePhaseSmokeTarget(

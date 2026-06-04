@@ -149,7 +149,7 @@ public sealed class AgentClassRouterReadinessTests
     private static AgentClassRouter BuildRouter(
         IReadOnlyList<AgentClass> classes,
         IEnumerable<IAgentQuotaProbe> probes,
-        IAgentAvailabilityRegistry? availability = null,
+        IAgentEffectiveAvailabilityReader? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         TimeProvider? timeProvider = null,
         IQuotaFailureStore? quotaFailures = null)
@@ -160,8 +160,8 @@ public sealed class AgentClassRouterReadinessTests
             NullLogger<AgentClassRouter>.Instance,
             timeProvider: timeProvider,
             quotaFailures: quotaFailures,
-            availability: availability,
-            budgetProvider: budgetProvider);
+            budgetProvider: budgetProvider,
+            dispatchAvailability: availability is null ? null : new AgentDispatchAvailability(availability));
 
     private static AgentClass Class(params AgentMembership[] members) => new()
     {
@@ -200,7 +200,7 @@ public sealed class AgentClassRouterReadinessTests
         public bool HasCapacity(AgentKind agent) => _hasCapacity;
     }
 
-    private sealed class FixedAvailability : IAgentAvailabilityRegistry
+    private sealed class FixedAvailability : IAgentAvailabilityRegistry, IAgentEffectiveAvailabilityReader
     {
         private readonly bool _available;
 
@@ -208,6 +208,9 @@ public sealed class AgentClassRouterReadinessTests
 
         public AgentAvailability GetAvailability(AgentKind kind) =>
             new(_available, _available ? null : "unavailable", null);
+
+        public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind) =>
+            GetAvailability(kind);
 
         public AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration) =>
             new(false, !_available, _available ? null : "unavailable");

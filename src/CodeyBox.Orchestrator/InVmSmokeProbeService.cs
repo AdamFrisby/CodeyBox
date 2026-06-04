@@ -9,8 +9,10 @@ namespace CodeyBox.Orchestrator;
 /// Drives the in-VM smoke gate (<see cref="IInVmSmokeGate"/>) on a schedule: one
 /// sweep at startup, then every <see cref="InVmSmokeOptions.SweepIntervalSeconds"/>.
 /// Runs in the background so the first (VM-provisioning) sweep never blocks host
-/// startup. Depends on the gate abstraction rather than the concrete prober so
-/// the sweep path stays decoupled from the implementation.
+/// startup. The gate's live <see cref="IInVmSmokeGate.Enabled"/> value is checked
+/// before each sweep so the hosted service can resume after the master smoke
+/// switch is hot-reloaded on. Depends on the gate abstraction rather than the
+/// concrete prober so the sweep path stays decoupled from the implementation.
 ///
 /// <para>A passing agent is cheap to re-sweep — the per-baseline cache means a
 /// sweep only provisions a VM when the baseline ref changed or the TTL expired.
@@ -39,10 +41,8 @@ public sealed class InVmSmokeProbeService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!_gate.Enabled)
-            return;
-
-        await SafeSweepAsync(stoppingToken);
+        if (_gate.Enabled)
+            await SafeSweepAsync(stoppingToken);
 
         if (_opts.SweepIntervalSeconds <= 0)
             return;
@@ -56,7 +56,8 @@ public sealed class InVmSmokeProbeService : BackgroundService
             }
             catch (OperationCanceledException) { return; }
 
-            await SafeSweepAsync(stoppingToken);
+            if (_gate.Enabled)
+                await SafeSweepAsync(stoppingToken);
         }
     }
 

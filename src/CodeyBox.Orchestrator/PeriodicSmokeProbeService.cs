@@ -23,7 +23,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IAgentSmokeProbe> _probes;
     private readonly IWebhookDispatcher _webhooks;
-    private readonly SmokeOptions _smokeOpts;
+    private readonly SmokeOptionsSnapshot _smokeOpts;
     private readonly AvailabilityOptions _availOpts;
     private readonly ISmokeAvailabilityRegistry _availability;
     private readonly ILogger<PeriodicSmokeProbeService> _log;
@@ -33,6 +33,18 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
         IEnumerable<IAgentSmokeProbe> probes,
         IWebhookDispatcher webhooks,
         SmokeOptions smokeOpts,
+        AvailabilityOptions availOpts,
+        ISmokeAvailabilityRegistry availability,
+        ILogger<PeriodicSmokeProbeService> log)
+        : this(credentials, probes, webhooks, new SmokeOptionsSnapshot(smokeOpts), availOpts, availability, log)
+    {
+    }
+
+    public PeriodicSmokeProbeService(
+        ICredentialProvider credentials,
+        IEnumerable<IAgentSmokeProbe> probes,
+        IWebhookDispatcher webhooks,
+        SmokeOptionsSnapshot smokeOpts,
         AvailabilityOptions availOpts,
         ISmokeAvailabilityRegistry availability,
         ILogger<PeriodicSmokeProbeService> log)
@@ -48,7 +60,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!_smokeOpts.Enabled || _probes.Count == 0)
+        if (_probes.Count == 0)
             return;
         if (_availOpts.PeriodicSweepInterval <= TimeSpan.Zero)
             return;
@@ -64,7 +76,8 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
             }
             catch (OperationCanceledException) { return; }
 
-            await SweepOnceAsync(stoppingToken);
+            if (_smokeOpts.Enabled)
+                await SweepOnceAsync(stoppingToken);
         }
     }
 
@@ -75,6 +88,9 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
     /// </summary>
     public async Task SweepOnceAsync(CancellationToken ct)
     {
+        if (!_smokeOpts.Enabled)
+            return;
+
         var tasks = _probes.Select(p => ProbeOneAsync(p, ct));
         await Task.WhenAll(tasks);
     }
@@ -86,6 +102,9 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
     /// </summary>
     public async Task<AgentSmokeResult?> ProbeAsync(AgentKind kind, CancellationToken ct)
     {
+        if (!_smokeOpts.Enabled)
+            return null;
+
         var probe = _probes.FirstOrDefault(p => p.Kind == kind);
         if (probe is null) return null;
         return await ProbeOneAsync(probe, ct);
@@ -109,7 +128,7 @@ public sealed class PeriodicSmokeProbeService : BackgroundService, IHostSmokePro
         try
         {
             using var perProbeCts = new CancellationTokenSource(
-                TimeSpan.FromSeconds(_smokeOpts.StartupTimeoutSeconds));
+                TimeSpan.FromSeconds(_smokeOpts.Current.StartupTimeoutSeconds));
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, perProbeCts.Token);
             result = await probe.SmokeTestAsync(credential, linked.Token);
         }

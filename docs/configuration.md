@@ -65,6 +65,8 @@ Hot-reloadable today:
 - `Shutdown.SandboxTeardownMode` — re-read when graceful shutdown teardown
   begins. Operators can switch between `Stop`, `Suspend`, and `Dispose` before
   stopping the process, and that shutdown uses the updated mode.
+- `Smoke.Enabled` — hot-reloaded through `SmokeOptionsSnapshot`; disables the
+  pickup credential gate, router smoke exclusions, and in-VM smoke gate.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
@@ -94,8 +96,8 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   `OrchestratorOptions` and the worker-pool plumbing at startup.
 - `QuotaRouter.*` — `QuotaRouterOptions` and the per-probe `QuotaCacheTtl` are
   captured by the router and the per-provider quota probes at construction.
-- `Smoke.*` / `Smoke.Availability.*` — bound into `SmokeOptions` /
-  `AvailabilityOptions` singletons at startup.
+- `Smoke.CacheTtlMinutes` / `Smoke.Availability.*` — cache and availability
+  registry singletons are sized at startup.
 - `BudgetAlerts.CheckInterval` — sized into the `BudgetAlertService`'s
   `PeriodicTimer` at startup.
 - `SandboxLeak.Enabled` / `SandboxLeak.CheckInterval` — see above.

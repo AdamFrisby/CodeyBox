@@ -16,7 +16,8 @@ public sealed class PeriodicSmokeProbeServiceTests
         IEnumerable<IAgentSmokeProbe> probes,
         AgentAvailabilityRegistry registry,
         CapturingWebhookDispatcher webhooks,
-        TimeSpan? interval = null)
+        TimeSpan? interval = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         var cred = new AgentCredential(
             AgentKind.Claude,
@@ -26,7 +27,7 @@ public sealed class PeriodicSmokeProbeServiceTests
             new ConstantCredentialProvider(cred),
             probes,
             webhooks,
-            new SmokeOptions { Enabled = true, StartupTimeoutSeconds = 5 },
+            smokeOptions ?? new SmokeOptionsSnapshot(new SmokeOptions { Enabled = true, StartupTimeoutSeconds = 5 }),
             new AvailabilityOptions { PeriodicSweepInterval = interval ?? TimeSpan.FromSeconds(30) },
             registry,
             NullLogger<PeriodicSmokeProbeService>.Instance);
@@ -107,5 +108,72 @@ public sealed class PeriodicSmokeProbeServiceTests
 
         var result = await svc.ProbeAsync(AgentKind.Codex, CancellationToken.None);
         Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task SmokeDisabled_SweepOnceAndProbeAsync_DoNotProbeOrMutateAvailability()
+    {
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var probe = new FakeSmokeProbe(AgentKind.Claude, shouldPass: false);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false, StartupTimeoutSeconds = 5 });
+        var svc = Build([probe], registry, webhooks, smokeOptions: smokeOptions);
+
+        await svc.SweepOnceAsync(CancellationToken.None);
+        var result = await svc.ProbeAsync(AgentKind.Claude, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.Equal(0, probe.CallCount);
+        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.Empty(webhooks.Events);
+    }
+
+    [Fact]
+    public async Task BackgroundSweep_DisabledThenEnabled_ResumesAfterHotReload()
+    {
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        var probe = new FakeSmokeProbe(AgentKind.Claude, shouldPass: false);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false, StartupTimeoutSeconds = 5 });
+        var svc = Build(
+            [probe],
+            registry,
+            webhooks,
+            interval: TimeSpan.FromMilliseconds(20),
+            smokeOptions: smokeOptions);
+
+        await svc.StartAsync(CancellationToken.None);
+        try
+        {
+            await Task.Delay(80);
+            Assert.Equal(0, probe.CallCount);
+            Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+
+            smokeOptions.Replace(new SmokeOptions { Enabled = true, StartupTimeoutSeconds = 5 });
+
+            await WaitUntilAsync(() => probe.CallCount > 0, TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            await svc.StopAsync(CancellationToken.None);
+        }
+
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.Contains(webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (predicate())
+                return;
+            await Task.Delay(10);
+        }
+
+        Assert.True(predicate(), "Timed out waiting for condition.");
     }
 }

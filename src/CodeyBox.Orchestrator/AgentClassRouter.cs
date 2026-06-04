@@ -44,7 +44,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IAgentBurnEstimator? _burnEstimator;
     private readonly IAgentRunningCounters? _runningCounters;
-    private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentBudgetProvider? _budgetProvider;
     // Shared swappable holder for per-agent operator caps. Same instance is
     // held by OrchestratorService and PipelineRunner so hot-reload writes
@@ -52,8 +51,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // (legacy test fixtures) — the cap-spill check falls back to "no cap" and
     // the router behaves as before this feature.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
-    private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
+    private readonly IAgentDispatchAvailability? _dispatchAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -97,11 +96,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
-        IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
-        InVmSmokeSandboxTarget? configuredSmokeTarget = null)
+        InVmSmokeSandboxTarget? configuredSmokeTarget = null,
+        IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -120,11 +118,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _quotaFailures = quotaFailures;
         _burnEstimator = burnEstimator;
         _runningCounters = runningCounters;
-        _availability = availability;
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
-        _inVmSmokeGate = inVmSmokeGate;
         _configuredSmokeTarget = configuredSmokeTarget;
+        _dispatchAvailability = dispatchAvailability;
     }
 
     /// <summary>
@@ -929,7 +926,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .Select(x => x.Member)
             .ToList();
 
-        if (_availability is null && _inVmSmokeGate is null)
+        if (_dispatchAvailability is null)
             return ordered;
 
         // Apply the same gate-or-registry verdict ResolveAsync uses, so a
@@ -985,11 +982,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
-        if (_inVmSmokeGate is not null)
-            return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);
-        if (_availability is not null)
-            return _availability.GetAvailability(kind);
-        return null;
+        return _dispatchAvailability is null
+            ? null
+            : await _dispatchAvailability.EnsureAvailableAsync(kind, target, ct);
     }
 
     /// <summary>

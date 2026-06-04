@@ -23,7 +23,7 @@ public sealed class CredentialSmokeGate
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyDictionary<AgentKind, IAgentSmokeProbe> _probes;
     private readonly IAgentSmokeCache _cache;
-    private readonly SmokeOptions _opts;
+    private readonly SmokeOptionsSnapshot _opts;
     private readonly ILogger<CredentialSmokeGate> _log;
 
     public bool Enabled => _opts.Enabled;
@@ -33,6 +33,16 @@ public sealed class CredentialSmokeGate
         IEnumerable<IAgentSmokeProbe> probes,
         IAgentSmokeCache cache,
         SmokeOptions opts,
+        ILogger<CredentialSmokeGate> log)
+        : this(credentials, probes, cache, new SmokeOptionsSnapshot(opts), log)
+    {
+    }
+
+    public CredentialSmokeGate(
+        ICredentialProvider credentials,
+        IEnumerable<IAgentSmokeProbe> probes,
+        IAgentSmokeCache cache,
+        SmokeOptionsSnapshot opts,
         ILogger<CredentialSmokeGate> log)
     {
         _credentials = credentials;

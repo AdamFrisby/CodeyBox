@@ -19,9 +19,10 @@ public sealed class StartupSmokeProbeService : IHostedService
     private readonly ICredentialProvider _credentials;
     private readonly IReadOnlyList<IAgentSmokeProbe> _probes;
     private readonly IWebhookDispatcher _webhooks;
-    private readonly SmokeOptions _opts;
+    private readonly SmokeOptionsSnapshot _opts;
     private readonly ILogger<StartupSmokeProbeService> _log;
     private readonly ISmokeAvailabilityRegistry? _availability;
+    private readonly InVmSmokeOptions? _inVmSmokeOptions;
 
     // Exposed for test awaiting — callers can await this after StartAsync
     // to know when all background probes have completed.
@@ -33,7 +34,20 @@ public sealed class StartupSmokeProbeService : IHostedService
         IWebhookDispatcher webhooks,
         SmokeOptions opts,
         ILogger<StartupSmokeProbeService> log,
-        ISmokeAvailabilityRegistry? availability = null)
+        ISmokeAvailabilityRegistry? availability = null,
+        InVmSmokeOptions? inVmSmokeOptions = null)
+        : this(credentials, probes, webhooks, new SmokeOptionsSnapshot(opts), log, availability, inVmSmokeOptions)
+    {
+    }
+
+    public StartupSmokeProbeService(
+        ICredentialProvider credentials,
+        IEnumerable<IAgentSmokeProbe> probes,
+        IWebhookDispatcher webhooks,
+        SmokeOptionsSnapshot opts,
+        ILogger<StartupSmokeProbeService> log,
+        ISmokeAvailabilityRegistry? availability = null,
+        InVmSmokeOptions? inVmSmokeOptions = null)
     {
         _credentials = credentials;
         _probes = probes.ToList();
@@ -41,11 +55,15 @@ public sealed class StartupSmokeProbeService : IHostedService
         _opts = opts;
         _log = log;
         _availability = availability;
+        _inVmSmokeOptions = inVmSmokeOptions;
     }
 
     public Task StartAsync(CancellationToken ct)
     {
-        if (!_opts.Enabled || _probes.Count == 0)
+        LogEffectivePosture();
+
+        var opts = _opts.Current;
+        if (!opts.Enabled || _probes.Count == 0)
             return Task.CompletedTask;
 
         // Fire and forget — startup probes must not block the host from starting.
@@ -63,6 +81,9 @@ public sealed class StartupSmokeProbeService : IHostedService
 
     private async Task ProbeOneAsync(IAgentSmokeProbe probe, CancellationToken ct)
     {
+        if (!_opts.Enabled)
+            return;
+
         AgentCredential? credential;
         try
         {
@@ -84,7 +105,7 @@ public sealed class StartupSmokeProbeService : IHostedService
         try
         {
             using var perProbeCts = new CancellationTokenSource(
-                TimeSpan.FromSeconds(_opts.StartupTimeoutSeconds));
+                TimeSpan.FromSeconds(_opts.Current.StartupTimeoutSeconds));
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, perProbeCts.Token);
             result = await probe.SmokeTestAsync(credential, linked.Token);
         }
@@ -122,6 +143,30 @@ public sealed class StartupSmokeProbeService : IHostedService
                     Category = result.Category,
                 },
             }, CancellationToken.None);
+        }
+    }
+
+    private void LogEffectivePosture()
+    {
+        var smoke = _opts.Current;
+        var inVmConfigured = _inVmSmokeOptions?.Enabled;
+        var inVmEffective = smoke.Enabled && inVmConfigured == true;
+        _log.LogInformation(
+            "Smoke posture: CodeyBox:Smoke:Enabled={SmokeEnabled}; credential startup probes={StartupProbes}; " +
+            "credential pickup gate={CredentialPickupGate}; router smoke exclusions={RouterSmokeExclusions}; " +
+            "in-VM smoke gate={InVmSmokeGate}; CodeyBox:Smoke:InVm:Enabled={InVmConfigured}",
+            smoke.Enabled,
+            smoke.Enabled && _probes.Count > 0,
+            smoke.Enabled,
+            smoke.Enabled,
+            inVmEffective,
+            inVmConfigured);
+
+        if (smoke.Enabled && inVmConfigured == false)
+        {
+            _log.LogWarning(
+                "Smoke posture partial: CodeyBox:Smoke:InVm:Enabled=false disables only in-VM smoke. " +
+                "Credential smoke and router smoke exclusions remain active; set CodeyBox:Smoke:Enabled=false to disable all smoke gates.");
         }
     }
 }

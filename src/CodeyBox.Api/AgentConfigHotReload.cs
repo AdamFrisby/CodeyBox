@@ -15,7 +15,7 @@ namespace CodeyBox.Api;
 /// model IDs without a process restart.
 ///
 /// <para>
-/// Five blocks are hot-reloadable here:
+/// Several blocks are hot-reloadable here:
 /// <list type="bullet">
 /// <item><c>CodeyBox:AgentConcurrency</c> → <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/>.</item>
 /// <item><c>CodeyBox:AgentClasses</c> + <c>CodeyBox:AgentScoreModifiers</c> →
@@ -30,6 +30,9 @@ namespace CodeyBox.Api;
 ///   snapshot cache — it recomputes from the live usage store on every call —
 ///   so the new windows take effect on the next gate/visibility read).</item>
 /// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
+/// <item><c>CodeyBox:Smoke</c> → <see cref="SmokeOptionsSnapshot.Replace"/>
+///   so the master smoke switch applies to pickup, router, and in-VM gates
+///   without restart.</item>
 /// </list>
 /// </para>
 ///
@@ -64,6 +67,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly BudgetDeferralRecheckSnapshot? _budgetDeferralRecheck;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -81,6 +85,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastQuotaRouter = "";
     private string _lastPipelineTuning = "";
     private string _lastBudgetDeferralRecheck = "";
+    private string _lastSmoke = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -99,7 +104,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         PipelineTuningSnapshot? pipelineTuning = null,
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         QuotaRouterOptions? quotaRouterOptions = null,
-        IInVmSmokeCoveragePolicy? coverage = null)
+        IInVmSmokeCoveragePolicy? coverage = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -122,6 +128,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _budgetDeferralRecheck = budgetDeferralRecheck;
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
+        _smokeOptions = smokeOptions;
         _log = log;
     }
 
@@ -142,6 +149,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
+        _lastSmoke = SerializeSmoke(initial.Smoke);
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
 
@@ -169,6 +177,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         lock (_gate)
         {
             ApplyConcurrencyIfChanged(opts);
+            ApplySmokeIfChanged(opts);
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
             ApplyPricingIfChanged(opts);
@@ -237,6 +246,38 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 "Fix the configuration error and re-save to retry.",
                 prev);
         }
+    }
+
+    private void ApplySmokeIfChanged(CodeyBoxOptions opts)
+    {
+        if (_smokeOptions is null) return;
+
+        var next = SerializeSmoke(opts.Smoke);
+        if (string.Equals(_lastSmoke, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastSmoke;
+        var enforceProbeCoverage = false;
+        try
+        {
+            var previousOptions = _smokeOptions.Current;
+            var nextOptions = ToSmokeOptions(opts.Smoke, previousOptions.CacheTtlMinutes);
+            _smokeOptions.Replace(nextOptions);
+            _lastSmoke = next;
+            AuditLog.ConfigReloaded("Smoke", prev, next);
+            _log.LogInformation("Hot-reloaded Smoke: {OldValue} → {NewValue}", prev, next);
+            enforceProbeCoverage = !previousOptions.Enabled && nextOptions.Enabled;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of Smoke rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+
+        if (enforceProbeCoverage)
+            EnforceProbeCoverage(opts);
     }
 
     private void ApplyIncrementalRebaseIfChanged(CodeyBoxOptions opts)
@@ -663,6 +704,22 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MaxQuestionsPerWorkItem,
                 opts.AgentSuspendMaxRetries,
                 opts.AutoMergeRaceRecoveryMaxAttempts,
+            },
+            JsonOpts);
+
+    private static SmokeOptions ToSmokeOptions(SmokeConfig opts, int cacheTtlMinutes) => new()
+    {
+        Enabled = opts.Enabled,
+        CacheTtlMinutes = cacheTtlMinutes,
+        StartupTimeoutSeconds = opts.StartupTimeoutSeconds,
+    };
+
+    private static string SerializeSmoke(SmokeConfig opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.Enabled,
+                opts.StartupTimeoutSeconds,
             },
             JsonOpts);
 

@@ -1017,11 +1017,10 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
-        sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
-        sp.GetService<IInVmSmokeGate>(),
-        configuredSmokeTarget);
+        configuredSmokeTarget,
+        sp.GetService<IAgentDispatchAvailability>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1257,6 +1256,8 @@ builder.Services.AddSingleton<SmokeOptions>(sp =>
         StartupTimeoutSeconds = s.StartupTimeoutSeconds,
     };
 });
+builder.Services.AddSingleton<SmokeOptionsSnapshot>(sp =>
+    new SmokeOptionsSnapshot(sp.GetRequiredService<SmokeOptions>()));
 builder.Services.AddSingleton<AvailabilityOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1276,11 +1277,17 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
 // same singleton, exposed as the read/run-outcome/snapshot/reset surface.
 builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 // The smoke-mutator port the in-VM prober, coverage policy, and host smoke
 // services bind to — same singleton, exposed as the exclusion-taxonomy
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
 builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
+    sp.GetService<IAgentEffectiveAvailabilityReader>(),
+    sp.GetService<IInVmSmokeGate>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1291,7 +1298,7 @@ builder.Services.AddSingleton<CredentialSmokeGate>(sp =>
         sp.GetRequiredService<ICredentialProvider>(),
         sp.GetServices<IAgentSmokeProbe>(),
         sp.GetRequiredService<IAgentSmokeCache>(),
-        sp.GetRequiredService<SmokeOptions>(),
+        sp.GetRequiredService<SmokeOptionsSnapshot>(),
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<CredentialSmokeGate>()));
 
 // --- In-VM smoke prober ------------------------------------------------------
@@ -1339,7 +1346,8 @@ builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<IInVmSmokeCache>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
-    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>()));
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<InVmSmokeProber>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>()));
 // The router consults the prober as a dispatch gate (IInVmSmokeGate) so the
 // first work item per baseline is verified in-VM before routing; share the
 // single InVmSmokeProber instance so the gate, the background sweep service,
@@ -1352,7 +1360,8 @@ builder.Services.AddSingleton<IInVmSmokeGate>(sp => sp.GetRequiredService<InVmSm
 builder.Services.AddSingleton<IInVmSmokeCoveragePolicy>(sp => new InVmSmokeCoveragePolicy(
     sp.GetServices<IInVmSmokeProbe>(),
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
-    sp.GetRequiredService<InVmSmokeOptions>()));
+    sp.GetRequiredService<InVmSmokeOptions>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>()));
 builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<IInVmSmokeGate>(),
     sp.GetRequiredService<InVmSmokeOptions>(),
@@ -1922,13 +1931,13 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     budgetProvider: sp.GetService<IAgentBudgetProvider>(),
     incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
     pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
-    inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     involvement: sp.GetService<IAgentInvolvementStore>(),
     // Resolve through the live IOptionsMonitor so PostAgentTransitionTimeout
     // edits applied via config hot-reload take effect on the next bounded
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
-    requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>()));
+    requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
+    dispatchAvailability: sp.GetService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2042,8 +2051,8 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IAgentRegistry>(),
-    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
-    sp.GetRequiredService<IAgentRoutingReadiness>()));
+    sp.GetRequiredService<IAgentRoutingReadiness>(),
+    sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>
@@ -2148,21 +2157,23 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
         budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
-        coverage: sp.GetService<IInVmSmokeCoveragePolicy>());
+        coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
+        smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
-    sp.GetRequiredService<SmokeOptions>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
     sp.GetRequiredService<ILogger<StartupSmokeProbeService>>(),
-    sp.GetService<ISmokeAvailabilityRegistry>()));
+    sp.GetService<ISmokeAvailabilityRegistry>(),
+    sp.GetRequiredService<InVmSmokeOptions>()));
 builder.Services.AddSingleton<PeriodicSmokeProbeService>(sp => new PeriodicSmokeProbeService(
     sp.GetRequiredService<ICredentialProvider>(),
     sp.GetServices<IAgentSmokeProbe>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
-    sp.GetRequiredService<SmokeOptions>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
     sp.GetRequiredService<AvailabilityOptions>(),
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     sp.GetRequiredService<ILogger<PeriodicSmokeProbeService>>()));
@@ -2697,7 +2708,7 @@ namespace CodeyBox.Api
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
-    ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>DeadWorker</c>
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
@@ -2714,7 +2725,7 @@ namespace CodeyBox.Api
     ///   after a rejected reload.</item>
     /// <item><b>Startup-only by capture</b> — bound into a downstream
     ///   singleton (PipelineOptions, OrchestratorOptions, QuotaRouterOptions,
-    ///   SmokeOptions, AvailabilityOptions, WebhookEventBroadcaster,
+    ///   Smoke cache TTL, AvailabilityOptions, WebhookEventBroadcaster,
     ///   HttpWebhookDispatcher, ClaudeChangelogGenerator, Serilog sinks,
     ///   etc.) at startup. Edits land in <see cref="IOptionsMonitor{T}.CurrentValue"/>
     ///   but the captured singleton continues to use the prior value until

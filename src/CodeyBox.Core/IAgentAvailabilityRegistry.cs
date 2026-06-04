@@ -1,11 +1,10 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Narrow availability port for cross-cutting routing/dispatch consumers
-/// (the agent-class router, the pipeline runner, the admin availability
-/// endpoints). Exposes only the read / run-outcome / snapshot surface
-/// those callers need, so they depend on this rather than the concrete
-/// availability registry.
+/// Source-neutral availability storage port for cross-cutting consumers such
+/// as admin availability endpoints and run-outcome recorders. Dispatch call
+/// sites that need effective gate semantics should layer that policy above
+/// this port rather than adding source-specific read modes here.
 ///
 /// <para>Reset is deliberately absent: operator reset must clear both the
 /// registry and the in-VM smoke cache atomically, so it lives only on

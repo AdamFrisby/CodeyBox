@@ -1498,9 +1498,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
-            inVmSmokeGate: inVmSmokeGate,
             involvement: involvementForPipeline,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: inVmSmokeGate is null
+                ? null
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
 
         return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }

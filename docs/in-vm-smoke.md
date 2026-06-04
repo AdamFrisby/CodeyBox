@@ -49,6 +49,11 @@ exempt via `CodeyBox:Smoke:InVm:ExemptAgentsWithoutProbe` (warned, not benched).
 When the prober is disabled or no probes are registered, enforcement is inactive
 and the validator only warns.
 
+`CodeyBox:Smoke:Enabled=false` is the master switch and suppresses this gate,
+startup coverage benching, and router smoke exclusions. `CodeyBox:Smoke:InVm:Enabled=false`
+disables only the in-VM prober; host credential smoke and router smoke
+exclusions remain active while the master switch is true.
+
 ## Caching, self-healing and operator reset
 
 - Only **passing** verdicts are cached, keyed by `(agent, baselineRef)`. A

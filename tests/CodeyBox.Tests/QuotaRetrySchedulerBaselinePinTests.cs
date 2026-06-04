@@ -64,6 +64,9 @@ public sealed class QuotaRetrySchedulerBaselinePinTests : IDisposable
         // availablePct below MinQuotaPct → router waits after consulting the gate,
         // so we never reach the git-dependent PerformRetry path; the gate was
         // already asked with the pinned ref by then.
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
         return new AgentClassRouter(
             [cls],
             [new FakeProbe(AgentKind.Claude, 0.0)],
@@ -74,10 +77,7 @@ public sealed class QuotaRetrySchedulerBaselinePinTests : IDisposable
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: null,
-            availability: new AgentAvailabilityRegistry(
-                new AvailabilityOptions(), TimeProvider.System,
-                NullLogger<AgentAvailabilityRegistry>.Instance),
-            inVmSmokeGate: gate);
+            dispatchAvailability: new AgentDispatchAvailability(availability, gate));
     }
 
     private Fixture BuildScheduler(AgentClassRouter router, IBaselineImageResolver resolver)

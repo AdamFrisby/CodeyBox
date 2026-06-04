@@ -95,6 +95,23 @@ public sealed class InVmSmokeProbeCoverageValidatorTests
     }
 
     [Fact]
+    public async Task GlobalSmokeDisabled_WarnsOnly_DoesNotBench()
+    {
+        var reg = NewRegistry();
+        var validator = Build(
+            classes: [ClassWith("frontier", "cursor")],
+            probes: [new ClaudeInVmSmokeProbe()],
+            reg: reg,
+            out var capture,
+            smokeOptions: new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+
+        await validator.StartAsync(CancellationToken.None);
+
+        Assert.True(reg.GetAvailability(Cursor).Available);
+        Assert.Contains(capture.Warnings, w => w.Contains("prober inactive"));
+    }
+
+    [Fact]
     public async Task NoProbesRegistered_WarnsOnly_DoesNotBench()
     {
         var reg = NewRegistry();
@@ -128,7 +145,8 @@ public sealed class InVmSmokeProbeCoverageValidatorTests
         IEnumerable<IInVmSmokeProbe> probes,
         AgentAvailabilityRegistry reg,
         out WarningCapturingLogger capture,
-        InVmSmokeOptions? opts = null)
+        InVmSmokeOptions? opts = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         var cbOpts = new CodeyBoxOptions { AgentClasses = classes.ToList() };
         capture = new WarningCapturingLogger();
@@ -140,7 +158,8 @@ public sealed class InVmSmokeProbeCoverageValidatorTests
         var coverage = new InVmSmokeCoveragePolicy(
             probes,
             reg,
-            opts ?? new InVmSmokeOptions { Enabled = true });
+            opts ?? new InVmSmokeOptions { Enabled = true },
+            smokeOptions);
         return new InVmSmokeProbeCoverageValidator(
             Options.Create(cbOpts),
             coverage,

@@ -498,6 +498,51 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task HealthCandidates_WhenSmokeDisabled_IgnoresDirectAgentSmokeExclusion()
+    {
+        var item = Item() with { Agent = AgentKind.Claude };
+        await _store.CreateAsync(item);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient));
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var health = BuildHealthSource(
+            availability: registry,
+            smokeOptions: new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+
+        var candidates = await health.ListRunnableCandidatesAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.Contains(candidates, i => i.Id == item.Id);
+    }
+
+    [Fact]
+    public async Task HealthCandidates_WhenSmokeDisabled_StillHonorDirectAgentFastFailExclusion()
+    {
+        var item = Item() with { Agent = AgentKind.Claude };
+        await _store.CreateAsync(item);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        for (var i = 0; i < 3; i++)
+            registry.RecordRunOutcome(AgentKind.Claude, success: false, duration: TimeSpan.FromMilliseconds(500));
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var health = BuildHealthSource(
+            availability: registry,
+            smokeOptions: new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+
+        var candidates = await health.ListRunnableCandidatesAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(candidates, i => i.Id == item.Id);
+    }
+
+    [Fact]
     public async Task AuditPassedCandidate_IsTreatedAsRunnableWork()
     {
         var item = Item() with { State = WorkItemState.AuditPassed };
@@ -532,8 +577,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
-        IAgentAvailabilityRegistry? availability = null,
-        IAgentRoutingReadiness? routingReadiness = null)
+        IAgentEffectiveAvailabilityReader? availability = null,
+        IAgentRoutingReadiness? routingReadiness = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
         => new(
             orchestrator ?? _orchestrator,
             _store,
@@ -542,8 +588,8 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             projects ?? _projects,
             queueController,
             agents ?? new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            availability,
-            routingReadiness);
+            routingReadiness,
+            availability is null ? null : new AgentDispatchAvailability(availability, smokeOptions: smokeOptions));
 
     private static WorkerPoolHealthWatchdogOptions StandardOptions(int maxAttempts = 2) => new()
     {
@@ -692,7 +738,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
                 : null);
     }
 
-    private sealed class FakeAvailabilityRegistry : IAgentAvailabilityRegistry
+    private sealed class FakeAvailabilityRegistry : IAgentAvailabilityRegistry, IAgentEffectiveAvailabilityReader
     {
         private readonly bool _available;
 
@@ -700,6 +746,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         public AgentAvailability GetAvailability(AgentKind kind) =>
             new(_available, _available ? null : "unavailable", null);
+
+        public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind) =>
+            GetAvailability(kind);
 
         public AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration) =>
             new(false, !_available, _available ? null : "unavailable");
