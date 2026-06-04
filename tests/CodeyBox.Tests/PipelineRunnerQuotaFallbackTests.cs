@@ -68,8 +68,6 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     public async Task NearZeroFloorRoutedCodexQuotaFailure_FallsBackToClaudeSameIteration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
-
         var now = DateTimeOffset.UtcNow;
         var quotaOptions = new QuotaRouterOptions
         {
@@ -88,38 +86,32 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             StartFloorPct = 1.0,
             EndFloorPct = 0.0,
         };
-        var routingClass = new AgentClass
-        {
-            Id = "frontier",
-            DisplayName = "Frontier",
-            Members =
-            [
-                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
-                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
-            ],
-        };
-        var routeRouter = new AgentClassRouter(
-            [routingClass],
-            [
-                new RecordingProbe(AgentKind.Claude, new AgentQuotaSnapshot
-                {
-                    AvailablePct = 20.0,
-                    ResetAt = now + TimeSpan.FromDays(7),
-                    Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 20.0 }],
-                }),
-                new RecordingProbe(AgentKind.Codex, new AgentQuotaSnapshot
-                {
-                    AvailablePct = 1.0,
-                    ResetAt = now + TimeSpan.FromDays(7),
-                    Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 1.0 }],
-                }),
-            ],
-            quotaOptions,
-            NullLogger<AgentClassRouter>.Instance);
+        using var fix = BuildPipeline(
+            seed,
+            quotaOptions: quotaOptions,
+            codexQuotaSnapshot: new AgentQuotaSnapshot
+            {
+                AvailablePct = 1.0,
+                ResetAt = now + TimeSpan.FromDays(7),
+                Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 1.0 }],
+            },
+            claudeQuotaSnapshot: new AgentQuotaSnapshot
+            {
+                AvailablePct = 80.0,
+                ResetAt = now + TimeSpan.FromDays(7),
+                Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 80.0 }],
+            });
 
         var item = NewItem(initialAgent: AgentKind.Codex);
-        var routeDecision = await routeRouter.ResolveAsync(item, project: null, CancellationToken.None);
-        Assert.Equal(AgentKind.Codex, routeDecision.Chosen!.Agent);
+        var routeDecision = await fix.Router.ResolveAsync(item, project: null, CancellationToken.None);
+        var chosen = Assert.IsType<AgentMembership>(routeDecision.Chosen);
+        Assert.Equal(AgentKind.Codex, chosen.Agent);
+        item = item with
+        {
+            Agent = chosen.Agent,
+            ModelId = chosen.ModelId,
+            ReasoningMode = chosen.ReasoningMode,
+        };
 
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
@@ -1534,7 +1526,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         int stuckThresholdMinutes = -1,
         Func<InMemoryAgentInvolvementStore, IAgentInvolvementStore>? wrapInvolvement = null,
         ProjectNetworkProfiles? networkProfiles = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        QuotaRouterOptions? quotaOptions = null,
+        AgentQuotaSnapshot? codexQuotaSnapshot = null,
+        AgentQuotaSnapshot? claudeQuotaSnapshot = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1582,13 +1577,13 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var projects = new InMemoryProjectRepository(project);
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
 
-        var codexProbe = new RecordingProbe(AgentKind.Codex);
-        var claudeProbe = new RecordingProbe(AgentKind.Claude);
+        var codexProbe = new RecordingProbe(AgentKind.Codex, codexQuotaSnapshot);
+        var claudeProbe = new RecordingProbe(AgentKind.Claude, claudeQuotaSnapshot);
 
         var router = new AgentClassRouter(
             [frontier],
             [codexProbe, claudeProbe],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -1619,7 +1614,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
                 ? null
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
 
-        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
+        return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
 
     private TestFixture BuildPipelineWithCost(string seedRepoUrl, IWorkItemCostStore costStore)
@@ -1698,7 +1693,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             involvement: involvement,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
-        return new TestFixture(pipeline, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
+        return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }
 
     private sealed class FakeFallbackExtractor : IAgentCostExtractor
@@ -1976,6 +1971,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     private sealed class TestFixture : IDisposable
     {
         public PipelineRunner Pipeline { get; }
+        public AgentClassRouter Router { get; }
         public SqliteWorkItemStore Store { get; }
         public LocalGitHost GitHost { get; }
         public ScriptableAgent Codex { get; }
@@ -1986,7 +1982,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public InMemoryAgentFallbackHistoryStore FallbackHistory { get; }
         public InMemoryAgentInvolvementStore Involvement { get; }
 
-        public TestFixture(PipelineRunner pipeline, SqliteWorkItemStore store,
+        public TestFixture(PipelineRunner pipeline, AgentClassRouter router, SqliteWorkItemStore store,
             LocalGitHost gitHost,
             ScriptableAgent codex, ScriptableAgent claude,
             RecordingProbe codexProbe, RecordingProbe claudeProbe,
@@ -1995,6 +1991,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             InMemoryAgentInvolvementStore involvement)
         {
             Pipeline = pipeline;
+            Router = router;
             Store = store;
             GitHost = gitHost;
             Codex = codex;

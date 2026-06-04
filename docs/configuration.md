@@ -52,6 +52,12 @@ Hot-reloadable today:
 - `AgentPricing` — re-applied via `AgentConfigHotReload` to the live
   `AgentCostCalculator`. Negative-rate validation runs on the reload candidate
   before the swap; rejected reloads keep the prior pricing.
+- `QuotaRouter` decision fields — re-applied via `AgentConfigHotReload` to the
+  live `QuotaRouterOptions` singleton. This includes global floors,
+  `MinQuotaPctByWindow`, `FloorByAgent`, per-agent ramp windows, unknown-policy
+  handling, observed-failure windows, cap-retry cadence, and cold-start
+  fit-in-window. `QuotaCacheTtlSeconds` is still sampled by quota probe
+  constructors at startup.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `WorkerProgressWatchdog.ProgressTimeout`,
@@ -113,8 +119,9 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   shutdown-service constructors.
 - `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
   `OrchestratorOptions` and the worker-pool plumbing at startup.
-- `QuotaRouter.QuotaCacheTtlSeconds` — per-provider quota probe caches are sized
-  at construction. Other router gate fields are hot-reloaded.
+- `QuotaRouter.QuotaCacheTtlSeconds` — captured by the per-provider quota probes
+  at construction (probe caches are sized once). Other router gate fields are
+  hot-reloaded.
 - `Smoke.CacheTtlMinutes` / `Smoke.Availability.*` — cache and availability
   registry singletons are sized at startup.
 - `BudgetAlerts.CheckInterval` — sized into the `BudgetAlertService`'s

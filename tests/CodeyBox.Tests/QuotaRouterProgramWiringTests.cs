@@ -27,6 +27,91 @@ public sealed class QuotaRouterProgramWiringTests
         Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
     }
 
+    [Fact]
+    public void Mapper_DropsInvalidFloorByAgentEntriesAndFields()
+    {
+        var config = new QuotaRouterConfig
+        {
+            FloorByAgent = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["valid"] = new QuotaRouterFloorConfig
+                {
+                    MinQuotaPct = 1.0,
+                    StartFloorPct = 2.0,
+                    EndFloorPct = 0.0,
+                    RampWindowSeconds = 60,
+                },
+                [" "] = new QuotaRouterFloorConfig { MinQuotaPct = 2.0 },
+                ["null-entry"] = null!,
+                ["empty"] = new QuotaRouterFloorConfig(),
+                ["negative-only"] = new QuotaRouterFloorConfig
+                {
+                    MinQuotaPct = -1.0,
+                    StartFloorPct = -2.0,
+                    EndFloorPct = -3.0,
+                },
+                ["zero-window-only"] = new QuotaRouterFloorConfig { RampWindowSeconds = 0 },
+                ["negative-window-only"] = new QuotaRouterFloorConfig { RampWindowSeconds = -60 },
+                ["mixed"] = new QuotaRouterFloorConfig
+                {
+                    MinQuotaPct = -1.0,
+                    StartFloorPct = 4.0,
+                    RampWindowSeconds = 0,
+                },
+            },
+        };
+
+        var options = QuotaRouterConfigMapper.ToOptions(config);
+
+        Assert.True(options.FloorByAgent.TryGetValue("valid", out var valid));
+        Assert.Equal(1.0, valid.MinQuotaPct);
+        Assert.Equal(2.0, valid.StartFloorPct);
+        Assert.Equal(0.0, valid.EndFloorPct);
+        Assert.Equal(TimeSpan.FromSeconds(60), valid.RampWindow);
+
+        Assert.True(options.FloorByAgent.TryGetValue("mixed", out var mixed));
+        Assert.Null(mixed.MinQuotaPct);
+        Assert.Equal(4.0, mixed.StartFloorPct);
+        Assert.Null(mixed.RampWindow);
+
+        Assert.DoesNotContain(" ", options.FloorByAgent.Keys);
+        Assert.DoesNotContain("null-entry", options.FloorByAgent.Keys);
+        Assert.DoesNotContain("empty", options.FloorByAgent.Keys);
+        Assert.DoesNotContain("negative-only", options.FloorByAgent.Keys);
+        Assert.DoesNotContain("zero-window-only", options.FloorByAgent.Keys);
+        Assert.DoesNotContain("negative-window-only", options.FloorByAgent.Keys);
+    }
+
+    [Fact]
+    public void HotReloadMapper_DropsInvalidFloorByAgentEntries()
+    {
+        var options = new QuotaRouterOptions
+        {
+            FloorByAgent = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = new QuotaFloorOverrideOptions { MinQuotaPct = 1.0 },
+            },
+        };
+        var config = new QuotaRouterConfig
+        {
+            FloorByAgent = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = new QuotaRouterFloorConfig(),
+                ["claude"] = new QuotaRouterFloorConfig { MinQuotaPct = -1.0 },
+                ["opencode"] = new QuotaRouterFloorConfig { RampWindowSeconds = 0 },
+                ["gemini"] = new QuotaRouterFloorConfig { EndFloorPct = 0.0 },
+            },
+        };
+
+        QuotaRouterConfigMapper.ApplyHotReload(options, config);
+
+        var gemini = Assert.Single(options.FloorByAgent);
+        Assert.Equal("gemini", gemini.Key);
+        Assert.Equal(0.0, gemini.Value.EndFloorPct);
+        Assert.Null(gemini.Value.MinQuotaPct);
+        Assert.Null(gemini.Value.RampWindow);
+    }
+
     private sealed class QuotaRouterWiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(

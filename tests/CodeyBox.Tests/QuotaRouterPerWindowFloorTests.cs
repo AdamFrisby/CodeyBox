@@ -228,6 +228,27 @@ public sealed class QuotaRouterPerWindowFloorTests
     }
 
     [Fact]
+    public void PartialAgentOverrideWithoutMin_StillUsesGlobalWindowFloor()
+    {
+        var opts = Opts(
+            new(StringComparer.OrdinalIgnoreCase) { ["five_hour"] = 25.0 },
+            minQuotaPct: 10.0);
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var router = new AgentClassRouter(
+            catalog: [ClaudeOnlyClass()],
+            probes: Array.Empty<IAgentQuotaProbe>(),
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance);
+
+        Assert.Equal(25.0, router.ResolveWindowFloorPct(Codex, "five_hour"));
+        Assert.Equal(10.0, router.ResolveWindowFloorPct(Codex, "unlisted-window"));
+    }
+
+    [Fact]
     public void DefaultOptions_HasNoPerWindowFloors_SoLegacyBehaviourPreserved()
     {
         // Constructing QuotaRouterOptions directly (the test path) must not
