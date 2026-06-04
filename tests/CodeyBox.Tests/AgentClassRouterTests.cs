@@ -470,6 +470,44 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task ComputeEarliestExhaustedReset_UsesWindowResetForWindowFloorDenial()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var windowReset = now.AddHours(5);
+        var aggregateReset = now.AddDays(7);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+            MinQuotaPctByWindow = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["five_hour"] = 25.0,
+            },
+        };
+
+        var cls = FrontierClass(Sub(Claude));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, new AgentQuotaSnapshot
+            {
+                AvailablePct = 80.0,
+                ResetAt = aggregateReset,
+                Windows =
+                [
+                    new WindowQuota { Name = "five_hour", AvailablePct = 10.0, ResetAt = windowReset },
+                ],
+            }),
+        ], opts);
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(windowReset, earliest);
+    }
+
+    [Fact]
     public async Task ComputeEarliestExhaustedReset_NoClassConfigured_ReturnsNull()
     {
         var router = BuildRouter([], []);

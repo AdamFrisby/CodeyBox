@@ -5,13 +5,13 @@ namespace CodeyBox.Notifications;
 
 /// <summary>
 /// Evaluates true when every configured agent with a subscription quota probe
-/// reports available percentage below <paramref name="minQuotaPct"/>.
-/// Clears when at least one agent reports above the threshold.
+/// is denied by the shared quota gate. Clears when at least one agent is
+/// routable.
 /// </summary>
 public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 {
     private readonly IEnumerable<IAgentQuotaProbe> _probes;
-    private readonly double _minQuotaPct;
+    private readonly IAgentQuotaGate _quotaGate;
     private readonly IAgentRegistry _agentRegistry;
     private readonly ILogger<AllQuotasExhaustedCondition> _log;
 
@@ -19,12 +19,12 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 
     public AllQuotasExhaustedCondition(
         IEnumerable<IAgentQuotaProbe> probes,
-        double minQuotaPct,
+        IAgentQuotaGate quotaGate,
         IAgentRegistry agentRegistry,
         ILogger<AllQuotasExhaustedCondition> log)
     {
         _probes = probes;
-        _minQuotaPct = minQuotaPct;
+        _quotaGate = quotaGate;
         _agentRegistry = agentRegistry;
         _log = log;
     }
@@ -42,15 +42,15 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
         {
             try
             {
-                var snapshot = await probe.GetAvailabilityAsync(
-                    new AgentMembership
-                    {
-                        Agent = probe.Kind,
-                        Billing = AgentBilling.Subscription,
-                        QualityScore = 100,
-                    }, ct);
+                var member = new AgentMembership
+                {
+                    Agent = probe.Kind,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100,
+                };
+                var snapshot = await probe.GetAvailabilityAsync(member, ct);
 
-                if (!snapshot.IsKnown || snapshot.AvailablePct >= _minQuotaPct)
+                if (_quotaGate.Allows(member, snapshot, DateTimeOffset.UtcNow))
                     return false;
             }
             catch (Exception ex)

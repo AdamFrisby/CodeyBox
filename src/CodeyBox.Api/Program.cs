@@ -895,6 +895,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
 });
 builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
     new QuotaGatePolicy(sp.GetRequiredService<QuotaRouterOptions>()));
+builder.Services.AddSingleton<IAgentQuotaGate, QuotaGateAvailability>();
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1649,7 +1650,7 @@ builder.Services.AddSingleton<INotificationProvider>(sp =>
 builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
-    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct,
+    sp.GetRequiredService<IAgentQuotaGate>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();

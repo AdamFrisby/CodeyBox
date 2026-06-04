@@ -4,20 +4,42 @@ namespace CodeyBox.Orchestrator;
 
 public static class QuotaRouter
 {
-    public static bool WouldAllow(double availablePct, bool recentFailure, QuotaRouterOptions options)
+    public static bool WouldAllow(
+        AgentKind agent,
+        double availablePct,
+        bool recentFailure,
+        QuotaRouterOptions options,
+        DateTimeOffset? resetAt = null,
+        DateTimeOffset? nowUtc = null)
     {
-        if (recentFailure)
-            return false;
-        if (availablePct >= options.MinQuotaPct)
-            return true;
-        if (availablePct >= 0)
-            return false;
+        return WouldAllow(
+            new AgentMembership
+            {
+                Agent = agent,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            },
+            new EffectiveQuota(availablePct, resetAt, null),
+            recentFailure,
+            options,
+            nowUtc);
+    }
 
-        return options.UnknownPolicy switch
-        {
-            QuotaUnknownPolicy.FailOpen => true,
-            QuotaUnknownPolicy.FailCautious => false,
-            _ => !recentFailure,
-        };
+    public static bool WouldAllow(
+        AgentMembership member,
+        EffectiveQuota quota,
+        bool recentFailure,
+        QuotaRouterOptions options,
+        DateTimeOffset? nowUtc = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(member);
+        return QuotaGatePolicy.Evaluate(
+            options,
+            member,
+            quota,
+            nowUtc ?? DateTimeOffset.UtcNow,
+            recentFailure,
+            observedFailureReason: "recent observed quota failure").Allow;
     }
 }

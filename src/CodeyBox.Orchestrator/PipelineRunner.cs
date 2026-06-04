@@ -275,7 +275,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
         _auditQuotaOptions = auditQuotaOptions ?? classRouter?.QuotaOptions ?? new QuotaRouterOptions();
-        _auditQuotaGatePolicy = classRouter?.QuotaGatePolicy ?? new QuotaGatePolicy(_auditQuotaOptions);
+        _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
@@ -5315,7 +5315,8 @@ public sealed class PipelineRunner : IPipelineRunner
         var quotaRejectedCount = preferredPauseReason is null && preferredAvailable && !preferredOk
             ? 1
             : 0;
-        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, auditSmokeTarget))
+        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
+            item, project, ct, auditSmokeTarget, requireQuota: false))
         {
             if (preferredMember is not null
                 && string.Equals(member.RouteKey, preferredMember.RouteKey, StringComparison.OrdinalIgnoreCase))
@@ -5413,8 +5414,8 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Walks the routed class chain looking for the first audit-capable member
     /// that is registered, credentialed, and quota OK. Smoke availability is
     /// handled upstream by <see cref="AgentClassRouter.OrderedFallbackCandidatesAsync"/>,
-    /// which only yields members that pass the work-phase availability gates;
-    /// this method does not re-run the smoke probe. Used when the operator gave
+    /// which yields smoke-checked members for this path; this method applies the
+    /// audit quota policy itself. Used when the operator gave
     /// no explicit audit preference AND the work agent itself is not tagged
     /// audit-capable — falling back to the work agent would breach the AC
     /// ("a non-audit-capable agent must NEVER be selected for auditing").
@@ -5426,7 +5427,8 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (_classRouter is null) return null;
         var quotaRejectedCount = 0;
-        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
+        foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
+            item, project, ct, requireQuota: false))
         {
             if (_classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
                 continue;
@@ -5505,15 +5507,6 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Returns <c>(true, reason)</c> when the candidate passes both the
-    /// observed-failure breaker and the live quota probe (reason is a short
-    /// human-readable description like "available (80.0%)" or
-    /// "quota unknown; fail-open"); otherwise returns <c>(false, reason)</c>
-    /// describing which gate rejected the candidate. Mirrors the gating logic
-    /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
-    /// on what counts as "available".
-    /// </summary>
-    /// <summary>
     /// Reads the operator's local spend budget for (<paramref name="kind"/>,
     /// <paramref name="modelId"/>) and classifies it for the mid-iteration fallback
     /// gates. Returns the budget snapshot when configured and a <c>FailedClosed</c>
@@ -5544,6 +5537,15 @@ public sealed class PipelineRunner : IPipelineRunner
         }
     }
 
+    /// <summary>
+    /// Returns <c>(true, reason)</c> when the candidate passes both the
+    /// observed-failure breaker and the live quota probe (reason is a short
+    /// human-readable description like "available (80.0%)" or
+    /// "quota unknown; fail-open"); otherwise returns <c>(false, reason)</c>
+    /// describing which gate rejected the candidate. Mirrors the gating logic
+    /// in <see cref="AgentClassRouter"/> so the work and audit phases agree
+    /// on what counts as "available".
+    /// </summary>
     private async Task<(bool Allowed, string Reason)> EvaluateAuditCandidateQuotaAsync(
         AgentKind kind, AgentMembership member, CancellationToken ct)
     {

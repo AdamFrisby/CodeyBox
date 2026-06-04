@@ -236,6 +236,20 @@ public sealed class QuotaGatePolicy
         TimeSpan RampWindow);
 }
 
+public sealed class QuotaGateAvailability : IAgentQuotaGate
+{
+    private readonly QuotaGatePolicy _policy;
+
+    public QuotaGateAvailability(QuotaGatePolicy policy) =>
+        _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+
+    public bool Allows(AgentMembership member, AgentQuotaSnapshot snapshot, DateTimeOffset nowUtc)
+    {
+        var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+        return _policy.Evaluate(member, quota, nowUtc).Allow;
+    }
+}
+
 public sealed record QuotaGateDecision(
     bool Allow,
     string Reason,

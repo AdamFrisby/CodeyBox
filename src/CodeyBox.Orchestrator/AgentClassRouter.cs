@@ -135,8 +135,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     public QuotaRouterOptions QuotaOptions => _opts;
 
-    public QuotaGatePolicy QuotaGatePolicy => _quotaGatePolicy;
-
     /// <summary>
     /// Combines a probe-derived quota with the operator's local budget for the
     /// same (agent, model): takes MIN of the two available percentages so the
@@ -1060,14 +1058,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// hands work to an agent whose CLI was never in-VM smoke-checked (the
     /// exit-127 / auth cascade). A cache hit is free; an agent the probe
     /// benches is dropped from the returned list exactly as the primary path
-    /// would skip it.
+    /// would skip it. When <paramref name="requireQuota"/> is false, callers
+    /// receive the ordered smoke-checked candidates and apply their own quota
+    /// policy.
     /// </para>
     /// </summary>
     public async Task<IReadOnlyList<AgentMembership>> OrderedFallbackCandidatesAsync(
         WorkItem item,
         Project? project,
         CancellationToken ct,
-        InVmSmokeSandboxTarget? smokeTarget = null)
+        InVmSmokeSandboxTarget? smokeTarget = null,
+        bool requireQuota = true)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         var classId = item.AgentClassId ?? project?.DefaultAgentClass;
@@ -1112,6 +1113,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             var av = await GetGatedAvailabilityAsync(member, target, ct);
             if (av is { Available: false })
                 continue;
+
+            if (!requireQuota)
+            {
+                result.Add(member);
+                continue;
+            }
 
             AgentQuotaSnapshot snapshot;
             try
@@ -1960,9 +1967,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var modelDesc = string.IsNullOrEmpty(member.ModelId) ? member.Agent.Value : $"{member.Agent.Value}/{member.ModelId}";
         return $"{modelDesc} observed quota failure {ageDesc}";
     }
-
-    /// <summary>Sentinel ModelId meaning "any model in the bucket list is acceptable".</summary>
-    internal const string AutoModelSentinel = "auto";
 
     internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member) =>
         QuotaGatePolicy.ResolveMemberQuota(snapshot, member);

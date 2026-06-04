@@ -159,6 +159,50 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task ExplicitAuditQuotaOptions_BuildAuditGateEvenWhenRouterHasDifferentPolicy()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        var auditOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        auditOptions.FloorByAgent[AgentKind.Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 20.0, [AgentKind.Codex] = 1.0 },
+            routerQuotaOptions: routerOptions,
+            auditQuotaOptions: auditOptions,
+            quotaResetAt: reset);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
+    [Fact]
     public async Task PreferredWindowBelowFloor_AuditFallsThroughToClassMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -509,6 +553,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         IAgentBudgetProvider? budgetProvider = null,
         bool registerAuditProbes = true,
         QuotaRouterOptions? quotaOptions = null,
+        QuotaRouterOptions? routerQuotaOptions = null,
+        QuotaRouterOptions? auditQuotaOptions = null,
         DateTimeOffset? quotaResetAt = null,
         Dictionary<AgentKind, IReadOnlyList<WindowQuota>>? quotaWindows = null)
     {
@@ -554,13 +600,15 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 quotaWindows?.GetValueOrDefault(kind),
                 shouldThrow: throwSet.Contains(kind)))
             .ToList();
-        var effectiveQuotaOptions = quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 };
-        effectiveQuotaOptions.UnknownPolicy = unknownPolicy;
+        var effectiveRouterQuotaOptions = routerQuotaOptions ?? quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        var effectiveAuditQuotaOptions = auditQuotaOptions ?? quotaOptions ?? effectiveRouterQuotaOptions;
+        effectiveRouterQuotaOptions.UnknownPolicy = unknownPolicy;
+        effectiveAuditQuotaOptions.UnknownPolicy = unknownPolicy;
 
         var router = new AgentClassRouter(
             [frontier],
             probes,
-            effectiveQuotaOptions,
+            effectiveRouterQuotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var project = new Project
@@ -600,7 +648,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: registerAuditProbes ? probes : null,
-            auditQuotaOptions: effectiveQuotaOptions,
+            auditQuotaOptions: effectiveAuditQuotaOptions,
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(

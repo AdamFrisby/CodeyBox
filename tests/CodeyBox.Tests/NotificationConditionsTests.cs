@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Notifications;
+using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -7,6 +8,12 @@ namespace CodeyBox.Tests;
 
 public sealed class NotificationConditionsTests
 {
+    private static IAgentQuotaGate QuotaGate(double minQuotaPct)
+        => QuotaGate(new QuotaRouterOptions { MinQuotaPct = minQuotaPct });
+
+    private static IAgentQuotaGate QuotaGate(QuotaRouterOptions options)
+        => new QuotaGateAvailability(new QuotaGatePolicy(options));
+
     private static OrchestratorStallCondition CreateStallCondition(OrchestratorProgressClock clock, int thresholdMinutes)
     {
         var opts = new NotificationsOptions
@@ -150,7 +157,7 @@ public sealed class NotificationConditionsTests
     {
         var registry = new StubAgentRegistry();
         var condition = new AllQuotasExhaustedCondition(
-            [], 10,
+            [], QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
@@ -166,7 +173,7 @@ public sealed class NotificationConditionsTests
         };
         var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
@@ -182,9 +189,28 @@ public sealed class NotificationConditionsTests
         };
         var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
+        Assert.False(await condition.EvaluateAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AllQuotasExhausted_PerAgentFloorAllowsBurnAgent_ReturnsFalse()
+    {
+        var probes = new IAgentQuotaProbe[]
+        {
+            new StubQuotaProbe(new AgentKind("claude"), 5),
+            new StubQuotaProbe(new AgentKind("codex"), 5),
+        };
+        var options = new QuotaRouterOptions { MinQuotaPct = 10 };
+        options.FloorByAgent["codex"] = new QuotaFloorOverrideOptions { MinQuotaPct = 1 };
+        var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
+        var condition = new AllQuotasExhaustedCondition(
+            probes, QuotaGate(options),
+            registry,
+            NullLogger<AllQuotasExhaustedCondition>.Instance);
+
         Assert.False(await condition.EvaluateAsync(CancellationToken.None));
     }
 
@@ -199,7 +225,7 @@ public sealed class NotificationConditionsTests
         // Registry only contains claude — codex is not available.
         var registry = new StubAgentRegistry(probes[0].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         // Only claude is considered, and it's below threshold.
@@ -216,7 +242,7 @@ public sealed class NotificationConditionsTests
         };
         var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         // claude probe returns -1 (unknown) — short-circuits to false.
@@ -233,7 +259,7 @@ public sealed class NotificationConditionsTests
         };
         var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         Assert.True(await condition.EvaluateAsync(CancellationToken.None));
@@ -249,7 +275,7 @@ public sealed class NotificationConditionsTests
         };
         var registry = new StubAgentRegistry(probes[0].Kind, probes[1].Kind);
         var condition = new AllQuotasExhaustedCondition(
-            probes, 10,
+            probes, QuotaGate(10),
             registry,
             NullLogger<AllQuotasExhaustedCondition>.Instance);
         // claude is at exactly 10 (>= minQuotaPct), so returns false.
