@@ -237,9 +237,19 @@ builder.Services.AddOptions<ProjectsOptions>()
 // The retaining monitor cache is deliberate: stock IOptionsMonitor drops its
 // prior cached value before validating a reload candidate, so a rejected edit
 // would make CurrentValue throw until the next successful reload.
-builder.Services.AddSingleton(sp => new CodeyBoxOptionsStartupSnapshot(
-    sp.GetRequiredService<IConfiguration>().GetSection("CodeyBox").Get<CodeyBoxOptions>()
-    ?? new CodeyBoxOptions()));
+//
+// AgentClassesOverrideResolver runs here AS WELL AS in the IOptions PostConfigure
+// pipeline: this snapshot pre-seeds the RetainingOptionsMonitorCache below, and
+// stock IOptionsMonitor returns that cached value without running the options
+// factory, so without this call IOptionsMonitor<CodeyBoxOptions>.CurrentValue
+// would observe the raw positional-merge AgentClasses until the first reload.
+builder.Services.AddSingleton(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    var snapshot = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
+    AgentClassesOverrideResolver.ApplyTo(snapshot, config);
+    return new CodeyBoxOptionsStartupSnapshot(snapshot);
+});
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
