@@ -317,6 +317,8 @@ internal sealed class AgentTrackingPipeline : IPipelineRunner
     private readonly IWorkItemStore _store;
     private string? _lastAgent;
     private int _receivedNullAgent;
+    private readonly TaskCompletionSource _ran =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public AgentKind? LastAgent
     {
@@ -327,6 +329,7 @@ internal sealed class AgentTrackingPipeline : IPipelineRunner
         }
     }
     public bool ReceivedNullAgent => Volatile.Read(ref _receivedNullAgent) != 0;
+    public Task Ran => _ran.Task;
 
     public AgentTrackingPipeline(IWorkItemStore store) => _store = store;
 
@@ -336,5 +339,6 @@ internal sealed class AgentTrackingPipeline : IPipelineRunner
         if (item.Agent is null)
             Volatile.Write(ref _receivedNullAgent, 1);
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+        _ran.TrySetResult();
     }
 }

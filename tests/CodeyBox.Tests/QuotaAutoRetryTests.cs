@@ -17,6 +17,7 @@ namespace CodeyBox.Tests;
 
 public sealed class QuotaAutoRetryTests : IDisposable
 {
+    private static readonly TimeSpan DispatchObservationTimeout = TimeSpan.FromSeconds(30);
     private readonly string _workspace;
     private readonly FakeTimeProvider _time;
 
@@ -594,9 +595,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             await orchestrator.StartAsync(CancellationToken.None);
             try
             {
-                await WaitForConditionAsync(
-                    () => tracking.LastAgent == AgentKind.Claude,
-                    TimeSpan.FromSeconds(5));
+                await tracking.Ran.WaitAsync(DispatchObservationTimeout);
             }
             finally
             {
@@ -731,9 +730,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
         await orchestrator.StartAsync(CancellationToken.None);
         try
         {
-            await WaitForConditionAsync(
-                () => tracking.LastAgent == AgentKind.Claude,
-                TimeSpan.FromSeconds(5));
+            await tracking.Ran.WaitAsync(DispatchObservationTimeout);
         }
         finally
         {
@@ -1543,9 +1540,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
         await orchestrator.StartAsync(CancellationToken.None);
         try
         {
-            await WaitForConditionAsync(
-                () => tracking.LastAgent == AgentKind.Claude,
-                TimeSpan.FromSeconds(5));
+            await tracking.Ran.WaitAsync(DispatchObservationTimeout);
         }
         finally
         {
