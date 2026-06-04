@@ -1881,7 +1881,7 @@ internal static class WorkItemEndpoints
                 : item.RequiredCapabilities.ToList(),
             JobType: item.JobType.ToString(),
             Check: item.Check,
-            AgentControl: item.AgentControl,
+            AgentControl: ToAgentControlDto(item.AgentControl),
             Verdict: item.Verdict,
             OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString(),
             ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
@@ -1943,6 +1943,21 @@ internal static class WorkItemEndpoints
         }
         return (result, null);
     }
+
+    private static AgentControlDto? ToAgentControlDto(AgentControlSpec? spec) =>
+        spec is null
+            ? null
+            : new AgentControlDto(
+                spec.Action switch
+                {
+                    AgentControlAction.Pause => "pause",
+                    AgentControlAction.Resume => "resume",
+                    _ => spec.Action.ToString(),
+                },
+                spec.Agent,
+                spec.Reason,
+                spec.DurationSeconds,
+                spec.ExpiresAt);
 
     /// <summary>
     /// Validates a requested priority against the global cap and the project's
@@ -2139,6 +2154,13 @@ public sealed record AgentControlRequest(
     int? DurationSeconds = null,
     DateTimeOffset? ExpiresAt = null);
 
+public sealed record AgentControlDto(
+    string Action,
+    string Agent,
+    string? Reason = null,
+    int? DurationSeconds = null,
+    DateTimeOffset? ExpiresAt = null);
+
 public sealed record RetryWorkItemRequest(string? From);
 
 public sealed record ResumeWorkItemRequest(string? From = null, string? Reason = null);
@@ -2244,7 +2266,7 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     CheckAndActSpec? Check = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    AgentControlSpec? AgentControl = null,
+    AgentControlDto? AgentControl = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     CheckVerdict? Verdict = null,
     string? OriginCheckWorkItemId = null,

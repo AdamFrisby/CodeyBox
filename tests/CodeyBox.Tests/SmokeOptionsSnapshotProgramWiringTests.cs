@@ -34,6 +34,9 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
         Assert.Same(dispatchAvailability, FieldValue(
             factory.Services.GetRequiredService<WorkerPoolHealthCoordinator>(),
             "_dispatchAvailability"));
+        Assert.Same(dispatchAvailability, FieldValue(
+            factory.Services.GetRequiredService<OrchestratorService>(),
+            "_dispatchAvailability"));
         Assert.Same(snapshot, Field<SmokeOptionsSnapshot>(
             dispatchAvailability,
             "_smokeOptions"));

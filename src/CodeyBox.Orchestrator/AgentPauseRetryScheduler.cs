@@ -40,6 +40,9 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
         CancellationToken ct = default) =>
         await RetryWaitingItemsAsync(source, ct).ConfigureAwait(false);
 
+    internal async Task<int> RunPeriodicExpirySweepForTestAsync(CancellationToken ct = default) =>
+        await RunPeriodicExpirySweepAsync(ct).ConfigureAwait(false);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await RetryWaitingItemsAsync("startup", stoppingToken).ConfigureAwait(false);
@@ -55,11 +58,7 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
                     continue;
                 }
 
-                // ListPausedAsync lazily expires duration-based pauses. If that
-                // expiry removes the final active pause, retry all waiting items.
-                var stillPaused = await _pauses.ListPausedAsync(stoppingToken).ConfigureAwait(false);
-                if (stillPaused.Count == 0)
-                    await RetryWaitingItemsAsync("periodic-no-pauses", stoppingToken).ConfigureAwait(false);
+                await RunPeriodicExpirySweepAsync(stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -105,6 +104,14 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
         var retried = 0;
         await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForAgentResume, ct))
         {
+            if (await IsResumeTargetStillPausedAsync(item, ct).ConfigureAwait(false))
+            {
+                _log.LogInformation(
+                    "Agent pause retry skipped {Id}: paused target is still unavailable",
+                    item.Id);
+                continue;
+            }
+
             var retryFrom = NormaliseRetryFrom(item.QuotaRetryFrom);
             var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
             var resumed = item.With(resumeState, error: null) with
@@ -137,10 +144,31 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
         return retried;
     }
 
+    private async Task<int> RunPeriodicExpirySweepAsync(CancellationToken ct)
+    {
+        // ListPausedAsync lazily expires duration-based pauses. RetryWaitingItemsAsync
+        // then filters each row by its stamped target agent, so an expired claude
+        // pause can requeue claude work even if a separate gemini pause remains.
+        _ = await _pauses.ListPausedAsync(ct).ConfigureAwait(false);
+        return await RetryWaitingItemsAsync("periodic-agent-pause-sweep", ct).ConfigureAwait(false);
+    }
+
+    private async Task<bool> IsResumeTargetStillPausedAsync(WorkItem item, CancellationToken ct)
+    {
+        if (item.Agent is { } target)
+            return await _pauses.GetAgentStateAsync(target, ct).ConfigureAwait(false) is not null;
+
+        // Older parked rows may not have a target agent stamped. Do not blindly
+        // resume them on an unrelated signal while any operator pause is still
+        // active; the next all-clear sweep can safely requeue them.
+        return (await _pauses.ListPausedAsync(ct).ConfigureAwait(false)).Count > 0;
+    }
+
     private static string NormaliseRetryFrom(string? retryFrom) =>
         retryFrom?.Trim().ToLowerInvariant() switch
         {
             "audit" => "audit",
+            "conflict_rework" => "conflict_rework",
             "merge" => "merge",
             "upstream" => "upstream",
             _ => "work",

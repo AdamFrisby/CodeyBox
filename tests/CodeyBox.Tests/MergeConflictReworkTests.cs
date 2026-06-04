@@ -427,7 +427,8 @@ public sealed class MergeConflictReworkTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
-        Assert.Equal("audit", final.QuotaRetryFrom);
+        Assert.Equal("conflict_rework", final.QuotaRetryFrom);
+        Assert.Equal(0, final.ConflictReworkAttempts);
         Assert.Contains("waiting: agent paused", final.LastError);
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
         Assert.Contains(pauseGate.Calls, c =>

@@ -459,6 +459,22 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
+        // The retry endpoint and recovery scheduler set the entry state to a
+        // pre-phase marker so the pipeline resumes at the matching phase. Compute
+        // this before dispatch-time availability gates: a WorkComplete /
+        // AuditPassed / Merged continuation must not be parked just because the
+        // original work agent is paused when the next phase uses another agent
+        // or no agent at all.
+        var entry = item.State;
+        var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        var resumingConflictRework = entry is WorkItemState.ReworkingForConflict;
+        var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
+            || resumingConflictRework
+            || (resumingPreempt && entry is WorkItemState.Reworking);
+        var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged
+            || resumingConflictRework;
+        var skipMerge = entry is WorkItemState.Merged;
+
         // ── Credential smoke gate ────────────────────────────────────────────────
         // Run before ANY sandbox is allocated. Skipped when the project opts out
         // (e.g. Copilot), when the gate is disabled globally, or when no probe is
@@ -522,41 +538,48 @@ public sealed class PipelineRunner : IPipelineRunner
         // this gate closes. Agents with no first-party sandbox CLI (e.g. copilot)
         // have no IInVmSmokeProbe and are exempted in the coverage policy, so the
         // gate is a free pass-through for them regardless of this flag.
-        var initialSmokePhase = item.JobType == JobType.CheckAndAct ? "check" : "work";
-        var initialSmokeTarget = ResolvePhaseSmokeTarget(project, initialSmokePhase, item.BaselineImageRef);
-        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(
-            agentKind, initialSmokeTarget, ct);
-        if (!smokeAvailability.Available)
+        var initialSmokePhase = item.JobType == JobType.CheckAndAct
+            ? "check"
+            : skipWork
+                ? null
+                : "work";
+        if (initialSmokePhase is not null)
         {
-            var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
-            if (IsOperatorPaused(smokeAvailability))
+            var initialSmokeTarget = ResolvePhaseSmokeTarget(project, initialSmokePhase, item.BaselineImageRef);
+            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(
+                agentKind, initialSmokeTarget, ct);
+            if (!smokeAvailability.Available)
             {
-                await TransitionWaitingForAgentResumeAsync(item, reason, project);
+                var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
+                if (IsOperatorPaused(smokeAvailability))
+                {
+                    await TransitionWaitingForAgentResumeAsync(item, reason, project, agentKind);
+                    return;
+                }
+
+                // The exclusion category isn't carried by the availability snapshot
+                // (the registry collapses sources into a single reason string), so
+                // we default to Unknown here. The underlying probe still recorded
+                // the correct category at the source (InVmSmokeProber /
+                // PeriodicSmokeProbeService); this branch is just the dispatch-time
+                // re-rejection of an already-recorded exclusion.
+                AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero, SmokeFailureCategory.Unknown);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.smoke_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new AgentSmokeFailedDetails
+                    {
+                        AgentKind = agentKind.Value,
+                        Reason = reason,
+                    },
+                }, CancellationToken.None);
+                await TransitionFailed(item,
+                    $"in-VM smoke gate: {reason}",
+                    CancellationToken.None, project, failureKind: "infrastructure");
                 return;
             }
-
-            // The exclusion category isn't carried by the availability snapshot
-            // (the registry collapses sources into a single reason string), so
-            // we default to Unknown here. The underlying probe still recorded
-            // the correct category at the source (InVmSmokeProber /
-            // PeriodicSmokeProbeService); this branch is just the dispatch-time
-            // re-rejection of an already-recorded exclusion.
-            AuditLog.AgentSmokeFailed(agentKind, reason, TimeSpan.Zero, SmokeFailureCategory.Unknown);
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "agent.smoke_failed",
-                WorkItem = item,
-                Project = project,
-                Details = new AgentSmokeFailedDetails
-                {
-                    AgentKind = agentKind.Value,
-                    Reason = reason,
-                },
-            }, CancellationToken.None);
-            await TransitionFailed(item,
-                $"in-VM smoke gate: {reason}",
-                CancellationToken.None, project, failureKind: "infrastructure");
-            return;
         }
 
         // ── check-and-act branch ─────────────────────────────────────────────
@@ -587,18 +610,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 item = item with { WorkBranch = workBranch };
                 await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { WorkBranch = workBranch }, ct);
             }
-
-            // The retry endpoint sets the entry state to a pre-phase marker
-            // (Queued / WorkComplete / AuditPassed / Merged) so we resume at
-            // the matching phase. Read once at the top so we don't re-fetch
-            // mid-pipeline (TransitionFailed/restart-recovery already handle
-            // mid-phase failures).
-            var entry = item.State;
-            var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
-            var skipWork = entry is WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
-                || (resumingPreempt && entry is WorkItemState.Reworking);
-            var skipAudit = entry is WorkItemState.AuditPassed or WorkItemState.Merged;
-            var skipMerge = entry is WorkItemState.Merged;
 
             // Fresh work-phase entry (a new WI, or a retry-from-work) must
             // observe a pristine base state. Reset the work branch in the
@@ -925,7 +936,9 @@ public sealed class PipelineRunner : IPipelineRunner
                     // the existing work branch. Capped at one iteration per merge
                     // attempt; a second failure parks at MergeConflictResolutionFailed.
                     var current = await _store.GetAsync(item.Id, ct) ?? item;
-                    if (current.ConflictReworkAttempts > 0)
+                    var conflictReworkAttemptAlreadyReserved =
+                        resumingConflictRework && current.ConflictReworkAttempts > 0;
+                    if (current.ConflictReworkAttempts > 0 && !conflictReworkAttemptAlreadyReserved)
                     {
                         _log.LogWarning(
                             "Work item {Id} merge conflict-rework already ran ({Attempts}); not re-engaging the agent",
@@ -935,7 +948,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
                     var reworkOutcome = await RunConflictReworkIterationAsync(
                         current, project, agentRunner, repoId, baseBranch, workBranch,
-                        firstFailure, ct, hostShutdownToken);
+                        firstFailure, ct, hostShutdownToken,
+                        countAttempt: !conflictReworkAttemptAlreadyReserved);
                     if (!reworkOutcome.Success)
                     {
                         throw new MergeConflictResolutionFailedException(reworkOutcome.ParkReason!, firstFailure);
@@ -1093,7 +1107,7 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogInformation(
                 "Work item {Id} parking in WaitingForAgentResume: {Reason}",
                 item.Id, ex.Message);
-            await TransitionWaitingForAgentResumeAsync(item, ex.Message, project);
+            await TransitionWaitingForAgentResumeAsync(item, ex.Message, project, ex.Agent);
         }
         catch (AgentUnavailableException ex)
         {
@@ -7590,7 +7604,8 @@ public sealed class PipelineRunner : IPipelineRunner
         string workBranch,
         MergeConflictResolutionFailedException originalFailure,
         CancellationToken ct,
-        CancellationToken hostShutdownToken)
+        CancellationToken hostShutdownToken,
+        bool countAttempt = true)
     {
         var startedAt = DateTimeOffset.UtcNow;
 
@@ -7610,10 +7625,33 @@ public sealed class PipelineRunner : IPipelineRunner
                 $"could not resolve branch tips before conflict rework: {ex.Message}");
         }
 
-        var bumped = await BumpConflictReworkAttemptsAsync(item, ct);
-        item = bumped ?? item;
-
         await Transition(item, WorkItemState.ReworkingForConflict, ct, project);
+
+        var smokeTarget = ResolvePhaseSmokeTarget(project, "rework", item.BaselineImageRef);
+        var smokeAvailability = await EnsureAgentSmokeAvailableAsync(runner.Kind, smokeTarget, ct);
+        if (!smokeAvailability.Available)
+        {
+            if (IsOperatorPaused(smokeAvailability))
+            {
+                var pausedReason = smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                throw new AgentPausedException(ConflictReworkPhaseKey, runner.Kind, pausedReason);
+            }
+
+            if (countAttempt)
+            {
+                var bumped = await BumpConflictReworkAttemptsAsync(item, ct);
+                item = bumped ?? item;
+            }
+
+            return new ConflictReworkResult(false,
+                $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
+        }
+
+        if (countAttempt)
+        {
+            var bumped = await BumpConflictReworkAttemptsAsync(item, ct);
+            item = bumped ?? item;
+        }
 
         // Capture the file-set the work agent's prior commits modified. `git
         // rebase` re-creates commits with new SHAs so an ancestor-SHA check
@@ -7880,24 +7918,6 @@ public sealed class PipelineRunner : IPipelineRunner
             // Run the agent. We use the same agent identity/class as the
             // original work agent (this method's `runner` parameter); the
             // contract is `IAgentRunner.RunAsync`, identical to the work phase.
-            var smokeTarget = ResolvePhaseSmokeTarget(project, "rework", item.BaselineImageRef);
-            var smokeAvailability = await EnsureAgentSmokeAvailableAsync(runner.Kind, smokeTarget, ct);
-            if (!smokeAvailability.Available)
-            {
-                if (IsOperatorPaused(smokeAvailability))
-                {
-                    var pausedReason = smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
-                    throw new AgentPausedException(ConflictReworkPhaseKey, runner.Kind, pausedReason);
-                }
-
-                return new ConflictReworkAgentOutcome(
-                    AgentSucceeded: false,
-                    NewTip: null,
-                    FailureReason: $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}",
-                    SemanticIncompatibleReason: null,
-                    FilesChanged: null, Insertions: null, Deletions: null);
-            }
-
             using var phase = new PhaseCancellation(ConflictReworkPhaseKey, ct, _opts.TimeProvider);
             phase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
             phase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
@@ -9510,7 +9530,8 @@ Original merge-phase failure (for context):
     private async Task TransitionWaitingForAgentResumeAsync(
         WorkItem item,
         string reason,
-        Project? project)
+        Project? project,
+        AgentKind? pausedAgent = null)
     {
         var ct = CancellationToken.None;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -9519,6 +9540,7 @@ Original merge-phase failure (for context):
             WorkItemState.WaitingForAgentResume,
             $"waiting: agent paused: {reason}") with
         {
+            Agent = pausedAgent ?? current.Agent,
             FailureKind = null,
             QuotaResetAt = null,
             NextQuotaRetryAt = null,

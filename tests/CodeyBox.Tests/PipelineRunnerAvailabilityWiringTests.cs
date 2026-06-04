@@ -342,6 +342,31 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task MergePhase_PausedDirectAgent_ParksFromMerge()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Codex);
+        using var fix = BuildPipeline(seed, inVmSmokeGate: pauseGate);
+
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-paused-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitWorkBranchAsync(fix.GitHost.GetRepoPath(repoId), item.WorkBranch!);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal("merge", final.QuotaRetryFrom);
+        Assert.Contains("waiting: agent paused", final.LastError);
+        Assert.Equal(0, fix.Codex.CallCount);
+    }
+
+    [Fact]
     public async Task DirectAgentPickup_SmokeDisabledGlobally_SkipsInVmGate_AndInvokesRunner()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -500,7 +525,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions));
 
-        return new TestFixture(pipeline, store, codex, webhooks, availability);
+        return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
     }
 
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
@@ -535,6 +560,27 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         PushUpstream = false,
     };
 
+    private static async Task CommitWorkBranchAsync(string bareRepoPath, string workBranch)
+    {
+        var clone = Path.Combine(Path.GetTempPath(), "codeybox-merge-pause-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(clone);
+        try
+        {
+            await TestSupport.RunGit(clone, "clone", bareRepoPath, ".");
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", "-b", workBranch, "origin/main");
+            await File.WriteAllTextAsync(Path.Combine(clone, "merge-phase.txt"), "ready\n");
+            await TestSupport.RunGit(clone, "add", "merge-phase.txt");
+            await TestSupport.RunGit(clone, "commit", "-m", "work already audited");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{workBranch}");
+        }
+        finally
+        {
+            try { Directory.Delete(clone, recursive: true); } catch { }
+        }
+    }
+
     private sealed class TestFixture : IDisposable
     {
         public PipelineRunner Pipeline { get; }
@@ -542,19 +588,22 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         public ScriptableAgent Codex { get; }
         public CapturingWebhookDispatcher Webhooks { get; }
         public AgentAvailabilityRegistry Registry { get; }
+        public LocalGitHost GitHost { get; }
 
         public TestFixture(
             PipelineRunner pipeline,
             SqliteWorkItemStore store,
             ScriptableAgent codex,
             CapturingWebhookDispatcher webhooks,
-            AgentAvailabilityRegistry registry)
+            AgentAvailabilityRegistry registry,
+            LocalGitHost gitHost)
         {
             Pipeline = pipeline;
             Store = store;
             Codex = codex;
             Webhooks = webhooks;
             Registry = registry;
+            GitHost = gitHost;
         }
 
         public void Dispose() => Store.Dispose();

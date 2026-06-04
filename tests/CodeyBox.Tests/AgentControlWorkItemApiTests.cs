@@ -50,6 +50,11 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         var id = WorkItemId.Parse(doc.RootElement.GetProperty("id").GetString()!);
+        var control = doc.RootElement.GetProperty("agentControl");
+        Assert.Equal("pause", control.GetProperty("action").GetString());
+        Assert.Equal("claude", control.GetProperty("agent").GetString());
+        Assert.Equal("reserve quota", control.GetProperty("reason").GetString());
+        Assert.Equal(3600, control.GetProperty("durationSeconds").GetInt32());
 
         var item = await _factory.Store.GetAsync(id);
         Assert.NotNull(item);

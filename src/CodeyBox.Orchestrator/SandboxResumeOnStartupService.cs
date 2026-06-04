@@ -701,7 +701,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             TaskScheduler.Default);
     }
 
-    private static async Task ObserveProviderTaskAfterCancellationAsync(Task task)
+    private async Task ObserveProviderTaskAfterCancellationAsync(Task task)
     {
         try
         {
@@ -713,9 +713,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         catch (OperationCanceledException)
         {
+            _log.LogDebug("Provider task observed cancellation after startup resume timeout/cancellation");
         }
-        catch
+        catch (Exception ex)
         {
+            _log.LogWarning(ex, "Provider task faulted after startup resume timeout/cancellation");
         }
     }
 

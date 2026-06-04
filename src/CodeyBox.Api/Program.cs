@@ -2079,7 +2079,7 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
-    agentPauseController: sp.GetRequiredService<IAgentPauseController>()));
+    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(

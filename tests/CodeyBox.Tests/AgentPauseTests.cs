@@ -150,7 +150,7 @@ public sealed class AgentPauseTests : IDisposable
             NullLogger<OrchestratorService>.Instance,
             router: router,
             projects: ProjectRepo(),
-            agentPauseController: pauses);
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
@@ -196,7 +196,7 @@ public sealed class AgentPauseTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             projects: ProjectRepo(),
-            agentPauseController: pauses);
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
@@ -231,7 +231,7 @@ public sealed class AgentPauseTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             projects: ProjectRepo(),
-            agentPauseController: pauses);
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
@@ -240,6 +240,42 @@ public sealed class AgentPauseTests : IDisposable
         Assert.NotNull(parked);
         Assert.False(pipeline.Entered);
         Assert.Equal("work", parked!.QuotaRetryFrom);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Worker_AuditPassedDirectItemWithPausedWorkAgent_EntersPipeline()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new CapturingPipeline(store);
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.AuditPassed,
+        };
+        await store.CreateAsync(item);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.EnqueueAsync(item.Id);
+
+        var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
+        Assert.NotNull(done);
+        Assert.True(pipeline.Entered);
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -274,7 +310,7 @@ public sealed class AgentPauseTests : IDisposable
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
             NullLogger<OrchestratorService>.Instance,
             projects: ProjectRepo(),
-            agentPauseController: pauses);
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
         await svc.StartAsync(CancellationToken.None);
         await queue.EnqueueAsync(item.Id);
@@ -319,6 +355,108 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task Worker_AgentControlPauseItem_WithoutPauseController_FailsConfiguration()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses: null, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agent pause controller is not configured", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlItem_MissingSpec_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = null,
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agentControl spec is missing", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_InvalidPersistedReason_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "   ",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agentControl.reason is required for pause", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlItem_UnsupportedPersistedAction_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = (AgentControlAction)99,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("unsupported agentControl action", failed.LastError);
+    }
+
+    [Fact]
     public async Task AgentPauseRetryScheduler_StartsAndWakesWaitingItemsOnResumeSignal()
     {
         using var pauses = MakeController();
@@ -357,8 +495,74 @@ public sealed class AgentPauseTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task AgentPauseRetryScheduler_DoesNotResumeWaitingItemUntilTargetAgentUnpaused()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "operator reserve", "test");
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: paused by operator: operator reserve",
+            QuotaRetryFrom = "work",
+        };
+        await store.CreateAsync(item);
+        var scheduler = new AgentPauseRetryScheduler(
+            store,
+            queue,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance);
+
+        Assert.Equal(0, await scheduler.RetryWaitingItemsForTestAsync("still-paused"));
+        var stillParked = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, stillParked!.State);
+        Assert.Equal(0, queue.Count);
+
+        await pauses.ResumeAsync(AgentKind.Claude, "test", "operator ready");
+        Assert.Equal(1, await scheduler.RetryWaitingItemsForTestAsync("resumed"));
+        var resumed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
+    public async Task AgentPauseRetryScheduler_PeriodicExpirySweep_RequeuesExpiredPause()
+    {
+        var now = new DateTimeOffset(2026, 6, 4, 0, 0, 0, TimeSpan.Zero);
+        var time = new FakeTimeProvider(now);
+        using var pauses = MakeController(time);
+        await pauses.PauseAsync(AgentKind.Claude, "outage", "test", now.AddMinutes(30));
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: paused by operator: outage",
+            QuotaRetryFrom = "work",
+        };
+        await store.CreateAsync(item);
+        var scheduler = new AgentPauseRetryScheduler(
+            store,
+            queue,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance);
+
+        time.Advance(TimeSpan.FromHours(1));
+        var retried = await scheduler.RunPeriodicExpirySweepForTestAsync();
+
+        Assert.Equal(1, retried);
+        var resumed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Equal(1, queue.Count);
+    }
+
     [Theory]
     [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.ReworkingForConflict, "conflict_rework", WorkItemState.ReworkingForConflict)]
     [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.Merged, "upstream", WorkItemState.Merged)]
     public void PauseResumeMapper_PreservesDurablePhaseBoundaries(
@@ -372,7 +576,7 @@ public sealed class AgentPauseTests : IDisposable
 
     private static PipelineRunner BuildRealAgentControlPipeline(
         IWorkItemStore store,
-        IAgentPauseController pauses,
+        IAgentPauseController? pauses,
         IWebhookDispatcher webhooks)
     {
         var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-git-{Guid.NewGuid():N}");

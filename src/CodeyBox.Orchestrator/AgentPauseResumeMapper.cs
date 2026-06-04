@@ -9,7 +9,7 @@ internal static class AgentPauseResumeMapper
         WorkItemState.WorkComplete => "audit",
         WorkItemState.Auditing => "audit",
         WorkItemState.Reworking => "audit",
-        WorkItemState.ReworkingForConflict => "audit",
+        WorkItemState.ReworkingForConflict => "conflict_rework",
         WorkItemState.AuditFailed => "audit",
         WorkItemState.AuditPassed => "merge",
         WorkItemState.Merging => "merge",
@@ -22,6 +22,7 @@ internal static class AgentPauseResumeMapper
         retryFrom?.Trim().ToLowerInvariant() switch
         {
             "audit" => WorkItemState.WorkComplete,
+            "conflict_rework" => WorkItemState.ReworkingForConflict,
             "merge" => WorkItemState.AuditPassed,
             "upstream" => WorkItemState.Merged,
             _ => WorkItemState.Queued,
