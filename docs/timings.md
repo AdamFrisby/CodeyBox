@@ -78,7 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_timings_work_item_phase
 ```
 
 The table lives in the same SQLite file as `work_items` and uses WAL mode
-(`journal_mode=WAL`, `busy_timeout=5000`) for safe concurrent access.
+(`journal_mode=WAL`, `busy_timeout=30000`) for safe concurrent access.
 
 ## REST API
 

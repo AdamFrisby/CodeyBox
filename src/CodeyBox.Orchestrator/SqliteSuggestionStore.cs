@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     public SqliteSuggestionStore(string path)
     {
@@ -21,36 +21,45 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var walCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            // Disable FK enforcement: the REFERENCES declaration is for schema clarity only;
-            // enforcement is not required and would break standalone-store usage in tests.
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys = OFF;";
-            walCmd.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS suggestions (
-                id                        TEXT PRIMARY KEY,
-                source_work_item_id       TEXT NOT NULL REFERENCES work_items(id),
-                project_id                TEXT NOT NULL,
-                title                     TEXT NOT NULL,
-                rationale                 TEXT NOT NULL,
-                category                  TEXT NOT NULL,
-                severity                  TEXT NOT NULL,
-                estimated_effort          TEXT NOT NULL,
-                files_referenced_json     TEXT NOT NULL DEFAULT '[]',
-                created_at                TEXT NOT NULL,
-                state                     TEXT NOT NULL DEFAULT 'open',
-                dismiss_reason            TEXT,
-                promoted_to_work_item_id  TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_suggestions_state_project ON suggestions(state, project_id);
-            """;
-        cmd.ExecuteNonQuery();
+            using (var walCmd = _conn.CreateCommand())
+            {
+                // Disable FK enforcement: the REFERENCES declaration is for schema clarity only;
+                // enforcement is not required and would break standalone-store usage in tests.
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys = OFF;";
+                walCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS suggestions (
+                    id                        TEXT PRIMARY KEY,
+                    source_work_item_id       TEXT NOT NULL REFERENCES work_items(id),
+                    project_id                TEXT NOT NULL,
+                    title                     TEXT NOT NULL,
+                    rationale                 TEXT NOT NULL,
+                    category                  TEXT NOT NULL,
+                    severity                  TEXT NOT NULL,
+                    estimated_effort          TEXT NOT NULL,
+                    files_referenced_json     TEXT NOT NULL DEFAULT '[]',
+                    created_at                TEXT NOT NULL,
+                    state                     TEXT NOT NULL DEFAULT 'open',
+                    dismiss_reason            TEXT,
+                    promoted_to_work_item_id  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_suggestions_state_project ON suggestions(state, project_id);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task CreateAsync(Suggestion suggestion, CancellationToken ct = default)

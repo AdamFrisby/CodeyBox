@@ -15,7 +15,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly SqliteCommand _insertCmd;
 
     public SqliteWorkItemCostStore(string path)
@@ -25,64 +25,73 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragmaCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            pragmaCmd.ExecuteNonQuery();
+            _conn.Open();
+
+            using (var pragmaCmd = _conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using var createCmd = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
+            createCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_item_costs (
+                    id                  TEXT PRIMARY KEY,
+                    work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    phase               TEXT NOT NULL,
+                    iteration           INTEGER,
+                    agent_kind          TEXT NOT NULL,
+                    model_id            TEXT,
+                    input_tokens        INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL,
+                    estimated_usd       REAL NOT NULL DEFAULT 0,
+                    started_at          TEXT NOT NULL,
+                    ended_at            TEXT NOT NULL,
+                    raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_costs_work_item
+                    ON work_item_costs(work_item_id, phase, iteration);
+                CREATE INDEX IF NOT EXISTS idx_costs_project_time
+                    ON work_item_costs(work_item_id, started_at);
+                """;
+            createCmd.ExecuteNonQuery();
+
+            _insertCmd = _conn.CreateCommand();
+            _insertCmd.CommandText = """
+                INSERT INTO work_item_costs
+                    (id, work_item_id, phase, iteration, agent_kind, model_id,
+                     input_tokens, cached_input_tokens, output_tokens,
+                     estimated_usd, started_at, ended_at, raw_metadata_json)
+                VALUES
+                    ($id, $wi, $phase, $iter, $kind, $model,
+                     $input, $cached, $output,
+                     $usd, $started, $ended, $meta)
+                """;
+            _insertCmd.Parameters.Add("$id", SqliteType.Text);
+            _insertCmd.Parameters.Add("$wi", SqliteType.Text);
+            _insertCmd.Parameters.Add("$phase", SqliteType.Text);
+            _insertCmd.Parameters.Add("$iter", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$kind", SqliteType.Text);
+            _insertCmd.Parameters.Add("$model", SqliteType.Text);
+            _insertCmd.Parameters.Add("$input", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$output", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$usd", SqliteType.Real);
+            _insertCmd.Parameters.Add("$started", SqliteType.Text);
+            _insertCmd.Parameters.Add("$ended", SqliteType.Text);
+            _insertCmd.Parameters.Add("$meta", SqliteType.Text);
+            _insertCmd.Prepare();
         }
-
-        using var createCmd = _conn.CreateCommand();
-        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
-        createCmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS work_item_costs (
-                id                  TEXT PRIMARY KEY,
-                work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                phase               TEXT NOT NULL,
-                iteration           INTEGER,
-                agent_kind          TEXT NOT NULL,
-                model_id            TEXT,
-                input_tokens        INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens       INTEGER NOT NULL,
-                estimated_usd       REAL NOT NULL DEFAULT 0,
-                started_at          TEXT NOT NULL,
-                ended_at            TEXT NOT NULL,
-                raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_costs_work_item
-                ON work_item_costs(work_item_id, phase, iteration);
-            CREATE INDEX IF NOT EXISTS idx_costs_project_time
-                ON work_item_costs(work_item_id, started_at);
-            """;
-        createCmd.ExecuteNonQuery();
-
-        _insertCmd = _conn.CreateCommand();
-        _insertCmd.CommandText = """
-            INSERT INTO work_item_costs
-                (id, work_item_id, phase, iteration, agent_kind, model_id,
-                 input_tokens, cached_input_tokens, output_tokens,
-                 estimated_usd, started_at, ended_at, raw_metadata_json)
-            VALUES
-                ($id, $wi, $phase, $iter, $kind, $model,
-                 $input, $cached, $output,
-                 $usd, $started, $ended, $meta)
-            """;
-        _insertCmd.Parameters.Add("$id", SqliteType.Text);
-        _insertCmd.Parameters.Add("$wi", SqliteType.Text);
-        _insertCmd.Parameters.Add("$phase", SqliteType.Text);
-        _insertCmd.Parameters.Add("$iter", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$kind", SqliteType.Text);
-        _insertCmd.Parameters.Add("$model", SqliteType.Text);
-        _insertCmd.Parameters.Add("$input", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$output", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$usd", SqliteType.Real);
-        _insertCmd.Parameters.Add("$started", SqliteType.Text);
-        _insertCmd.Parameters.Add("$ended", SqliteType.Text);
-        _insertCmd.Parameters.Add("$meta", SqliteType.Text);
-        _insertCmd.Prepare();
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task RecordAsync(WorkItemCost cost, CancellationToken ct = default)
@@ -268,7 +277,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         if (limit <= 0) return (0, 0);
 
         // Read-only connection: this query is invoked from the rate-aware gate
-        // on every dispatch tick. The shared writer connection `_conn` is not
+        // on every dispatch tick. The store write connection `_conn` is not
         // safe to use for concurrent commands, so opening a dedicated read
         // connection avoids racing the writer (RecordAsync, DeleteByWorkItemAsync,
         // ReconcileFromAgentStreamSummaryAsync). Matches the pattern used by

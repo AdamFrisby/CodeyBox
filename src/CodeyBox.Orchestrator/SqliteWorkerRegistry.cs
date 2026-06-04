@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly ILogger<SqliteWorkerRegistry>? _logger;
     private int _disposed;
 
@@ -24,27 +24,36 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragma = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragma.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS worker_registry (
-                worker_id            TEXT PRIMARY KEY,
-                host_name            TEXT NOT NULL,
-                process_id           INTEGER NOT NULL,
-                started_at           TEXT NOT NULL,
-                last_heartbeat_at    TEXT NOT NULL,
-                current_work_item_id TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_worker_heartbeat ON worker_registry(last_heartbeat_at);
-            """;
-        cmd.ExecuteNonQuery();
+            using (var pragma = _conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragma.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS worker_registry (
+                    worker_id            TEXT PRIMARY KEY,
+                    host_name            TEXT NOT NULL,
+                    process_id           INTEGER NOT NULL,
+                    started_at           TEXT NOT NULL,
+                    last_heartbeat_at    TEXT NOT NULL,
+                    current_work_item_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_heartbeat ON worker_registry(last_heartbeat_at);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task RegisterAsync(WorkerRegistration reg, CancellationToken ct = default)

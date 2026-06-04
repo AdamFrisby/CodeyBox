@@ -14,7 +14,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     public SqliteReleaseStore(string path)
     {
@@ -22,50 +22,59 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var walCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            walCmd.ExecuteNonQuery();
+            _conn.Open();
+
+            using (var walCmd = _conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                walCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS releases (
+                    id                  TEXT PRIMARY KEY,
+                    project_id          TEXT NOT NULL,
+                    name                TEXT NOT NULL,
+                    description         TEXT,
+                    state               INTEGER NOT NULL,
+                    base_commit_sha     TEXT,
+                    branch_name         TEXT,
+                    created_at          TEXT NOT NULL,
+                    closed_at           TEXT,
+                    review_started_at   TEXT,
+                    released_at         TEXT,
+                    failed_reason       TEXT,
+                    target_tag          TEXT,
+                    config_json         TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_project_name ON releases(project_id, name);
+                CREATE INDEX IF NOT EXISTS idx_releases_state ON releases(state);
+
+                CREATE TABLE IF NOT EXISTS release_audit_iterations (
+                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    release_id                  TEXT NOT NULL,
+                    iteration                   INTEGER NOT NULL,
+                    max_iterations              INTEGER NOT NULL,
+                    total_findings              INTEGER NOT NULL,
+                    blocking_findings           INTEGER NOT NULL,
+                    findings_json               TEXT NOT NULL,
+                    remediation_work_item_id    TEXT,
+                    created_at                  TEXT NOT NULL,
+                    UNIQUE(release_id, iteration)
+                );
+                CREATE INDEX IF NOT EXISTS idx_release_audit_iter ON release_audit_iterations(release_id);
+                """;
+            cmd.ExecuteNonQuery();
         }
-
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS releases (
-                id                  TEXT PRIMARY KEY,
-                project_id          TEXT NOT NULL,
-                name                TEXT NOT NULL,
-                description         TEXT,
-                state               INTEGER NOT NULL,
-                base_commit_sha     TEXT,
-                branch_name         TEXT,
-                created_at          TEXT NOT NULL,
-                closed_at           TEXT,
-                review_started_at   TEXT,
-                released_at         TEXT,
-                failed_reason       TEXT,
-                target_tag          TEXT,
-                config_json         TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_project_name ON releases(project_id, name);
-            CREATE INDEX IF NOT EXISTS idx_releases_state ON releases(state);
-
-            CREATE TABLE IF NOT EXISTS release_audit_iterations (
-                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                release_id                  TEXT NOT NULL,
-                iteration                   INTEGER NOT NULL,
-                max_iterations              INTEGER NOT NULL,
-                total_findings              INTEGER NOT NULL,
-                blocking_findings           INTEGER NOT NULL,
-                findings_json               TEXT NOT NULL,
-                remediation_work_item_id    TEXT,
-                created_at                  TEXT NOT NULL,
-                UNIQUE(release_id, iteration)
-            );
-            CREATE INDEX IF NOT EXISTS idx_release_audit_iter ON release_audit_iterations(release_id);
-            """;
-        cmd.ExecuteNonQuery();
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task CreateAsync(Release release, CancellationToken ct = default)

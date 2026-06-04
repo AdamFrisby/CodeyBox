@@ -12,7 +12,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteAgentFallbackHistoryStore(string path)
     {
@@ -20,32 +20,41 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragma = _conn.CreateCommand())
+        _lock = SqliteDatabaseWriteGate.ForPath(path);
+        _lock.Wait();
+        try
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragma.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var create = _conn.CreateCommand();
-        create.CommandText = """
-            CREATE TABLE IF NOT EXISTS agent_fallback_history (
-                id TEXT PRIMARY KEY,
-                work_item_id TEXT NOT NULL,
-                phase TEXT NOT NULL,
-                iteration INTEGER,
-                from_agent TEXT NOT NULL,
-                from_model TEXT,
-                to_agent TEXT,
-                to_model TEXT,
-                reason TEXT NOT NULL,
-                occurred_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_agent_fallback_history_work_item
-                ON agent_fallback_history(work_item_id, occurred_at);
-            """;
-        create.ExecuteNonQuery();
+            using (var pragma = _conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragma.ExecuteNonQuery();
+            }
+
+            using var create = _conn.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE IF NOT EXISTS agent_fallback_history (
+                    id TEXT PRIMARY KEY,
+                    work_item_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    iteration INTEGER,
+                    from_agent TEXT NOT NULL,
+                    from_model TEXT,
+                    to_agent TEXT,
+                    to_model TEXT,
+                    reason TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_fallback_history_work_item
+                    ON agent_fallback_history(work_item_id, occurred_at);
+                """;
+            create.ExecuteNonQuery();
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     public async Task RecordAsync(AgentFallbackRecord record, CancellationToken ct = default)
@@ -116,7 +125,11 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
         }
     }
 
-    public void Dispose() => _conn.Dispose();
+    public void Dispose()
+    {
+        _conn.Dispose();
+        _lock.Dispose();
+    }
 }
 
 /// <summary>

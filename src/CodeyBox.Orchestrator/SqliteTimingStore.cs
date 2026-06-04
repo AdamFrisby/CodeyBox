@@ -16,7 +16,7 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly SqliteCommand _insertCmd;
     private readonly SqliteCommand _updateCmd;
 
@@ -27,58 +27,67 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var walCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            walCmd.ExecuteNonQuery();
+            _conn.Open();
+
+            using (var walCmd = _conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                walCmd.ExecuteNonQuery();
+            }
+
+            using var createCmd = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
+            createCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_item_timings (
+                    id              TEXT PRIMARY KEY,
+                    work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    phase           TEXT NOT NULL,
+                    iteration       INTEGER,
+                    step            TEXT NOT NULL,
+                    started_at      TEXT NOT NULL,
+                    ended_at        TEXT,
+                    duration_ms     INTEGER,
+                    metadata_json   TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_timings_work_item_phase
+                    ON work_item_timings(work_item_id, phase, iteration, started_at);
+                """;
+            createCmd.ExecuteNonQuery();
+
+            // Prepared INSERT — called on every Begin (hot path).
+            _insertCmd = _conn.CreateCommand();
+            _insertCmd.CommandText = """
+                INSERT INTO work_item_timings
+                    (id, work_item_id, phase, iteration, step, started_at, ended_at, duration_ms, metadata_json)
+                VALUES ($id, $wid, $phase, $iter, $step, $started, NULL, NULL, $meta)
+                """;
+            _insertCmd.Parameters.Add("$id", SqliteType.Text);
+            _insertCmd.Parameters.Add("$wid", SqliteType.Text);
+            _insertCmd.Parameters.Add("$phase", SqliteType.Text);
+            _insertCmd.Parameters.Add("$iter", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$step", SqliteType.Text);
+            _insertCmd.Parameters.Add("$started", SqliteType.Text);
+            _insertCmd.Parameters.Add("$meta", SqliteType.Text);
+            _insertCmd.Prepare();
+
+            // Prepared UPDATE — called on every End (hot path).
+            _updateCmd = _conn.CreateCommand();
+            _updateCmd.CommandText = """
+                UPDATE work_item_timings SET ended_at = $ended, duration_ms = $dur WHERE id = $id
+                """;
+            _updateCmd.Parameters.Add("$ended", SqliteType.Text);
+            _updateCmd.Parameters.Add("$dur", SqliteType.Integer);
+            _updateCmd.Parameters.Add("$id", SqliteType.Text);
+            _updateCmd.Prepare();
         }
-
-        using var createCmd = _conn.CreateCommand();
-        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
-        createCmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS work_item_timings (
-                id              TEXT PRIMARY KEY,
-                work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                phase           TEXT NOT NULL,
-                iteration       INTEGER,
-                step            TEXT NOT NULL,
-                started_at      TEXT NOT NULL,
-                ended_at        TEXT,
-                duration_ms     INTEGER,
-                metadata_json   TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_timings_work_item_phase
-                ON work_item_timings(work_item_id, phase, iteration, started_at);
-            """;
-        createCmd.ExecuteNonQuery();
-
-        // Prepared INSERT — called on every Begin (hot path).
-        _insertCmd = _conn.CreateCommand();
-        _insertCmd.CommandText = """
-            INSERT INTO work_item_timings
-                (id, work_item_id, phase, iteration, step, started_at, ended_at, duration_ms, metadata_json)
-            VALUES ($id, $wid, $phase, $iter, $step, $started, NULL, NULL, $meta)
-            """;
-        _insertCmd.Parameters.Add("$id", SqliteType.Text);
-        _insertCmd.Parameters.Add("$wid", SqliteType.Text);
-        _insertCmd.Parameters.Add("$phase", SqliteType.Text);
-        _insertCmd.Parameters.Add("$iter", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$step", SqliteType.Text);
-        _insertCmd.Parameters.Add("$started", SqliteType.Text);
-        _insertCmd.Parameters.Add("$meta", SqliteType.Text);
-        _insertCmd.Prepare();
-
-        // Prepared UPDATE — called on every End (hot path).
-        _updateCmd = _conn.CreateCommand();
-        _updateCmd.CommandText = """
-            UPDATE work_item_timings SET ended_at = $ended, duration_ms = $dur WHERE id = $id
-            """;
-        _updateCmd.Parameters.Add("$ended", SqliteType.Text);
-        _updateCmd.Parameters.Add("$dur", SqliteType.Integer);
-        _updateCmd.Parameters.Add("$id", SqliteType.Text);
-        _updateCmd.Prepare();
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task BeginAsync(TimingRecord record, CancellationToken ct = default)

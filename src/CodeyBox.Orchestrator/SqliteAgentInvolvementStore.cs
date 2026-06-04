@@ -12,7 +12,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteAgentInvolvementStore(string path)
     {
@@ -20,31 +20,40 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragma = _conn.CreateCommand())
+        _lock = SqliteDatabaseWriteGate.ForPath(path);
+        _lock.Wait();
+        try
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragma.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var create = _conn.CreateCommand();
-        create.CommandText = """
-            CREATE TABLE IF NOT EXISTS agent_involvement (
-                id TEXT PRIMARY KEY,
-                work_item_id TEXT NOT NULL,
-                agent_kind TEXT NOT NULL,
-                model_id TEXT,
-                phase TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                iteration INTEGER,
-                outcome TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_agent_involvement_work_item
-                ON agent_involvement(work_item_id, started_at);
-            """;
-        create.ExecuteNonQuery();
+            using (var pragma = _conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragma.ExecuteNonQuery();
+            }
+
+            using var create = _conn.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE IF NOT EXISTS agent_involvement (
+                    id TEXT PRIMARY KEY,
+                    work_item_id TEXT NOT NULL,
+                    agent_kind TEXT NOT NULL,
+                    model_id TEXT,
+                    phase TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    iteration INTEGER,
+                    outcome TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_involvement_work_item
+                    ON agent_involvement(work_item_id, started_at);
+                """;
+            create.ExecuteNonQuery();
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     public async Task RecordStartAsync(AgentInvolvement entry, CancellationToken ct = default)
@@ -138,7 +147,11 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         }
     }
 
-    public void Dispose() => _conn.Dispose();
+    public void Dispose()
+    {
+        _conn.Dispose();
+        _lock.Dispose();
+    }
 }
 
 /// <summary>

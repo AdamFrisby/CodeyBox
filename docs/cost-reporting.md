@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_costs_project_time
 ```
 
 The table lives in the same SQLite file as `work_items` and uses WAL mode
-(`journal_mode=WAL`, `busy_timeout=5000`) for safe concurrent access.  Rows
+(`journal_mode=WAL`, `busy_timeout=30000`) for safe concurrent access.  Rows
 are deleted automatically when the parent work item is deleted (CASCADE).
 
 ## Pricing configuration

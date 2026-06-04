@@ -233,7 +233,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         await using var conn = new SqliteConnection($"Data Source={_dbPath}");
         await conn.OpenAsync();
         await using var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
         await pragma.ExecuteNonQueryAsync();
 
         await using var cmd = conn.CreateCommand();

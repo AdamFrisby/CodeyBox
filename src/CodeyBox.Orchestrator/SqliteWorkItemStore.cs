@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
     public SqliteWorkItemStore(string path)
@@ -22,259 +22,268 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        // WAL mode allows concurrent readers + SqliteQueueController writes without SQLITE_BUSY.
-        // busy_timeout is per-connection and provides a retry window for the rare lock collision.
-        // foreign_keys enables ON DELETE CASCADE from work_items → work_item_timings.
-        using (var walCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            walCmd.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS work_items (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                base_branch TEXT,
-                work_branch TEXT,
-                agent TEXT,
-                work_timeout_ticks INTEGER NOT NULL,
-                merge_timeout_ticks INTEGER NOT NULL,
-                push_upstream INTEGER NOT NULL,
-                state INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_error TEXT,
-                upstream_push_attempts INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_work_items_state ON work_items(state);
-            CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
-            """;
-        cmd.ExecuteNonQuery();
+            // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
+            // busy_timeout is per-connection and gives external lock holders a retry window.
+            // foreign_keys enables ON DELETE CASCADE from work_items → work_item_timings.
+            using (var walCmd = _conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                walCmd.ExecuteNonQuery();
+            }
 
-        // Additive migration: add depends_on_json column if it doesn't exist yet.
-        // Existing rows get the default '[]' so behaviour is unchanged.
-        RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
-
-        // Additive migration: add agent_class_id column for quota-aware routing.
-        RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
-
-        // Additive migration: add queue_position for admin-dashboard reorder support.
-        // Default 0 = "no explicit position" → store treats as sort-last (behind timestamp-based positions).
-        RunMigration("ALTER TABLE work_items ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;");
-
-        // Additive migration: track automatic re-queues from stuck-agent detection.
-        RunMigration("ALTER TABLE work_items ADD COLUMN stuck_retries INTEGER NOT NULL DEFAULT 0;");
-
-        // Additive migration: record when an item was first picked up by a worker.
-        // Used for per-project hourly/daily budget cap queries.
-        RunMigration("ALTER TABLE work_items ADD COLUMN started_at TEXT;");
-
-        // Index for cheap per-project budget window queries.
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_started ON work_items(project_id, started_at);");
-
-        // Additive migration: caller-supplied external identifier, unique per project.
-        RunMigration("ALTER TABLE work_items ADD COLUMN external_id TEXT;");
-
-        // Partial unique index: enforces per-project uniqueness while allowing NULL coexistence.
-        RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_external_id_per_project ON work_items(project_id, external_id) WHERE external_id IS NOT NULL;");
-
-        // Additive migration: link a replay to its source work item.
-        // Cleared (set to NULL) when the source is cancelled so replays keep running.
-        RunMigration("ALTER TABLE work_items ADD COLUMN replay_of_work_item_id TEXT;");
-
-        // Index for cheap replay-listing queries.
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_replay_of ON work_items(replay_of_work_item_id) WHERE replay_of_work_item_id IS NOT NULL;");
-
-        // Additive migration: store the SHA of the merge commit produced during the merge phase.
-        RunMigration("ALTER TABLE work_items ADD COLUMN merge_sha TEXT;");
-        // Additive migration: minimum quality-score floor for routing.
-        // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
-        RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
-
-        // Additive migration: capture failure details for auto-retry logic.
-        RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_from TEXT;");
-
-        // Composite indexes for fleet summary aggregation queries.
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_state ON work_items(project_id, state);");
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_updated ON work_items(project_id, updated_at);");
-        // Additive migration: why the item was cancelled (OperatorRequested, ParentCascaded, HostShutdown).
-        // NULL means legacy row or non-cancelled item.
-        RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_reason TEXT;");
-
-        // Additive migration: how many times the recovery loop / dead-worker reaper
-        // has reset this item. Default 0 = never recovered. Capped at MaxRecoveryAttempts.
-        RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
-
-        // Additive migration: link work items to a release. NULL = legacy / merge-to-main behaviour.
-        RunMigration("ALTER TABLE work_items ADD COLUMN release_id TEXT;");
-
-        // Index for release state machine queries (all items for a release).
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_release ON work_items(release_id) WHERE release_id IS NOT NULL;");
-
-        // Additive migration: graceful-shutdown preemption metadata. Nullable so
-        // existing rows are treated as not preempted.
-        RunMigration("ALTER TABLE work_items ADD COLUMN preempted_at TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN preempt_checkpoint TEXT;");
-
-        // Additive migration: VM-suspend recovery metadata (R8-core). Records the
-        // name of the suspended multipass VM that holds this item's in-progress
-        // sandbox state across an orchestrator restart. Nullable: only set
-        // between the shutdown teardown handler and the startup resume
-        // handler. The leak reaper skips VMs named here so the suspended VM is
-        // not auto-disposed during the restart window.
-        RunMigration("ALTER TABLE work_items ADD COLUMN suspended_vm_name TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN suspended_at TEXT;");
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_suspended_vm ON work_items(suspended_vm_name) WHERE suspended_vm_name IS NOT NULL;");
-
-        // R8-core: in-VM path to the tee'd agent-CLI log file. Persisted at
-        // agent invocation time so the startup resume handler can re-tail the
-        // file inside the resumed VM. Nullable: only set while an agent CLI
-        // that opted into tee'd capture is active for the work item.
-        RunMigration("ALTER TABLE work_items ADD COLUMN agent_log_path TEXT;");
-
-        // Additive migration: optional per-work-item audit profile override.
-        // NULL means use the project's default audit profile.
-        RunMigration("ALTER TABLE work_items ADD COLUMN auditor_profile TEXT;");
-
-        // Additive migration: dispatch priority. Default 0 preserves FIFO behaviour
-        // for existing rows. Higher values pick up first; ties break by created_at ASC.
-        RunMigration("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;");
-
-        // Index for the priority-aware pickup query: state filter first, then priority,
-        // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
-
-        // Additive migration: capture the first contributor that cancelled a
-        // pipeline phase so the operator can distinguish a configured timeout
-        // ("timeout:work") from a transient host-side cancellation ("unknown").
-        // NULL means legacy row or never-cancelled item.
-        RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_source TEXT;");
-
-        // Additive migration: counts auto-retries triggered by transient
-        // (unattributed) host-side cancellations. Default 0 keeps existing rows
-        // eligible for the auto-retry path on their next transient failure.
-        RunMigration("ALTER TABLE work_items ADD COLUMN transient_cancel_retries INTEGER NOT NULL DEFAULT 0;");
-
-        // Additive migration: monotonic prompt-generation counter. Default 1 so
-        // legacy rows behave as "never edited"; the PUT /workitems/{id}/prompt
-        // endpoint increments this on every successful write.
-        RunMigration("ALTER TABLE work_items ADD COLUMN prompt_revision INTEGER NOT NULL DEFAULT 1;");
-
-        // Additive migration: counts conflict-rework iterations executed on
-        // this work item. Capped at 1 per merge attempt; the pipeline parks at
-        // MergeConflictResolutionFailed past the cap rather than re-engaging
-        // the original work agent a second time.
-        RunMigration("ALTER TABLE work_items ADD COLUMN conflict_rework_attempts INTEGER NOT NULL DEFAULT 0;");
-
-        // B1: content-hashed baseline image ref pinned at pickup. Lets in-flight
-        // items keep using their original baseline across an operator edit to
-        // ExtraRuncmd / ExtraCloudInit / cloud-init contents. Null for legacy rows
-        // (the provider falls back to live-config behaviour).
-        RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_ref TEXT;");
-        // Partial index used by the BaselineImageReaper's live-ref query.
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_baseline_image_ref ON work_items(baseline_image_ref) WHERE baseline_image_ref IS NOT NULL;");
-
-        // Required-capability eligibility gate. Composes (AND) with min_model_score
-        // during the transition window; min_model_score is slated for removal once
-        // legacy items have migrated. Stored as a JSON array; default '[]' = open
-        // to any member of the routed class.
-        RunMigration("ALTER TABLE work_items ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]';");
-
-        // check-and-act job-type fields. New work-item kind that runs a single
-        // agent invocation against the project repo, parses a structured
-        // verdict, and optionally enqueues a follow-up Normal item. Default
-        // job_type 'Normal' preserves the prior shape for every legacy row.
-        RunMigration("ALTER TABLE work_items ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Normal';");
-        // CheckAndActSpec (question + actionable condition + on-yes action). JSON.
-        RunMigration("ALTER TABLE work_items ADD COLUMN check_spec_json TEXT;");
-        // CheckVerdict (answer + evidence + confidence). JSON; populated after check completes.
-        RunMigration("ALTER TABLE work_items ADD COLUMN check_verdict_json TEXT;");
-        // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
-        RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
-        ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex();
-        RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_origin_check_unique ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
-
-        // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
-        // Populated only on follow-up items by the re-validation loop that re-runs
-        // the originating check's question against the modified repo before merge.
-        // Default '[]' so legacy rows behave as "never re-validated".
-        RunMigration("ALTER TABLE work_items ADD COLUMN re_check_verdicts_json TEXT NOT NULL DEFAULT '[]';");
-
-        // Task-template provenance for bulk-expanded check-and-act work items.
-        // Null for ordinary items; template_entry_index is zero-based.
-        RunMigration("ALTER TABLE work_items ADD COLUMN template_name TEXT;");
-        RunMigration("ALTER TABLE work_items ADD COLUMN template_entry_index INTEGER;");
-        RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_template_source ON work_items(template_name, template_entry_index) WHERE template_name IS NOT NULL;");
-
-        // Per-iteration dispatch record. One row per (work_item_id, iteration);
-        // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
-        // restart-recovery for the same iteration) overwrites the row via
-        // ON CONFLICT DO UPDATE in RecordIterationDispatchAsync. The work
-        // item's current prompt_revision is snapshotted into
-        // prompt_revision_at_dispatch so a prompt edit landing mid-iteration
-        // cannot be misattributed to the already-running iteration. Cascade-
-        // delete with the parent work item.
-        using (var iterCmd = _conn.CreateCommand())
-        {
-            iterCmd.CommandText = """
-                CREATE TABLE IF NOT EXISTS work_item_iterations (
-                    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                    iteration INTEGER NOT NULL,
-                    prompt_revision_at_dispatch INTEGER NOT NULL,
-                    dispatched_at TEXT NOT NULL,
-                    PRIMARY KEY (work_item_id, iteration)
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS work_items (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    base_branch TEXT,
+                    work_branch TEXT,
+                    agent TEXT,
+                    work_timeout_ticks INTEGER NOT NULL,
+                    merge_timeout_ticks INTEGER NOT NULL,
+                    push_upstream INTEGER NOT NULL,
+                    state INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    upstream_push_attempts INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE INDEX IF NOT EXISTS idx_work_items_state ON work_items(state);
+                CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
                 """;
-            iterCmd.ExecuteNonQuery();
-        }
+            cmd.ExecuteNonQuery();
 
-        // Namespaced external-ID side table. Each work item may carry an ID per
-        // namespace (jobtrack, github, linear, …). The legacy single-value
-        // external_id column on work_items is preserved as a denormalised
-        // projection of the 'legacy' namespace for the deprecation window;
-        // back-fill happens once on the migration below. Cascade-delete with
-        // the parent work item so cancelled/deleted items don't leak rows.
-        using (var extCmd = _conn.CreateCommand())
-        {
-            extCmd.CommandText = """
-                CREATE TABLE IF NOT EXISTS work_item_external_ids (
-                    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                    project_id   TEXT NOT NULL,
-                    namespace    TEXT NOT NULL,
-                    external_id  TEXT NOT NULL,
-                    PRIMARY KEY (work_item_id, namespace)
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_external_ids_per_project
-                    ON work_item_external_ids(project_id, namespace, external_id);
-                CREATE INDEX IF NOT EXISTS idx_work_item_external_ids_lookup
-                    ON work_item_external_ids(project_id, external_id);
-                """;
-            extCmd.ExecuteNonQuery();
-        }
+            // Additive migration: add depends_on_json column if it doesn't exist yet.
+            // Existing rows get the default '[]' so behaviour is unchanged.
+            RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
 
-        // One-shot back-fill: copy any non-null work_items.external_id into the
-        // side table under namespace 'legacy'. INSERT OR IGNORE so re-running
-        // the migration is a no-op (rows already populated take precedence).
-        using (var backfill = _conn.CreateCommand())
+            // Additive migration: add agent_class_id column for quota-aware routing.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
+
+            // Additive migration: add queue_position for admin-dashboard reorder support.
+            // Default 0 = "no explicit position" → store treats as sort-last (behind timestamp-based positions).
+            RunMigration("ALTER TABLE work_items ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;");
+
+            // Additive migration: track automatic re-queues from stuck-agent detection.
+            RunMigration("ALTER TABLE work_items ADD COLUMN stuck_retries INTEGER NOT NULL DEFAULT 0;");
+
+            // Additive migration: record when an item was first picked up by a worker.
+            // Used for per-project hourly/daily budget cap queries.
+            RunMigration("ALTER TABLE work_items ADD COLUMN started_at TEXT;");
+
+            // Index for cheap per-project budget window queries.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_started ON work_items(project_id, started_at);");
+
+            // Additive migration: caller-supplied external identifier, unique per project.
+            RunMigration("ALTER TABLE work_items ADD COLUMN external_id TEXT;");
+
+            // Partial unique index: enforces per-project uniqueness while allowing NULL coexistence.
+            RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_external_id_per_project ON work_items(project_id, external_id) WHERE external_id IS NOT NULL;");
+
+            // Additive migration: link a replay to its source work item.
+            // Cleared (set to NULL) when the source is cancelled so replays keep running.
+            RunMigration("ALTER TABLE work_items ADD COLUMN replay_of_work_item_id TEXT;");
+
+            // Index for cheap replay-listing queries.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_replay_of ON work_items(replay_of_work_item_id) WHERE replay_of_work_item_id IS NOT NULL;");
+
+            // Additive migration: store the SHA of the merge commit produced during the merge phase.
+            RunMigration("ALTER TABLE work_items ADD COLUMN merge_sha TEXT;");
+            // Additive migration: minimum quality-score floor for routing.
+            // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
+            RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
+
+            // Additive migration: capture failure details for auto-retry logic.
+            RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_from TEXT;");
+
+            // Composite indexes for fleet summary aggregation queries.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_state ON work_items(project_id, state);");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_updated ON work_items(project_id, updated_at);");
+            // Additive migration: why the item was cancelled (OperatorRequested, ParentCascaded, HostShutdown).
+            // NULL means legacy row or non-cancelled item.
+            RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_reason TEXT;");
+
+            // Additive migration: how many times the recovery loop / dead-worker reaper
+            // has reset this item. Default 0 = never recovered. Capped at MaxRecoveryAttempts.
+            RunMigration("ALTER TABLE work_items ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;");
+
+            // Additive migration: link work items to a release. NULL = legacy / merge-to-main behaviour.
+            RunMigration("ALTER TABLE work_items ADD COLUMN release_id TEXT;");
+
+            // Index for release state machine queries (all items for a release).
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_release ON work_items(release_id) WHERE release_id IS NOT NULL;");
+
+            // Additive migration: graceful-shutdown preemption metadata. Nullable so
+            // existing rows are treated as not preempted.
+            RunMigration("ALTER TABLE work_items ADD COLUMN preempted_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN preempt_checkpoint TEXT;");
+
+            // Additive migration: VM-suspend recovery metadata (R8-core). Records the
+            // name of the suspended multipass VM that holds this item's in-progress
+            // sandbox state across an orchestrator restart. Nullable: only set
+            // between the shutdown teardown handler and the startup resume
+            // handler. The leak reaper skips VMs named here so the suspended VM is
+            // not auto-disposed during the restart window.
+            RunMigration("ALTER TABLE work_items ADD COLUMN suspended_vm_name TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN suspended_at TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_suspended_vm ON work_items(suspended_vm_name) WHERE suspended_vm_name IS NOT NULL;");
+
+            // R8-core: in-VM path to the tee'd agent-CLI log file. Persisted at
+            // agent invocation time so the startup resume handler can re-tail the
+            // file inside the resumed VM. Nullable: only set while an agent CLI
+            // that opted into tee'd capture is active for the work item.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_log_path TEXT;");
+
+            // Additive migration: optional per-work-item audit profile override.
+            // NULL means use the project's default audit profile.
+            RunMigration("ALTER TABLE work_items ADD COLUMN auditor_profile TEXT;");
+
+            // Additive migration: dispatch priority. Default 0 preserves FIFO behaviour
+            // for existing rows. Higher values pick up first; ties break by created_at ASC.
+            RunMigration("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;");
+
+            // Index for the priority-aware pickup query: state filter first, then priority,
+            // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
+
+            // Additive migration: capture the first contributor that cancelled a
+            // pipeline phase so the operator can distinguish a configured timeout
+            // ("timeout:work") from a transient host-side cancellation ("unknown").
+            // NULL means legacy row or never-cancelled item.
+            RunMigration("ALTER TABLE work_items ADD COLUMN cancellation_source TEXT;");
+
+            // Additive migration: counts auto-retries triggered by transient
+            // (unattributed) host-side cancellations. Default 0 keeps existing rows
+            // eligible for the auto-retry path on their next transient failure.
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_cancel_retries INTEGER NOT NULL DEFAULT 0;");
+
+            // Additive migration: monotonic prompt-generation counter. Default 1 so
+            // legacy rows behave as "never edited"; the PUT /workitems/{id}/prompt
+            // endpoint increments this on every successful write.
+            RunMigration("ALTER TABLE work_items ADD COLUMN prompt_revision INTEGER NOT NULL DEFAULT 1;");
+
+            // Additive migration: counts conflict-rework iterations executed on
+            // this work item. Capped at 1 per merge attempt; the pipeline parks at
+            // MergeConflictResolutionFailed past the cap rather than re-engaging
+            // the original work agent a second time.
+            RunMigration("ALTER TABLE work_items ADD COLUMN conflict_rework_attempts INTEGER NOT NULL DEFAULT 0;");
+
+            // B1: content-hashed baseline image ref pinned at pickup. Lets in-flight
+            // items keep using their original baseline across an operator edit to
+            // ExtraRuncmd / ExtraCloudInit / cloud-init contents. Null for legacy rows
+            // (the provider falls back to live-config behaviour).
+            RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_ref TEXT;");
+            // Partial index used by the BaselineImageReaper's live-ref query.
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_baseline_image_ref ON work_items(baseline_image_ref) WHERE baseline_image_ref IS NOT NULL;");
+
+            // Required-capability eligibility gate. Composes (AND) with min_model_score
+            // during the transition window; min_model_score is slated for removal once
+            // legacy items have migrated. Stored as a JSON array; default '[]' = open
+            // to any member of the routed class.
+            RunMigration("ALTER TABLE work_items ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]';");
+
+            // check-and-act job-type fields. New work-item kind that runs a single
+            // agent invocation against the project repo, parses a structured
+            // verdict, and optionally enqueues a follow-up Normal item. Default
+            // job_type 'Normal' preserves the prior shape for every legacy row.
+            RunMigration("ALTER TABLE work_items ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Normal';");
+            // CheckAndActSpec (question + actionable condition + on-yes action). JSON.
+            RunMigration("ALTER TABLE work_items ADD COLUMN check_spec_json TEXT;");
+            // CheckVerdict (answer + evidence + confidence). JSON; populated after check completes.
+            RunMigration("ALTER TABLE work_items ADD COLUMN check_verdict_json TEXT;");
+            // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
+            RunMigration("ALTER TABLE work_items ADD COLUMN origin_check_work_item_id TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_origin_check ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+            ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex();
+            RunMigration("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_origin_check_unique ON work_items(origin_check_work_item_id) WHERE origin_check_work_item_id IS NOT NULL;");
+
+            // Ordered history of post-act re-check verdicts (JSON array of CheckVerdict).
+            // Populated only on follow-up items by the re-validation loop that re-runs
+            // the originating check's question against the modified repo before merge.
+            // Default '[]' so legacy rows behave as "never re-validated".
+            RunMigration("ALTER TABLE work_items ADD COLUMN re_check_verdicts_json TEXT NOT NULL DEFAULT '[]';");
+
+            // Task-template provenance for bulk-expanded check-and-act work items.
+            // Null for ordinary items; template_entry_index is zero-based.
+            RunMigration("ALTER TABLE work_items ADD COLUMN template_name TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN template_entry_index INTEGER;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_template_source ON work_items(template_name, template_entry_index) WHERE template_name IS NOT NULL;");
+
+            // Per-iteration dispatch record. One row per (work_item_id, iteration);
+            // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
+            // restart-recovery for the same iteration) overwrites the row via
+            // ON CONFLICT DO UPDATE in RecordIterationDispatchAsync. The work
+            // item's current prompt_revision is snapshotted into
+            // prompt_revision_at_dispatch so a prompt edit landing mid-iteration
+            // cannot be misattributed to the already-running iteration. Cascade-
+            // delete with the parent work item.
+            using (var iterCmd = _conn.CreateCommand())
+            {
+                iterCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS work_item_iterations (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        iteration INTEGER NOT NULL,
+                        prompt_revision_at_dispatch INTEGER NOT NULL,
+                        dispatched_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, iteration)
+                    );
+                    """;
+                iterCmd.ExecuteNonQuery();
+            }
+
+            // Namespaced external-ID side table. Each work item may carry an ID per
+            // namespace (jobtrack, github, linear, …). The legacy single-value
+            // external_id column on work_items is preserved as a denormalised
+            // projection of the 'legacy' namespace for the deprecation window;
+            // back-fill happens once on the migration below. Cascade-delete with
+            // the parent work item so cancelled/deleted items don't leak rows.
+            using (var extCmd = _conn.CreateCommand())
+            {
+                extCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS work_item_external_ids (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        project_id   TEXT NOT NULL,
+                        namespace    TEXT NOT NULL,
+                        external_id  TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, namespace)
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_external_ids_per_project
+                        ON work_item_external_ids(project_id, namespace, external_id);
+                    CREATE INDEX IF NOT EXISTS idx_work_item_external_ids_lookup
+                        ON work_item_external_ids(project_id, external_id);
+                    """;
+                extCmd.ExecuteNonQuery();
+            }
+
+            // One-shot back-fill: copy any non-null work_items.external_id into the
+            // side table under namespace 'legacy'. INSERT OR IGNORE so re-running
+            // the migration is a no-op (rows already populated take precedence).
+            using (var backfill = _conn.CreateCommand())
+            {
+                backfill.CommandText = """
+                    INSERT OR IGNORE INTO work_item_external_ids (work_item_id, project_id, namespace, external_id)
+                    SELECT id, project_id, 'legacy', external_id
+                    FROM work_items
+                    WHERE external_id IS NOT NULL;
+                    """;
+                backfill.ExecuteNonQuery();
+            }
+        }
+        finally
         {
-            backfill.CommandText = """
-                INSERT OR IGNORE INTO work_item_external_ids (work_item_id, project_id, namespace, external_id)
-                SELECT id, project_id, 'legacy', external_id
-                FROM work_items
-                WHERE external_id IS NOT NULL;
-                """;
-            backfill.ExecuteNonQuery();
+            _writeLock.Release();
         }
     }
 

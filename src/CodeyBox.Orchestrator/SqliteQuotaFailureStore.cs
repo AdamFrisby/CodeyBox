@@ -6,7 +6,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
 {
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteQuotaFailureStore(string path)
     {
@@ -14,38 +14,47 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragma = _conn.CreateCommand())
+        _lock = SqliteDatabaseWriteGate.ForPath(path);
+        _lock.Wait();
+        try
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragma.ExecuteNonQuery();
+            _conn.Open();
+
+            using (var pragma = _conn.CreateCommand())
+            {
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragma.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS quota_failures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent TEXT NOT NULL,
+                    model_id TEXT,
+                    project_id TEXT,
+                    failure_kind TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+                """;
+            cmd.ExecuteNonQuery();
+            EnsureProjectIdColumn();
+
+            using var indexCmd = _conn.CreateCommand();
+            indexCmd.CommandText = """
+                CREATE INDEX IF NOT EXISTS idx_quota_failures_agent_model_observed
+                    ON quota_failures(agent, model_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_quota_failures_project_agent_model_observed
+                    ON quota_failures(project_id, agent, model_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_quota_failures_observed
+                    ON quota_failures(observed_at);
+                """;
+            indexCmd.ExecuteNonQuery();
         }
-
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS quota_failures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent TEXT NOT NULL,
-                model_id TEXT,
-                project_id TEXT,
-                failure_kind TEXT NOT NULL,
-                observed_at TEXT NOT NULL
-            );
-            """;
-        cmd.ExecuteNonQuery();
-        EnsureProjectIdColumn();
-
-        using var indexCmd = _conn.CreateCommand();
-        indexCmd.CommandText = """
-            CREATE INDEX IF NOT EXISTS idx_quota_failures_agent_model_observed
-                ON quota_failures(agent, model_id, observed_at);
-            CREATE INDEX IF NOT EXISTS idx_quota_failures_project_agent_model_observed
-                ON quota_failures(project_id, agent, model_id, observed_at);
-            CREATE INDEX IF NOT EXISTS idx_quota_failures_observed
-                ON quota_failures(observed_at);
-            """;
-        indexCmd.ExecuteNonQuery();
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     public async Task RecordAsync(AgentKind agent, string? modelId, QuotaFailureKind kind, DateTimeOffset observedAt, CancellationToken ct = default)
@@ -198,7 +207,11 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         }
     }
 
-    public void Dispose() => _conn.Dispose();
+    public void Dispose()
+    {
+        _conn.Dispose();
+        _lock.Dispose();
+    }
 
     private void EnsureProjectIdColumn()
     {

@@ -127,6 +127,33 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_DoesNotClaimWorkerAfterSingleMissedHeartbeatWithinThreshold()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = workerId,
+            HostName = "host",
+            ProcessId = 1,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            LastHeartbeatAt = DateTimeOffset.UtcNow - _opts.HeartbeatInterval - TimeSpan.FromMilliseconds(100),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        var worker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, worker.WorkerId);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
     public async Task Reaper_FiresWebhookEvent_OnRecovery()
     {
         var item = MakeItem(WorkItemState.Auditing);

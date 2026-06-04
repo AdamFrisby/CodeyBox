@@ -14,7 +14,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 {
     private readonly string _dbPath;
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _lock;
     private readonly ILogger<SqliteQueueController> _log;
 
     // volatile so reads outside the lock see writes made inside the lock on ARM64.
@@ -43,38 +43,47 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
-        _conn.Open();
-
-        // WAL mode lets SqliteWorkItemStore and this connection write concurrently
-        // without SQLITE_BUSY. busy_timeout gives the rare collision a retry window.
-        using (var walCmd = _conn.CreateCommand())
+        _lock = SqliteDatabaseWriteGate.ForPath(dbPath);
+        _lock.Wait();
+        try
         {
-            walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            walCmd.ExecuteNonQuery();
+            _conn.Open();
+
+            // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes
+            // writers in-process. busy_timeout gives external lock holders a retry window.
+            using (var walCmd = _conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                walCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS queue_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    state     INTEGER NOT NULL DEFAULT 0,
+                    paused_at TEXT,
+                    paused_reason TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO queue_state (singleton, state, updated_at)
+                VALUES (1, 0, datetime('now'));
+                CREATE TABLE IF NOT EXISTS project_queue_state (
+                    project_id    TEXT PRIMARY KEY,
+                    paused        INTEGER NOT NULL DEFAULT 0,
+                    paused_at     TEXT,
+                    paused_reason TEXT,
+                    updated_at    TEXT NOT NULL
+                );
+                """;
+            cmd.ExecuteNonQuery();
+
+            LoadState();
         }
-
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS queue_state (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                state     INTEGER NOT NULL DEFAULT 0,
-                paused_at TEXT,
-                paused_reason TEXT,
-                updated_at TEXT NOT NULL
-            );
-            INSERT OR IGNORE INTO queue_state (singleton, state, updated_at)
-            VALUES (1, 0, datetime('now'));
-            CREATE TABLE IF NOT EXISTS project_queue_state (
-                project_id    TEXT PRIMARY KEY,
-                paused        INTEGER NOT NULL DEFAULT 0,
-                paused_at     TEXT,
-                paused_reason TEXT,
-                updated_at    TEXT NOT NULL
-            );
-            """;
-        cmd.ExecuteNonQuery();
-
-        LoadState();
+        finally
+        {
+            _lock.Release();
+        }
 
         if (_state == QueueState.Paused)
             AuditLog.QueueStartedWhilePaused();
