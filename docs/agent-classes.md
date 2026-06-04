@@ -496,6 +496,16 @@ Configured under `CodeyBox:QuotaRouter`:
   "CodeyBox": {
     "QuotaRouter": {
       "MinQuotaPct": 10,
+      "StartFloorPct": 25,
+      "EndFloorPct": 3,
+      "RampWindowSeconds": 604800,
+      "FloorByAgent": {
+        "codex": {
+          "StartFloorPct": 1,
+          "EndFloorPct": 0,
+          "MinQuotaPct": 1
+        }
+      },
       "QuotaRecheckIntervalSeconds": 300,
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
@@ -513,7 +523,11 @@ Configured under `CodeyBox:QuotaRouter`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `MinQuotaPct` | `10` | Minimum available percentage before a Subscription member is skipped. |
+| `MinQuotaPct` | `10` | Global fallback minimum available percentage when a ramp cannot be computed. |
+| `StartFloorPct` | `25` | Global early-window floor just after the quota window resets. |
+| `EndFloorPct` | `3` | Global late-window floor as reset approaches. |
+| `RampWindowSeconds` | `604800` | Global quota-window length used for the time-based floor ramp. |
+| `FloorByAgent` | `{}` | Optional per-agent floor overrides keyed by agent kind. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted agents and omitted fields use the global values. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
@@ -524,6 +538,11 @@ Configured under `CodeyBox:QuotaRouter`:
 | `ProbeRetryInitialDelayMs` | `250` | Base retry backoff in milliseconds; doubles each attempt. Hot-reloadable. |
 | `ProbeMaxConsecutiveFailures` | `3` | Consecutive probe failures tolerated before the probe stops returning the retained last-known-good snapshot. A single transient blip cannot silently disable the `MinQuotaPct` floor. Hot-reloadable. |
 | `ProbeMaxStalenessSeconds` | `300` | Maximum age of a retained last-known-good snapshot before it is dropped in favour of `AvailablePct=-1` (unknown). Hot-reloadable. |
+
+Use `FloorByAgent` when the oversight model and work agent differ. A near-zero
+entry such as `codex: { StartFloorPct: 1, EndFloorPct: 0, MinQuotaPct: 1 }`
+lets codex burn close to empty, while an omitted claude entry keeps the global
+protective ramp.
 
 ---
 

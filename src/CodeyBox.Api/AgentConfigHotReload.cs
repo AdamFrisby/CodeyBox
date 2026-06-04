@@ -371,6 +371,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _quotaRouterOptions.MinQuotaPctByWindow = windowFloors;
             _quotaRouterOptions.StartFloorPct = src.StartFloorPct;
             _quotaRouterOptions.EndFloorPct = src.EndFloorPct;
+            _quotaRouterOptions.FloorByAgent = BuildFloorOverrides(src.FloorByAgent);
             if (src.RampWindowSeconds > 0)
                 _quotaRouterOptions.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
             var overrides = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
@@ -824,6 +825,15 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 RampWindowByAgentSeconds = opts.RampWindowByAgentSeconds
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(kv => kv.Key, kv => kv.Value),
+                FloorByAgent = opts.FloorByAgent
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => new
+                    {
+                        kv.Value.MinQuotaPct,
+                        kv.Value.StartFloorPct,
+                        kv.Value.EndFloorPct,
+                        kv.Value.RampWindowSeconds,
+                    }),
                 opts.QuotaRecheckIntervalSeconds,
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
                 opts.ObservedFailureWindowMinutes,
@@ -833,6 +843,38 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);
+
+    private static Dictionary<string, QuotaFloorOverrideOptions> BuildFloorOverrides(
+        IDictionary<string, QuotaRouterFloorConfig>? src)
+    {
+        var dst = new Dictionary<string, QuotaFloorOverrideOptions>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value is null) continue;
+            var entry = new QuotaFloorOverrideOptions
+            {
+                MinQuotaPct = NonNegative(kv.Value.MinQuotaPct),
+                StartFloorPct = NonNegative(kv.Value.StartFloorPct),
+                EndFloorPct = NonNegative(kv.Value.EndFloorPct),
+                RampWindow = kv.Value.RampWindowSeconds is { } seconds && seconds > 0
+                    ? TimeSpan.FromSeconds(seconds)
+                    : null,
+            };
+            if (entry.MinQuotaPct is null
+                && entry.StartFloorPct is null
+                && entry.EndFloorPct is null
+                && entry.RampWindow is null)
+            {
+                continue;
+            }
+            dst[kv.Key] = entry;
+        }
+        return dst;
+
+        static double? NonNegative(double? value) =>
+            value is { } v && v >= 0 ? v : null;
+    }
 
     private void ApplyPipelineTuningIfChanged(CodeyBoxOptions opts)
     {

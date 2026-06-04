@@ -65,6 +65,83 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task NearZeroFloorRoutedCodexQuotaFailure_FallsBackToClaudeSameIteration()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        var now = DateTimeOffset.UtcNow;
+        var quotaOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+            MinQuotaPctByWindow = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["five_hour"] = 25.0,
+            },
+        };
+        quotaOptions.FloorByAgent[AgentKind.Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var routingClass = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+        var routeRouter = new AgentClassRouter(
+            [routingClass],
+            [
+                new RecordingProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 20.0,
+                    ResetAt = now + TimeSpan.FromDays(7),
+                    Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 20.0 }],
+                }),
+                new RecordingProbe(AgentKind.Codex, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 1.0,
+                    ResetAt = now + TimeSpan.FromDays(7),
+                    Windows = [new WindowQuota { Name = "five_hour", AvailablePct = 1.0 }],
+                }),
+            ],
+            quotaOptions,
+            NullLogger<AgentClassRouter>.Instance);
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        var routeDecision = await routeRouter.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Equal(AgentKind.Codex, routeDecision.Chosen!.Agent);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.NotEqual(WorkItemState.Failed, finalItem!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem.State);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var swap = Assert.Single(history, h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, swap.FromAgent);
+    }
+
+    [Fact]
     public async Task AuditDrivenRework_EmitsReworkPhaseSpanAndDuration()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2207,19 +2284,18 @@ internal sealed class FlakyInvolvementStore : IAgentInvolvementStore
 /// </summary>
 internal sealed class RecordingProbe : IAgentQuotaProbe
 {
-    private readonly double _availablePct;
-
     public AgentKind Kind { get; }
     public List<AgentKind> MarkedExhausted { get; } = new();
+    private readonly AgentQuotaSnapshot _snapshot;
 
-    public RecordingProbe(AgentKind kind, double availablePct = 80.0)
+    public RecordingProbe(AgentKind kind, AgentQuotaSnapshot? snapshot = null)
     {
         Kind = kind;
-        _availablePct = availablePct;
+        _snapshot = snapshot ?? new AgentQuotaSnapshot { AvailablePct = 80.0 };
     }
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
+        => Task.FromResult(_snapshot);
 
     public Task MarkExhaustedAsync(
         AgentMembership member,

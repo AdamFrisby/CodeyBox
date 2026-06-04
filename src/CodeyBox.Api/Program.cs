@@ -898,6 +898,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         MinQuotaPctByWindow = BuildWindowFloorOverrides(qr.MinQuotaPctByWindow),
         StartFloorPct = qr.StartFloorPct,
         EndFloorPct = qr.EndFloorPct,
+        FloorByAgent = BuildFloorOverrides(qr.FloorByAgent),
         RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
         RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
         QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
@@ -920,6 +921,38 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
             dst[kv.Key] = TimeSpan.FromSeconds(kv.Value);
         }
         return dst;
+    }
+
+    static Dictionary<string, QuotaFloorOverrideOptions> BuildFloorOverrides(
+        IDictionary<string, QuotaRouterFloorConfig>? src)
+    {
+        var dst = new Dictionary<string, QuotaFloorOverrideOptions>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value is null) continue;
+            var entry = new QuotaFloorOverrideOptions
+            {
+                MinQuotaPct = NonNegative(kv.Value.MinQuotaPct),
+                StartFloorPct = NonNegative(kv.Value.StartFloorPct),
+                EndFloorPct = NonNegative(kv.Value.EndFloorPct),
+                RampWindow = kv.Value.RampWindowSeconds is { } seconds && seconds > 0
+                    ? TimeSpan.FromSeconds(seconds)
+                    : null,
+            };
+            if (entry.MinQuotaPct is null
+                && entry.StartFloorPct is null
+                && entry.EndFloorPct is null
+                && entry.RampWindow is null)
+            {
+                continue;
+            }
+            dst[kv.Key] = entry;
+        }
+        return dst;
+
+        static double? NonNegative(double? value) =>
+            value is { } v && v >= 0 ? v : null;
     }
 
     static Dictionary<string, double> BuildWindowFloorOverrides(IDictionary<string, double>? src)
@@ -3982,6 +4015,16 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, int> RampWindowByAgentSeconds { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Optional per-agent floor overrides keyed by agent kind value
+        /// (e.g. <c>codex</c>, <c>claude</c>). Omitted agents and omitted
+        /// fields inherit the global ramp/fallback settings above. Set
+        /// low values such as StartFloorPct=1, EndFloorPct=0, MinQuotaPct=1
+        /// to burn a work-only agent close to empty while keeping oversight
+        /// agents on the global reserve. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaRouterFloorConfig> FloorByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
@@ -4035,6 +4078,25 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public int ProbeMaxStalenessSeconds { get; set; } = 300;
+    }
+
+    /// <summary>
+    /// Per-agent quota floor override. Null fields inherit the corresponding
+    /// global <see cref="QuotaRouterConfig"/> setting.
+    /// </summary>
+    public sealed class QuotaRouterFloorConfig
+    {
+        /// <summary>Fallback floor used when the ramp cannot be computed.</summary>
+        public double? MinQuotaPct { get; set; }
+
+        /// <summary>Early-window ramp floor for this agent.</summary>
+        public double? StartFloorPct { get; set; }
+
+        /// <summary>Late-window ramp floor for this agent.</summary>
+        public double? EndFloorPct { get; set; }
+
+        /// <summary>Optional ramp-window length in seconds for this agent.</summary>
+        public int? RampWindowSeconds { get; set; }
     }
 
     /// <summary>

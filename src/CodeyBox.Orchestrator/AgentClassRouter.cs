@@ -754,7 +754,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             else
             {
                 reason = $"all members of class '{classId}' are below the effective quota floor " +
-                         $"(ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%)";
+                         $"(global ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%; per-agent overrides may apply)";
                 suggested = _opts.QuotaRecheckInterval;
             }
             if (pausedSuffix is not null)
@@ -1619,7 +1619,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 foreach (var w in windows)
                 {
                     if (w.AvailablePct < 0) continue; // unknown — gated by aggregated check above
-                    var windowFloor = ResolveWindowFloorPct(w.Name);
+                    var windowFloor = ResolveWindowFloorPct(member.Agent, w.Name);
                     if (w.AvailablePct < windowFloor)
                     {
                         return new QuotaGateDecision(
@@ -1766,12 +1766,28 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// vs <c>5h-rolling</c> style names.
     /// </summary>
     internal double ResolveWindowFloorPct(string windowName)
+        => ResolveWindowFloorPct(default, windowName);
+
+    /// <summary>
+    /// Returns the absolute floor for one provider window name scoped to
+    /// <paramref name="agent"/>. An agent with a
+    /// <see cref="QuotaFloorOverrideOptions.MinQuotaPct"/> override uses that
+    /// value for provider-window fallback too, so a burn-to-zero agent is not
+    /// still held back by a global per-window reserve meant for an oversight
+    /// agent.
+    /// </summary>
+    internal double ResolveWindowFloorPct(AgentKind agent, string windowName)
     {
-        if (string.IsNullOrEmpty(windowName)) return _opts.MinQuotaPct;
+        var settings = ResolveFloorSettings(agent);
+        if (TryGetFloorOverride(agent, out var perAgent)
+            && perAgent?.MinQuotaPct is { } agentMin)
+            return agentMin;
+
+        if (string.IsNullOrEmpty(windowName)) return settings.MinQuotaPct;
         if (_opts.MinQuotaPctByWindow is { } overrides
             && overrides.TryGetValue(windowName, out var perWindow))
             return perWindow;
-        return _opts.MinQuotaPct;
+        return settings.MinQuotaPct;
     }
 
     /// <summary>
@@ -1797,30 +1813,64 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// </summary>
     internal double ComputeEffectiveFloorPct(AgentKind agent, DateTimeOffset? resetAt, DateTimeOffset nowUtc)
     {
-        if (resetAt is not { } reset) return _opts.MinQuotaPct;
-        var rampWindow = GetRampWindow(agent);
-        if (rampWindow <= TimeSpan.Zero) return _opts.MinQuotaPct;
+        var settings = ResolveFloorSettings(agent);
+        if (resetAt is not { } reset) return settings.MinQuotaPct;
+        if (settings.RampWindow <= TimeSpan.Zero) return settings.MinQuotaPct;
 
         var untilReset = reset - nowUtc;
-        var fractionElapsed = 1.0 - untilReset.TotalSeconds / rampWindow.TotalSeconds;
+        var fractionElapsed = 1.0 - untilReset.TotalSeconds / settings.RampWindow.TotalSeconds;
         if (double.IsNaN(fractionElapsed) || double.IsInfinity(fractionElapsed))
-            return _opts.MinQuotaPct;
+            return settings.MinQuotaPct;
         fractionElapsed = Math.Clamp(fractionElapsed, 0.0, 1.0);
 
-        var floor = _opts.StartFloorPct + (_opts.EndFloorPct - _opts.StartFloorPct) * fractionElapsed;
-        var lo = Math.Min(_opts.StartFloorPct, _opts.EndFloorPct);
-        var hi = Math.Max(_opts.StartFloorPct, _opts.EndFloorPct);
+        var floor = settings.StartFloorPct + (settings.EndFloorPct - settings.StartFloorPct) * fractionElapsed;
+        var lo = Math.Min(settings.StartFloorPct, settings.EndFloorPct);
+        var hi = Math.Max(settings.StartFloorPct, settings.EndFloorPct);
         return Math.Clamp(floor, lo, hi);
+    }
+
+    private AgentFloorSettings ResolveFloorSettings(AgentKind agent)
+    {
+        var perAgent = TryGetFloorOverride(agent, out var overrideOptions)
+            ? overrideOptions
+            : null;
+        return new AgentFloorSettings(
+            MinQuotaPct: perAgent?.MinQuotaPct ?? _opts.MinQuotaPct,
+            StartFloorPct: perAgent?.StartFloorPct ?? _opts.StartFloorPct,
+            EndFloorPct: perAgent?.EndFloorPct ?? _opts.EndFloorPct,
+            RampWindow: ResolveRampWindow(agent, perAgent));
+    }
+
+    private TimeSpan ResolveRampWindow(AgentKind agent, QuotaFloorOverrideOptions? perAgent)
+    {
+        if (perAgent?.RampWindow is { } rampWindow)
+            return rampWindow;
+        return GetRampWindow(agent);
+    }
+
+    private bool TryGetFloorOverride(AgentKind agent, out QuotaFloorOverrideOptions? overrideOptions)
+    {
+        overrideOptions = null;
+        if (string.IsNullOrEmpty(agent.Value)) return false;
+        return _opts.FloorByAgent is { } overrides
+            && overrides.TryGetValue(agent.Value, out overrideOptions);
     }
 
     private TimeSpan GetRampWindow(AgentKind agent)
     {
-        if (_opts.RampWindowByAgent is { } overrides
+        if (!string.IsNullOrEmpty(agent.Value)
+            && _opts.RampWindowByAgent is { } overrides
             && overrides.TryGetValue(agent.Value, out var perAgent)
             && perAgent > TimeSpan.Zero)
             return perAgent;
         return _opts.RampWindow;
     }
+
+    private readonly record struct AgentFloorSettings(
+        double MinQuotaPct,
+        double StartFloorPct,
+        double EndFloorPct,
+        TimeSpan RampWindow);
 
     /// <summary>
     /// Rate-aware gate: returns a denying <see cref="QuotaGateDecision"/> when
@@ -2369,6 +2419,15 @@ public sealed class QuotaRouterOptions
     public double EndFloorPct { get; set; } = 3.0;
 
     /// <summary>
+    /// Optional per-agent floor overrides keyed by <see cref="AgentKind.Value"/>.
+    /// Any omitted field on an entry falls back to the corresponding global
+    /// <see cref="MinQuotaPct"/>, <see cref="StartFloorPct"/>,
+    /// <see cref="EndFloorPct"/>, or ramp-window setting. Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, QuotaFloorOverrideOptions> FloorByAgent { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Default length of the quota window used to compute the time-based
     /// floor ramp when the probe surfaces a <c>ResetAt</c>. The fraction-
     /// elapsed is <c>1 - timeUntilReset / RampWindow</c>. Default 7 days
@@ -2435,6 +2494,28 @@ public enum IntraKindRoutingPolicy
     MostQuotaFirst,
     RoundRobin,
     Sticky,
+}
+
+/// <summary>
+/// Per-agent override for quota floor parameters. Null properties inherit the
+/// corresponding global <see cref="QuotaRouterOptions"/> value.
+/// </summary>
+public sealed class QuotaFloorOverrideOptions
+{
+    /// <summary>
+    /// Per-agent fallback floor used when the ramp cannot be computed. Also
+    /// overrides provider-window fallback floors for this agent when set.
+    /// </summary>
+    public double? MinQuotaPct { get; set; }
+
+    /// <summary>Per-agent early-window ramp floor.</summary>
+    public double? StartFloorPct { get; set; }
+
+    /// <summary>Per-agent late-window ramp floor.</summary>
+    public double? EndFloorPct { get; set; }
+
+    /// <summary>Optional per-agent ramp-window length.</summary>
+    public TimeSpan? RampWindow { get; set; }
 }
 
 public enum QuotaUnknownPolicy

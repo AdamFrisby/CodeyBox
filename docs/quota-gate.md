@@ -48,8 +48,32 @@ before the use-it-or-lose-it reset rather than sitting unused.
 
 `fractionElapsed = 1 - timeUntilReset / RampWindow`, clamped to `[0, 1]`, and
 `effectiveFloorPct = lerp(StartFloorPct, EndFloorPct, fractionElapsed)`.
-Per-agent overrides go in `RampWindowByAgentSeconds`; agents missing from
-that map use the default `RampWindowSeconds`. The ramp applies to
+Per-agent floor overrides go in `FloorByAgent`, keyed by agent kind:
+
+```json
+"QuotaRouter": {
+  "FloorByAgent": {
+    "codex": {
+      "StartFloorPct": 1,
+      "EndFloorPct": 0,
+      "MinQuotaPct": 1
+    }
+  }
+}
+```
+
+Each `FloorByAgent` entry may set `StartFloorPct`, `EndFloorPct`,
+`MinQuotaPct`, and optionally `RampWindowSeconds`; omitted fields inherit the
+global `QuotaRouter` values. Omitted agents use the global ramp unchanged. A
+near-zero floor lets a work-only subscription agent burn close to empty, while
+an oversight agent left on the global defaults keeps the protective reserve.
+When an agent sets `MinQuotaPct`, that value is also the fallback floor for its
+provider windows, so global `MinQuotaPctByWindow` reserves do not accidentally
+hold back that burn-to-zero agent.
+
+Legacy per-agent ramp-window-only overrides still go in
+`RampWindowByAgentSeconds`; agents missing from that map use the default
+`RampWindowSeconds`. The ramp applies to
 Subscription members only — PayPerApi members fall back to the fixed
 `MinQuotaPct` because their `AvailablePct` is driven by the operator's
 local budget, not an agent quota window. Unknown windows (no `ResetAt`)

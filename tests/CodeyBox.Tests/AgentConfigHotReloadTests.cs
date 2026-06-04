@@ -2121,6 +2121,69 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterFloorByAgentPropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0 },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = new QuotaRouterOptions
+        {
+            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
+            StartFloorPct = initial.QuotaRouter.StartFloorPct,
+            EndFloorPct = initial.QuotaRouter.EndFloorPct,
+        };
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                FloorByAgent = new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["codex"] = new QuotaRouterFloorConfig
+                    {
+                        MinQuotaPct = 1.0,
+                        StartFloorPct = 1.0,
+                        EndFloorPct = 0.0,
+                    },
+                },
+            },
+        });
+
+        Assert.True(qro.FloorByAgent.TryGetValue("codex", out var codexFloor));
+        Assert.NotNull(codexFloor);
+        Assert.Equal(1.0, codexFloor.MinQuotaPct);
+        Assert.Equal(1.0, codexFloor.StartFloorPct);
+        Assert.Equal(0.0, codexFloor.EndFloorPct);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0 },
+        });
+
+        Assert.Empty(qro.FloorByAgent);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_PipelineTuningPushesNewFieldsToSnapshot()
     {
         var initial = new CodeyBoxOptions

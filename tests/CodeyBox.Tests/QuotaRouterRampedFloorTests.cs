@@ -172,6 +172,28 @@ public sealed class QuotaRouterRampedFloorTests
     }
 
     [Fact]
+    public void PerAgentFloorOverride_UsesAgentFloorAndOmittedAgentUsesGlobalRamp()
+    {
+        var opts = DefaultOpts();
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var router = BuildRouter(opts);
+        var reset = Now + TimeSpan.FromDays(3.5);
+
+        var codexFloor = router.ComputeEffectiveFloorPct(Codex, reset, Now);
+        var claudeFloor = router.ComputeEffectiveFloorPct(Claude, reset, Now);
+        var codexUnknownResetFloor = router.ComputeEffectiveFloorPct(Codex, resetAt: null, Now);
+
+        Assert.Equal(0.5, codexFloor, precision: 6);
+        Assert.Equal(14.0, claudeFloor, precision: 6);
+        Assert.Equal(1.0, codexUnknownResetFloor, precision: 6);
+    }
+
+    [Fact]
     public void HotReloadOfOptions_TakesEffectOnNextCall()
     {
         // The router holds the QuotaRouterOptions singleton by reference and
@@ -188,6 +210,58 @@ public sealed class QuotaRouterRampedFloorTests
 
         // lerp(50, 10, 0.5) = 30
         Assert.Equal(30.0, router.ComputeEffectiveFloorPct(Claude, reset, Now), precision: 6);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_PerAgentNearZeroFloorAdmitsBurnAgentWhileReservedAgentWaits()
+    {
+        var opts = DefaultOpts();
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var reset = Now + TimeSpan.FromDays(7);
+        var frontier = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "frontier",
+            Members = [
+                new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+        var claudeProbe = new FakeProbe(Claude, new AgentQuotaSnapshot
+        {
+            AvailablePct = 20.0,
+            ResetAt = reset,
+        });
+        var codexProbe = new FakeProbe(Codex, new AgentQuotaSnapshot
+        {
+            AvailablePct = 1.0,
+            ResetAt = reset,
+        });
+        var router = new AgentClassRouter(
+            catalog: [frontier],
+            probes: [claudeProbe, codexProbe],
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance,
+            timeProvider: new FakeTimeProvider(Now));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        };
+
+        var decision = await router.ResolveAsync(item, project: null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.Equal(1, claudeProbe.CallCount);
+        Assert.Equal(1, codexProbe.CallCount);
     }
 
     [Fact]
@@ -265,10 +339,15 @@ public sealed class QuotaRouterRampedFloorTests
             _snapshot = snapshot;
         }
 
+        public int CallCount { get; private set; }
+
         public void SetSnapshot(AgentQuotaSnapshot s) => _snapshot = s;
 
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-            => Task.FromResult(_snapshot);
+        {
+            CallCount++;
+            return Task.FromResult(_snapshot);
+        }
     }
 
     private sealed class FakeTimeProvider : TimeProvider

@@ -26,6 +26,7 @@ namespace CodeyBox.Tests;
 public sealed class QuotaRouterPerWindowFloorTests
 {
     private static readonly AgentKind Claude = AgentKind.Claude;
+    private static readonly AgentKind Codex = AgentKind.Codex;
 
     private static readonly DateTimeOffset Now =
         new(2026, 5, 31, 12, 0, 0, TimeSpan.Zero);
@@ -202,6 +203,28 @@ public sealed class QuotaRouterPerWindowFloorTests
         Assert.Equal(25.0, router.ResolveWindowFloorPct("five_hour"));
         Assert.Equal(12.5, router.ResolveWindowFloorPct("seven_day"));
         Assert.Equal(12.5, router.ResolveWindowFloorPct("anything-else"));
+    }
+
+    [Fact]
+    public void AgentMinOverride_BeatsGlobalWindowFloorForThatAgentOnly()
+    {
+        var opts = Opts(
+            new(StringComparer.OrdinalIgnoreCase) { ["five_hour"] = 25.0 },
+            minQuotaPct: 10.0);
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+        };
+        var router = new AgentClassRouter(
+            catalog: [ClaudeOnlyClass()],
+            probes: Array.Empty<IAgentQuotaProbe>(),
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance);
+
+        Assert.Equal(1.0, router.ResolveWindowFloorPct(Codex, "five_hour"));
+        Assert.Equal(25.0, router.ResolveWindowFloorPct(Claude, "five_hour"));
+        Assert.Equal(1.0, router.ResolveWindowFloorPct(Codex, "unlisted-window"));
+        Assert.Equal(10.0, router.ResolveWindowFloorPct(Claude, "unlisted-window"));
     }
 
     [Fact]
