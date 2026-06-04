@@ -41,7 +41,8 @@ public sealed class InVmSmokeProberTests
         InVmSmokeOptions? opts = null,
         ICredentialProvider? credentials = null,
         IEnumerable<IInVmSmokeProbe>? probes = null,
-        bool fillDefaultNetworkProfile = true)
+        bool fillDefaultNetworkProfile = true,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         var effectiveOpts = opts ?? new InVmSmokeOptions
         {
@@ -63,7 +64,8 @@ public sealed class InVmSmokeProberTests
             cache,
             new NullWebhookDispatcher(),
             effectiveOpts,
-            NullLogger<InVmSmokeProber>.Instance);
+            NullLogger<InVmSmokeProber>.Instance,
+            smokeOptions);
     }
 
     private static InVmSmokeCache NewCache() => new(TimeSpan.FromMinutes(60));
@@ -338,6 +340,38 @@ public sealed class InVmSmokeProberTests
 
         Assert.Equal(0, provider.CreateCount);
         Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+    }
+
+    [Fact]
+    public async Task MasterSmokeDisabled_NoOpsAllEntrypoints_ThenHotReloadEnableResumes()
+    {
+        var provider = new FakeSandboxProvider(_ => new SandboxExecResult(127, "", "not found"));
+        var registry = NewRegistry();
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var prober = Build(
+            provider,
+            registry,
+            NewCache(),
+            new FakeBaselineResolver("base-A"),
+            smokeOptions: smokeOptions);
+
+        Assert.False(prober.Enabled);
+        await prober.ProbeAllAsync(CancellationToken.None);
+        var availability = await prober.EnsureAvailableAsync(AgentKind.Cursor, WorkTarget, CancellationToken.None);
+        var forced = await prober.ForceProbeAsync(AgentKind.Cursor, CancellationToken.None);
+
+        Assert.True(availability.Available);
+        Assert.Null(forced);
+        Assert.Equal(0, provider.CreateCount);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        smokeOptions.Replace(new SmokeOptions { Enabled = true });
+
+        Assert.True(prober.Enabled);
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.Equal(1, provider.CreateCount);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
     }
 
     [Fact]

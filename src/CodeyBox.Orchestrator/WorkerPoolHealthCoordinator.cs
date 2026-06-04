@@ -18,6 +18,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     private readonly IAgentRegistry? _agents;
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentRoutingReadiness? _routingReadiness;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly ILogger<WorkerPoolHealthCoordinator> _log;
 
     public WorkerPoolHealthCoordinator(
@@ -29,7 +30,8 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentAvailabilityRegistry? availability = null,
-        IAgentRoutingReadiness? routingReadiness = null)
+        IAgentRoutingReadiness? routingReadiness = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _dispatcher = dispatcher;
         _store = store;
@@ -39,6 +41,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _agents = agents;
         _availability = availability;
         _routingReadiness = routingReadiness;
+        _smokeOptions = smokeOptions;
         _log = log;
     }
 
@@ -235,9 +238,12 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
 
-        var availability = _availability?.GetAvailability(agent);
-        if (availability is { Available: false })
-            return false;
+        if (_smokeOptions?.Enabled != false)
+        {
+            var availability = _availability?.GetAvailability(agent);
+            if (availability is { Available: false })
+                return false;
+        }
 
         return HasCapacity(agent);
     }

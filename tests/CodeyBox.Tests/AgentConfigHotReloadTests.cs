@@ -104,6 +104,52 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task SmokeHotReload_ReEnableRunsMissingProbeCoverage()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            AgentClasses = [HotReloadClass("frontier", "cursor")],
+            Smoke = new SmokeConfig { Enabled = false },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            AgentClassesConfigBuilder.Build(initial.AgentClasses, NullLogger<AgentClassRouter>.Instance),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var coverage = new InVmSmokeCoveragePolicy(
+            [new ClaudeInVmSmokeProbe()],
+            registry,
+            new InVmSmokeOptions { Enabled = true },
+            smokeOptions);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            coverage: coverage,
+            smokeOptions: smokeOptions);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentClasses = [HotReloadClass("frontier", "cursor")],
+            Smoke = new SmokeConfig { Enabled = true },
+        });
+
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.Contains("no registered IInVmSmokeProbe", registry.GetAvailability(AgentKind.Cursor).Reason);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     // ── AgentClassRouter.ApplyConfigReload ──────────────────────────────────
 
     [Fact]
@@ -416,6 +462,56 @@ public sealed class AgentConfigHotReloadTests
         Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
         Assert.Contains("no registered IInVmSmokeProbe", registry.GetAvailability(AgentKind.Cursor).Reason);
         Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_WhenSmokeDisabled_DoesNotBenchNewlyAddedMemberWithoutInVmProbe()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            AgentClasses = [HotReloadClass("frontier", "claude")],
+            Smoke = new SmokeConfig { Enabled = false },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            AgentClassesConfigBuilder.Build(initial.AgentClasses, NullLogger<AgentClassRouter>.Instance),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var coverage = new InVmSmokeCoveragePolicy(
+            [new ClaudeInVmSmokeProbe()],
+            registry,
+            new InVmSmokeOptions { Enabled = true },
+            smokeOptions);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            coverage: coverage,
+            smokeOptions: smokeOptions);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                HotReloadClass("frontier", "claude"),
+                HotReloadClass("extra", "cursor"),
+            ],
+            Smoke = new SmokeConfig { Enabled = false },
+        });
+
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

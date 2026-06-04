@@ -257,12 +257,16 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             return;
 
         var prev = _lastSmoke;
+        var enforceProbeCoverage = false;
         try
         {
-            _smokeOptions.Replace(ToSmokeOptions(opts.Smoke));
+            var previousOptions = _smokeOptions.Current;
+            var nextOptions = ToSmokeOptions(opts.Smoke);
+            _smokeOptions.Replace(nextOptions);
             _lastSmoke = next;
             AuditLog.ConfigReloaded("Smoke", prev, next);
             _log.LogInformation("Hot-reloaded Smoke: {OldValue} → {NewValue}", prev, next);
+            enforceProbeCoverage = !previousOptions.Enabled && nextOptions.Enabled;
         }
         catch (Exception ex)
         {
@@ -271,6 +275,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 "Fix the configuration error and re-save to retry.",
                 prev);
         }
+
+        if (enforceProbeCoverage)
+            EnforceProbeCoverage(opts);
     }
 
     private void ApplyIncrementalRebaseIfChanged(CodeyBoxOptions opts)

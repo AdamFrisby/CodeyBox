@@ -2049,7 +2049,8 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<IAgentAvailabilityRegistry>(),
-    sp.GetRequiredService<IAgentRoutingReadiness>()));
+    sp.GetRequiredService<IAgentRoutingReadiness>(),
+    sp.GetRequiredService<SmokeOptionsSnapshot>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>
