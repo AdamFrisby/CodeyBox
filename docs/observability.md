@@ -141,6 +141,7 @@ Polled at collection time; registered only when OTel is enabled.
 | `codeybox.workers.in_use` | `{worker}` | — | Worker slots currently occupied by an in-flight pipeline run. |
 | `codeybox.workers.max` | `{worker}` | — | Configured `MaxConcurrentWorkers` ceiling. |
 | `codeybox.sandbox.active` | `{sandbox}` | `provider` | Sandboxes/VMs the process is actively tracking. Providers that expose lifecycle-aware active sandboxes report from `IActiveSandboxProvider.SnapshotActiveSandboxes()`; ephemeral providers (process, bubblewrap) report in-flight created-but-not-disposed sandboxes via the process-wide `SandboxLiveCounter`. |
+| `codeybox.sandbox.max` | `{sandbox}` | — | Configured `MaxConcurrentSandboxes` admission ceiling. |
 | `codeybox.agent.quota.available_pct` | `%` | `agent.kind`, `model` | Most-recent subscription quota headroom observed per agent/model during routing (`-1` = unknown). |
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.

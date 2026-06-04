@@ -56,6 +56,11 @@ public static class OrchestratorOptionsFactory
         if (maxConcurrent < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConcurrentWorkers must be >= 1");
+        var maxConcurrentSandboxes = wp.MaxConcurrentSandboxes
+            ?? DeriveDefaultMaxConcurrentSandboxes(maxConcurrent);
+        if (maxConcurrentSandboxes < 1)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
         if (wp.MinSpawnInterval < TimeSpan.Zero)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
@@ -66,8 +71,18 @@ public static class OrchestratorOptionsFactory
         return new OrchestratorOptions
         {
             MaxConcurrentWorkers = maxConcurrent,
+            MaxConcurrentSandboxes = maxConcurrentSandboxes,
             MinSpawnInterval = wp.MinSpawnInterval,
         };
+    }
+
+    public static int DeriveDefaultMaxConcurrentSandboxes(int maxConcurrentWorkers)
+    {
+        if (maxConcurrentWorkers < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(maxConcurrentWorkers),
+                "MaxConcurrentWorkers must be >= 1");
+        return Math.Max(1, (maxConcurrentWorkers * 3 + 1) / 2);
     }
 
     public static OrchestratorOptions Build(

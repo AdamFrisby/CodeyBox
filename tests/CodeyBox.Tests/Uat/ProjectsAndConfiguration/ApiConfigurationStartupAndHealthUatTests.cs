@@ -28,11 +28,13 @@ public sealed class ApiConfigurationStartupValidationUatTests
             workerPool: new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = 8,
+                MaxConcurrentSandboxes = 10,
                 MinSpawnInterval = TimeSpan.FromMilliseconds(250),
             },
             log: logger);
 
         Assert.Equal(8, options.MaxConcurrentWorkers);
+        Assert.Equal(10, options.MaxConcurrentSandboxes);
         Assert.Equal(TimeSpan.FromMilliseconds(250), options.MinSpawnInterval);
         var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
         Assert.Contains("CodeyBox:Concurrency", warning.Message);

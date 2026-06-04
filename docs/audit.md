@@ -429,6 +429,12 @@ Tool auditors (`security:gitleaks`, `security:semgrep`, language presets,
 shell commands, diff-pattern matchers) are unaffected: they always run
 sequentially in a single shared sandbox, regardless of this setting.
 
+`MaxLlmAuditorParallelism` is a per-item fan-out policy, not a host VM budget.
+Every LLM auditor sandbox still goes through
+`CodeyBox:WorkerPool:MaxConcurrentSandboxes`; when several items audit at once,
+excess auditor sandboxes queue at the global provider gate instead of exceeding
+the host's configured VM ceiling.
+
 ### Configuration
 
 ```json

@@ -3508,9 +3508,9 @@ public sealed record MultipassSandboxOptions
     /// bumping speeds up build / scan / install cold-starts when the
     /// underlying tools parallelise. Keep <see cref="BaselineMemoryGB"/>
     /// at roughly 2-3× this value or builds OOM under MSBuild's per-core
-    /// worker fan-out. Total host budget is
-    /// <c>WorkerPool:MaxConcurrentWorkers × BaselineCpus</c> vCPUs and
-    /// <c>... × BaselineMemoryGB</c> GiB at saturation.
+    /// worker fan-out. Total host VM budget is
+    /// <c>WorkerPool:MaxConcurrentSandboxes × BaselineCpus</c> vCPUs and
+    /// <c>... × BaselineMemoryGB</c> GiB at sandbox saturation.
     /// </summary>
     public int BaselineCpus { get; init; } = 6;
 

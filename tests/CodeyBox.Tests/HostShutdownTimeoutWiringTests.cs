@@ -31,12 +31,17 @@ public sealed class HostShutdownTimeoutWiringTests
         SandboxTeardownMode teardownMode,
         int? concurrency = null,
         int? maxWorkers = null,
+        int? maxSandboxes = null,
         int graceSeconds = 60)
     {
         var o = new CodeyBoxOptions
         {
             Concurrency = concurrency,
-            WorkerPool = new WorkerPoolOptions { MaxConcurrentWorkers = maxWorkers },
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = maxWorkers,
+                MaxConcurrentSandboxes = maxSandboxes,
+            },
         };
         o.Shutdown.GraceSeconds = graceSeconds;
         o.Shutdown.SandboxTeardownMode = teardownMode;
@@ -69,7 +74,7 @@ public sealed class HostShutdownTimeoutWiringTests
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(180) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
@@ -82,14 +87,15 @@ public sealed class HostShutdownTimeoutWiringTests
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(120) + TimeSpan.FromSeconds(45), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(180) + TimeSpan.FromSeconds(45), timeout);
     }
 
     [Fact]
     public void SuspendingProvider_SingleWorker_StacksOneWaveOnTopOfTheGrace()
     {
-        // One in-flight VM → one suspend wave of the default 12 GiB profile
-        // budget (30 min), STACKED on top of the 60s post-suspend drain grace.
+        // One worker defaults to two sandbox slots. Both fit inside one
+        // parallel-suspend wave of the default 12 GiB profile budget (30 min),
+        // STACKED on top of the 60s post-suspend drain grace.
         var timeout = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Suspend, maxWorkers: 1),
             providerSupportsSuspend: true,
@@ -99,9 +105,10 @@ public sealed class HostShutdownTimeoutWiringTests
     }
 
     [Fact]
-    public void SuspendingProvider_ScalesByWaveCount_FromWorkerPool()
+    public void SuspendingProvider_ScalesByWaveCount_FromSandboxBudget()
     {
-        // 16 workers > the parallel-suspend cap (8) → two sequential waves → 60 min,
+        // 16 workers default to 24 sandbox slots. With an 8-suspend batch cap,
+        // that is three sequential waves → 90 min,
         // plus the 60s drain grace. This is the exact undersizing the wave-scaling
         // fix targets: a single-wave ceiling would SIGKILL the host before wave 2
         // finished its snapshot.
@@ -110,29 +117,41 @@ public sealed class HostShutdownTimeoutWiringTests
             providerSupportsSuspend: true,
             NullLogger.Instance);
 
-        Assert.Equal(TimeSpan.FromMinutes(60) + TimeSpan.FromSeconds(60), timeout);
+        Assert.Equal(TimeSpan.FromMinutes(90) + TimeSpan.FromSeconds(60), timeout);
     }
 
     [Fact]
-    public void WorkerCount_FollowsOrchestratorOptionsFactoryPrecedence()
+    public void SandboxCount_FollowsOrchestratorOptionsFactoryPrecedence()
     {
-        // The ceiling must size off the SAME worker count the orchestrator pool
-        // runs at. Legacy CodeyBox:Concurrency is the fallback when WorkerPool is
-        // unset (16 → 2 waves → 60 min + 60s grace)...
+        // The ceiling must size off the SAME sandbox count the admission gate
+        // uses. Legacy CodeyBox:Concurrency still feeds the derived default when
+        // WorkerPool is unset (16 workers → 24 sandboxes → 3 waves → 90 min + 60s grace)...
         var legacyOnly = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Suspend, concurrency: 16, maxWorkers: null),
             providerSupportsSuspend: true,
             NullLogger.Instance);
-        Assert.Equal(TimeSpan.FromMinutes(60) + TimeSpan.FromSeconds(60), legacyOnly);
+        Assert.Equal(TimeSpan.FromMinutes(90) + TimeSpan.FromSeconds(60), legacyOnly);
 
         // ...and WorkerPool:MaxConcurrentWorkers wins when both are set, so a stale
         // legacy value cannot inflate (or here, would not shrink) the ceiling. 1
-        // worker → a single 30-min wave (+60s grace) even though Concurrency says 16.
+        // worker → 2 sandbox slots → a single 30-min wave (+60s grace) even though
+        // Concurrency says 16.
         var workerPoolWins = Program.ComputeHostShutdownTimeout(
             Opts(SandboxTeardownMode.Suspend, concurrency: 16, maxWorkers: 1),
             providerSupportsSuspend: true,
             NullLogger.Instance);
         Assert.Equal(TimeSpan.FromMinutes(30) + TimeSpan.FromSeconds(60), workerPoolWins);
+    }
+
+    [Fact]
+    public void ExplicitMaxConcurrentSandboxes_ControlsSuspendReserve()
+    {
+        var timeout = Program.ComputeHostShutdownTimeout(
+            Opts(SandboxTeardownMode.Suspend, maxWorkers: 16, maxSandboxes: 16),
+            providerSupportsSuspend: true,
+            NullLogger.Instance);
+
+        Assert.Equal(TimeSpan.FromMinutes(60) + TimeSpan.FromSeconds(60), timeout);
     }
 
     [Fact]

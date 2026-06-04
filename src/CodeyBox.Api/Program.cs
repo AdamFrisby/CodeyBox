@@ -365,7 +365,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
     }
 
-    return kind switch
+    var inner = kind switch
     {
         "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
         "bubblewrap" => new BubblewrapSandboxProvider(
@@ -376,6 +376,15 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, bubblewrap, process"),
     };
+    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
+    startupLog.LogInformation(
+        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
+    return SandboxAdmissionControlledProvider.Wrap(
+        inner,
+        orchestratorOptions.MaxConcurrentSandboxes,
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
 }
 
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
@@ -4169,12 +4178,13 @@ public partial class Program
     /// StoppingAsync completes, so raising it only affects the suspend case.
     ///
     /// <para>The concurrent-sandbox bound is resolved through
-    /// <see cref="OrchestratorOptionsFactory"/> — the same validation/precedence
-    /// path the orchestrator pool uses (WorkerPool wins, legacy Concurrency is the
-    /// fallback, default 1) — so this ceiling cannot drift below the actual pool
-    /// size. All VMs are provisioned at <see cref="SandboxResourceLimits.Default"/>
-    /// (no per-VM RAM override is wired through SandboxSpec today), so the default
-    /// profile RAM is the largest per-VM suspend budget the host must cover.</para>
+    /// <see cref="OrchestratorOptionsFactory"/> — the same validation/defaulting
+    /// path the admission-control decorator uses for
+    /// <c>WorkerPool:MaxConcurrentSandboxes</c> — so the shutdown reserve matches
+    /// the actual live-VM ceiling. All VMs are provisioned at
+    /// <see cref="SandboxResourceLimits.Default"/> (no per-VM RAM override is
+    /// wired through SandboxSpec today), so the default profile RAM is the
+    /// largest per-VM suspend budget the host must cover.</para>
     /// </summary>
     internal static TimeSpan ComputeHostShutdownTimeout(
         CodeyBoxOptions cbOpts, bool providerSupportsSuspend, ILogger log)
@@ -4182,7 +4192,7 @@ public partial class Program
         var grace = TimeSpan.FromSeconds(Math.Max(1, cbOpts.Shutdown.GraceSeconds));
         var maxConcurrent = OrchestratorOptionsFactory
             .Build(cbOpts.Concurrency, cbOpts.WorkerPool, log)
-            .MaxConcurrentWorkers;
+            .MaxConcurrentSandboxes;
         return SuspendTimeoutPolicy.ResolveHostShutdownTimeout(
             providerSupportsSuspend, grace, maxConcurrent);
     }

@@ -23,6 +23,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private readonly IWorkerPoolOccupancy? _workerPool;
     private readonly IAgentQuotaAvailabilitySnapshot? _quotaSnapshot;
     private readonly int _maxWorkers;
+    private readonly int _maxSandboxes;
     private readonly ILogger<CodeyBoxObservableMetrics> _log;
     private readonly TimeSpan _refreshInterval;
 
@@ -32,6 +33,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private readonly ObservableGauge<long> _workersInUse;
     private readonly ObservableGauge<long> _workersMax;
     private readonly ObservableGauge<long> _sandboxActive;
+    private readonly ObservableGauge<long> _sandboxMax;
     private readonly ObservableGauge<double>? _quotaAvailable;
 
     // Refreshed off-thread; read by the work-item gauge callback.
@@ -52,6 +54,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         _workerPool = workerPool;
         _quotaSnapshot = quotaSnapshot;
         _maxWorkers = orchestratorOptions.MaxConcurrentWorkers;
+        _maxSandboxes = orchestratorOptions.MaxConcurrentSandboxes;
         _log = log;
         _refreshInterval = refreshInterval ?? TimeSpan.FromSeconds(15);
 
@@ -78,6 +81,12 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
             ObserveActiveSandboxes,
             unit: "{sandbox}",
             description: "Sandboxes/VMs the current process is actively tracking.");
+
+        _sandboxMax = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
+            "codeybox.sandbox.max",
+            () => [new Measurement<long>(_maxSandboxes)],
+            unit: "{sandbox}",
+            description: "Configured MaxConcurrentSandboxes admission ceiling.");
 
         if (_quotaSnapshot is not null)
         {
@@ -171,6 +180,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         GC.KeepAlive(_workersInUse);
         GC.KeepAlive(_workersMax);
         GC.KeepAlive(_sandboxActive);
+        GC.KeepAlive(_sandboxMax);
         GC.KeepAlive(_quotaAvailable);
         _refreshTimer?.Dispose();
     }

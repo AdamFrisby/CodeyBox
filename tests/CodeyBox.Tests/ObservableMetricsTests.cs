@@ -149,16 +149,17 @@ public sealed class ObservableMetricsTests : IDisposable
         using var svc = new CodeyBoxObservableMetrics(
             store,
             new FakeActiveProvider(2),
-            new OrchestratorOptions { MaxConcurrentWorkers = 4 },
+            new OrchestratorOptions { MaxConcurrentWorkers = 4, MaxConcurrentSandboxes = 6 },
             NullLogger<CodeyBoxObservableMetrics>.Instance,
             workerPool: new FakeWorkerPool(0),
             quotaSnapshot: null,
             refreshInterval: TimeSpan.FromMinutes(10));
         await svc.StartAsync(CancellationToken.None);
 
-        var observed = CollectLong(svc, "provider", "codeybox.sandbox.active");
+        var observed = CollectLong(svc, "provider", "codeybox.sandbox.active", "codeybox.sandbox.max");
 
         Assert.Contains(observed, m => m.Instrument == "codeybox.sandbox.active" && m.Value == 2 && m.Tag == "fake-vm");
+        Assert.Contains(observed, m => m.Instrument == "codeybox.sandbox.max" && m.Value == 6);
 
         await svc.StopAsync(CancellationToken.None);
     }

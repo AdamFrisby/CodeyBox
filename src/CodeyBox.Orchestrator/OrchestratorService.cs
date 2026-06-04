@@ -2242,6 +2242,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 public sealed record OrchestratorOptions
 {
     public int MaxConcurrentWorkers { get; init; } = 1;
+    public int MaxConcurrentSandboxes { get; init; } = 2;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
     public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(60);
 
