@@ -2458,6 +2458,7 @@ app.MapGet("/concurrency", async (
             agent = name,
             avgBurnPctPerItem = est.AvgBurnPctPerItem,
             sampleCount = est.SampleCount,
+            status = est.Status.ToString(),
         });
     }
 
@@ -2490,7 +2491,8 @@ app.MapGet("/concurrency", async (
             availablePct = f.AvailablePct,
             avgBurnPctPerItem = f.AvgBurnPctPerItem,
             sampleCount = f.SampleCount,
-            fitInWindow = double.IsNaN(f.FitInWindow) ? (double?)null : f.FitInWindow,
+            status = f.BurnEstimateStatus.ToString(),
+            fitInWindow = double.IsFinite(f.FitInWindow) ? f.FitInWindow : (double?)null,
             runningOnAgent = f.RunningOnAgent,
         }),
         agentAvailability = availabilityView.Select(s => new

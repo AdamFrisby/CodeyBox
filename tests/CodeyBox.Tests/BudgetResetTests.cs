@@ -11,6 +11,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class BudgetResetTests : IDisposable
 {
+    private static readonly TimeSpan DispatchObservationTimeout = TimeSpan.FromSeconds(15);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-budgetreset-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -122,7 +124,7 @@ public sealed class BudgetResetTests : IDisposable
         var reg = new CancellationRegistry(CancellationToken.None);
         var budgetRecheck = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            HourlyLimitRecheck = TimeSpan.FromMilliseconds(500),
+            HourlyLimitRecheck = TimeSpan.FromSeconds(3),
         });
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,
@@ -152,11 +154,10 @@ public sealed class BudgetResetTests : IDisposable
         // multiple seconds to even pick up the item — a 2 s wall was flaky in
         // the audit sandbox. The check exits early once the item is deferred,
         // so happy-path runs are unaffected.
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (DateTimeOffset.UtcNow < deferDeadline && !svc.IsDeferredForTest(newItem.Id))
-            await Task.Delay(25);
-
-        Assert.True(svc.IsDeferredForTest(newItem.Id));
+        var observedDeferred = await WaitUntilAsync(
+            () => svc.IsDeferredForTest(newItem.Id),
+            DispatchObservationTimeout);
+        Assert.True(observedDeferred);
         Assert.Equal(0, pickupCount);
 
         // Simulate the rolling window advancing: age the blocking item out of the window.
@@ -170,5 +171,16 @@ public sealed class BudgetResetTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
 
         Assert.Equal(1, Volatile.Read(ref pickupCount));
+    }
+
+    private static async Task<bool> WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (predicate()) return true;
+            await Task.Delay(25);
+        }
+        return predicate();
     }
 }

@@ -974,11 +974,12 @@ public static class AuditLog
         double fitInWindow,
         double avgBurnPct,
         double availablePct,
-        int sampleCount) =>
+        int sampleCount,
+        AgentBurnEstimateStatus status) =>
         Audit("concurrency.gated_rate_aware")
             .Information(
-                "Rate-aware gate: {Agent}/{Model} running={Running} >= fit={FitInWindow:F2} (avgBurn={AvgBurnPct:F1}% available={AvailablePct:F1}% samples={Samples})",
-                agent.Value, modelId ?? "(default)", running, fitInWindow, avgBurnPct, availablePct, sampleCount);
+                "Rate-aware gate: {Agent}/{Model} running={Running} >= fit={FitInWindow:F2} (avgBurn={AvgBurnPct:F1}% available={AvailablePct:F1}% samples={Samples} status={Status})",
+                agent.Value, modelId ?? "(default)", running, fitInWindow, avgBurnPct, availablePct, sampleCount, status);
 
     // ── Plugin loading ───────────────────────────────────────────────────────
 

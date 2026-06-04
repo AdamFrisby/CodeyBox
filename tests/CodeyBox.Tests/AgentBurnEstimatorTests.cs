@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -36,6 +37,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(AgentBurnEstimateStatus.NoHistory, result.Status);
     }
 
     [Fact]
@@ -48,6 +50,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.True(result.AvgBurnPctPerItem < 0);
+        Assert.Equal(AgentBurnEstimateStatus.NoHistory, result.Status);
     }
 
     [Fact]
@@ -65,24 +68,35 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(5, result.SampleCount);
         Assert.Equal(94.17, Math.Round(result.AvgBurnPctPerItem, 2));
+        Assert.Equal(AgentBurnEstimateStatus.Measured, result.Status);
     }
 
     [Fact]
-    public async Task HistoricalSamples_ButNoBudget_FallsBackToDefaultAndResetsSampleCount()
+    public async Task HistoricalSamples_ButNoBudget_ReportsSamplesAndUnknownBurn()
     {
         // When the store returns samples but the operator has not configured a
-        // WindowTokenBudget for that agent, the avg pct comes from the default
-        // table — but the spec contract is that SampleCount==N means "we used N
-        // empirical samples for the avg pct". So SampleCount must be reset to 0
-        // when falling back to the configured default.
+        // WindowTokenBudget for that agent, the estimator must not present the
+        // hardcoded default as a measured burn. It preserves the real sample
+        // count and marks the burn as unknown so the router can fail open.
         var costs = new FakeCostStore { TokensByAgent = { ["codex"] = (50_000_000L, 7) } };
-        var opts = new AgentBurnEstimatorOptions(); // no WindowTokenBudget for codex
-        var est = BuildEstimator(costs, opts);
+        var opts = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["claude"] = 1L }, // no WindowTokenBudget for codex
+        };
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var est = new AgentBurnEstimator(costs, opts, logger);
 
         var result = await est.GetEstimateAsync(Codex);
 
-        Assert.Equal(0, result.SampleCount);
-        Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(7, result.SampleCount);
+        Assert.True(result.AvgBurnPctPerItem < 0);
+        Assert.Equal(AgentBurnEstimateStatus.NoWindowBudget, result.Status);
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("token samples but no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("codex", warning.Properties["Agent"]);
+        Assert.Equal(7, warning.Properties["Samples"]);
     }
 
     [Fact]
@@ -100,13 +114,14 @@ public sealed class AgentBurnEstimatorTests
         var result = await est.GetEstimateAsync(Codex);
 
         Assert.Equal(100.0, result.AvgBurnPctPerItem);
+        Assert.Equal(AgentBurnEstimateStatus.Measured, result.Status);
     }
 
     [Fact]
-    public async Task ZeroBudget_FallsBackToDefaultWithoutDivideByZero()
+    public async Task ZeroBudget_ReportsNoWindowBudgetWithoutDivideByZero()
     {
-        // A configured budget of 0 would divide by zero — the estimator must
-        // detect this and fall through to the configured default.
+        // A configured budget of 0 would divide by zero; treat it as unusable
+        // and fail open instead of throttling on a guessed default.
         var costs = new FakeCostStore { TokensByAgent = { ["codex"] = (100L, 2) } };
         var opts = new AgentBurnEstimatorOptions
         {
@@ -116,8 +131,59 @@ public sealed class AgentBurnEstimatorTests
 
         var result = await est.GetEstimateAsync(Codex);
 
-        Assert.Equal(0, result.SampleCount);
-        Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(2, result.SampleCount);
+        Assert.True(result.AvgBurnPctPerItem < 0);
+        Assert.Equal(AgentBurnEstimateStatus.NoWindowBudget, result.Status);
+    }
+
+    [Fact]
+    public void Constructor_NoPositiveWindowBudgets_EmitsStartupWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+
+        _ = new AgentBurnEstimator(
+            new FakeCostStore(),
+            new AgentBurnEstimatorOptions(),
+            logger);
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("startup", warning.Properties["Reason"]);
+    }
+
+    [Fact]
+    public void Constructor_PositiveWindowBudget_SuppressesStartupWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var opts = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["codex"] = 1L },
+        };
+
+        _ = new AgentBurnEstimator(new FakeCostStore(), opts, logger);
+
+        Assert.DoesNotContain(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ApplyConfigReload_NoPositiveWindowBudgets_EmitsReloadWarning()
+    {
+        var logger = new CapturingLogger<AgentBurnEstimator>();
+        var initial = new AgentBurnEstimatorOptions
+        {
+            WindowTokenBudget = { ["codex"] = 1L },
+        };
+        var est = new AgentBurnEstimator(new FakeCostStore(), initial, logger);
+
+        est.ApplyConfigReload(new AgentBurnEstimatorOptions());
+
+        var warning = Assert.Single(logger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("no positive WindowTokenBudget", StringComparison.Ordinal));
+        Assert.Equal("config reload", warning.Properties["Reason"]);
     }
 
     [Fact]
@@ -132,6 +198,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]
@@ -149,13 +216,14 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]
     public async Task LegacyStore_NotIRecentCostsByAgentQueryable_FallsBackToDefault()
     {
         // An older IWorkItemCostStore without the capability interface must
-        // not blow up; estimator treats it as "no samples available".
+        // not blow up; estimator treats the empirical sample source as unavailable.
         var legacy = new LegacyCostStore();
         var est = new AgentBurnEstimator(
             () => legacy,
@@ -166,6 +234,7 @@ public sealed class AgentBurnEstimatorTests
 
         Assert.Equal(0, result.SampleCount);
         Assert.Equal(90.0, result.AvgBurnPctPerItem);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, result.Status);
     }
 
     [Fact]
