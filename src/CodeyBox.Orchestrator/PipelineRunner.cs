@@ -254,11 +254,8 @@ public sealed class PipelineRunner : IPipelineRunner
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;
-        // Explicit DI registration is required (see Program.cs). The runtime
-        // `as` cast that used to silently sniff IAuditProgressStore off the
-        // IWorkItemStore parameter has been removed: null here means audit
-        // progress is intentionally disabled (test fixtures that don't
-        // exercise audit-progress paths), not a misconfigured production graph.
+        // Null intentionally disables durable audit-progress history for narrow
+        // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent
@@ -565,10 +562,10 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!skipWork)
             {
                 using var workPhaseScope = BeginPhaseScope(item, "work");
-                await PublishIterationStartedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber, ct);
+                await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
                 var workIterationStart = DateTimeOffset.UtcNow;
                 await _store.RecordIterationDispatchAsync(
-                    item.Id, WorkPhaseIterationNumber, item.PromptRevision, workIterationStart, ct);
+                    item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
@@ -602,7 +599,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
-                await PublishIterationCompletedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber,
+                await PublishIterationCompletedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase,
                     repoId, workBranch, workIterationStart, ct);
                 if (resumingPreempt)
                 {
@@ -2091,7 +2088,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // The orchestrator records this row before transitioning the item to
         // Working/Reworking; a concurrent PUT /workitems/{id}/prompt cannot
         // change what we read here.
-        var dispatchIteration = isInitial ? WorkPhaseIterationNumber : (iteration ?? WorkPhaseIterationNumber);
+        var dispatchIteration = isInitial ? AuditProgressIterationNumbers.WorkPhase : (iteration ?? AuditProgressIterationNumbers.WorkPhase);
         var promptRevisionAtDispatch = await ResolveIterationRevisionAsync(item, dispatchIteration, ct);
 
         var extraEnv = new Dictionary<string, string>
@@ -3576,7 +3573,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (iterations.Any(i => i.Iteration == startIteration))
             return false;
 
-        var findings = (last.Findings.Count > 0 ? last.Findings : last.BlockingFindingsDetails)
+        var findings = last.Findings
             .Select(ToAuditFinding)
             .ToList();
         _log.LogInformation(
@@ -3806,7 +3803,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var iterations = await _store.GetIterationsAsync(workItemId, ct);
         return iterations
-            .Where(i => i.Iteration == WorkPhaseIterationNumber)
+            .Where(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
             .OrderByDescending(i => i.DispatchedAt)
             .Select(i => (DateTimeOffset?)i.DispatchedAt)
             .FirstOrDefault();
@@ -3822,6 +3819,10 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (priorAuditHistory.Count > 0)
         {
+            // Retrying an item parked at the audit ceiling is an explicit
+            // operator re-drive, so continue from the prior trajectory even
+            // when static per-item budget overrides are capped at project
+            // defaults.
             var priorMaxIteration = priorAuditHistory.Max(h => h.Iteration);
             maxIterations = Math.Max(maxIterations, priorMaxIteration + projectBudget);
         }
@@ -8704,11 +8705,6 @@ Original merge-phase failure (for context):
     // and logs at Debug. Cancellation is the exception — when the caller's
     // token fires we rethrow so the pipeline can unwind for shutdown rather
     // than absorbing the signal.
-
-    // Work-phase events nominally have no iteration number ("work runs once").
-    // We align them with iteration=1 so audit-iter-1's input is the same number
-    // as the work that produced it — keeps tracker pairing simple.
-    private const int WorkPhaseIterationNumber = 1;
 
     /// <summary>Explicit map from <see cref="AuditSeverity"/> to the wire string
     /// documented in webhooks.md. Keeps the contract stable independently of

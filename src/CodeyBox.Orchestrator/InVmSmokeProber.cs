@@ -647,12 +647,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// wrapper alone cannot bound a synchronously-blocking provider. The orphaned create task is handed to
     /// <see cref="ObserveOrphanedSandboxCreateAsync"/>, which disposes any
     /// sandbox the provider eventually yields so a late-arriving VM does not
-    /// leak. The linked / provisioning CTS pair is disposed before we walk away
-    /// from a non-cooperative create — the token's cancelled state is preserved
-    /// after dispose (so a cooperative provider still observes the cancel) and
-    /// disposing unregisters the linked source from the parent worker token, so
-    /// repeated timed-out probes cannot accumulate registrations against
-    /// <paramref name="ct"/> for the process lifetime.</para>
+    /// leak. The linked/provisioning CTS pair and local delay CTSes are
+    /// disposed before we walk away from a non-cooperative create. The token's
+    /// cancelled state is preserved after dispose (so a cooperative provider
+    /// still observes the cancel), while disposing unregisters linked sources
+    /// from the parent worker token so repeated probes cannot accumulate
+    /// registrations against <paramref name="ct"/> for the process lifetime.</para>
     /// </summary>
     private async Task<ISandbox> CreateSandboxWithProvisionTimeoutAsync(
         SandboxSpec spec, CancellationToken ct)
@@ -681,8 +681,10 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             throw;
         }
 
-        var timeoutTask = Task.Delay(provisionTimeout);
-        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        using var timeoutCts = new CancellationTokenSource();
+        using var callerCancellationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var timeoutTask = Task.Delay(provisionTimeout, timeoutCts.Token);
+        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, callerCancellationCts.Token);
         var winner = await Task.WhenAny(createTask, timeoutTask, cancellationTask);
         if (winner == createTask)
         {
@@ -697,6 +699,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             }
             finally
             {
+                timeoutCts.Cancel();
+                callerCancellationCts.Cancel();
                 linked.Dispose();
                 provisionCts.Dispose();
             }
@@ -714,6 +718,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         // propagating either cancellation or the timeout exception, so a
         // caller-cancelled provisioning never falls through unobserved.
         provisionCts.Cancel();
+        timeoutCts.Cancel();
+        callerCancellationCts.Cancel();
         _ = ObserveOrphanedSandboxCreateAsync(createTask);
         linked.Dispose();
         provisionCts.Dispose();

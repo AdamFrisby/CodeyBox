@@ -35,11 +35,8 @@ public sealed class WorkItemRetrier
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
-        // Explicit DI registration is required (see Program.cs). The runtime
-        // `as` cast that used to silently sniff IAuditProgressStore off the
-        // IWorkItemStore parameter has been removed: null here means audit
-        // progress is intentionally disabled (test fixtures that don't
-        // exercise audit-progress paths), not a misconfigured production graph.
+        // Null intentionally disables durable audit-progress history for narrow
+        // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
         _projects = projects;
         _releases = releases;
@@ -426,7 +423,7 @@ public sealed class WorkItemRetrier
     {
         var iterations = await _store.GetIterationsAsync(workItemId, ct);
         return iterations
-            .Where(i => i.Iteration == 1)
+            .Where(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
             .OrderByDescending(i => i.DispatchedAt)
             .Select(i => (DateTimeOffset?)i.DispatchedAt)
             .FirstOrDefault();

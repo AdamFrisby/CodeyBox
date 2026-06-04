@@ -1004,6 +1004,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (remaining <= TimeSpan.Zero)
                 return;
 
+            // Poll often enough for pause/shutdown to preempt spawn pacing,
+            // while keeping the loop idle between checks.
             var delay = remaining < SpawnPacingPausePollInterval
                 ? remaining
                 : SpawnPacingPausePollInterval;
