@@ -392,23 +392,25 @@ public sealed class MultipassAdoptionTests
             .AddExitMissing()
             .AddTailRead(offset: 13, bytes: "second chunk\n")
             .AddExitMissing()
-            .AddTailRead(offset: 27, bytes: "")
+            .AddTailRead(offset: 26, bytes: "")
             .AddExitPresent(0)
             // Final flush after the marker is observed.
-            .AddTailRead(offset: 27, bytes: "post-exit trailing\n");
+            .AddTailRead(offset: 26, bytes: "post-exit trailing\n");
 
         var runner = script.Build();
         var provider = NewProviderWithRunner(runner);
         var emitted = new List<string>();
 
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var exit = await provider.WaitForAdoptedAgentCompletionAsync(
             "codeybox-test", ValidLogPath,
             chunk => emitted.Add(chunk),
-            deadline: TimeSpan.FromSeconds(5),
-            ct: CancellationToken.None);
+            deadline: null,
+            ct: cts.Token);
 
         Assert.Equal(0, exit);
         Assert.Equal(["first chunk\n", "second chunk\n", "post-exit trailing\n"], emitted);
+        AssertTailOffsets(runner, 1, 13, 26, 26);
     }
 
     [Fact]
@@ -565,6 +567,28 @@ public sealed class MultipassAdoptionTests
         && argv[5] == "-c"
         && argv[6].StartsWith("test -f", StringComparison.Ordinal);
 
+    private static void AssertTailOffsets(RecordingMultipassRunner runner, params long[] expectedOffsets)
+    {
+        var actual = runner.Calls
+            .Select(call => call.Argv)
+            .Where(IsTailCall)
+            .Select(argv => ExtractTailOffset(argv[6]))
+            .ToArray();
+
+        Assert.Equal(expectedOffsets, actual);
+    }
+
+    private static long ExtractTailOffset(string script)
+    {
+        const string prefix = "tail -c +";
+        var start = script.IndexOf(prefix, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"tail script did not contain '{prefix}': {script}");
+        start += prefix.Length;
+        var end = script.IndexOf(' ', start);
+        Assert.True(end > start, $"tail script did not contain an offset terminator: {script}");
+        return long.Parse(script[start..end], System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     private static MultipassSandboxProvider NewProviderWithRunner(IProcessRunner runner)
     {
         var staging = Directory.CreateTempSubdirectory("codeybox-adopt-").FullName;
@@ -624,7 +648,7 @@ public sealed class MultipassAdoptionTests
             return this;
         }
 
-        public IProcessRunner Build()
+        public RecordingMultipassRunner Build()
         {
             return new RecordingMultipassRunner((argv, _, _) =>
             {

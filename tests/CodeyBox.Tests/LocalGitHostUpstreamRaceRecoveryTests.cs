@@ -313,6 +313,26 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task RunGitAsync_RetriesTextFileBusyProcessStartByMessageWhenErrnoDiffers()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return starts == 1
+                ? new FakeLocalGitProcess(startException: new Win32Exception(11, "Text file busy"))
+                : new FakeLocalGitProcess(exitCode: 0);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.True(exists);
+        Assert.Equal(2, starts);
+    }
+
+    [Fact]
     public async Task RunGitAsync_TextFileBusyProcessStartAfterRetryCap_Propagates()
     {
         var starts = 0;

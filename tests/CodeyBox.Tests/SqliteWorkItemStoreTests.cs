@@ -54,6 +54,23 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateAsync_RoundTripsPreserveWorkBranchOnQueuedPickup()
+    {
+        var item = Sample() with
+        {
+            WorkBranch = "feature/operator-resume",
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.NotNull(read);
+        Assert.True(read!.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(item.WorkBranch, read.WorkBranch);
+    }
+
+    [Fact]
     public async Task UpdateAsync_PersistsTransitions()
     {
         var item = Sample();
