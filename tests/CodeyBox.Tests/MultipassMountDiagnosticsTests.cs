@@ -254,7 +254,7 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         var mountCalls = calls.Where(c => c.Count >= 2 && c[1] == "mount").ToList();
         var unmount = Assert.Single(calls, c => c.Count >= 2 && c[1] == "umount");
         Assert.Equal(2, mountCalls.Count);
-        Assert.Equal([ "multipass", "umount", "codeybox-test:/repo" ], unmount);
+        Assert.Equal(["multipass", "umount", "codeybox-test:/repo"], unmount);
         Assert.Equal(hostSource, mountCalls[1][3]);
         Assert.Equal("codeybox-test:/repo", mountCalls[1][4]);
     }
@@ -297,7 +297,7 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
         var mountCalls = calls.Where(c => c.Count >= 2 && c[1] == "mount").ToList();
         var unmount = Assert.Single(calls, c => c.Count >= 2 && c[1] == "umount");
         Assert.Equal(2, mountCalls.Count);
-        Assert.Equal([ "multipass", "umount", "codeybox-test:/repo" ], unmount);
+        Assert.Equal(["multipass", "umount", "codeybox-test:/repo"], unmount);
         Assert.Equal(hostSource, mountCalls[1][3]);
         Assert.Equal("codeybox-test:/repo", mountCalls[1][4]);
     }
