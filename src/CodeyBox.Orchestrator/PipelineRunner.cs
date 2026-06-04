@@ -5568,22 +5568,6 @@ public sealed class PipelineRunner : IPipelineRunner
             return (false, "budget provider error (fail-closed)");
         var budgetPct = budget?.AvailablePct ?? -1;
 
-        // A configured budget that carries its own reset and is below the
-        // effective floor gates regardless of the probe — MIN(probe, budget)
-        // would be below threshold anyway. If the budget has no reset, defer the
-        // decision until the probe contributes the quota-window reset; near the
-        // end of a ramped window the effective floor may be below the global
-        // fallback.
-        if (budgetPct >= 0 && budget is { ResetAt: { } budgetResetAt })
-        {
-            var earlyBudgetGate = _auditQuotaGatePolicy.Evaluate(
-                member,
-                new EffectiveQuota(budgetPct, budgetResetAt, null, budget.Windows),
-                DateTimeOffset.UtcNow);
-            if (!earlyBudgetGate.Allow)
-                return (false, FormatLocalBudgetRejected(budgetPct, earlyBudgetGate));
-        }
-
         if (_quotaProbesByKind is null || !_quotaProbesByKind.TryGetValue(kind, out var probe))
         {
             // No real probe. A healthy configured budget supplies a concrete
@@ -5647,11 +5631,6 @@ public sealed class PipelineRunner : IPipelineRunner
             return (false, $"quota exhausted ({combinedPct:F1}% < {floor:F1}%)");
 
         return (false, gate.Reason);
-    }
-
-    private static string FormatLocalBudgetRejected(double budgetPct, QuotaGateDecision gate)
-    {
-        return $"local budget exhausted ({FormatBudgetGateComparison(budgetPct, gate)})";
     }
 
     private static string FormatBudgetGateComparison(double budgetPct, QuotaGateDecision gate)

@@ -194,6 +194,34 @@ public sealed class QuotaRouterRampedFloorTests
     }
 
     [Fact]
+    public void WouldAllowWrapper_UsesPerAgentOverrideAndResetAt()
+    {
+        var opts = DefaultOpts();
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var reset = Now + TimeSpan.FromDays(7);
+
+        Assert.True(QuotaRouter.WouldAllow(
+            Codex,
+            availablePct: 1.0,
+            recentFailure: false,
+            opts,
+            resetAt: reset,
+            nowUtc: Now));
+        Assert.False(QuotaRouter.WouldAllow(
+            Claude,
+            availablePct: 20.0,
+            recentFailure: false,
+            opts,
+            resetAt: reset,
+            nowUtc: Now));
+    }
+
+    [Fact]
     public void PerAgentFloorOverride_UsesPerAgentRampWindowBeforeOtherWindows()
     {
         var opts = DefaultOpts();

@@ -433,15 +433,17 @@ public sealed class NotificationConditionsTests
         var notification = builder.Build(timestamp);
 
         Assert.Equal("all_quotas_exhausted", notification.ConditionId);
-        Assert.Contains("10%", notification.Title);
-        Assert.Contains("threshold: 10", notification.Title);
+        Assert.Contains("quota gate", notification.Title);
         Assert.Contains("claude", notification.Summary);
         Assert.Contains("codex", notification.Summary);
-        Assert.Contains("10%", notification.Body);
+        Assert.Contains("effective gate policy", notification.Body);
+        Assert.Contains("per-agent", notification.Body);
         Assert.Equal(NotificationSeverity.Critical, notification.Severity);
         Assert.Equal(timestamp, notification.Timestamp);
-        Assert.True(notification.Fields!.ContainsKey("minQuotaPct"));
-        Assert.Equal("10", notification.Fields!["minQuotaPct"]);
+        Assert.True(notification.Fields!.ContainsKey("globalMinQuotaPct"));
+        Assert.Equal("10", notification.Fields!["globalMinQuotaPct"]);
+        Assert.True(notification.Fields!.ContainsKey("gate"));
+        Assert.Equal("effective", notification.Fields!["gate"]);
         Assert.True(notification.Fields!.ContainsKey("agents"));
         Assert.Contains("claude", notification.Fields!["agents"]);
         Assert.Contains("codex", notification.Fields!["agents"]);

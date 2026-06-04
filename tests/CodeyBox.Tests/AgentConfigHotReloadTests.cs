@@ -2134,11 +2134,20 @@ public sealed class AgentConfigHotReloadTests
             StartFloorPct = initial.QuotaRouter.StartFloorPct,
             EndFloorPct = initial.QuotaRouter.EndFloorPct,
         };
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
         var router = new AgentClassRouter(
-            Array.Empty<AgentClass>(),
-            Array.Empty<IAgentQuotaProbe>(),
+            [MakeClass("frontier", Codex)],
+            [new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 5.0, ResetAt = reset })],
             qro,
             NullLogger<AgentClassRouter>.Instance);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        };
         using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
         var burnEstimator = new AgentBurnEstimator(
             new InertCostStore(), initial.AgentBurnEstimator,
@@ -2175,12 +2184,20 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(0.0, codexFloor.EndFloorPct);
         Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
 
+        var allowedAfterReload = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Equal(Codex, allowedAfterReload.Chosen!.Agent);
+        Assert.False(allowedAfterReload.ShouldWait);
+
         monitor.Fire(new CodeyBoxOptions
         {
             QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0 },
         });
 
         Assert.Empty(qro.FloorByAgent);
+
+        var deniedAfterClear = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Null(deniedAfterClear.Chosen);
+        Assert.True(deniedAfterClear.ShouldWait);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

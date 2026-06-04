@@ -2536,7 +2536,7 @@ app.MapGet("/quota", async (
     AgentClassRouter? router,
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
-    QuotaGatePolicy quotaGatePolicy,
+    IAgentQuotaGate quotaGate,
     IAgentBudgetProvider? budgetProvider,
     IAgentPauseController? agentPauses,
     ILoggerFactory loggerFactory,
@@ -2581,14 +2581,13 @@ app.MapGet("/quota", async (
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        var accountQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-        bool WouldAllow(AgentMembership gateMember, EffectiveQuota quota, bool hasRecentFailure) =>
-            quotaGatePolicy.Evaluate(
+        bool WouldAllow(AgentMembership gateMember, bool hasRecentFailure) =>
+            quotaGate.Allows(
                 gateMember,
-                quota,
+                snapshot,
                 now,
-                recentObservedFailure: hasRecentFailure,
-                observedFailureReason: "recent observed quota failure").Allow;
+                hasRecentFailure,
+                "recent observed quota failure");
         snapshots.Add(new
         {
             agent = member.Agent.Value,
@@ -2618,19 +2617,18 @@ app.MapGet("/quota", async (
             pauseExpiresAt = pause?.ExpiresAt,
             dispatchStatus = paused ? "paused" : "quota",
             dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
-            wouldAllow = !paused && WouldAllow(member, accountQuota, recentFailure),
-            defaultModelWouldAllow = !paused && WouldAllow(member, accountQuota, recentDefaultFailure),
+            wouldAllow = !paused && WouldAllow(member, recentFailure),
+            defaultModelWouldAllow = !paused && WouldAllow(member, recentDefaultFailure),
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
                 modelId =>
                 {
                     if (paused) return false;
                     var modelMember = member with { ModelId = modelId };
-                    var modelQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, modelMember);
                     var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
                         f.Agent == probe.Kind &&
                         string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
-                    return WouldAllow(modelMember, modelQuota, modelHasRecentFailure);
+                    return WouldAllow(modelMember, modelHasRecentFailure);
                 },
                 StringComparer.OrdinalIgnoreCase),
         });

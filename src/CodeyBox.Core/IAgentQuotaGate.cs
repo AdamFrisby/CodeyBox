@@ -7,5 +7,10 @@ namespace CodeyBox.Core;
 /// </summary>
 public interface IAgentQuotaGate
 {
-    bool Allows(AgentMembership member, AgentQuotaSnapshot snapshot, DateTimeOffset nowUtc);
+    bool Allows(
+        AgentMembership member,
+        AgentQuotaSnapshot snapshot,
+        DateTimeOffset nowUtc,
+        bool recentObservedFailure = false,
+        string? observedFailureReason = null);
 }

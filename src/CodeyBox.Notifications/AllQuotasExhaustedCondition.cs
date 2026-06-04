@@ -93,11 +93,12 @@ public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder
         return new Notification
         {
             ConditionId = "all_quotas_exhausted",
-            Title = $"All agent quotas exhausted (threshold: {_minQuotaPct:F0}%)",
+            Title = "All agent quotas denied by quota gate",
             Summary = $"Every configured subscription agent ({string.Join(", ", agentNames)}) " +
-                      $"is below the {_minQuotaPct:F0}% minimum threshold.",
-            Body = $"As of {evaluatedAt:R}, all subscription agent quotas are below " +
-                   $"the configured minimum ({_minQuotaPct:F0}%). " +
+                      "is currently denied by the effective quota gate.",
+            Body = $"As of {evaluatedAt:R}, all subscription agent quotas are denied " +
+                   "by the effective gate policy, including any ramped, per-window, " +
+                   "or per-agent floors. " +
                    $"Agents monitored: {string.Join(", ", agentNames)}. " +
                    "The orchestrator will not dispatch new work items until at least one " +
                    "agent recovers.",
@@ -105,7 +106,8 @@ public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder
             Timestamp = evaluatedAt,
             Fields = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["minQuotaPct"] = _minQuotaPct.ToString("F0"),
+                ["globalMinQuotaPct"] = _minQuotaPct.ToString("F0"),
+                ["gate"] = "effective",
                 ["agents"] = string.Join(",", agentNames),
             },
         };

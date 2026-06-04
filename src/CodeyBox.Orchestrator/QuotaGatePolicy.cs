@@ -243,10 +243,20 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     public QuotaGateAvailability(QuotaGatePolicy policy) =>
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
 
-    public bool Allows(AgentMembership member, AgentQuotaSnapshot snapshot, DateTimeOffset nowUtc)
+    public bool Allows(
+        AgentMembership member,
+        AgentQuotaSnapshot snapshot,
+        DateTimeOffset nowUtc,
+        bool recentObservedFailure = false,
+        string? observedFailureReason = null)
     {
         var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-        return _policy.Evaluate(member, quota, nowUtc).Allow;
+        return _policy.Evaluate(
+            member,
+            quota,
+            nowUtc,
+            recentObservedFailure,
+            observedFailureReason).Allow;
     }
 }
 
