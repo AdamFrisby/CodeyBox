@@ -87,6 +87,24 @@ public sealed class WorkerRegistryTests : IDisposable
     }
 
     [Fact]
+    public async Task Heartbeat_PropagatesNonTransientStorageFailure()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"codeybox-regtest-disposed-{Guid.NewGuid():N}.db");
+        var registry = new SqliteWorkerRegistry(path);
+        registry.Dispose();
+
+        try
+        {
+            await Assert.ThrowsAsync<ObjectDisposedException>(
+                () => registry.HeartbeatAsync(Guid.NewGuid().ToString(), null));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Deregister_RemovesRow()
     {
         var reg = MakeReg();

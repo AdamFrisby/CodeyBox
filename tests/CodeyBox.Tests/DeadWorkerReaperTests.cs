@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -70,6 +71,37 @@ public sealed class DeadWorkerReaperTests : IDisposable
         await _registry.RegisterAsync(reg);
     }
 
+    private static async Task<SqliteConnection> OpenExternalWriterLockAsync(string dbPath)
+    {
+        var conn = new SqliteConnection($"Data Source={dbPath}");
+        await conn.OpenAsync();
+
+        using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+            await pragma.ExecuteNonQueryAsync();
+        }
+
+        using var begin = conn.CreateCommand();
+        begin.CommandText = "BEGIN IMMEDIATE;";
+        await begin.ExecuteNonQueryAsync();
+        return conn;
+    }
+
+    private static async Task ReleaseExternalWriterLockAsync(SqliteConnection conn)
+    {
+        try
+        {
+            using var rollback = conn.CreateCommand();
+            rollback.CommandText = "ROLLBACK;";
+            await rollback.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            await conn.DisposeAsync();
+        }
+    }
+
     [Theory]
     [InlineData(WorkItemState.Reworking, WorkItemState.Queued)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
@@ -124,6 +156,78 @@ public sealed class DeadWorkerReaperTests : IDisposable
         var release = Assert.Single(slotReleaser.Releases);
         Assert.Equal(workerId, release.WorkerId);
         Assert.Null(release.WorkItemId);
+    }
+
+    [Fact]
+    public async Task Reaper_DoesNotClaimWorkerAfterSingleMissedHeartbeatWithinThreshold()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = workerId,
+            HostName = "host",
+            ProcessId = 1,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            LastHeartbeatAt = DateTimeOffset.UtcNow - _opts.HeartbeatInterval - TimeSpan.FromMilliseconds(100),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        var worker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, worker.WorkerId);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task TransientlyFailedHeartbeat_DoesNotCauseWorkerToBeReaped()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        var seededHeartbeatAt = DateTimeOffset.UtcNow - _opts.DeadWorkerThreshold + TimeSpan.FromSeconds(5);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = workerId,
+            HostName = "host",
+            ProcessId = 1,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            LastHeartbeatAt = seededHeartbeatAt,
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var replacementWorkItemId = WorkItemId.New().ToString();
+        using var heartbeatRegistry = new SqliteWorkerRegistry(_dbPath, busyTimeoutMilliseconds: 1);
+        var writerLock = await OpenExternalWriterLockAsync(_dbPath);
+        try
+        {
+            await heartbeatRegistry.HeartbeatAsync(workerId, replacementWorkItemId);
+        }
+        finally
+        {
+            await ReleaseExternalWriterLockAsync(writerLock);
+        }
+
+        var staleWorker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, staleWorker.WorkerId);
+        Assert.Equal(seededHeartbeatAt, staleWorker.LastHeartbeatAt);
+        Assert.Equal(item.Id.ToString(), staleWorker.CurrentWorkItemId);
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        var worker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, worker.WorkerId);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
     }
 
     [Fact]

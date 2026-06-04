@@ -181,6 +181,40 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task DeleteOlderThan_ContinuesPastFirstBatch()
+    {
+        const int oldCount = 501;
+        var wi = "wi-expire-batches";
+        var now = DateTimeOffset.UtcNow;
+        await SeedWorkItemAsync(wi);
+
+        for (var i = 0; i < oldCount; i++)
+        {
+            var started = now.AddDays(-40).AddMilliseconds(i);
+            await _store.CreateAsync(Make(wi, iteration: i + 1) with
+            {
+                StartedAt = started,
+                EndedAt = started.AddSeconds(1),
+            });
+        }
+
+        var freshStarted = now.AddDays(-5);
+        var fresh = Make(wi, iteration: oldCount + 1) with
+        {
+            StartedAt = freshStarted,
+            EndedAt = freshStarted.AddSeconds(1),
+        };
+        await _store.CreateAsync(fresh);
+
+        var deleted = await _store.DeleteOlderThanAsync(now.AddDays(-30));
+
+        Assert.Equal(oldCount, deleted);
+        var remaining = await _store.GetByWorkItemAsync(wi);
+        var survivor = Assert.Single(remaining);
+        Assert.Equal(fresh.Id, survivor.Id);
+    }
+
+    [Fact]
     public async Task DeleteOlderThan_KeepsRowsAtOrAfterCutoff()
     {
         var wi = "wi-keep";
@@ -233,7 +267,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         await using var conn = new SqliteConnection($"Data Source={_dbPath}");
         await conn.OpenAsync();
         await using var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
         await pragma.ExecuteNonQueryAsync();
 
         await using var cmd = conn.CreateCommand();
