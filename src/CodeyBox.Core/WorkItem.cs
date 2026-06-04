@@ -42,7 +42,11 @@ public sealed record WorkItem
     /// <summary>
     /// One-shot pickup policy for operator resume-from-work. When true and the
     /// item is queued, the next work-phase pickup keeps an existing work branch
-    /// instead of resetting it to base. Normal state transitions clear it.
+    /// instead of resetting it to base. <see cref="With(WorkItemState)"/> preserves
+    /// the flag across Queued→Queued transitions (so a cascade re-recovery keeps
+    /// operator intent) and clears it on any transition out of Queued. The
+    /// watchdog Working→Queued recovery also clears it because that path
+    /// regenerates the work branch and the prior preserve-target is lost.
     /// </summary>
     public bool PreserveWorkBranchOnQueuedPickup { get; init; }
 

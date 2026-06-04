@@ -337,6 +337,13 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {fromState}",
                 StartedAt = target == WorkItemState.Queued ? null : item.StartedAt,
                 WorkBranch = target == WorkItemState.Queued ? null : item.WorkBranch,
+                // Clearing WorkBranch on Queued recovery regenerates the default
+                // rebase-owned branch name on re-dispatch; the operator-resume
+                // preservation flag pointed at the prior (now-lost) branch, so
+                // it must not silently apply to the regenerated default branch.
+                PreserveWorkBranchOnQueuedPickup = target == WorkItemState.Queued
+                    ? false
+                    : item.PreserveWorkBranchOnQueuedPickup,
                 PreemptedAt = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptedAt : null,
                 PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptCheckpoint : null,
                 RecoveryAttempts = attempts,
