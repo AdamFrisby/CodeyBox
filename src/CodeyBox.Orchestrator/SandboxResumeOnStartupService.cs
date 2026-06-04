@@ -327,6 +327,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private async Task ResumeOneAsync(ISuspendingSandboxProvider suspending, WorkItem item, CancellationToken ct)
     {
         var vmName = item.SuspendedVmName!;
+        var disposeResumedVm = false;
         try
         {
             var agentLogPath = item.AgentLogPath;
@@ -340,6 +341,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 await DeferProvisioningResumeAsync(item, vmName, provisioningDeferred, ct);
                 return;
             }
+            disposeResumedVm = resumeSucceeded;
 
             if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
             {
@@ -415,8 +417,39 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         finally
         {
-            if (suspending is ISandboxResumeAdmissionTracker admissionTracker)
+            var releaseAdmission = true;
+            var admissionReleasedByDisposal = false;
+            if (disposeResumedVm)
+            {
+                (releaseAdmission, admissionReleasedByDisposal) =
+                    await TryDisposeStartupResumedVmAsync(vmName);
+            }
+
+            if (releaseAdmission
+                && !admissionReleasedByDisposal
+                && suspending is ISandboxResumeAdmissionTracker admissionTracker)
                 admissionTracker.ReleaseResumeAdmission(vmName);
+        }
+    }
+
+    private async Task<(bool ReleaseAdmission, bool AdmissionReleasedByDisposal)> TryDisposeStartupResumedVmAsync(
+        string vmName)
+    {
+        if (_provider is null)
+            return (true, false);
+
+        try
+        {
+            await _provider.DisposeLeakedAsync(vmName, CancellationToken.None);
+            return (true, _provider is ISandboxResumeAdmissionTracker);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Startup resume could not purge resumed sandbox {VmName}; retaining sandbox admission until leak disposal succeeds or inventory no longer lists it",
+                vmName);
+            return (false, false);
         }
     }
 

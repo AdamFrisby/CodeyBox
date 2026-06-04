@@ -552,7 +552,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupResume_WithAdmissionWrapper_RetainsSuccessfulResumeUntilLeakDisposal()
+    public async Task StartupResume_WithAdmissionWrapper_PurgesSuccessfulResumeAndReleasesAdmission()
     {
         var item = MakeItem();
         await _store.CreateAsync(item with { SuspendedVmName = "vm-retained", SuspendedAt = DateTimeOffset.UtcNow });
@@ -564,13 +564,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
-        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
-        var queuedCreate = provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None);
-        await Task.Delay(50);
-        Assert.False(queuedCreate.IsCompleted);
-
-        await provider.DisposeLeakedAsync("vm-retained", CancellationToken.None);
-        await using var sandbox = await queuedCreate.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        Assert.Contains("vm-retained", inner.DisposedNames);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
         Assert.Equal(1, admission.CurrentAdmittedSandboxes);
     }
 
@@ -2320,10 +2317,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // one entry, which historically surfaced as a flaky "vm-1 not in
         // ResumedNames" assertion.
         private readonly ConcurrentQueue<string> _resumedNames = new();
+        private readonly ConcurrentQueue<string> _disposedNames = new();
         private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
         private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
         private readonly ManualResetEventSlim _resumeBlockRelease = new();
         public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
+        public IReadOnlyList<string> DisposedNames => _disposedNames.ToArray();
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
@@ -2356,7 +2355,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             => Task.FromResult<ISandbox>(new NoopSandbox());
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
-        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        {
+            _disposedNames.Enqueue(name);
+            return Task.CompletedTask;
+        }
         public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
 
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()

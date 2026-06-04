@@ -30,6 +30,14 @@ public sealed class WorkerPoolOptionsValidationTests
     }
 
     [Fact]
+    public void DeriveDefaultMaxConcurrentSandboxes_InvalidWorkerCount_Throws()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OrchestratorOptionsFactory.DeriveDefaultMaxConcurrentSandboxes(0));
+        Assert.Equal("maxConcurrentWorkers", ex.ParamName);
+    }
+
+    [Fact]
     public void MinSpawnInterval_Negative_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>

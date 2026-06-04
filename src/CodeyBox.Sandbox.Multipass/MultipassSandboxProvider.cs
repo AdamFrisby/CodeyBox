@@ -1524,10 +1524,22 @@ git push origin HEAD:{refName}";
         }
         catch
         {
-            // If bake half-succeeded, leave a partial baseline that the operator
-            // can `multipass delete --purge` and we'll re-bake. Don't auto-purge
-            // — losing partial install progress on transient errors is wasteful.
-            _log.LogError("Baseline bake for {Name} failed; you may need to `multipass delete --purge {PurgeTarget}` and retry", baselineName, baselineName);
+            // A failed bake may have already launched a VM. Purge it before the
+            // admission decorator releases its baseline-provisioning token; a
+            // half-created running baseline must not escape the global VM cap.
+            if (await TryDeleteVmAsync(opts, baselineName))
+            {
+                _log.LogWarning(
+                    "Baseline bake for {Name} failed; purged partial baseline VM before retry",
+                    baselineName);
+            }
+            else
+            {
+                _log.LogError(
+                    "Baseline bake for {Name} failed and automatic purge did not complete; operator may need to `multipass delete --purge {PurgeTarget}` before retry",
+                    baselineName,
+                    baselineName);
+            }
             throw;
         }
     }
@@ -3013,13 +3025,30 @@ test "$work" = present && test "$exec_wrapper" = present
         && (result.Stderr.Contains(sandboxPath, StringComparison.Ordinal)
             || result.Stderr.Contains("is already mounted", StringComparison.OrdinalIgnoreCase));
 
-    private async Task TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
+    private async Task<bool> TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
     {
         try
         {
-            await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
+            var result = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "delete", "--purge", name],
+                stdin: null,
+                ct: CancellationToken.None);
+            if (result.ExitCode == 0)
+                return true;
+
+            _log.LogWarning(
+                "Best-effort multipass delete --purge {Name} failed (exit {ExitCode}): {Stderr}",
+                name,
+                result.ExitCode,
+                result.Stderr);
+            return false;
         }
-        catch { /* best-effort */ }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Best-effort multipass delete --purge {Name} threw", name);
+            return false;
+        }
     }
 }
 
@@ -3589,7 +3618,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IHostSandboxLifecycleStatus
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -3618,6 +3647,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private bool _hostSandboxDisposed;
 
     /// <summary>
     /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
@@ -3638,6 +3668,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// the VM.
     /// </summary>
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
+
+    public bool HostSandboxDisposed => _hostSandboxDisposed;
 
     /// <summary>
     /// Called by <c>SandboxShutdownTeardownService</c> when non-suspend
@@ -4101,6 +4133,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             return;
         }
         _disposed = true;
+        _hostSandboxDisposed = true;
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name);
         try { Directory.Delete(_sandboxRoot, recursive: true); }

@@ -106,7 +106,7 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
-    public async Task DisposeFailure_ReleasesAdmissionToken()
+    public async Task DisposeFailure_RetainsAdmissionTokenUntilManagedVmDisappears()
     {
         var inner = new CountingSandboxProvider { ThrowOnNextSandboxDispose = true };
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
@@ -114,8 +114,37 @@ public sealed class SandboxAdmissionControlledProviderTests
         var sandbox = await provider.CreateAsync(Spec());
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
 
-        await using var next = await provider.CreateAsync(Spec()).WaitAsync(TestDeadline);
+        var queuedCreate = provider.CreateAsync(Spec(), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queuedCreate.IsCompleted);
 
+        await provider.ListAllManagedAsync(CancellationToken.None);
+        await using var next = await queuedCreate.WaitAsync(TestDeadline);
+
+        Assert.Equal(2, inner.Created);
+    }
+
+    [Fact]
+    public async Task DisposeLeavesHostSandbox_RetainsAdmissionTokenUntilLeakDisposalSucceeds()
+    {
+        var inner = new CountingSandboxProvider { LeaveHostSandboxAfterNextDispose = true };
+        inner.ManagedSandboxes =
+        [
+            new ManagedSandboxInfo("sandbox-1", DateTimeOffset.UtcNow, DiskBytes: null, IsTrackedActive: false),
+        ];
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        var sandbox = await provider.CreateAsync(Spec());
+        await sandbox.DisposeAsync();
+
+        var queuedCreate = provider.CreateAsync(Spec(), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queuedCreate.IsCompleted);
+
+        await provider.DisposeLeakedAsync("sandbox-1", CancellationToken.None);
+        await using var next = await queuedCreate.WaitAsync(TestDeadline);
+
+        Assert.Equal(["sandbox-1"], inner.DisposedLeaks);
         Assert.Equal(2, inner.Created);
     }
 
@@ -162,7 +191,25 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
-    public async Task ResumeAdmissionLease_IsHeldUntilResumedVmIsDisposed()
+    public async Task BaselineProvisioningFailure_ReleasesAdmissionToken()
+    {
+        var inner = new CountingSandboxProvider { ThrowOnEnsureBaseline = true };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.EnsureBaselineImageAsync(
+            "default",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None));
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var sandbox = await provider.CreateAsync(Spec()).WaitAsync(TestDeadline);
+    }
+
+    [Fact]
+    public async Task ReleaseResumeAdmission_ReleasesRetainedResumeLease()
     {
         var inner = new CountingSandboxProvider();
         inner.ManagedSandboxes =
@@ -184,17 +231,13 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.False(queuedCreate.IsCompleted);
 
         resumeTracker.ReleaseResumeAdmission("codeybox-resume");
-        await Task.Delay(50);
-        Assert.False(queuedCreate.IsCompleted);
-
-        await provider.DisposeLeakedAsync("codeybox-resume", CancellationToken.None);
         await using var sandbox = await queuedCreate.WaitAsync(TestDeadline);
 
         Assert.Equal(1, admission.CurrentAdmittedSandboxes);
     }
 
     [Fact]
-    public async Task ResumeAdmissionReleaseBeforeProviderCompletes_RetainsLeaseIfResumeEventuallySucceeds()
+    public async Task ResumeAdmissionReleaseBeforeProviderCompletes_ReleasesLeaseIfResumeEventuallySucceeds()
     {
         var inner = new CountingSandboxProvider { BlockResume = true };
         inner.ManagedSandboxes =
@@ -216,13 +259,8 @@ public sealed class SandboxAdmissionControlledProviderTests
         inner.AllowResume.SetResult();
         await resume.WaitAsync(TestDeadline);
 
-        var queuedCreate = provider.CreateAsync(Spec(), CancellationToken.None);
-        await Task.Delay(50);
-        Assert.False(queuedCreate.IsCompleted);
-        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
-
-        await provider.DisposeLeakedAsync("codeybox-slow-resume", CancellationToken.None);
-        await using var sandbox = await queuedCreate.WaitAsync(TestDeadline);
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None).WaitAsync(TestDeadline);
     }
 
     [Fact]
@@ -308,6 +346,16 @@ public sealed class SandboxAdmissionControlledProviderTests
         await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
         Assert.Single(active.SnapshotActiveSandboxes());
 
+        using var execCts = new CancellationTokenSource();
+        var execResult = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }, execCts.Token);
+        Assert.Equal(0, execResult.ExitCode);
+        Assert.Equal([1, 2, 3], await sandbox.GetScreenshotAsync(CancellationToken.None));
+        await sandbox.SynthesizeInputAsync(
+            [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "A" }],
+            CancellationToken.None);
+        Assert.NotNull(await sandbox.GetAccessibilityAtPointAsync(10, 20, CancellationToken.None));
+        Assert.Equal("{}", await sandbox.GetAccessibilityTreeJsonAsync(CancellationToken.None));
+
         var preemptible = Assert.IsAssignableFrom<IPreemptibleSandbox>(sandbox);
         var suspendable = Assert.IsAssignableFrom<ISuspendableSandbox>(sandbox);
         var shutdown = Assert.IsAssignableFrom<IShutdownTeardownSandbox>(sandbox);
@@ -329,6 +377,12 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.Equal(1, inner.ListBaselineCalls);
         Assert.Equal(1, inner.DisposeBaselineCalls);
         Assert.Equal(1, inner.EnsureBaselineCalls);
+        Assert.Equal(1, inner.ExecCalls);
+        Assert.True(inner.ExecSawCancellableToken);
+        Assert.Equal(1, inner.ScreenshotCalls);
+        Assert.Equal(1, inner.InputCalls);
+        Assert.Equal(1, inner.AccessibilityAtPointCalls);
+        Assert.Equal(1, inner.AccessibilityTreeCalls);
     }
 
     [Fact]
@@ -436,6 +490,12 @@ public sealed class SandboxAdmissionControlledProviderTests
         private int _createAttempts;
         private int _listManagedCalls;
         private int _peakActive;
+        private int _execCalls;
+        private int _execSawCancellableToken;
+        private int _screenshotCalls;
+        private int _inputCalls;
+        private int _accessibilityAtPointCalls;
+        private int _accessibilityTreeCalls;
         private readonly List<string> _disposedLeaks = [];
 
         public int Active => Volatile.Read(ref _active);
@@ -443,6 +503,12 @@ public sealed class SandboxAdmissionControlledProviderTests
         public int CreateAttempts => Volatile.Read(ref _createAttempts);
         public int ListManagedCalls => Volatile.Read(ref _listManagedCalls);
         public int PeakActive => Volatile.Read(ref _peakActive);
+        public int ExecCalls => Volatile.Read(ref _execCalls);
+        public bool ExecSawCancellableToken => Volatile.Read(ref _execSawCancellableToken) != 0;
+        public int ScreenshotCalls => Volatile.Read(ref _screenshotCalls);
+        public int InputCalls => Volatile.Read(ref _inputCalls);
+        public int AccessibilityAtPointCalls => Volatile.Read(ref _accessibilityAtPointCalls);
+        public int AccessibilityTreeCalls => Volatile.Read(ref _accessibilityTreeCalls);
         public IReadOnlyList<string> DisposedLeaks
         {
             get
@@ -453,6 +519,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public IReadOnlyList<ManagedSandboxInfo> ManagedSandboxes { get; set; } = [];
         public bool FailNextCreate { get; set; }
         public bool ThrowOnNextSandboxDispose { get; set; }
+        public bool LeaveHostSandboxAfterNextDispose { get; set; }
 
         public string Name => "counting";
 
@@ -471,7 +538,9 @@ public sealed class SandboxAdmissionControlledProviderTests
             UpdatePeak(active);
             var disposeThrows = ThrowOnNextSandboxDispose;
             ThrowOnNextSandboxDispose = false;
-            return Task.FromResult<ISandbox>(new CountingSandbox(this, $"sandbox-{created}", disposeThrows));
+            var leaveHostSandbox = LeaveHostSandboxAfterNextDispose;
+            LeaveHostSandboxAfterNextDispose = false;
+            return Task.FromResult<ISandbox>(new CountingSandbox(this, $"sandbox-{created}", disposeThrows, leaveHostSandbox));
         }
 
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
@@ -490,6 +559,21 @@ public sealed class SandboxAdmissionControlledProviderTests
         {
             Interlocked.Decrement(ref _active);
         }
+
+        public void RecordExec(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _execCalls);
+            if (ct.CanBeCanceled)
+                Interlocked.Exchange(ref _execSawCancellableToken, 1);
+        }
+
+        public void RecordScreenshot() => Interlocked.Increment(ref _screenshotCalls);
+
+        public void RecordInput() => Interlocked.Increment(ref _inputCalls);
+
+        public void RecordAccessibilityAtPoint() => Interlocked.Increment(ref _accessibilityAtPointCalls);
+
+        public void RecordAccessibilityTree() => Interlocked.Increment(ref _accessibilityTreeCalls);
 
         private void UpdatePeak(int active)
         {
@@ -592,6 +676,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public int SuspendCalls => Volatile.Read(ref _suspendCalls);
         public int MarkOwnedCalls => Volatile.Read(ref _markOwnedCalls);
         public bool BlockEnsureBaseline { get; init; }
+        public bool ThrowOnEnsureBaseline { get; init; }
         public bool BlockResume { get; init; }
         public TaskCompletionSource ResumeStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -691,18 +776,26 @@ public sealed class SandboxAdmissionControlledProviderTests
                 EnsureBaselineStarted.SetResult();
                 await AllowEnsureBaseline.Task.WaitAsync(ct);
             }
+            if (ThrowOnEnsureBaseline)
+                throw new InvalidOperationException("ensure baseline failed");
             return "baseline";
         }
     }
 
-    private sealed class CountingSandbox(PlainCountingProvider provider, string id, bool disposeThrows) :
+    private sealed class CountingSandbox(
+        PlainCountingProvider provider,
+        string id,
+        bool disposeThrows,
+        bool leaveHostSandboxAfterDispose) :
         IPreemptibleSandbox,
         ISuspendableSandbox,
-        IShutdownTeardownSandbox
+        IShutdownTeardownSandbox,
+        IHostSandboxLifecycleStatus
     {
         private int _disposed;
         private bool _ownedByShutdownHandler;
         private bool _suspended;
+        private bool _hostSandboxDisposed;
 
         public Action? OnStopAndPreserve { get; set; }
         public Action? OnSuspend { get; set; }
@@ -716,8 +809,37 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         public long? MemoryBytes => 1024;
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
-            throw new NotSupportedException();
+        public bool HostSandboxDisposed => _hostSandboxDisposed;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            provider.RecordExec(ct);
+            return Task.FromResult(new SandboxExecResult(0, "stdout", "stderr"));
+        }
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+        {
+            provider.RecordScreenshot();
+            return Task.FromResult<byte[]>([1, 2, 3]);
+        }
+
+        public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+        {
+            provider.RecordInput();
+            return Task.CompletedTask;
+        }
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+        {
+            provider.RecordAccessibilityAtPoint();
+            return Task.FromResult<SandboxAccessibilitySnapshot?>(new SandboxAccessibilitySnapshot { Role = "button" });
+        }
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+        {
+            provider.RecordAccessibilityTree();
+            return Task.FromResult<string?>("{}");
+        }
 
         public Task StopAndPreserveAsync(CancellationToken ct = default)
         {
@@ -743,7 +865,11 @@ public sealed class SandboxAdmissionControlledProviderTests
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                provider.Release();
+                if (!leaveHostSandboxAfterDispose)
+                {
+                    provider.Release();
+                    _hostSandboxDisposed = true;
+                }
                 if (disposeThrows)
                     return ValueTask.FromException(new InvalidOperationException("dispose failed"));
             }

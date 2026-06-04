@@ -167,6 +167,41 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureBaselineImageAsync_BakeFailure_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineInstall: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(extraRuncmd: ["touch /opt/codeybox-fail"]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.StartsWith("cb-baseline-", baselineName, StringComparison.Ordinal);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
     public async Task CreateAsync_WithPinnedBaselineForDifferentProfile_FailsClosedBeforeClone()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -258,7 +293,9 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         ConcurrentDictionary<string, string> states,
         ConcurrentQueue<string> infoQueries,
         ConcurrentQueue<string> launchNames,
-        ConcurrentQueue<string> cloneSources)
+        ConcurrentQueue<string> cloneSources,
+        ConcurrentQueue<string>? deleteNames = null,
+        bool failBaselineInstall = false)
     {
         return new RecordingMultipassRunner((argv, _, _) =>
         {
@@ -280,7 +317,11 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", ..]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            {
+                return Task.FromResult(failBaselineInstall
+                    ? new ProcessRunResult(42, "", "install failed")
+                    : new ProcessRunResult(0, "", ""));
+            }
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
@@ -304,6 +345,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "delete", "--purge", var deleteName])
             {
+                deleteNames?.Enqueue(deleteName);
                 states.TryRemove(deleteName, out _);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }

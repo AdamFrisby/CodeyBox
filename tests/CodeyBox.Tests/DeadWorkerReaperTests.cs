@@ -140,6 +140,49 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_SuspendedItem_SkipsRecovery()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            SuspendedVmName = "vm-startup-owned",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        Assert.Equal("vm-startup-owned", after.SuspendedVmName);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task StartupSweep_SuspendedItem_SkipsRecovery()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            SuspendedVmName = "vm-startup-sweep-owned",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        Assert.Equal("vm-startup-sweep-owned", after.SuspendedVmName);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
     public async Task Reaper_WorkItemIdNull_DeletesRowWithoutTouchingAnyItem()
     {
         var slotReleaser = new RecordingWorkerPoolRecoverySlotReleaser();
