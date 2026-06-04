@@ -80,7 +80,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
             "codeybox.sandbox.active",
             ObserveActiveSandboxes,
             unit: "{sandbox}",
-            description: "Sandboxes/VMs the current process is actively tracking.");
+            description: "Currently admitted live or provisioning sandboxes/VMs.");
 
         _sandboxMax = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
             "codeybox.sandbox.max",
@@ -102,12 +102,13 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     private IEnumerable<Measurement<long>> ObserveActiveSandboxes()
     {
-        // Providers with a persistent VM lifecycle (multipass) expose a native
-        // snapshot of shutdown-active VMs. Ephemeral providers
-        // (process/bubblewrap) have no such snapshot, so they feed the
-        // process-wide created-but-not-disposed counter instead; that keeps the
-        // gauge meaningful on the default local paths rather than reporting 0.
-        var count = _sandboxes is IActiveSandboxProvider activeProvider
+        // VM providers wrapped by SandboxAdmissionControlledProvider report the
+        // admission gate directly. That includes queued/provisioning CreateAsync,
+        // baseline warm-up, and startup resume leases that are not part of the
+        // shutdown-owned active-sandbox snapshot.
+        var count = _sandboxes is ISandboxAdmissionSnapshot admission
+            ? admission.CurrentAdmittedSandboxes
+            : _sandboxes is IActiveSandboxProvider activeProvider
             ? activeProvider.SnapshotActiveSandboxes().Count
             : SandboxLiveCounter.Active;
         return [new Measurement<long>(count, new KeyValuePair<string, object?>("provider", _sandboxes.Name))];

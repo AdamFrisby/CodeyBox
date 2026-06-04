@@ -327,89 +327,97 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private async Task ResumeOneAsync(ISuspendingSandboxProvider suspending, WorkItem item, CancellationToken ct)
     {
         var vmName = item.SuspendedVmName!;
-        var agentLogPath = item.AgentLogPath;
-        var (resumeSucceeded, resumeError, provisioningDeferred) =
-            await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
-        int? adoptionExitCode = null;
-        var adopted = false;
+        try
+        {
+            var agentLogPath = item.AgentLogPath;
+            var (resumeSucceeded, resumeError, provisioningDeferred) =
+                await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
+            int? adoptionExitCode = null;
+            var adopted = false;
 
-        if (provisioningDeferred is not null)
-        {
-            await DeferProvisioningResumeAsync(item, vmName, provisioningDeferred, ct);
-            return;
-        }
-
-        if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
-        {
-            // Adopt: re-tail the in-VM agent log file until the wrapper's
-            // .exit marker appears (or the deadline elapses). Streaming what
-            // the agent emits post-resume to the orchestrator log captures
-            // output the host stream lost when the previous process exited.
-            adoptionExitCode = await TryWaitForAdoptionAsync(
-                suspending, item.Id, vmName, agentLogPath!, ct);
-            adopted = adoptionExitCode is not null;
-        }
-
-        // Promote whatever the adopted agent committed inside the VM into a
-        // real PreemptCheckpoint git ref so DeadWorkerReaper.RecoverWorkItemAsync
-        // sees a non-null checkpoint and re-enqueues the item for clean resume
-        // instead of marking it Failed for "Working without a preempt checkpoint"
-        // (the happy-path failure mode of the suspend/resume cycle before R8-core
-        // wired the checkpoint promotion). Only attempt when the resumed VM is
-        // actually live and the agent has exited cleanly — a non-zero exit, a
-        // missing exit code (deadline elapsed) or a resume failure all leave
-        // the in-VM state untrustworthy, so we fall through to the standard
-        // stranded-item recovery path which re-runs the iteration.
-        string? promotedCheckpointRef = null;
-        if (resumeSucceeded && adopted && adoptionExitCode == 0)
-        {
-            var refName = PreemptCheckpointRefFor(item.Id);
-            if (await TryPromoteCheckpointAsync(suspending, item.Id, vmName, refName, ct))
-                promotedCheckpointRef = refName;
-        }
-
-        // Clear the suspended-bookkeeping AFTER the adoption + promotion
-        // attempts complete (or after the resume itself failed). This way the
-        // leak reaper keeps the suspended VM exempt for the entire window we
-        // were waiting for it to come back — see
-        // SandboxLeakReaper.BuildSuspendedVmNameSetAsync. When promotion
-        // succeeded we ALSO persist PreemptCheckpoint so the next pass of
-        // DeadWorkerReaper.SweepStrandedItemsAsync re-enqueues the item via
-        // the with-checkpoint branch instead of marking it Failed.
-        var fresh = await _store.GetAsync(item.Id, ct);
-        if (fresh is null)
-        {
-            AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError);
-            return;
-        }
-        var updatedItem = fresh with
-        {
-            SuspendedVmName = null,
-            SuspendedAt = null,
-            AgentLogPath = null,
-            UpdatedAt = DateTimeOffset.UtcNow,
-        };
-        if (!resumeSucceeded
-            && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
-                updatedItem,
-                $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
-                out var failedItem))
-        {
-            updatedItem = failedItem;
-            _log.LogWarning(
-                "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
-                item.Id, vmName, resumeError ?? "unknown error");
-        }
-        if (promotedCheckpointRef is not null)
-        {
-            updatedItem = updatedItem with
+            if (provisioningDeferred is not null)
             {
-                PreemptCheckpoint = promotedCheckpointRef,
-                PreemptedAt = DateTimeOffset.UtcNow,
+                await DeferProvisioningResumeAsync(item, vmName, provisioningDeferred, ct);
+                return;
+            }
+
+            if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
+            {
+                // Adopt: re-tail the in-VM agent log file until the wrapper's
+                // .exit marker appears (or the deadline elapses). Streaming what
+                // the agent emits post-resume to the orchestrator log captures
+                // output the host stream lost when the previous process exited.
+                adoptionExitCode = await TryWaitForAdoptionAsync(
+                    suspending, item.Id, vmName, agentLogPath!, ct);
+                adopted = adoptionExitCode is not null;
+            }
+
+            // Promote whatever the adopted agent committed inside the VM into a
+            // real PreemptCheckpoint git ref so DeadWorkerReaper.RecoverWorkItemAsync
+            // sees a non-null checkpoint and re-enqueues the item for clean resume
+            // instead of marking it Failed for "Working without a preempt checkpoint"
+            // (the happy-path failure mode of the suspend/resume cycle before R8-core
+            // wired the checkpoint promotion). Only attempt when the resumed VM is
+            // actually live and the agent has exited cleanly — a non-zero exit, a
+            // missing exit code (deadline elapsed) or a resume failure all leave
+            // the in-VM state untrustworthy, so we fall through to the standard
+            // stranded-item recovery path which re-runs the iteration.
+            string? promotedCheckpointRef = null;
+            if (resumeSucceeded && adopted && adoptionExitCode == 0)
+            {
+                var refName = PreemptCheckpointRefFor(item.Id);
+                if (await TryPromoteCheckpointAsync(suspending, item.Id, vmName, refName, ct))
+                    promotedCheckpointRef = refName;
+            }
+
+            // Clear the suspended-bookkeeping AFTER the adoption + promotion
+            // attempts complete (or after the resume itself failed). This way the
+            // leak reaper keeps the suspended VM exempt for the entire window we
+            // were waiting for it to come back — see
+            // SandboxLeakReaper.BuildSuspendedVmNameSetAsync. When promotion
+            // succeeded we ALSO persist PreemptCheckpoint so the next pass of
+            // DeadWorkerReaper.SweepStrandedItemsAsync re-enqueues the item via
+            // the with-checkpoint branch instead of marking it Failed.
+            var fresh = await _store.GetAsync(item.Id, ct);
+            if (fresh is null)
+            {
+                AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError);
+                return;
+            }
+            var updatedItem = fresh with
+            {
+                SuspendedVmName = null,
+                SuspendedAt = null,
+                AgentLogPath = null,
+                UpdatedAt = DateTimeOffset.UtcNow,
             };
+            if (!resumeSucceeded
+                && WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(
+                    updatedItem,
+                    $"startup resume failed for sandbox {vmName}: {resumeError ?? "unknown error"}",
+                    out var failedItem))
+            {
+                updatedItem = failedItem;
+                _log.LogWarning(
+                    "Startup resume marked work item {WorkItemId} Failed after sandbox {VmName} could not be resumed: {Error}",
+                    item.Id, vmName, resumeError ?? "unknown error");
+            }
+            if (promotedCheckpointRef is not null)
+            {
+                updatedItem = updatedItem with
+                {
+                    PreemptCheckpoint = promotedCheckpointRef,
+                    PreemptedAt = DateTimeOffset.UtcNow,
+                };
+            }
+            await _store.UpdateAsync(updatedItem, ct);
+            AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
         }
-        await _store.UpdateAsync(updatedItem, ct);
-        AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
+        finally
+        {
+            if (suspending is ISandboxResumeAdmissionTracker admissionTracker)
+                admissionTracker.ReleaseResumeAdmission(vmName);
+        }
     }
 
     private async Task<(bool Succeeded, string? Error, SandboxProvisioningDeferredException? ProvisioningDeferred)> TryResumeSandboxAsync(

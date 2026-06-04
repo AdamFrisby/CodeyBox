@@ -165,6 +165,32 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxActiveGauge_ReportsAdmissionCount_ForWrappedProvider()
+    {
+        var store = new SqliteWorkItemStore(_dbPath);
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            new FakeCreatedProvider(),
+            maxConcurrentSandboxes: 2,
+            NullLogger.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "test" });
+        using var svc = new CodeyBoxObservableMetrics(
+            store,
+            provider,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4, MaxConcurrentSandboxes = 2 },
+            NullLogger<CodeyBoxObservableMetrics>.Instance,
+            workerPool: new FakeWorkerPool(0),
+            quotaSnapshot: null,
+            refreshInterval: TimeSpan.FromMinutes(10));
+        await svc.StartAsync(CancellationToken.None);
+
+        var observed = CollectLong(svc, "provider", "codeybox.sandbox.active");
+
+        Assert.Contains(observed, m => m.Instrument == "codeybox.sandbox.active" && m.Value == 1 && m.Tag == "created");
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task QuotaAvailableGauge_RegisteredWhenSnapshotPresent_ReportsPerAgentPct()
     {
         var store = new SqliteWorkItemStore(_dbPath);
@@ -294,6 +320,16 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
             throw new NotSupportedException();
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class FakeCreatedProvider : ISandboxProvider
+    {
+        public string Name => "created";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            Task.FromResult<ISandbox>(new FakeActiveSandbox());
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
     /// <summary>

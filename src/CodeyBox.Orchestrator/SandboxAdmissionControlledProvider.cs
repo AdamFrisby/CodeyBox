@@ -4,6 +4,17 @@ using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
+internal interface ISandboxAdmissionSnapshot
+{
+    int CurrentAdmittedSandboxes { get; }
+    int MaxConcurrentSandboxes { get; }
+}
+
+internal interface ISandboxResumeAdmissionTracker
+{
+    void ReleaseResumeAdmission(string name);
+}
+
 /// <summary>
 /// Decorates an <see cref="ISandboxProvider"/> with a process-wide live-sandbox
 /// admission gate. The token is acquired before the inner provider starts
@@ -11,7 +22,7 @@ namespace CodeyBox.Orchestrator;
 /// disposed, so worker, audit, merge, smoke, and verifier call sites all share
 /// the same VM budget without each call site knowing about the policy.
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot
 {
     private readonly SandboxAdmissionGate _gate;
     private readonly ILogger _log;
@@ -49,6 +60,16 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
                 log);
         }
 
+        if (inner is IActiveSandboxProvider
+            && inner is ISuspendingSandboxProvider activeSuspending)
+        {
+            return new ActiveSuspendingSandboxAdmissionControlledProvider(
+                inner,
+                activeSuspending,
+                gate,
+                log);
+        }
+
         if (inner is IActiveSandboxProvider)
             return new ActiveSandboxAdmissionControlledProvider(inner, gate, log);
 
@@ -62,6 +83,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
     }
 
     protected ISandboxProvider Inner { get; }
+
+    public int CurrentAdmittedSandboxes => _gate.CurrentAdmitted;
+
+    public int MaxConcurrentSandboxes => _gate.MaxConcurrent;
 
     public string Name => Inner.Name;
 
@@ -91,6 +116,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
     protected virtual void TrackActive(SandboxSpec spec, ISandbox sandbox) { }
 
     protected virtual void OnSandboxDisposed(ISandbox sandbox) { }
+
+    private protected ValueTask<SandboxAdmissionLease> AcquireAdmissionAsync(CancellationToken ct = default) =>
+        _gate.AcquireAsync(ct);
 
     private ISandbox WrapSandbox(ISandbox sandbox, SandboxAdmissionLease lease)
     {
@@ -158,14 +186,65 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
             _active.Remove(sandbox);
     }
 
-    private sealed class SuspendingSandboxAdmissionControlledProvider(
+    private abstract class SuspendingSandboxAdmissionControlledProviderBase(
         ISandboxProvider inner,
         ISuspendingSandboxProvider suspendingProvider,
         SandboxAdmissionGate gate,
-        ILogger log) : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider
+        ILogger log) : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker
     {
-        public Task ResumeSandboxAsync(string name, CancellationToken ct) =>
-            suspendingProvider.ResumeSandboxAsync(name, ct);
+        private readonly object _resumeLeaseSync = new();
+        private readonly Dictionary<string, SandboxAdmissionLease> _resumeLeases = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _releasedResumeNames = new(StringComparer.Ordinal);
+
+        public async Task ResumeSandboxAsync(string name, CancellationToken ct)
+        {
+            var lease = await AcquireAdmissionAsync(ct).ConfigureAwait(false);
+            var leaseTransferred = false;
+            try
+            {
+                await suspendingProvider.ResumeSandboxAsync(name, ct).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+
+                SandboxAdmissionLease? prior = null;
+                lock (_resumeLeaseSync)
+                {
+                    if (_releasedResumeNames.Remove(name))
+                    {
+                        leaseTransferred = true;
+                    }
+                    else
+                    {
+                        if (_resumeLeases.Remove(name, out var existing))
+                            prior = existing;
+                        _resumeLeases[name] = lease;
+                        leaseTransferred = true;
+                        lease = null!;
+                    }
+                }
+
+                prior?.Dispose();
+            }
+            finally
+            {
+                if (!leaseTransferred)
+                    lease.Dispose();
+                else
+                    lease?.Dispose();
+            }
+        }
+
+        public void ReleaseResumeAdmission(string name)
+        {
+            SandboxAdmissionLease? lease = null;
+            lock (_resumeLeaseSync)
+            {
+                if (_resumeLeases.Remove(name, out var existing))
+                    lease = existing;
+                else
+                    _releasedResumeNames.Add(name);
+            }
+            lease?.Dispose();
+        }
 
         public Task<int?> WaitForAdoptedAgentCompletionAsync(
             string vmName,
@@ -187,6 +266,32 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
             IReadOnlySet<string> liveSuspendedNames,
             CancellationToken ct) =>
             suspendingProvider.ReconcileStuckSandboxesAsync(liveSuspendedNames, ct);
+    }
+
+    private sealed class SuspendingSandboxAdmissionControlledProvider(
+        ISandboxProvider inner,
+        ISuspendingSandboxProvider suspendingProvider,
+        SandboxAdmissionGate gate,
+        ILogger log) : SuspendingSandboxAdmissionControlledProviderBase(inner, suspendingProvider, gate, log)
+    {
+    }
+
+    private class ActiveSuspendingSandboxAdmissionControlledProvider(
+        ISandboxProvider inner,
+        ISuspendingSandboxProvider suspendingProvider,
+        SandboxAdmissionGate gate,
+        ILogger log) : SuspendingSandboxAdmissionControlledProviderBase(inner, suspendingProvider, gate, log), IActiveSandboxProvider
+    {
+        private readonly ActiveSandboxTracker _active = new();
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+            _active.Snapshot();
+
+        protected override void TrackActive(SandboxSpec spec, ISandbox sandbox) =>
+            _active.Track(spec, sandbox);
+
+        protected override void OnSandboxDisposed(ISandbox sandbox) =>
+            _active.Remove(sandbox);
     }
 
     private sealed class DiskGuardedSandboxAdmissionControlledProvider(
@@ -207,48 +312,11 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
         IBaselineImageProvisioner baselineProvisioner,
         SandboxAdmissionGate gate,
         ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log),
-            IActiveSandboxProvider,
-            ISuspendingSandboxProvider,
+        : ActiveSuspendingSandboxAdmissionControlledProvider(inner, suspendingProvider, gate, log),
             IDiskGuardedSandboxProvider,
             IBaselineImageResolver,
             IBaselineImageProvisioner
     {
-        private readonly ActiveSandboxTracker _active = new();
-
-        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
-            _active.Snapshot();
-
-        protected override void TrackActive(SandboxSpec spec, ISandbox sandbox) =>
-            _active.Track(spec, sandbox);
-
-        protected override void OnSandboxDisposed(ISandbox sandbox) =>
-            _active.Remove(sandbox);
-
-        public Task ResumeSandboxAsync(string name, CancellationToken ct) =>
-            suspendingProvider.ResumeSandboxAsync(name, ct);
-
-        public Task<int?> WaitForAdoptedAgentCompletionAsync(
-            string vmName,
-            string agentLogPath,
-            Action<string>? logSink,
-            TimeSpan? deadline,
-            CancellationToken ct) =>
-            suspendingProvider.WaitForAdoptedAgentCompletionAsync(vmName, agentLogPath, logSink, deadline, ct);
-
-        public Task<bool> PushSuspendedVmCheckpointRefAsync(
-            string vmName,
-            string workingDir,
-            string refName,
-            string commitMessage,
-            CancellationToken ct) =>
-            suspendingProvider.PushSuspendedVmCheckpointRefAsync(vmName, workingDir, refName, commitMessage, ct);
-
-        public Task<IReadOnlyList<string>> ReconcileStuckSandboxesAsync(
-            IReadOnlySet<string> liveSuspendedNames,
-            CancellationToken ct) =>
-            suspendingProvider.ReconcileStuckSandboxesAsync(liveSuspendedNames, ct);
-
         public IReadOnlyList<DiskGuardSample> SampleDiskGuardState() =>
             diskGuardedProvider.SampleDiskGuardState();
 
@@ -261,12 +329,19 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider
         public Task DisposeBaselineImageAsync(string name, CancellationToken ct) =>
             baselineResolver.DisposeBaselineImageAsync(name, ct);
 
-        public Task<string?> EnsureBaselineImageAsync(
+        public async Task<string?> EnsureBaselineImageAsync(
             string profileName,
             SandboxProfileFlavor flavor,
             string? pinnedBaselineRef,
-            CancellationToken ct) =>
-            baselineProvisioner.EnsureBaselineImageAsync(profileName, flavor, pinnedBaselineRef, ct);
+            CancellationToken ct)
+        {
+            using var lease = await AcquireAdmissionAsync(ct).ConfigureAwait(false);
+            return await baselineProvisioner.EnsureBaselineImageAsync(
+                profileName,
+                flavor,
+                pinnedBaselineRef,
+                ct).ConfigureAwait(false);
+        }
     }
 
     private sealed class ActiveSandboxTracker
@@ -306,6 +381,15 @@ internal sealed class SandboxAdmissionGate
     }
 
     public int MaxConcurrent { get; }
+
+    public int CurrentAdmitted
+    {
+        get
+        {
+            lock (_sync)
+                return MaxConcurrent - _available;
+        }
+    }
 
     public ValueTask<SandboxAdmissionLease> AcquireAsync(CancellationToken ct = default)
     {

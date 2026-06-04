@@ -165,6 +165,27 @@ public sealed class SandboxStartupConfigurationUatTests
         Assert.IsType<ProcessSandboxProvider>(provider);
     }
 
+    [Fact]
+    public void MultipassSandboxResolvesAdmissionControlledProvider()
+    {
+        using var factory = new ProjectsAndConfigurationApiFactory(
+            configuration: new Dictionary<string, string?>
+            {
+                ["CodeyBox:SandboxProvider"] = "multipass",
+                ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "3",
+            },
+            projects: new InMemoryProjectRepository());
+
+        var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        Assert.Equal("multipass", provider.Name);
+        Assert.Equal(3, admission.MaxConcurrentSandboxes);
+        Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
+    }
+
     private static IDisposable ConfigureRequiredProductionApiSecrets()
         => new CompositeDisposable(
             new EnvironmentVariableScope("CODEYBOX_API_KEY", HealthCheckAndApiAuthUatTests.ValidToken),
