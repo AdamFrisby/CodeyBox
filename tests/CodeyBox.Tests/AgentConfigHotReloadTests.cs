@@ -52,6 +52,58 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal("pricingState", ex.ParamName);
     }
 
+    [Fact]
+    public async Task SmokeHotReload_SwapsLiveSnapshot()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            Smoke = new SmokeConfig
+            {
+                Enabled = true,
+                CacheTtlMinutes = 15,
+                StartupTimeoutSeconds = 5,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var smoke = new SmokeOptionsSnapshot(new SmokeOptions
+        {
+            Enabled = true,
+            CacheTtlMinutes = 15,
+            StartupTimeoutSeconds = 5,
+        });
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            smokeOptions: smoke);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            Smoke = new SmokeConfig
+            {
+                Enabled = false,
+                CacheTtlMinutes = 7,
+                StartupTimeoutSeconds = 3,
+            },
+        });
+
+        Assert.False(smoke.Enabled);
+        Assert.Equal(7, smoke.Current.CacheTtlMinutes);
+        Assert.Equal(3, smoke.Current.StartupTimeoutSeconds);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
     // ── AgentClassRouter.ApplyConfigReload ──────────────────────────────────
 
     [Fact]

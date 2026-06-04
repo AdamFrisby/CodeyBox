@@ -56,6 +56,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     private readonly IInVmSmokeCache _cache;
     private readonly IWebhookDispatcher _webhooks;
     private readonly InVmSmokeOptions _opts;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly ILogger<InVmSmokeProber> _log;
 
     public InVmSmokeProber(
@@ -68,7 +69,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         IInVmSmokeCache cache,
         IWebhookDispatcher webhooks,
         InVmSmokeOptions opts,
-        ILogger<InVmSmokeProber> log)
+        ILogger<InVmSmokeProber> log,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _provider = provider;
         _resolver = resolver;
@@ -79,10 +81,11 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         _cache = cache;
         _webhooks = webhooks;
         _opts = opts;
+        _smokeOptions = smokeOptions;
         _log = log;
     }
 
-    public bool Enabled => _opts.Enabled && _probes.Count > 0;
+    public bool Enabled => (_smokeOptions?.Enabled ?? true) && _opts.Enabled && _probes.Count > 0;
 
     /// <summary>
     /// Probes every registered agent against the active baseline. Sequential so

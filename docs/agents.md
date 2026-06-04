@@ -443,17 +443,19 @@ forces a fresh probe on the next pickup.
 
 ### Disabling smoke tests
 
-**Globally** — set `CodeyBox:Smoke:Enabled=false`. No probes run at startup
-or pickup.
+**Globally** — set `CodeyBox:Smoke:Enabled=false`. This is the master smoke
+switch: no startup probes, pickup credential gate, router smoke exclusions, or
+in-VM dispatch smoke gate can block dispatch. The switch is hot-reloaded.
 
 **Per-project** — set `SkipCredentialSmokeTest: true` in the project
-configuration. Useful for agents (like Copilot) that have no testable
-credential, or for internal test projects that always use fake credentials.
+configuration. This skips only the pickup-time credential probe for that
+project; router smoke exclusions and in-VM smoke are still governed by
+`CodeyBox:Smoke:Enabled`.
 
 ### Configuration reference
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `CodeyBox:Smoke:Enabled` | `true` | Enable or disable all smoke testing. |
+| `CodeyBox:Smoke:Enabled` | `true` | Master switch for all smoke testing and smoke-based dispatch exclusions. |
 | `CodeyBox:Smoke:CacheTtlMinutes` | `15` | How long to cache a probe result before re-probing. |
 | `CodeyBox:Smoke:StartupTimeoutSeconds` | `10` | Per-agent timeout for the startup probe. |

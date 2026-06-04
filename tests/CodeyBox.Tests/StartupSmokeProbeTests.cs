@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -21,15 +22,18 @@ public sealed class StartupSmokeProbeTests
         ICredentialProvider? credentials = null,
         bool enabled = true,
         int timeoutSeconds = 5,
-        AgentAvailabilityRegistry? availability = null)
+        AgentAvailabilityRegistry? availability = null,
+        ILogger<StartupSmokeProbeService>? logger = null,
+        InVmSmokeOptions? inVmSmokeOptions = null)
     {
         return new StartupSmokeProbeService(
             credentials ?? new ConstantCredentialProvider(AnyClaudeCred),
             probes,
             webhooks,
             new SmokeOptions { Enabled = enabled, StartupTimeoutSeconds = timeoutSeconds },
-            NullLogger<StartupSmokeProbeService>.Instance,
-            availability);
+            logger ?? NullLogger<StartupSmokeProbeService>.Instance,
+            availability,
+            inVmSmokeOptions);
     }
 
     // ── Failure events ────────────────────────────────────────────────────────
@@ -126,6 +130,32 @@ public sealed class StartupSmokeProbeTests
 
         Assert.Equal(0, probe.CallCount);
         Assert.Empty(webhooks.Events);
+    }
+
+    [Fact]
+    public async Task StartAsync_LogsEffectivePosture_AndPartialInVmDisableWarning()
+    {
+        var webhooks = new CapturingWebhookDispatcher();
+        var log = new CapturingLogger<StartupSmokeProbeService>();
+        var svc = Build(
+            [new FakeSmokeProbe(AgentKind.Claude, shouldPass: true)],
+            webhooks,
+            logger: log,
+            inVmSmokeOptions: new InVmSmokeOptions { Enabled = false });
+
+        await svc.StartAsync(CancellationToken.None);
+        await svc.StartupTask;
+
+        Assert.Contains(log.Entries, e =>
+            e.Level == LogLevel.Information
+            && e.Message.Contains("Smoke posture:", StringComparison.Ordinal)
+            && e.Properties.TryGetValue("SmokeEnabled", out var smokeEnabled)
+            && smokeEnabled is true
+            && e.Properties.TryGetValue("InVmSmokeGate", out var inVmGate)
+            && inVmGate is false);
+        Assert.Contains(log.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("CodeyBox:Smoke:InVm:Enabled=false disables only in-VM smoke", StringComparison.Ordinal));
     }
 
     // ── No credential ─────────────────────────────────────────────────────────

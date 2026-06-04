@@ -71,6 +71,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
@@ -206,7 +207,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IInVmSmokeGate? inVmSmokeGate = null,
         IAgentInvolvementStore? involvement = null,
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
-        IRequiredBuildVerifier? requiredBuildVerifier = null)
+        IRequiredBuildVerifier? requiredBuildVerifier = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -265,6 +267,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
         _inVmSmokeGate = inVmSmokeGate;
+        _smokeOptions = smokeOptions;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -352,7 +355,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // Run before ANY sandbox is allocated. Skipped when the project opts out
         // (e.g. Copilot), when the gate is disabled globally, or when no probe is
         // registered for this agent. Results are cached per-credential-fingerprint.
-        if (_smokeGate is not null && !project.SkipCredentialSmokeTest)
+        if ((_smokeOptions?.Enabled ?? true) && _smokeGate is not null && !project.SkipCredentialSmokeTest)
         {
             AgentSmokeResult? smokeResult;
             try
@@ -4391,6 +4394,9 @@ public sealed class PipelineRunner : IPipelineRunner
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
+        if (_smokeOptions?.Enabled == false)
+            return new AgentAvailability(true, null, null);
+
         // The in-VM gate (when wired) owns the read→probe→re-read and returns the
         // reconciled availability — including the exclusion Reason — so callers
         // get a verdict from this one call and never re-read the availability

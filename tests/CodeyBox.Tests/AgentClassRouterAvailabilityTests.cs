@@ -23,7 +23,8 @@ public sealed class AgentClassRouterAvailabilityTests
     private static AgentClassRouter BuildRouter(
         AgentClass cls,
         IEnumerable<IAgentQuotaProbe> probes,
-        AgentAvailabilityRegistry registry)
+        AgentAvailabilityRegistry registry,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         var opts = new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromMinutes(5) };
         return new AgentClassRouter(
@@ -36,7 +37,8 @@ public sealed class AgentClassRouterAvailabilityTests
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: null,
-            availability: registry);
+            availability: registry,
+            smokeOptions: smokeOptions);
     }
 
     private static AgentAvailabilityRegistry NewRegistry()
@@ -107,6 +109,29 @@ public sealed class AgentClassRouterAvailabilityTests
         var candidates = await router.OrderedFallbackCandidatesAsync(MakeItem(), null, CancellationToken.None);
         Assert.Single(candidates);
         Assert.Equal(Claude, candidates[0].Agent);
+    }
+
+    [Fact]
+    public async Task SmokeDisabledGlobally_IgnoresRouterSmokeExclusions()
+    {
+        var cls = FrontierClass(Sub(Cursor, score: 150), Sub(Claude, score: 100));
+        var reg = NewRegistry();
+        reg.MarkSmokeResult(Cursor,
+            new AgentSmokeResult(false, "transient: try later", TimeSpan.Zero, SmokeFailureCategory.Transient),
+            SmokeExclusionSource.InVmSmoke);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+
+        var router = BuildRouter(cls,
+            [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)],
+            reg,
+            smokeOptions);
+
+        var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
+        var candidates = await router.OrderedFallbackCandidatesAsync(MakeItem(), null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Cursor, decision.Chosen!.Agent);
+        Assert.Equal(Cursor, candidates[0].Agent);
     }
 
     [Fact]

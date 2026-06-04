@@ -54,6 +54,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
+    private readonly SmokeOptionsSnapshot? _smokeOptions;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -101,7 +102,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        InVmSmokeSandboxTarget? configuredSmokeTarget = null)
+        InVmSmokeSandboxTarget? configuredSmokeTarget = null,
+        SmokeOptionsSnapshot? smokeOptions = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -125,6 +127,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _concurrencySnapshot = concurrencySnapshot;
         _inVmSmokeGate = inVmSmokeGate;
         _configuredSmokeTarget = configuredSmokeTarget;
+        _smokeOptions = smokeOptions;
     }
 
     /// <summary>
@@ -985,6 +988,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
+        if (_smokeOptions?.Enabled == false)
+            return null;
+
         if (_inVmSmokeGate is not null)
             return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);
         if (_availability is not null)
