@@ -23,15 +23,30 @@ public sealed class LocalGitHost : IGitHost
     // git update-ref treats an all-zero old oid as "create this ref only if it
     // does not already exist"; bare repos here use the normal 40-hex SHA-1 oid.
     private const string GitNullObjectId = "0000000000000000000000000000000000000000";
+    private const int GitStartTextFileBusyMaxAttempts = 8;
+    private const int GitStartTextFileBusyDelayStepMilliseconds = 25;
+    // POSIX ETXTBSY. On Linux, Process.Start surfaces this as Win32Exception(26)
+    // when another process briefly has the executable open for writing.
+    private const int PosixTextFileBusyErrno = 26;
 
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
     private readonly string _disabledHooksPath;
+    private readonly Func<ProcessStartInfo, ILocalGitProcess> _processFactory;
 
     public LocalGitHost(LocalGitHostOptions opts, ILogger<LocalGitHost> log)
+        : this(opts, log, static psi => new SystemLocalGitProcess(psi))
+    {
+    }
+
+    internal LocalGitHost(
+        LocalGitHostOptions opts,
+        ILogger<LocalGitHost> log,
+        Func<ProcessStartInfo, ILocalGitProcess> processFactory)
     {
         _opts = opts;
         _log = log;
+        _processFactory = processFactory ?? throw new ArgumentNullException(nameof(processFactory));
         Directory.CreateDirectory(_opts.RootDirectory);
         _disabledHooksPath = Path.Combine(_opts.RootDirectory, ".codeybox-disabled-hooks");
         Directory.CreateDirectory(_disabledHooksPath);
@@ -1108,17 +1123,16 @@ public sealed class LocalGitHost : IGitHost
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
 
-        const int maxStartAttempts = 8;
         for (var attempt = 1; ; attempt++)
         {
-            using var p = new System.Diagnostics.Process { StartInfo = psi };
+            using var p = _processFactory(psi);
             try
             {
                 p.Start();
             }
-            catch (Win32Exception ex) when (attempt < maxStartAttempts && IsTextFileBusy(ex))
+            catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
             {
-                await Task.Delay(25 * attempt, ct);
+                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
                 continue;
             }
 
@@ -1130,8 +1144,20 @@ public sealed class LocalGitHost : IGitHost
     }
 
     private static bool IsTextFileBusy(Win32Exception ex)
-        => ex.NativeErrorCode == 26
+        => ex.NativeErrorCode == PosixTextFileBusyErrno
             || ex.Message.Contains("Text file busy", StringComparison.Ordinal);
+
+    private sealed class SystemLocalGitProcess(ProcessStartInfo startInfo) : ILocalGitProcess
+    {
+        private readonly System.Diagnostics.Process _process = new() { StartInfo = startInfo };
+
+        public TextReader StandardOutput => _process.StandardOutput;
+        public TextReader StandardError => _process.StandardError;
+        public int ExitCode => _process.ExitCode;
+        public void Start() => _process.Start();
+        public Task WaitForExitAsync(CancellationToken ct) => _process.WaitForExitAsync(ct);
+        public void Dispose() => _process.Dispose();
+    }
 
     private sealed class RepositoryLockState
     {
@@ -1165,6 +1191,15 @@ public sealed class LocalGitHost : IGitHost
             ReleaseRepositoryLockReference(_path, state);
         }
     }
+}
+
+internal interface ILocalGitProcess : IDisposable
+{
+    TextReader StandardOutput { get; }
+    TextReader StandardError { get; }
+    int ExitCode { get; }
+    void Start();
+    Task WaitForExitAsync(CancellationToken ct);
 }
 
 public sealed record LocalGitHostOptions

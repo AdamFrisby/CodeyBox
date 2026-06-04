@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -25,16 +27,19 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         catch { }
     }
 
-    private LocalGitHost CreateGitHost(string? gitExecutable = null)
+    private LocalGitHost CreateGitHost(
+        string? gitExecutable = null,
+        Func<ProcessStartInfo, ILocalGitProcess>? processFactory = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
-        return new LocalGitHost(
-            new LocalGitHostOptions
-            {
-                RootDirectory = gitRoot,
-                GitExecutable = gitExecutable ?? "git",
-            },
-            NullLogger<LocalGitHost>.Instance);
+        var opts = new LocalGitHostOptions
+        {
+            RootDirectory = gitRoot,
+            GitExecutable = gitExecutable ?? "git",
+        };
+        return processFactory is null
+            ? new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance)
+            : new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance, processFactory);
     }
 
     private static IReadOnlyDictionary<string, string> EmptyEnv()
@@ -284,6 +289,49 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     // -------------------------------------------------------------------------
+    // RunGitAsync Process.Start ETXTBSY retry
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RunGitAsync_RetriesTextFileBusyProcessStartAndSucceeds()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return starts == 1
+                ? new FakeLocalGitProcess(startException: new Win32Exception(26, "Text file busy"))
+                : new FakeLocalGitProcess(exitCode: 0);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.True(exists);
+        Assert.Equal(2, starts);
+    }
+
+    [Fact]
+    public async Task RunGitAsync_TextFileBusyProcessStartAfterRetryCap_Propagates()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return new FakeLocalGitProcess(startException: new Win32Exception(26, "Text file busy"));
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var ex = await Assert.ThrowsAsync<Win32Exception>(
+            () => gitHost.BranchExistsAsync(repoId, "main"));
+
+        Assert.Equal(26, ex.NativeErrorCode);
+        Assert.Equal(8, starts);
+    }
+
+    // -------------------------------------------------------------------------
     // helpers
     // -------------------------------------------------------------------------
 
@@ -328,5 +376,33 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
             tempPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         File.Move(tempPath, path);
+    }
+
+    private sealed class FakeLocalGitProcess(
+        int exitCode = 0,
+        string stdout = "",
+        string stderr = "",
+        Win32Exception? startException = null) : ILocalGitProcess
+    {
+        private readonly StringReader _stdout = new(stdout);
+        private readonly StringReader _stderr = new(stderr);
+
+        public TextReader StandardOutput => _stdout;
+        public TextReader StandardError => _stderr;
+        public int ExitCode { get; } = exitCode;
+
+        public void Start()
+        {
+            if (startException is not null)
+                throw startException;
+        }
+
+        public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public void Dispose()
+        {
+            _stdout.Dispose();
+            _stderr.Dispose();
+        }
     }
 }

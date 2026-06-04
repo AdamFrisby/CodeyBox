@@ -727,6 +727,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
                 }
 
+                if (_opts.OnWorkerReservedForTest is { } onWorkerReservedForTest)
+                {
+                    try
+                    {
+                        await onWorkerReservedForTest(id.Value);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogError(ex, "OnWorkerReservedForTest callback threw; releasing concurrency slot and skipping item {Id}", id);
+                        _activeItems.TryRemove(id.Value, out _);
+                        TryReleaseConcurrencyGate();
+                        blockForFirstSlot = false;
+                        continue;
+                    }
+                }
+
                 // Spawn pacing: enforce MinSpawnInterval between successive spawns.
                 if (_opts.MinSpawnInterval > TimeSpan.Zero)
                 {
@@ -2035,6 +2051,12 @@ public sealed record OrchestratorOptions
     /// true spawn time rather than the thread-pool scheduling time.
     /// </summary>
     internal Action? OnWorkerSpawned { get; init; }
+
+    /// <summary>
+    /// Called by the dispatch loop after an item is reserved in <c>_activeItems</c>
+    /// and before spawn pacing. Used by tests to close pause/reservation races.
+    /// </summary>
+    internal Func<WorkItemId, Task>? OnWorkerReservedForTest { get; init; }
 
     /// <summary>
     /// Legacy alias for <see cref="MaxConcurrentWorkers"/>.
