@@ -61,8 +61,7 @@ public sealed class PickupSmokeTests : IDisposable
     private TestResources BuildResources(
         string seedRepoUrl,
         CredentialSmokeGate? gate,
-        bool skipSmoke = false,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        bool skipSmoke = false)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -98,7 +97,6 @@ public sealed class PickupSmokeTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored" },
             NullLogger<PipelineRunner>.Instance,
             smokeGate: gate,
-            smokeOptions: smokeOptions,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestResources
@@ -206,7 +204,7 @@ public sealed class PickupSmokeTests : IDisposable
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = true });
         var (gate, probe) = SmokeGateFactory.Build(probePass: false, smokeOptions: smokeOptions);
         smokeOptions.Replace(new SmokeOptions { Enabled = false });
-        using var r = BuildResources(seed, gate, smokeOptions: smokeOptions);
+        using var r = BuildResources(seed, gate);
 
         var item = NewItem(workTimeout: TimeSpan.FromMilliseconds(200));
         await r.Store.CreateAsync(item);

@@ -66,8 +66,7 @@ public sealed class InVmSmokeGateTests
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: null,
-            availability: registry,
-            inVmSmokeGate: gate);
+            dispatchAvailability: new AgentDispatchAvailability(registry, gate));
     }
 
     private static WorkItem MakeItem(string? baselineImageRef = null) => new()

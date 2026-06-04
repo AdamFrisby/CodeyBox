@@ -37,8 +37,7 @@ public sealed class AgentClassRouterAvailabilityTests
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: null,
-            availability: registry,
-            smokeOptions: smokeOptions);
+            dispatchAvailability: new AgentDispatchAvailability(registry, smokeOptions: smokeOptions));
     }
 
     private static AgentAvailabilityRegistry NewRegistry()
@@ -177,8 +176,7 @@ public sealed class AgentClassRouterAvailabilityTests
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)],
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance,
-            availability: reg,
-            inVmSmokeGate: gate);
+            dispatchAvailability: new AgentDispatchAvailability(reg, gate));
 
         var candidates = await router.OrderedFallbackCandidatesAsync(MakeItem(), null, CancellationToken.None);
 
@@ -198,8 +196,7 @@ public sealed class AgentClassRouterAvailabilityTests
             [new FakeProbe(Cursor, 90.0)],
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance,
-            availability: reg,
-            inVmSmokeGate: gate,
+            dispatchAvailability: new AgentDispatchAvailability(reg, gate),
             configuredSmokeTarget: new InVmSmokeSandboxTarget("smoke-profile", SandboxProfileFlavor.Headless));
 
         var decision = await router.ResolveAsync(MakeItem(), project: null, CancellationToken.None);
@@ -470,8 +467,7 @@ public sealed class AgentClassRouterAvailabilityTests
             [new FakeProbe(Cursor, 90.0), new FakeProbe(Claude, 90.0)],
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance,
-            availability: registry,
-            inVmSmokeGate: prober);
+            dispatchAvailability: new AgentDispatchAvailability(registry, prober));
 
         var slotGate = new SlotCountingGate();
 

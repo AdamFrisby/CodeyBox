@@ -288,8 +288,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            inVmSmokeGate: prober,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, prober));
 
         var item = new WorkItem
         {
@@ -365,9 +365,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            inVmSmokeGate: gate,
-            smokeOptions: smokeOptions,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions));
 
         var item = new WorkItem
         {
@@ -478,9 +477,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
-            inVmSmokeGate: inVmSmokeGate,
-            smokeOptions: smokeOptions,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions));
 
         return new TestFixture(pipeline, store, codex, webhooks, availability);
     }

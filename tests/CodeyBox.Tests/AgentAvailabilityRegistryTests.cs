@@ -205,9 +205,8 @@ public sealed class AgentAvailabilityRegistryTests
         var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
         var dispatchAvailability = new AgentDispatchAvailability(
             reg,
-            reg,
             inVmSmokeGate: null,
-            new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+            smokeOptions: new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
 
         reg.MarkSmokeResult(
             Claude,

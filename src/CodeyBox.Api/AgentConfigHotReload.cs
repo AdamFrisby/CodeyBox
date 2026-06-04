@@ -261,7 +261,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         try
         {
             var previousOptions = _smokeOptions.Current;
-            var nextOptions = ToSmokeOptions(opts.Smoke);
+            var nextOptions = ToSmokeOptions(opts.Smoke, previousOptions.CacheTtlMinutes);
             _smokeOptions.Replace(nextOptions);
             _lastSmoke = next;
             AuditLog.ConfigReloaded("Smoke", prev, next);
@@ -707,10 +707,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             },
             JsonOpts);
 
-    private static SmokeOptions ToSmokeOptions(SmokeConfig opts) => new()
+    private static SmokeOptions ToSmokeOptions(SmokeConfig opts, int cacheTtlMinutes) => new()
     {
         Enabled = opts.Enabled,
-        CacheTtlMinutes = opts.CacheTtlMinutes,
+        CacheTtlMinutes = cacheTtlMinutes,
         StartupTimeoutSeconds = opts.StartupTimeoutSeconds,
     };
 
@@ -719,7 +719,6 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             new
             {
                 opts.Enabled,
-                opts.CacheTtlMinutes,
                 opts.StartupTimeoutSeconds,
             },
             JsonOpts);

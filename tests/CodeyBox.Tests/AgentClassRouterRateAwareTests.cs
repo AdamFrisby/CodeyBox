@@ -371,7 +371,6 @@ public sealed class AgentClassRouterRateAwareTests
             quotaFailures: null,
             burnEstimator: estimator,
             runningCounters: counters,
-            availability: null,
             budgetProvider: new StubBudgetProvider(20.0));
 
         var fits = await router.SummariseFitsAsync("frontier");

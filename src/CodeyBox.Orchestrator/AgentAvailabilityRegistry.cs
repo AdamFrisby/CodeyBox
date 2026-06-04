@@ -378,17 +378,17 @@ public enum SmokeExclusionSource
 /// exclusion model depend on this one — so neither side is pinned to the
 /// concrete registry type (interface segregation; loose coupling).</para>
 /// </summary>
-public interface ISmokeAvailabilityRegistry
+public interface ISmokeAvailabilityRegistry : IAgentEffectiveAvailabilityReader
 {
     /// <summary>Current routable verdict for an agent (shared with the read port).</summary>
-    AgentAvailability GetAvailability(AgentKind kind);
+    new AgentAvailability GetAvailability(AgentKind kind);
 
     /// <summary>
     /// Current verdict with smoke-gate exclusions ignored. Used by the dispatch
     /// smoke policy when the master smoke switch is disabled; non-smoke
     /// exclusions such as the fast-fail circuit breaker still apply.
     /// </summary>
-    AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind);
+    new AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind);
 
     /// <summary>Feeds a smoke-probe outcome from a specific source into availability.</summary>
     AvailabilityTransition MarkSmokeResult(

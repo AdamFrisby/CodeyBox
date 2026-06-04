@@ -279,6 +279,9 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
                 new() { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
             ],
         };
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
         return new AgentClassRouter(
             [cls],
             [new FakeProbe(AgentKind.Claude, 90.0)],
@@ -289,10 +292,7 @@ public sealed class OrchestratorBaselinePickupStampingTests : IDisposable
             quotaFailures: null,
             burnEstimator: null,
             runningCounters: null,
-            availability: new AgentAvailabilityRegistry(
-                new AvailabilityOptions(), TimeProvider.System,
-                NullLogger<AgentAvailabilityRegistry>.Instance),
-            inVmSmokeGate: gate);
+            dispatchAvailability: new AgentDispatchAvailability(availability, gate));
     }
 
     private sealed class StubResolver : IBaselineImageResolver

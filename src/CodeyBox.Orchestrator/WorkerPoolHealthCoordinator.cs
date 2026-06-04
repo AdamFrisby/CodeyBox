@@ -28,9 +28,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
-        IAgentAvailabilityRegistry? availability = null,
         IAgentRoutingReadiness? routingReadiness = null,
-        SmokeOptionsSnapshot? smokeOptions = null,
         IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _dispatcher = dispatcher;
@@ -39,8 +37,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _projects = projects;
         _queueController = queueController;
         _agents = agents;
-        _dispatchAvailability = dispatchAvailability
-            ?? AgentDispatchAvailability.CreateIfConfigured(availability, inVmSmokeGate: null, smokeOptions);
+        _dispatchAvailability = dispatchAvailability;
         _routingReadiness = routingReadiness;
         _log = log;
     }

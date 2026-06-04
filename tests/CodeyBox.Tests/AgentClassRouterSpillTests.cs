@@ -41,7 +41,7 @@ public sealed class AgentClassRouterSpillTests
             quotaFailures: failures,
             burnEstimator: null,
             runningCounters: null,
-            availability: registry);
+            dispatchAvailability: registry is null ? null : new AgentDispatchAvailability(registry));
     }
 
     private static AgentAvailabilityRegistry NewRegistry()

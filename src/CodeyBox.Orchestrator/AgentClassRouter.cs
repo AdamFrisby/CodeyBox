@@ -96,12 +96,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IQuotaFailureStore? quotaFailures = null,
         IAgentBurnEstimator? burnEstimator = null,
         IAgentRunningCounters? runningCounters = null,
-        IAgentAvailabilityRegistry? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
         InVmSmokeSandboxTarget? configuredSmokeTarget = null,
-        SmokeOptionsSnapshot? smokeOptions = null,
         IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _routingConfig = new RoutingConfig(
@@ -124,8 +121,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _budgetProvider = budgetProvider;
         _concurrencySnapshot = concurrencySnapshot;
         _configuredSmokeTarget = configuredSmokeTarget;
-        _dispatchAvailability = dispatchAvailability
-            ?? AgentDispatchAvailability.CreateIfConfigured(availability, inVmSmokeGate, smokeOptions);
+        _dispatchAvailability = dispatchAvailability;
     }
 
     /// <summary>

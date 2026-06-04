@@ -577,7 +577,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         IProjectRepository? projects = null,
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
-        IAgentAvailabilityRegistry? availability = null,
+        IAgentEffectiveAvailabilityReader? availability = null,
         IAgentRoutingReadiness? routingReadiness = null,
         SmokeOptionsSnapshot? smokeOptions = null)
         => new(
@@ -588,9 +588,8 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             projects ?? _projects,
             queueController,
             agents ?? new AgentRegistry([new DummyAgentRunner(AgentKind.Claude)]),
-            availability,
             routingReadiness,
-            smokeOptions);
+            availability is null ? null : new AgentDispatchAvailability(availability, smokeOptions: smokeOptions));
 
     private static WorkerPoolHealthWatchdogOptions StandardOptions(int maxAttempts = 2) => new()
     {
@@ -739,7 +738,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
                 : null);
     }
 
-    private sealed class FakeAvailabilityRegistry : IAgentAvailabilityRegistry
+    private sealed class FakeAvailabilityRegistry : IAgentAvailabilityRegistry, IAgentEffectiveAvailabilityReader
     {
         private readonly bool _available;
 
@@ -747,6 +746,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         public AgentAvailability GetAvailability(AgentKind kind) =>
             new(_available, _available ? null : "unavailable", null);
+
+        public AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind) =>
+            GetAvailability(kind);
 
         public AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration) =>
             new(false, !_available, _available ? null : "unavailable");

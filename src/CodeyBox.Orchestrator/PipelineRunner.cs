@@ -203,11 +203,9 @@ public sealed class PipelineRunner : IPipelineRunner
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         AgenticConflictResolver? agenticConflictResolver = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
         IAgentInvolvementStore? involvement = null,
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
         IRequiredBuildVerifier? requiredBuildVerifier = null,
-        SmokeOptionsSnapshot? smokeOptions = null,
         IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _sandboxes = sandboxes;
@@ -266,8 +264,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
-        _dispatchAvailability = dispatchAvailability
-            ?? AgentDispatchAvailability.CreateIfConfigured(availability, inVmSmokeGate, smokeOptions);
+        _dispatchAvailability = dispatchAvailability;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps

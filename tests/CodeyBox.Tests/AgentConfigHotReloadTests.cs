@@ -53,7 +53,7 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
-    public async Task SmokeHotReload_SwapsLiveSnapshot()
+    public async Task SmokeHotReload_SwapsLiveFieldsButKeepsStartupCacheTtl()
     {
         var initial = new CodeyBoxOptions
         {
@@ -98,7 +98,7 @@ public sealed class AgentConfigHotReloadTests
         });
 
         Assert.False(smoke.Enabled);
-        Assert.Equal(7, smoke.Current.CacheTtlMinutes);
+        Assert.Equal(15, smoke.Current.CacheTtlMinutes);
         Assert.Equal(3, smoke.Current.StartupTimeoutSeconds);
 
         await coordinator.StopAsync(CancellationToken.None);

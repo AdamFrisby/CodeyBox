@@ -1017,12 +1017,9 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IQuotaFailureStore>(),
         sp.GetService<IAgentBurnEstimator>(),
         sp.GetService<IAgentRunningCounters>(),
-        sp.GetService<IAgentAvailabilityRegistry>(),
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
-        sp.GetService<IInVmSmokeGate>(),
         configuredSmokeTarget,
-        sp.GetService<SmokeOptionsSnapshot>(),
         sp.GetService<IAgentDispatchAvailability>());
 });
 
@@ -1280,14 +1277,15 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
 // same singleton, exposed as the read/run-outcome/snapshot/reset surface.
 builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 // The smoke-mutator port the in-VM prober, coverage policy, and host smoke
 // services bind to — same singleton, exposed as the exclusion-taxonomy
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
 builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
-    sp.GetService<IAgentAvailabilityRegistry>(),
-    sp.GetService<ISmokeAvailabilityRegistry>(),
+    sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
     sp.GetRequiredService<SmokeOptionsSnapshot>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
@@ -1933,14 +1931,12 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     budgetProvider: sp.GetService<IAgentBudgetProvider>(),
     incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
     pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
-    inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     involvement: sp.GetService<IAgentInvolvementStore>(),
     // Resolve through the live IOptionsMonitor so PostAgentTransitionTimeout
     // edits applied via config hot-reload take effect on the next bounded
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
-    smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
@@ -2055,9 +2051,7 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IAgentRegistry>(),
-    sp.GetRequiredService<IAgentAvailabilityRegistry>(),
     sp.GetRequiredService<IAgentRoutingReadiness>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>(),
     sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());

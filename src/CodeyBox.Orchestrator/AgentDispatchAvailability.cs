@@ -9,9 +9,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public interface IAgentDispatchAvailability
 {
-    /// <summary>True when either availability storage or an in-VM gate is wired.</summary>
-    bool IsWired { get; }
-
     /// <summary>
     /// Returns the effective availability for dispatch. When smoke is enabled,
     /// the in-VM gate owns the read/probe/re-read sequence if present. When the
@@ -30,26 +27,33 @@ public interface IAgentDispatchAvailability
     AgentAvailability? GetAvailability(AgentKind kind);
 }
 
+/// <summary>
+/// Read-only availability view used by dispatch policy. The default read
+/// includes every exclusion; the smoke-disabled read keeps non-smoke
+/// exclusions such as the fast-fail breaker while ignoring smoke-gate sources.
+/// </summary>
+public interface IAgentEffectiveAvailabilityReader
+{
+    AgentAvailability GetAvailability(AgentKind kind);
+
+    AgentAvailability GetAvailabilityWithoutSmokeGateExclusions(AgentKind kind);
+}
+
 public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
 {
-    private readonly IAgentAvailabilityRegistry? _availability;
-    private readonly ISmokeAvailabilityRegistry? _smokeAvailability;
+    private readonly IAgentEffectiveAvailabilityReader? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
 
     public AgentDispatchAvailability(
-        IAgentAvailabilityRegistry? availability = null,
-        ISmokeAvailabilityRegistry? smokeAvailability = null,
+        IAgentEffectiveAvailabilityReader? availability = null,
         IInVmSmokeGate? inVmSmokeGate = null,
         SmokeOptionsSnapshot? smokeOptions = null)
     {
         _availability = availability;
-        _smokeAvailability = smokeAvailability ?? availability as ISmokeAvailabilityRegistry;
         _inVmSmokeGate = inVmSmokeGate;
         _smokeOptions = smokeOptions;
     }
-
-    public bool IsWired => _availability is not null || _inVmSmokeGate is not null;
 
     public async Task<AgentAvailability?> EnsureAvailableAsync(
         AgentKind kind,
@@ -70,24 +74,10 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
         if (_availability is null)
             return null;
 
-        if (SmokeDisabled && _smokeAvailability is not null)
-            return _smokeAvailability.GetAvailabilityWithoutSmokeGateExclusions(kind);
+        if (SmokeDisabled)
+            return _availability.GetAvailabilityWithoutSmokeGateExclusions(kind);
 
         return _availability.GetAvailability(kind);
-    }
-
-    public static IAgentDispatchAvailability? CreateIfConfigured(
-        IAgentAvailabilityRegistry? availability = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
-        SmokeOptionsSnapshot? smokeOptions = null)
-    {
-        return availability is null && inVmSmokeGate is null
-            ? null
-            : new AgentDispatchAvailability(
-                availability,
-                availability as ISmokeAvailabilityRegistry,
-                inVmSmokeGate,
-                smokeOptions);
     }
 
     private bool SmokeDisabled => _smokeOptions?.Enabled == false;

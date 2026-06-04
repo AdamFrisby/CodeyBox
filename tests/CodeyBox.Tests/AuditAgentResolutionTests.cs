@@ -272,8 +272,10 @@ public sealed class AuditAgentResolutionTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            inVmSmokeGate: inVmSmokeGate,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: availability is null && inVmSmokeGate is null
+                ? null
+                : new AgentDispatchAvailability(availability, inVmSmokeGate));
 
         return new TestPipelineWithCapture(pipeline, store, claudeAgent, webhooks);
     }
