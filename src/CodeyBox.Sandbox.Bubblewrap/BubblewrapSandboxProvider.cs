@@ -3,6 +3,7 @@ using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Bubblewrap;
 
@@ -65,6 +66,8 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        spec = SandboxConventions.WithTimingEnvironment(spec);
+
         var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
         var timingItemId = spec.TimingWorkItemId.GetValueOrDefault();
         var timingPhase = spec.TimingPhase ?? "work";

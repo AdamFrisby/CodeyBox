@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
@@ -101,5 +102,25 @@ public sealed class ProcessSandboxProviderTests : IDisposable
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Warning
             && e.Message.Contains("UNSAFE provider", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TimingWorkItemId_IsExposedToExecEnvironment()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        var itemId = WorkItemId.New();
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = itemId,
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", $"printf '%s' \"${SandboxConventions.WorkItemIdEnvironmentVariable}\""],
+        });
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal(itemId.ToString(), result.Stdout.TrimEnd('\r', '\n'));
     }
 }

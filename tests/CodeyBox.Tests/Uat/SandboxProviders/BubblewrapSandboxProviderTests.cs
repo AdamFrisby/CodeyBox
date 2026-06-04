@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Tests;
 
@@ -75,6 +76,36 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Warning
             && e.Message.Contains("network policy is NOT enforced", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TimingWorkItemId_IsExposedToExecEnvironment()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var fakeBwrap = Path.Combine(_workspace, "fake-env-bwrap.sh");
+        WriteExecutableScript(
+            fakeBwrap,
+            "#!/bin/sh\n" +
+            $"printf '%s' \"${SandboxConventions.WorkItemIdEnvironmentVariable}\"\n");
+        var provider = new BubblewrapSandboxProvider(
+            new BubblewrapSandboxOptions
+            {
+                BwrapBinary = fakeBwrap,
+                ReadOnlyHostBinds = [],
+            },
+            new RecordingLogger<BubblewrapSandboxProvider>());
+        var itemId = WorkItemId.New();
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = itemId,
+        });
+
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec { Argv = ["ignored"] });
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal(itemId.ToString(), result.Stdout.TrimEnd('\r', '\n'));
     }
 
     [Fact]

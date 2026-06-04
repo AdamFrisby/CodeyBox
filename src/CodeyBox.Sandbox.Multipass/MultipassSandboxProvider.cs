@@ -46,7 +46,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -258,6 +258,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        spec = SandboxConventions.WithTimingEnvironment(spec);
+
         // Preflight: refuse to launch when the host is out of disk. Without
         // this check, multipass / qemu happily start the VM, the install
         // runcmd or the orchestrator's first big artifact write hits
@@ -431,6 +433,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var result = new List<(WorkItemId, IShutdownTeardownSandbox)>(entries.Count);
         foreach (var entry in entries)
             result.Add((entry.WorkItemId, entry.Sandbox));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
+    {
+        var entries = _activeSandboxOwners.Values.ToList();
+        var result = new List<ActiveSandboxProgress>(entries.Count);
+        foreach (var entry in entries)
+            result.Add(new ActiveSandboxProgress(entry.WorkItemId, entry.Sandbox.Id, Status: "active"));
         return result;
     }
 
@@ -2921,16 +2933,35 @@ test "$work" = present && test "$exec_wrapper" = present
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
-        WorkItemId? workItemId = null) =>
-        MultipassDaemonRetry.RunWithRetryAsync(
+        WorkItemId? workItemId = null)
+    {
+        var environment = BuildHostProcessEnvironment(workItemId);
+        return MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            ctInner => _runner.RunAsync(argv, stdin, ctInner),
+            ctInner => _runner.RunAsync(argv, stdin, ctInner, environment: environment),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             workItemId,
             ct,
             _daemonRetryPolicy);
+    }
+
+    internal static IReadOnlyDictionary<string, string>? BuildHostProcessEnvironment(WorkItemId? workItemId)
+    {
+        if (workItemId is not { } owner)
+            return null;
+
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is string key && entry.Value is string value)
+                environment[key] = value;
+        }
+
+        environment[SandboxConventions.WorkItemIdEnvironmentVariable] = owner.ToString();
+        return environment;
+    }
 
     private async Task<ProcessRunResult> RunProvisioningAsync(
         MultipassSandboxOptions opts,
@@ -3952,11 +3983,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
     private async Task TransferFileToVmAsync(string hostPath, string vmRelativePath, string description, CancellationToken ct)
     {
+        var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
         var tx = await MultipassRetry.RunWithRetryAsync(
             ctInner => _runner.RunAsync(
                 [_opts.MultipassBinary, "transfer", hostPath, $"{_name}:{vmRelativePath}"],
                 stdin: null,
-                ct: ctInner),
+                ct: ctInner,
+                environment: environment),
             _log,
             description,
             ct);
@@ -3996,16 +4029,27 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         Action<string>? stdoutChunkCallback = null,
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
-        int? maxStderrBytes = null) =>
-        MultipassDaemonRetry.RunWithRetryAsync(
+        int? maxStderrBytes = null)
+    {
+        var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
+        return MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback, maxStdoutBytes, maxStderrBytes),
+            ctInner => _runner.RunAsync(
+                argv,
+                stdin,
+                ctInner,
+                stdoutChunkCallback,
+                stderrChunkCallback,
+                maxStdoutBytes,
+                maxStderrBytes,
+                environment),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             _workItemId,
             ct,
             _daemonRetryPolicy);
+    }
 
     public async ValueTask DisposeAsync()
     {

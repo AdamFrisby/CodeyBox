@@ -66,7 +66,12 @@ internal sealed class RecordingMultipassRunner : IProcessRunner
         int? maxStderrBytes = null,
         IReadOnlyDictionary<string, string>? environment = null)
     {
-        Calls.Enqueue(new MultipassCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes));
+        Calls.Enqueue(new MultipassCall(
+            argv.ToArray(),
+            stdin,
+            maxStdoutBytes,
+            maxStderrBytes,
+            environment is null ? null : new Dictionary<string, string>(environment, StringComparer.Ordinal)));
         return await _handler(argv, stdin, ct);
     }
 }
@@ -75,7 +80,8 @@ internal sealed record MultipassCall(
     IReadOnlyList<string> Argv,
     string? Stdin,
     int? MaxStdoutBytes = null,
-    int? MaxStderrBytes = null);
+    int? MaxStderrBytes = null,
+    IReadOnlyDictionary<string, string>? Environment = null);
 
 internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
 {

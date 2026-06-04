@@ -172,6 +172,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static readonly TimeSpan DefaultCapRetryRecheckInterval = TimeSpan.FromSeconds(15);
 
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan SpawnPacingPausePollInterval = TimeSpan.FromMilliseconds(50);
 
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
@@ -756,7 +757,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         if (wait > TimeSpan.Zero)
                         {
                             AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
-                            try { await Task.Delay(wait, stoppingToken); }
+                            try { await WaitForSpawnPacingDelayAsync(wait, stoppingToken); }
                             catch (OperationCanceledException)
                             {
                                 _activeItems.TryRemove(id.Value, out _);
@@ -991,6 +992,25 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return true;
     }
 
+    private async Task WaitForSpawnPacingDelayAsync(TimeSpan wait, CancellationToken stoppingToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + wait;
+        while (true)
+        {
+            if (IsDispatchPaused || IsQueuePaused)
+                return;
+
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                return;
+
+            var delay = remaining < SpawnPacingPausePollInterval
+                ? remaining
+                : SpawnPacingPausePollInterval;
+            await Task.Delay(delay, stoppingToken);
+        }
+    }
+
     // Exposed as internal so tests can invoke recovery in isolation without
     // starting the full worker loop.
     internal Task ReplayPendingForTestAsync(CancellationToken ct) => ReplayPendingAsync(ct);
@@ -1007,6 +1027,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
+    internal void SetLastSpawnAtForTest(DateTimeOffset at)
+    {
+        lock (_spawnTimeLock) { _lastSpawnAtTicks = at.Ticks; }
+    }
 
     internal IReadOnlyCollection<WorkItemId> ActiveWorkItemIdsForHealthCheck() =>
         _activeItems.Keys.ToList();
