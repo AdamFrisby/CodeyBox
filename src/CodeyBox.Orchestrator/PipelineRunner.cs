@@ -4395,7 +4395,8 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (_smokeOptions?.Enabled == false)
-            return SmokeDisabledAvailabilityView.GetOrAvailable(_availability, kind);
+            return _availability?.GetAvailability(kind, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions)
+                ?? new AgentAvailability(true, null, null);
 
         // The in-VM gate (when wired) owns the read→probe→re-read and returns the
         // reconciled availability — including the exclusion Reason — so callers

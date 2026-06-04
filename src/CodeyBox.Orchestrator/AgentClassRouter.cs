@@ -989,7 +989,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         CancellationToken ct)
     {
         if (_smokeOptions?.Enabled == false)
-            return SmokeDisabledAvailabilityView.GetOrNull(_availability, kind);
+            return _availability?.GetAvailability(kind, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions);
 
         if (_inVmSmokeGate is not null)
             return await _inVmSmokeGate.EnsureAvailableAsync(kind, target, ct);

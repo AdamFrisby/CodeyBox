@@ -132,6 +132,23 @@ public sealed class InVmSmokeProbeServiceTests
     }
 
     [Fact]
+    public async Task PeriodicSweep_StaysAlive_WhenGateStartsDisabledAndLaterEnables()
+    {
+        var gate = new CountingGate { Enabled = false };
+        var service = new InVmSmokeProbeService(
+            gate,
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
+            NullLogger<InVmSmokeProbeService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        gate.Enabled = true;
+        var reachedOne = await gate.WaitForAtLeastAsync(1, TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        Assert.True(reachedOne, "expected the periodic service to observe the live gate after it was re-enabled");
+    }
+
+    [Fact]
     public async Task StartupSweep_UsesProjectWorkTarget_WhenSmokeProfileUnset()
     {
         var gate = new CountingGate();
@@ -259,7 +276,7 @@ public sealed class InVmSmokeProbeServiceTests
         private int _count;
         private int _target = int.MaxValue;
 
-        public bool Enabled => true;
+        public bool Enabled { get; set; } = true;
         public int SweepCount { get { lock (_sync) return _count; } }
         public List<InVmSmokeSandboxTarget> Targets { get; } = [];
 

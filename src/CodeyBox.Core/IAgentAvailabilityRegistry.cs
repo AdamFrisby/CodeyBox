@@ -32,11 +32,33 @@ public interface IAgentAvailabilityRegistry
     /// <summary>Whether the agent is currently routable, with an exclusion reason when not.</summary>
     AgentAvailability GetAvailability(AgentKind kind);
 
+    /// <summary>
+    /// Whether the agent is currently routable under the requested read mode.
+    /// Smoke-disabled dispatch paths use <see cref="AgentAvailabilityReadMode.IgnoreSmokeGateExclusions"/>
+    /// so host-smoke, in-VM-smoke, and missing-probe benches do not reject
+    /// dispatch while non-smoke availability exclusions such as the fast-fail
+    /// circuit breaker still apply.
+    /// </summary>
+    AgentAvailability GetAvailability(AgentKind kind, AgentAvailabilityReadMode mode);
+
     /// <summary>Feeds a real agent-run outcome into the fast-fail circuit breaker.</summary>
     AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration);
 
     /// <summary>Snapshot of every tracked agent's current state.</summary>
     IReadOnlyList<AgentAvailabilitySnapshot> Snapshot();
+}
+
+/// <summary>Availability read semantics for routing and dispatch consumers.</summary>
+public enum AgentAvailabilityReadMode
+{
+    /// <summary>Apply every recorded exclusion source.</summary>
+    AllExclusions,
+
+    /// <summary>
+    /// Ignore exclusions created by smoke gates while retaining non-smoke
+    /// exclusions such as the fast-fail circuit breaker.
+    /// </summary>
+    IgnoreSmokeGateExclusions,
 }
 
 /// <summary>

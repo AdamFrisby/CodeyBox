@@ -36,7 +36,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAvailabilityExclusionFilter
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -60,24 +60,22 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     /// </summary>
     public AgentAvailability GetAvailability(AgentKind kind)
     {
-        if (!_entries.TryGetValue(kind, out var entry))
-            return new AgentAvailability(true, null, null);
-
-        lock (entry.Sync)
-        {
-            var reason = entry.CombinedReason();
-            return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
-        }
+        return GetAvailability(kind, AgentAvailabilityReadMode.AllExclusions);
     }
 
-    public AgentAvailability GetAvailabilityIgnoringSmokeGateExclusions(AgentKind kind)
+    public AgentAvailability GetAvailability(AgentKind kind, AgentAvailabilityReadMode mode)
     {
         if (!_entries.TryGetValue(kind, out var entry))
             return new AgentAvailability(true, null, null);
 
         lock (entry.Sync)
         {
-            var reason = entry.CombinedReason(IsNonSmokeExclusion);
+            var reason = mode switch
+            {
+                AgentAvailabilityReadMode.AllExclusions => entry.CombinedReason(),
+                AgentAvailabilityReadMode.IgnoreSmokeGateExclusions => entry.CombinedReason(IsNonSmokeExclusion),
+                _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown availability read mode."),
+            };
             return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
@@ -338,27 +336,6 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         source is not SmokeExclusionSource.HostSmoke
             and not SmokeExclusionSource.InVmSmoke
             and not SmokeExclusionSource.MissingProbe;
-}
-
-internal interface IAgentAvailabilityExclusionFilter
-{
-    AgentAvailability GetAvailabilityIgnoringSmokeGateExclusions(AgentKind kind);
-}
-
-internal static class SmokeDisabledAvailabilityView
-{
-    public static AgentAvailability GetOrAvailable(IAgentAvailabilityRegistry? availability, AgentKind kind) =>
-        availability is null
-            ? new AgentAvailability(true, null, null)
-            : Get(availability, kind);
-
-    public static AgentAvailability? GetOrNull(IAgentAvailabilityRegistry? availability, AgentKind kind) =>
-        availability is null ? null : Get(availability, kind);
-
-    private static AgentAvailability Get(IAgentAvailabilityRegistry availability, AgentKind kind) =>
-        availability is IAgentAvailabilityExclusionFilter filter
-            ? filter.GetAvailabilityIgnoringSmokeGateExclusions(kind)
-            : availability.GetAvailability(kind);
 }
 
 /// <summary>

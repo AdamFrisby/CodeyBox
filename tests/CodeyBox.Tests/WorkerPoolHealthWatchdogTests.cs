@@ -748,6 +748,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         public AgentAvailability GetAvailability(AgentKind kind) =>
             new(_available, _available ? null : "unavailable", null);
 
+        public AgentAvailability GetAvailability(AgentKind kind, AgentAvailabilityReadMode mode) =>
+            GetAvailability(kind);
+
         public AvailabilityTransition RecordRunOutcome(AgentKind kind, bool success, TimeSpan duration) =>
             new(false, !_available, _available ? null : "unavailable");
 

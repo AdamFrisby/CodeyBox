@@ -1,3 +1,4 @@
+using System.Reflection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -133,6 +134,30 @@ public sealed class StartupSmokeProbeTests
     }
 
     [Fact]
+    public async Task ProbeQueuedWhileEnabled_NoOps_WhenSmokeDisabledBeforeProbeRuns()
+    {
+        var webhooks = new CapturingWebhookDispatcher();
+        var probe = new FakeSmokeProbe(AgentKind.Claude, shouldPass: false);
+        var snapshot = new SmokeOptionsSnapshot(new SmokeOptions
+        {
+            Enabled = true,
+            StartupTimeoutSeconds = 5,
+        });
+        var svc = new StartupSmokeProbeService(
+            new ConstantCredentialProvider(AnyClaudeCred),
+            [probe],
+            webhooks,
+            snapshot,
+            NullLogger<StartupSmokeProbeService>.Instance);
+
+        snapshot.Replace(new SmokeOptions { Enabled = false, StartupTimeoutSeconds = 5 });
+        await InvokeProbeOneAsync(svc, probe);
+
+        Assert.Equal(0, probe.CallCount);
+        Assert.Empty(webhooks.Events);
+    }
+
+    [Fact]
     public async Task StartAsync_LogsEffectivePosture_AndPartialInVmDisableWarning()
     {
         var webhooks = new CapturingWebhookDispatcher();
@@ -210,5 +235,14 @@ public sealed class StartupSmokeProbeTests
         await svc.StartupTask;
 
         Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+    }
+
+    private static Task InvokeProbeOneAsync(StartupSmokeProbeService service, IAgentSmokeProbe probe)
+    {
+        var method = typeof(StartupSmokeProbeService).GetMethod(
+            "ProbeOneAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+        return (Task)method.Invoke(service, [probe, CancellationToken.None])!;
     }
 }

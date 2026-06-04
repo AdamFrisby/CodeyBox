@@ -239,7 +239,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
             return false;
 
         var availability = _smokeOptions?.Enabled == false
-            ? SmokeDisabledAvailabilityView.GetOrNull(_availability, agent)
+            ? _availability?.GetAvailability(agent, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions)
             : _availability?.GetAvailability(agent);
         if (availability is { Available: false })
             return false;

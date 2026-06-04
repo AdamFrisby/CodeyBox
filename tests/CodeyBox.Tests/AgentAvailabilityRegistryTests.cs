@@ -203,7 +203,6 @@ public sealed class AgentAvailabilityRegistryTests
     public void SmokeDisabledView_IgnoresSmokeSourcesButKeepsFastFail()
     {
         var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
-        var filtered = (IAgentAvailabilityExclusionFilter)reg;
 
         reg.MarkSmokeResult(
             Claude,
@@ -216,12 +215,12 @@ public sealed class AgentAvailabilityRegistryTests
         reg.ExcludeForMissingProbe(Claude, "no in-VM smoke probe registered");
 
         Assert.False(reg.GetAvailability(Claude).Available);
-        Assert.True(filtered.GetAvailabilityIgnoringSmokeGateExclusions(Claude).Available);
+        Assert.True(reg.GetAvailability(Claude, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions).Available);
 
         for (var i = 0; i < 3; i++)
             reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
 
-        var av = filtered.GetAvailabilityIgnoringSmokeGateExclusions(Claude);
+        var av = reg.GetAvailability(Claude, AgentAvailabilityReadMode.IgnoreSmokeGateExclusions);
         Assert.False(av.Available);
         Assert.Contains("fast-fail circuit breaker", av.Reason);
         Assert.DoesNotContain("smoke failed", av.Reason);
