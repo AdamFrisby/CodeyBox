@@ -67,6 +67,47 @@ internal sealed class SmokeHangingHandler : HttpMessageHandler
     }
 }
 
+internal sealed class PausingTargetInVmSmokeGate : IInVmSmokeGate
+{
+    private readonly AgentKind _pausedKind;
+    private readonly string? _pausedProfile;
+
+    public PausingTargetInVmSmokeGate(AgentKind pausedKind, string? pausedProfile = null)
+    {
+        _pausedKind = pausedKind;
+        _pausedProfile = pausedProfile;
+    }
+
+    public bool Enabled => true;
+    public List<(AgentKind Kind, InVmSmokeSandboxTarget Target)> Calls { get; } = [];
+
+    public Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        Calls.Add((kind, target));
+        var paused = kind == _pausedKind
+            && (_pausedProfile is null
+                || string.Equals(target.NetworkProfile, _pausedProfile, StringComparison.Ordinal));
+        return Task.FromResult(paused
+            ? new AgentAvailability(
+                false,
+                "paused by operator: maintenance",
+                null,
+                AgentAvailabilityCause.OperatorPaused)
+            : new AgentAvailability(true, null, null));
+    }
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+        Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+}
+
 // ── Shared probe fakes ────────────────────────────────────────────────────────
 
 /// <summary>

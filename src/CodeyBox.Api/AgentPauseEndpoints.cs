@@ -40,7 +40,7 @@ internal static class AgentPauseEndpoints
         {
             expiresAt = ResolveExpiresAt(body);
         }
-        catch (ArgumentException ex)
+        catch (Exception ex) when (ex is ArgumentException or OverflowException)
         {
             return Results.BadRequest(new { error = ex.Message });
         }

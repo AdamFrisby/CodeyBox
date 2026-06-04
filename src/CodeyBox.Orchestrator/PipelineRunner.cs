@@ -529,6 +529,12 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!smokeAvailability.Available)
         {
             var reason = smokeAvailability.Reason ?? "in-VM smoke gate excluded agent";
+            if (IsOperatorPaused(smokeAvailability))
+            {
+                await TransitionWaitingForAgentResumeAsync(item, reason, project);
+                return;
+            }
+
             // The exclusion category isn't carried by the availability snapshot
             // (the registry collapses sources into a single reason string), so
             // we default to Unknown here. The underlying probe still recorded
@@ -1977,7 +1983,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!smokeAvailability.Available)
             {
                 var availabilityReason = smokeAvailability.Reason ?? "unavailable";
-                if (AgentDispatchAvailability.IsPausedVerdict(smokeAvailability))
+                if (IsOperatorPaused(smokeAvailability))
                 {
                     pausedCandidate ??= (candidate.Kind, availabilityReason);
                     var pausedSkipReason = $"{candidate.Kind.Value}: {availabilityReason}";
@@ -4759,7 +4765,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         preferredAvailability = await EnsureAgentSmokeAvailableAsync(
             preferredKind.Value, auditSmokeTarget, ct);
-        if (AgentDispatchAvailability.IsPausedVerdict(preferredAvailability))
+        if (IsOperatorPaused(preferredAvailability))
         {
             preferredPauseReason = preferredAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
             _log.LogInformation(
@@ -4888,7 +4894,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private string? GetAgentPausedReason(AgentKind agent)
     {
         var availability = _dispatchAvailability?.GetAvailability(agent);
-        return AgentDispatchAvailability.IsPausedVerdict(availability)
+        return IsOperatorPaused(availability)
             ? availability!.Reason ?? AgentDispatchAvailability.PausedReasonPrefix
             : null;
     }
@@ -5136,6 +5142,9 @@ public sealed class PipelineRunner : IPipelineRunner
             : new AgentAvailability(true, null, null);
     }
 
+    private static bool IsOperatorPaused(AgentAvailability? availability) =>
+        availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
+
     private static InVmSmokeSandboxTarget ResolvePhaseSmokeTarget(
         Project project,
         string phase,
@@ -5331,7 +5340,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var smokeAvailability = await EnsureAgentSmokeAvailableAsync(initialRunner.Kind, fallbackSmokeTarget, ct);
             if (!smokeAvailability.Available)
             {
-                if (AgentDispatchAvailability.IsPausedVerdict(smokeAvailability))
+                if (IsOperatorPaused(smokeAvailability))
                 {
                     var pausedReason = smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
                     throw new AgentPausedException(phase, initialRunner.Kind, pausedReason);
@@ -5656,7 +5665,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var smokeAvailability = await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
             if (!smokeAvailability.Available)
             {
-                if (AgentDispatchAvailability.IsPausedVerdict(smokeAvailability))
+                if (IsOperatorPaused(smokeAvailability))
                 {
                     var pausedReason = SingleLineSummary(
                         smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix);
@@ -7647,7 +7656,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 ct, hostShutdownToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException
-            && ex is not SandboxProvisioningDeferredException)
+            && ex is not SandboxProvisioningDeferredException
+            && ex is not AgentPausedException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",
@@ -7874,7 +7884,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var smokeAvailability = await EnsureAgentSmokeAvailableAsync(runner.Kind, smokeTarget, ct);
             if (!smokeAvailability.Available)
             {
-                if (AgentDispatchAvailability.IsPausedVerdict(smokeAvailability))
+                if (IsOperatorPaused(smokeAvailability))
                 {
                     var pausedReason = smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
                     throw new AgentPausedException(ConflictReworkPhaseKey, runner.Kind, pausedReason);

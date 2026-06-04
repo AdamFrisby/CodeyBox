@@ -96,6 +96,32 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task Router_PayPerApiFallback_SkipsPausedMemberAndDispatchesLowerEligibleMember()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
+        var claude = PayPerApiMember(AgentKind.Claude, score: 100);
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members =
+                [
+                    PayPerApiMember(AgentKind.Codex, score: 150),
+                    claude,
+                ],
+            });
+        router.MarkExhausted(claude, TimeSpan.FromMinutes(5));
+
+        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task Worker_OnlyEligiblePausedAgent_ParksThenSchedulerRequeuesOnResume()
     {
         using var pauses = MakeController();
@@ -260,6 +286,77 @@ public sealed class AgentPauseTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_RunsRealPipelineAndPublishesPause()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+                DurationSeconds = 3600,
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var done = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, done!.State);
+        var paused = await pauses.GetAgentStateAsync(AgentKind.Claude);
+        Assert.NotNull(paused);
+        Assert.Equal("reserve quota", paused!.PausedReason);
+        Assert.Equal($"work-item:{item.Id}", paused.PausedBy);
+        Assert.NotNull(paused.ExpiresAt);
+        Assert.Contains(webhooks.Events, e => e.Event == "agent.paused");
+    }
+
+    [Fact]
+    public async Task AgentPauseRetryScheduler_StartsAndWakesWaitingItemsOnResumeSignal()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "operator reserve", "test");
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        using var scheduler = new AgentPauseRetryScheduler(
+            store,
+            queue,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance,
+            signal: pauses);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            await Task.Delay(100);
+            var item = Item(classId: null) with
+            {
+                State = WorkItemState.WaitingForAgentResume,
+                LastError = "waiting: agent paused: paused by operator: operator reserve",
+                QuotaRetryFrom = "work",
+            };
+            await store.CreateAsync(item);
+
+            await pauses.ResumeAsync(AgentKind.Claude, "test", "operator ready");
+
+            var resumed = await WaitForStateAsync(store, item.Id, WorkItemState.Queued);
+            Assert.NotNull(resumed);
+            Assert.Null(resumed!.QuotaRetryFrom);
+            Assert.True(await WaitForQueueCountAsync(queue, 1));
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
     [Theory]
     [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]
@@ -323,6 +420,13 @@ public sealed class AgentPauseTests : IDisposable
         QualityScore = 100,
     };
 
+    private static AgentMembership PayPerApiMember(AgentKind agent, int score) => new()
+    {
+        Agent = agent,
+        Billing = AgentBilling.PayPerApi,
+        QualityScore = score,
+    };
+
     private static WorkItem Item(string? classId) => new()
     {
         Id = WorkItemId.New(),
@@ -356,6 +460,18 @@ public sealed class AgentPauseTests : IDisposable
             await Task.Delay(25);
         }
         return await store.GetAsync(id);
+    }
+
+    private static async Task<bool> WaitForQueueCountAsync(InMemoryTaskQueue queue, int count)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!cts.IsCancellationRequested)
+        {
+            if (queue.Count == count)
+                return true;
+            await Task.Delay(25);
+        }
+        return queue.Count == count;
     }
 
     private sealed class CapturingPipeline(IWorkItemStore store) : IPipelineRunner

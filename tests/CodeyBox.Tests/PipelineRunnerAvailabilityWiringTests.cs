@@ -322,6 +322,26 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task DirectAgentPickup_PausedVerdict_ParksWithoutSmokeFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Codex);
+        using var fix = BuildPipeline(seed, inVmSmokeGate: pauseGate);
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal("work", final.QuotaRetryFrom);
+        Assert.Contains("waiting: agent paused", final.LastError);
+        Assert.Equal(0, fix.Codex.CallCount);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
     public async Task DirectAgentPickup_SmokeDisabledGlobally_SkipsInVmGate_AndInvokesRunner()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

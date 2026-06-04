@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -32,6 +33,73 @@ public sealed class WorkItemRecoveryPolicyTests
         };
 
         Assert.True(WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void AgentControlWorkingItem_WithEmptyOrWhitespaceCheckpoint_IsRerunnableWithoutPreempt(
+        string preemptCheckpoint)
+    {
+        var item = MakeAgentControlItem(WorkItemState.Working) with
+        {
+            PreemptCheckpoint = preemptCheckpoint,
+        };
+
+        Assert.True(WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item));
+    }
+
+    [Fact]
+    public void BuildAgentControlRerun_RequeuesAndPreservesControlSpec()
+    {
+        var item = MakeAgentControlItem(WorkItemState.Working) with
+        {
+            LastError = "worker disappeared",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            RecoveryAttempts = 2,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildAgentControlRerun(item, recoveryAttempts: 3);
+
+        Assert.Equal(WorkItemState.Queued, recovered.State);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.StartedAt);
+        Assert.Same(item.AgentControl, recovered.AgentControl);
+    }
+
+    [Fact]
+    public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        try
+        {
+            var svc = new OrchestratorService(
+                new InMemoryTaskQueue(),
+                store,
+                new FakePipelineRunner(store),
+                new CancellationRegistry(CancellationToken.None),
+                new OrchestratorOptions { MaxRecoveryAttempts = 3 },
+                NullLogger<OrchestratorService>.Instance);
+            var item = MakeAgentControlItem(WorkItemState.Working) with
+            {
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                RecoveryAttempts = 1,
+            };
+
+            var recovered = svc.TryBuildRecoveredStateForTest(item);
+
+            Assert.NotNull(recovered);
+            Assert.Equal(WorkItemState.Queued, recovered!.State);
+            Assert.Equal(2, recovered.RecoveryAttempts);
+            Assert.Null(recovered.StartedAt);
+            Assert.Same(item.AgentControl, recovered.AgentControl);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+        }
     }
 
     [Theory]
@@ -149,5 +217,16 @@ public sealed class WorkItemRecoveryPolicyTests
         Title = "t",
         Prompt = "p",
         State = state,
+    };
+
+    private static WorkItem MakeAgentControlItem(WorkItemState state) => MakeItem(state) with
+    {
+        JobType = JobType.AgentControl,
+        AgentControl = new AgentControlSpec
+        {
+            Action = AgentControlAction.Pause,
+            Agent = AgentKind.Claude.Value,
+            Reason = "reserve quota",
+        },
     };
 }

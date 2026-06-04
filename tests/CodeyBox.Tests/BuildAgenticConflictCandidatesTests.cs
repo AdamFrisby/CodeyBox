@@ -469,6 +469,39 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         Assert.Null(call.Target.BaselineRef);
     }
 
+    [Fact]
+    public async Task PausedPrimaryResolver_IsSkippedAndClassFallbackIsUsed()
+    {
+        var primary = new FakeAgentRunner(AgentKind.Claude);
+        var codex = new FakeAgentRunner(AgentKind.Codex);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Claude, "audit-agent-profile");
+
+        var fixture = BuildFixture(
+            runners: [primary, codex],
+            members:
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                AuditAgent = "audit-agent-profile",
+            },
+            inVmSmokeGate: pauseGate);
+
+        var item = NewItem(AgentKind.Claude);
+        await fixture.Store.CreateAsync(item);
+
+        var candidates = await fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+            item, fixture.Project, primary, CancellationToken.None);
+
+        var candidate = Assert.Single(candidates);
+        Assert.Equal(AgentKind.Codex, candidate.Runner.Kind);
+        Assert.Contains(pauseGate.Calls, c =>
+            c.Kind == AgentKind.Claude &&
+            c.Target.NetworkProfile == "audit-agent-profile");
+    }
+
     // ── Fixture and helpers ────────────────────────────────────────────────
 
     private Fixture BuildFixture(

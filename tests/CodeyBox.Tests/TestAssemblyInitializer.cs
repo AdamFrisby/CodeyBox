@@ -29,6 +29,10 @@ internal static class TestAssemblyInitializer
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
             Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
 
+        ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
+        if (workerThreads < 128)
+            ThreadPool.SetMinThreads(128, completionPortThreads);
+
         SetIfMissing("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing(CredentialFileWatcherSettings.EnvironmentVariable, "false");

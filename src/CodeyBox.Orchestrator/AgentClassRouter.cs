@@ -388,6 +388,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
 
         var pausedRejected = new List<(AgentKind Agent, string Reason)>();
+        var pausedMembers = new HashSet<AgentMembership>();
 
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
         // Track subscription members benched purely by the availability gate
@@ -453,10 +454,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             var availability = await GetGatedAvailabilityAsync(member.Agent, smokeTarget, ct);
             if (availability is { Available: false })
             {
-                if (AgentDispatchAvailability.IsPausedVerdict(availability))
+                if (IsOperatorPaused(availability))
                 {
                     var pausedReason = availability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
                     pausedRejected.Add((member.Agent, pausedReason));
+                    pausedMembers.Add(member);
                     if (commitDispatchSideEffects)
                         _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
@@ -715,6 +717,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
             if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
+            if (pausedMembers.Contains(candidate.Member)) continue;
             var fallback = candidate.Member;
             if (slotGate is not null && !slotGate.TryReserve(fallback.Agent))
             {
@@ -1138,7 +1141,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (member.QualityScore < item.MinModelScore) continue;
             if (!MemberCoversRequiredCapabilities(member, item.RequiredCapabilities)) continue;
             var availability = _dispatchAvailability?.GetAvailability(member.Agent);
-            if (AgentDispatchAvailability.IsPausedVerdict(availability))
+            if (IsOperatorPaused(availability))
                 continue;
 
             AgentQuotaSnapshot snapshot;
@@ -1585,6 +1588,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
         return true;
     }
+
+    private static bool IsOperatorPaused(AgentAvailability? availability) =>
+        availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
 
     private static string DescribeIneligibility(AgentMembership member, WorkItem item)
     {

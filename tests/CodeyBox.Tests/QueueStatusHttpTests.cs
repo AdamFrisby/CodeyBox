@@ -95,10 +95,43 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task AgentPauseEndpoints_AcceptDurationStringAndFutureExpiresAt()
+    {
+        var durationPause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "outage", duration = "6h" });
+        Assert.Equal(HttpStatusCode.OK, durationPause.StatusCode);
+
+        var paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        var claude = Assert.Single(paused!);
+        Assert.Equal("claude", claude.Agent);
+        Assert.Equal("outage", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+
+        var resume = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = "switch to absolute" });
+        Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
+
+        var future = DateTimeOffset.UtcNow.AddHours(2);
+        var expiresAtPause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "maintenance", expiresAt = future });
+        Assert.Equal(HttpStatusCode.OK, expiresAtPause.StatusCode);
+
+        paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        claude = Assert.Single(paused!);
+        Assert.Equal("maintenance", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+        Assert.True(claude.ExpiresAt >= future.AddSeconds(-5));
+    }
+
+    [Fact]
     public async Task AgentPauseEndpoints_RejectUnknownAgentAndInvalidBodies()
     {
         var unknown = await _client.PostAsJsonAsync("/agents/not-real/pause", new { reason = "test" });
         Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+
+        var unknownResume = await _client.PostAsJsonAsync("/agents/not-real/resume", new { });
+        Assert.Equal(HttpStatusCode.NotFound, unknownResume.StatusCode);
 
         var missingReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { });
         Assert.Equal(HttpStatusCode.BadRequest, missingReason.StatusCode);
@@ -131,6 +164,13 @@ public sealed class QueueStatusHttpTests : IDisposable
             duration = "12w",
         });
         Assert.Equal(HttpStatusCode.BadRequest, badDuration.StatusCode);
+
+        var overflowDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            duration = "1e100d",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, overflowDuration.StatusCode);
 
         var pastExpiry = await _client.PostAsJsonAsync("/agents/claude/pause", new
         {

@@ -95,8 +95,7 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
     private bool SmokeDisabled => _smokeOptions?.Enabled == false;
 
     public static bool IsPausedVerdict(AgentAvailability? availability) =>
-        availability is { Available: false, Reason: { } reason }
-        && reason.StartsWith(PausedReasonPrefix, StringComparison.Ordinal);
+        availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
 
     private async Task<AgentAvailability?> GetPausedAvailabilityAsync(
         AgentKind kind,
@@ -122,7 +121,7 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
     }
 
     private static AgentAvailability ToPausedAvailability(AgentPauseState pause) =>
-        new(false, FormatPausedReason(pause), null);
+        new(false, FormatPausedReason(pause), null, AgentAvailabilityCause.OperatorPaused);
 
     private static string FormatPausedReason(AgentPauseState pause)
     {
