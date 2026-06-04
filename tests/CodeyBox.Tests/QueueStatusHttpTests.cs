@@ -73,6 +73,27 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task PauseAndResumeAgent_UpdatesPausedAgentsList()
+    {
+        var pause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "reserve quota", durationSeconds = 3600 });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        var claude = Assert.Single(paused!);
+        Assert.Equal("claude", claude.Agent);
+        Assert.True(claude.Paused);
+        Assert.Equal("reserve quota", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+
+        var resume = await _client.PostAsJsonAsync("/agents/claude/resume", new { });
+        Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
+        paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        Assert.Empty(paused!);
+    }
+
+    [Fact]
     public async Task PauseQueue_EmptyReason_Returns400()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "" });
@@ -117,6 +138,14 @@ public sealed class QueueStatusHttpTests : IDisposable
         string State,
         DateTimeOffset? PausedAt,
         string? PausedReason);
+
+    private sealed record AgentPauseResponse(
+        string Agent,
+        bool Paused,
+        DateTimeOffset? PausedAt,
+        string? PausedReason,
+        string? PausedBy,
+        DateTimeOffset? ExpiresAt);
 
     private sealed record BudgetLimitsResponse(int PerHour, int PerDay, int Concurrent);
 

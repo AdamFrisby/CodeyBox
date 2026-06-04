@@ -68,6 +68,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly AgentClassRouter? _router;
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
+    private readonly IAgentPauseController? _agentPauses;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly IWorkerRegistry? _workerRegistry;
     private readonly DeadWorkerOptions? _deadWorkerOpts;
@@ -201,7 +202,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         QuotaRouterOptions? quotaRouterOptions = null,
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         IStartupRecoveryInputBarrier? startupRecoveryBarrier = null,
-        IStartupInitialRecoverySink? startupRecoveryCompletion = null)
+        IStartupInitialRecoverySink? startupRecoveryCompletion = null,
+        IAgentPauseController? agentPauseController = null)
     {
         _queue = queue;
         _store = store;
@@ -212,6 +214,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _router = router;
         _projects = projects;
         _queueController = queueController;
+        _agentPauses = agentPauseController;
         _webhooks = webhooks;
         _workerRegistry = workerRegistry;
         _deadWorkerOpts = deadWorkerOpts;
@@ -1242,6 +1245,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return WorkItemRecoveryPolicy.BuildCheckAndActRerun(item, checkAttempts);
         }
 
+        if (WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
+        {
+            var controlAttempts = item.RecoveryAttempts + 1;
+            if (_opts.MaxRecoveryAttempts > 0 && controlAttempts > _opts.MaxRecoveryAttempts)
+            {
+                return item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = $"abandoned after {_opts.MaxRecoveryAttempts} recovery attempts; was {item.State}",
+                    RecoveryAttempts = controlAttempts,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                };
+            }
+
+            return WorkItemRecoveryPolicy.BuildAgentControlRerun(item, controlAttempts);
+        }
+
         if (item.State == WorkItemState.Working)
         {
             return item with
@@ -1260,7 +1283,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // sweep re-enqueues when any member becomes available. Treat it as a
         // resting point on startup so a routine restart doesn't burn a recovery
         // credit or jump the queue.
-        if (item.State == WorkItemState.WaitingForQuotaReset)
+        if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
             return null;
 
         WorkItemState? targetState = WorkItemRecoveryPolicy.MapToRecoveryState(item.State);
@@ -1324,6 +1347,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State is WorkItemState.WaitingForQuotaReset)
         {
             _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
+            return;
+        }
+        if (item.State is WorkItemState.WaitingForAgentResume)
+        {
+            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForAgentResume", workerIndex, id);
             return;
         }
 
@@ -1392,6 +1420,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
 
             item = current;
+
+            if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
+            {
+                _log.LogInformation(
+                    "Worker {WorkerId} skipping {Id} after active claim: parked state {State}",
+                    workerIndex, id, item.State);
+                return;
+            }
+
+            var isAgentControlItem = item.JobType == JobType.AgentControl;
 
             // Dependency gate: skip items whose deps aren't all satisfied yet
             // (see WorkItemDependencies.SatisfyingStates — currently only Done
@@ -1473,11 +1511,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // agent and deferring. When ResolveAsync returns Chosen != null
             // it has already test-and-reserved the chosen member's slot via
             // the gate; the outer finally releases on every exit path.
-            if (_router is not null)
+            if (_router is not null && !isAgentControlItem)
             {
                 var decision = await _router.ResolveAsync(item, project, ct, slotGate: this);
                 if (decision.ShouldWait)
                 {
+                    if (decision.WaitingForPausedAgent)
+                    {
+                        await ParkForAgentResumeAsync(item, decision.Reason, ct);
+                        return;
+                    }
+
                     // Honour the router's suggested delay verbatim — when a
                     // quota-passing member was at cap, the router has already
                     // picked the short cap-retry interval; pure quota stalls
@@ -1525,8 +1569,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // so the next pickup (after some agent slot frees up) finds it
             // again. Reservation is held for the life of the worker and
             // released in the outer finally.
-            if (!agentSlotReserved)
+            if (!agentSlotReserved && !isAgentControlItem)
             {
+                var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
+                if (effectiveDirectAgent is { } pausedCandidate
+                    && await IsAgentPausedAsync(pausedCandidate, ct) is { } pause)
+                {
+                    await ParkForAgentResumeAsync(
+                        item,
+                        $"agent '{pausedCandidate.Value}' {FormatAgentPauseReason(pause)}",
+                        ct);
+                    return;
+                }
+
                 agentForRelease = item.Agent;
                 if (item.Agent is { } routedAgent)
                 {
@@ -1823,6 +1878,58 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 try { await svc.OnWorkItemTerminalAsync(completedReleaseId, CancellationToken.None); }
                 catch (Exception ex) { _log.LogError(ex, "OnWorkItemTerminalAsync threw for release {Id}", completedReleaseId); }
             });
+        }
+    }
+
+    private async Task<AgentPauseState?> IsAgentPausedAsync(AgentKind agent, CancellationToken ct) =>
+        _agentPauses is null ? null : await _agentPauses.GetAgentStateAsync(agent, ct);
+
+    private static string FormatAgentPauseReason(AgentPauseState pause)
+    {
+        var reason = string.IsNullOrWhiteSpace(pause.PausedReason)
+            ? "paused by operator"
+            : $"paused by operator: {pause.PausedReason}";
+        return pause.ExpiresAt is { } expiresAt
+            ? $"{reason} until {expiresAt:O}"
+            : reason;
+    }
+
+    private async Task ParkForAgentResumeAsync(
+        WorkItem item,
+        string reason,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        var retryFrom = AgentPauseResumeMapper.RetryFromForState(current.State);
+        var next = current.With(
+            WorkItemState.WaitingForAgentResume,
+            $"waiting: agent paused: {reason}") with
+        {
+            QuotaRetryFrom = retryFrom,
+            StartedAt = null,
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(
+            next,
+            current.State,
+            ct);
+        if (!updated)
+        {
+            _log.LogInformation(
+                "Work item {Id} state changed concurrently; skipping WaitingForAgentResume transition",
+                item.Id);
+            return;
+        }
+
+        AuditLog.AgentPauseDispatchDeferred(item.Id, reason, retryFrom);
+        if (_webhooks is not null)
+        {
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.waiting_for_agent_resume",
+                WorkItem = next,
+                Details = new { reason, retryFrom },
+            }, CancellationToken.None);
         }
     }
 

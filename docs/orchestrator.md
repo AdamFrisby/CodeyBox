@@ -231,6 +231,42 @@ The queue index page shows a coloured banner at the top:
 - **Running (green)**: subtle dot + **Pause queue** button (opens a modal
   asking for a reason).
 
+## Per-Agent Pause
+
+Operators can pause and resume one agent kind without stopping the whole
+queue. The pause is a pickup gate only: in-flight runs are not killed, and all
+other agents continue dispatching normally.
+
+### API And CLI
+
+```
+GET  /agents/paused
+POST /agents/{kind}/pause   body: { "reason": "...", "durationSeconds": 21600 }
+POST /agents/{kind}/resume  body: { "reason": "..." }
+
+codeybox agents pause claude --reason "reserve quota" --for 6h
+codeybox agents resume claude
+codeybox agents paused
+```
+
+The paused set is persisted in SQLite and survives orchestrator restart. A
+pause can be indefinite or have an expiry; expired pauses auto-resume on the
+next pause-state read.
+
+### Routing Behaviour
+
+| What | Behaviour |
+|---|---|
+| New work/rework/audit/merge dispatch | Paused agent is excluded from eligible candidates |
+| Only eligible agent is paused | Item parks at `WaitingForAgentResume` and resumes automatically on unpause |
+| In-flight run on paused agent | Continues normally |
+| `/quota` and dashboard | Show paused status separately from quota exhaustion |
+| Queued control work item | `agentControl` work items bypass agent routing so they can resume a paused agent |
+
+The audit log records `agent.paused`, `agent.resumed`,
+`agent.pause_dispatch_deferred`, and
+`agent.pause_waiting_item_resumed` entries for operator traceability.
+
 ## Observability
 
 ### Audit log events

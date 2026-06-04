@@ -387,6 +387,8 @@ public sealed record WorkItem
     /// runs a single agent invocation in a sandbox that evaluates a yes/no
     /// question against the project repo, persists a structured verdict, and
     /// optionally enqueues a follow-up <see cref="JobType.Normal"/> item.
+    /// <see cref="JobType.AgentControl"/> runs an operator control-plane pause
+    /// or resume action without launching an agent sandbox.
     /// </summary>
     public JobType JobType { get; init; } = JobType.Normal;
 
@@ -397,6 +399,12 @@ public sealed record WorkItem
     /// <see cref="JobType"/> is <see cref="JobType.CheckAndAct"/>; null otherwise.
     /// </summary>
     public CheckAndActSpec? Check { get; init; }
+
+    /// <summary>
+    /// Configuration for a <see cref="JobType.AgentControl"/> item. Null for
+    /// ordinary and check-and-act work items.
+    /// </summary>
+    public AgentControlSpec? AgentControl { get; init; }
 
     /// <summary>
     /// Verdict the agent returned for a <see cref="JobType.CheckAndAct"/> item.

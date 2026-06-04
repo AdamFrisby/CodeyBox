@@ -22,6 +22,12 @@ public interface ICodeyBoxApiClient
     Task<QueueStatusDto?> GetQueueStatusAsync(CancellationToken ct = default);
     Task<QueueStatusDto?> PauseQueueAsync(string reason, CancellationToken ct = default);
     Task<QueueStatusDto?> ResumeQueueAsync(CancellationToken ct = default);
+    Task<List<AgentPauseStateDto>> GetPausedAgentsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<AgentPauseStateDto>());
+    Task<AgentPauseStateDto?> PauseAgentAsync(string agent, string reason, double? durationSeconds = null, CancellationToken ct = default)
+        => Task.FromResult<AgentPauseStateDto?>(null);
+    Task<bool> ResumeAgentAsync(string agent, CancellationToken ct = default)
+        => Task.FromResult(false);
 
     // ── Budget usage ──────────────────────────────────────────────────────────
     Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default);

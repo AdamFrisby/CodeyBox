@@ -18,6 +18,57 @@
     <p class="error-banner">Error loading fleet: @_error</p>
 }
 
+<section class="agent-controls" style="margin-bottom:1rem;">
+    <h2>Agent controls</h2>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:end;">
+        <label>
+            <span>Agent</span><br />
+            <input style="min-width:8rem;" @bind="_agentPauseKind" />
+        </label>
+        <label>
+            <span>Reason</span><br />
+            <input style="min-width:16rem;" @bind="_agentPauseReason" />
+        </label>
+        <label>
+            <span>Hours</span><br />
+            <input style="width:5rem;" type="number" min="0" step="0.25" @bind="_agentPauseHours" />
+        </label>
+        <button class="btn btn-agent-pause" @onclick="PauseAgentAsync">Pause</button>
+    </div>
+    @if (_pausedAgents is { Count: > 0 })
+    {
+        <table class="queue-table" style="margin-top:0.75rem;">
+            <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>Reason</th>
+                    <th>Paused</th>
+                    <th>Expires</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var p in _pausedAgents)
+                {
+                    <tr>
+                        <td><code>@p.Agent</code></td>
+                        <td>@(p.PausedReason ?? "—")</td>
+                        <td>@FormatDate(p.PausedAt)</td>
+                        <td>@FormatDate(p.ExpiresAt)</td>
+                        <td>
+                            <button class="btn btn-agent-resume" @onclick="() => ResumeAgentAsync(p.Agent)">Resume</button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+    else
+    {
+        <p style="color:#666;margin-top:0.5rem;">No paused agents.</p>
+    }
+</section>
+
 @if (_summaries is null)
 {
     <p>Loading…</p>
@@ -137,8 +188,12 @@ else
 
 @code {
     private List<FleetSummaryDto>? _summaries;
+    private List<AgentPauseStateDto> _pausedAgents = [];
     private AgentStreamAggregateDto? _agentActivity;
     private string? _error;
+    private string _agentPauseKind = "";
+    private string _agentPauseReason = "";
+    private double? _agentPauseHours;
     private CancellationTokenSource? _cts;
 
     protected override async Task OnInitializedAsync()
@@ -168,6 +223,7 @@ else
         {
             var ct = _cts?.Token ?? default;
             _summaries = await ApiClient.GetFleetSummaryAsync(ct);
+            _pausedAgents = await ApiClient.GetPausedAgentsAsync(ct);
             _agentActivity = await ApiClient.GetFleetAgentStreamAggregateAsync(50, ct);
             _error = null;
         }
@@ -175,6 +231,46 @@ else
         {
             Logger.LogError(ex, "Fleet: failed to load fleet summary");
             _error = "Failed to load fleet data. Check server logs for details.";
+        }
+    }
+
+    private async Task PauseAgentAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_agentPauseKind) || string.IsNullOrWhiteSpace(_agentPauseReason))
+        {
+            _error = "Agent and reason are required.";
+            return;
+        }
+
+        try
+        {
+            var seconds = _agentPauseHours is > 0
+                ? _agentPauseHours.Value * 3600
+                : (double?)null;
+            await ApiClient.PauseAgentAsync(_agentPauseKind.Trim(), _agentPauseReason.Trim(), seconds);
+            _agentPauseKind = "";
+            _agentPauseReason = "";
+            _agentPauseHours = null;
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Fleet: failed to pause agent {Agent}", _agentPauseKind);
+            _error = "Failed to pause agent. Check server logs for details.";
+        }
+    }
+
+    private async Task ResumeAgentAsync(string agent)
+    {
+        try
+        {
+            await ApiClient.ResumeAgentAsync(agent);
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Fleet: failed to resume agent {Agent}", agent);
+            _error = "Failed to resume agent. Check server logs for details.";
         }
     }
 
@@ -247,4 +343,7 @@ else
         var sec = (ms % 60_000) / 1000;
         return $"{min}m {sec}s";
     }
+
+    private static string FormatDate(DateTimeOffset? value) =>
+        value is null ? "—" : value.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
 }

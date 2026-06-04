@@ -68,6 +68,10 @@ When `RequireAuth=true`, all dashboard pages require a cookie login. The placeho
 | Budget (30 d) | Rolling 30-day spend if cost-reporting is available, with a bar; `—` otherwise |
 | Actions | "Pause project" / "Resume project" buttons (falls back to global pause while per-project pause is pending) |
 
+The top of the page also has an **Agent controls** panel for pausing one
+agent kind with a reason and optional duration, plus a paused-agent table with
+per-agent resume buttons.
+
 **Limitations (pending future work items):**
 
 - Per-project pause/resume requires the *budget-alerts* work item. The page shows a fallback banner directing operators to the global pause button on the Queue page.

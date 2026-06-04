@@ -18,6 +18,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     private readonly IAgentRegistry? _agents;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentRoutingReadiness? _routingReadiness;
+    private readonly IAgentPauseController? _agentPauses;
     private readonly ILogger<WorkerPoolHealthCoordinator> _log;
 
     public WorkerPoolHealthCoordinator(
@@ -29,7 +30,8 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentRoutingReadiness? routingReadiness = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IAgentPauseController? agentPauseController = null)
     {
         _dispatcher = dispatcher;
         _store = store;
@@ -39,6 +41,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _agents = agents;
         _dispatchAvailability = dispatchAvailability;
         _routingReadiness = routingReadiness;
+        _agentPauses = agentPauseController;
         _log = log;
     }
 
@@ -152,6 +155,9 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         if (project is not null && await IsBudgetBlockedAsync(candidate, project.Budget, ct))
             return false;
 
+        if (candidate.JobType == JobType.AgentControl)
+            return true;
+
         return await HasEligibleAvailableAgentAsync(candidate, project, ct);
     }
 
@@ -227,13 +233,20 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         }
 
         var directAgent = item.Agent ?? project?.DefaultAgent;
-        return directAgent is { } agent && IsDirectAgentAvailable(agent);
+        return directAgent is { } agent
+               && await IsDirectAgentAvailableAsync(agent, ct);
     }
 
-    private bool IsDirectAgentAvailable(AgentKind agent)
+    private async Task<bool> IsDirectAgentAvailableAsync(AgentKind agent, CancellationToken ct)
     {
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
+
+        if (_agentPauses is not null
+            && await _agentPauses.GetAgentStateAsync(agent, ct) is { Paused: true })
+        {
+            return false;
+        }
 
         var availability = _dispatchAvailability?.GetAvailability(agent);
         if (availability is { Available: false })

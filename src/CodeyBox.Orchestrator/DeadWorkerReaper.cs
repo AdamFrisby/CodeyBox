@@ -322,6 +322,60 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
+        if (WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
+        {
+            var controlAttempt = item.RecoveryAttempts + 1;
+            WorkItem recovered;
+            if (_opts.MaxRecoveryAttempts > 0 && controlAttempt > _opts.MaxRecoveryAttempts)
+            {
+                recovered = item with
+                {
+                    State = WorkItemState.Failed,
+                    LastError = "exceeded MaxRecoveryAttempts",
+                    RecoveryAttempts = controlAttempt,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                };
+                _log.LogWarning(
+                    "Recovery ({WorkerId}): agent-control item {ItemId} exceeded MaxRecoveryAttempts ({Max}); failing permanently",
+                    workerIdContext, itemId, _opts.MaxRecoveryAttempts);
+                AuditLog.DeadWorkerFailedTerminal(itemId, workerIdContext, controlAttempt);
+                await _store.UpdateAsync(recovered, ct);
+                MarkRecoveredItem(itemId);
+                await ReleaseRecoveredWorkerSlotAsync(workerIdContext, itemId, "recovery failed interrupted agent-control item permanently without re-dispatch", ct);
+                return;
+            }
+
+            recovered = WorkItemRecoveryPolicy.BuildAgentControlRerun(item, controlAttempt);
+            await _store.UpdateAsync(recovered, ct);
+            await _queue.EnqueueAsync(itemId, ct);
+            MarkRecoveredItem(itemId);
+            _log.LogInformation(
+                "Recovery ({WorkerId}): agent-control item {ItemId} was interrupted while Working; re-enqueued for a fresh control run (attempt {Attempt}/{Max})",
+                workerIdContext, itemId, controlAttempt, _opts.MaxRecoveryAttempts);
+            if (_webhooks is not null)
+            {
+                _ = _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.recovered",
+                    WorkItem = recovered,
+                    Details = new
+                    {
+                        workItemId = itemId.ToString(),
+                        projectId = item.ProjectId.Value,
+                        fromState = item.State.ToString(),
+                        toState = recovered.State.ToString(),
+                        reason = webhookReason,
+                        recoveryAttempt = controlAttempt,
+                        maxRecoveryAttempts = _opts.MaxRecoveryAttempts,
+                    },
+                }, CancellationToken.None);
+            }
+            return;
+        }
+
         if (WorkItemRecoveryPolicy.TryBuildWorkingWithoutPreemptFailure(item, noPreemptFailedReason, out var failed))
         {
             await _store.UpdateAsync(failed, ct);

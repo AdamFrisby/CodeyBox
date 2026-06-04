@@ -184,6 +184,9 @@ for follow-on shapes that surface before a code release can land.
 - per-model quota breakdowns
 - observed failure counters from the last 60 minutes
 - overall and per-model `wouldAllow` decisions
+- paused-agent status. Paused agents are reported distinctly from quota
+  exhaustion with `dispatchStatus: "paused"` and reason text of the form
+  `paused by operator: <reason>`.
 
 The endpoint requires the normal API bearer token; it is not included in the
 anonymous health-check surface.

@@ -76,6 +76,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
+    private readonly IAgentPauseController? _agentPauses;
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
@@ -212,7 +213,8 @@ public sealed class PipelineRunner : IPipelineRunner
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
         IRequiredBuildVerifier? requiredBuildVerifier = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
-        IAuditProgressStore? auditProgress = null)
+        IAuditProgressStore? auditProgress = null,
+        IAgentPauseController? agentPauseController = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -274,6 +276,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
         _availability = availability;
         _dispatchAvailability = dispatchAvailability;
+        _agentPauses = agentPauseController;
         _agentRunningCounters = agentRunningCounters;
         // Prefer the shared snapshot when DI supplies it (production path —
         // OrchestratorService holds the same instance, so hot-reload swaps
@@ -308,6 +311,99 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private readonly RequiredBuildGate _requiredBuildGate;
 
+    private async Task RunAgentControlAsync(WorkItem item, Project project, CancellationToken ct)
+    {
+        if (_agentPauses is null)
+        {
+            await TransitionFailed(
+                item,
+                "agent pause controller is not configured",
+                CancellationToken.None,
+                project,
+                failureKind: "configuration");
+            return;
+        }
+
+        var spec = item.AgentControl;
+        if (spec is null)
+        {
+            await TransitionFailed(
+                item,
+                "agentControl spec is missing",
+                CancellationToken.None,
+                project,
+                failureKind: "configuration");
+            return;
+        }
+
+        await Transition(item, WorkItemState.Working, ct, project);
+        var agent = new AgentKind(spec.Agent.Trim().ToLowerInvariant());
+        var actor = $"work-item:{item.Id}";
+
+        try
+        {
+            switch (spec.Action)
+            {
+                case AgentControlAction.Pause:
+                {
+                    if (string.IsNullOrWhiteSpace(spec.Reason))
+                        throw new InvalidOperationException("agentControl.reason is required for pause");
+
+                    var expiresAt = spec.ExpiresAt
+                        ?? (spec.DurationSeconds is { } seconds
+                            ? DateTimeOffset.UtcNow.AddSeconds(seconds)
+                            : null);
+                    var state = await _agentPauses.PauseAsync(agent, spec.Reason.Trim(), actor, expiresAt, ct);
+                    await _webhooks.PublishAsync(new WebhookEvent
+                    {
+                        Event = "agent.paused",
+                        Details = new
+                        {
+                            agent = state.Agent.Value,
+                            reason = state.PausedReason,
+                            pausedAt = state.PausedAt,
+                            pausedBy = state.PausedBy,
+                            expiresAt = state.ExpiresAt,
+                        },
+                    }, CancellationToken.None);
+                    break;
+                }
+                case AgentControlAction.Resume:
+                {
+                    var wasPaused = await _agentPauses.ResumeAsync(agent, actor, spec.Reason, ct);
+                    if (wasPaused)
+                    {
+                        await _webhooks.PublishAsync(new WebhookEvent
+                        {
+                            Event = "agent.resumed",
+                            Details = new
+                            {
+                                agent = agent.Value,
+                                resumedAt = DateTimeOffset.UtcNow,
+                                resumedBy = actor,
+                                reason = spec.Reason,
+                            },
+                        }, CancellationToken.None);
+                    }
+                    break;
+                }
+                default:
+                    throw new InvalidOperationException($"unsupported agentControl action '{spec.Action}'");
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
+            return;
+        }
+
+        await Transition(item, WorkItemState.Done, ct, project);
+    }
+
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         using var workItemScope = AuditLog.WorkItemScope(item.Id);
@@ -338,6 +434,12 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         using var projectScope = AuditLog.ProjectScope(project.Id);
+
+        if (item.JobType == JobType.AgentControl)
+        {
+            await RunAgentControlAsync(item, project, ct);
+            return;
+        }
 
         try
         {
@@ -4567,15 +4669,18 @@ public sealed class PipelineRunner : IPipelineRunner
             // No explicit override (or it was demoted by the capability gate).
             // Legacy path: no audit pool active → use work agent.
             if (auditPool is null)
-                return workRunner;
+                return await WorkRunnerForAuditUnlessPausedAsync(workRunner, auditorName, ct);
             // Audit pool active: the work agent is only safe if it carries
             // the audit tag itself. Otherwise we must walk the class chain
             // for a tagged substitute — falling back to workRunner here
             // would breach the AC (a non-audit-capable agent must NEVER be
             // selected for auditing). The walk runs the full quota /
             // availability gate on each candidate.
-            if (auditPool.Contains(workRunner.Kind))
+            if (auditPool.Contains(workRunner.Kind)
+                && await GetAgentPauseStateAsync(workRunner.Kind, ct) is null)
+            {
                 return workRunner;
+            }
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
         }
 
@@ -4589,7 +4694,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // the audit-capable pool for a tagged substitute instead.
             if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
                 return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return workRunner;
+            return await WorkRunnerForAuditUnlessPausedAsync(workRunner, auditorName, ct);
         }
 
         var preferredCred = await ResolveAgentCredentialAsync(preferredKind.Value, project, ct);
@@ -4601,7 +4706,15 @@ public sealed class PipelineRunner : IPipelineRunner
             // Same capability gate as the unregistered-preferred branch above.
             if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
                 return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return workRunner;
+            return await WorkRunnerForAuditUnlessPausedAsync(workRunner, auditorName, ct);
+        }
+
+        var preferredPause = await GetAgentPauseStateAsync(preferredKind.Value, ct);
+        if (preferredPause is not null)
+        {
+            _log.LogInformation(
+                "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
+                preferredKind.Value.Value, FormatPausedReason(preferredPause), auditorName);
         }
 
         var preferredMember = classId is not null
@@ -4626,21 +4739,31 @@ public sealed class PipelineRunner : IPipelineRunner
             project,
             SandboxTargetResolver.ResolveAudit(project.NetworkProfiles.AuditAgent, required),
             item.BaselineImageRef);
-        var preferredAvailability = await EnsureAgentSmokeAvailableAsync(
-            preferredKind.Value, auditSmokeTarget, ct);
-        var preferredAvailable = preferredAvailability.Available;
+        AgentAvailability? preferredAvailability = null;
+        var preferredAvailable = false;
+        var preferredOk = false;
+        string? preferredReason = null;
+        if (preferredPause is null)
+        {
+            preferredAvailability = await EnsureAgentSmokeAvailableAsync(
+                preferredKind.Value, auditSmokeTarget, ct);
+            preferredAvailable = preferredAvailability.Available;
 
-        var (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
-            preferredKind.Value, preferredProbeMember, ct);
-        if (preferredAvailable && preferredOk)
+            (preferredOk, preferredReason) = await EvaluateAuditCandidateQuotaAsync(
+                preferredKind.Value, preferredProbeMember, ct);
+        }
+        if (preferredPause is null && preferredAvailable && preferredOk)
             return preferredRunner;
 
-        var rejectReason = preferredAvailable
-            ? preferredReason
-            : $"smoke gate: {(preferredAvailability.Reason ?? "unavailable")}";
-        _log.LogInformation(
-            "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
-            preferredKind.Value.Value, rejectReason, auditorName);
+        if (preferredPause is null)
+        {
+            var rejectReason = preferredAvailable
+                ? preferredReason
+                : $"smoke gate: {(preferredAvailability?.Reason ?? "unavailable")}";
+            _log.LogInformation(
+                "Audit agent '{AuditKind}' rejected ({Reason}) for auditor '{Auditor}'",
+                preferredKind.Value.Value, rejectReason, auditorName);
+        }
 
         // No class chain to walk — preserve legacy fall-through to the work
         // agent. With no class configured, the operator hasn't opted into
@@ -4648,7 +4771,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is null || classId is null)
         {
             AuditLog.QuotaAuditFallthrough(preferredKind.Value, workRunner.Kind, auditorName);
-            return workRunner;
+            return await WorkRunnerForAuditUnlessPausedAsync(workRunner, auditorName, ct);
         }
 
         // Walk the work item's class chain for an unexhausted candidate.
@@ -4656,7 +4779,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // (including the preferred agent above) — this is what the
         // LlmAuditorSkippedQuota event reports. Candidates skipped for other
         // reasons (missing runner / credentials) are intentionally excluded.
-        var quotaRejectedCount = 1;   // the preferred agent we just rejected
+        var quotaRejectedCount = preferredPause is null && preferredAvailable && !preferredOk
+            ? 1
+            : 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, auditSmokeTarget))
         {
             if (member.Agent == preferredKind.Value)
@@ -4718,6 +4843,36 @@ public sealed class PipelineRunner : IPipelineRunner
             "LLM auditor '{Auditor}' skipped: all {Members} candidate agent(s) of class '{ClassId}' quota-exhausted",
             auditorName, quotaRejectedCount, classId);
         return null;
+    }
+
+    private async Task<IAgentRunner?> WorkRunnerForAuditUnlessPausedAsync(
+        IAgentRunner workRunner,
+        string auditorName,
+        CancellationToken ct)
+    {
+        var pause = await GetAgentPauseStateAsync(workRunner.Kind, ct);
+        if (pause is null)
+            return workRunner;
+
+        _log.LogWarning(
+            "LLM auditor '{Auditor}' skipped: work agent '{Agent}' is {Reason}",
+            auditorName,
+            workRunner.Kind.Value,
+            FormatPausedReason(pause));
+        return null;
+    }
+
+    private Task<AgentPauseState?> GetAgentPauseStateAsync(AgentKind agent, CancellationToken ct) =>
+        _agentPauses is null ? Task.FromResult<AgentPauseState?>(null) : _agentPauses.GetAgentStateAsync(agent, ct);
+
+    private static string FormatPausedReason(AgentPauseState pause)
+    {
+        var reason = string.IsNullOrWhiteSpace(pause.PausedReason)
+            ? "paused by operator"
+            : $"paused by operator: {pause.PausedReason}";
+        return pause.ExpiresAt is { } expiresAt
+            ? $"{reason} until {expiresAt:O}"
+            : reason;
     }
 
     /// <summary>

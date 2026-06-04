@@ -36,6 +36,13 @@ public enum WorkItemState
     /// auto-rebase and the merge-phase LLM rerun have already failed.
     /// </summary>
     ReworkingForConflict = 12,
+    /// <summary>
+    /// Every agent that can take this item is currently paused by an operator.
+    /// The item is parked, not failed, and is re-enqueued automatically when
+    /// agent pause state changes. Distinct from <see cref="WaitingForQuotaReset"/>
+    /// so operator intent is visible and quota auto-retry accounting is not used.
+    /// </summary>
+    WaitingForAgentResume = 13,
     Failed = 100,
     Cancelled = 101,
     AuditFailed = 102,

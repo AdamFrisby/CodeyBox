@@ -7,9 +7,12 @@ namespace CodeyBox.Core;
 /// question against the target project repo and returns a structured verdict;
 /// when the verdict matches the actionable condition, the orchestrator enqueues
 /// a follow-up <see cref="Normal"/> work item against the same project.
+/// <see cref="AgentControl"/> items are operator control-plane work items that
+/// pause or resume one agent kind without launching an agent sandbox.
 /// </summary>
 public enum JobType
 {
     Normal = 0,
     CheckAndAct = 1,
+    AgentControl = 2,
 }

@@ -5,7 +5,7 @@ namespace CodeyBox.Orchestrator;
 internal static class WorkItemRecoveryPolicy
 {
     public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
-        item.JobType != JobType.CheckAndAct
+        item.JobType is not JobType.CheckAndAct and not JobType.AgentControl
         && item.State is (WorkItemState.Working or WorkItemState.Reworking)
         && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
@@ -14,7 +14,23 @@ internal static class WorkItemRecoveryPolicy
         && item.State == WorkItemState.Working
         && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
+    public static bool IsRerunnableAgentControlWithoutPreempt(WorkItem item) =>
+        item.JobType == JobType.AgentControl
+        && item.State == WorkItemState.Working
+        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+
     public static WorkItem BuildCheckAndActRerun(WorkItem item, int recoveryAttempts) => item with
+    {
+        State = WorkItemState.Queued,
+        LastError = null,
+        RecoveryAttempts = recoveryAttempts,
+        StartedAt = null,
+        PreemptedAt = null,
+        PreemptCheckpoint = null,
+        UpdatedAt = DateTimeOffset.UtcNow,
+    };
+
+    public static WorkItem BuildAgentControlRerun(WorkItem item, int recoveryAttempts) => item with
     {
         State = WorkItemState.Queued,
         LastError = null,
@@ -31,6 +47,7 @@ internal static class WorkItemRecoveryPolicy
         out WorkItem failed)
     {
         if (IsRerunnableCheckAndActWithoutPreempt(item)
+            || IsRerunnableAgentControlWithoutPreempt(item)
             || item.State != WorkItemState.Working
             || !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
         {

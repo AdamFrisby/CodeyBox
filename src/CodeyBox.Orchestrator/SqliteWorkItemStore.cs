@@ -236,6 +236,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Normal';");
             // CheckAndActSpec (question + actionable condition + on-yes action). JSON.
             RunMigration("ALTER TABLE work_items ADD COLUMN check_spec_json TEXT;");
+            // AgentControlSpec (pause/resume agent control-plane action). JSON.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_control_json TEXT;");
             // CheckVerdict (answer + evidence + confidence). JSON; populated after check completes.
             RunMigration("ALTER TABLE work_items ADD COLUMN check_verdict_json TEXT;");
             // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
@@ -392,7 +394,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
-                        job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
+                        job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
@@ -403,7 +405,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
-                        $job_type, $check_spec, $check_verdict, $origin_check,
+                        $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup);
                     """;
@@ -521,6 +523,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
                     check_verdict_json = $check_verdict,
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
@@ -582,6 +585,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
                     check_verdict_json = $check_verdict,
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
@@ -913,7 +917,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     {(int)WorkItemState.MergeConflictResolutionFailed},
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
                     {(int)WorkItemState.NeedsOperatorInput},
-                    {(int)WorkItemState.WaitingForQuotaReset}
+                    {(int)WorkItemState.WaitingForQuotaReset},
+                    {(int)WorkItemState.WaitingForAgentResume}
                 )
                 ORDER BY
                     CASE
@@ -1002,7 +1007,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.WaitingForAgentResume}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -1699,6 +1704,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$job_type", item.JobType.ToString());
         cmd.Parameters.AddWithValue("$check_spec",
             item.Check is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Check));
+        cmd.Parameters.AddWithValue("$agent_control",
+            item.AgentControl is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.AgentControl));
         cmd.Parameters.AddWithValue("$check_verdict",
             item.Verdict is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Verdict));
         cmd.Parameters.AddWithValue("$origin_check",
@@ -1765,6 +1772,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         RequiredCapabilities = ReadRequiredCapabilities(r),
         JobType = ReadJobType(r),
         Check = ReadCheckSpec(r),
+        AgentControl = ReadAgentControlSpec(r),
         Verdict = ReadCheckVerdict(r),
         OriginCheckWorkItemId = ReadNullableWorkItemId(r, "origin_check_work_item_id"),
         ReCheckVerdicts = ReadReCheckVerdicts(r),
@@ -1809,6 +1817,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         var json = r.GetString(ord);
         if (string.IsNullOrEmpty(json)) return null;
         try { return JsonSerializer.Deserialize<CheckAndActSpec>(json); }
+        catch (JsonException) { return null; }
+    }
+
+    private static AgentControlSpec? ReadAgentControlSpec(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("agent_control_json");
+        if (r.IsDBNull(ord)) return null;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<AgentControlSpec>(json); }
         catch (JsonException) { return null; }
     }
 

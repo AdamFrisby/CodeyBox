@@ -699,6 +699,57 @@ public static class AuditLog
         Audit("queue.started_while_paused")
             .Warning("Orchestrator started with queue in Paused state; no new work items will be picked up until the queue is resumed");
 
+    // ── Per-agent pause control ─────────────────────────────────────────────
+
+    public static void AgentPaused(
+        AgentKind agent,
+        string reason,
+        string pausedBy,
+        DateTimeOffset? expiresAt) =>
+        Audit("agent.paused")
+            .Information(
+                "Agent {Agent} paused by {PausedBy}: {Reason} expiresAt={ExpiresAt}",
+                agent.Value, pausedBy, reason, expiresAt);
+
+    public static void AgentResumed(
+        AgentKind agent,
+        string resumedBy,
+        string? reason = null) =>
+        Audit("agent.resumed")
+            .Information(
+                "Agent {Agent} resumed by {ResumedBy}: {Reason}",
+                agent.Value, resumedBy, reason ?? "");
+
+    public static void AgentPauseExpired(AgentKind agent, string? reason) =>
+        Audit("agent.pause_expired")
+            .Information(
+                "Agent {Agent} pause expired: {Reason}",
+                agent.Value, reason ?? "");
+
+    public static void AgentStartedWhilePaused(AgentKind agent, string? reason) =>
+        Audit("agent.started_while_paused")
+            .Warning(
+                "Orchestrator started with agent {Agent} paused; no new work will dispatch to it until resumed: {Reason}",
+                agent.Value, reason ?? "");
+
+    public static void AgentPauseDispatchDeferred(
+        WorkItemId id,
+        string reason,
+        string retryFrom) =>
+        Audit("agent.pause_dispatch_deferred")
+            .Information(
+                "Work item {WorkItemId} waiting for paused agent resume from={RetryFrom}: {Reason}",
+                id.ToString(), retryFrom, reason);
+
+    public static void AgentPauseWaitingItemResumed(
+        WorkItemId id,
+        string source,
+        string retryFrom) =>
+        Audit("agent.pause_waiting_item_resumed")
+            .Information(
+                "Work item {WorkItemId} re-enqueued after agent pause change: source={Source} from={RetryFrom}",
+                id.ToString(), source, retryFrom);
+
     // ── Suggestions ─────────────────────────────────────────────────────────
 
     public static void SuggestionDismissed(string suggestionId, string? reason) =>

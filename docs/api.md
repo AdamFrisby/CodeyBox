@@ -85,8 +85,30 @@ Queue a new work item.
   de-duplicated case-insensitively; max 16 entries, each ≤64 chars. See
   [`agent-classes.md`](agent-classes.md#capability-gate) for the recommended
   tag vocabulary.
+* `agentControl` — optional control-plane work item. When provided, the item
+  does not launch an agent; it performs a queued agent pause/resume action:
+  `{ "action": "pause"|"resume", "agent": "claude", "reason": "...",
+  "durationSeconds": 21600 }`. `reason` is required for `pause`; use either
+  `durationSeconds` or an absolute `expiresAt`, not both. `agentControl`
+  cannot be combined with `check`.
 
 Response: `201 Created` with the work item record.
+
+Example queued agent pause:
+
+```json
+{
+  "projectId": "ops",
+  "title": "Pause Claude for maintenance",
+  "prompt": "Operator control action.",
+  "agentControl": {
+    "action": "pause",
+    "agent": "claude",
+    "reason": "reserve quota for oversight",
+    "durationSeconds": 21600
+  }
+}
+```
 
 ### Task templates
 
@@ -956,6 +978,30 @@ Clear a per-project queue pause. No-op if the project is not paused.
 
 * Returns `200 OK` with `{ "projectId", "paused": false, "pausedAt": null, "pausedReason": null }`.
 * Returns `404 Not Found` if the project does not exist.
+
+### `GET /agents/paused`
+
+List agent kinds currently paused for new dispatch.
+
+### `POST /agents/{kind}/pause`
+
+Pause new dispatch to one registered agent kind. In-flight runs on that agent
+continue to completion.
+
+```json
+{ "reason": "provider outage", "durationSeconds": 21600 }
+```
+
+`reason` is required, ≤ 500 chars, no control characters. Optional expiry can
+be sent as `durationSeconds`, `duration` (for example `"6h"`), or `expiresAt`.
+
+### `POST /agents/{kind}/resume`
+
+Resume dispatch to one agent kind. No-op if the agent is not paused.
+
+```json
+{ "reason": "maintenance complete" }
+```
 ### `GET /workers`
 
 List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.
@@ -1134,7 +1180,9 @@ Liveness probe. Returns `{ "status": "ok" }`.
 
 Returns the orchestrator's current quota view for registered subscription
 probes: latest snapshots, per-model buckets, observed quota-shaped failures in
-the last 60 minutes, and `wouldAllow` decisions. See
+the last 60 minutes, `wouldAllow` decisions, and paused-agent annotations
+(`paused`, `pausedReason`, `pausedAt`, `pausedBy`, `pauseExpiresAt`,
+`dispatchStatus`). See
 [`quota-gate.md`](quota-gate.md).
 
 ### `POST /projects/{id}/release`
