@@ -122,6 +122,42 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
     }
 
+    [Fact]
+    public async Task PerAgentFloorOverride_AuditGateRejectsReservedPreferredAndAllowsBurnFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var quotaOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        quotaOptions.FloorByAgent[AgentKind.Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 20.0, [AgentKind.Codex] = 1.0 },
+            quotaOptions: quotaOptions,
+            quotaResetAt: reset);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Codex], auditor.Invocations);
+    }
+
     // ── Probe-throws + UnknownPolicy branches in EvaluateAuditCandidateQuotaAsync ─
 
     [Fact]
@@ -399,7 +435,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         IReadOnlyList<AgentKind>? throwingProbes = null,
         QuotaUnknownPolicy unknownPolicy = QuotaUnknownPolicy.UseObservedFailures,
         IAgentBudgetProvider? budgetProvider = null,
-        bool registerAuditProbes = true)
+        bool registerAuditProbes = true,
+        QuotaRouterOptions? quotaOptions = null,
+        DateTimeOffset? quotaResetAt = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -439,13 +477,16 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             .Select(kind => (IAgentQuotaProbe)new ConfigurableProbe(
                 kind,
                 quotas?.GetValueOrDefault(kind, 80.0) ?? 80.0,
+                quotaResetAt,
                 shouldThrow: throwSet.Contains(kind)))
             .ToList();
+        var effectiveQuotaOptions = quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 };
+        effectiveQuotaOptions.UnknownPolicy = unknownPolicy;
 
         var router = new AgentClassRouter(
             [frontier],
             probes,
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            effectiveQuotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var project = new Project
@@ -485,11 +526,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: registerAuditProbes ? probes : null,
-            auditQuotaOptions: new QuotaRouterOptions
-            {
-                MinQuotaPct = 10.0,
-                UnknownPolicy = unknownPolicy,
-            },
+            auditQuotaOptions: effectiveQuotaOptions,
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(
@@ -535,11 +572,17 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
     private sealed class ConfigurableProbe : IAgentQuotaProbe
     {
         private readonly bool _shouldThrow;
+        private readonly DateTimeOffset? _resetAt;
         private double _pct;
-        public ConfigurableProbe(AgentKind kind, double initialPct, bool shouldThrow = false)
+        public ConfigurableProbe(
+            AgentKind kind,
+            double initialPct,
+            DateTimeOffset? resetAt = null,
+            bool shouldThrow = false)
         {
             Kind = kind;
             _pct = initialPct;
+            _resetAt = resetAt;
             _shouldThrow = shouldThrow;
         }
         public AgentKind Kind { get; }
@@ -547,7 +590,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         {
             if (_shouldThrow)
                 throw new InvalidOperationException("probe failure (test)");
-            return Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct });
+            return Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _pct, ResetAt = _resetAt });
         }
         public Task MarkExhaustedAsync(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null, CancellationToken ct = default)
         {

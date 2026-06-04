@@ -181,6 +181,80 @@ public sealed class AgentClassRouterBudgetTests
         Assert.True(decision.ShouldWait);
     }
 
+    [Theory]
+    [InlineData(QuotaUnknownPolicy.FailOpen, true)]
+    [InlineData(QuotaUnknownPolicy.FailCautious, false)]
+    public async Task FallbackCandidates_ProbeThrows_AppliesUnknownPolicy(
+        QuotaUnknownPolicy policy,
+        bool expectedAllowed)
+    {
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = [new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 }],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new ThrowingProbe(Claude)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, UnknownPolicy = policy },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), null, CancellationToken.None);
+
+        if (expectedAllowed)
+        {
+            var candidate = Assert.Single(candidates);
+            Assert.Equal(Claude, candidate.Agent);
+        }
+        else
+        {
+            Assert.Empty(candidates);
+        }
+    }
+
+    [Fact]
+    public async Task FallbackCandidates_BudgetExhausted_DropsCandidate()
+    {
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = [new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 }],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 80.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, UnknownPolicy = QuotaUnknownPolicy.FailCautious },
+            NullLogger<AgentClassRouter>.Instance,
+            budgetProvider: new FakeBudgetProvider(5.0));
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), null, CancellationToken.None);
+
+        Assert.Empty(candidates);
+    }
+
+    [Fact]
+    public async Task FallbackCandidates_BudgetProviderThrows_DropsCandidate()
+    {
+        var cls = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = [new AgentMembership { Agent = Claude, Billing = AgentBilling.Subscription, QualityScore = 100 }],
+        };
+        var router = new AgentClassRouter(
+            [cls],
+            [new FakeProbe(Claude, 80.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, UnknownPolicy = QuotaUnknownPolicy.FailCautious },
+            NullLogger<AgentClassRouter>.Instance,
+            budgetProvider: new ThrowingBudgetProvider());
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(Item(), null, CancellationToken.None);
+
+        Assert.Empty(candidates);
+    }
+
     [Fact]
     public async Task EarliestExhaustedReset_PrefersEarlierBudgetReset()
     {

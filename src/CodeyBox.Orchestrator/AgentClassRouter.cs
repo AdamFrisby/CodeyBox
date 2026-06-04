@@ -1802,8 +1802,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// </summary>
     internal double ResolveWindowFloorPct(AgentKind agent, string windowName)
     {
-        var settings = ResolveFloorSettings(agent);
-        if (TryGetFloorOverride(agent, out var perAgent)
+        var settings = ResolveFloorSettings(_opts, agent);
+        if (TryGetFloorOverride(_opts, agent, out var perAgent)
             && perAgent?.MinQuotaPct is { } agentMin)
             return agentMin;
 
@@ -1836,8 +1836,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// </para>
     /// </summary>
     internal double ComputeEffectiveFloorPct(AgentKind agent, DateTimeOffset? resetAt, DateTimeOffset nowUtc)
+        => ComputeEffectiveFloorPct(_opts, agent, resetAt, nowUtc);
+
+    internal static double ComputeEffectiveFloorPct(
+        QuotaRouterOptions opts,
+        AgentKind agent,
+        DateTimeOffset? resetAt,
+        DateTimeOffset nowUtc)
     {
-        var settings = ResolveFloorSettings(agent);
+        var settings = ResolveFloorSettings(opts, agent);
         if (resetAt is not { } reset) return settings.MinQuotaPct;
         if (settings.RampWindow <= TimeSpan.Zero) return settings.MinQuotaPct;
 
@@ -1853,41 +1860,64 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return Math.Clamp(floor, lo, hi);
     }
 
-    private AgentFloorSettings ResolveFloorSettings(AgentKind agent)
+    internal static double ResolveWindowFloorPct(
+        QuotaRouterOptions opts,
+        AgentKind agent,
+        string windowName)
     {
-        var perAgent = TryGetFloorOverride(agent, out var overrideOptions)
+        var settings = ResolveFloorSettings(opts, agent);
+        if (TryGetFloorOverride(opts, agent, out var perAgent)
+            && perAgent?.MinQuotaPct is { } agentMin)
+            return agentMin;
+
+        if (string.IsNullOrEmpty(windowName)) return settings.MinQuotaPct;
+        if (opts.MinQuotaPctByWindow is { } overrides
+            && overrides.TryGetValue(windowName, out var perWindow))
+            return perWindow;
+        return settings.MinQuotaPct;
+    }
+
+    private static AgentFloorSettings ResolveFloorSettings(QuotaRouterOptions opts, AgentKind agent)
+    {
+        var perAgent = TryGetFloorOverride(opts, agent, out var overrideOptions)
             ? overrideOptions
             : null;
         return new AgentFloorSettings(
-            MinQuotaPct: perAgent?.MinQuotaPct ?? _opts.MinQuotaPct,
-            StartFloorPct: perAgent?.StartFloorPct ?? _opts.StartFloorPct,
-            EndFloorPct: perAgent?.EndFloorPct ?? _opts.EndFloorPct,
-            RampWindow: ResolveRampWindow(agent, perAgent));
+            MinQuotaPct: perAgent?.MinQuotaPct ?? opts.MinQuotaPct,
+            StartFloorPct: perAgent?.StartFloorPct ?? opts.StartFloorPct,
+            EndFloorPct: perAgent?.EndFloorPct ?? opts.EndFloorPct,
+            RampWindow: ResolveRampWindow(opts, agent, perAgent));
     }
 
-    private TimeSpan ResolveRampWindow(AgentKind agent, QuotaFloorOverrideOptions? perAgent)
+    private static TimeSpan ResolveRampWindow(
+        QuotaRouterOptions opts,
+        AgentKind agent,
+        QuotaFloorOverrideOptions? perAgent)
     {
         if (perAgent?.RampWindow is { } rampWindow)
             return rampWindow;
-        return GetRampWindow(agent);
+        return GetRampWindow(opts, agent);
     }
 
-    private bool TryGetFloorOverride(AgentKind agent, out QuotaFloorOverrideOptions? overrideOptions)
+    private static bool TryGetFloorOverride(
+        QuotaRouterOptions opts,
+        AgentKind agent,
+        out QuotaFloorOverrideOptions? overrideOptions)
     {
         overrideOptions = null;
         if (string.IsNullOrEmpty(agent.Value)) return false;
-        return _opts.FloorByAgent is { } overrides
+        return opts.FloorByAgent is { } overrides
             && overrides.TryGetValue(agent.Value, out overrideOptions);
     }
 
-    private TimeSpan GetRampWindow(AgentKind agent)
+    private static TimeSpan GetRampWindow(QuotaRouterOptions opts, AgentKind agent)
     {
         if (!string.IsNullOrEmpty(agent.Value)
-            && _opts.RampWindowByAgent is { } overrides
+            && opts.RampWindowByAgent is { } overrides
             && overrides.TryGetValue(agent.Value, out var perAgent)
             && perAgent > TimeSpan.Zero)
             return perAgent;
-        return _opts.RampWindow;
+        return opts.RampWindow;
     }
 
     private readonly record struct AgentFloorSettings(
