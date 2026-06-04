@@ -164,21 +164,18 @@ public sealed class RetryFromWorkResetTests : IDisposable
     }
 
     [Fact]
-    public async Task ExplicitNonOwnedWorkBranchIsNotResetOnQueuedEntry()
+    public async Task ExplicitNonOwnedWorkBranchIsResetOnQueuedEntry()
     {
-        // Operator-managed (non-default) work branches stay outside the
-        // server-owned namespace; the reset must not touch them even on
-        // a Queued retry.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
         var item = NewItem("feature/operator-managed");
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
         var existingTip = await CommitToBareBranchAsync(
             barePath, item.WorkBranch!, "operator.txt", "operator content\n", "operator setup");
 
-        // Agent makes a no-op work plan; the pipeline will keep the operator content.
         tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent addition\n"));
 
         await tp.Store.CreateAsync(item);
@@ -186,10 +183,41 @@ public sealed class RetryFromWorkResetTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        // First parent of HEAD must be the operator-set tip (agent stacked on top, no reset).
-        Assert.Equal(existingTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
-        Assert.Equal("operator content\n", await ShowAsync(barePath, $"{item.WorkBranch}:operator.txt"));
+        Assert.NotEqual(existingTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:operator.txt")).code);
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", "main:operator.txt")).code);
         Assert.Equal("agent addition\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task MissingWorkBranchResetFailureFailsItemInsteadOfLeavingQueued()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const string resetError = "simulated reset failure for missing work branch";
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            gitHostDecorator: inner => new ResetFailingGitHost(inner, resetError));
+
+        var item = NewItem("feature/missing-reset-failure");
+        await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+
+        var agentInvoked = false;
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            agentInvoked = true;
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "should not run\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains(resetError, final.LastError);
+        Assert.False(agentInvoked);
     }
 
     private async Task<string> CommitToBareBranchAsync(
@@ -245,5 +273,141 @@ public sealed class RetryFromWorkResetTests : IDisposable
             WorkBranch = workBranch ?? $"codeybox/{id.ToString()[..8]}",
             PushUpstream = false,
         };
+    }
+
+    private sealed class ResetFailingGitHost(IGitHost inner, string resetError) : IGitHost
+    {
+        public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
+            => inner.EnsureRepositoryAsync(id, seedFromUrl, ct);
+
+        public Task<string> EnsureRepositoryAsync(
+            WorkItemId id,
+            string? seedFromUrl,
+            string? baseBranch,
+            CancellationToken ct = default)
+            => inner.EnsureRepositoryAsync(id, seedFromUrl, baseBranch, ct);
+
+        public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
+            => inner.GetSandboxAccess(repositoryId);
+
+        public string GetRepoPath(string repositoryId)
+            => inner.GetRepoPath(repositoryId);
+
+        public string GetMergeStagingRoot(string repositoryId)
+            => inner.GetMergeStagingRoot(repositoryId);
+
+        public SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+            => inner.GetIsolatedRepoSandboxAccess(isolatedRepoHostPath);
+
+        public Task<string> CreateIsolatedMergeCloneAsync(
+            string repositoryId,
+            WorkItemId workItemId,
+            CancellationToken ct = default)
+            => inner.CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
+
+        public Task RestoreIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
+            => inner.RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+
+        public Task DisposeIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
+            => inner.DisposeIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
+
+        public Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
+            => inner.GetDefaultBranchAsync(repositoryId, ct);
+
+        public Task PushToUpstreamAsync(
+            string repositoryId,
+            string upstreamUrl,
+            string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv,
+            UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
+            CancellationToken ct = default)
+            => inner.PushToUpstreamAsync(repositoryId, upstreamUrl, branch, upstreamEnv, reconcileStrategy, ct);
+
+        public Task<string?> FetchUpstreamBranchAsync(
+            string repositoryId,
+            string upstreamUrl,
+            string branch,
+            IReadOnlyDictionary<string, string> upstreamEnv,
+            CancellationToken ct = default)
+            => inner.FetchUpstreamBranchAsync(repositoryId, upstreamUrl, branch, upstreamEnv, ct);
+
+        public Task SetBranchToCommitAsync(string repositoryId, string branch, string sha, CancellationToken ct = default)
+            => inner.SetBranchToCommitAsync(repositoryId, branch, sha, ct);
+
+        public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
+            => inner.DisposeRepositoryAsync(repositoryId, ct);
+
+        public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
+            => inner.RepositoryExistsAsync(id, ct);
+
+        public Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
+            => inner.BranchExistsAsync(repositoryId, branch, ct);
+
+        public Task<bool> BranchHasCommitsAheadAsync(
+            string repositoryId,
+            string baseBranch,
+            string workBranch,
+            CancellationToken ct = default)
+            => inner.BranchHasCommitsAheadAsync(repositoryId, baseBranch, workBranch, ct);
+
+        public Task<(string DiffStat, string FullDiff)> GetDiffAsync(
+            string repositoryId,
+            string baseBranch,
+            string workBranch,
+            CancellationToken ct = default)
+            => inner.GetDiffAsync(repositoryId, baseBranch, workBranch, ct);
+
+        public Task<GitMergeTreeResult> ComputeMergeTreeAsync(
+            string repositoryId,
+            string mainCommit,
+            string workCommit,
+            CancellationToken ct = default)
+            => inner.ComputeMergeTreeAsync(repositoryId, mainCommit, workCommit, ct);
+
+        public Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
+            => inner.ResolveCommitAsync(repositoryId, commitish, ct);
+
+        public Task ResetWorkBranchToBaseAsync(
+            string repositoryId,
+            string workBranch,
+            string baseBranch,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException(resetError);
+
+        public Task<string> ResolveTreeAsync(string repositoryId, string treeish, CancellationToken ct = default)
+            => inner.ResolveTreeAsync(repositoryId, treeish, ct);
+
+        public Task<string> ReadTextFileAsync(string repositoryId, string treeish, string path, CancellationToken ct = default)
+            => inner.ReadTextFileAsync(repositoryId, treeish, path, ct);
+
+        public Task<IReadOnlyList<string>> ListFilesAsync(
+            string repositoryId,
+            string treeish,
+            string? pathPrefix,
+            CancellationToken ct = default)
+            => inner.ListFilesAsync(repositoryId, treeish, pathPrefix, ct);
+
+        public Task<IReadOnlyList<string>> ListFilesEndingWithAsync(
+            string repositoryId,
+            string treeish,
+            IReadOnlyList<string> filenameSuffixes,
+            int maxResults,
+            CancellationToken ct = default)
+            => inner.ListFilesEndingWithAsync(repositoryId, treeish, filenameSuffixes, maxResults, ct);
+
+        public Task<IReadOnlyList<GitChangedPath>> GetChangedPathsAsync(
+            string repositoryId,
+            string fromTreeish,
+            string toTreeish,
+            CancellationToken ct = default)
+            => inner.GetChangedPathsAsync(repositoryId, fromTreeish, toTreeish, ct);
+
+        public Task<string> GetUnifiedDiffAsync(
+            string repositoryId,
+            string fromTreeish,
+            string toTreeish,
+            string path,
+            CancellationToken ct = default)
+            => inner.GetUnifiedDiffAsync(repositoryId, fromTreeish, toTreeish, path, ct);
     }
 }

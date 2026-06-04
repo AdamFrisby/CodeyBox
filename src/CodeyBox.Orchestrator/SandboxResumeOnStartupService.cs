@@ -220,8 +220,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             {
                 var backgroundCts = new CancellationTokenSource();
                 _backgroundCts = backgroundCts;
-                _resumeTask = RunLongRunningAsync(
-                    () => ResumeAllAndSignalAsync(backgroundCts.Token));
+                _resumeTask = ResumeAllAndSignalAsync(backgroundCts.Token);
                 return Task.CompletedTask;
             }
 

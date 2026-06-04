@@ -19,6 +19,9 @@ public sealed class LocalGitHost : IGitHost
     private static readonly Regex UrlUserInfoPattern = new(
         @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    // git update-ref treats an all-zero old oid as "create this ref only if it
+    // does not already exist"; bare repos here use the normal 40-hex SHA-1 oid.
+    private const string GitNullObjectId = "0000000000000000000000000000000000000000";
 
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
@@ -596,7 +599,7 @@ public sealed class LocalGitHost : IGitHost
         {
             var update = await RunGitAsync(
                 workdir: path, ct,
-                "update-ref", $"refs/heads/{workBranch}", baseSha, new string('0', 40));
+                "update-ref", $"refs/heads/{workBranch}", baseSha, GitNullObjectId);
             if (update.ExitCode != 0)
             {
                 throw new InvalidOperationException(

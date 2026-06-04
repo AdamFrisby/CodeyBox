@@ -72,7 +72,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkPhasePickup_WithExistingBareRepoWorkBranch_PreservesPriorAttempt()
+    public async Task WorkPhasePickup_WithExistingBareRepoWorkBranch_ResetsPriorAttempt()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
@@ -81,7 +81,9 @@ public sealed class PipelineIntegrationTests : IDisposable
         var item = NewItem("feature/retry");
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
         await CommitToBareBranchAsync(barePath, item.WorkBranch!, "stale.txt", "prior attempt\n", "prior attempt");
+        var staleTip = await RevParseAsync(barePath, item.WorkBranch!);
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -89,14 +91,14 @@ public sealed class PipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
 
-        var (_, staleOnWorkBranch, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:stale.txt");
+        Assert.NotEqual(staleTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:stale.txt")).code);
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", "main:stale.txt")).code);
         var (_, freshOnWorkBranch, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:fresh.txt");
-        var (_, staleOnMain, _) = await TestSupport.RunGit(barePath, "show", "main:stale.txt");
         var (_, freshOnMain, _) = await TestSupport.RunGit(barePath, "show", "main:fresh.txt");
 
-        Assert.Equal("prior attempt\n", staleOnWorkBranch);
         Assert.Equal("fresh run\n", freshOnWorkBranch);
-        Assert.Equal("prior attempt\n", staleOnMain);
         Assert.Equal("fresh run\n", freshOnMain);
     }
 
