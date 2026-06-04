@@ -95,6 +95,39 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task AgentPauseEndpoint_UpdatesProductionDispatchAvailabilityUsedByRouter()
+    {
+        var pause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "reserve quota" });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var availability = _factory.Services
+            .GetRequiredService<IAgentDispatchAvailability>()
+            .GetAvailability(AgentKind.Claude);
+        Assert.True(AgentDispatchAvailability.IsPausedVerdict(availability));
+
+        var project = await _factory.Services
+            .GetRequiredService<IProjectRepository>()
+            .GetAsync(new ProjectId("proj"));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "dispatch integration",
+            Prompt = "do work",
+            AgentClassId = "frontier",
+        };
+
+        var decision = await _factory.Services
+            .GetRequiredService<AgentClassRouter>()
+            .ResolveAsync(item, project, CancellationToken.None);
+
+        Assert.False(decision.ShouldWait);
+        Assert.Equal(AgentKind.Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
     public async Task AgentPauseEndpoints_AcceptDurationStringAndFutureExpiresAt()
     {
         var durationPause = await _client.PostAsJsonAsync(
@@ -302,6 +335,15 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:Smoke:Enabled"] = "false",
+                ["CodeyBox:AgentClasses:0:Id"] = "frontier",
+                ["CodeyBox:AgentClasses:0:DisplayName"] = "Frontier",
+                ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "claude",
+                ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                ["CodeyBox:AgentClasses:0:Members:1:Agent"] = "codex",
+                ["CodeyBox:AgentClasses:0:Members:1:Billing"] = "Subscription",
+                ["CodeyBox:AgentClasses:0:Members:1:QualityScore"] = "90",
             });
         });
         builder.ConfigureTestServices(services =>
@@ -313,6 +355,7 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
             services.AddSingleton<IQueueController>(QueueController);
             services.RemoveAll<IAgentQuotaProbe>();
             services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, 100));
+            services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Codex, 100));
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project
@@ -320,6 +363,7 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
                     Id = new ProjectId("proj"),
                     DisplayName = "Test Project",
                     RepositoryUrl = "https://github.com/test/repo",
+                    DefaultAgentClass = "frontier",
                 }));
         });
     }

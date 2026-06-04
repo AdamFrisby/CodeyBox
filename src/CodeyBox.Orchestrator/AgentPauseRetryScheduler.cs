@@ -85,7 +85,8 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
 
     private async Task<bool> WaitForSignalOrTimerAsync(CancellationToken ct)
     {
-        var signal = _wake.WaitAsync(ct);
+        using var signalCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var signal = _wake.WaitAsync(signalCts.Token);
         var timer = Task.Delay(PeriodicSweepInterval, ct);
         var completed = await Task.WhenAny(signal, timer).ConfigureAwait(false);
         if (completed == signal)
@@ -93,6 +94,17 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
             await signal.ConfigureAwait(false);
             while (_wake.CurrentCount > 0 && _wake.Wait(0)) { }
             return true;
+        }
+
+        signalCts.Cancel();
+        try
+        {
+            await signal.ConfigureAwait(false);
+            while (_wake.CurrentCount > 0 && _wake.Wait(0)) { }
+            return true;
+        }
+        catch (OperationCanceledException) when (signalCts.IsCancellationRequested)
+        {
         }
 
         await timer.ConfigureAwait(false);
@@ -158,10 +170,11 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
         if (item.Agent is { } target)
             return await _pauses.GetAgentStateAsync(target, ct).ConfigureAwait(false) is not null;
 
-        // Older parked rows may not have a target agent stamped. Do not blindly
-        // resume them on an unrelated signal while any operator pause is still
-        // active; the next all-clear sweep can safely requeue them.
-        return (await _pauses.ListPausedAsync(ct).ConfigureAwait(false)).Count > 0;
+        // Older rows and class-routing rows with multiple paused eligible agents
+        // do not carry a single target. Requeue them on pause-state changes and
+        // let the router decide again; if every eligible agent is still paused,
+        // pickup will park the item again with the current blocker set.
+        return false;
     }
 
     private static string NormaliseRetryFrom(string? retryFrom) =>

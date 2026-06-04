@@ -91,6 +91,26 @@ public sealed class RetryWaitingForQuotaResetEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Retry_WaitingForAgentResume_TransitionsToQueuedAndClearsPauseRetryFields()
+    {
+        var item = WaitingAgentResumeItem();
+        await _factory.Store.CreateAsync(item);
+
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        var resp = await _client.PostAsJsonAsync($"/workitems/{item.Id}/retry", new { from = "work" });
+
+        Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+        Assert.Equal(1, queue.Count);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.NotNull(readBack);
+        Assert.Equal(WorkItemState.Queued, readBack!.State);
+        Assert.Null(readBack.LastError);
+        Assert.Null(readBack.QuotaRetryFrom);
+        Assert.Null(readBack.StartedAt);
+    }
+
+    [Fact]
     public async Task Retry_AcceptedResponseBody_ReportsQueuedResumeState()
     {
         // The Accepted response carries `{ id, from, state }` — the state
@@ -120,6 +140,19 @@ public sealed class RetryWaitingForQuotaResetEndpointTests : IDisposable
         FailureKind = "quota",
         QuotaResetAt = DateTimeOffset.UtcNow.AddHours(1),
         NextQuotaRetryAt = DateTimeOffset.UtcNow.AddMinutes(30),
+    };
+
+    private static WorkItem WaitingAgentResumeItem() => new()
+    {
+        Id = WorkItemId.New(),
+        ProjectId = new ProjectId("test-project"),
+        Title = "paused",
+        Prompt = "p",
+        Agent = AgentKind.Claude,
+        State = WorkItemState.WaitingForAgentResume,
+        LastError = "waiting: agent paused: paused by operator: maintenance",
+        QuotaRetryFrom = "work",
+        StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
 
     private sealed record RetryAcceptedBody(string Id, string From, string State);

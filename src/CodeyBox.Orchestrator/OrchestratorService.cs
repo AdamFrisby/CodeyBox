@@ -1940,7 +1940,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             WorkItemState.WaitingForAgentResume,
             $"waiting: agent paused: {reason}") with
         {
-            Agent = pausedAgent ?? current.Agent,
+            Agent = pausedAgent,
             QuotaRetryFrom = retryFrom,
             StartedAt = null,
         };

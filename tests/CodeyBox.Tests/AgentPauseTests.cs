@@ -52,6 +52,23 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task PauseWithExpiredExpiry_IsNotLoadedAfterRestart()
+    {
+        var now = new DateTimeOffset(2026, 6, 4, 0, 0, 0, TimeSpan.Zero);
+        var time = new FakeTimeProvider(now);
+        using (var ctrl = MakeController(time))
+        {
+            await ctrl.PauseAsync(AgentKind.Gemini, "outage", "test", now.AddHours(1));
+        }
+
+        time.Advance(TimeSpan.FromHours(2));
+        using var restarted = MakeController(time);
+
+        Assert.Null(await restarted.GetAgentStateAsync(AgentKind.Gemini));
+        Assert.Empty(await restarted.ListPausedAsync());
+    }
+
+    [Fact]
     public async Task Router_ExcludesPausedAgent_AndDispatchesOtherEligibleAgent()
     {
         using var pauses = MakeController();
@@ -93,6 +110,58 @@ public sealed class AgentPauseTests : IDisposable
         Assert.True(decision.WaitingForPausedAgent);
         Assert.Contains("paused by operator", decision.Reason);
         Assert.Equal([AgentKind.Claude], decision.PausedAgents);
+    }
+
+    [Fact]
+    public async Task Router_PauseTakesPrecedenceOverInProcessExhaustionCache()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "operator reserve", "test");
+        var claude = Member(AgentKind.Claude);
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members = [claude],
+            });
+        router.MarkExhausted(claude, TimeSpan.FromMinutes(5));
+
+        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+
+        Assert.True(decision.ShouldWait);
+        Assert.True(decision.WaitingForPausedAgent);
+        Assert.Contains("paused by operator", decision.Reason);
+        Assert.Equal([AgentKind.Claude], decision.PausedAgents);
+    }
+
+    [Fact]
+    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForAgentResume()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members =
+                [
+                    Member(AgentKind.Codex),
+                    Member(AgentKind.Claude),
+                ],
+            },
+            [
+                new FakeProbe(AgentKind.Codex, 100.0),
+                new FakeProbe(AgentKind.Claude, 0.0),
+            ]);
+
+        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+
+        Assert.True(decision.ShouldWait);
+        Assert.True(decision.WaitingForPausedAgent);
+        Assert.Contains("paused by operator", decision.Reason);
+        Assert.Equal([AgentKind.Codex], decision.PausedAgents);
     }
 
     [Fact]
@@ -175,6 +244,66 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(WorkItemState.Queued, resumed!.State);
         Assert.Null(resumed.QuotaRetryFrom);
         Assert.True(queue.Count >= 1);
+    }
+
+    [Fact]
+    public async Task Worker_MultiplePausedEligibleAgents_RequeuesAfterOneAgentResumes()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "claude maintenance", "test");
+        await pauses.PauseAsync(AgentKind.Codex, "codex maintenance", "test");
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new CapturingPipeline(store);
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members =
+                [
+                    Member(AgentKind.Claude),
+                    Member(AgentKind.Codex),
+                ],
+            });
+        var item = Item("frontier");
+        await store.CreateAsync(item);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            projects: ProjectRepo(),
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.EnqueueAsync(item.Id);
+
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.Null(parked!.Agent);
+        Assert.False(pipeline.Entered);
+
+        await svc.StopAsync(CancellationToken.None);
+        await pauses.ResumeAsync(AgentKind.Codex, "test");
+
+        var scheduler = new AgentPauseRetryScheduler(
+            store,
+            queue,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance);
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("test");
+
+        Assert.Equal(1, retried);
+        var resumed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Equal(AgentKind.Codex, await RouteResumedAgentAsync(router, resumed));
     }
 
     [Fact]
@@ -529,6 +658,37 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AgentPauseRetryScheduler_RequeuesUnstampedWaitingItemEvenWhenAnotherAgentStillPaused()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "claude maintenance", "test");
+        await pauses.PauseAsync(AgentKind.Codex, "codex maintenance", "test");
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var item = Item("frontier") with
+        {
+            Agent = null,
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: multiple paused agents",
+            QuotaRetryFrom = "work",
+        };
+        await store.CreateAsync(item);
+        var scheduler = new AgentPauseRetryScheduler(
+            store,
+            queue,
+            pauses,
+            NullLogger<AgentPauseRetryScheduler>.Instance);
+
+        await pauses.ResumeAsync(AgentKind.Codex, "test", "operator ready");
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("resumed-one");
+
+        Assert.Equal(1, retried);
+        var resumed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
     public async Task AgentPauseRetryScheduler_PeriodicExpirySweep_RequeuesExpiredPause()
     {
         var now = new DateTimeOffset(2026, 6, 4, 0, 0, 0, TimeSpan.Zero);
@@ -605,9 +765,11 @@ public sealed class AgentPauseTests : IDisposable
 
     private static AgentClassRouter BuildRouter(
         IAgentPauseController pauses,
-        AgentClass agentClass) =>
+        AgentClass agentClass,
+        IEnumerable<IAgentQuotaProbe>? probes = null) =>
         new(
             [agentClass],
+            probes ??
             [
                 new FakeProbe(AgentKind.Claude, 100.0),
                 new FakeProbe(AgentKind.Codex, 100.0),
@@ -616,6 +778,14 @@ public sealed class AgentPauseTests : IDisposable
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance,
             dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+    private static async Task<AgentKind?> RouteResumedAgentAsync(
+        AgentClassRouter router,
+        WorkItem item)
+    {
+        var decision = await router.ResolveAsync(item, null, CancellationToken.None);
+        return decision.Chosen?.Agent;
+    }
 
     private static AgentMembership Member(AgentKind agent) => new()
     {

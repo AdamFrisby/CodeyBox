@@ -435,9 +435,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         {
             var member = entry.Member;
             var quotaRetryAdmissionMatches = QuotaRetryAdmissionMatches(quotaRetryAdmission, member);
+            var cachedAvailability = _dispatchAvailability?.GetAvailability(member.Agent);
+            if (IsOperatorPaused(cachedAvailability))
+            {
+                var pausedReason = cachedAvailability!.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                pausedRejected.Add((member.Agent, pausedReason));
+                pausedMembers.Add(member);
+                if (commitDispatchSideEffects)
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
+                continue;
+            }
+
             // Mid-iteration fallback may have marked this member exhausted in the
             // current process. Skip it immediately so we don't burn a probe round-trip
-            // re-discovering what we just learned from a live failure.
+            // re-discovering what we just learned from a live failure. Operator
+            // pause is checked first so a paused agent remains visibly distinct
+            // from an older in-process exhaustion cache entry.
             if (!bypassInProcessExhaustion
                 && !quotaRetryAdmissionMatches
                 && IsExhausted(member, nowUtc))
@@ -616,13 +630,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
-        if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
-            ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
-
-        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
+        AgentRoutingDecision BuildPausedWaitDecision()
         {
-            var reason = $"all eligible members of class '{classId}' are paused by operator: "
-                         + string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"));
+            if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
+                ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
+
+            var allPaused = pausedRejected.Count == sorted.Count;
+            var reason = allPaused
+                ? $"all eligible members of class '{classId}' are paused by operator: "
+                : $"at least one eligible member of class '{classId}' is paused by operator while all others are blocked: ";
+            reason += string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"));
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
@@ -635,6 +652,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     .ToList(),
             };
         }
+
+        if (pausedRejected.Count > 0
+            && (hasSubscription || atCapAgents.Count > 0 || capSaturatedMembers.Count > 0))
+            return BuildPausedWaitDecision();
+
+        if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
+            ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
         // No member was chosen. Distinguish stall reasons so the caller picks
         // the right defer interval and the audit log shows what actually
@@ -740,6 +764,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 Reason = "only PayPerApi members — firing despite apparent low quota",
             };
         }
+
+        if (pausedRejected.Count > 0)
+            return BuildPausedWaitDecision();
 
         // Build the park interval from whichever blocker is the soonest to clear.
         // budget-reset is typically minutes-to-hours; cap-retry is seconds. Both

@@ -205,6 +205,42 @@ public sealed class AuditQuotaPauseTests : IDisposable
         Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_agent_resume");
     }
 
+    [Fact]
+    public async Task AuditRouting_PausedCredentialedAuditMemberParksEvenWhenAnotherAuditMemberLacksCredentials()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Codex, "audit subscription reserved", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Codex, AgentKind.Claude],
+            pauses: pauses,
+            capabilities: new Dictionary<AgentKind, IReadOnlyList<string>>
+            {
+                [AgentKind.Codex] = [WellKnownCapabilities.Audit],
+                [AgentKind.Claude] = [WellKnownCapabilities.Audit],
+            },
+            missingCredentials: new HashSet<AgentKind> { AgentKind.Claude });
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal(AgentKind.Codex, final.Agent);
+        Assert.Equal("audit", final.QuotaRetryFrom);
+        Assert.Empty(auditor.Invocations);
+    }
+
     private AuditQuotaFixture BuildFixture(
         string seedRepoUrl,
         RoutingLlmAuditor auditor,
@@ -212,7 +248,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
         IQuotaFailureStore? quotaFailures = null,
         IAgentPauseController? pauses = null,
         AgentKind? auditAgent = null,
-        IReadOnlyDictionary<AgentKind, IReadOnlyList<string>>? capabilities = null)
+        IReadOnlyDictionary<AgentKind, IReadOnlyList<string>>? capabilities = null,
+        IReadOnlySet<AgentKind>? missingCredentials = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -309,7 +346,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             sandboxes,
             gitHost,
             registry,
-            new AlwaysCredentialProvider(),
+            new SelectiveCredentialProvider(missingCredentials),
             prs,
             projects,
             new TestUpstreamFactory(),
@@ -411,13 +448,18 @@ public sealed class AuditQuotaPauseTests : IDisposable
         }
     }
 
-    private sealed class AlwaysCredentialProvider : ICredentialProvider
+    private sealed class SelectiveCredentialProvider(IReadOnlySet<AgentKind>? missing) : ICredentialProvider
     {
-        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
-            Task.FromResult<AgentCredential?>(new AgentCredential(
-                agent,
-                new Dictionary<string, string>(),
-                new Dictionary<string, string>()));
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            if (missing is not null && missing.Contains(agent))
+                return Task.FromResult<AgentCredential?>(null);
+
+            return Task.FromResult<AgentCredential?>(new AgentCredential(
+                    agent,
+                    new Dictionary<string, string>(),
+                    new Dictionary<string, string>()));
+        }
     }
 
     private sealed class ManualClock : TimeProvider

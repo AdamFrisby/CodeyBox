@@ -4968,10 +4968,10 @@ public sealed class PipelineRunner : IPipelineRunner
         // every member is filtered for missing runner/credentials, the cause
         // is misconfiguration, not a quota crunch; surfacing it as quota would
         // misdirect operators investigating the skip.
+        if (await TryGetPausedAuditPoolMemberAsync(project, classId, ct) is { } paused)
+            throw new AgentPausedException("audit", paused.Agent, paused.Reason);
         if (quotaRejectedCount > 0)
             AuditLog.LlmAuditorSkippedQuota(item.Id, auditorName, quotaRejectedCount);
-        if (TryGetPausedAuditPoolMember(classId) is { } paused)
-            throw new AgentPausedException("audit", paused.Agent, paused.Reason);
 
         _log.LogWarning(
             "LLM auditor '{Auditor}' skipped: no audit-capable member of class '{ClassId}' is available ({Rejected} quota-rejected)",
@@ -4979,32 +4979,32 @@ public sealed class PipelineRunner : IPipelineRunner
         return null;
     }
 
-    private (AgentKind Agent, string Reason)? TryGetPausedAuditPoolMember(string classId)
+    private async Task<(AgentKind Agent, string Reason)?> TryGetPausedAuditPoolMemberAsync(
+        Project project,
+        string classId,
+        CancellationToken ct)
     {
         var auditPool = _classRouter?.GetCapabilityPool(classId, WellKnownCapabilities.Audit);
         if (auditPool is null || auditPool.Count == 0)
             return null;
 
-        (AgentKind Agent, string Reason)? firstPaused = null;
-        var registeredCount = 0;
-        var pausedRegisteredCount = 0;
         foreach (var agent in auditPool)
         {
             if (!_agents.TryGet(agent, out _))
                 continue;
 
-            registeredCount++;
+            var cred = await ResolveAgentCredentialAsync(agent, project, ct);
+            if (cred is null)
+                continue;
+
             var reason = GetAgentPausedReason(agent);
             if (reason is null)
                 continue;
 
-            pausedRegisteredCount++;
-            firstPaused ??= (agent, reason);
+            return (agent, reason);
         }
 
-        return registeredCount > 0 && pausedRegisteredCount == registeredCount
-            ? firstPaused
-            : null;
+        return null;
     }
 
     /// <summary>

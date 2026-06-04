@@ -50,6 +50,83 @@ public sealed class AgentsCommandTests
     }
 
     [Fact]
+    public async Task AgentsPause_InvalidDuration_ReturnsErrorAndDoesNotCallApi()
+    {
+        var called = false;
+        var factory = MakeFactory(req =>
+        {
+            called = true;
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["agents", "pause", "claude", "--reason", "reserve quota", "--for", "soon"],
+                factory);
+
+            Assert.Equal(1, code);
+            Assert.False(called);
+            Assert.Contains("--for must be a positive duration", output.Error.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task AgentsPause_ApiFailure_ReturnsError()
+    {
+        var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError)
+        {
+            Content = new StringContent("boom"),
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["agents", "pause", "claude", "--reason", "reserve quota"],
+                factory);
+
+            Assert.Equal(1, code);
+            Assert.Contains("Error (500)", output.Error.ToString());
+            Assert.DoesNotContain("paused", output.Out.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task AgentsPause_ConnectionFailure_ReturnsError()
+    {
+        var factory = MakeFactory(_ => throw new HttpRequestException("offline"));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(
+                ["agents", "pause", "claude", "--reason", "reserve quota"],
+                factory);
+
+            Assert.Equal(1, code);
+            Assert.Contains("Connection error: offline", output.Error.ToString());
+            Assert.DoesNotContain("paused", output.Out.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
     public async Task AgentsResume_PostsAgentResume()
     {
         HttpRequestMessage? captured = null;
@@ -70,6 +147,51 @@ public sealed class AgentsCommandTests
             Assert.Equal(HttpMethod.Post, captured.Method);
             Assert.EndsWith("/agents/gemini/resume", captured.RequestUri!.ToString());
             Assert.Contains("Agent gemini resumed", output.Out.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task AgentsResume_ApiFailure_ReturnsError()
+    {
+        var factory = MakeFactory(_ => new HttpResponseMessage(HttpStatusCode.BadRequest)
+        {
+            Content = new StringContent("unknown agent"),
+        });
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["agents", "resume", "unknown"], factory);
+
+            Assert.Equal(1, code);
+            Assert.Contains("Error (400)", output.Error.ToString());
+            Assert.DoesNotContain("resumed", output.Out.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", null);
+        }
+    }
+
+    [Fact]
+    public async Task AgentsResume_ConnectionFailure_ReturnsError()
+    {
+        var factory = MakeFactory(_ => throw new HttpRequestException("offline"));
+
+        Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_KEY", "test-key");
+        using var output = new TestOutput();
+        try
+        {
+            var code = await CliApp.InvokeAsync(["agents", "resume", "gemini"], factory);
+
+            Assert.Equal(1, code);
+            Assert.Contains("Connection error: offline", output.Error.ToString());
+            Assert.DoesNotContain("resumed", output.Out.ToString());
         }
         finally
         {
