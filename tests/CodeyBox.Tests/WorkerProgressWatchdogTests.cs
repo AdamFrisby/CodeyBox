@@ -376,7 +376,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_StaticActiveSandboxOwnership_DoesNotMaskRecovery()
+    public async Task Watchdog_ActiveSandboxOwnershipWithDefaultActivitySource_LeavesWorkerAlone()
     {
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
         var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
@@ -393,9 +393,11 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, after!.State);
-        Assert.Single(_slotReleaser.Releases);
-        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
     }
 
     [Fact]
@@ -408,8 +410,8 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
         var opts = new WorkerProgressWatchdogOptions
         {
-            ProgressTimeout = TimeSpan.FromMilliseconds(20),
-            CheckInterval = TimeSpan.FromMilliseconds(10),
+            ProgressTimeout = TimeSpan.FromMilliseconds(200),
+            CheckInterval = TimeSpan.FromMilliseconds(50),
             ProcessCpuProgressSignalEnabled = true,
             ActiveSandboxProgressSignalEnabled = false,
         };
@@ -426,13 +428,20 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await watchdog.RunOnceAsync(CancellationToken.None);
         Assert.Empty(_slotReleaser.Releases);
         Assert.Single(await _registry.ListAsync());
+        Assert.Equal(1, activity.Calls);
 
         activity.Activity = null;
-        await Task.Delay(TimeSpan.FromMilliseconds(40));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(1, activity.Calls);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(250));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(2, activity.Calls);
         Assert.Single(_slotReleaser.Releases);
         Assert.Empty(await _registry.ListAsync());
     }
@@ -611,13 +620,35 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         provider.SandboxId = "replacement";
         var replacement = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
 
-        Assert.Null(first);
+        Assert.NotNull(first);
+        Assert.Equal("active-sandbox", first!.Reason);
         Assert.NotNull(replacement);
         Assert.Equal("active-sandbox-change", replacement!.Reason);
     }
 
     [Fact]
-    public async Task DefaultActivitySource_StableActiveSandboxSet_DoesNotCountAsProgress()
+    public async Task DefaultActivitySource_ActiveSandboxStatusChange_CountsAsProgress()
+    {
+        var itemId = WorkItemId.New();
+        var provider = new ActiveSandboxProviderStub(itemId);
+        var source = new DefaultWorkerProgressActivitySource(provider);
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: false,
+            ActiveSandboxProgressSignalEnabled: true);
+        var worker = WorkerForItem("sandbox-status-test", itemId);
+
+        var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        provider.Status = "busy";
+        var statusChange = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.NotNull(first);
+        Assert.Equal("active-sandbox", first!.Reason);
+        Assert.NotNull(statusChange);
+        Assert.Equal("active-sandbox-change", statusChange!.Reason);
+    }
+
+    [Fact]
+    public async Task DefaultActivitySource_StableActiveSandboxSet_CountsAsProgress()
     {
         var itemId = WorkItemId.New();
         var provider = new ActiveSandboxProviderStub(itemId);
@@ -630,8 +661,10 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
         var second = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
 
-        Assert.Null(first);
-        Assert.Null(second);
+        Assert.NotNull(first);
+        Assert.Equal("active-sandbox", first!.Reason);
+        Assert.NotNull(second);
+        Assert.Equal("active-sandbox", second!.Reason);
     }
 
     [Fact]
@@ -1056,7 +1089,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             _queue,
             new WorkerProgressWatchdogOptions
             {
-                ProgressTimeout = TimeSpan.FromMilliseconds(10),
+                ProgressTimeout = TimeSpan.FromMilliseconds(200),
                 CheckInterval = TimeSpan.FromSeconds(30),
                 AutoRecover = true,
             },
@@ -1339,13 +1372,17 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     private sealed class MutableWorkerProgressActivitySource : IWorkerProgressActivitySource
     {
         public WorkerProgressActivity? Activity { get; set; }
+        public int Calls { get; private set; }
 
         public ValueTask<WorkerProgressActivity?> ObserveAsync(
             WorkerRegistration worker,
             WorkItemId itemId,
             WorkerProgressActivityProbe probe,
-            CancellationToken ct) =>
-            ValueTask.FromResult(Activity);
+            CancellationToken ct)
+        {
+            Calls++;
+            return ValueTask.FromResult(Activity);
+        }
     }
 
     private sealed class ThrowingWorkerProgressActivitySource : IWorkerProgressActivitySource
@@ -1361,9 +1398,10 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     private sealed class ActiveSandboxProviderStub(WorkItemId itemId) : IActiveSandboxProgressProvider
     {
         public string SandboxId { get; set; } = "noop";
+        public string Status { get; set; } = "active";
 
         public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
-            => [new ActiveSandboxProgress(itemId, SandboxId, Status: "active")];
+            => [new ActiveSandboxProgress(itemId, SandboxId, Status)];
     }
 
     /// <summary>

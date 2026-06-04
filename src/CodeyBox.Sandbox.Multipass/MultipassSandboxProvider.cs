@@ -2947,7 +2947,7 @@ test "$work" = present && test "$exec_wrapper" = present
             _daemonRetryPolicy);
     }
 
-    private static IReadOnlyDictionary<string, string>? BuildHostProcessEnvironment(WorkItemId? workItemId)
+    internal static IReadOnlyDictionary<string, string>? BuildHostProcessEnvironment(WorkItemId? workItemId)
     {
         if (workItemId is not { } owner)
             return null;
@@ -3983,11 +3983,13 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
     private async Task TransferFileToVmAsync(string hostPath, string vmRelativePath, string description, CancellationToken ct)
     {
+        var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
         var tx = await MultipassRetry.RunWithRetryAsync(
             ctInner => _runner.RunAsync(
                 [_opts.MultipassBinary, "transfer", hostPath, $"{_name}:{vmRelativePath}"],
                 stdin: null,
-                ct: ctInner),
+                ct: ctInner,
+                environment: environment),
             _log,
             description,
             ct);
@@ -4027,16 +4029,27 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         Action<string>? stdoutChunkCallback = null,
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
-        int? maxStderrBytes = null) =>
-        MultipassDaemonRetry.RunWithRetryAsync(
+        int? maxStderrBytes = null)
+    {
+        var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
+        return MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            ctInner => _runner.RunAsync(argv, stdin, ctInner, stdoutChunkCallback, stderrChunkCallback, maxStdoutBytes, maxStderrBytes),
+            ctInner => _runner.RunAsync(
+                argv,
+                stdin,
+                ctInner,
+                stdoutChunkCallback,
+                stderrChunkCallback,
+                maxStdoutBytes,
+                maxStderrBytes,
+                environment),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             _workItemId,
             ct,
             _daemonRetryPolicy);
+    }
 
     public async ValueTask DisposeAsync()
     {
