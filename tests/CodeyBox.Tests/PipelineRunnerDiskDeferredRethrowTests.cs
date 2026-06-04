@@ -83,8 +83,42 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
         Assert.NotEqual(WorkItemState.Failed, persisted!.State);
     }
 
+    [Fact]
+    public async Task RunAsync_CheckAndActRethrowsSandboxProvisioningDeferredException_AndLeavesItemNonFailed()
+    {
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "mount",
+            errorClass: "multipass-mount-retry-exhausted",
+            detail: "multipass mount failed after retries",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var fixture = await BuildPipelineAsync(
+            new ThrowingProvisioningDeferSandboxProvider(deferAt),
+            item => item with
+            {
+                JobType = JobType.CheckAndAct,
+                Check = new CheckAndActSpec
+                {
+                    Question = "Does the repo need work?",
+                    ActionableAnswer = true,
+                    OnYes = new OnYesActionSpec { Title = "Fix it", Prompt = "go" },
+                },
+            });
+        using var store = fixture.Store;
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => fixture.Pipeline.RunAsync(fixture.Item, CancellationToken.None, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+
+        var persisted = await store.GetAsync(fixture.Item.Id);
+        Assert.NotNull(persisted);
+        Assert.NotEqual(WorkItemState.Failed, persisted!.State);
+    }
+
     private async Task<(PipelineRunner Pipeline, SqliteWorkItemStore Store, WorkItem Item)> BuildPipelineAsync(
-        ISandboxProvider sandboxes)
+        ISandboxProvider sandboxes,
+        Func<WorkItem, WorkItem>? configureItem = null)
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -127,6 +161,7 @@ public sealed class PipelineRunnerDiskDeferredRethrowTests : IDisposable
             Prompt = "p",
             State = WorkItemState.Queued,
         };
+        item = configureItem?.Invoke(item) ?? item;
         await store.CreateAsync(item);
         return (pipeline, store, item);
     }

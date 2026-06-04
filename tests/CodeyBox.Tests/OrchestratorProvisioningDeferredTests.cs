@@ -133,7 +133,14 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
             pipeline,
             new CancellationRegistry(CancellationToken.None),
             new OrchestratorOptions { MaxConcurrentWorkers = 1 },
-            NullLogger<OrchestratorService>.Instance);
+            NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = "Test",
+                RepositoryUrl = "unused",
+                Budget = new ProjectBudget { MaxConcurrentForProject = 1 },
+            }));
 
         await queue.EnqueueAsync(item.Id);
         await svc.StartAsync(CancellationToken.None);

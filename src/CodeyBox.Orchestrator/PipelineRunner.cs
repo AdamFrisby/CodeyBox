@@ -1464,6 +1464,10 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             throw;
         }
+        catch (SandboxProvisioningDeferredException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _log.LogWarning(
@@ -2556,6 +2560,10 @@ public sealed class PipelineRunner : IPipelineRunner
             await Transition(item, WorkItemState.Done, ct, project);
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SandboxProvisioningDeferredException)
         {
             throw;
         }
@@ -6515,7 +6523,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 // handler to be attributed correctly. If we caught it here we
                 // would relabel it as "infrastructure" and (worse) on success
                 // backoffs misclassify the next iteration's terminal state.
-                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException)
+                // Sandbox provisioning deferrals must also bubble out to the
+                // orchestrator requeue path; retrying them here would hard-fail
+                // infrastructure flaps after the upstream attempt budget.
+                catch (Exception ex) when (ex is not MergeConflictResolutionFailedException
+                    && ex is not SandboxProvisioningDeferredException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
@@ -6892,7 +6904,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 priorWorkTip, baseTip, conflictFiles, originalFailure,
                 ct, hostShutdownToken);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException
+            && ex is not SandboxProvisioningDeferredException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",

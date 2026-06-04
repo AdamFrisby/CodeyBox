@@ -124,6 +124,7 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.NotNull(recovered);
         Assert.Equal(WorkItemState.WorkComplete, recovered!.State);
         Assert.Equal(item.WorkBranch, recovered.WorkBranch);
+        Assert.Null(recovered.StartedAt);
         Assert.Null(recovered.PreemptCheckpoint);
         Assert.Null(recovered.LastError);
         Assert.Null(recovered.FailureKind);

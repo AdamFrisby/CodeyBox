@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -566,6 +567,45 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal(1, final.ConflictReworkAttempts);
         // The agent's rework plan was never consulted.
         Assert.Empty(tp.Agent.ConflictReworkPrompts);
+    }
+
+    [Fact]
+    public async Task ConflictRework_ProvisioningDeferredBeforeAgent_Rethrows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var deferAt = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "mount",
+            errorClass: "multipass-mount-retry-exhausted",
+            detail: "conflict rework mount retry exhausted",
+            recheckIn: TimeSpan.FromMinutes(1));
+        var sandboxes = new ThrowingNthTimingPhaseSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            "conflict_rework",
+            throwOnOccurrence: 1,
+            deferAt);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            sandboxProvider: sandboxes);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        var thrown = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        Assert.Same(deferAt, thrown);
+        Assert.Equal(1, sandboxes.MatchingCreateCalls);
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Failed, final!.State);
+        Assert.NotEqual(WorkItemState.MergeConflictResolutionFailed, final.State);
     }
 
     /// <summary>

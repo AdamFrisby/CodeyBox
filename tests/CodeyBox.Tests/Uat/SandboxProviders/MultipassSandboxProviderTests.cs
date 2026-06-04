@@ -3076,6 +3076,58 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ResumeSandboxAsync_StartRetryExhaustion_DefersProvisioning()
+    {
+        var startCalls = 0;
+        var versionCalls = 0;
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "info", var infoName, "--format=json"])
+            {
+                var info = new Dictionary<string, object>
+                {
+                    [infoName] = new Dictionary<string, object?>
+                    {
+                        ["state"] = "Stopped",
+                        ["memory"] = new Dictionary<string, object> { ["total"] = 1024L * 1024 * 1024 },
+                    },
+                };
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { info }), ""));
+            }
+
+            if (argv is [_, "start", _])
+            {
+                startCalls++;
+                return Task.FromResult(new ProcessRunResult(1, "", "start failed: argument not found"));
+            }
+
+            if (argv is [_, "version"])
+            {
+                versionCalls++;
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            runner: runner,
+            stagingDirectory: Path.Combine(_workspace, "staging"),
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            ((ISuspendingSandboxProvider)provider).ResumeSandboxAsync("codeybox-start-exhausted", CancellationToken.None));
+
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("start", ex.Operation);
+        Assert.Equal("multipass-start-argument-not-found", ex.ErrorClass);
+        Assert.Equal(InstantDaemonRetryPolicy().ExhaustedRequeueDelay, ex.RecheckIn);
+        Assert.Equal(3, startCalls);
+        Assert.Equal(3, versionCalls);
+    }
+
+    [Fact]
     public async Task ResumeSandboxAsync_RejectsInvalidName()
     {
         var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(new ProcessRunResult(0, "", "")));

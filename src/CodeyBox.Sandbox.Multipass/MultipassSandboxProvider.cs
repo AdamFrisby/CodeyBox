@@ -451,12 +451,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         {
             run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         }
-        // Treat "instance not running" / "already started" as success: the goal
-        // of ResumeSandboxAsync is "VM is Running afterwards", and multipass
-        // start on an already-Running VM is the same desired postcondition. We
-        // do not parse stderr for VM-not-found vs other failures here because
-        // the orchestrator's caller treats any failure as "fall through to the
-        // stranded-item recovery path" — preserving the explicit signal.
+        // Treat "already running" / "already started" as success: the goal of
+        // ResumeSandboxAsync is "VM is Running afterwards", and multipass start
+        // on an already-Running VM is the same desired postcondition. Exhausted
+        // transient start retries are promoted to SandboxProvisioningDeferredException
+        // so startup resume uses the same delayed requeue path as provisioning.
         if (run.ExitCode != 0)
         {
             if (IsStartAlreadyRunning(run))

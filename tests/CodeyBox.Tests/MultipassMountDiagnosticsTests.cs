@@ -407,6 +407,71 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMountedInfoRetryExhausted_DefersBeforeUnmount()
+    {
+        var hostSource = Path.Combine(_workspace, "info-retryable-source");
+        Directory.CreateDirectory(hostSource);
+        var mountCalls = 0;
+        var infoCalls = 0;
+        var versionCalls = 0;
+        var unmountCalls = 0;
+        var recheckIn = TimeSpan.FromMilliseconds(123);
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                mountCalls++;
+                return new ProcessRunResult(1, "", "\"/repo\" is already mounted");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+            {
+                infoCalls++;
+                return new ProcessRunResult(1, "", "cannot connect to the multipass socket");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "version")
+            {
+                versionCalls++;
+                return new ProcessRunResult(0, "multipass 1.16.0", "");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                unmountCalls++;
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner, new MultipassDaemonRetryPolicy
+        {
+            Delay = (_, _) => Task.CompletedTask,
+            HealthProbeTimeout = TimeSpan.FromMilliseconds(100),
+            ExhaustedRequeueDelay = recheckIn,
+        });
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.MountSingleBindWithRetryAsync(
+                new MultipassSandboxOptions(),
+                name: "codeybox-test",
+                host: hostSource,
+                sandbox: "/repo",
+                workItemId: WorkItemId.New(),
+                ct: CancellationToken.None));
+
+        Assert.Equal(1, mountCalls);
+        Assert.Equal(3, infoCalls);
+        Assert.Equal(3, versionCalls);
+        Assert.Equal(0, unmountCalls);
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("info", ex.Operation);
+        Assert.Equal("multipass-socket-unreachable", ex.ErrorClass);
+        Assert.Equal(recheckIn, ex.RecheckIn);
+    }
+
+    [Fact]
     public async Task MountSingleBindWithRetry_HostSourceMissing_ThrowsTypedExceptionWithoutRetry()
     {
         // If the source doesn't exist on the host filesystem, no number of

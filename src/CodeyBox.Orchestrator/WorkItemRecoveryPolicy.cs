@@ -108,7 +108,10 @@ internal static class WorkItemRecoveryPolicy
         if (target is null)
             return null;
 
-        return ClearInfrastructureDeferralFields(item.With(target.Value), now);
+        return ClearInfrastructureDeferralFields(item.With(target.Value), now) with
+        {
+            StartedAt = null,
+        };
     }
 
     public static bool HandlesRecoveryState(WorkItemState state)
