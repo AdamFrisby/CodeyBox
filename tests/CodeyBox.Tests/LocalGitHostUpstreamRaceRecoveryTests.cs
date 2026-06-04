@@ -5,9 +5,10 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Direct coverage for the two <see cref="LocalGitHost"/> methods added for the
-/// auto-merge race recovery path: <see cref="LocalGitHost.FetchUpstreamBranchAsync"/>
-/// and <see cref="LocalGitHost.SetBranchToCommitAsync"/>. The orchestrator
+/// Direct coverage for <see cref="LocalGitHost"/> methods added for recovery
+/// paths: <see cref="LocalGitHost.FetchUpstreamBranchAsync"/>,
+/// <see cref="LocalGitHost.SetBranchToCommitAsync"/> and
+/// <see cref="LocalGitHost.ResetWorkBranchToBaseAsync"/>. The orchestrator
 /// integration test (UpstreamAutoMergeRaceRecoveryTests) substitutes a fake
 /// upstream that bypasses these methods entirely, so they need their own
 /// targeted tests — otherwise a regression in (say) the refspec polarity would
@@ -24,11 +25,15 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         catch { }
     }
 
-    private LocalGitHost CreateGitHost()
+    private LocalGitHost CreateGitHost(string? gitExecutable = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         return new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = gitRoot },
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                GitExecutable = gitExecutable ?? "git",
+            },
             NullLogger<LocalGitHost>.Instance);
     }
 
@@ -237,6 +242,48 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     // -------------------------------------------------------------------------
+    // ResetWorkBranchToBaseAsync
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task ResetWorkBranchToBaseAsync_ThrowsWhenPostResetVerificationCannotResolveWorkBranch()
+    {
+        // Simulate a race/corruption shape where update-ref succeeds but the
+        // work branch disappears before the post-reset rev-parse. The method
+        // must fail loudly instead of returning as if the reset succeeded.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const string workBranch = "feature/post-reset-verify-vanished";
+        var gitWrapper = Path.Combine(_workspace, "git-wrapper-" + Guid.NewGuid().ToString("N")[..8], "git");
+        await WriteExecutableScriptAsync(
+            gitWrapper,
+            $$"""
+            #!/usr/bin/env bash
+            target='refs/heads/{{workBranch}}'
+            if [ "${3:-}" = "update-ref" ] && [ "${4:-}" = "$target" ]; then
+                git "$@"
+                rc=$?
+                if [ "$rc" -eq 0 ]; then
+                    git -c core.hooksPath=/dev/null update-ref -d "$target" >/dev/null 2>&1 || true
+                fi
+                exit "$rc"
+            fi
+            exec git "$@"
+            """);
+
+        var gitHost = CreateGitHost(gitWrapper);
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        Assert.False(await gitHost.BranchExistsAsync(repoId, workBranch));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, "main"));
+
+        Assert.Contains("did not resolve after reset to base", ex.Message, StringComparison.Ordinal);
+        Assert.False(await gitHost.BranchExistsAsync(repoId, workBranch));
+    }
+
+    // -------------------------------------------------------------------------
     // helpers
     // -------------------------------------------------------------------------
 
@@ -269,5 +316,17 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         var sha = await RevParse(clone, "HEAD");
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
         return sha;
+    }
+
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static async Task WriteExecutableScriptAsync(string path, string contents)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        await File.WriteAllTextAsync(tempPath, contents);
+        File.SetUnixFileMode(
+            tempPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(tempPath, path);
     }
 }

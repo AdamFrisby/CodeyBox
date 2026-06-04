@@ -640,7 +640,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                     $"codeybox: suspend-resume checkpoint {itemId}",
                     timeoutCts.Token));
 
-            var pushed = await promoteTask.WaitAsync(timeoutCts.Token);
+            var pushed = await promoteTask.WaitAsync(timeout, ct);
             if (pushed)
                 return true;
 
@@ -652,7 +652,20 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             timeoutCts.Cancel();
+            if (promoteTask is not null)
+                ObserveProviderTaskException(promoteTask);
             throw;
+        }
+        catch (TimeoutException)
+        {
+            timeoutCts.Cancel();
+            if (promoteTask is not null)
+                ObserveProviderTaskException(promoteTask);
+
+            _log.LogWarning(
+                "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
+                vmName, itemId, timeout);
+            return false;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {

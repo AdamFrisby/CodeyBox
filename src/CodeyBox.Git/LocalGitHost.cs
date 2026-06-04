@@ -1094,7 +1094,7 @@ public sealed class LocalGitHost : IGitHost
     {
         var psi = new ProcessStartInfo
         {
-            FileName = "git",
+            FileName = _opts.GitExecutable,
             WorkingDirectory = workdir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -1152,6 +1152,7 @@ public sealed class LocalGitHost : IGitHost
 public sealed record LocalGitHostOptions
 {
     public required string RootDirectory { get; init; }
+    public string GitExecutable { get; init; } = "git";
     public string FallbackDefaultBranch { get; init; } = "main";
 
     /// <summary>
