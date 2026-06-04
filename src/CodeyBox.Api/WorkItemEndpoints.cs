@@ -876,9 +876,9 @@ internal static class WorkItemEndpoints
     /// prompt, agent, work/merge timeouts, min model score, required
     /// capabilities) are Queued-only — they affect a running pipeline so the
     /// endpoint rejects 409 once dispatch starts. <see cref="PatchWorkItemRequest.DependsOn"/>
-    /// is the exception: it's a replace-set edit allowed on any non-terminal
-    /// state (Queued / Working / Auditing / …), persisted via a partial
-    /// UPDATE that does not stomp <c>state</c> and friends.
+    /// and the audit-budget fields are the exceptions: they are allowed on any
+    /// non-terminal state (Queued / Working / Auditing / …), persisted via
+    /// partial UPDATEs that do not stomp <c>state</c> and friends.
     ///
     /// Timeout / score fields are clamped using the same bounds as creation —
     /// out-of-range values do not error, they pin to the boundary so an
@@ -1003,8 +1003,9 @@ internal static class WorkItemEndpoints
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
-            if (auditMaxIterations <= 0)
-                return Results.BadRequest(new { error = "auditMaxIterations must be greater than 0" });
+            var auditMaxIterationsError = ValidateAuditMaxIterations(auditMaxIterations);
+            if (auditMaxIterationsError is not null)
+                return auditMaxIterationsError;
             updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
         }
 
@@ -1020,24 +1021,49 @@ internal static class WorkItemEndpoints
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Non-dep fields are Queued-only and go through the full-row UPDATE.
-        // A dep-only edit on a non-Queued non-terminal item (Working, Auditing,
-        // etc.) takes the partial-UPDATE path so we don't stomp state/started_at.
+        // Queued-only fields go through the full-row UPDATE, but audit-budget
+        // fields are restored to their original values for that write and then
+        // persisted through UpdateAuditBudgetAsync below. That keeps the audit
+        // budget path partial even when an operator sends it alongside a queued
+        // title/timeout/etc edit.
         if (queuedOnlyPatch)
         {
+            var queuedUpdate = auditBudgetPatch
+                ? updated with
+                {
+                    AuditMaxIterations = item!.AuditMaxIterations,
+                    AuditComplexity = item!.AuditComplexity,
+                }
+                : updated;
             // TryUpdateIfStateAsync guards against a race where the orchestrator picks
             // up the item between the GetAsync above and this write.
-            var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
+            var written = await store.TryUpdateIfStateAsync(queuedUpdate, WorkItemState.Queued, ct);
             if (!written)
                 return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
         }
-        else if (auditBudgetPatch)
+        if (auditBudgetPatch)
         {
-            var written = await store.TryUpdateIfStateAsync(updated, updated.State, ct);
-            if (!written)
-                return Results.Conflict(new { error = "item state changed before the audit budget update could be written" });
+            var budgetResult = await store.UpdateAuditBudgetAsync(
+                updated.Id,
+                updated.AuditMaxIterations,
+                updated.AuditComplexity,
+                now,
+                ct);
+            switch (budgetResult.Outcome)
+            {
+                case AuditBudgetUpdateOutcome.NotFound:
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                case AuditBudgetUpdateOutcome.TerminalState:
+                    return Results.Conflict(new
+                    {
+                        error = $"work item transitioned to terminal state '{budgetResult.Item!.State}' before audit budget could be updated",
+                    });
+                case AuditBudgetUpdateOutcome.Updated:
+                    updated = budgetResult.Item ?? updated;
+                    break;
+            }
         }
-        else if (depsPatch)
+        if (depsPatch && !queuedOnlyPatch)
         {
             var depResult = await store.UpdateDependsOnAsync(updated.Id, newDependsOn!, now, ct);
             switch (depResult.Outcome)
@@ -1051,6 +1077,7 @@ internal static class WorkItemEndpoints
                     });
             }
             oldDependsOn = depResult.OldDependsOn ?? oldDependsOn;
+            updated = depResult.Item ?? updated with { DependsOn = newDependsOn!, UpdatedAt = now };
         }
 
         if (queuedOnlyPatch || auditBudgetPatch)
@@ -1924,6 +1951,15 @@ internal static class WorkItemEndpoints
         try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
         catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
         return (trimmed, null);
+    }
+
+    private static IResult? ValidateAuditMaxIterations(int value)
+    {
+        if (value <= 0)
+            return Results.BadRequest(new { error = "auditMaxIterations must be greater than 0" });
+        if (value > ProjectAudit.MaxIterationBudget)
+            return Results.BadRequest(new { error = $"auditMaxIterations must be <= {ProjectAudit.MaxIterationBudget}" });
+        return null;
     }
 
     /// <summary>

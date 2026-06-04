@@ -246,8 +246,9 @@ internal sealed class WorkItemCreationService
         int? auditMaxIterations = null;
         if (req.AuditMaxIterations is { } auditBudget)
         {
-            if (auditBudget <= 0)
-                return Error("auditMaxIterations must be greater than 0");
+            var auditBudgetError = ValidateAuditMaxIterations(auditBudget);
+            if (auditBudgetError is not null)
+                return Error(auditBudgetError);
             auditMaxIterations = auditBudget;
         }
 
@@ -485,6 +486,15 @@ internal sealed class WorkItemCreationService
         try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
         catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
         return (trimmed, null);
+    }
+
+    private static string? ValidateAuditMaxIterations(int value)
+    {
+        if (value <= 0)
+            return "auditMaxIterations must be greater than 0";
+        if (value > ProjectAudit.MaxIterationBudget)
+            return $"auditMaxIterations must be <= {ProjectAudit.MaxIterationBudget}";
+        return null;
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)

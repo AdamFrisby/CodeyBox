@@ -3670,15 +3670,21 @@ public sealed class PipelineRunner : IPipelineRunner
                 .Select(r => r.AuditorName)
                 .Distinct(StringComparer.Ordinal)
                 .ToHashSet(StringComparer.Ordinal);
-            if (!expectedAuditors.IsSubsetOf(reportedAuditors))
-                break;
-
             var findings = group
                 .SelectMany(report => report.Findings.Select(f => ToSnapshotFinding(report.AuditorName, f)))
                 .ToList();
             var blocking = findings
                 .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
                 .ToList();
+            var allExpectedAuditorsReported = expectedAuditors.IsSubsetOf(reportedAuditors);
+            var stopOnFirstIterationComplete =
+                project.Audit.StopOnFirstFailure
+                && blocking.Count > 0
+                && reportedAuditors.IsSubsetOf(expectedAuditors)
+                && (!requiredBuildApplies || reportedAuditors.Contains(RequiredBuildGateIdentity.AuditorName));
+            if (!allExpectedAuditorsReported && !stopOnFirstIterationComplete)
+                break;
+
             var blockingIds = group
                 .SelectMany(report => report.Findings
                     .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
@@ -3718,7 +3724,7 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
     {
-        var projectBudget = Math.Max(1, project.Audit.MaxIterations);
+        var projectBudget = Math.Clamp(project.Audit.MaxIterations, 1, ProjectAudit.MaxIterationBudget);
         var maxIterations = ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget);
 
         if (priorAuditHistory.Count > 0)
@@ -3727,18 +3733,20 @@ public sealed class PipelineRunner : IPipelineRunner
             maxIterations = Math.Max(maxIterations, priorMaxIteration + projectBudget);
         }
 
-        return maxIterations;
+        return Math.Min(ProjectAudit.MaxIterationBudget, maxIterations);
     }
 
     private static int ResolveConfiguredAuditIterationBudget(
         WorkItem item,
         ProjectAudit audit,
         int projectBudget)
-        => Math.Max(
-            projectBudget,
+        => Math.Min(
+            ProjectAudit.MaxIterationBudget,
             Math.Max(
-                item.AuditMaxIterations.GetValueOrDefault(),
-                ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault()));
+                projectBudget,
+                Math.Max(
+                    item.AuditMaxIterations.GetValueOrDefault(),
+                    ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault())));
 
     private static int? ResolveComplexityAuditIterationBudget(string? complexity, ProjectAudit audit)
         => string.IsNullOrWhiteSpace(complexity)

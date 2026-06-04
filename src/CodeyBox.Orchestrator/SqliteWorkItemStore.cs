@@ -746,6 +746,65 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         }
     }
 
+    public async Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+        WorkItemId id,
+        int? auditMaxIterations,
+        string? auditComplexity,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null);
+
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.TerminalState, current);
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
+                    updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$audit_max_iterations", (object?)auditMaxIterations ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$audit_complexity", (object?)auditComplexity ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with
+            {
+                AuditMaxIterations = auditMaxIterations,
+                AuditComplexity = auditComplexity,
+                UpdatedAt = updatedAt,
+            };
+            return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.Updated, updated);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("UpdateAuditBudgetAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();

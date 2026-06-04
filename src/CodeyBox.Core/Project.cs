@@ -344,6 +344,7 @@ public sealed record ProjectPrDescription
 public sealed record ProjectAudit
 {
     public const string DefaultProfileName = "default";
+    public const int MaxIterationBudget = 100;
 
     /// <summary>
     /// Project-default audit profile name. <c>default</c> uses the fields on this

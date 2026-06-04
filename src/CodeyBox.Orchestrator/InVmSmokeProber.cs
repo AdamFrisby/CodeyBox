@@ -661,7 +661,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             return await _provider.CreateAsync(spec, ct);
 
         var provisionTimeout = TimeSpan.FromSeconds(_opts.ProvisionTimeoutSeconds);
-        var provisionCts = new CancellationTokenSource(provisionTimeout);
+        var provisionCts = new CancellationTokenSource();
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, provisionCts.Token);
 
         // ISandboxProvider.CreateAsync is not required to be an async state
@@ -681,7 +681,9 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             throw;
         }
 
-        var winner = await Task.WhenAny(createTask, Task.Delay(provisionTimeout, ct));
+        var timeoutTask = Task.Delay(provisionTimeout);
+        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        var winner = await Task.WhenAny(createTask, timeoutTask, cancellationTask);
         if (winner == createTask)
         {
             try
@@ -718,7 +720,8 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         // Propagate caller cancellation first so a real shutdown is
         // distinguishable from a provisioning hang.
-        ct.ThrowIfCancellationRequested();
+        if (winner == cancellationTask)
+            ct.ThrowIfCancellationRequested();
         throw new TimeoutException(
             $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
     }

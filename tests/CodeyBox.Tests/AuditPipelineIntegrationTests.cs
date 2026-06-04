@@ -417,6 +417,156 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task StopOnFirstPersistedAuditReports_AdvanceRecoveredIteration()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var auditorA = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("AuditorA", AuditSeverity.Error, "first blocker", "x")]),
+            new AuditOutcome(false, [new AuditFinding("AuditorA", AuditSeverity.Error, "first blocker", "x")]),
+            new AuditOutcome(true, []),
+        ], "AuditorA");
+        var auditorB = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorB");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditorA, auditorB],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 2,
+                AuditTypes = ["scripted"],
+                StopOnFirstFailure = true,
+            },
+            auditReportStore: reports,
+            webhookDispatcher: new CapturingWebhookDispatcher());
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "work iteration\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("slow.txt", "rework iteration\n"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, parked!.State);
+
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            new InMemoryTaskQueue(),
+            tp.GitHost,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(parked, from: null);
+        Assert.True(retry.Success, retry.Error);
+
+        var resumed = await tp.Store.GetAsync(item.Id);
+        await tp.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1, 2, 3], auditorA.SeenIterations);
+        Assert.Equal([3], auditorB.SeenIterations);
+    }
+
+    [Fact]
+    public async Task RequiredBuildPersistedAuditReports_AdvanceRecoveredIteration_WhenBuildReportPresent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            auditReportStore: reports,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")));
+
+        var item = NewItem();
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        var startedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        reports.Add(Report(item.Id, 1, "AuditorA", "Error", startedAt,
+        [
+            new AuditReportFinding("old-a", "Error", "old blocker", "x", ["tests/A.cs"], [1]),
+        ]));
+        reports.Add(Report(item.Id, 1, RequiredBuildGateIdentity.AuditorName, "None", startedAt.AddSeconds(1), []));
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([2], auditor.SeenIterations);
+    }
+
+    [Fact]
+    public async Task RequiredBuildPersistedAuditReports_DoNotAdvanceRecoveredIteration_WhenBuildReportMissing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            auditReportStore: reports,
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")));
+
+        var item = NewItem();
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+        reports.Add(Report(item.Id, 1, "AuditorA", "Error", DateTimeOffset.UtcNow.AddMinutes(-1),
+        [
+            new AuditReportFinding("old-a", "Error", "old blocker", "x", ["tests/A.cs"], [1]),
+        ]));
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Fact]
+    public async Task AuditHistoryLoadFailure_FailsWorkItemAsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new ThrowingAuditReportStore();
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 2,
+            auditReportStore: reports);
+
+        var item = NewItem();
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("failed to load persisted audit history", final.LastError);
+        Assert.Empty(auditor.SeenIterations);
+    }
+
+    [Fact]
     public async Task WorkItemAuditMaxIterations_ExtendsProjectAuditIterationBudget()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -764,6 +914,20 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             => Task.FromResult(0);
     }
 
+    private sealed class ThrowingAuditReportStore : IAuditReportStore
+    {
+        public Task CreateAsync(AuditReport report, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+            => throw new InvalidOperationException("audit report store unavailable");
+
+        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+            => Task.FromResult<string?>(null);
+
+        public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+            => Task.FromResult(0);
+    }
+
     private sealed class DrainingAuditor : IAuditor
     {
         private readonly bool _blockingFinding;
@@ -848,6 +1012,26 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
         return sha;
     }
+
+    private static AuditReport Report(
+        WorkItemId workItemId,
+        int iteration,
+        string auditorName,
+        string worstSeverity,
+        DateTimeOffset startedAt,
+        IReadOnlyList<AuditReportFinding> findings) => new()
+    {
+        Id = Guid.NewGuid().ToString(),
+        WorkItemId = workItemId.ToString(),
+        Iteration = iteration,
+        AuditorName = auditorName,
+        AuditorKind = "tool",
+        WorstSeverity = worstSeverity,
+        StartedAt = startedAt,
+        EndedAt = startedAt.AddSeconds(1),
+        DurationMs = 1000,
+        Findings = findings,
+    };
 
     private static T? GetScalar<T>(LogEvent evt, string key)
     {
