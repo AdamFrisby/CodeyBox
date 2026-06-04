@@ -368,7 +368,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             ProfileName = request.SandboxPolicy.NetworkProfile,
         };
 
-        return new SandboxSpec
+        return SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {
             ImageReference = _pipelineOptions.SandboxImageReference,
             Mounts =
@@ -383,7 +383,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             TimingWorkItemId = request.WorkItemId,
             TimingPhase = request.Phase,
             BaselineImageRef = request.SandboxPolicy.BaselineImageRef,
-        };
+        });
     }
 
     private static async Task RunOrUnavailableAsync(

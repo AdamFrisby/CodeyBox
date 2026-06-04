@@ -195,7 +195,8 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 Detects a bound worker that has stopped making lifecycle progress while its
 heartbeat may still be fresh. Heartbeat alone is ignored. The watchdog recycles
 only when the work item timestamp, agent stream timestamp, item-owned process
-CPU signal, and active sandbox signal are all stale for `ProgressTimeout`.
+CPU signal, and bounded active sandbox generation signal are all stale for
+`ProgressTimeout`.
 
 ```json
 "WorkerProgressWatchdog": {
@@ -211,11 +212,11 @@ CPU signal, and active sandbox signal are all stale for `ProgressTimeout`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ProgressTimeout` | `01:00:00` | Window without item, stream, process CPU, or active sandbox progress before a worker is considered wedged. Set `00:00:00` to disable the watchdog. |
+| `ProgressTimeout` | `01:00:00` | Window without item, stream, process CPU, or active sandbox generation progress before a worker is considered wedged. Set `00:00:00` to disable the watchdog. |
 | `CheckInterval` | `00:01:00` | Sweep cadence. Sampled at startup; restart to change. |
 | `AutoRecover` | `true` | Recycle the worker and requeue the item from the nearest recoverable state. When false, park the item at `NeedsOperatorInput`. |
-| `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between sweeps as progress. The pipeline stamps `CODEYBOX_WORK_ITEM_ID` into sandbox environments so the probe is scoped to the work item. |
-| `ActiveSandboxProgressSignalEnabled` | `true` | Count a provider-tracked active sandbox owned by the work item as progress. This covers VM-backed providers where guest processes are not visible from host `/proc`. |
+| `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between sweeps as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
+| `ActiveSandboxProgressSignalEnabled` | `true` | Count first observation of a provider-tracked active sandbox, or a change in that work item's active sandbox set, as progress. A stable active-sandbox snapshot is not refreshed forever. |
 | `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. |
 | `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `Failed`; `0` means unlimited. |
 

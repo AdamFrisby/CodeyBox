@@ -1483,6 +1483,8 @@ public sealed class RequiredBuildGateTests : IDisposable
         var spec = Assert.Single(capturingProvider.CapturedSpecs);
         Assert.Equal("audit-tool-test-profile", spec.Network.ProfileName);
         Assert.Equal("baseline-pin:abcdef0123", spec.BaselineImageRef);
+        Assert.Equal(item.Id, spec.TimingWorkItemId);
+        Assert.Equal(item.Id.ToString(), spec.Environment[SandboxConventions.WorkItemIdEnvironmentVariable]);
     }
 
     [Fact]

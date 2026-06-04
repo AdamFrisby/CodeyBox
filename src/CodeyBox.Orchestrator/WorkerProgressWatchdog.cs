@@ -46,6 +46,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     // process so the next sweep does not re-recover an item that was correctly
     // re-queued and is now waiting on the dispatcher.
     private readonly ConcurrentDictionary<string, byte> _recoveredWorkers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<WorkerActivityKey, DateTimeOffset> _workerActivityProgress = new();
 
     private WorkerProgressWatchdogOptions _opts => _optsAccessor();
 
@@ -148,10 +149,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 if (!IsWatchedState(item.State)) continue;
                 if (_recoveredWorkers.ContainsKey(worker.WorkerId)) continue;
 
+                var activityKey = new WorkerActivityKey(worker.WorkerId, itemId);
                 var lastStreamAt = await GetLastStreamActivityAsync(itemId, ct);
-                var lastProgress = lastStreamAt is { } streamAt && streamAt > item.UpdatedAt
-                    ? streamAt
-                    : item.UpdatedAt;
+                var lastActivityAt = _workerActivityProgress.TryGetValue(activityKey, out var activityAt)
+                    ? activityAt
+                    : (DateTimeOffset?)null;
+                var lastProgress = MaxProgressAt(item.UpdatedAt, lastStreamAt, lastActivityAt);
 
                 // Items that have not run long enough yet (StartedAt newer than
                 // cutoff) cannot have stalled for the configured window even if
@@ -164,6 +167,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 var workerActivity = await GetWorkerActivityAsync(worker, itemId, opts, ct);
                 if (workerActivity is not null)
                 {
+                    _workerActivityProgress[activityKey] = now;
                     _log.LogDebug(
                         "Watchdog: worker {WorkerId} for item {ItemId} has live activity signal {Reason}; treating as progress",
                         worker.WorkerId, itemId, workerActivity.Reason);
@@ -203,9 +207,13 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         if (!opts.ProcessCpuProgressSignalEnabled && !opts.ActiveSandboxProgressSignalEnabled)
             return null;
 
+        var probe = new WorkerProgressActivityProbe(
+            opts.ProcessCpuProgressSignalEnabled,
+            opts.ActiveSandboxProgressSignalEnabled);
+
         try
         {
-            return await _activitySource.ObserveAsync(worker, itemId, opts, ct);
+            return await _activitySource.ObserveAsync(worker, itemId, probe, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
@@ -214,6 +222,21 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             return null;
         }
     }
+
+    private static DateTimeOffset MaxProgressAt(
+        DateTimeOffset itemUpdatedAt,
+        DateTimeOffset? streamAt,
+        DateTimeOffset? activityAt)
+    {
+        var max = itemUpdatedAt;
+        if (streamAt is { } stream && stream > max)
+            max = stream;
+        if (activityAt is { } activity && activity > max)
+            max = activity;
+        return max;
+    }
+
+    private readonly record struct WorkerActivityKey(string WorkerId, WorkItemId ItemId);
 
     private async Task<DateTimeOffset?> GetLastStreamActivityAsync(WorkItemId itemId, CancellationToken ct)
     {

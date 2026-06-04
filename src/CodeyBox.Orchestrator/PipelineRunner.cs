@@ -7855,11 +7855,6 @@ Original merge-phase failure (for context):
             foreach (var (k, v) in extraEnvironment)
                 env[k] = v;
         }
-        if (timingWorkItemId is { } workItemId && workItemId.Value != Guid.Empty)
-        {
-            env[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable] = workItemId.ToString();
-        }
-
         var allowedHosts = allowAgentNetwork
             ? includeAgentCredential is null
                 ? _opts.AuditToolAllowedHosts
@@ -7872,7 +7867,7 @@ Original merge-phase failure (for context):
             ProfileName = hostNetworkProfile,
         };
 
-        return new SandboxSpec
+        return SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {
             ImageReference = _opts.SandboxImageReference,
             Mounts = mounts,
@@ -7883,7 +7878,7 @@ Original merge-phase failure (for context):
             TimingWorkItemId = timingWorkItemId,
             TimingPhase = timingPhase,
             BaselineImageRef = baselineImageRef,
-        };
+        });
     }
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)

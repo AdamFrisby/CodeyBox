@@ -36,6 +36,8 @@ public sealed class ProcessSandboxProvider : ISandboxProvider
 
     public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        spec = SandboxConventions.WithTimingEnvironment(spec);
+
         var id = Guid.NewGuid().ToString("N");
         var root = Path.Combine(Path.GetTempPath(), "codeybox-sandbox-" + id);
         Directory.CreateDirectory(root);

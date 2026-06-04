@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
@@ -145,7 +146,7 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
             $"work-phase sandbox spec missing {CodeyBoxTrailers.PromptRevisionEnvVar}");
         Assert.Equal("1", workSpec.Environment[CodeyBoxTrailers.PromptRevisionEnvVar]);
         Assert.Equal(item.Id.ToString(),
-            workSpec.Environment[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable]);
+            workSpec.Environment[SandboxConventions.WorkItemIdEnvironmentVariable]);
 
         var reworkSpec = Assert.Single(sandboxes.Specs, s => s.TimingPhase == "rework");
         Assert.True(reworkSpec.Environment.ContainsKey(CodeyBoxTrailers.PromptRevisionEnvVar),
@@ -155,7 +156,7 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         // pickup-time snapshot.
         Assert.Equal("2", reworkSpec.Environment[CodeyBoxTrailers.PromptRevisionEnvVar]);
         Assert.Equal(item.Id.ToString(),
-            reworkSpec.Environment[DefaultWorkerProgressActivitySource.WorkItemIdEnvironmentVariable]);
+            reworkSpec.Environment[SandboxConventions.WorkItemIdEnvironmentVariable]);
     }
 
     // ── Commit-trailer wiring ──────────────────────────────────────────────

@@ -258,6 +258,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
+        spec = SandboxConventions.WithTimingEnvironment(spec);
+
         // Preflight: refuse to launch when the host is out of disk. Without
         // this check, multipass / qemu happily start the VM, the install
         // runcmd or the orchestrator's first big artifact write hits
