@@ -37,20 +37,20 @@ public interface IWorkerProgressActivitySource
 /// Default watchdog activity source. It combines exact host-side process CPU
 /// sampling for sandbox processes that carry
 /// <see cref="SandboxConventions.WorkItemIdEnvironmentVariable"/> with a
-/// bounded provider-owned active sandbox generation signal for VM-backed
-/// providers whose guest processes are not visible from host <c>/proc</c>.
+/// provider-owned active sandbox signal for VM-backed providers whose guest
+/// processes are not visible from host <c>/proc</c>.
 /// </summary>
 public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivitySource
 {
     public const string WorkItemIdEnvironmentVariable = SandboxConventions.WorkItemIdEnvironmentVariable;
 
     private const int MaxAncestorWalk = 32;
-    private readonly ISandboxProvider? _sandboxProvider;
+    private readonly IActiveSandboxProgressProvider? _activeSandboxProvider;
     private readonly ConcurrentDictionary<WorkItemId, ProcessCpuSample> _processSamples = new();
     private readonly ConcurrentDictionary<WorkItemId, ActiveSandboxSample> _activeSandboxSamples = new();
 
-    public DefaultWorkerProgressActivitySource(ISandboxProvider? sandboxProvider = null)
-        => _sandboxProvider = sandboxProvider;
+    public DefaultWorkerProgressActivitySource(IActiveSandboxProgressProvider? activeSandboxProvider = null)
+        => _activeSandboxProvider = activeSandboxProvider;
 
     public ValueTask<WorkerProgressActivity?> ObserveAsync(
         WorkerRegistration worker,
@@ -82,13 +82,13 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
     private bool TryObserveActiveSandbox(WorkItemId itemId, out string reason)
     {
         reason = "";
-        if (_sandboxProvider is not IActiveSandboxProvider activeProvider)
+        if (_activeSandboxProvider is not { } activeProvider)
             return false;
 
-        IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> snapshot;
+        IReadOnlyList<ActiveSandboxProgress> snapshot;
         try
         {
-            snapshot = activeProvider.SnapshotActiveSandboxes();
+            snapshot = activeProvider.SnapshotActiveSandboxProgress();
         }
         catch
         {
@@ -97,7 +97,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
 
         var sandboxIds = snapshot
             .Where(entry => entry.WorkItemId == itemId)
-            .Select(entry => entry.Sandbox.Id)
+            .Select(entry => entry.SandboxId)
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToArray();
@@ -118,7 +118,8 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
         }
 
         _activeSandboxSamples[itemId] = sample;
-        return false;
+        reason = "active-sandbox";
+        return true;
     }
 
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)

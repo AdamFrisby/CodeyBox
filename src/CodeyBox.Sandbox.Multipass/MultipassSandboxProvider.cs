@@ -46,7 +46,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
 {
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
@@ -433,6 +433,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var result = new List<(WorkItemId, IShutdownTeardownSandbox)>(entries.Count);
         foreach (var entry in entries)
             result.Add((entry.WorkItemId, entry.Sandbox));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
+    {
+        var entries = _activeSandboxOwners.Values.ToList();
+        var result = new List<ActiveSandboxProgress>(entries.Count);
+        foreach (var entry in entries)
+            result.Add(new ActiveSandboxProgress(entry.WorkItemId, entry.Sandbox.Id, Status: "active"));
         return result;
     }
 

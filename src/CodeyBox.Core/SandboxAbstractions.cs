@@ -388,6 +388,41 @@ public interface IActiveSandboxProvider
 }
 
 /// <summary>
+/// Lightweight projection of a provider-owned sandbox that is still active for a
+/// work item. This is intentionally separate from
+/// <see cref="IActiveSandboxProvider"/> so progress monitoring can observe live
+/// sandbox ownership without receiving shutdown-capable teardown handles.
+/// </summary>
+public sealed record ActiveSandboxProgress(WorkItemId WorkItemId, string SandboxId, string? Status = null);
+
+/// <summary>
+/// Optional provider capability for reporting active sandbox ownership to
+/// progress watchdogs. Implementations should omit sandboxes whose owning work
+/// item is unknown.
+/// </summary>
+public interface IActiveSandboxProgressProvider
+{
+    /// <summary>
+    /// Snapshot of currently-active sandboxes, projected to the fields progress
+    /// monitoring needs.
+    /// </summary>
+    IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress();
+}
+
+/// <summary>
+/// Empty active-sandbox progress provider used when the configured sandbox
+/// provider has no active-sandbox progress capability.
+/// </summary>
+public sealed class NullActiveSandboxProgressProvider : IActiveSandboxProgressProvider
+{
+    public static NullActiveSandboxProgressProvider Instance { get; } = new();
+
+    private NullActiveSandboxProgressProvider() { }
+
+    public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() => [];
+}
+
+/// <summary>
 /// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.
 /// The startup resume handler uses <see cref="ResumeSandboxAsync"/> to start
 /// each persisted VM by name and adopt its still-running agent process.

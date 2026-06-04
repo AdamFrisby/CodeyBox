@@ -1696,8 +1696,11 @@ builder.Services.AddSingleton<WorkerProgressWatchdogOptions>(sp =>
     opts.Validate();
     return opts;
 });
+builder.Services.AddSingleton<IActiveSandboxProgressProvider>(sp =>
+    sp.GetRequiredService<ISandboxProvider>() as IActiveSandboxProgressProvider
+    ?? NullActiveSandboxProgressProvider.Instance);
 builder.Services.AddSingleton<IWorkerProgressActivitySource>(sp =>
-    new DefaultWorkerProgressActivitySource(sp.GetService<ISandboxProvider>()));
+    new DefaultWorkerProgressActivitySource(sp.GetRequiredService<IActiveSandboxProgressProvider>()));
 builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();

@@ -315,7 +315,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_StableActiveSandboxSignal_AgesOutAndRecovers()
+    public async Task Watchdog_StableActiveSandboxSignal_RefreshesProgress()
     {
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
         var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
@@ -340,13 +340,16 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Empty(_slotReleaser.Releases);
         Assert.Single(await _registry.ListAsync());
 
-        await Task.Delay(TimeSpan.FromMilliseconds(40));
-        await watchdog.RunOnceAsync(CancellationToken.None);
+        for (var i = 0; i < 3; i++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(40));
+            await watchdog.RunOnceAsync(CancellationToken.None);
+        }
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Queued, after!.State);
-        Assert.Single(_slotReleaser.Releases);
-        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
     }
 
     [Fact]
@@ -514,6 +517,26 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         var activity = await source.ObserveAsync(WorkerForItem("sandbox-disabled-test", itemId), itemId, probe, CancellationToken.None);
 
         Assert.Null(activity);
+    }
+
+    [Fact]
+    public async Task DefaultActivitySource_ActiveSandboxSetChange_CountsAsProgress()
+    {
+        var itemId = WorkItemId.New();
+        var provider = new ActiveSandboxProviderStub(itemId);
+        var source = new DefaultWorkerProgressActivitySource(provider);
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: false,
+            ActiveSandboxProgressSignalEnabled: true);
+        var worker = WorkerForItem("sandbox-replacement-test", itemId);
+
+        var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        provider.SandboxId = "replacement";
+        var replacement = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.NotNull(first);
+        Assert.NotNull(replacement);
+        Assert.Equal("active-sandbox", replacement!.Reason);
     }
 
     [Fact]
@@ -1228,33 +1251,12 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             throw new InvalidOperationException("activity probe failed");
     }
 
-    private sealed class ActiveSandboxProviderStub(WorkItemId itemId) : ISandboxProvider, IActiveSandboxProvider
+    private sealed class ActiveSandboxProviderStub(WorkItemId itemId) : IActiveSandboxProgressProvider
     {
-        private static readonly NoopShutdownSandbox Sandbox = new();
+        public string SandboxId { get; set; } = "noop";
 
-        public string Name => "active-sandbox-test";
-
-        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotSupportedException();
-
-        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
-            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
-
-        public Task DisposeLeakedAsync(string name, CancellationToken ct)
-            => Task.CompletedTask;
-
-        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
-            => [(itemId, Sandbox)];
-    }
-
-    private sealed class NoopShutdownSandbox : IShutdownTeardownSandbox
-    {
-        public string Id => "noop";
-
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
-            => throw new NotSupportedException();
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
+            => [new ActiveSandboxProgress(itemId, SandboxId, Status: "active")];
     }
 
     /// <summary>
