@@ -456,7 +456,7 @@ public sealed class HotReloadConfigTests
             var after = await store.GetAsync(item.Id);
             Assert.NotNull(after);
             Assert.NotEqual(WorkItemState.Failed, after.State);
-            Assert.Equal(WorkItemState.Queued, after.State); // Reworking → Queued
+            Assert.Equal(WorkItemState.WorkComplete, after.State); // Reworking -> WorkComplete
             Assert.Equal(3, after.RecoveryAttempts);
         }
         finally

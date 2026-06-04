@@ -87,6 +87,30 @@ internal static class WorkItemRecoveryPolicy
         };
     }
 
+    public static WorkItem? BuildInfrastructureDeferredResumeState(WorkItem item, DateTimeOffset now)
+    {
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.State is WorkItemState.Working or WorkItemState.Reworking)
+        {
+            return ClearInfrastructureDeferralFields(item, now) with
+            {
+                StartedAt = null,
+            };
+        }
+
+        var target = item.State switch
+        {
+            WorkItemState.Queued => WorkItemState.Queued,
+            WorkItemState.Working => WorkItemState.Queued,
+            _ => MapToRecoveryState(item.State),
+        };
+
+        if (target is null)
+            return null;
+
+        return ClearInfrastructureDeferralFields(item.With(target.Value), now);
+    }
+
     public static bool HandlesRecoveryState(WorkItemState state)
         => state == WorkItemState.Working || MapToRecoveryState(state) is not null;
 
@@ -98,7 +122,7 @@ internal static class WorkItemRecoveryPolicy
     /// </summary>
     public static WorkItemState? MapToRecoveryState(WorkItemState state) => state switch
     {
-        WorkItemState.Reworking => WorkItemState.Queued,
+        WorkItemState.Reworking => WorkItemState.WorkComplete,
         WorkItemState.WorkComplete => WorkItemState.WorkComplete,
         WorkItemState.Auditing => WorkItemState.WorkComplete,
         WorkItemState.AuditPassed => WorkItemState.AuditPassed,
@@ -107,5 +131,17 @@ internal static class WorkItemRecoveryPolicy
         WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
         WorkItemState.UpstreamPushing => WorkItemState.Merged,
         _ => null,
+    };
+
+    private static WorkItem ClearInfrastructureDeferralFields(WorkItem item, DateTimeOffset now) => item with
+    {
+        LastError = null,
+        FailureKind = null,
+        QuotaResetAt = null,
+        NextQuotaRetryAt = null,
+        QuotaRetryFrom = null,
+        CancellationReason = null,
+        CancellationSource = null,
+        UpdatedAt = now,
     };
 }

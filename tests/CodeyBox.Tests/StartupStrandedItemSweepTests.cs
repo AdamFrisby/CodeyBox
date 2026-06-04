@@ -164,7 +164,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Theory]
-    [InlineData(WorkItemState.Reworking, WorkItemState.Queued)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed)]
@@ -323,7 +323,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
         await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
 
         Assert.Equal(WorkItemState.Failed, (await _store.GetAsync(working.Id))!.State);
-        Assert.Equal(WorkItemState.Queued, (await _store.GetAsync(reworking.Id))!.State);
+        Assert.Equal(WorkItemState.WorkComplete, (await _store.GetAsync(reworking.Id))!.State);
         Assert.Equal(WorkItemState.WorkComplete, (await _store.GetAsync(auditing.Id))!.State);
         Assert.Equal(WorkItemState.AuditPassed, (await _store.GetAsync(merging.Id))!.State);
         // Three enqueues: reworking, auditing, merging. Working→Failed is terminal.

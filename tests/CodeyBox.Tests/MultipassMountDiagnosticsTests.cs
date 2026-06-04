@@ -303,6 +303,110 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMountedUnmountNonRetryableFailure_ContinuesOuterRetryLoop()
+    {
+        var hostSource = Path.Combine(_workspace, "unmount-nonretryable-source");
+        Directory.CreateDirectory(hostSource);
+        var mountCalls = 0;
+        var unmountCalls = 0;
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                mountCalls++;
+                return mountCalls == 1
+                    ? new ProcessRunResult(1, "", "\"/repo\" is already mounted")
+                    : new ProcessRunResult(0, "", "");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+                return new ProcessRunResult(
+                    0,
+                    """{"info":{"codeybox-test":{"mounts":{"/repo":{"source_path":"/old/source"}}}}}""",
+                    "");
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                unmountCalls++;
+                return new ProcessRunResult(1, "", "permission denied");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            ct: CancellationToken.None);
+
+        Assert.Equal(2, mountCalls);
+        Assert.Equal(1, unmountCalls);
+    }
+
+    [Fact]
+    public async Task MountSingleBindWithRetry_AlreadyMountedUnmountRetryExhausted_DefersWithUnmountOperation()
+    {
+        var hostSource = Path.Combine(_workspace, "unmount-retryable-source");
+        Directory.CreateDirectory(hostSource);
+        var mountCalls = 0;
+        var unmountCalls = 0;
+        var recheckIn = TimeSpan.FromMilliseconds(123);
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                mountCalls++;
+                return new ProcessRunResult(1, "", "\"/repo\" is already mounted");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+                return new ProcessRunResult(
+                    0,
+                    """{"info":{"codeybox-test":{"mounts":{"/repo":{"source_path":"/old/source"}}}}}""",
+                    "");
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                unmountCalls++;
+                return new ProcessRunResult(1, "", "cannot connect to the multipass socket");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "version")
+                return new ProcessRunResult(0, "multipass 1.16.0", "");
+
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner, new MultipassDaemonRetryPolicy
+        {
+            Delay = (_, _) => Task.CompletedTask,
+            HealthProbeTimeout = TimeSpan.FromMilliseconds(100),
+            ExhaustedRequeueDelay = recheckIn,
+        });
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.MountSingleBindWithRetryAsync(
+                new MultipassSandboxOptions(),
+                name: "codeybox-test",
+                host: hostSource,
+                sandbox: "/repo",
+                workItemId: WorkItemId.New(),
+                ct: CancellationToken.None));
+
+        Assert.Equal(1, mountCalls);
+        Assert.Equal(3, unmountCalls);
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("umount", ex.Operation);
+        Assert.Equal("multipass-socket-unreachable", ex.ErrorClass);
+        Assert.Equal(recheckIn, ex.RecheckIn);
+    }
+
+    [Fact]
     public async Task MountSingleBindWithRetry_HostSourceMissing_ThrowsTypedExceptionWithoutRetry()
     {
         // If the source doesn't exist on the host filesystem, no number of

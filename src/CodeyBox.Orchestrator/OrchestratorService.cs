@@ -1204,28 +1204,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (item.State == WorkItemState.WaitingForQuotaReset)
             return null;
 
-        WorkItemState? targetState = item.State switch
-        {
-            WorkItemState.Auditing => WorkItemState.WorkComplete,
-            WorkItemState.Reworking => WorkItemState.WorkComplete,
-            // ReworkingForConflict resumes from AuditPassed so the merge phase
-            // re-runs. The ConflictReworkAttempts counter is preserved across
-            // the restart so the third-line fallback cannot fire a second
-            // time: if the re-run merge fails again the item parks at
-            // MergeConflictResolutionFailed instead of looping the agent.
-            WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
-            WorkItemState.Merging => WorkItemState.AuditPassed,
-            // WorkComplete / AuditPassed / Merged: pipeline resumes at the correct
-            // phase; no state change needed, just re-enqueue.
-            // UpstreamPushing → Merged: the skip flags in PipelineRunner treat Merged
-            // as "all phases done, go straight to RunUpstreamPushPhaseAsync". Keeping
-            // UpstreamPushing would leave skipWork/skipAudit/skipMerge all false and
-            // trigger a full pipeline replay from scratch.
-            WorkItemState.WorkComplete or WorkItemState.AuditPassed or WorkItemState.Merged
-                => item.State,
-            WorkItemState.UpstreamPushing => WorkItemState.Merged,
-            _ => null,
-        };
+        WorkItemState? targetState = WorkItemRecoveryPolicy.MapToRecoveryState(item.State);
 
         if (targetState is null) return null;
 
@@ -1846,15 +1825,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private async Task<WorkItem> ResetInfrastructureDeferredItemAsync(WorkItem item, CancellationToken ct)
     {
         var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
-        var target = InfrastructureDeferredResumeState(current.State);
-        if (target is null)
+        var reset = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            current,
+            DateTimeOffset.UtcNow);
+        if (reset is null)
             return current;
 
-        var reset = BuildInfrastructureDeferredReset(current, target.Value);
-        if (reset.State == current.State
-            && reset.LastError == current.LastError
-            && reset.FailureKind == current.FailureKind
-            && reset.StartedAt == current.StartedAt)
+        if (reset == current)
             return current;
 
         var updated = await _store.TryUpdateIfStateAsync(reset, current.State, ct).ConfigureAwait(false);
@@ -1863,38 +1840,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? current;
     }
-
-    private static WorkItem BuildInfrastructureDeferredReset(WorkItem current, WorkItemState target)
-        => current with
-        {
-            State = target,
-            LastError = null,
-            FailureKind = null,
-            QuotaResetAt = null,
-            NextQuotaRetryAt = null,
-            QuotaRetryFrom = null,
-            CancellationReason = null,
-            CancellationSource = null,
-            UpdatedAt = DateTimeOffset.UtcNow,
-            StartedAt = target == WorkItemState.Queued ? null : current.StartedAt,
-            PreemptedAt = target is WorkItemState.Working or WorkItemState.Reworking ? current.PreemptedAt : null,
-            PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? current.PreemptCheckpoint : null,
-        };
-
-    private static WorkItemState? InfrastructureDeferredResumeState(WorkItemState state) => state switch
-    {
-        WorkItemState.Queued => WorkItemState.Queued,
-        WorkItemState.Working => WorkItemState.Queued,
-        WorkItemState.Reworking => WorkItemState.Reworking,
-        WorkItemState.WorkComplete => WorkItemState.WorkComplete,
-        WorkItemState.Auditing => WorkItemState.WorkComplete,
-        WorkItemState.AuditPassed => WorkItemState.AuditPassed,
-        WorkItemState.Merging => WorkItemState.AuditPassed,
-        WorkItemState.Merged => WorkItemState.Merged,
-        WorkItemState.ReworkingForConflict => WorkItemState.AuditPassed,
-        WorkItemState.UpstreamPushing => WorkItemState.Merged,
-        _ => null,
-    };
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after

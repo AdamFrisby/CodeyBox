@@ -96,7 +96,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
     }
 
     [Theory]
-    [InlineData(WorkItemState.Reworking, WorkItemState.Reworking)]
+    [InlineData(WorkItemState.Reworking, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Merging, WorkItemState.AuditPassed)]
     [InlineData(WorkItemState.ReworkingForConflict, WorkItemState.AuditPassed)]
@@ -156,6 +156,67 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public async Task ProvisioningDeferredException_PreservesCheckpointedResumeState(
+        WorkItemState deferredFrom)
+    {
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            Title = "t",
+            Prompt = "p",
+            State = WorkItemState.Queued,
+        };
+        await _store.CreateAsync(item);
+
+        var queue = new InMemoryTaskQueue();
+        var workBranch = $"codeybox/{item.Id.ToString()[..8]}";
+        var checkpoint = $"refs/heads/codeybox/preempt/{item.Id}";
+        var pipeline = new ProvisioningDeferFromStateOncePipeline(
+            _store,
+            deferredFrom,
+            workBranch,
+            new SandboxProvisioningDeferredException(
+                provider: "multipass",
+                operation: "start",
+                errorClass: "multipass-start-argument-not-found",
+                detail: "start retry exhausted",
+                recheckIn: TimeSpan.FromMilliseconds(10)),
+            checkpoint);
+        var svc = new OrchestratorService(
+            queue,
+            _store,
+            pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        await queue.EnqueueAsync(item.Id);
+        await svc.StartAsync(CancellationToken.None);
+
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < deadline)
+                await Task.Delay(20);
+
+            Assert.Equal(2, pipeline.CallCount);
+            Assert.Equal(deferredFrom, pipeline.SecondCallState);
+            Assert.Equal(workBranch, pipeline.SecondCallWorkBranch);
+            Assert.Equal(checkpoint, pipeline.SecondCallPreemptCheckpoint);
+            Assert.NotNull(pipeline.SecondCallPreemptedAt);
+            Assert.Null(pipeline.SecondCallLastError);
+            Assert.Null(pipeline.SecondCallFailureKind);
+        }
+        finally
+        {
+            await svc.StopAsync(CancellationToken.None);
+        }
+    }
+
     private sealed class ProvisioningDeferOncePipeline : IPipelineRunner
     {
         private readonly IWorkItemStore _store;
@@ -197,18 +258,21 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         private readonly WorkItemState _deferredFrom;
         private readonly string _workBranch;
         private readonly SandboxProvisioningDeferredException _exception;
+        private readonly string? _preemptCheckpoint;
         private int _callCount;
 
         public ProvisioningDeferFromStateOncePipeline(
             IWorkItemStore store,
             WorkItemState deferredFrom,
             string workBranch,
-            SandboxProvisioningDeferredException exception)
+            SandboxProvisioningDeferredException exception,
+            string? preemptCheckpoint = null)
         {
             _store = store;
             _deferredFrom = deferredFrom;
             _workBranch = workBranch;
             _exception = exception;
+            _preemptCheckpoint = preemptCheckpoint;
         }
 
         public int CallCount => Volatile.Read(ref _callCount);
@@ -216,6 +280,9 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         public string? SecondCallWorkBranch { get; private set; }
         public string? SecondCallLastError { get; private set; }
         public string? SecondCallFailureKind { get; private set; }
+        public DateTimeOffset? SecondCallStartedAt { get; private set; }
+        public DateTimeOffset? SecondCallPreemptedAt { get; private set; }
+        public string? SecondCallPreemptCheckpoint { get; private set; }
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
@@ -229,6 +296,8 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                     StartedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
                     LastError = "previous transient error",
                     FailureKind = "other",
+                    PreemptedAt = _preemptCheckpoint is null ? null : DateTimeOffset.UtcNow.AddMinutes(-2),
+                    PreemptCheckpoint = _preemptCheckpoint,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }, ct);
                 throw _exception;
@@ -240,6 +309,9 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                 SecondCallWorkBranch = item.WorkBranch;
                 SecondCallLastError = item.LastError;
                 SecondCallFailureKind = item.FailureKind;
+                SecondCallStartedAt = item.StartedAt;
+                SecondCallPreemptedAt = item.PreemptedAt;
+                SecondCallPreemptCheckpoint = item.PreemptCheckpoint;
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
             }
         }

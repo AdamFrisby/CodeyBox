@@ -1608,6 +1608,15 @@ git push origin HEAD:{refName}";
                     newName);
                 return true;
             }
+
+            var infoDetail = retryInfo.ExitCode == 0
+                ? $"target info after retry: {SingleLine(retryInfo.Stdout)}"
+                : $"target info after retry was unreadable: {SingleLine(retryInfo.Stderr)}";
+            ThrowProvisioningDeferred(
+                "clone",
+                "multipass-clone-target-already-exists",
+                $"multipass clone target {newName} still reported already-exists after stale-target recovery; " +
+                $"{infoDetail}; stderr={retry.Stderr.Trim()}");
         }
 
         ThrowIfProvisioningRetryExhausted("clone", retry);
