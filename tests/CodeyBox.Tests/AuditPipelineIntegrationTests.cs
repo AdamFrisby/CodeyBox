@@ -577,6 +577,50 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ExhaustedPersistedAuditHistory_WithUnchangedBlockingFindings_HardFails()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var webhooks = new CapturingWebhookDispatcher();
+        var auditor = new ScriptedAuditor([new AuditOutcome(true, [])], "AuditorA");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: ProjectAudit.MaxIterationBudget,
+            webhookDispatcher: webhooks);
+
+        var item = NewItem() with { AuditMaxIterations = ProjectAudit.MaxIterationBudget };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var bareRepo = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(bareRepo, item.WorkBranch!, "work.txt", "work complete\n", "work commit");
+        var workComplete = item with { State = WorkItemState.WorkComplete };
+        await tp.Store.CreateAsync(workComplete);
+
+        var startedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var unchangedBlocking =
+            new[] { Payload("AuditorA", "Error", "same blocker", "x", "tests/A.cs:1") };
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            Progress(ProjectAudit.MaxIterationBudget - 1, ProjectAudit.MaxIterationBudget, unchangedBlocking),
+            startedAt);
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            Progress(ProjectAudit.MaxIterationBudget, ProjectAudit.MaxIterationBudget, unchangedBlocking),
+            startedAt.AddSeconds(1));
+
+        await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("same blocker", final.LastError);
+        Assert.Empty(auditor.SeenIterations);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.Single(webhooks.Events, e => e.Event == "work_item.audit_failed");
+    }
+
+    [Fact]
     public async Task RequiredBuildPersistedAuditReports_DoNotAdvanceRecoveredIteration_WhenBuildReportMissing()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1308,15 +1352,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     private static AuditProgressRecord Progress(
         int iteration,
         int maxIterations,
-        IReadOnlyList<AuditFindingPayload> findings,
+        IReadOnlyList<AuditProgressFinding> findings,
         string? workBranchTip = null)
     {
         var blocking = findings
-            .Where(f => Enum.TryParse<AuditSeverity>(f.Severity, ignoreCase: true, out var severity)
-                && severity >= AuditSeverity.Error)
+            .Where(f => f.Severity >= AuditSeverity.Error)
             .ToList();
         var blockingIds = blocking
-            .Select(f => FindingIdComputer.Compute(f.Auditor, f.Title, ParsePayloadFiles(f.Location)))
+            .Select(f => FindingIdComputer.Compute(f.AuditorName, f.Title, ParsePayloadFiles(f.Location)))
             .Distinct(StringComparer.Ordinal)
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToList();
@@ -1332,19 +1375,17 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             workBranchTip);
     }
 
-    private static AuditFindingPayload Payload(
+    private static AuditProgressFinding Payload(
         string auditor,
         string severity,
         string title,
         string description,
-        string? location = null) => new()
-        {
-            Auditor = auditor,
-            Severity = severity,
-            Title = title,
-            Description = description,
-            Location = location,
-        };
+        string? location = null) => new(
+            auditor,
+            AuditSeverityParser.Parse(severity),
+            title,
+            description,
+            location);
 
     private static IReadOnlyList<string> ParsePayloadFiles(string? location)
     {

@@ -36,6 +36,10 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class PipelineRunner : IPipelineRunner
 {
+    private const int AuditEscalationHistoryLimit = 25;
+    private const int AuditEscalationFindingsPerIterationLimit = 20;
+    private const int AuditEscalationFindingDescriptionLimit = 2000;
+
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -3544,7 +3548,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AuditLog.AuditFailed(last.Iteration, last.BlockingFindings);
         var summary = string.Join("; ", last.BlockingFindingsDetails
             .Take(5)
-            .Select(f => $"[{f.Auditor}] {f.Title}"));
+            .Select(f => $"[{f.AuditorName}] {f.Title}"));
         throw new AuditFailedException(
             $"Audit did not pass after {last.Iteration} iterations. {last.BlockingFindings} blocking finding(s): {summary}");
     }
@@ -3720,8 +3724,8 @@ public sealed class PipelineRunner : IPipelineRunner
             blocking.Count,
             nonBlocking,
             FingerprintFindings(blocking),
-            blocking.Select(ToSnapshotFinding).ToList(),
-            findings.Select(ToSnapshotFinding).ToList(),
+            blocking.Select(ToProgressFinding).ToList(),
+            findings.Select(ToProgressFinding).ToList(),
             workBranchTip);
     }
 
@@ -3882,26 +3886,33 @@ public sealed class PipelineRunner : IPipelineRunner
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToList();
 
-    private static AuditFindingPayload ToSnapshotFinding(AuditFinding finding) => new()
-    {
-        Auditor = finding.AuditorName,
-        Severity = finding.Severity.ToString(),
-        Title = finding.Title,
-        Description = finding.Description,
-        Location = finding.Location,
-    };
-
-    private static AuditFinding ToAuditFinding(AuditFindingPayload finding) => new(
-        finding.Auditor,
-        ParseAuditSeverity(finding.Severity),
+    private static AuditProgressFinding ToProgressFinding(AuditFinding finding) => new(
+        finding.AuditorName,
+        finding.Severity,
         finding.Title,
         finding.Description,
         finding.Location);
 
-    private static AuditSeverity ParseAuditSeverity(string severity)
-        => Enum.TryParse<AuditSeverity>(severity, ignoreCase: true, out var parsed)
-            ? parsed
-            : AuditSeverity.Info;
+    private static AuditFinding ToAuditFinding(AuditProgressFinding finding) => new(
+        finding.AuditorName,
+        finding.Severity,
+        finding.Title,
+        finding.Description,
+        finding.Location);
+
+    private static AuditFindingPayload ToEscalationWebhookFinding(AuditProgressFinding finding) => new()
+    {
+        Auditor = finding.AuditorName,
+        Severity = finding.Severity.ToString(),
+        Title = finding.Title,
+        Description = TruncateForEscalation(finding.Description),
+        Location = finding.Location,
+    };
+
+    private static string TruncateForEscalation(string value)
+        => value.Length <= AuditEscalationFindingDescriptionLimit
+            ? value
+            : value[..AuditEscalationFindingDescriptionLimit] + "...";
 
     private static string BuildAuditMaxIterationEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history)
@@ -3909,7 +3920,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var last = history[^1];
         var summary = string.Join("; ", last.BlockingFindingsDetails
             .Take(5)
-            .Select(f => $"[{f.Auditor}] {f.Title}"));
+            .Select(f => $"[{f.AuditorName}] {f.Title}"));
 
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
@@ -3922,6 +3933,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var last = history[^1];
         var signals = BuildAuditProgressSignals(history);
+        var emittedHistory = history.TakeLast(AuditEscalationHistoryLimit).ToList();
         return new AuditMaxIterationsEscalationDetails
         {
             WorkItemId = workItemId.ToString(),
@@ -3931,15 +3943,24 @@ public sealed class PipelineRunner : IPipelineRunner
             NonBlockingFindings = last.NonBlockingFindings,
             ProgressObserved = signals.Count > 0,
             ProgressSignals = signals,
-            History = history.Select(h => new AuditProgressIterationDetails
+            History = emittedHistory.Select(h => new AuditProgressIterationDetails
             {
                 Iteration = h.Iteration,
                 BlockingFindings = h.BlockingFindings,
                 NonBlockingFindings = h.NonBlockingFindings,
-                BlockingFindingsDetails = h.BlockingFindingsDetails,
-                Findings = h.Findings,
+                BlockingFindingsDetails = h.BlockingFindingsDetails
+                    .Take(AuditEscalationFindingsPerIterationLimit)
+                    .Select(ToEscalationWebhookFinding)
+                    .ToList(),
+                Findings = h.Findings
+                    .Take(AuditEscalationFindingsPerIterationLimit)
+                    .Select(ToEscalationWebhookFinding)
+                    .ToList(),
             }).ToList(),
-            RemainingBlockingFindings = last.BlockingFindingsDetails,
+            RemainingBlockingFindings = last.BlockingFindingsDetails
+                .Take(AuditEscalationFindingsPerIterationLimit)
+                .Select(ToEscalationWebhookFinding)
+                .ToList(),
             ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
         };
     }
@@ -9754,8 +9775,8 @@ internal sealed record AuditProgressSnapshot(
     int BlockingFindings,
     int NonBlockingFindings,
     IReadOnlyList<string> BlockingFindingIds,
-    IReadOnlyList<AuditFindingPayload> BlockingFindingsDetails,
-    IReadOnlyList<AuditFindingPayload> Findings,
+    IReadOnlyList<AuditProgressFinding> BlockingFindingsDetails,
+    IReadOnlyList<AuditProgressFinding> Findings,
     string? WorkBranchTip);
 
 internal sealed record SuggestionWebhookDetails(

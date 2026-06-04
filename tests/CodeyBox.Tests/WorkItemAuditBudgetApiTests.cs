@@ -182,6 +182,30 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         Assert.Equal("hard", stored.AuditComplexity);
     }
 
+    [Fact]
+    public async Task PatchAuditBudget_OnNeedsOperatorInputItem_Persists()
+    {
+        var item = NewStoredItem() with
+        {
+            State = WorkItemState.NeedsOperatorInput,
+            LastError = "audit reached max iterations",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync($"/workitems/{item.Id}", new
+        {
+            auditMaxIterations = 17,
+            auditComplexity = "  very-hard  ",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, stored!.State);
+        Assert.Equal("audit reached max iterations", stored.LastError);
+        Assert.Equal(17, stored.AuditMaxIterations);
+        Assert.Equal("very-hard", stored.AuditComplexity);
+    }
+
     [Theory]
     [InlineData(AuditBudgetUpdateOutcome.NotFound, HttpStatusCode.NotFound)]
     [InlineData(AuditBudgetUpdateOutcome.TerminalState, HttpStatusCode.Conflict)]

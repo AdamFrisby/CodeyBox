@@ -28,6 +28,17 @@ public sealed record AuditProgressRecord(
     int BlockingFindings,
     int NonBlockingFindings,
     IReadOnlyList<string> BlockingFindingIds,
-    IReadOnlyList<AuditFindingPayload> BlockingFindingsDetails,
-    IReadOnlyList<AuditFindingPayload> Findings,
+    IReadOnlyList<AuditProgressFinding> BlockingFindingsDetails,
+    IReadOnlyList<AuditProgressFinding> Findings,
     string? WorkBranchTip);
+
+/// <summary>
+/// Workflow-domain snapshot of an audit finding persisted for retry/escalation
+/// control. Webhook payload DTOs are derived from this only at publish time.
+/// </summary>
+public sealed record AuditProgressFinding(
+    string AuditorName,
+    AuditSeverity Severity,
+    string Title,
+    string Description,
+    string? Location = null);

@@ -106,8 +106,8 @@ public sealed class ResumeEndpointTests : IDisposable
                 BlockingFindings: 0,
                 NonBlockingFindings: 0,
                 BlockingFindingIds: Array.Empty<string>(),
-                BlockingFindingsDetails: Array.Empty<AuditFindingPayload>(),
-                Findings: Array.Empty<AuditFindingPayload>(),
+                BlockingFindingsDetails: Array.Empty<AuditProgressFinding>(),
+                Findings: Array.Empty<AuditProgressFinding>(),
                 WorkBranchTip: "deadbeef"),
             DateTimeOffset.UtcNow);
     }

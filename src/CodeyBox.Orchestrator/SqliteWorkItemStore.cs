@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 
@@ -12,7 +13,10 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, IDisposable
 {
-    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() },
+    };
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
@@ -1518,8 +1522,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 BlockingFindings: reader.GetInt32(2),
                 NonBlockingFindings: reader.GetInt32(3),
                 BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
-                BlockingFindingsDetails: DeserializeAuditFindingPayloads(reader.GetString(5)),
-                Findings: DeserializeAuditFindingPayloads(reader.GetString(6)),
+                BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(5)),
+                Findings: DeserializeAuditProgressFindings(reader.GetString(6)),
                 WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7)));
         }
         return results;
@@ -1549,16 +1553,89 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
-    private static IReadOnlyList<AuditFindingPayload> DeserializeAuditFindingPayloads(string json)
+    private static IReadOnlyList<AuditProgressFinding> DeserializeAuditProgressFindings(string json)
     {
         try
         {
-            return JsonSerializer.Deserialize<List<AuditFindingPayload>>(json, JsonOpts) ?? [];
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var findings = new List<AuditProgressFinding>();
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var auditorName = ReadStringProperty(element, "auditorName")
+                    ?? ReadStringProperty(element, "auditor")
+                    ?? string.Empty;
+                findings.Add(new AuditProgressFinding(
+                    auditorName,
+                    ReadAuditSeverity(element),
+                    ReadStringProperty(element, "title") ?? string.Empty,
+                    ReadStringProperty(element, "description") ?? string.Empty,
+                    ReadStringProperty(element, "location")));
+            }
+
+            return findings;
         }
         catch (JsonException)
         {
             return [];
         }
+    }
+
+    private static string? ReadStringProperty(JsonElement element, string name)
+    {
+        if (!TryGetPropertyIgnoreCase(element, name, out var property)
+            || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : property.ToString();
+    }
+
+    private static AuditSeverity ReadAuditSeverity(JsonElement element)
+    {
+        if (!TryGetPropertyIgnoreCase(element, "severity", out var property))
+            return AuditSeverity.Info;
+
+        if (property.ValueKind == JsonValueKind.String
+            && Enum.TryParse<AuditSeverity>(property.GetString(), ignoreCase: true, out var parsedString))
+        {
+            return parsedString;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number
+            && property.TryGetInt32(out var parsedNumber)
+            && Enum.IsDefined(typeof(AuditSeverity), parsedNumber))
+        {
+            return (AuditSeverity)parsedNumber;
+        }
+
+        return AuditSeverity.Info;
+    }
+
+    private static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement property)
+    {
+        if (element.TryGetProperty(name, out property))
+            return true;
+
+        foreach (var candidate in element.EnumerateObject())
+        {
+            if (string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                property = candidate.Value;
+                return true;
+            }
+        }
+
+        property = default;
+        return false;
     }
 
     private static void Bind(SqliteCommand cmd, WorkItem item)

@@ -266,7 +266,10 @@ public sealed record WorkItem
     /// Optional per-item audit iteration ceiling. When set, this overrides the
     /// project profile's default max when it is higher, allowing intentionally
     /// hard items to receive a larger audit budget without encoding that policy
-    /// into dispatch priority.
+    /// into dispatch priority. Raising the budget above the project default also
+    /// requires the project audit profile's
+    /// <see cref="ProjectAudit.BudgetOverrideMaxIterations"/> cap to allow that
+    /// higher value.
     /// </summary>
     public int? AuditMaxIterations { get; init; }
 

@@ -971,9 +971,6 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // StartAsync schedules the resume sweep on a LongRunning task that
-        // signals the barrier in its finally. Allow extra headroom for thread
-        // spin-up under parallel-test load — locally this completes in ~80ms.
         await barrier.RecoveryInputReady.WaitAsync(TimeSpan.FromSeconds(5));
         await svc.StopAsync(CancellationToken.None);
     }
