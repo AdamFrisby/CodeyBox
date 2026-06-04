@@ -246,7 +246,7 @@ internal sealed class WorkItemCreationService
         int? auditMaxIterations = null;
         if (req.AuditMaxIterations is { } auditBudget)
         {
-            var auditBudgetError = ValidateAuditMaxIterations(auditBudget);
+            var auditBudgetError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditBudget);
             if (auditBudgetError is not null)
                 return Error(auditBudgetError);
             auditMaxIterations = auditBudget;
@@ -255,9 +255,9 @@ internal sealed class WorkItemCreationService
         string? auditComplexity = null;
         if (req.AuditComplexity is not null)
         {
-            var (normalised, complexityError) = NormaliseAuditComplexity(req.AuditComplexity);
+            var (normalised, complexityError) = AuditBudgetRequestValidation.NormaliseAuditComplexity(req.AuditComplexity);
             if (complexityError is not null)
-                return new PreparedWorkItemCreationResult(null, complexityError);
+                return Error(complexityError);
             auditComplexity = normalised;
         }
 
@@ -473,27 +473,6 @@ internal sealed class WorkItemCreationService
             {
                 error = $"priority {priority} exceeds project '{project.Id}' maxPriority {maxPriority}",
             });
-        return null;
-    }
-
-    private static (string? Normalised, IResult? Error) NormaliseAuditComplexity(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return (null, null);
-        var trimmed = value.Trim();
-        if (trimmed.Length > 64)
-            return (null, Results.BadRequest(new { error = "auditComplexity must be <= 64 chars" }));
-        try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
-        catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
-        return (trimmed, null);
-    }
-
-    private static string? ValidateAuditMaxIterations(int value)
-    {
-        if (value <= 0)
-            return "auditMaxIterations must be greater than 0";
-        if (value > ProjectAudit.MaxIterationBudget)
-            return $"auditMaxIterations must be <= {ProjectAudit.MaxIterationBudget}";
         return null;
     }
 

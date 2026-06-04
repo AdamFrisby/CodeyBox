@@ -190,40 +190,26 @@ public sealed class ProjectRepositoryTests
     [Fact]
     public async Task ProjectAuditComplexityIterationBudgets_BindAndOverrideDefaults()
     {
-        var opts = new ProjectsOptions
-        {
-            Defaults = new ProjectDefaultsConfig
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                Audit = new ProjectAuditConfig
-                {
-                    ComplexityIterationBudgets = new Dictionary<string, int>
-                    {
-                        ["hard"] = 20,
-                        ["very-hard"] = 40,
-                    },
-                },
-            },
-            Projects =
-            [
-                new ProjectConfig
-                {
-                    Id = "alpha",
-                    RepositoryUrl = "https://example.com/x.git",
-                    Audit = new ProjectAuditConfig
-                    {
-                        ComplexityIterationBudgets = new Dictionary<string, int>
-                        {
-                            ["hard"] = 30,
-                        },
-                    },
-                },
-            ],
-        };
+                ["CodeyBox:Defaults:Audit:BudgetOverrideMaxIterations"] = "50",
+                ["CodeyBox:Defaults:Audit:ComplexityIterationBudgets:hard"] = "20",
+                ["CodeyBox:Defaults:Audit:ComplexityIterationBudgets:very-hard"] = "40",
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
+                ["CodeyBox:Projects:0:Audit:BudgetOverrideMaxIterations"] = "60",
+                ["CodeyBox:Projects:0:Audit:ComplexityIterationBudgets:hard"] = "30",
+            })
+            .Build();
+
+        var opts = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
         var repo = new ProjectRepository(Options.Create(opts));
         var p = await repo.GetAsync(new ProjectId("alpha"));
 
         Assert.Equal(30, p!.Audit.ComplexityIterationBudgets["hard"]);
         Assert.Equal(40, p.Audit.ComplexityIterationBudgets["very-hard"]);
+        Assert.Equal(60, p.Audit.BudgetOverrideMaxIterations);
     }
 
     [Fact]

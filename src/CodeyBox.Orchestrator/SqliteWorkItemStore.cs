@@ -10,8 +10,9 @@ namespace CodeyBox.Orchestrator;
 /// Schema is created on first use; intentionally minimal — most fields are
 /// stored as columns so the orchestrator can query by state at startup.
 /// </summary>
-public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
+public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, IDisposable
 {
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
@@ -64,6 +65,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             // Additive migration: add depends_on_json column if it doesn't exist yet.
             // Existing rows get the default '[]' so behaviour is unchanged.
             RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
+
+            // Workflow-owned audit progress history. This is separate from
+            // audit_reports, which is diagnostic storage and may be retention-swept.
+            using (var auditProgressCmd = _conn.CreateCommand())
+            {
+                auditProgressCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS work_item_audit_progress (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        work_attempt_started_at TEXT NOT NULL,
+                        iteration INTEGER NOT NULL,
+                        max_iterations INTEGER NOT NULL,
+                        blocking_findings INTEGER NOT NULL,
+                        non_blocking_findings INTEGER NOT NULL,
+                        blocking_finding_ids_json TEXT NOT NULL,
+                        blocking_findings_json TEXT NOT NULL,
+                        findings_json TEXT NOT NULL,
+                        work_branch_tip TEXT,
+                        recorded_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, work_attempt_started_at, iteration)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_work_item_audit_progress_attempt
+                        ON work_item_audit_progress(work_item_id, work_attempt_started_at, iteration);
+                    """;
+                auditProgressCmd.ExecuteNonQuery();
+            }
 
             // Additive migration: add agent_class_id column for quota-aware routing.
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
@@ -1414,6 +1440,91 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return results;
     }
 
+    public async Task RecordAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        AuditProgressRecord progress,
+        DateTimeOffset recordedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO work_item_audit_progress (
+                    work_item_id, work_attempt_started_at, iteration, max_iterations,
+                    blocking_findings, non_blocking_findings, blocking_finding_ids_json,
+                    blocking_findings_json, findings_json, work_branch_tip, recorded_at)
+                VALUES (
+                    $wi, $attempt, $iter, $max, $blocking, $non_blocking, $blocking_ids,
+                    $blocking_findings, $findings, $tip, $recorded_at)
+                ON CONFLICT(work_item_id, work_attempt_started_at, iteration) DO UPDATE SET
+                    max_iterations = excluded.max_iterations,
+                    blocking_findings = excluded.blocking_findings,
+                    non_blocking_findings = excluded.non_blocking_findings,
+                    blocking_finding_ids_json = excluded.blocking_finding_ids_json,
+                    blocking_findings_json = excluded.blocking_findings_json,
+                    findings_json = excluded.findings_json,
+                    work_branch_tip = excluded.work_branch_tip,
+                    recorded_at = excluded.recorded_at;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+            cmd.Parameters.AddWithValue("$iter", progress.Iteration);
+            cmd.Parameters.AddWithValue("$max", progress.MaxIterations);
+            cmd.Parameters.AddWithValue("$blocking", progress.BlockingFindings);
+            cmd.Parameters.AddWithValue("$non_blocking", progress.NonBlockingFindings);
+            cmd.Parameters.AddWithValue("$blocking_ids", JsonSerializer.Serialize(progress.BlockingFindingIds, JsonOpts));
+            cmd.Parameters.AddWithValue("$blocking_findings", JsonSerializer.Serialize(progress.BlockingFindingsDetails, JsonOpts));
+            cmd.Parameters.AddWithValue("$findings", JsonSerializer.Serialize(progress.Findings, JsonOpts));
+            cmd.Parameters.AddWithValue("$tip", (object?)progress.WorkBranchTip ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$recorded_at", recordedAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("RecordAuditProgressAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
+                   blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip
+            FROM work_item_audit_progress
+            WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
+            ORDER BY iteration ASC;
+            """;
+        cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+        cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+
+        var results = new List<AuditProgressRecord>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            results.Add(new AuditProgressRecord(
+                Iteration: reader.GetInt32(0),
+                MaxIterations: reader.GetInt32(1),
+                BlockingFindings: reader.GetInt32(2),
+                NonBlockingFindings: reader.GetInt32(3),
+                BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
+                BlockingFindingsDetails: DeserializeAuditFindingPayloads(reader.GetString(5)),
+                Findings: DeserializeAuditFindingPayloads(reader.GetString(6)),
+                WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7)));
+        }
+        return results;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -1421,6 +1532,33 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         _conn.Dispose();
         _writeLock.Dispose();
+    }
+
+    private static string AuditProgressAttemptKey(DateTimeOffset? workAttemptStartedAt)
+        => workAttemptStartedAt?.ToString("O") ?? "";
+
+    private static IReadOnlyList<string> DeserializeStringList(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(json, JsonOpts) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static IReadOnlyList<AuditFindingPayload> DeserializeAuditFindingPayloads(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<AuditFindingPayload>>(json, JsonOpts) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
     }
 
     private static void Bind(SqliteCommand cmd, WorkItem item)

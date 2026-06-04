@@ -193,7 +193,8 @@ internal static class TestSupport
                 resolvedOptions),
             dispatchAvailability: inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            auditProgress: store);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

@@ -502,6 +502,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             new AuditReportFinding("old-a", "Error", "old blocker", "x", ["tests/A.cs"], [1]),
         ]));
         reports.Add(Report(item.Id, 1, RequiredBuildGateIdentity.AuditorName, "None", startedAt.AddSeconds(1), []));
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            Progress(1, 2,
+            [
+                Payload("AuditorA", "Error", "old blocker", "x", "tests/A.cs:1"),
+            ]),
+            startedAt.AddSeconds(2));
 
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "recovered rework\n"));
         await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
@@ -542,6 +550,23 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         [
             new AuditReportFinding("old-b", "Error", "second blocker", "x", ["tests/B.cs"], [2]),
         ]));
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            Progress(ProjectAudit.MaxIterationBudget - 1, ProjectAudit.MaxIterationBudget,
+            [
+                Payload("AuditorA", "Error", "first blocker", "x", "tests/A.cs:1"),
+                Payload("AuditorA", "Error", "second blocker", "x", "tests/B.cs:2"),
+            ]),
+            startedAt.AddSeconds(2));
+        await tp.Store.RecordAuditProgressAsync(
+            item.Id,
+            workAttemptStartedAt: null,
+            Progress(ProjectAudit.MaxIterationBudget, ProjectAudit.MaxIterationBudget,
+            [
+                Payload("AuditorA", "Error", "second blocker", "x", "tests/B.cs:2"),
+            ]),
+            startedAt.AddSeconds(3));
 
         await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
 
@@ -586,7 +611,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditHistoryLoadFailure_FailsWorkItemAsInfrastructure()
+    public async Task AuditReportLoadFailure_DoesNotControlAuditRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new ThrowingAuditReportStore();
@@ -608,14 +633,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync(workComplete, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("failed to load persisted audit history", final.LastError);
-        Assert.Empty(auditor.SeenIterations);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
     }
 
     [Fact]
-    public async Task AuditReportPersistenceFailure_FailsWorkItemAsInfrastructure()
+    public async Task AuditReportPersistenceFailure_DoesNotFailWorkItem()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new ThrowingCreateAuditReportStore();
@@ -633,9 +656,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("failed to persist audit report", final.LastError);
+        Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal([1], auditor.SeenIterations);
     }
 
@@ -652,7 +673,12 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             _workspace,
             seed,
             auditors: [auditor],
-            maxAuditIterations: 1);
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                BudgetOverrideMaxIterations = 2,
+                AuditTypes = ["scripted"],
+            });
         tp.Agent.WorkPlan.Enqueue(new FileWrite("priority.txt", "work\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("priority.txt", "rework\n"));
 
@@ -682,6 +708,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             projectAudit: new ProjectAudit
             {
                 MaxIterations = 1,
+                BudgetOverrideMaxIterations = 3,
                 AuditTypes = ["scripted"],
                 ComplexityIterationBudgets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -699,6 +726,67 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal([1, 2, 3], auditor.SeenIterations);
+    }
+
+    [Fact]
+    public async Task WorkItemAuditMaxIterations_WithoutProjectOverrideCap_DoesNotExtendProjectBudget()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("quality:llm-review", AuditSeverity.Error, "still blocked", "x")]),
+            new AuditOutcome(true, []),
+        ]);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("priority.txt", "work\n"));
+
+        var item = NewItem() with { AuditMaxIterations = 2 };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("unknown")]
+    public async Task AuditComplexityBudget_NullOrUnknownComplexity_DoesNotUseConfiguredBudget(string? complexity)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("quality:llm-review", AuditSeverity.Error, "still blocked", "x")]),
+            new AuditOutcome(true, []),
+        ]);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                BudgetOverrideMaxIterations = 3,
+                AuditTypes = ["scripted"],
+                ComplexityIterationBudgets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["hard"] = 3,
+                },
+            });
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("complex.txt", "work\n"));
+
+        var item = NewItem() with { AuditComplexity = complexity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal([1], auditor.SeenIterations);
     }
 
     [Fact]
@@ -1120,6 +1208,56 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             DurationMs = 1000,
             Findings = findings,
         };
+
+    private static AuditProgressRecord Progress(
+        int iteration,
+        int maxIterations,
+        IReadOnlyList<AuditFindingPayload> findings,
+        string? workBranchTip = null)
+    {
+        var blocking = findings
+            .Where(f => Enum.TryParse<AuditSeverity>(f.Severity, ignoreCase: true, out var severity)
+                && severity >= AuditSeverity.Error)
+            .ToList();
+        var blockingIds = blocking
+            .Select(f => FindingIdComputer.Compute(f.Auditor, f.Title, ParsePayloadFiles(f.Location)))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToList();
+
+        return new AuditProgressRecord(
+            iteration,
+            maxIterations,
+            blocking.Count,
+            findings.Count - blocking.Count,
+            blockingIds,
+            blocking,
+            findings,
+            workBranchTip);
+    }
+
+    private static AuditFindingPayload Payload(
+        string auditor,
+        string severity,
+        string title,
+        string description,
+        string? location = null) => new()
+        {
+            Auditor = auditor,
+            Severity = severity,
+            Title = title,
+            Description = description,
+            Location = location,
+        };
+
+    private static IReadOnlyList<string> ParsePayloadFiles(string? location)
+    {
+        if (string.IsNullOrWhiteSpace(location))
+            return [];
+        var first = location.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
+        var lastColon = first.LastIndexOf(':');
+        return [lastColon > 1 && int.TryParse(first[(lastColon + 1)..], out _) ? first[..lastColon] : first];
+    }
 
     private static T? GetScalar<T>(LogEvent evt, string key)
     {

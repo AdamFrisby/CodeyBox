@@ -14,7 +14,7 @@ public sealed class WorkItemRetrier
     private readonly ITaskQueue _queue;
     private readonly IGitHost _gitHost;
     private readonly IAgentStreamSummaryStore? _streamSummaries;
-    private readonly IAuditReportStore? _auditReports;
+    private readonly IAuditProgressStore? _auditProgress;
     private readonly IProjectRepository? _projects;
     private readonly IReleaseStore? _releases;
     private readonly IWorkItemQuestionStore? _questions;
@@ -29,13 +29,14 @@ public sealed class WorkItemRetrier
         IAuditReportStore? auditReports = null,
         IProjectRepository? projects = null,
         IReleaseStore? releases = null,
-        IWorkItemQuestionStore? questions = null)
+        IWorkItemQuestionStore? questions = null,
+        IAuditProgressStore? auditProgress = null)
     {
         _store = store;
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
-        _auditReports = auditReports;
+        _auditProgress = auditProgress ?? store as IAuditProgressStore;
         _projects = projects;
         _releases = releases;
         _questions = questions;
@@ -351,18 +352,18 @@ public sealed class WorkItemRetrier
             return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
         // from=audit / from=merge bypass the work phase, so the existing
-        // commits on the work-branch must already be auditable. The cheapest
-        // signal is the audit-reports table: a non-empty set proves the audit
-        // phase ran at least once on these commits. If it hasn't, force the
-        // operator through from=work (which produces a rework iteration on top
-        // of the prior commits) rather than running auditors on a clean diff.
-        if (resumeState.Value != WorkItemState.Queued && _auditReports is not null)
+        // commits on the work branch must already have durable workflow-owned
+        // audit progress. Audit reports are diagnostic rows and may be
+        // retention-swept, so they are deliberately not used as a resume
+        // precondition.
+        if (resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
         {
-            var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
-            if (reports.Count == 0)
+            var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+            var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
+            if (progress.Count == 0)
                 return new ResumeOutcome(
                     ResumeStatus.Conflict,
-                    $"cannot resume from '{requestedFrom}': work-branch has never reached an audit-passing state (no prior audit reports). Use from=work to produce an auditable rework iteration first.",
+                    $"cannot resume from '{requestedFrom}': work branch has no durable audit progress. Use from=work to produce an auditable rework iteration first.",
                     null,
                     null);
         }
@@ -413,5 +414,17 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemResumed(resumed.Id, requestedFrom, reason);
 
         return new ResumeOutcome(ResumeStatus.Ok, null, resumed, resumeState);
+    }
+
+    private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
+        WorkItemId workItemId,
+        CancellationToken ct)
+    {
+        var iterations = await _store.GetIterationsAsync(workItemId, ct);
+        return iterations
+            .Where(i => i.Iteration == 1)
+            .OrderByDescending(i => i.DispatchedAt)
+            .Select(i => (DateTimeOffset?)i.DispatchedAt)
+            .FirstOrDefault();
     }
 }

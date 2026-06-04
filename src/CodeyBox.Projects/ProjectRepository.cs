@@ -363,6 +363,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         // taken whole from whichever side defines them — we don't try to
         // append defaults to project lists, which would be surprising.
         var mergedMaxIter = project?.MaxIterations ?? defaults?.MaxIterations ?? 3;
+        var mergedBudgetOverrideMax = project?.BudgetOverrideMaxIterations ?? defaults?.BudgetOverrideMaxIterations;
         var mergedComplexityBudgets = MergeComplexityIterationBudgets(
             defaults?.ComplexityIterationBudgets,
             project?.ComplexityIterationBudgets);
@@ -405,6 +406,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         {
             Profile = selectedProfile,
             MaxIterations = mergedMaxIter,
+            BudgetOverrideMaxIterations = mergedBudgetOverrideMax,
             ComplexityIterationBudgets = mergedComplexityBudgets,
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
@@ -468,6 +470,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         {
             Profile = audit.Profile,
             MaxIterations = audit.MaxIterations,
+            BudgetOverrideMaxIterations = audit.BudgetOverrideMaxIterations,
             ComplexityIterationBudgets = audit.ComplexityIterationBudgets.ToDictionary(
                 kvp => kvp.Key,
                 kvp => kvp.Value,

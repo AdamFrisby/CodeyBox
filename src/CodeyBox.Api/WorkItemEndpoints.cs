@@ -796,7 +796,7 @@ internal static class WorkItemEndpoints
     ///   - 400 if 'from' is not one of work/audit/merge or the reason violates
     ///     the length/control-character guard shared with /queue/pause.
     ///   - 409 if the item is not in Cancelled state, or if from=audit/merge
-    ///     was requested but no prior audit reports exist (work-branch never
+    ///     was requested but no durable audit progress exists (work-branch never
     ///     reached an auditable state).
     ///   - 412 if the bare repo or the work-branch ref is no longer present
     ///     (resume cannot reconstruct the prior agent work; the operator must
@@ -1003,16 +1003,16 @@ internal static class WorkItemEndpoints
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
         {
-            var auditMaxIterationsError = ValidateAuditMaxIterations(auditMaxIterations);
+            var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
             if (auditMaxIterationsError is not null)
-                return auditMaxIterationsError;
+                return Results.BadRequest(new { error = auditMaxIterationsError });
             updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
         }
 
         if (body.AuditComplexity is not null)
         {
-            var (normalised, complexityErr) = NormaliseAuditComplexity(body.AuditComplexity);
-            if (complexityErr is not null) return complexityErr;
+            var (normalised, complexityErr) = AuditBudgetRequestValidation.NormaliseAuditComplexity(body.AuditComplexity);
+            if (complexityErr is not null) return Results.BadRequest(new { error = complexityErr });
             updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
         }
 
@@ -1939,27 +1939,6 @@ internal static class WorkItemEndpoints
             if (seen.Add(tag)) result.Add(tag);
         }
         return (result, null);
-    }
-
-    private static (string? Normalised, IResult? Error) NormaliseAuditComplexity(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return (null, null);
-        var trimmed = value.Trim();
-        if (trimmed.Length > 64)
-            return (null, Results.BadRequest(new { error = "auditComplexity must be <= 64 chars" }));
-        try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
-        catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
-        return (trimmed, null);
-    }
-
-    private static IResult? ValidateAuditMaxIterations(int value)
-    {
-        if (value <= 0)
-            return Results.BadRequest(new { error = "auditMaxIterations must be greater than 0" });
-        if (value > ProjectAudit.MaxIterationBudget)
-            return Results.BadRequest(new { error = $"auditMaxIterations must be <= {ProjectAudit.MaxIterationBudget}" });
-        return null;
     }
 
     /// <summary>

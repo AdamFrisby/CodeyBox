@@ -364,6 +364,14 @@ public sealed record ProjectAudit
     public int MaxIterations { get; init; } = 10;
 
     /// <summary>
+    /// Project-specific upper bound for work-item audit budget overrides and
+    /// caller-selected complexity budgets. Null means overrides may not raise
+    /// the effective budget above <see cref="MaxIterations"/>. Operators must
+    /// set this explicitly to allow per-item or per-complexity elevation.
+    /// </summary>
+    public int? BudgetOverrideMaxIterations { get; init; }
+
+    /// <summary>
     /// Optional per-complexity audit iteration ceilings. Keys are operator-defined
     /// labels carried by <see cref="WorkItem.AuditComplexity"/>. Values are total
     /// iteration budgets, not bonuses; the runner uses the largest of the project

@@ -51,6 +51,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
     private readonly IAuditReportStore? _auditReports;
+    private readonly IAuditProgressStore? _auditProgress;
     private readonly ITimingStore? _timings;
     private readonly IWorkItemCostStore? _costStore;
     private readonly IAgentUsageStore? _usageStore;
@@ -206,7 +207,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentInvolvementStore? involvement = null,
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
         IRequiredBuildVerifier? requiredBuildVerifier = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IAuditProgressStore? auditProgress = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -252,6 +254,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;
+        _auditProgress = auditProgress ?? store as IAuditProgressStore;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent
         // and only genuine subscription probes receive mid-iteration write-back.
@@ -670,7 +673,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
-                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, requiredBuildApplies, repoId, baseBranch, workBranch, ct, hostShutdownToken);
+                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
                 if (resumingPreempt)
                 {
@@ -1008,9 +1011,9 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Work item {Id} could not load persisted audit history", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
-        catch (AuditReportPersistenceFailedException ex)
+        catch (AuditHistoryPersistenceFailedException ex)
         {
-            _log.LogWarning(ex, "Work item {Id} could not persist audit history", item.Id);
+            _log.LogWarning(ex, "Work item {Id} could not persist audit progress", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (TerminalQuotaError ex)
@@ -3344,14 +3347,14 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         IAgentRunner runner,
         IReadOnlyList<IAuditor> auditors,
-        bool requiredBuildApplies,
         string repoId,
         string baseBranch,
         string workBranch,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, project, auditors, requiredBuildApplies, ct);
+        var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, currentWorkAttemptStartedAt, ct);
         var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
         var auditHistory = priorAuditHistory
             .Select(h => h with { MaxIterations = maxIterations })
@@ -3436,6 +3439,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var progressSnapshot = BuildAuditProgressSnapshot(
                 iteration, maxIterations, findings, blocking, nonBlocking, workBranchTip);
             auditHistory.Add(progressSnapshot);
+            await PersistAuditProgressAsync(item, currentWorkAttemptStartedAt, progressSnapshot, ct);
 
             AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
@@ -3724,88 +3728,71 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
         WorkItem item,
-        Project project,
-        IReadOnlyList<IAuditor> auditors,
-        bool requiredBuildApplies,
+        DateTimeOffset? currentWorkAttemptStartedAt,
         CancellationToken ct)
     {
-        if (_auditReports is null || item.State != WorkItemState.WorkComplete)
+        if (_auditProgress is null || item.State != WorkItemState.WorkComplete)
             return [];
 
-        var expectedAuditors = auditors
-            .Select(a => a.Name)
-            .Distinct(StringComparer.Ordinal)
-            .ToHashSet(StringComparer.Ordinal);
-        if (requiredBuildApplies)
-            expectedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
-        if (expectedAuditors.Count == 0)
-            return [];
-
-        IReadOnlyList<AuditReport> reports;
+        IReadOnlyList<AuditProgressRecord> records;
         try
         {
-            reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+            records = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw new AuditHistoryLoadFailedException(
-                $"failed to load persisted audit history for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
+                $"failed to load durable audit progress history for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
                 ex);
         }
 
-        if (reports.Count == 0)
-            return [];
+        return records
+            .Where(r => r.Iteration > 0)
+            .OrderBy(r => r.Iteration)
+            .Select(r => new AuditProgressSnapshot(
+                r.Iteration,
+                r.MaxIterations,
+                r.BlockingFindings,
+                r.NonBlockingFindings,
+                r.BlockingFindingIds,
+                r.BlockingFindingsDetails,
+                r.Findings,
+                r.WorkBranchTip))
+            .ToList();
+    }
 
-        var currentAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
-        if (currentAttemptStartedAt is not null)
+    private async Task PersistAuditProgressAsync(
+        WorkItem item,
+        DateTimeOffset? currentWorkAttemptStartedAt,
+        AuditProgressSnapshot progress,
+        CancellationToken ct)
+    {
+        if (_auditProgress is null)
+            return;
+
+        try
         {
-            reports = reports
-                .Where(r => r.StartedAt >= currentAttemptStartedAt.Value)
-                .ToList();
+            await _auditProgress.RecordAuditProgressAsync(
+                item.Id,
+                currentWorkAttemptStartedAt,
+                new AuditProgressRecord(
+                    progress.Iteration,
+                    progress.MaxIterations,
+                    progress.BlockingFindings,
+                    progress.NonBlockingFindings,
+                    progress.BlockingFindingIds,
+                    progress.BlockingFindingsDetails,
+                    progress.Findings,
+                    progress.WorkBranchTip),
+                DateTimeOffset.UtcNow,
+                ct);
         }
-
-        var history = new List<AuditProgressSnapshot>();
-        foreach (var group in reports.Where(r => r.Iteration > 0).GroupBy(r => r.Iteration).OrderBy(g => g.Key))
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            var reportedAuditors = group
-                .Select(r => r.AuditorName)
-                .Distinct(StringComparer.Ordinal)
-                .ToHashSet(StringComparer.Ordinal);
-            var findings = group
-                .SelectMany(report => report.Findings.Select(f => ToSnapshotFinding(report.AuditorName, f)))
-                .ToList();
-            var blocking = findings
-                .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
-                .ToList();
-            var allExpectedAuditorsReported = expectedAuditors.IsSubsetOf(reportedAuditors);
-            var stopOnFirstIterationComplete =
-                project.Audit.StopOnFirstFailure
-                && blocking.Count > 0
-                && reportedAuditors.IsSubsetOf(expectedAuditors)
-                && (!requiredBuildApplies || reportedAuditors.Contains(RequiredBuildGateIdentity.AuditorName));
-            if (!allExpectedAuditorsReported && !stopOnFirstIterationComplete)
-                break;
-
-            var blockingIds = group
-                .SelectMany(report => report.Findings
-                    .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
-                    .Select(f => f.Id))
-                .Distinct(StringComparer.Ordinal)
-                .OrderBy(id => id, StringComparer.Ordinal)
-                .ToList();
-
-            history.Add(new AuditProgressSnapshot(
-                group.Key,
-                Math.Max(1, project.Audit.MaxIterations),
-                blocking.Count,
-                findings.Count - blocking.Count,
-                blockingIds,
-                blocking,
-                findings,
-                WorkBranchTip: null));
+            throw new AuditHistoryPersistenceFailedException(
+                $"failed to persist durable audit progress for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
+                ex);
         }
-
-        return history;
     }
 
     private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
@@ -3841,13 +3828,19 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         ProjectAudit audit,
         int projectBudget)
-        => Math.Min(
-            ProjectAudit.MaxIterationBudget,
-            Math.Max(
-                projectBudget,
-                Math.Max(
-                    item.AuditMaxIterations.GetValueOrDefault(),
-                    ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault())));
+    {
+        var overrideCap = ResolveAuditBudgetOverrideCap(audit, projectBudget);
+        var requestedOverride = Math.Max(
+            item.AuditMaxIterations.GetValueOrDefault(),
+            ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault());
+        return Math.Max(projectBudget, Math.Min(overrideCap, requestedOverride));
+    }
+
+    private static int ResolveAuditBudgetOverrideCap(ProjectAudit audit, int projectBudget)
+        => Math.Clamp(
+            audit.BudgetOverrideMaxIterations.GetValueOrDefault(projectBudget),
+            projectBudget,
+            ProjectAudit.MaxIterationBudget);
 
     private static int? ResolveComplexityAuditIterationBudget(string? complexity, ProjectAudit audit)
         => string.IsNullOrWhiteSpace(complexity)
@@ -3883,7 +3876,7 @@ public sealed class PipelineRunner : IPipelineRunner
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToList();
 
-    private static AuditFindingSnapshot ToSnapshotFinding(AuditFinding finding) => new()
+    private static AuditFindingPayload ToSnapshotFinding(AuditFinding finding) => new()
     {
         Auditor = finding.AuditorName,
         Severity = finding.Severity.ToString(),
@@ -3892,30 +3885,12 @@ public sealed class PipelineRunner : IPipelineRunner
         Location = finding.Location,
     };
 
-    private static AuditFindingSnapshot ToSnapshotFinding(string auditorName, AuditReportFinding finding) => new()
-    {
-        Auditor = auditorName,
-        Severity = finding.Severity,
-        Title = finding.Title,
-        Description = finding.Message,
-        Location = FormatReportFindingLocation(finding),
-    };
-
-    private static AuditFinding ToAuditFinding(AuditFindingSnapshot finding) => new(
+    private static AuditFinding ToAuditFinding(AuditFindingPayload finding) => new(
         finding.Auditor,
         ParseAuditSeverity(finding.Severity),
         finding.Title,
         finding.Description,
         finding.Location);
-
-    private static string? FormatReportFindingLocation(AuditReportFinding finding)
-    {
-        if (finding.Files.Count == 0)
-            return null;
-        if (finding.Files.Count == 1 && finding.LineHints.Count > 0)
-            return $"{finding.Files[0]}:{finding.LineHints[0]}";
-        return string.Join(", ", finding.Files);
-    }
 
     private static AuditSeverity ParseAuditSeverity(string severity)
         => Enum.TryParse<AuditSeverity>(severity, ignoreCase: true, out var parsed)
@@ -4477,9 +4452,11 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw new AuditReportPersistenceFailedException(
-                $"failed to persist audit report for auditor '{auditor.Name}' iteration {ctx.Iteration}; retry cannot safely continue without durable audit history",
-                ex);
+            _log.LogWarning(ex,
+                "Failed to persist diagnostic audit report for auditor {AuditorName} iteration {Iteration} on work item {WorkItemId}",
+                auditor.Name,
+                ctx.Iteration,
+                ctx.WorkItemId);
         }
     }
 
@@ -9689,9 +9666,9 @@ internal sealed class AuditHistoryLoadFailedException : Exception
         : base(message, innerException) { }
 }
 
-internal sealed class AuditReportPersistenceFailedException : Exception
+internal sealed class AuditHistoryPersistenceFailedException : Exception
 {
-    public AuditReportPersistenceFailedException(string message, Exception innerException)
+    public AuditHistoryPersistenceFailedException(string message, Exception innerException)
         : base(message, innerException) { }
 }
 
@@ -9776,8 +9753,8 @@ internal sealed record AuditProgressSnapshot(
     int BlockingFindings,
     int NonBlockingFindings,
     IReadOnlyList<string> BlockingFindingIds,
-    IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails,
-    IReadOnlyList<AuditFindingSnapshot> Findings,
+    IReadOnlyList<AuditFindingPayload> BlockingFindingsDetails,
+    IReadOnlyList<AuditFindingPayload> Findings,
     string? WorkBranchTip);
 
 internal sealed record SuggestionWebhookDetails(

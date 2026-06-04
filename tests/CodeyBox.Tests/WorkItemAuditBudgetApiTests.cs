@@ -268,6 +268,46 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         Assert.Equal("hard", stored.AuditComplexity);
     }
 
+    [Fact]
+    public async Task SqliteUpdateAuditBudget_MissingRow_ReturnsNotFound()
+    {
+        var result = await _factory.Store.UpdateAuditBudgetAsync(
+            WorkItemId.New(),
+            auditMaxIterations: 7,
+            auditComplexity: "hard",
+            DateTimeOffset.UtcNow);
+
+        Assert.Equal(AuditBudgetUpdateOutcome.NotFound, result.Outcome);
+        Assert.Null(result.Item);
+    }
+
+    [Fact]
+    public async Task SqliteUpdateAuditBudget_TerminalRow_ReturnsTerminalStateAndDoesNotUpdate()
+    {
+        var item = NewStoredItem() with
+        {
+            State = WorkItemState.Done,
+            AuditMaxIterations = 4,
+            AuditComplexity = "hard",
+        };
+        await _factory.Store.CreateAsync(item);
+
+        var result = await _factory.Store.UpdateAuditBudgetAsync(
+            item.Id,
+            auditMaxIterations: 8,
+            auditComplexity: "very-hard",
+            DateTimeOffset.UtcNow);
+
+        Assert.Equal(AuditBudgetUpdateOutcome.TerminalState, result.Outcome);
+        Assert.Equal(WorkItemState.Done, result.Item!.State);
+        Assert.Equal(4, result.Item.AuditMaxIterations);
+        Assert.Equal("hard", result.Item.AuditComplexity);
+
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal(4, stored!.AuditMaxIterations);
+        Assert.Equal("hard", stored.AuditComplexity);
+    }
+
     private static WorkItem NewStoredItem() => new()
     {
         Id = WorkItemId.New(),
