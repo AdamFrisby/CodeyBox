@@ -1131,8 +1131,17 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add("while :; do :; done");
         psi.Environment[SandboxConventions.WorkItemIdEnvironmentVariable] = itemId.ToString();
-        return DiagProcess.Start(psi)
+        var process = DiagProcess.Start(psi)
             ?? throw new InvalidOperationException("failed to start busy test process");
+        // The busy sh process saturates a CPU core; without lowering its priority
+        // it can starve other parallel xUnit test classes (time-sensitive
+        // pacing/timeout tests) on the shared host. Idle priority maps to
+        // nice 19 on Linux so this loop only runs when nothing else needs CPU,
+        // while still accumulating enough utime/stime for the activity source
+        // to observe CPU progress between samples.
+        try { process.PriorityClass = System.Diagnostics.ProcessPriorityClass.Idle; }
+        catch { /* best-effort: priority adjustments require capabilities on some Linux configs */ }
+        return process;
     }
 
     private static DiagProcess StartIdleProcess(WorkItemId itemId)
