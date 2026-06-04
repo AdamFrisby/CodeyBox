@@ -10,6 +10,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
 {
+    private const int DeleteBatchSize = 500;
+
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
 
@@ -133,17 +135,37 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
 
     public async Task<int> DeleteExpiredAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
+        var deleted = 0;
+        var cutoffText = cutoff.ToString("O");
+
+        while (true)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM idempotency_keys WHERE expires_at <= $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
-            return await cmd.ExecuteNonQueryAsync(ct);
-        }
-        finally
-        {
-            _writeLock.Release();
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    DELETE FROM idempotency_keys
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM idempotency_keys
+                        WHERE expires_at <= $cutoff
+                        LIMIT $limit
+                    );
+                    """;
+                cmd.Parameters.AddWithValue("$cutoff", cutoffText);
+                cmd.Parameters.AddWithValue("$limit", DeleteBatchSize);
+                var batchDeleted = await cmd.ExecuteNonQueryAsync(ct);
+                deleted += batchDeleted;
+                if (batchDeleted < DeleteBatchSize)
+                    return deleted;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+
+            await Task.Yield();
         }
     }
 

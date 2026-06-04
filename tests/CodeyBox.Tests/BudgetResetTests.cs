@@ -122,7 +122,7 @@ public sealed class BudgetResetTests : IDisposable
         var reg = new CancellationRegistry(CancellationToken.None);
         var budgetRecheck = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            HourlyLimitRecheck = TimeSpan.FromMilliseconds(500),
+            HourlyLimitRecheck = TimeSpan.FromSeconds(2),
         });
         var svc = new OrchestratorService(
             queue, _store, pipeline, reg, opts,

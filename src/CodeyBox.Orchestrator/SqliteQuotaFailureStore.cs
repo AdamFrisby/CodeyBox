@@ -5,6 +5,8 @@ namespace CodeyBox.Orchestrator;
 
 public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
 {
+    private const int PruneBatchSize = 500;
+
     private readonly SqliteConnection _conn;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
@@ -202,25 +204,43 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
 
     public async Task PruneOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _connectionLock.WaitAsync(ct);
-        try
+        var cutoffText = cutoff.ToUniversalTime().ToString("O");
+
+        while (true)
         {
-            await _lock.WaitAsync(ct);
+            await _connectionLock.WaitAsync(ct);
             try
             {
-                using var cmd = _conn.CreateCommand();
-                cmd.CommandText = "DELETE FROM quota_failures WHERE observed_at < $cutoff;";
-                cmd.Parameters.AddWithValue("$cutoff", cutoff.ToUniversalTime().ToString("O"));
-                await cmd.ExecuteNonQueryAsync(ct);
+                await _lock.WaitAsync(ct);
+                try
+                {
+                    using var cmd = _conn.CreateCommand();
+                    cmd.CommandText = """
+                        DELETE FROM quota_failures
+                        WHERE rowid IN (
+                            SELECT rowid
+                            FROM quota_failures
+                            WHERE observed_at < $cutoff
+                            LIMIT $limit
+                        );
+                        """;
+                    cmd.Parameters.AddWithValue("$cutoff", cutoffText);
+                    cmd.Parameters.AddWithValue("$limit", PruneBatchSize);
+                    var deleted = await cmd.ExecuteNonQueryAsync(ct);
+                    if (deleted < PruneBatchSize)
+                        return;
+                }
+                finally
+                {
+                    _lock.Release();
+                }
             }
             finally
             {
-                _lock.Release();
+                _connectionLock.Release();
             }
-        }
-        finally
-        {
-            _connectionLock.Release();
+
+            await Task.Yield();
         }
     }
 

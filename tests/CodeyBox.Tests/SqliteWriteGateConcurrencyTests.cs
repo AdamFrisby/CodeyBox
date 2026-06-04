@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using CodeyBox.Agents;
 using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -19,9 +20,12 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         using var registry = new SqliteWorkerRegistry(_dbPath);
         using var timing = new SqliteTimingStore(_dbPath);
         using var usage = new SqliteAgentUsageStore(_dbPath);
+        using var costs = new SqliteWorkItemCostStore(_dbPath);
+        using var streamSummaries = new SqliteAgentStreamSummaryStore(_dbPath);
 
         var timedItem = MakeWorkItem("timed");
         await factory.Store.CreateAsync(timedItem);
+        var streamRow = MakeStreamSummary(timedItem.Id);
 
         const int workerCount = 4;
         var workerIds = new List<string>();
@@ -89,20 +93,35 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             .ToArray();
 
         var pruneTask = usage.PruneAsync(DateTimeOffset.UtcNow.AddDays(-90));
+        var streamSummaryTask = streamSummaries.UpsertAsync(streamRow);
+        var reconcileTask = costs.ReconcileFromAgentStreamSummaryAsync(streamRow);
+        var allWrites = postTasks
+            .Select(t => (Task)t)
+            .Concat(heartbeatTasks)
+            .Concat(timingTasks)
+            .Append(pruneTask)
+            .Append(streamSummaryTask)
+            .Append(reconcileTask)
+            .ToArray();
 
         try
         {
+            await AssertUngatedWriterBlockedBySqliteLockAsync(_dbPath);
+
             await Task.Delay(100);
-            var allWrites = postTasks
-                .Select(t => (Task)t)
-                .Concat(heartbeatTasks)
-                .Concat(timingTasks)
-                .Append(pruneTask)
-                .ToArray();
-            Assert.False(
-                allWrites.All(t => t.IsCompleted),
-                "The real SQLite write transaction should hold at least one concurrent writer until it is released.");
+            Assert.All(
+                allWrites,
+                t => Assert.False(t.IsCompleted, "Writers should queue behind the shared write gate while maintenance owns it."));
             Assert.DoesNotContain(allWrites, t => t.IsFaulted);
+
+            await maintenance.ReleaseSqliteWriteLockAsync();
+            await AssertUngatedWriterCanWriteWhileGateHeldAsync(_dbPath);
+            await Task.Delay(250);
+            Assert.All(
+                allWrites,
+                t => Assert.False(
+                    t.IsCompleted,
+                    "A writer completed after the raw SQLite lock was released while the shared write gate was still held, which indicates it bypassed the gate."));
         }
         finally
         {
@@ -110,7 +129,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         }
 
         var responses = await Task.WhenAll(postTasks).WaitAsync(TimeSpan.FromSeconds(15));
-        await Task.WhenAll(heartbeatTasks.Concat(timingTasks)).WaitAsync(TimeSpan.FromSeconds(15));
+        await Task.WhenAll(heartbeatTasks.Concat(timingTasks).Append(streamSummaryTask).Append(reconcileTask)).WaitAsync(TimeSpan.FromSeconds(15));
         var pruned = await pruneTask.WaitAsync(TimeSpan.FromSeconds(15));
 
         try
@@ -128,6 +147,12 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         Assert.All(workers, worker => Assert.StartsWith("work-", worker.CurrentWorkItemId));
         Assert.Equal(8, (await timing.GetByWorkItemAsync(timedItem.Id)).Count);
         Assert.Equal(usageRows, pruned);
+        Assert.Single(await streamSummaries.GetByWorkItemAsync(timedItem.Id));
+        var costRow = Assert.Single(await costs.GetByWorkItemAsync(timedItem.Id.ToString()));
+        Assert.Equal("work", costRow.Phase);
+        Assert.Equal(100, costRow.InputTokens);
+        Assert.Equal(20, costRow.CachedInputTokens);
+        Assert.Equal(50, costRow.OutputTokens);
     }
 
     public void Dispose()
@@ -146,10 +171,76 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         Prompt = "p",
     };
 
+    private static AgentStreamSummaryRow MakeStreamSummary(WorkItemId id) => new(
+        id,
+        "work-codex.jsonl",
+        "work",
+        null,
+        AgentKind.Codex,
+        new AgentStreamSummary(
+            TimeSpan.FromSeconds(3),
+            TimeSpan.FromMilliseconds(250),
+            100,
+            50,
+            20,
+            0.42m,
+            [],
+            [],
+            "done"),
+        DateTimeOffset.UtcNow);
+
+    private static async Task AssertUngatedWriterBlockedBySqliteLockAsync(string dbPath)
+    {
+        await using var conn = new SqliteConnection($"Data Source={dbPath}");
+        await conn.OpenAsync();
+
+        using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA busy_timeout=50;";
+            await pragma.ExecuteNonQueryAsync();
+        }
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandTimeout = 1;
+        cmd.CommandText = """
+            INSERT INTO write_gate_maintenance_lock (id, touched_at)
+            VALUES (1, $touched_at)
+            ON CONFLICT(id) DO UPDATE SET touched_at = excluded.touched_at;
+            """;
+        cmd.Parameters.AddWithValue("$touched_at", DateTimeOffset.UtcNow.ToString("O"));
+
+        var ex = await Assert.ThrowsAsync<SqliteException>(() => cmd.ExecuteNonQueryAsync());
+        Assert.True(
+            ex.SqliteErrorCode is 5 or 6,
+            $"expected SQLITE_BUSY/SQLITE_LOCKED from an ungated writer, got {ex.SqliteErrorCode}");
+    }
+
+    private static async Task AssertUngatedWriterCanWriteWhileGateHeldAsync(string dbPath)
+    {
+        await using var conn = new SqliteConnection($"Data Source={dbPath}");
+        await conn.OpenAsync();
+
+        using (var pragma = conn.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA busy_timeout=50;";
+            await pragma.ExecuteNonQueryAsync();
+        }
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO write_gate_maintenance_lock (id, touched_at)
+            VALUES (2, $touched_at)
+            ON CONFLICT(id) DO UPDATE SET touched_at = excluded.touched_at;
+            """;
+        cmd.Parameters.AddWithValue("$touched_at", DateTimeOffset.UtcNow.ToString("O"));
+        Assert.Equal(1, await cmd.ExecuteNonQueryAsync());
+    }
+
     private sealed class LongMaintenanceWriter : IAsyncDisposable
     {
         private readonly SqliteDatabaseWriteGate _gate;
         private readonly SqliteConnection _conn;
+        private int _sqliteLockReleased;
         private int _released;
 
         private LongMaintenanceWriter(SqliteDatabaseWriteGate gate, SqliteConnection conn)
@@ -210,6 +301,16 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             }
         }
 
+        public async Task ReleaseSqliteWriteLockAsync()
+        {
+            if (Interlocked.Exchange(ref _sqliteLockReleased, 1) != 0)
+                return;
+
+            using var rollback = _conn.CreateCommand();
+            rollback.CommandText = "ROLLBACK;";
+            await rollback.ExecuteNonQueryAsync();
+        }
+
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _released, 1) != 0)
@@ -217,9 +318,12 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 
             try
             {
-                using var rollback = _conn.CreateCommand();
-                rollback.CommandText = "ROLLBACK;";
-                await rollback.ExecuteNonQueryAsync();
+                if (Interlocked.Exchange(ref _sqliteLockReleased, 1) == 0)
+                {
+                    using var rollback = _conn.CreateCommand();
+                    rollback.CommandText = "ROLLBACK;";
+                    await rollback.ExecuteNonQueryAsync();
+                }
             }
             finally
             {
