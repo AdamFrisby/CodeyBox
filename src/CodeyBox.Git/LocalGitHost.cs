@@ -707,7 +707,7 @@ public sealed class LocalGitHost : IGitHost
 
         var psi = new ProcessStartInfo
         {
-            FileName = "git",
+            FileName = _opts.GitExecutable,
             WorkingDirectory = path,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -721,8 +721,28 @@ public sealed class LocalGitHost : IGitHost
         psi.ArgumentList.Add("--name-only");
         psi.ArgumentList.Add(treeish);
 
-        using var p = new System.Diagnostics.Process { StartInfo = psi };
-        p.Start();
+        ILocalGitProcess? p = null;
+        for (var attempt = 1; ; attempt++)
+        {
+            p = _processFactory(psi);
+            try
+            {
+                p.Start();
+                break;
+            }
+            catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
+            {
+                p.Dispose();
+                p = null;
+                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+            }
+            catch
+            {
+                p.Dispose();
+                throw;
+            }
+        }
+        using var _p = p;
 
         var results = new List<string>(Math.Min(64, maxResults));
         var capExceeded = false;
@@ -1156,6 +1176,7 @@ public sealed class LocalGitHost : IGitHost
         public int ExitCode => _process.ExitCode;
         public void Start() => _process.Start();
         public Task WaitForExitAsync(CancellationToken ct) => _process.WaitForExitAsync(ct);
+        public void Kill(bool entireProcessTree) => _process.Kill(entireProcessTree);
         public void Dispose() => _process.Dispose();
     }
 
@@ -1200,6 +1221,7 @@ internal interface ILocalGitProcess : IDisposable
     int ExitCode { get; }
     void Start();
     Task WaitForExitAsync(CancellationToken ct);
+    void Kill(bool entireProcessTree);
 }
 
 public sealed record LocalGitHostOptions

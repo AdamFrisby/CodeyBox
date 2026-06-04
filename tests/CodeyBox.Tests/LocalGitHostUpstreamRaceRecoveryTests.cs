@@ -399,6 +399,8 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
 
+        public void Kill(bool entireProcessTree) { }
+
         public void Dispose()
         {
             _stdout.Dispose();
