@@ -38,7 +38,9 @@ Hot-reloadable today:
   to the live `AgentClassRouter` catalog. In-flight routing calls finish against
   the snapshot they started with.
 - `AgentBurnEstimator` — re-applied via `AgentConfigHotReload` to the live
-  burn-estimator (per-window token budgets, default burn percentages).
+  burn-estimator (per-window token budgets, default burn percentages). Agents
+  with samples but no positive `WindowTokenBudget` fail open until a budget is
+  configured.
 - `AgentPricing` — re-applied via `AgentConfigHotReload` to the live
   `AgentCostCalculator`. Negative-rate validation runs on the reload candidate
   before the swap; rejected reloads keep the prior pricing.

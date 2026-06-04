@@ -112,6 +112,35 @@ public sealed class AgentClassRouterRateAwareTests
     }
 
     [Fact]
+    public async Task RateAware_NoWindowBudgetWithSamples_FailsOpenInsteadOfColdStartFit()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        counters.Increment(Codex);
+        counters.Increment(Codex);
+        counters.Increment(Codex);
+
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = -1,
+                    SampleCount = 10,
+                    Status = AgentBurnEstimateStatus.NoWindowBudget,
+                },
+            }
+        };
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 81.0)], estimator, counters);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
     public async Task RateAware_BlockedCodex_FallsThroughToClaude()
     {
         // Codex is in-flight and rate-aware gated; claude is freely available.
@@ -274,6 +303,33 @@ public sealed class AgentClassRouterRateAwareTests
     }
 
     [Fact]
+    public async Task SummariseFitsAsync_NoWindowBudgetWithSamples_ReportsUnboundedFit()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var estimator = new FakeBurnEstimator
+        {
+            EstimatesByAgent =
+            {
+                [Codex] = new AgentBurnEstimate
+                {
+                    AvgBurnPctPerItem = -1,
+                    SampleCount = 10,
+                    Status = AgentBurnEstimateStatus.NoWindowBudget,
+                },
+            }
+        };
+        var router = BuildRouter([cls], [new FakeProbe(Codex, 81.0)], estimator, counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.Equal(10, view.SampleCount);
+        Assert.Equal(AgentBurnEstimateStatus.NoWindowBudget, view.BurnEstimateStatus);
+        Assert.True(double.IsPositiveInfinity(view.FitInWindow));
+    }
+
+    [Fact]
     public async Task SummariseFitsAsync_UnknownAvailability_ReturnsNaNFit()
     {
         // Probe returned AvailablePct = -1 (unknown). With samples present,
@@ -314,6 +370,26 @@ public sealed class AgentClassRouterRateAwareTests
 
         Assert.Single(fits);
         Assert.Equal(Claude, fits[0].Agent);
+    }
+
+    [Fact]
+    public async Task SummariseFitsAsync_BurnEstimatorThrows_ReportsSampleSourceUnavailable()
+    {
+        var cls = FrontierClass(Sub(Codex));
+        var counters = new FakeCounters();
+        var router = BuildRouter(
+            [cls],
+            [new FakeProbe(Codex, 100.0)],
+            new ThrowingBurnEstimator(),
+            counters);
+
+        var fits = await router.SummariseFitsAsync("frontier");
+
+        var view = Assert.Single(fits);
+        Assert.Equal(AgentBurnEstimateStatus.SampleSourceUnavailable, view.BurnEstimateStatus);
+        Assert.Equal(0, view.SampleCount);
+        Assert.Equal(-1, view.AvgBurnPctPerItem);
+        Assert.Equal(AgentClassRouter.DefaultColdStartFitInWindow, view.FitInWindow);
     }
 
     [Fact]
