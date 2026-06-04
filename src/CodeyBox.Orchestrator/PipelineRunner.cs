@@ -3340,9 +3340,14 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var maxIterations = Math.Max(1, project.Audit.MaxIterations);
-        var auditHistory = new List<AuditProgressSnapshot>(maxIterations);
-        for (var iteration = 1; iteration <= maxIterations; iteration++)
+        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, project, ct);
+        var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
+        var auditHistory = priorAuditHistory
+            .Select(h => h with { MaxIterations = maxIterations })
+            .ToList();
+        var startIteration = auditHistory.Count == 0 ? 1 : auditHistory.Max(h => h.Iteration) + 1;
+
+        for (var iteration = startIteration; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
@@ -3408,8 +3413,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
+            var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
             var progressSnapshot = BuildAuditProgressSnapshot(
-                iteration, maxIterations, findings, blocking, nonBlocking);
+                iteration, maxIterations, findings, blocking, nonBlocking, workBranchTip);
             auditHistory.Add(progressSnapshot);
 
             AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
@@ -3592,7 +3598,8 @@ public sealed class PipelineRunner : IPipelineRunner
         int maxIterations,
         IReadOnlyList<AuditFinding> findings,
         IReadOnlyList<AuditFinding> blocking,
-        int nonBlocking)
+        int nonBlocking,
+        string? workBranchTip)
     {
         return new AuditProgressSnapshot(
             iteration,
@@ -3601,25 +3608,106 @@ public sealed class PipelineRunner : IPipelineRunner
             nonBlocking,
             FingerprintFindings(blocking),
             blocking.Select(ToSnapshotFinding).ToList(),
-            findings.Select(ToSnapshotFinding).ToList());
+            findings.Select(ToSnapshotFinding).ToList(),
+            workBranchTip);
     }
 
     private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
+        => BuildAuditProgressSignals(history).Count > 0;
+
+    private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
+        WorkItem item,
+        Project project,
+        CancellationToken ct)
     {
-        if (history.Count < 2)
-            return false;
+        if (_auditReports is null || item.State != WorkItemState.WorkComplete)
+            return [];
 
-        var last = history[^1];
-        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
-            return true;
+        IReadOnlyList<AuditReport> reports;
+        try
+        {
+            reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to load persisted audit history for work item {WorkItemId}; retry will use in-memory history only", item.Id);
+            return [];
+        }
 
-        var lastTotal = last.BlockingFindings + last.NonBlockingFindings;
-        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings + h.NonBlockingFindings > lastTotal))
-            return true;
+        if (reports.Count == 0)
+            return [];
 
-        var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
-        return history.Take(history.Count - 1)
-            .Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds));
+        var history = new List<AuditProgressSnapshot>();
+        foreach (var group in reports.Where(r => r.Iteration > 0).GroupBy(r => r.Iteration).OrderBy(g => g.Key))
+        {
+            var findings = group
+                .SelectMany(report => report.Findings.Select(f => ToSnapshotFinding(report.AuditorName, f)))
+                .ToList();
+            var blocking = findings
+                .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
+                .ToList();
+            var blockingIds = group
+                .SelectMany(report => report.Findings
+                    .Where(f => ParseAuditSeverity(f.Severity) >= project.Audit.FailingSeverity)
+                    .Select(f => f.Id))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(id => id, StringComparer.Ordinal)
+                .ToList();
+
+            history.Add(new AuditProgressSnapshot(
+                group.Key,
+                Math.Max(1, project.Audit.MaxIterations),
+                blocking.Count,
+                findings.Count - blocking.Count,
+                blockingIds,
+                blocking,
+                findings,
+                WorkBranchTip: null));
+        }
+
+        return history;
+    }
+
+    private static int ResolveAuditMaxIterations(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
+    {
+        var projectBudget = Math.Max(1, project.Audit.MaxIterations);
+        var maxIterations = projectBudget + ResolvePriorityAuditIterationBonus(item.Priority, projectBudget);
+
+        if (priorAuditHistory.Count > 0)
+        {
+            var priorMaxIteration = priorAuditHistory.Max(h => h.Iteration);
+            maxIterations = Math.Max(maxIterations, priorMaxIteration + projectBudget);
+        }
+
+        return maxIterations;
+    }
+
+    private static int ResolvePriorityAuditIterationBonus(int priority, int projectBudget)
+    {
+        if (priority >= 90)
+            return projectBudget;
+        if (priority >= 50)
+            return Math.Max(1, projectBudget / 2);
+        return 0;
+    }
+
+    private async Task<string?> TryResolveWorkBranchTipAsync(
+        string repoId,
+        string workBranch,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await _gitHost.ResolveCommitAsync(repoId, $"refs/heads/{workBranch}", ct);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException)
+        {
+            _log.LogDebug(ex, "Could not resolve work branch tip for audit progress detection in repo {RepoId} branch {WorkBranch}", repoId, workBranch);
+            return null;
+        }
     }
 
     private static IReadOnlyList<string> FingerprintFindings(IReadOnlyList<AuditFinding> findings)
@@ -3639,6 +3727,27 @@ public sealed class PipelineRunner : IPipelineRunner
         finding.Title,
         finding.Description,
         finding.Location);
+
+    private static AuditFindingSnapshot ToSnapshotFinding(string auditorName, AuditReportFinding finding) => new(
+        auditorName,
+        finding.Severity,
+        finding.Title,
+        finding.Message,
+        FormatReportFindingLocation(finding));
+
+    private static string? FormatReportFindingLocation(AuditReportFinding finding)
+    {
+        if (finding.Files.Count == 0)
+            return null;
+        if (finding.Files.Count == 1 && finding.LineHints.Count > 0)
+            return $"{finding.Files[0]}:{finding.LineHints[0]}";
+        return string.Join(", ", finding.Files);
+    }
+
+    private static AuditSeverity ParseAuditSeverity(string severity)
+        => Enum.TryParse<AuditSeverity>(severity, ignoreCase: true, out var parsed)
+            ? parsed
+            : AuditSeverity.Info;
 
     private static string BuildAuditMaxIterationEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history)
@@ -3679,6 +3788,9 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
     {
+        if (history.Count < 2)
+            return [];
+
         var last = history[^1];
         var signals = new List<string>();
         if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
@@ -3691,6 +3803,10 @@ public sealed class PipelineRunner : IPipelineRunner
         var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
         if (history.Take(history.Count - 1).Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds)))
             signals.Add("blocking_findings_changed");
+
+        if (last.WorkBranchTip is { } lastTip
+            && history.Take(history.Count - 1).Any(h => h.WorkBranchTip is { } tip && !string.Equals(tip, lastTip, StringComparison.Ordinal)))
+            signals.Add("work_branch_tip_changed");
 
         return signals;
     }
@@ -9498,7 +9614,8 @@ internal sealed record AuditProgressSnapshot(
     int NonBlockingFindings,
     IReadOnlyList<string> BlockingFindingIds,
     IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails,
-    IReadOnlyList<AuditFindingSnapshot> Findings);
+    IReadOnlyList<AuditFindingSnapshot> Findings,
+    string? WorkBranchTip);
 
 internal sealed record SuggestionWebhookDetails(
     string Id,

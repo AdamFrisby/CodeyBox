@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Tests;
 
 namespace CodeyBox.Tests.Uat.PipelineAndWorkerLifecycle;
@@ -124,7 +125,7 @@ public sealed class PipelineStateMachineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditorBlocksPastMaxIterations_ItemBecomesAuditFailed()
+    public async Task AuditorBlocksPastMaxIterations_WithReworkProgress_ParksForOperator()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new ScriptedUatAuditor(
@@ -145,8 +146,15 @@ public sealed class PipelineStateMachineTests : IDisposable
         await context.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await context.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Contains("did not pass after 2 iterations", final.LastError);
-        Assert.Contains(context.Webhooks.Events, e => e.Event == "work_item.audit_failed");
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains("parked for operator review", final.LastError);
+        Assert.DoesNotContain(context.Webhooks.Events, e => e.Event == "work_item.audit_failed");
+        var escalation = Assert.Single(context.Webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        var details = Assert.IsType<AuditMaxIterationsEscalationDetails>(escalation.Details);
+        Assert.Contains("work_branch_tip_changed", details.ProgressSignals);
+
+        var barePath = Path.Combine(context.GitRoot, item.Id + ".git");
+        var (_, blob, _) = await TestSupport.RunGit(barePath, "show", $"{final.WorkBranch}:audit.txt");
+        Assert.Equal("second attempt\n", blob);
     }
 }

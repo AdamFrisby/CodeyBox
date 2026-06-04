@@ -159,6 +159,19 @@ public sealed class AnswerEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Retry_WhenOpenQuestionExists_ReturnsConflictAndLeavesItemParked()
+    {
+        var item = await CreateWorkItemAsync(WorkItemState.NeedsOperatorInput);
+        await CreateQuestionAsync(item, "q-001");
+
+        var resp = await _client.PostAsync($"/workitems/{item.Id}/retry", content: null);
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var updated = await _factory.WorkItemStore.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, updated!.State);
+    }
+
+    [Fact]
     public async Task AnswerQuestion_AlreadyAnswered_IsNoOp()
     {
         var item = await CreateWorkItemAsync();

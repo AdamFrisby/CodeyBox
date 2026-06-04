@@ -353,6 +353,7 @@ internal static class WorkItemEndpoints
         string id,
         RetryWorkItemRequest? body,
         IWorkItemStore store,
+        IWorkItemQuestionStore? questionStore,
         WorkItemRetrier retrier,
         CancellationToken ct)
     {
@@ -370,6 +371,23 @@ internal static class WorkItemEndpoints
             or WorkItemState.NeedsOperatorInput
             or WorkItemState.WaitingForQuotaReset))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
+
+        if (item.State == WorkItemState.NeedsOperatorInput && questionStore is not null)
+        {
+            var openQuestions = (await questionStore.ListByWorkItemAsync(item.Id.ToString(), ct))
+                .Where(q => string.Equals(q.State, "open", StringComparison.Ordinal))
+                .Select(q => q.QuestionId)
+                .Take(5)
+                .ToArray();
+            if (openQuestions.Length > 0)
+            {
+                return Results.Conflict(new
+                {
+                    error = "cannot retry item while operator questions are open; answer or dismiss them first",
+                    openQuestions,
+                });
+            }
+        }
 
         // Pass body.From through verbatim (including null) so the retrier can
         // auto-pick when the operator didn't specify a phase — defaulting at
