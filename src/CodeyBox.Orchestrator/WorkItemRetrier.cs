@@ -17,6 +17,7 @@ public sealed class WorkItemRetrier
     private readonly IAuditReportStore? _auditReports;
     private readonly IProjectRepository? _projects;
     private readonly IReleaseStore? _releases;
+    private readonly IWorkItemQuestionStore? _questions;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -27,7 +28,8 @@ public sealed class WorkItemRetrier
         IAgentStreamSummaryStore? streamSummaries = null,
         IAuditReportStore? auditReports = null,
         IProjectRepository? projects = null,
-        IReleaseStore? releases = null)
+        IReleaseStore? releases = null,
+        IWorkItemQuestionStore? questions = null)
     {
         _store = store;
         _queue = queue;
@@ -36,15 +38,34 @@ public sealed class WorkItemRetrier
         _auditReports = auditReports;
         _projects = projects;
         _releases = releases;
+        _questions = questions;
         _log = log;
     }
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
         WorkItem item,
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
     {
+        if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
+        {
+            var openQuestions = (await _questions.ListByWorkItemAsync(item.Id.ToString(), ct))
+                .Where(q => string.Equals(q.State, "open", StringComparison.Ordinal))
+                .Select(q => q.QuestionId)
+                .Take(5)
+                .ToArray();
+            if (openQuestions.Length > 0)
+            {
+                return (
+                    false,
+                    "cannot retry item while operator questions are open; answer or dismiss them first",
+                    null,
+                    null,
+                    openQuestions);
+            }
+        }
+
         // A null/blank `from` means "operator did not specify" — auto-pick
         // based on work-branch state. Explicit values (including from the
         // quota auto-retry scheduler, which always passes a normalized phase)
@@ -59,7 +80,7 @@ public sealed class WorkItemRetrier
             catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
             {
                 _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
-                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null);
+                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null, null);
             }
         }
 
@@ -74,7 +95,7 @@ public sealed class WorkItemRetrier
         };
 
         if (resumeState is null)
-            return (false, $"invalid 'from' value '{from}'", null, null);
+            return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
 
@@ -83,7 +104,7 @@ public sealed class WorkItemRetrier
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
-                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null);
+                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null, null);
 
             // The work branch must also exist — earlier work-phase failures can
             // leave the item in Failed without ever producing a commit, in which
@@ -117,12 +138,12 @@ public sealed class WorkItemRetrier
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
         // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
-        // WaitingForQuotaReset. The API is the public gate; this method stays
-        // reusable for scheduler/operator paths that pass an already-vetted item.
+        // WaitingForQuotaReset. Eligibility gates that must apply across HTTP,
+        // scheduler, and operator paths live in this retrier before the write.
         var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
-            return (false, "work item state changed concurrently; retry aborted", null, null);
+            return (false, "work item state changed concurrently; retry aborted", null, null, null);
         }
 
         if (_streamSummaries is not null)
@@ -159,17 +180,17 @@ public sealed class WorkItemRetrier
                 _log.LogWarning(ex,
                     "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
                     item.Id, resumeState.Value, item.State);
-                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom);
+                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom, null);
             }
 
             _log.LogError(ex,
                 "Retry of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
                 item.Id, resumeState.Value);
-            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom);
+            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom, null);
         }
 
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
-        return (true, null, resumeState, actualFrom);
+        return (true, null, resumeState, actualFrom, null);
     }
 
     /// <summary>

@@ -128,6 +128,7 @@ public sealed class ProjectAuditConfig
     public string? Profile { get; set; }
     public Dictionary<string, ProjectAuditConfig>? Profiles { get; set; }
     public int? MaxIterations { get; set; }
+    public Dictionary<string, int>? ComplexityIterationBudgets { get; set; }
     public string? FailingSeverity { get; set; }
     public int? PerIterationTimeoutMinutes { get; set; }
     public bool? StopOnFirstFailure { get; set; }

@@ -53,6 +53,18 @@ public sealed class WorkItemPriorityTests : IDisposable
     }
 
     [Fact]
+    public async Task Store_PreservesAuditBudgetRoundTrip()
+    {
+        var item = MakeItem() with { AuditMaxIterations = 42, AuditComplexity = "hard" };
+        await _store.CreateAsync(item);
+
+        var read = await _store.GetAsync(item.Id);
+
+        Assert.Equal(42, read!.AuditMaxIterations);
+        Assert.Equal("hard", read.AuditComplexity);
+    }
+
+    [Fact]
     public async Task ListDispatchEligible_OrdersHighestFirstThenFifo()
     {
         var t0 = DateTimeOffset.UtcNow;

@@ -669,7 +669,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
         // audit logs, and conditional state updates (prevents race conditions).
-        var (success, error, _, actualFrom) = await _retrier.RetryAsync(item, from: retryFrom, trigger, ct);
+        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(item, from: retryFrom, trigger, ct);
 
         if (!success)
         {

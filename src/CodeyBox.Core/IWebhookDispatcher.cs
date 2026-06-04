@@ -181,6 +181,44 @@ public sealed record AuditCompletedDetails
     public required long DurationMs { get; init; }
 }
 
+/// <summary>
+/// Details payload for <c>work_item.needs_operator_input</c> when the audit
+/// loop reaches its iteration ceiling while still showing progress.
+/// </summary>
+public sealed record AuditMaxIterationsEscalationDetails
+{
+    public required string WorkItemId { get; init; }
+    public required int Iteration { get; init; }
+    public required int MaxIterations { get; init; }
+    public required int BlockingFindings { get; init; }
+    public required int NonBlockingFindings { get; init; }
+    public required bool ProgressObserved { get; init; }
+    public required IReadOnlyList<string> ProgressSignals { get; init; }
+    public required IReadOnlyList<AuditProgressIterationDetails> History { get; init; }
+    public required IReadOnlyList<AuditFindingSnapshot> RemainingBlockingFindings { get; init; }
+    public required string ResumeHint { get; init; }
+}
+
+/// <summary>One audit iteration inside <see cref="AuditMaxIterationsEscalationDetails"/>.</summary>
+public sealed record AuditProgressIterationDetails
+{
+    public required int Iteration { get; init; }
+    public required int BlockingFindings { get; init; }
+    public required int NonBlockingFindings { get; init; }
+    public required IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails { get; init; }
+    public required IReadOnlyList<AuditFindingSnapshot> Findings { get; init; }
+}
+
+/// <summary>Finding snapshot used by audit-progress webhook payloads.</summary>
+public sealed record AuditFindingSnapshot
+{
+    public required string Auditor { get; init; }
+    public required string Severity { get; init; }
+    public required string Title { get; init; }
+    public required string Description { get; init; }
+    public string? Location { get; init; }
+}
+
 /// <summary>Details payload for the <c>merge.started</c> event.</summary>
 public sealed record MergeStartedDetails
 {

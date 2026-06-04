@@ -188,6 +188,45 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task ProjectAuditComplexityIterationBudgets_BindAndOverrideDefaults()
+    {
+        var opts = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Audit = new ProjectAuditConfig
+                {
+                    ComplexityIterationBudgets = new Dictionary<string, int>
+                    {
+                        ["hard"] = 20,
+                        ["very-hard"] = 40,
+                    },
+                },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Audit = new ProjectAuditConfig
+                    {
+                        ComplexityIterationBudgets = new Dictionary<string, int>
+                        {
+                            ["hard"] = 30,
+                        },
+                    },
+                },
+            ],
+        };
+        var repo = new ProjectRepository(Options.Create(opts));
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+
+        Assert.Equal(30, p!.Audit.ComplexityIterationBudgets["hard"]);
+        Assert.Equal(40, p.Audit.ComplexityIterationBudgets["very-hard"]);
+    }
+
+    [Fact]
     public async Task ProjectLanguageOverrides_BindFromLanguagesOverridesPath()
     {
         var config = new ConfigurationBuilder()
@@ -696,4 +735,3 @@ internal sealed class TestProjectsOptionsMonitor : IOptionsMonitor<ProjectsOptio
         public void Dispose() => _onDispose();
     }
 }
-

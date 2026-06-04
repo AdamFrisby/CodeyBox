@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -167,6 +168,9 @@ public sealed class AnswerEndpointTests : IDisposable
         var resp = await _client.PostAsync($"/workitems/{item.Id}/retry", content: null);
 
         Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var payload = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("operator questions are open", payload.GetProperty("error").GetString());
+        Assert.Contains("q-001", payload.GetProperty("openQuestions").EnumerateArray().Select(q => q.GetString()));
         var updated = await _factory.WorkItemStore.GetAsync(item.Id);
         Assert.Equal(WorkItemState.NeedsOperatorInput, updated!.State);
     }

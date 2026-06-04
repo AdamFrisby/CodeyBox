@@ -243,6 +243,23 @@ internal sealed class WorkItemCreationService
             priority = p;
         }
 
+        int? auditMaxIterations = null;
+        if (req.AuditMaxIterations is { } auditBudget)
+        {
+            if (auditBudget <= 0)
+                return Error("auditMaxIterations must be greater than 0");
+            auditMaxIterations = auditBudget;
+        }
+
+        string? auditComplexity = null;
+        if (req.AuditComplexity is not null)
+        {
+            var (normalised, complexityError) = NormaliseAuditComplexity(req.AuditComplexity);
+            if (complexityError is not null)
+                return new PreparedWorkItemCreationResult(null, complexityError);
+            auditComplexity = normalised;
+        }
+
         IReadOnlyList<string> requiredCapabilities = [];
         if (req.RequiredCapabilities is { } reqCaps)
         {
@@ -331,6 +348,8 @@ internal sealed class WorkItemCreationService
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             Priority = priority,
+            AuditMaxIterations = auditMaxIterations,
+            AuditComplexity = auditComplexity,
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,
@@ -454,6 +473,18 @@ internal sealed class WorkItemCreationService
                 error = $"priority {priority} exceeds project '{project.Id}' maxPriority {maxPriority}",
             });
         return null;
+    }
+
+    private static (string? Normalised, IResult? Error) NormaliseAuditComplexity(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return (null, null);
+        var trimmed = value.Trim();
+        if (trimmed.Length > 64)
+            return (null, Results.BadRequest(new { error = "auditComplexity must be <= 64 chars" }));
+        try { Validation.ValidateNoOptionLikeOrControl(trimmed, "auditComplexity"); }
+        catch (ArgumentException ex) { return (null, Results.BadRequest(new { error = ex.Message })); }
+        return (trimmed, null);
     }
 
     private static bool AuditProfileExists(ProjectAudit audit, string profile)

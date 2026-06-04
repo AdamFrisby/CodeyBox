@@ -154,6 +154,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             // for existing rows. Higher values pick up first; ties break by created_at ASC.
             RunMigration("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;");
 
+            // Explicit per-item audit budget knobs. Nullable: existing rows use the
+            // project audit profile's max iteration policy.
+            RunMigration("ALTER TABLE work_items ADD COLUMN audit_max_iterations INTEGER;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN audit_complexity TEXT;");
+
             // Index for the priority-aware pickup query: state filter first, then priority,
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
@@ -354,6 +359,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
+                        audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
                         job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
@@ -364,6 +370,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
+                        $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
                         $job_type, $check_spec, $check_verdict, $origin_check,
@@ -475,6 +482,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
@@ -536,6 +545,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
@@ -1404,6 +1415,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$priority", item.Priority);
+        cmd.Parameters.AddWithValue("$audit_max_iterations", (object?)item.AuditMaxIterations ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$audit_complexity", (object?)item.AuditComplexity ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cancellation_source", (object?)item.CancellationSource ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
@@ -1470,6 +1483,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
         Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
+        AuditMaxIterations = ReadNullableInt32(r, "audit_max_iterations"),
+        AuditComplexity = ReadNullableString(r, "audit_complexity"),
         CancellationSource = ReadNullableString(r, "cancellation_source"),
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),

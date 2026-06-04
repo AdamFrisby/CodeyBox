@@ -670,7 +670,7 @@ public sealed class PipelineRunner : IPipelineRunner
             }
             if (!skipAudit && (auditors.Count > 0 || requiredBuildApplies))
             {
-                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, repoId, baseBranch, workBranch, ct, hostShutdownToken);
+                var auditParked = await RunAuditLoopAsync(item, project, agentRunner, auditors, requiredBuildApplies, repoId, baseBranch, workBranch, ct, hostShutdownToken);
                 if (auditParked) return; // Pipeline parked; resume when operator answers.
                 if (resumingPreempt)
                 {
@@ -1001,6 +1001,11 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (RequiredBuildVerificationUnavailableException ex)
         {
             _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (AuditHistoryLoadFailedException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not load persisted audit history", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (TerminalQuotaError ex)
@@ -3334,13 +3339,14 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         IAgentRunner runner,
         IReadOnlyList<IAuditor> auditors,
+        bool requiredBuildApplies,
         string repoId,
         string baseBranch,
         string workBranch,
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, project, ct);
+        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, project, auditors, requiredBuildApplies, ct);
         var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
         var auditHistory = priorAuditHistory
             .Select(h => h with { MaxIterations = maxIterations })
@@ -3618,9 +3624,20 @@ public sealed class PipelineRunner : IPipelineRunner
     private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
         WorkItem item,
         Project project,
+        IReadOnlyList<IAuditor> auditors,
+        bool requiredBuildApplies,
         CancellationToken ct)
     {
         if (_auditReports is null || item.State != WorkItemState.WorkComplete)
+            return [];
+
+        var expectedAuditors = auditors
+            .Select(a => a.Name)
+            .Distinct(StringComparer.Ordinal)
+            .ToHashSet(StringComparer.Ordinal);
+        if (requiredBuildApplies)
+            expectedAuditors.Add(RequiredBuildGateIdentity.AuditorName);
+        if (expectedAuditors.Count == 0)
             return [];
 
         IReadOnlyList<AuditReport> reports;
@@ -3630,16 +3647,32 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _log.LogWarning(ex, "Failed to load persisted audit history for work item {WorkItemId}; retry will use in-memory history only", item.Id);
-            return [];
+            throw new AuditHistoryLoadFailedException(
+                $"failed to load persisted audit history for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
+                ex);
         }
 
         if (reports.Count == 0)
             return [];
 
+        var currentAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+        if (currentAttemptStartedAt is not null)
+        {
+            reports = reports
+                .Where(r => r.StartedAt >= currentAttemptStartedAt.Value)
+                .ToList();
+        }
+
         var history = new List<AuditProgressSnapshot>();
         foreach (var group in reports.Where(r => r.Iteration > 0).GroupBy(r => r.Iteration).OrderBy(g => g.Key))
         {
+            var reportedAuditors = group
+                .Select(r => r.AuditorName)
+                .Distinct(StringComparer.Ordinal)
+                .ToHashSet(StringComparer.Ordinal);
+            if (!expectedAuditors.IsSubsetOf(reportedAuditors))
+                break;
+
             var findings = group
                 .SelectMany(report => report.Findings.Select(f => ToSnapshotFinding(report.AuditorName, f)))
                 .ToList();
@@ -3668,13 +3701,25 @@ public sealed class PipelineRunner : IPipelineRunner
         return history;
     }
 
+    private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
+        WorkItemId workItemId,
+        CancellationToken ct)
+    {
+        var iterations = await _store.GetIterationsAsync(workItemId, ct);
+        return iterations
+            .Where(i => i.Iteration == WorkPhaseIterationNumber)
+            .OrderByDescending(i => i.DispatchedAt)
+            .Select(i => (DateTimeOffset?)i.DispatchedAt)
+            .FirstOrDefault();
+    }
+
     private static int ResolveAuditMaxIterations(
         WorkItem item,
         Project project,
         IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
     {
         var projectBudget = Math.Max(1, project.Audit.MaxIterations);
-        var maxIterations = projectBudget + ResolvePriorityAuditIterationBonus(item.Priority, projectBudget);
+        var maxIterations = ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget);
 
         if (priorAuditHistory.Count > 0)
         {
@@ -3685,14 +3730,22 @@ public sealed class PipelineRunner : IPipelineRunner
         return maxIterations;
     }
 
-    private static int ResolvePriorityAuditIterationBonus(int priority, int projectBudget)
-    {
-        if (priority >= 90)
-            return projectBudget;
-        if (priority >= 50)
-            return Math.Max(1, projectBudget / 2);
-        return 0;
-    }
+    private static int ResolveConfiguredAuditIterationBudget(
+        WorkItem item,
+        ProjectAudit audit,
+        int projectBudget)
+        => Math.Max(
+            projectBudget,
+            Math.Max(
+                item.AuditMaxIterations.GetValueOrDefault(),
+                ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault()));
+
+    private static int? ResolveComplexityAuditIterationBudget(string? complexity, ProjectAudit audit)
+        => string.IsNullOrWhiteSpace(complexity)
+            ? null
+            : audit.ComplexityIterationBudgets.TryGetValue(complexity.Trim(), out var budget) && budget > 0
+                ? budget
+                : null;
 
     private async Task<string?> TryResolveWorkBranchTipAsync(
         string repoId,
@@ -3721,19 +3774,23 @@ public sealed class PipelineRunner : IPipelineRunner
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToList();
 
-    private static AuditFindingSnapshot ToSnapshotFinding(AuditFinding finding) => new(
-        finding.AuditorName,
-        finding.Severity.ToString(),
-        finding.Title,
-        finding.Description,
-        finding.Location);
+    private static AuditFindingSnapshot ToSnapshotFinding(AuditFinding finding) => new()
+    {
+        Auditor = finding.AuditorName,
+        Severity = finding.Severity.ToString(),
+        Title = finding.Title,
+        Description = finding.Description,
+        Location = finding.Location,
+    };
 
-    private static AuditFindingSnapshot ToSnapshotFinding(string auditorName, AuditReportFinding finding) => new(
-        auditorName,
-        finding.Severity,
-        finding.Title,
-        finding.Message,
-        FormatReportFindingLocation(finding));
+    private static AuditFindingSnapshot ToSnapshotFinding(string auditorName, AuditReportFinding finding) => new()
+    {
+        Auditor = auditorName,
+        Severity = finding.Severity,
+        Title = finding.Title,
+        Description = finding.Message,
+        Location = FormatReportFindingLocation(finding),
+    };
 
     private static string? FormatReportFindingLocation(AuditReportFinding finding)
     {
@@ -3768,22 +3825,26 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         var last = history[^1];
         var signals = BuildAuditProgressSignals(history);
-        return new AuditMaxIterationsEscalationDetails(
-            WorkItemId: workItemId.ToString(),
-            Iteration: last.Iteration,
-            MaxIterations: last.MaxIterations,
-            BlockingFindings: last.BlockingFindings,
-            NonBlockingFindings: last.NonBlockingFindings,
-            ProgressObserved: signals.Count > 0,
-            ProgressSignals: signals,
-            History: history.Select(h => new AuditProgressIterationDetails(
-                h.Iteration,
-                h.BlockingFindings,
-                h.NonBlockingFindings,
-                h.BlockingFindingsDetails,
-                h.Findings)).ToList(),
-            RemainingBlockingFindings: last.BlockingFindingsDetails,
-            ResumeHint: "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.");
+        return new AuditMaxIterationsEscalationDetails
+        {
+            WorkItemId = workItemId.ToString(),
+            Iteration = last.Iteration,
+            MaxIterations = last.MaxIterations,
+            BlockingFindings = last.BlockingFindings,
+            NonBlockingFindings = last.NonBlockingFindings,
+            ProgressObserved = signals.Count > 0,
+            ProgressSignals = signals,
+            History = history.Select(h => new AuditProgressIterationDetails
+            {
+                Iteration = h.Iteration,
+                BlockingFindings = h.BlockingFindings,
+                NonBlockingFindings = h.NonBlockingFindings,
+                BlockingFindingsDetails = h.BlockingFindingsDetails,
+                Findings = h.Findings,
+            }).ToList(),
+            RemainingBlockingFindings = last.BlockingFindingsDetails,
+            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
+        };
     }
 
     private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
@@ -9506,6 +9567,12 @@ internal sealed class RequiredBuildVerificationUnavailableException : Exception
         : base(message, innerException) { }
 }
 
+internal sealed class AuditHistoryLoadFailedException : Exception
+{
+    public AuditHistoryLoadFailedException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
 {
     public SandboxPushReconcileConflictException(string branch, string strategy)
@@ -9580,32 +9647,6 @@ internal sealed record AuditIterationDetails(
     /// Receivers that do not care about this field ignore it safely.
     /// </summary>
     string? AuditAgentKind = null);
-
-internal sealed record AuditMaxIterationsEscalationDetails(
-    string WorkItemId,
-    int Iteration,
-    int MaxIterations,
-    int BlockingFindings,
-    int NonBlockingFindings,
-    bool ProgressObserved,
-    IReadOnlyList<string> ProgressSignals,
-    IReadOnlyList<AuditProgressIterationDetails> History,
-    IReadOnlyList<AuditFindingSnapshot> RemainingBlockingFindings,
-    string ResumeHint);
-
-internal sealed record AuditProgressIterationDetails(
-    int Iteration,
-    int BlockingFindings,
-    int NonBlockingFindings,
-    IReadOnlyList<AuditFindingSnapshot> BlockingFindingsDetails,
-    IReadOnlyList<AuditFindingSnapshot> Findings);
-
-internal sealed record AuditFindingSnapshot(
-    string Auditor,
-    string Severity,
-    string Title,
-    string Description,
-    string? Location);
 
 internal sealed record AuditProgressSnapshot(
     int Iteration,
