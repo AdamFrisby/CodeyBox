@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -91,6 +92,80 @@ public sealed class QueueStatusHttpTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
         paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
         Assert.Empty(paused!);
+    }
+
+    [Fact]
+    public async Task AgentPauseEndpoints_RejectUnknownAgentAndInvalidBodies()
+    {
+        var unknown = await _client.PostAsJsonAsync("/agents/not-real/pause", new { reason = "test" });
+        Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+
+        var missingReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { });
+        Assert.Equal(HttpStatusCode.BadRequest, missingReason.StatusCode);
+
+        var controlReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = "bad\nreason" });
+        Assert.Equal(HttpStatusCode.BadRequest, controlReason.StatusCode);
+
+        var longReason = new string('x', 501);
+        var tooLongReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = longReason });
+        Assert.Equal(HttpStatusCode.BadRequest, tooLongReason.StatusCode);
+
+        var conflictingExpiry = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            durationSeconds = 60,
+            expiresAt = DateTimeOffset.UtcNow.AddHours(1),
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, conflictingExpiry.StatusCode);
+
+        var nonPositiveDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            durationSeconds = 0,
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, nonPositiveDuration.StatusCode);
+
+        var badDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            duration = "12w",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, badDuration.StatusCode);
+
+        var pastExpiry = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            expiresAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, pastExpiry.StatusCode);
+
+        var badResumeReason = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = "bad\nreason" });
+        Assert.Equal(HttpStatusCode.BadRequest, badResumeReason.StatusCode);
+
+        var longResumeReason = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = longReason });
+        Assert.Equal(HttpStatusCode.BadRequest, longResumeReason.StatusCode);
+    }
+
+    [Fact]
+    public async Task QuotaEndpoint_ReportsPausedAgentAsPausedAndNotAllowed()
+    {
+        var pause = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = "reserve quota" });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var quota = await _client.GetAsync("/quota");
+        Assert.Equal(HttpStatusCode.OK, quota.StatusCode);
+        using var doc = JsonDocument.Parse(await quota.Content.ReadAsStringAsync());
+        var claude = doc.RootElement.GetProperty("probes").EnumerateArray()
+            .First(e => e.GetProperty("agent").GetString() == "claude");
+        var pausedClaude = doc.RootElement.GetProperty("pausedAgents").EnumerateArray()
+            .First(e => e.GetProperty("agent").GetString() == "claude");
+
+        Assert.True(claude.GetProperty("paused").GetBoolean());
+        Assert.True(pausedClaude.GetProperty("paused").GetBoolean());
+        Assert.Equal("paused", claude.GetProperty("dispatchStatus").GetString());
+        Assert.Contains("paused by operator", claude.GetProperty("dispatchReason").GetString());
+        Assert.False(claude.GetProperty("wouldAllow").GetBoolean());
+        Assert.False(claude.GetProperty("defaultModelWouldAllow").GetBoolean());
     }
 
     [Fact]
@@ -196,6 +271,8 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
             services.AddSingleton<IWorkItemStore>(Store);
             services.RemoveAll<IQueueController>();
             services.AddSingleton<IQueueController>(QueueController);
+            services.RemoveAll<IAgentQuotaProbe>();
+            services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, 100));
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project

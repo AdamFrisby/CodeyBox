@@ -348,8 +348,13 @@ internal sealed class WorkItemCreationService
                     null,
                     Results.BadRequest(new { error = $"unknown agent '{control.Agent}'", available = _agents.Available.Select(a => a.Value) }));
 
-            if (string.IsNullOrWhiteSpace(control.Action)
-                || !Enum.TryParse<AgentControlAction>(control.Action.Trim(), ignoreCase: true, out var action))
+            var actionText = control.Action?.Trim();
+            AgentControlAction action;
+            if (string.Equals(actionText, "pause", StringComparison.OrdinalIgnoreCase))
+                action = AgentControlAction.Pause;
+            else if (string.Equals(actionText, "resume", StringComparison.OrdinalIgnoreCase))
+                action = AgentControlAction.Resume;
+            else
                 return Error("agentControl.action must be 'pause' or 'resume'");
 
             var reason = string.IsNullOrWhiteSpace(control.Reason) ? null : control.Reason.Trim();

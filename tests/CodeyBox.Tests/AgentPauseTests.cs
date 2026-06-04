@@ -1,6 +1,11 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents;
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
+using CodeyBox.Sandbox.Process;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -180,14 +185,48 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_AgentControlResumeItem_RunsEvenWhenTargetAgentPaused()
+    public async Task Worker_DirectAgentAlreadyPaused_ParksWithoutEnteringPipeline()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new CapturingPipeline(store);
+        var item = Item(classId: null) with { Agent = AgentKind.Claude };
+        await store.CreateAsync(item);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: ProjectRepo(),
+            agentPauseController: pauses);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.EnqueueAsync(item.Id);
+
+        var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
+        Assert.NotNull(parked);
+        Assert.False(pipeline.Entered);
+        Assert.Equal("work", parked!.QuotaRetryFrom);
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlResumeItem_RunsRealPipelineEvenWhenTargetAgentPaused()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Claude, "existing pause", "test");
 
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var pipeline = new AgentControlPipeline(store, pauses);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -216,9 +255,48 @@ public sealed class AgentPauseTests : IDisposable
 
         var done = await WaitForStateAsync(store, item.Id, WorkItemState.Done);
         Assert.NotNull(done);
-        Assert.True(pipeline.Entered);
         Assert.Null(await pauses.GetAgentStateAsync(AgentKind.Claude));
+        Assert.Contains(webhooks.Events, e => e.Event == "agent.resumed");
         await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.WorkComplete, "audit", WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed, "merge", WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged, "upstream", WorkItemState.Merged)]
+    public void PauseResumeMapper_PreservesDurablePhaseBoundaries(
+        WorkItemState parkedFrom,
+        string retryFrom,
+        WorkItemState resumeState)
+    {
+        Assert.Equal(retryFrom, AgentPauseResumeMapper.RetryFromForState(parkedFrom));
+        Assert.Equal(resumeState, AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom));
+    }
+
+    private static PipelineRunner BuildRealAgentControlPipeline(
+        IWorkItemStore store,
+        IAgentPauseController pauses,
+        IWebhookDispatcher webhooks)
+    {
+        var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-git-{Guid.NewGuid():N}");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        return new PipelineRunner(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost,
+            new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
+            new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            ProjectRepo(),
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store,
+            webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            agentPauseController: pauses);
     }
 
     private SqliteAgentPauseController MakeController(TimeProvider? timeProvider = null) =>
@@ -236,7 +314,7 @@ public sealed class AgentPauseTests : IDisposable
             ],
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance,
-            agentPauses: pauses);
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
     private static AgentMembership Member(AgentKind agent) => new()
     {
@@ -308,30 +386,6 @@ public sealed class AgentPauseTests : IDisposable
                 .ContinueWith(t => t.Result == _entered.Task);
 
         public void Release() => _release.TrySetResult();
-    }
-
-    private sealed class AgentControlPipeline(
-        IWorkItemStore store,
-        IAgentPauseController pauses) : IPipelineRunner
-    {
-        public bool Entered { get; private set; }
-
-        public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
-        {
-            Entered = true;
-            var spec = item.AgentControl ?? throw new InvalidOperationException("missing agentControl");
-            var agent = new AgentKind(spec.Agent);
-            if (spec.Action == AgentControlAction.Resume)
-            {
-                await pauses.ResumeAsync(agent, "test", spec.Reason, ct);
-            }
-            else
-            {
-                await pauses.PauseAsync(agent, spec.Reason ?? "test", "test", spec.ExpiresAt, ct);
-            }
-
-            await store.UpdateAsync(item.With(WorkItemState.Done), ct);
-        }
     }
 
     private sealed class FakeTimeProvider(DateTimeOffset now) : TimeProvider

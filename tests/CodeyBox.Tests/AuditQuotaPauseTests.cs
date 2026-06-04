@@ -142,11 +142,77 @@ public sealed class AuditQuotaPauseTests : IDisposable
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
     }
 
+    [Fact]
+    public async Task AuditRouting_SkipsPausedPreferredAuditorAndUsesClassFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Codex, "provider outage", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Codex],
+            pauses: pauses,
+            auditAgent: AgentKind.Codex);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
+    [Fact]
+    public async Task AuditRouting_AllAuditCapableAgentsPaused_ParksForAgentResume()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseDb = Path.Combine(_workspace, $"audit-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(AgentKind.Codex, "audit subscription reserved", "test");
+
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(true, []));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Codex],
+            pauses: pauses,
+            capabilities: new Dictionary<AgentKind, IReadOnlyList<string>>
+            {
+                [AgentKind.Codex] = [WellKnownCapabilities.Audit],
+            });
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal("audit", final.QuotaRetryFrom);
+        Assert.Empty(auditor.Invocations);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_agent_resume");
+    }
+
     private AuditQuotaFixture BuildFixture(
         string seedRepoUrl,
         RoutingLlmAuditor auditor,
         IReadOnlyList<AgentKind> classMembers,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        IAgentPauseController? pauses = null,
+        AgentKind? auditAgent = null,
+        IReadOnlyDictionary<AgentKind, IReadOnlyList<string>>? capabilities = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -182,16 +248,23 @@ public sealed class AuditQuotaPauseTests : IDisposable
                     Agent = kind,
                     Billing = AgentBilling.Subscription,
                     QualityScore = 100,
+                    Capabilities = capabilities is not null && capabilities.TryGetValue(kind, out var caps)
+                        ? caps.ToList()
+                        : [],
                 })
                 .ToList(),
         };
         var probes = classMembers.Select(kind => new RecordingProbe(kind)).ToList();
+        var dispatchAvailability = pauses is null
+            ? null
+            : new AgentDispatchAvailability(pauses: pauses);
         var router = new AgentClassRouter(
             [frontier],
             probes,
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            time);
+            time,
+            dispatchAvailability: dispatchAvailability);
 
         var project = new Project
         {
@@ -206,6 +279,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 MaxIterations = 1,
                 AuditTypes = ["scripted"],
                 MaxLlmAuditorParallelism = 1,
+                AuditAgent = auditAgent,
             },
         };
         var projects = new InMemoryProjectRepository(project);
@@ -235,7 +309,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             sandboxes,
             gitHost,
             registry,
-            new StaticCredentialProvider(),
+            new AlwaysCredentialProvider(),
             prs,
             projects,
             new TestUpstreamFactory(),
@@ -255,7 +329,9 @@ public sealed class AuditQuotaPauseTests : IDisposable
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             ]),
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            dispatchAvailability: dispatchAvailability,
+            agentPauseController: pauses);
 
         return new AuditQuotaFixture(pipeline, scheduler, store, queue, webhooks, fallbackHistory, time, gemini, codex);
     }
@@ -333,6 +409,15 @@ public sealed class AuditQuotaPauseTests : IDisposable
             Scheduler.Dispose();
             Store.Dispose();
         }
+    }
+
+    private sealed class AlwaysCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default) =>
+            Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                new Dictionary<string, string>(),
+                new Dictionary<string, string>()));
     }
 
     private sealed class ManualClock : TimeProvider

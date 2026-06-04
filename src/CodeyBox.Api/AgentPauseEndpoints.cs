@@ -74,6 +74,9 @@ internal static class AgentPauseEndpoints
         if (!agents.Available.Contains(agent))
             return Results.NotFound(new { error = $"unknown agent '{kind}'", available = agents.Available.Select(a => a.Value) });
 
+        var validation = ValidateResumeReason(body?.Reason);
+        if (validation is not null) return validation;
+
         var wasPaused = await pauses.ResumeAsync(agent, "api", body?.Reason, ct);
         if (wasPaused)
         {
@@ -104,6 +107,17 @@ internal static class AgentPauseEndpoints
     {
         if (string.IsNullOrWhiteSpace(reason))
             return Results.BadRequest(new { error = "reason is required" });
+        if (reason.Any(char.IsControl))
+            return Results.BadRequest(new { error = "reason must not contain control characters" });
+        if (reason.Length > 500)
+            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        return null;
+    }
+
+    private static IResult? ValidateResumeReason(string? reason)
+    {
+        if (reason is null)
+            return null;
         if (reason.Any(char.IsControl))
             return Results.BadRequest(new { error = "reason must not contain control characters" });
         if (reason.Length > 500)

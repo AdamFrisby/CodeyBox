@@ -6,11 +6,14 @@ internal static class AgentPauseResumeMapper
 {
     public static string RetryFromForState(WorkItemState state) => state switch
     {
+        WorkItemState.WorkComplete => "audit",
         WorkItemState.Auditing => "audit",
         WorkItemState.Reworking => "audit",
         WorkItemState.ReworkingForConflict => "audit",
         WorkItemState.AuditFailed => "audit",
+        WorkItemState.AuditPassed => "merge",
         WorkItemState.Merging => "merge",
+        WorkItemState.Merged => "upstream",
         WorkItemState.UpstreamPushing => "upstream",
         _ => "work",
     };

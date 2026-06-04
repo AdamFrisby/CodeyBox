@@ -1020,8 +1020,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
         configuredSmokeTarget,
-        sp.GetService<IAgentDispatchAvailability>(),
-        agentPauses: sp.GetRequiredService<IAgentPauseController>());
+        sp.GetService<IAgentDispatchAvailability>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1288,7 +1287,8 @@ builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    sp.GetRequiredService<IAgentPauseController>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -2091,8 +2091,7 @@ builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolH
     sp.GetRequiredService<IQueueController>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<IAgentRoutingReadiness>(),
-    sp.GetRequiredService<IAgentDispatchAvailability>(),
-    sp.GetRequiredService<IAgentPauseController>()));
+    sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IWorkerPoolHealthSource>(sp =>
     sp.GetRequiredService<WorkerPoolHealthCoordinator>());
 builder.Services.AddSingleton<IAgentCapacitySnapshot>(sp =>

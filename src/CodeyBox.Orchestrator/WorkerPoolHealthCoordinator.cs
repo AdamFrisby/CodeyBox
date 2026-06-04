@@ -18,7 +18,6 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     private readonly IAgentRegistry? _agents;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentRoutingReadiness? _routingReadiness;
-    private readonly IAgentPauseController? _agentPauses;
     private readonly ILogger<WorkerPoolHealthCoordinator> _log;
 
     public WorkerPoolHealthCoordinator(
@@ -30,8 +29,7 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         IQueueController? queueController = null,
         IAgentRegistry? agents = null,
         IAgentRoutingReadiness? routingReadiness = null,
-        IAgentDispatchAvailability? dispatchAvailability = null,
-        IAgentPauseController? agentPauseController = null)
+        IAgentDispatchAvailability? dispatchAvailability = null)
     {
         _dispatcher = dispatcher;
         _store = store;
@@ -41,7 +39,6 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         _agents = agents;
         _dispatchAvailability = dispatchAvailability;
         _routingReadiness = routingReadiness;
-        _agentPauses = agentPauseController;
         _log = log;
     }
 
@@ -241,12 +238,6 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
     {
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
-
-        if (_agentPauses is not null
-            && await _agentPauses.GetAgentStateAsync(agent, ct) is { Paused: true })
-        {
-            return false;
-        }
 
         var availability = _dispatchAvailability?.GetAvailability(agent);
         if (availability is { Available: false })
