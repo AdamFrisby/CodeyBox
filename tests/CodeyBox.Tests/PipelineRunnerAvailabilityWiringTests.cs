@@ -389,9 +389,37 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(0, gate.EnsureCalls);
     }
 
+    [Fact]
+    public async Task DirectAgentPickup_SmokeDisabledGlobally_StillHonorsFastFailBreaker()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        var gate = new RejectingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, inVmSmokeGate: gate);
+        for (var i = 0; i < 3; i++)
+            fix.Registry.RecordRunOutcome(
+                AgentKind.Codex,
+                success: false,
+                duration: TimeSpan.FromMilliseconds(500));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("fast-fail circuit breaker", final.LastError);
+        Assert.Equal(0, gate.EnsureCalls);
+        Assert.Equal(0, fix.Codex.CallCount);
+    }
+
     // ── Harness ──────────────────────────────────────────────────────────────
 
-    private TestFixture BuildPipeline(string seedRepoUrl, int maxConsecutiveFastFails = 3)
+    private TestFixture BuildPipeline(
+        string seedRepoUrl,
+        int maxConsecutiveFastFails = 3,
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -450,6 +478,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
+            inVmSmokeGate: inVmSmokeGate,
+            smokeOptions: smokeOptions,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
 
         return new TestFixture(pipeline, store, codex, webhooks, availability);

@@ -200,6 +200,35 @@ public sealed class AgentAvailabilityRegistryTests
     }
 
     [Fact]
+    public void SmokeDisabledView_IgnoresSmokeSourcesButKeepsFastFail()
+    {
+        var reg = NewRegistry(fastFailThreshold: 10, maxConsecutive: 3);
+        var filtered = (IAgentAvailabilityExclusionFilter)reg;
+
+        reg.MarkSmokeResult(
+            Claude,
+            new AgentSmokeResult(false, "host smoke failed", TimeSpan.Zero),
+            SmokeExclusionSource.HostSmoke);
+        reg.MarkSmokeResult(
+            Claude,
+            new AgentSmokeResult(false, "in-VM smoke failed", TimeSpan.Zero),
+            SmokeExclusionSource.InVmSmoke);
+        reg.ExcludeForMissingProbe(Claude, "no in-VM smoke probe registered");
+
+        Assert.False(reg.GetAvailability(Claude).Available);
+        Assert.True(filtered.GetAvailabilityIgnoringSmokeGateExclusions(Claude).Available);
+
+        for (var i = 0; i < 3; i++)
+            reg.RecordRunOutcome(Claude, success: false, duration: TimeSpan.FromSeconds(1));
+
+        var av = filtered.GetAvailabilityIgnoringSmokeGateExclusions(Claude);
+        Assert.False(av.Available);
+        Assert.Contains("fast-fail circuit breaker", av.Reason);
+        Assert.DoesNotContain("smoke failed", av.Reason);
+        Assert.DoesNotContain("no in-VM smoke probe", av.Reason);
+    }
+
+    [Fact]
     public void CachedInVmPass_DoesNotClearFastFailExclusion()
     {
         // A cached in-VM verdict re-executed no CLI, so replaying it must NOT

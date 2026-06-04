@@ -355,7 +355,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // Run before ANY sandbox is allocated. Skipped when the project opts out
         // (e.g. Copilot), when the gate is disabled globally, or when no probe is
         // registered for this agent. Results are cached per-credential-fingerprint.
-        if ((_smokeOptions?.Enabled ?? true) && _smokeGate is not null && !project.SkipCredentialSmokeTest)
+        if (_smokeGate is not null && !project.SkipCredentialSmokeTest)
         {
             AgentSmokeResult? smokeResult;
             try
@@ -4395,7 +4395,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (_smokeOptions?.Enabled == false)
-            return new AgentAvailability(true, null, null);
+            return SmokeDisabledAvailabilityView.GetOrAvailable(_availability, kind);
 
         // The in-VM gate (when wired) owns the read→probe→re-read and returns the
         // reconciled availability — including the exclusion Reason — so callers

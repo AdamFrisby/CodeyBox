@@ -238,12 +238,11 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
 
-        if (_smokeOptions?.Enabled != false)
-        {
-            var availability = _availability?.GetAvailability(agent);
-            if (availability is { Available: false })
-                return false;
-        }
+        var availability = _smokeOptions?.Enabled == false
+            ? SmokeDisabledAvailabilityView.GetOrNull(_availability, agent)
+            : _availability?.GetAvailability(agent);
+        if (availability is { Available: false })
+            return false;
 
         return HasCapacity(agent);
     }

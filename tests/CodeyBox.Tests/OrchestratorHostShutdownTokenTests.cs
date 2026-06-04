@@ -48,6 +48,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         await pipeline.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await service.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
 
+        await pipeline.HostShutdownObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.True(pipeline.HostShutdownWasCancelled);
         Assert.False(pipeline.ItemTokenWasCancelledWhenHostStopped);
     }
@@ -130,6 +131,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         Assert.True(
             elapsed.Elapsed < TimeSpan.FromSeconds(10),
             $"StopAsync should return before the host stop token while a worker ignores shutdown; elapsed {elapsed.Elapsed}");
+        await pipeline.HostShutdownObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.True(pipeline.HostShutdownWasCancelled);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
@@ -149,6 +151,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
     private sealed class HostShutdownObservingPipeline : IPipelineRunner
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource HostShutdownObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool HostShutdownWasCancelled { get; private set; }
         public bool ItemTokenWasCancelledWhenHostStopped { get; private set; }
 
@@ -163,6 +166,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
             {
                 HostShutdownWasCancelled = hostShutdownToken.IsCancellationRequested;
                 ItemTokenWasCancelledWhenHostStopped = ct.IsCancellationRequested;
+                HostShutdownObserved.SetResult();
                 throw new OperationCanceledException(hostShutdownToken);
             }
         }
@@ -200,6 +204,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         public ShutdownIgnoringWorkingPipeline(IWorkItemStore store) => _store = store;
 
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource HostShutdownObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Exited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool HostShutdownWasCancelled { get; private set; }
@@ -217,6 +222,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
                 catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
                 {
                     HostShutdownWasCancelled = true;
+                    HostShutdownObserved.SetResult();
                     await Release.Task;
                     var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
                     await _store.UpdateAsync(current.With(WorkItemState.Done), CancellationToken.None);

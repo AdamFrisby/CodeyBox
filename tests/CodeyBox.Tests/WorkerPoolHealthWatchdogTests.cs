@@ -521,6 +521,28 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task HealthCandidates_WhenSmokeDisabled_StillHonorDirectAgentFastFailExclusion()
+    {
+        var item = Item() with { Agent = AgentKind.Claude };
+        await _store.CreateAsync(item);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
+        for (var i = 0; i < 3; i++)
+            registry.RecordRunOutcome(AgentKind.Claude, success: false, duration: TimeSpan.FromMilliseconds(500));
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var health = BuildHealthSource(
+            availability: registry,
+            smokeOptions: new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+
+        var candidates = await health.ListRunnableCandidatesAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(candidates, i => i.Id == item.Id);
+    }
+
+    [Fact]
     public async Task AuditPassedCandidate_IsTreatedAsRunnableWork()
     {
         var item = Item() with { State = WorkItemState.AuditPassed };

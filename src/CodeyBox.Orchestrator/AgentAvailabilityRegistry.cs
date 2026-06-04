@@ -36,7 +36,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAvailabilityExclusionFilter
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -66,6 +66,18 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var reason = entry.CombinedReason();
+            return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
+        }
+    }
+
+    public AgentAvailability GetAvailabilityIgnoringSmokeGateExclusions(AgentKind kind)
+    {
+        if (!_entries.TryGetValue(kind, out var entry))
+            return new AgentAvailability(true, null, null);
+
+        lock (entry.Sync)
+        {
+            var reason = entry.CombinedReason(IsNonSmokeExclusion);
             return new AgentAvailability(reason is null, reason, entry.LastSmokePassedAt);
         }
     }
@@ -301,9 +313,52 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         public bool IsExcluded => Exclusions.Count > 0;
 
         /// <summary>Null when available; the joined reasons across sources otherwise.</summary>
-        public string? CombinedReason() =>
-            Exclusions.Count == 0 ? null : string.Join("; ", Exclusions.Values);
+        public string? CombinedReason() => CombinedReason(static _ => true);
+
+        public string? CombinedReason(Func<SmokeExclusionSource, bool> include)
+        {
+            if (Exclusions.Count == 0)
+                return null;
+
+            List<string>? reasons = null;
+            foreach (var exclusion in Exclusions)
+            {
+                if (!include(exclusion.Key))
+                    continue;
+
+                reasons ??= [];
+                reasons.Add(exclusion.Value);
+            }
+
+            return reasons is { Count: > 0 } ? string.Join("; ", reasons) : null;
+        }
     }
+
+    private static bool IsNonSmokeExclusion(SmokeExclusionSource source) =>
+        source is not SmokeExclusionSource.HostSmoke
+            and not SmokeExclusionSource.InVmSmoke
+            and not SmokeExclusionSource.MissingProbe;
+}
+
+internal interface IAgentAvailabilityExclusionFilter
+{
+    AgentAvailability GetAvailabilityIgnoringSmokeGateExclusions(AgentKind kind);
+}
+
+internal static class SmokeDisabledAvailabilityView
+{
+    public static AgentAvailability GetOrAvailable(IAgentAvailabilityRegistry? availability, AgentKind kind) =>
+        availability is null
+            ? new AgentAvailability(true, null, null)
+            : Get(availability, kind);
+
+    public static AgentAvailability? GetOrNull(IAgentAvailabilityRegistry? availability, AgentKind kind) =>
+        availability is null ? null : Get(availability, kind);
+
+    private static AgentAvailability Get(IAgentAvailabilityRegistry availability, AgentKind kind) =>
+        availability is IAgentAvailabilityExclusionFilter filter
+            ? filter.GetAvailabilityIgnoringSmokeGateExclusions(kind)
+            : availability.GetAvailability(kind);
 }
 
 /// <summary>
