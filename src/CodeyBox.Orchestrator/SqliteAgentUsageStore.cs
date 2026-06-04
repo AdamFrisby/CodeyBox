@@ -10,14 +10,15 @@ namespace CodeyBox.Orchestrator;
 /// budget accounting survives work-item deletion.
 ///
 /// A prepared INSERT keeps the hot-path overhead small. Reads open dedicated
-/// read-only connections so they never race the shared writer connection.
+/// read-only connections so they never race the store's write connection.
 /// </summary>
 public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly SqliteCommand _insertCmd;
+    private const int PruneBatchSize = 500;
 
     public SqliteAgentUsageStore(string path)
     {
@@ -26,56 +27,65 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragmaCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragmaCmd.ExecuteNonQuery();
+            _conn.Open();
+
+            using (var pragmaCmd = _conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using var createCmd = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
+            createCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS agent_usage_events (
+                    id                  TEXT PRIMARY KEY,
+                    time_utc            TEXT NOT NULL,
+                    agent_kind          TEXT NOT NULL,
+                    model_id            TEXT,
+                    input_tokens        INTEGER NOT NULL,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens       INTEGER NOT NULL,
+                    cost_microcents     INTEGER NOT NULL DEFAULT 0,
+                    work_item_id        TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_agent_model_time
+                    ON agent_usage_events(agent_kind, model_id, time_utc);
+                CREATE INDEX IF NOT EXISTS idx_usage_time
+                    ON agent_usage_events(time_utc);
+                """;
+            createCmd.ExecuteNonQuery();
+
+            _insertCmd = _conn.CreateCommand();
+            _insertCmd.CommandText = """
+                INSERT INTO agent_usage_events
+                    (id, time_utc, agent_kind, model_id,
+                     input_tokens, cached_input_tokens, output_tokens,
+                     cost_microcents, work_item_id)
+                VALUES
+                    ($id, $time, $kind, $model,
+                     $input, $cached, $output,
+                     $cost, $wi)
+                """;
+            _insertCmd.Parameters.Add("$id", SqliteType.Text);
+            _insertCmd.Parameters.Add("$time", SqliteType.Text);
+            _insertCmd.Parameters.Add("$kind", SqliteType.Text);
+            _insertCmd.Parameters.Add("$model", SqliteType.Text);
+            _insertCmd.Parameters.Add("$input", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$output", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$cost", SqliteType.Integer);
+            _insertCmd.Parameters.Add("$wi", SqliteType.Text);
+            _insertCmd.Prepare();
         }
-
-        using var createCmd = _conn.CreateCommand();
-        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
-        createCmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS agent_usage_events (
-                id                  TEXT PRIMARY KEY,
-                time_utc            TEXT NOT NULL,
-                agent_kind          TEXT NOT NULL,
-                model_id            TEXT,
-                input_tokens        INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens       INTEGER NOT NULL,
-                cost_microcents     INTEGER NOT NULL DEFAULT 0,
-                work_item_id        TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_usage_agent_model_time
-                ON agent_usage_events(agent_kind, model_id, time_utc);
-            CREATE INDEX IF NOT EXISTS idx_usage_time
-                ON agent_usage_events(time_utc);
-            """;
-        createCmd.ExecuteNonQuery();
-
-        _insertCmd = _conn.CreateCommand();
-        _insertCmd.CommandText = """
-            INSERT INTO agent_usage_events
-                (id, time_utc, agent_kind, model_id,
-                 input_tokens, cached_input_tokens, output_tokens,
-                 cost_microcents, work_item_id)
-            VALUES
-                ($id, $time, $kind, $model,
-                 $input, $cached, $output,
-                 $cost, $wi)
-            """;
-        _insertCmd.Parameters.Add("$id", SqliteType.Text);
-        _insertCmd.Parameters.Add("$time", SqliteType.Text);
-        _insertCmd.Parameters.Add("$kind", SqliteType.Text);
-        _insertCmd.Parameters.Add("$model", SqliteType.Text);
-        _insertCmd.Parameters.Add("$input", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$output", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$cost", SqliteType.Integer);
-        _insertCmd.Parameters.Add("$wi", SqliteType.Text);
-        _insertCmd.Prepare();
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task RecordAsync(AgentUsageEvent usage, CancellationToken ct = default)
@@ -142,17 +152,36 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
 
     public async Task<int> PruneAsync(DateTimeOffset cutoffUtc, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
+        var deleted = 0;
+        var cutoff = cutoffUtc.ToUniversalTime().ToString("O");
+        while (true)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM agent_usage_events WHERE time_utc < $cutoff";
-            cmd.Parameters.AddWithValue("$cutoff", cutoffUtc.ToUniversalTime().ToString("O"));
-            return await cmd.ExecuteNonQueryAsync(ct);
-        }
-        finally
-        {
-            _writeLock.Release();
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    DELETE FROM agent_usage_events
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM agent_usage_events
+                        WHERE time_utc < $cutoff
+                        LIMIT $limit
+                    );
+                    """;
+                cmd.Parameters.AddWithValue("$cutoff", cutoff);
+                cmd.Parameters.AddWithValue("$limit", PruneBatchSize);
+                var batchDeleted = await cmd.ExecuteNonQueryAsync(ct);
+                deleted += batchDeleted;
+                if (batchDeleted < PruneBatchSize)
+                    return deleted;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+
+            await Task.Yield();
         }
     }
 

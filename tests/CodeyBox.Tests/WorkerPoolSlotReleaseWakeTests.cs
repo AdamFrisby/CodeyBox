@@ -341,7 +341,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         await controller.PauseAsync("pause after pickup during spawn pacing");
         Assert.True(
-            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(4)),
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
             "The queue-pause branch after spawn pacing must unreserve the item and release the gate.");
         Assert.False(pipeline.HasEntered(second.Id));
 

@@ -112,7 +112,7 @@ public sealed class RetentionSweepTests : IDisposable
         using var conn = new SqliteConnection($"Data Source={_dbPath}");
         conn.Open();
         using var pragma = conn.CreateCommand();
-        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+        pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
         pragma.ExecuteNonQuery();
 
         using var cmd = conn.CreateCommand();

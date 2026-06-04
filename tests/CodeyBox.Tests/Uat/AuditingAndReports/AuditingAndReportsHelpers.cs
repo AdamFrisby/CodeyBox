@@ -65,7 +65,7 @@ internal static class AuditingAndReportsHelpers
 
         await using (var pragma = conn.CreateCommand())
         {
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
+            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
             await pragma.ExecuteNonQueryAsync();
         }
 

@@ -11,8 +11,10 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 {
+    private const int DeleteBatchSize = 500;
+
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
@@ -22,33 +24,42 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragmaCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
-            pragmaCmd.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS audit_reports (
-                id              TEXT PRIMARY KEY,
-                work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-                iteration       INTEGER NOT NULL,
-                auditor_name    TEXT NOT NULL,
-                auditor_kind    TEXT NOT NULL,
-                worst_severity  TEXT NOT NULL,
-                started_at      TEXT NOT NULL,
-                ended_at        TEXT NOT NULL,
-                duration_ms     INTEGER NOT NULL,
-                findings_json   TEXT NOT NULL,
-                raw_output      TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_reports_workitem_iter
-                ON audit_reports(work_item_id, iteration, auditor_name);
-            """;
-        cmd.ExecuteNonQuery();
+            using (var pragmaCmd = _conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS audit_reports (
+                    id              TEXT PRIMARY KEY,
+                    work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    iteration       INTEGER NOT NULL,
+                    auditor_name    TEXT NOT NULL,
+                    auditor_kind    TEXT NOT NULL,
+                    worst_severity  TEXT NOT NULL,
+                    started_at      TEXT NOT NULL,
+                    ended_at        TEXT NOT NULL,
+                    duration_ms     INTEGER NOT NULL,
+                    findings_json   TEXT NOT NULL,
+                    raw_output      TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_reports_workitem_iter
+                    ON audit_reports(work_item_id, iteration, auditor_name);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task CreateAsync(AuditReport report, CancellationToken ct = default)
@@ -113,15 +124,38 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
     public async Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
+        var deleted = 0;
+        var cutoffText = cutoff.ToString("O");
+
+        while (true)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM audit_reports WHERE started_at < $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
-            return await cmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    DELETE FROM audit_reports
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM audit_reports
+                        WHERE started_at < $cutoff
+                        LIMIT $limit
+                    );
+                    """;
+                cmd.Parameters.AddWithValue("$cutoff", cutoffText);
+                cmd.Parameters.AddWithValue("$limit", DeleteBatchSize);
+                var batchDeleted = await cmd.ExecuteNonQueryAsync(ct);
+                deleted += batchDeleted;
+                if (batchDeleted < DeleteBatchSize)
+                    return deleted;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+
+            await Task.Yield();
         }
-        finally { _writeLock.Release(); }
     }
 
     public void Dispose()

@@ -6,13 +6,14 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// SQLite-backed implementation of <see cref="IIdempotencyStore"/>. Shares the
 /// state database file with <see cref="SqliteWorkItemStore"/> via a separate
-/// connection, so write-locking is per-store and the work-item write loop
-/// is not blocked by idempotency-key lookups.
+/// connection; writes are coordinated by the per-database SQLite write gate.
 /// </summary>
 public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
 {
+    private const int DeleteBatchSize = 500;
+
     private readonly SqliteConnection _conn;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SqliteDatabaseWriteGate _writeLock;
 
     public SqliteIdempotencyStore(string path)
     {
@@ -20,27 +21,36 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _conn.Open();
-
-        using (var pragmaCmd = _conn.CreateCommand())
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;";
-            pragmaCmd.ExecuteNonQuery();
-        }
+            _conn.Open();
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS idempotency_keys (
-                key                   TEXT PRIMARY KEY,
-                body_hash             TEXT NOT NULL,
-                response_status       INTEGER NOT NULL,
-                response_body         BLOB NOT NULL,
-                response_content_type TEXT NOT NULL DEFAULT 'application/json',
-                expires_at            TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_idempotency_expires_at ON idempotency_keys(expires_at);
-            """;
-        cmd.ExecuteNonQuery();
+            using (var pragmaCmd = _conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS idempotency_keys (
+                    key                   TEXT PRIMARY KEY,
+                    body_hash             TEXT NOT NULL,
+                    response_status       INTEGER NOT NULL,
+                    response_body         BLOB NOT NULL,
+                    response_content_type TEXT NOT NULL DEFAULT 'application/json',
+                    expires_at            TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_idempotency_expires_at ON idempotency_keys(expires_at);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IdempotencyLookupResult> LookupAsync(
@@ -125,17 +135,37 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
 
     public async Task<int> DeleteExpiredAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
+        var deleted = 0;
+        var cutoffText = cutoff.ToString("O");
+
+        while (true)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM idempotency_keys WHERE expires_at <= $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
-            return await cmd.ExecuteNonQueryAsync(ct);
-        }
-        finally
-        {
-            _writeLock.Release();
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    DELETE FROM idempotency_keys
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM idempotency_keys
+                        WHERE expires_at <= $cutoff
+                        LIMIT $limit
+                    );
+                    """;
+                cmd.Parameters.AddWithValue("$cutoff", cutoffText);
+                cmd.Parameters.AddWithValue("$limit", DeleteBatchSize);
+                var batchDeleted = await cmd.ExecuteNonQueryAsync(ct);
+                deleted += batchDeleted;
+                if (batchDeleted < DeleteBatchSize)
+                    return deleted;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+
+            await Task.Yield();
         }
     }
 
