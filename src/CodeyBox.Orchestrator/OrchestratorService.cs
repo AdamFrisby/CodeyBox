@@ -149,6 +149,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private int _pendingDeferrals = 0;
     private const int DeferralWarningThreshold = 100;
 
+    // No-progress re-dispatch backoff (incident 2026-06-04). When a worker is
+    // dispatched but the pipeline returns without advancing the item's state
+    // (e.g. a poisoned work branch whose pickup phase no-ops), the slot-release
+    // dispatch wake would re-pick the still-dispatchable item instantly — a tight
+    // ~160/sec spawn loop. MinSpawnInterval stays 0 for normal operation; instead
+    // we count consecutive no-progress re-dispatches per item and defer with an
+    // escalating backoff (0.5s → 15s cap), turning a loop into delayed/no work
+    // rather than a high-load event. After a cap the item is Failed so a genuinely
+    // stuck item is cleared instead of looping forever. Reset to 0 on any progress.
+    private readonly ConcurrentDictionary<WorkItemId, int> _noProgressRedispatch = new();
+    private static readonly TimeSpan NoProgressBackoffBase = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan NoProgressBackoffMax = TimeSpan.FromSeconds(15);
+    private const int MaxNoProgressRedispatches = 10;
+
     /// <summary>
     /// Fallback deferral interval when <c>QuotaRouterOptions</c> is not wired
     /// (DI omits it). 15s keeps the deferred item visible without busy-looping.
@@ -1683,6 +1697,54 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     _log.LogWarning(ex, "Failed to deregister worker {WorkerId}; row will be reaped by DeadWorkerReaper", registeredWorkerId);
                 }
+            }
+        }
+
+        // No-progress re-dispatch backoff (incident 2026-06-04). Reached only on
+        // the pipeline-ran fall-through — the quota/budget/cap/disk deferrals all
+        // `return` earlier and already set _deferredItems. If the worker ran but
+        // the item is STILL in the same re-pickable state it was dispatched in
+        // (item.State is the dispatched state; the pipeline transitions the store,
+        // not this local), it made no progress and the slot-release dispatch wake
+        // would re-pick it instantly. Defer with escalating backoff so a loop is
+        // delayed/no work, never a high-load spawn storm; fail after a cap so a
+        // genuinely poisoned item is cleared rather than looping forever.
+        if (!_deferredItems.ContainsKey(id))
+        {
+            var afterRun = await _store.GetAsync(id, CancellationToken.None);
+            if (afterRun is not null
+                && afterRun.State == item.State
+                && afterRun.State is WorkItemState.Queued
+                    or WorkItemState.WorkComplete or WorkItemState.AuditPassed)
+            {
+                var attempt = _noProgressRedispatch.AddOrUpdate(id, 1, static (_, c) => c + 1);
+                if (attempt >= MaxNoProgressRedispatches)
+                {
+                    _noProgressRedispatch.TryRemove(id, out _);
+                    _log.LogWarning(
+                        "Worker {WorkerId} failing {Id}: no progress after {Attempts} consecutive re-dispatches in state {State}",
+                        workerIndex, id, attempt, afterRun.State);
+                    await _store.UpdateAsync(
+                        afterRun.With(WorkItemState.Failed,
+                            $"no progress after {attempt} consecutive re-dispatches (dispatched but the pipeline made no progress; likely a poisoned work branch or a stuck pickup phase)"),
+                        CancellationToken.None);
+                }
+                else
+                {
+                    var backoff = TimeSpan.FromMilliseconds(Math.Min(
+                        NoProgressBackoffBase.TotalMilliseconds * Math.Pow(2, attempt - 1),
+                        NoProgressBackoffMax.TotalMilliseconds));
+                    _log.LogDebug(
+                        "Worker {WorkerId} backing off {Id} {Ms}ms: no-progress re-dispatch #{Attempt}",
+                        workerIndex, id, backoff.TotalMilliseconds, attempt);
+                    ScheduleDeferredRequeue(id, backoff, ct);
+                }
+            }
+            else
+            {
+                // Progressed (or item gone) — clear the counter so a future
+                // unrelated re-pickup starts fresh.
+                _noProgressRedispatch.TryRemove(id, out _);
             }
         }
 
