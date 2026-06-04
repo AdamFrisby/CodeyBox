@@ -1213,6 +1213,99 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BaselineImages_CloneAlreadyExistsOnRetryStoppedTarget_TreatsAsSuccess()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var cloneCalls = 0;
+        var targetInfoCalls = 0;
+        var started = false;
+        string? cloneName = null;
+        var purged = new List<string>();
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                if (infoName.StartsWith("cb-baseline-", StringComparison.Ordinal))
+                    return Task.FromResult(new ProcessRunResult(0, "Stopped", ""));
+
+                if (!started)
+                    targetInfoCalls++;
+                return Task.FromResult(states.TryGetValue(infoName, out var state)
+                    ? new ProcessRunResult(0, state, "")
+                    : new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv is [_, "stop", var stopName])
+            {
+                states[stopName] = "Stopped";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "clone", var source, "--name", var target])
+            {
+                Assert.StartsWith("cb-baseline-", source, StringComparison.Ordinal);
+                cloneName = target;
+                cloneCalls++;
+                states[target] = cloneCalls == 1 ? "Running" : "Stopped";
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    "",
+                    $"multipass clone failed: instance \"{target}\" already exists"));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                purged.Add(deleteName);
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "start", var startName])
+            {
+                started = true;
+                states[startName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal))
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            if (argv is [_, "exec", _, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"])
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-clone-retry-collision-stopped"),
+            networkProfiles: new Dictionary<string, string> { ["claude"] = "cb-claude" },
+            useBaselineImages: true,
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy { ProfileName = "claude" },
+            WorkingDirectory = "/work",
+        });
+
+        Assert.Equal(2, cloneCalls);
+        Assert.Equal(2, targetInfoCalls);
+        var purgedName = Assert.Single(purged);
+        Assert.Equal(cloneName, purgedName);
+        Assert.Equal(cloneName, sandbox.Id);
+        Assert.NotNull(cloneName);
+        Assert.Equal("Running", states[cloneName!]);
+    }
+
+    [Fact]
     public async Task BaselineImages_CloneAlreadyExistsStillColliding_DefersInsteadOfHardFail()
     {
         var cloneCalls = 0;

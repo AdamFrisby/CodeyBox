@@ -1,3 +1,5 @@
+using CodeyBox.Core;
+
 namespace CodeyBox.Orchestrator;
 
 public interface IStartupRecoveryInputBarrier
@@ -8,6 +10,11 @@ public interface IStartupRecoveryInputBarrier
 public interface IStartupRecoveryInputSink
 {
     void MarkRecoveryInputReady();
+}
+
+public interface IInfrastructureDeferralScheduler
+{
+    void ScheduleInfrastructureDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken = default);
 }
 
 public interface IStartupInitialRecoveryBarrier

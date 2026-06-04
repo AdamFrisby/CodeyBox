@@ -260,6 +260,57 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task MountSingleBindWithRetry_RemountAlreadyMountedWithMatchingSource_TreatsAsSuccess()
+    {
+        var hostSource = Path.Combine(_workspace, "correct-source-after-remount");
+        Directory.CreateDirectory(hostSource);
+        var calls = new List<IReadOnlyList<string>>();
+        var infoCalls = 0;
+
+        var runner = new SequencedRunner(call =>
+        {
+            if (call.Argv.Count >= 2 && call.Argv[1] == "mount")
+            {
+                calls.Add(call.Argv);
+                return new ProcessRunResult(1, "", "\"/repo\" is already mounted");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "info")
+            {
+                infoCalls++;
+                var source = infoCalls == 1 ? "/old/source" : hostSource;
+                var stdout = "{\"info\":{\"codeybox-test\":{\"mounts\":{\"/repo\":{\"source_path\":"
+                    + JsonString(source)
+                    + "}}}}}";
+                return new ProcessRunResult(0, stdout, "");
+            }
+
+            if (call.Argv.Count >= 2 && call.Argv[1] == "umount")
+            {
+                calls.Add(call.Argv);
+                return new ProcessRunResult(0, "", "");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+        var provider = NewProvider(runner);
+
+        await provider.MountSingleBindWithRetryAsync(
+            new MultipassSandboxOptions(),
+            name: "codeybox-test",
+            host: hostSource,
+            sandbox: "/repo",
+            workItemId: null,
+            ct: CancellationToken.None);
+
+        var mountCalls = calls.Where(c => c.Count >= 2 && c[1] == "mount").ToList();
+        var unmount = Assert.Single(calls, c => c.Count >= 2 && c[1] == "umount");
+        Assert.Equal(2, mountCalls.Count);
+        Assert.Equal(2, infoCalls);
+        Assert.Equal(["multipass", "umount", "codeybox-test:/repo"], unmount);
+    }
+
+    [Fact]
     public async Task MountSingleBindWithRetry_AlreadyMountedWithUnverifiedInfo_UnmountsAndRemounts()
     {
         var hostSource = Path.Combine(_workspace, "unverified-source");

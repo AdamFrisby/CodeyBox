@@ -46,16 +46,26 @@ public sealed class MultipassDaemonRetryTests
     [Fact]
     public void ClassifyTransient_ReturnsNull_ForNonRetryableCommand_EvenWithSocketStderr()
     {
-        // 'delete', 'transfer', 'list' must fail fast even when the
+        // 'delete', 'list' and similar maintenance commands must fail fast even when the
         // stderr looks transient — they're outside RetryableCommands and
         // running them again may have side effects.
-        foreach (var nonRetryable in new[] { "delete", "transfer", "list", "purge" })
+        foreach (var nonRetryable in new[] { "delete", "list", "purge" })
         {
             var classification = MultipassDaemonRetry.ClassifyTransient(
                 Argv(nonRetryable, "codeybox-x"),
                 new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
             Assert.Null(classification);
         }
+    }
+
+    [Fact]
+    public void ClassifyTransient_DetectsSocketError_ForTransferSetup()
+    {
+        var classification = MultipassDaemonRetry.ClassifyTransient(
+            Argv("transfer", "/tmp/env", "codeybox-x:.codeybox-env"),
+            new ProcessRunResult(1, "", "cannot connect to the multipass socket"));
+
+        Assert.Equal("multipass-socket-unreachable", classification);
     }
 
     [Fact]
@@ -554,7 +564,7 @@ public sealed class MultipassDaemonRetryTests
 }
 
 /// <summary>
-/// Pins the AuditLog.SandboxLaunchTransientRetry emission on retry to a real
+/// Pins the AuditLog.SandboxProvisioningTransientRetry emission on retry to a real
 /// Serilog sink. The unit-only tests above use the Microsoft.Extensions.Logging
 /// ILogger which is independent of Serilog's static <c>Log.Logger</c>, so the
 /// surface contract — the audit pipeline ACTUALLY fires for each retry with
@@ -591,7 +601,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
     };
 
     [Fact]
-    public async Task SandboxLaunchTransientRetry_FiresForEachRetry_WithAttemptAndErrorClass()
+    public async Task SandboxProvisioningTransientRetry_FiresForEachRetry_WithOperationAttemptAndErrorClass()
     {
         var workItemId = WorkItemId.New();
         await MultipassDaemonRetry.RunWithRetryAsync(
@@ -604,7 +614,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             InstantPolicy());
 
         var retryEvents = _sink.Events
-            .Where(e => GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry")
+            .Where(e => GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry")
             .ToList();
 
         // Two retries (between attempts 1→2 and 2→3); none after the final
@@ -612,16 +622,18 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         Assert.Equal(2, retryEvents.Count);
 
         Assert.Equal(workItemId.ToString(), GetScalar<string>(retryEvents[0], "WorkItemId"));
+        Assert.Equal("launch", GetScalar<string>(retryEvents[0], "Operation"));
         Assert.Equal(1, GetScalar<int>(retryEvents[0], "Attempt"));
         Assert.Equal("multipass-socket-unreachable", GetScalar<string>(retryEvents[0], "ErrorClass"));
 
         Assert.Equal(workItemId.ToString(), GetScalar<string>(retryEvents[1], "WorkItemId"));
+        Assert.Equal("launch", GetScalar<string>(retryEvents[1], "Operation"));
         Assert.Equal(2, GetScalar<int>(retryEvents[1], "Attempt"));
         Assert.Equal("multipass-socket-unreachable", GetScalar<string>(retryEvents[1], "ErrorClass"));
     }
 
     [Fact]
-    public async Task SandboxLaunchTransientRetry_DoesNotFire_OnFirstAttemptSuccess()
+    public async Task SandboxProvisioningTransientRetry_DoesNotFire_OnFirstAttemptSuccess()
     {
         // No transient classification → return path bypasses the audit
         // emission entirely. Guards against an accidental call before the
@@ -636,11 +648,11 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             InstantPolicy());
 
         Assert.DoesNotContain(_sink.Events, e =>
-            GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry");
+            GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");
     }
 
     [Fact]
-    public async Task SandboxLaunchTransientRetry_DoesNotFire_WhenWorkItemIdIsNull()
+    public async Task SandboxProvisioningTransientRetry_DoesNotFire_WhenWorkItemIdIsNull()
     {
         // Internal/maintenance callers (e.g. leak reaper) pass workItemId=null
         // so the audit emission is suppressed but the retry still runs.
@@ -654,7 +666,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             InstantPolicy());
 
         Assert.DoesNotContain(_sink.Events, e =>
-            GetScalar<string>(e, "EventName") == "sandbox.launch_transient_retry");
+            GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");
     }
 
     private static T? GetScalar<T>(LogEvent evt, string key)

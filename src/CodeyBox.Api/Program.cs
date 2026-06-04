@@ -2034,6 +2034,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>()));
+builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
+    sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(
     sp.GetRequiredService<OrchestratorService>(),
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2122,7 +2124,8 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
             AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
         };
     },
-    sp.GetRequiredService<IStartupRecoveryInputSink>()));
+    sp.GetRequiredService<IStartupRecoveryInputSink>(),
+    sp.GetRequiredService<IInfrastructureDeferralScheduler>()));
 
 // Hot-reload bridge: subscribes to IOptionsMonitor<CodeyBoxOptions> and pushes
 // changes to AgentConcurrency / AgentClasses / AgentBurnEstimator into the

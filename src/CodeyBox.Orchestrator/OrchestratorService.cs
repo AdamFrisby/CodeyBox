@@ -13,7 +13,7 @@ namespace CodeyBox.Orchestrator;
 /// caps how many run simultaneously; <see cref="OrchestratorOptions.MinSpawnInterval"/>
 /// enforces a minimum wall-clock gap between successive spawns.
 /// </summary>
-public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy
+public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler
 {
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
@@ -1043,6 +1043,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         foreach (var item in allItems)
         {
+            if (_deferredItems.ContainsKey(item.Id))
+                continue;
+
             if (_reaper is not null && _reaper.HasRecoveredItemInCurrentProcess(item.Id))
                 continue;
 
@@ -1843,19 +1846,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     /// <summary>
     /// Fires a background task that re-enqueues <paramref name="id"/> after
-    /// <paramref name="delay"/>. Used when the quota router defers a work item
-    /// because all subscription-billed members are exhausted. The item remains
-    /// in Queued state; the deferred task simply puts it back on the channel so
-    /// the next pickup attempt re-probes quota. On shutdown (stoppingToken
-    /// cancelled), the delayed task exits cleanly; the item is recovered via
-    /// ReplayPendingAsync on the next start.
+    /// <paramref name="delay"/>. Used for quota, budget, and infrastructure
+    /// deferrals. The item remains in its recoverable state; the deferred task
+    /// simply puts it back on the channel after the recheck window. On shutdown
+    /// (stoppingToken cancelled), the delayed task exits cleanly; the item is
+    /// recovered via ReplayPendingAsync on the next start.
     /// </summary>
+    public void ScheduleInfrastructureDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken = default)
+        => ScheduleDeferredRequeue(id, delay, stoppingToken);
+
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
         var count = Interlocked.Increment(ref _pendingDeferrals);
         if (count > DeferralWarningThreshold)
             _log.LogWarning(
-                "Deferred requeue backlog is {Count} items; quota exhaustion may be sustained across many work items",
+                "Deferred requeue backlog is {Count} items; deferrals may be sustained across many work items",
                 count);
 
         // Mark the item as currently-deferred so the priority pickup query skips it
@@ -1869,7 +1874,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try
             {
                 await Task.Delay(delay, stoppingToken);
-                _log.LogInformation("Re-enqueueing deferred work item {Id} after quota recheck interval", id);
+                _log.LogInformation("Re-enqueueing deferred work item {Id} after defer interval", id);
                 _deferredItems.TryRemove(id, out _);
                 await _queue.EnqueueAsync(id, stoppingToken);
             }

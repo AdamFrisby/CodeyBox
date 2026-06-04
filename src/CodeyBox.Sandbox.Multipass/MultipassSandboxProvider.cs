@@ -345,9 +345,12 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     }
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
-                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct);
+                var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct, workItemId: workItemId);
                 if (stop.ExitCode != 0)
+                {
+                    ThrowIfProvisioningRetryExhausted("stop", stop);
                     throw new InvalidOperationException($"multipass stop (for mount) failed: {stop.Stderr}");
+                }
                 await WaitForStoppedAsync(opts, name, workItemId, ct);
             }
 
@@ -1401,6 +1404,7 @@ git push origin HEAD:{refName}";
         CancellationToken ct)
     {
         var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+        ThrowIfProvisioningRetryExhausted("info", info);
         return info.ExitCode == 0;
     }
 
@@ -1485,17 +1489,23 @@ git push origin HEAD:{refName}";
                     [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "bash", "-c", cmd],
                     stdin: null, ct: ct, workItemId: workItemId);
                 if (execRun.ExitCode != 0)
+                {
+                    ThrowIfProvisioningRetryExhausted("exec", execRun);
                     throw new InvalidOperationException(
                         $"baseline install step {i + 1} failed (exit {execRun.ExitCode}):\n" +
                         $"stderr: {execRun.Stderr}\nstdout-tail: {(execRun.Stdout.Length > 1000 ? "…" + execRun.Stdout[^1000..] : execRun.Stdout)}");
+                }
             }
 
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped). Wait for the state to flip
             // so a subsequent clone doesn't race a still-Stopping VM.
-            var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+            var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct, workItemId: workItemId);
             if (stop.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("stop", stop);
                 throw new InvalidOperationException($"baseline stop failed: {stop.Stderr}");
+            }
             await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
@@ -1523,7 +1533,9 @@ git push origin HEAD:{refName}";
         // auto-starts stopped instances). Stop is idempotent — exits 0 if
         // already stopped — and we wait for the state to flip because
         // `multipass stop` returns when the request is queued.
-        await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct);
+        var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", baselineName], stdin: null, ct: ct, workItemId: workItemId);
+        if (stop.ExitCode != 0)
+            ThrowIfProvisioningRetryExhausted("stop", stop);
         await WaitForStoppedAsync(opts, baselineName, workItemId, ct);
 
         _log.LogInformation("Cloning {New} from baseline {Baseline}", newName, baselineName);
@@ -1578,6 +1590,7 @@ git push origin HEAD:{refName}";
         }
         else
         {
+            ThrowIfProvisioningRetryExhausted("info", info);
             _log.LogWarning(
                 "multipass clone reported target {Name} already exists, but info could not read it; retrying clone once. stderr={Stderr}",
                 newName, SingleLine(info.Stderr));
@@ -1608,6 +1621,7 @@ git push origin HEAD:{refName}";
                 return true;
             }
 
+            ThrowIfProvisioningRetryExhausted("info", retryInfo);
             var infoDetail = retryInfo.ExitCode == 0
                 ? $"target info after retry: {SingleLine(retryInfo.Stdout)}"
                 : $"target info after retry was unreadable: {SingleLine(retryInfo.Stderr)}";
@@ -1705,6 +1719,7 @@ git push origin HEAD:{refName}";
         {
             ct.ThrowIfCancellationRequested();
             var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
+            ThrowIfProvisioningRetryExhausted("info", info);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
                 break;
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
@@ -1746,6 +1761,7 @@ git push origin HEAD:{refName}";
                 opts,
                 [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--wait"],
                 stdin: null, ct: ct, workItemId: workItemId);
+            ThrowIfProvisioningRetryExhausted("exec", cloudInit);
 
             if (cloudInit.ExitCode is 0 or 2)
                 return;
@@ -1764,6 +1780,7 @@ git push origin HEAD:{refName}";
         }
 
         var probe = await ProbeCloudInitReadinessAsync(opts, name, workItemId, ct);
+        ThrowIfProvisioningRetryExhausted("exec", probe);
         if (probe.ExitCode == 0)
         {
             _log.LogWarning(
@@ -1830,9 +1847,10 @@ test "$work" = present && test "$exec_wrapper" = present
         await WaitForStoppedCoreAsync(
             name,
             stopTimeout,
-            ctInner => RunAsync(
+            ctInner => RunProvisioningAsync(
                 opts,
                 [opts.MultipassBinary, "info", name, "--format=csv"],
+                operation: "info",
                 stdin: null,
                 ct: ctInner,
                 workItemId: workItemId),
@@ -1929,6 +1947,7 @@ test "$work" = present && test "$exec_wrapper" = present
         CancellationToken ct)
     {
         var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=json"], stdin: null, ct: ct);
+        ThrowIfProvisioningRetryExhausted("info", info);
         if (info.ExitCode != 0) return (null, null);
         try
         {
@@ -2388,19 +2407,25 @@ test "$work" = present && test "$exec_wrapper" = present
             ctInner => RunAsync(
                 opts,
                 [opts.MultipassBinary, "transfer", envPath, $"{name}:.codeybox-env"],
-                stdin: null, ct: ctInner),
+                stdin: null, ct: ctInner, workItemId: workItemId),
             _log,
             description: $"multipass transfer env file -> {name}",
             ct);
         if (tx.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("transfer", tx);
             throw new InvalidOperationException($"multipass transfer env file failed: {tx.Stderr}");
+        }
 
         var perms = await RunAsync(
             opts,
             [opts.MultipassBinary, "exec", name, "--", "chmod", "0600", "/home/ubuntu/.codeybox-env"],
             stdin: null, ct: ct, workItemId: workItemId);
         if (perms.ExitCode != 0)
+        {
+            ThrowIfProvisioningRetryExhausted("exec", perms);
             throw new InvalidOperationException($"failed to chmod env file in VM: {perms.Stderr}");
+        }
 
         return "/home/ubuntu/.codeybox-env";
     }
@@ -2907,6 +2932,19 @@ test "$work" = present && test "$exec_wrapper" = present
             ct,
             _daemonRetryPolicy);
 
+    private async Task<ProcessRunResult> RunProvisioningAsync(
+        MultipassSandboxOptions opts,
+        IReadOnlyList<string> argv,
+        string operation,
+        string? stdin,
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
+    {
+        var result = await RunAsync(opts, argv, stdin, ct, workItemId);
+        ThrowIfProvisioningRetryExhausted(operation, result);
+        return result;
+    }
+
     private void ThrowIfProvisioningRetryExhausted(string operation, ProcessRunResult result)
     {
         if (!MultipassDaemonRetry.TryGetRetryExhaustedErrorClass(result, out var errorClass))
@@ -2993,6 +3031,7 @@ internal static class MultipassDaemonRetry
         "mount",
         "umount",
         "stop",
+        "transfer",
     };
 
     internal static async Task<ProcessRunResult> RunWithRetryAsync(
@@ -3017,6 +3056,7 @@ internal static class MultipassDaemonRetry
         ProcessRunResult result = default;
         string? errorClass = null;
         var description = Describe(argv);
+        var operation = argv.Count >= 2 ? argv[1] : "multipass";
 
         for (var attempt = 1; attempt <= policy.MaxAttempts; attempt++)
         {
@@ -3032,7 +3072,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, retryOrdinal, errorClass);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass);
 
             if (retryOrdinal == 1)
             {
@@ -3157,10 +3197,10 @@ internal static class MultipassDaemonRetry
         }
     }
 
-    private static void AuditTransientRetry(WorkItemId? workItemId, int attempt, string errorClass)
+    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass)
     {
         if (workItemId.HasValue)
-            AuditLog.SandboxLaunchTransientRetry(workItemId.Value, attempt, errorClass);
+            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass);
     }
 
     private static string Describe(IReadOnlyList<string> argv)

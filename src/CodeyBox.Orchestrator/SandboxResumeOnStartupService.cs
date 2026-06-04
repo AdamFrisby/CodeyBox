@@ -98,6 +98,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     private readonly ILogger<SandboxResumeOnStartupService> _log;
     private readonly Func<SandboxStartupResumeOptions> _optionsAccessor;
     private readonly IStartupRecoveryInputSink _startupRecovery;
+    private readonly IInfrastructureDeferralScheduler? _infrastructureDeferrals;
     private readonly Lock _resumeStartGate = new();
     private CancellationTokenSource? _backgroundCts;
     private Task? _resumeTask;
@@ -111,7 +112,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         int? maxParallel = null,
         TimeSpan? adoptionDeadline = null,
         TimeSpan? resumeTimeout = null,
-        SandboxStartupResumeMode? mode = null)
+        SandboxStartupResumeMode? mode = null,
+        IInfrastructureDeferralScheduler? infrastructureDeferrals = null)
         : this(
             provider,
             store,
@@ -127,7 +129,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                     : DefaultResumeTimeout,
                 Mode = mode ?? SandboxStartupResumeMode.Background,
             },
-            recoveryInput)
+            recoveryInput,
+            infrastructureDeferrals)
     {
     }
 
@@ -136,7 +139,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         IWorkItemStore store,
         ILogger<SandboxResumeOnStartupService> log,
         Func<SandboxStartupResumeOptions> optionsAccessor,
-        IStartupRecoveryInputSink recoveryInput)
+        IStartupRecoveryInputSink recoveryInput,
+        IInfrastructureDeferralScheduler? infrastructureDeferrals = null)
     {
         ArgumentNullException.ThrowIfNull(recoveryInput);
         _provider = provider;
@@ -144,6 +148,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         _log = log;
         _optionsAccessor = optionsAccessor;
         _startupRecovery = recoveryInput;
+        _infrastructureDeferrals = infrastructureDeferrals;
     }
 
     public Task StartAsync(CancellationToken ct)
@@ -324,9 +329,16 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         var vmName = item.SuspendedVmName!;
         var agentLogPath = item.AgentLogPath;
-        var (resumeSucceeded, resumeError) = await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
+        var (resumeSucceeded, resumeError, provisioningDeferred) =
+            await TryResumeSandboxAsync(suspending, item.Id, vmName, ct);
         int? adoptionExitCode = null;
         var adopted = false;
+
+        if (provisioningDeferred is not null)
+        {
+            await DeferProvisioningResumeAsync(item, vmName, provisioningDeferred, ct);
+            return;
+        }
 
         if (resumeSucceeded && !string.IsNullOrWhiteSpace(agentLogPath))
         {
@@ -401,7 +413,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         AuditLog.SandboxResumedOnStartup(item.Id, vmName, resumeSucceeded, resumeError, adopted, adoptionExitCode);
     }
 
-    private async Task<(bool Succeeded, string? Error)> TryResumeSandboxAsync(
+    private async Task<(bool Succeeded, string? Error, SandboxProvisioningDeferredException? ProvisioningDeferred)> TryResumeSandboxAsync(
         ISuspendingSandboxProvider suspending,
         WorkItemId itemId,
         string vmName,
@@ -417,7 +429,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             resumeTask = RunLongRunningAsync(
                 () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
             await resumeTask.WaitAsync(timeout, ct);
-            return (true, null);
+            return (true, null, null);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -435,7 +447,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
                 vmName, itemId, timeout);
-            return (false, error);
+            return (false, error, null);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
@@ -445,7 +457,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
                 vmName, itemId, timeout);
-            return (false, error);
+            return (false, error, null);
         }
         catch (OperationCanceledException ex)
         {
@@ -453,15 +465,61 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             _log.LogWarning(ex,
                 "Startup resume was cancelled by the provider for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
                 vmName, itemId);
-            return (false, error);
+            return (false, error, null);
+        }
+        catch (SandboxProvisioningDeferredException ex)
+        {
+            _log.LogWarning(ex,
+                "Startup resume deferred for sandbox {VmName} (work item {WorkItemId}) after transient provisioning failure",
+                vmName, itemId);
+            return (false, ex.Message, ex);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
                 "Startup resume failed for sandbox {VmName} (work item {WorkItemId}); clearing suspend bookkeeping so the item can recover via the stranded-item path",
                 vmName, itemId);
-            return (false, ex.Message);
+            return (false, ex.Message, null);
         }
+    }
+
+    private async Task DeferProvisioningResumeAsync(
+        WorkItem item,
+        string vmName,
+        SandboxProvisioningDeferredException provEx,
+        CancellationToken ct)
+    {
+        var fresh = await _store.GetAsync(item.Id, ct);
+        if (fresh is null)
+        {
+            AuditLog.SandboxResumedOnStartup(item.Id, vmName, success: false, error: provEx.Message);
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var cleared = fresh with
+        {
+            SuspendedVmName = null,
+            SuspendedAt = null,
+            AgentLogPath = null,
+            UpdatedAt = now,
+        };
+        var updated = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(cleared, now)
+            ?? cleared;
+
+        await _store.UpdateAsync(updated, ct);
+        AuditLog.SandboxProvisioningDeferred(
+            updated.Id,
+            provEx.Provider,
+            provEx.Operation,
+            provEx.ErrorClass,
+            updated.State.ToString(),
+            provEx.RecheckIn);
+        AuditLog.SandboxResumedOnStartup(item.Id, vmName, success: false, error: provEx.Message);
+        _infrastructureDeferrals?.ScheduleInfrastructureDeferredRequeue(item.Id, provEx.RecheckIn, ct);
+        _log.LogWarning(
+            "Startup resume deferred work item {WorkItemId} after sandbox {VmName} hit transient provisioning failure ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
+            item.Id, vmName, provEx.Provider, provEx.Operation, provEx.ErrorClass, updated.State);
     }
 
     private async Task<int?> TryWaitForAdoptionAsync(

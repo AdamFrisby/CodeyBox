@@ -41,6 +41,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         var queue = new InMemoryTaskQueue();
         var webhooks = new RecordingWebhookDispatcher();
+        var recheckIn = TimeSpan.FromMilliseconds(150);
         var pipeline = new ProvisioningDeferOncePipeline(
             _store,
             new SandboxProvisioningDeferredException(
@@ -48,7 +49,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                 operation: "start",
                 errorClass: "multipass-start-argument-not-found",
                 detail: "multipass start failed after retries",
-                recheckIn: TimeSpan.FromMilliseconds(100)));
+                recheckIn: recheckIn));
         var svc = new OrchestratorService(
             queue,
             _store,
@@ -64,11 +65,23 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         try
         {
             var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (pipeline.CallCount < 1 && DateTimeOffset.UtcNow < deadline)
+                await Task.Delay(20);
+
+            Assert.Equal(1, pipeline.CallCount);
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            Assert.Equal(1, pipeline.CallCount);
+
             while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(20);
 
             Assert.Equal(2, pipeline.CallCount);
             Assert.Equal(WorkItemState.Queued, pipeline.SecondCallState);
+            Assert.NotNull(pipeline.FirstCallAt);
+            Assert.NotNull(pipeline.SecondCallAt);
+            Assert.True(
+                pipeline.SecondCallAt.Value - pipeline.FirstCallAt.Value >= recheckIn - TimeSpan.FromMilliseconds(25),
+                $"deferred requeue fired too early: first={pipeline.FirstCallAt.Value:O}, second={pipeline.SecondCallAt.Value:O}, recheck={recheckIn}");
 
             var stored = await _store.GetAsync(item.Id);
             Assert.NotNull(stored);
@@ -84,6 +97,10 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
             Assert.Equal("start", (string)detailType.GetProperty("operation")!.GetValue(evt.Details)!);
             Assert.Equal("multipass-start-argument-not-found", (string)detailType.GetProperty("errorClass")!.GetValue(evt.Details)!);
             Assert.Equal("Queued", (string)detailType.GetProperty("resumeState")!.GetValue(evt.Details)!);
+            var suggestedRetryAt = (DateTimeOffset)detailType.GetProperty("suggestedRetryAt")!.GetValue(evt.Details)!;
+            Assert.True(
+                suggestedRetryAt >= pipeline.FirstCallAt.Value + recheckIn - TimeSpan.FromMilliseconds(25),
+                $"suggestedRetryAt did not honor RecheckIn: first={pipeline.FirstCallAt.Value:O}, suggested={suggestedRetryAt:O}, recheck={recheckIn}");
 
             Assert.Contains(_sink.Events, e =>
                 e.Properties.TryGetValue("EventName", out var name)
@@ -241,18 +258,22 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         public int CallCount => Volatile.Read(ref _callCount);
         public WorkItemState? SecondCallState => _secondCallState;
+        public DateTimeOffset? FirstCallAt { get; private set; }
+        public DateTimeOffset? SecondCallAt { get; private set; }
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
             var call = Interlocked.Increment(ref _callCount);
             if (call == 1)
             {
+                FirstCallAt = DateTimeOffset.UtcNow;
                 await _store.UpdateAsync(item.With(WorkItemState.Working), ct);
                 throw _exception;
             }
 
             if (call == 2)
             {
+                SecondCallAt = DateTimeOffset.UtcNow;
                 _secondCallState = item.State;
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
             }

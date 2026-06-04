@@ -665,6 +665,47 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         Assert.Equal(0, after.RecoveryAttempts);
     }
 
+    [Fact]
+    public async Task StartupResume_ProvisioningDeferred_RequeuesWithoutFailingAndSchedulesDelay()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-start-deferred",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            LastError = "previous infrastructure failure",
+            FailureKind = "other",
+        });
+        var deferred = new SandboxProvisioningDeferredException(
+            provider: "multipass",
+            operation: "start",
+            errorClass: "multipass-start-argument-not-found",
+            detail: "start retry exhausted",
+            recheckIn: TimeSpan.FromMilliseconds(75));
+        var provider = new FakeSuspendingProvider { ResumeProvisioningDeferred = deferred };
+        var scheduler = new RecordingInfrastructureDeferralScheduler();
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            infrastructureDeferrals: scheduler);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Null(after.SuspendedVmName);
+        Assert.Null(after.SuspendedAt);
+        Assert.Null(after.AgentLogPath);
+        Assert.Null(after.LastError);
+        Assert.Null(after.FailureKind);
+        Assert.Equal(0, after.RecoveryAttempts);
+        var scheduled = Assert.Single(scheduler.Scheduled);
+        Assert.Equal(item.Id, scheduled.Id);
+        Assert.Equal(deferred.RecheckIn, scheduled.Delay);
+    }
+
     [Theory]
     [InlineData(WorkItemState.Auditing)]
     [InlineData(WorkItemState.Reworking)]
@@ -2057,6 +2098,19 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public void MarkRecoveryInputReady() { }
     }
 
+    private sealed class RecordingInfrastructureDeferralScheduler : IInfrastructureDeferralScheduler
+    {
+        private readonly ConcurrentQueue<(WorkItemId Id, TimeSpan Delay)> _scheduled = new();
+
+        public IReadOnlyList<(WorkItemId Id, TimeSpan Delay)> Scheduled => _scheduled.ToArray();
+
+        public void ScheduleInfrastructureDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken = default)
+        {
+            _ = stoppingToken;
+            _scheduled.Enqueue((id, delay));
+        }
+    }
+
     private sealed class DeleteOnResumeProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider
     {
         private readonly IWorkItemStore _store;
@@ -2214,6 +2268,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
         public bool ResumeThrowsCancellation { get; set; }
+        public SandboxProvisioningDeferredException? ResumeProvisioningDeferred { get; set; }
         public bool ResumeHangs { get; set; }
         public bool ResumeBlocksBeforeReturningTask { get; set; }
         public TaskCompletionSource ResumeBlockEntered { get; } =
@@ -2256,6 +2311,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             _resumedNames.Enqueue(name);
             if (ResumeThrows) throw new InvalidOperationException("simulated multipass failure");
             if (ResumeThrowsCancellation) throw new OperationCanceledException("provider cancelled resume");
+            if (ResumeProvisioningDeferred is not null) throw ResumeProvisioningDeferred;
             if (ResumeBlocksBeforeReturningTask)
             {
                 ResumeBlockEntered.TrySetResult();
