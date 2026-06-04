@@ -194,6 +194,53 @@ public sealed class QuotaRouterRampedFloorTests
     }
 
     [Fact]
+    public void PerAgentFloorOverride_UsesPerAgentRampWindowBeforeOtherWindows()
+    {
+        var opts = DefaultOpts();
+        opts.RampWindowByAgent[Codex.Value] = TimeSpan.FromDays(2);
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            StartFloorPct = 21.0,
+            EndFloorPct = 1.0,
+            RampWindow = TimeSpan.FromDays(1),
+        };
+        var router = BuildRouter(opts);
+        var reset = Now + TimeSpan.FromHours(12);
+
+        var floor = router.ComputeEffectiveFloorPct(Codex, reset, Now);
+
+        // 12h remaining in the FloorByAgent 24h window => midpoint of 21..1.
+        Assert.Equal(11.0, floor, precision: 6);
+    }
+
+    [Fact]
+    public void PartialPerAgentFloorOverride_InheritsMissingGlobalRampFields()
+    {
+        var opts = DefaultOpts();
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            EndFloorPct = 0.0,
+        };
+        opts.FloorByAgent[AgentKind.Opencode.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 2.0,
+            StartFloorPct = 5.0,
+        };
+        var router = BuildRouter(opts);
+        var reset = Now + TimeSpan.FromDays(3.5);
+
+        var codexFloor = router.ComputeEffectiveFloorPct(Codex, reset, Now);
+        var opencodeFloor = router.ComputeEffectiveFloorPct(AgentKind.Opencode, reset, Now);
+        var codexUnknownResetFloor = router.ComputeEffectiveFloorPct(Codex, resetAt: null, Now);
+        var opencodeUnknownResetFloor = router.ComputeEffectiveFloorPct(AgentKind.Opencode, resetAt: null, Now);
+
+        Assert.Equal(12.5, codexFloor, precision: 6);
+        Assert.Equal(4.0, opencodeFloor, precision: 6);
+        Assert.Equal(10.0, codexUnknownResetFloor, precision: 6);
+        Assert.Equal(2.0, opencodeUnknownResetFloor, precision: 6);
+    }
+
+    [Fact]
     public void HotReloadOfOptions_TakesEffectOnNextCall()
     {
         // The router holds the QuotaRouterOptions singleton by reference and

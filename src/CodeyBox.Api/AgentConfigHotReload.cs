@@ -360,34 +360,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // attempt without a process restart. Probe-side knobs (cache TTL
             // bound at construction) are NOT reloaded here — they have their
             // own IOptionsMonitor-driven resilience-provider delegate.
-            var src = opts.QuotaRouter;
-            _quotaRouterOptions.MinQuotaPct = src.MinQuotaPct;
-            var windowFloors = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in src.MinQuotaPctByWindow)
-            {
-                if (kv.Value < 0) continue;
-                windowFloors[kv.Key] = kv.Value;
-            }
-            _quotaRouterOptions.MinQuotaPctByWindow = windowFloors;
-            _quotaRouterOptions.StartFloorPct = src.StartFloorPct;
-            _quotaRouterOptions.EndFloorPct = src.EndFloorPct;
-            _quotaRouterOptions.FloorByAgent = BuildFloorOverrides(src.FloorByAgent);
-            if (src.RampWindowSeconds > 0)
-                _quotaRouterOptions.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
-            var overrides = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in src.RampWindowByAgentSeconds)
-            {
-                if (kv.Value <= 0) continue;
-                overrides[kv.Key] = TimeSpan.FromSeconds(kv.Value);
-            }
-            _quotaRouterOptions.RampWindowByAgent = overrides;
-            _quotaRouterOptions.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
-            _quotaRouterOptions.UnknownPolicy = src.UnknownPolicy;
-            _quotaRouterOptions.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
-            _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
-            _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
-            _quotaRouterOptions.ColdStartFitInWindow = src.ColdStartFitInWindow;
-            _quotaRouterOptions.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
+            QuotaRouterConfigMapper.ApplyHotReload(_quotaRouterOptions, opts.QuotaRouter);
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -843,38 +816,6 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);
-
-    private static Dictionary<string, QuotaFloorOverrideOptions> BuildFloorOverrides(
-        IDictionary<string, QuotaRouterFloorConfig>? src)
-    {
-        var dst = new Dictionary<string, QuotaFloorOverrideOptions>(StringComparer.OrdinalIgnoreCase);
-        if (src is null) return dst;
-        foreach (var kv in src)
-        {
-            if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value is null) continue;
-            var entry = new QuotaFloorOverrideOptions
-            {
-                MinQuotaPct = NonNegative(kv.Value.MinQuotaPct),
-                StartFloorPct = NonNegative(kv.Value.StartFloorPct),
-                EndFloorPct = NonNegative(kv.Value.EndFloorPct),
-                RampWindow = kv.Value.RampWindowSeconds is { } seconds && seconds > 0
-                    ? TimeSpan.FromSeconds(seconds)
-                    : null,
-            };
-            if (entry.MinQuotaPct is null
-                && entry.StartFloorPct is null
-                && entry.EndFloorPct is null
-                && entry.RampWindow is null)
-            {
-                continue;
-            }
-            dst[kv.Key] = entry;
-        }
-        return dst;
-
-        static double? NonNegative(double? value) =>
-            value is { } v && v >= 0 ? v : null;
-    }
 
     private void ApplyPipelineTuningIfChanged(CodeyBoxOptions opts)
     {

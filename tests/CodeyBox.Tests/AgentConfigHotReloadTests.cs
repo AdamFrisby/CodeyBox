@@ -2162,6 +2162,7 @@ public sealed class AgentConfigHotReloadTests
                         MinQuotaPct = 1.0,
                         StartFloorPct = 1.0,
                         EndFloorPct = 0.0,
+                        RampWindowSeconds = 86_400,
                     },
                 },
             },
@@ -2172,6 +2173,7 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(1.0, codexFloor.MinQuotaPct);
         Assert.Equal(1.0, codexFloor.StartFloorPct);
         Assert.Equal(0.0, codexFloor.EndFloorPct);
+        Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
 
         monitor.Fire(new CodeyBoxOptions
         {
