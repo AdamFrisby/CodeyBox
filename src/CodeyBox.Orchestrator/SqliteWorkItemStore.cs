@@ -449,14 +449,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
-            // prompt / prompt_revision / priority / external_id(s) are excluded
+            // prompt / prompt_revision / priority / audit budget / external_id(s) are excluded
             // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
             // snapshot taken at pickup time; writing those columns from the
             // snapshot would clobber a concurrent PUT /workitems/{id}/prompt,
-            // POST /workitems/{id}/priority, or PATCH /workitems/{id}/external-ids
+            // POST /workitems/{id}/priority, PATCH /workitems/{id} audit budget,
+            // or PATCH /workitems/{id}/external-ids
             // that landed mid-pipeline. Use TryReplacePromptAsync /
-            // UpdatePriorityAsync / ReplaceExternalIdsAsync to mutate them safely;
-            // routine state transitions leave them alone.
+            // UpdatePriorityAsync / UpdateAuditBudgetAsync /
+            // ReplaceExternalIdsAsync to mutate them safely; routine state
+            // transitions leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -482,8 +484,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
-                    audit_max_iterations = $audit_max_iterations,
-                    audit_complexity = $audit_complexity,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,
@@ -518,7 +518,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
-            // See UpdateAsync — prompt / prompt_revision / priority / external_id(s)
+            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s)
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
@@ -545,8 +545,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     auditor_profile = $auditor_profile,
-                    audit_max_iterations = $audit_max_iterations,
-                    audit_complexity = $audit_complexity,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
                     conflict_rework_attempts = $conflict_rework_attempts,

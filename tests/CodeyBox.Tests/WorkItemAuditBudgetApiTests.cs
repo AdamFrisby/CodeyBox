@@ -87,6 +87,24 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Theory]
+    [InlineData("--flag")]
+    [InlineData("hard\nmode")]
+    public async Task PostWorkItem_AuditComplexity_OptionLikeOrControl_Returns400(string auditComplexity)
+    {
+        var response = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "t",
+            prompt = "p",
+            auditComplexity,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("auditComplexity", body);
+    }
+
     [Fact]
     public async Task PatchAuditBudget_OnWorkingItem_PersistsWithoutClobberingRuntimeColumns()
     {
@@ -144,6 +162,48 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         Assert.Equal([dep.Id], stored.DependsOn);
     }
 
+    [Fact]
+    public async Task PatchAuditBudget_WithQueuedOnlyField_OnQueuedItem_PersistsBothWrites()
+    {
+        var item = NewStoredItem() with { State = WorkItemState.Queued, Title = "old title" };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync($"/workitems/{item.Id}", new
+        {
+            title = "new title",
+            auditMaxIterations = 11,
+            auditComplexity = "  hard  ",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Equal("new title", stored!.Title);
+        Assert.Equal(11, stored.AuditMaxIterations);
+        Assert.Equal("hard", stored.AuditComplexity);
+    }
+
+    [Theory]
+    [InlineData(AuditBudgetUpdateOutcome.NotFound, HttpStatusCode.NotFound)]
+    [InlineData(AuditBudgetUpdateOutcome.TerminalState, HttpStatusCode.Conflict)]
+    public async Task PatchAuditBudget_ConcurrentStoreOutcome_MapsResponseStatus(
+        AuditBudgetUpdateOutcome outcome,
+        HttpStatusCode expectedStatus)
+    {
+        using var factory = new WorkItemApiFactory
+        {
+            WorkItemStoreDecorator = store => new AuditBudgetRaceStore(store, outcome),
+        };
+        using var client = factory.CreateClient();
+        var item = NewStoredItem() with { State = WorkItemState.Working };
+        await factory.Store.CreateAsync(item);
+
+        var response = await client.PatchAsJsonAsync(
+            $"/workitems/{item.Id}",
+            new { auditMaxIterations = 8 });
+
+        Assert.Equal(expectedStatus, response.StatusCode);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-3)]
@@ -170,6 +230,21 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
             new { auditMaxIterations = ProjectAudit.MaxIterationBudget + 1 });
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("--flag")]
+    [InlineData("hard\nmode")]
+    public async Task PatchAuditBudget_AuditComplexity_OptionLikeOrControl_Returns400(string auditComplexity)
+    {
+        var item = NewStoredItem() with { State = WorkItemState.Auditing };
+        await _factory.Store.CreateAsync(item);
+
+        var response = await _client.PatchAsJsonAsync($"/workitems/{item.Id}", new { auditComplexity });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var stored = await _factory.Store.GetAsync(item.Id);
+        Assert.Null(stored!.AuditComplexity);
     }
 
     [Fact]
@@ -208,4 +283,139 @@ public sealed class WorkItemAuditBudgetApiTests : IDisposable
         string State,
         int? AuditMaxIterations,
         string? AuditComplexity);
+
+    private sealed class AuditBudgetRaceStore(
+        SqliteWorkItemStore inner,
+        AuditBudgetUpdateOutcome outcome) : IWorkItemStore
+    {
+        public Task CreateAsync(WorkItem item, CancellationToken ct = default) =>
+            inner.CreateAsync(item, ct);
+
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) =>
+            inner.UpdateAsync(item, ct);
+
+        public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
+            inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) =>
+            inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+
+        public Task<DependsOnUpdateResult> UpdateDependsOnAsync(
+            WorkItemId id,
+            IReadOnlyList<WorkItemId> dependsOn,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+
+        public async Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+            WorkItemId id,
+            int? auditMaxIterations,
+            string? auditComplexity,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default)
+        {
+            if (outcome == AuditBudgetUpdateOutcome.NotFound)
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null);
+
+            if (outcome == AuditBudgetUpdateOutcome.TerminalState)
+            {
+                var current = await inner.GetAsync(id, ct);
+                var baseline = current ?? NewStoredItem() with { Id = id };
+                var terminal = baseline with
+                {
+                    State = WorkItemState.Done,
+                    UpdatedAt = updatedAt,
+                };
+                if (current is not null)
+                    await inner.UpdateAsync(terminal, ct);
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.TerminalState, terminal);
+            }
+
+            return await inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
+        }
+
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) =>
+            inner.GetAsync(id, ct);
+
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) =>
+            inner.ListAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            inner.ListByStateAsync(state, ct);
+
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            inner.CountByStateAsync(state, ct);
+
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) =>
+            inner.ReorderAsync(orderedIds, ct);
+
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) =>
+            inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+
+        public Task<int> CountStartedInWindowAsync(ProjectId projectId, DateTimeOffset since, CancellationToken ct = default) =>
+            inner.CountStartedInWindowAsync(projectId, since, ct);
+
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) =>
+            inner.CountInFlightAsync(projectId, ct);
+
+        public Task<WorkItem?> GetByExternalIdAsync(ProjectId projectId, string externalId, CancellationToken ct = default) =>
+            inner.GetByExternalIdAsync(projectId, externalId, ct);
+
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(ProjectId projectId, string @namespace, string externalId, CancellationToken ct = default) =>
+            inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+
+        public Task<WorkItem?> ReplaceExternalIdsAsync(
+            WorkItemId id,
+            IReadOnlyDictionary<string, string> externalIds,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(CancellationToken ct = default) =>
+            inner.GetFleetStateCountsAsync(ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(int perProject = 5, CancellationToken ct = default) =>
+            inner.GetFleetRecentOutcomesAsync(perProject, ct);
+
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) =>
+            inner.GetFleetPauseStatesAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            inner.ListByReplaySourceAsync(sourceId, ct);
+
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) =>
+            inner.ListSuspendedAsync(ct);
+
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) =>
+            inner.GetActiveBaselineImageRefsAsync(ct);
+
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
+            string baselineImageRef,
+            CancellationToken ct = default) =>
+            inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            inner.OrphanReplaysAsync(sourceId, ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) =>
+            inner.ListByReleaseAsync(releaseId, ct);
+
+        public Task<PromptReplaceResult> TryReplacePromptAsync(
+            WorkItemId id,
+            string newPrompt,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+
+        public Task RecordIterationDispatchAsync(
+            WorkItemId workItemId,
+            int iteration,
+            int promptRevisionAtDispatch,
+            DateTimeOffset dispatchedAt,
+            CancellationToken ct = default) =>
+            inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(WorkItemId workItemId, CancellationToken ct = default) =>
+            inner.GetIterationsAsync(workItemId, ct);
+    }
 }

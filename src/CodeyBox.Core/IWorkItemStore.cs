@@ -97,17 +97,21 @@ public interface IWorkItemStore
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
-    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>.
-    /// Use <see cref="UpdatePriorityAsync"/> for priority changes and
-    /// <see cref="TryReplacePromptAsync"/> for prompt changes so worker writes
-    /// from stale in-memory snapshots cannot revert a concurrent PATCH /priority
-    /// or PUT /workitems/{id}/prompt update.
+    /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
+    /// <see cref="WorkItem.AuditMaxIterations"/>, and
+    /// <see cref="WorkItem.AuditComplexity"/>. Use <see cref="UpdatePriorityAsync"/>,
+    /// <see cref="TryReplacePromptAsync"/>, and <see cref="UpdateAuditBudgetAsync"/>
+    /// for those fields so worker writes from stale in-memory snapshots cannot
+    /// revert concurrent PATCH /priority, PUT /workitems/{id}/prompt, or audit-budget
+    /// updates.
     /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
-    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>
-    /// only when the persisted state still matches <paramref name="onlyIfState"/>.
+    /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
+    /// <see cref="WorkItem.AuditMaxIterations"/>, and
+    /// <see cref="WorkItem.AuditComplexity"/> only when the persisted state still
+    /// matches <paramref name="onlyIfState"/>.
     /// Returns true if the row was updated.
     /// </summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);

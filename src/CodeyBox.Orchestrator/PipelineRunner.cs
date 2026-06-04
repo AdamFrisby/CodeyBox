@@ -1008,6 +1008,11 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Work item {Id} could not load persisted audit history", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
+        catch (AuditReportPersistenceFailedException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not persist audit history", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
         catch (TerminalQuotaError ex)
         {
             // Quota rejection is never a terminal Failure: the agent (or a peer
@@ -3353,6 +3358,14 @@ public sealed class PipelineRunner : IPipelineRunner
             .ToList();
         var startIteration = auditHistory.Count == 0 ? 1 : auditHistory.Max(h => h.Iteration) + 1;
 
+        if (startIteration > maxIterations)
+            return await HandleExhaustedPersistedAuditHistoryAsync(item, project, auditHistory, ct);
+
+        var resumeReworkParked = await RunMissingAuditResumeReworkAsync(
+            item, project, runner, repoId, baseBranch, workBranch,
+            auditHistory, startIteration, maxIterations, ct, hostShutdownToken);
+        if (resumeReworkParked) return true;
+
         for (var iteration = startIteration; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
@@ -3495,64 +3508,152 @@ public sealed class PipelineRunner : IPipelineRunner
             // Rework following audit iteration N is the input that will be
             // evaluated by audit iteration N+1, so emit it as iteration N+1.
             var reworkIterationNumber = iteration + 1;
-            // Audit-driven rework is the primary rework path; open a phase.rework
-            // span and record codeybox.phase.duration_ms{phase=rework} so rework
-            // telemetry matches the documented trace tree (the resume-preempt
-            // path opens its own scope independently).
-            using var reworkPhaseScope = BeginPhaseScope(item, "rework");
-            await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
-            var reworkStart = DateTimeOffset.UtcNow;
-            // Snapshot the prompt and revision now, before the rework agent runs.
-            // A concurrent PUT /workitems/{id}/prompt landing during this iteration
-            // will bump the revision but must not be attributed to it. The
-            // re-read also ensures the agent receives the LATEST prompt content,
-            // not the orchestrator's stale in-memory snapshot — otherwise the
-            // dispatch row, env-var, and trailer would all agree on revision N
-            // while the agent was looking at revision N-1's text, defeating the
-            // entire point of Layer 1.
-            var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
-            await _store.RecordIterationDispatchAsync(
-                item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
-            await Transition(item, WorkItemState.Reworking, ct, project);
-            var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
-                ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
-                : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
-            using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
-            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
-            reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
-            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
-            string? reworkStdout;
-            try
-            {
-                reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
-                    async (workerRunner, trialItem, attemptCt) =>
-                        await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
-                            phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                                reworkPrompt, isInitial: false,
-                                networkProfile: sandboxTarget.NetworkProfile,
-                                sandboxFlavor: sandboxTarget.Flavor,
-                                project: project,
-                                phaseCt,
-                                hostShutdownToken,
-                                iteration: reworkIterationNumber),
-                            workToken: attemptCt),
-                    ct,
-                    phaseCancellation: reworkPhase,
-                    attemptTimeout: item.WorkTimeout);
-            }
-            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
-            {
-                throw reworkPhase.Wrap(oce);
-            }
-            await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
-                repoId, workBranch, reworkStart, ct);
-            if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
-            {
-                var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
-                if (parked) return true;
-            }
+            var parked = await RunAuditReworkAsync(
+                item, project, runner, repoId, baseBranch, workBranch,
+                findings, iteration, reworkIterationNumber, maxIterations, ct, hostShutdownToken);
+            if (parked) return true;
         }
+        return false;
+    }
+
+    private async Task<bool> HandleExhaustedPersistedAuditHistoryAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        CancellationToken ct)
+    {
+        if (auditHistory.Count == 0 || auditHistory[^1].BlockingFindings == 0)
+            return false;
+
+        if (HasAuditConvergenceProgress(auditHistory))
+        {
+            CodeyBoxMeters.AuditIterations.Add(1,
+                new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+            await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+            return true;
+        }
+
+        var last = auditHistory[^1];
+        CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+        AuditLog.AuditFailed(last.Iteration, last.BlockingFindings);
+        var summary = string.Join("; ", last.BlockingFindingsDetails
+            .Take(5)
+            .Select(f => $"[{f.Auditor}] {f.Title}"));
+        throw new AuditFailedException(
+            $"Audit did not pass after {last.Iteration} iterations. {last.BlockingFindings} blocking finding(s): {summary}");
+    }
+
+    private async Task<bool> RunMissingAuditResumeReworkAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        int startIteration,
+        int maxIterations,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        if (auditHistory.Count == 0)
+            return false;
+
+        var last = auditHistory[^1];
+        if (last.BlockingFindings == 0)
+            return false;
+
+        var iterations = await _store.GetIterationsAsync(item.Id, ct);
+        if (iterations.Any(i => i.Iteration == startIteration))
+            return false;
+
+        var findings = (last.Findings.Count > 0 ? last.Findings : last.BlockingFindingsDetails)
+            .Select(ToAuditFinding)
+            .ToList();
+        _log.LogInformation(
+            "Resuming work item {Id} from parked audit history by reworking iteration {AuditIteration} findings before audit iteration {NextIteration}",
+            item.Id, last.Iteration, startIteration);
+
+        await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
+        return await RunAuditReworkAsync(
+            item, project, runner, repoId, baseBranch, workBranch,
+            findings, last.Iteration, startIteration, maxIterations, ct, hostShutdownToken);
+    }
+
+    private async Task<bool> RunAuditReworkAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<AuditFinding> findings,
+        int auditIteration,
+        int reworkIterationNumber,
+        int maxIterations,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        // Audit-driven rework is the primary rework path; open a phase.rework
+        // span and record codeybox.phase.duration_ms{phase=rework} so rework
+        // telemetry matches the documented trace tree (the resume-preempt
+        // path opens its own scope independently).
+        using var reworkPhaseScope = BeginPhaseScope(item, "rework");
+        await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
+        var reworkStart = DateTimeOffset.UtcNow;
+        // Snapshot the prompt and revision now, before the rework agent runs.
+        // A concurrent PUT /workitems/{id}/prompt landing during this iteration
+        // will bump the revision but must not be attributed to it. The
+        // re-read also ensures the agent receives the LATEST prompt content,
+        // not the orchestrator's stale in-memory snapshot — otherwise the
+        // dispatch row, env-var, and trailer would all agree on revision N
+        // while the agent was looking at revision N-1's text, defeating the
+        // entire point of Layer 1.
+        var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
+        await _store.RecordIterationDispatchAsync(
+            item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
+        await Transition(item, WorkItemState.Reworking, ct, project);
+        var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
+            ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
+            : (IReadOnlyList<WorkItemQuestion>)[];
+        var reworkPrompt = ReworkPromptBuilder.Build(
+            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
+        using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
+        reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+        reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+        var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
+        string? reworkStdout;
+        try
+        {
+            reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
+                async (workerRunner, trialItem, attemptCt) =>
+                    await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
+                        phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
+                            reworkPrompt, isInitial: false,
+                            networkProfile: sandboxTarget.NetworkProfile,
+                            sandboxFlavor: sandboxTarget.Flavor,
+                            project: project,
+                            phaseCt,
+                            hostShutdownToken,
+                            iteration: reworkIterationNumber),
+                        workToken: attemptCt),
+                ct,
+                phaseCancellation: reworkPhase,
+                attemptTimeout: item.WorkTimeout);
+        }
+        catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+        {
+            throw reworkPhase.Wrap(oce);
+        }
+
+        await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
+            repoId, workBranch, reworkStart, ct);
+        if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
+        {
+            var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
+            if (parked) return true;
+        }
+
         return false;
     }
 
@@ -3799,6 +3900,13 @@ public sealed class PipelineRunner : IPipelineRunner
         Description = finding.Message,
         Location = FormatReportFindingLocation(finding),
     };
+
+    private static AuditFinding ToAuditFinding(AuditFindingSnapshot finding) => new(
+        finding.Auditor,
+        ParseAuditSeverity(finding.Severity),
+        finding.Title,
+        finding.Description,
+        finding.Location);
 
     private static string? FormatReportFindingLocation(AuditReportFinding finding)
     {
@@ -4367,11 +4475,11 @@ public sealed class PipelineRunner : IPipelineRunner
             };
             await _auditReports.CreateAsync(report, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Non-fatal: audit report persistence must never abort the pipeline.
-            _log.LogWarning(ex, "Failed to persist audit report for auditor '{Auditor}' iteration {Iter}",
-                auditor.Name, ctx.Iteration);
+            throw new AuditReportPersistenceFailedException(
+                $"failed to persist audit report for auditor '{auditor.Name}' iteration {ctx.Iteration}; retry cannot safely continue without durable audit history",
+                ex);
         }
     }
 
@@ -9578,6 +9686,12 @@ internal sealed class RequiredBuildVerificationUnavailableException : Exception
 internal sealed class AuditHistoryLoadFailedException : Exception
 {
     public AuditHistoryLoadFailedException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
+internal sealed class AuditReportPersistenceFailedException : Exception
+{
+    public AuditReportPersistenceFailedException(string message, Exception innerException)
         : base(message, innerException) { }
 }
 

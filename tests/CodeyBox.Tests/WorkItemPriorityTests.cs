@@ -65,6 +65,39 @@ public sealed class WorkItemPriorityTests : IDisposable
     }
 
     [Fact]
+    public async Task UpdateAsync_DoesNotClobberAuditBudget_OnStaleSnapshot()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+        await _store.UpdateAuditBudgetAsync(item.Id, 42, "hard", DateTimeOffset.UtcNow);
+
+        await _store.UpdateAsync(item.With(WorkItemState.Working));
+
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, read!.State);
+        Assert.Equal(42, read.AuditMaxIterations);
+        Assert.Equal("hard", read.AuditComplexity);
+    }
+
+    [Fact]
+    public async Task TryUpdateIfStateAsync_DoesNotClobberAuditBudget_OnStaleSnapshot()
+    {
+        var item = MakeItem() with { State = WorkItemState.Working };
+        await _store.CreateAsync(item);
+        await _store.UpdateAuditBudgetAsync(item.Id, 42, "hard", DateTimeOffset.UtcNow);
+
+        var written = await _store.TryUpdateIfStateAsync(
+            item.With(WorkItemState.Auditing),
+            WorkItemState.Working);
+
+        Assert.True(written);
+        var read = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Auditing, read!.State);
+        Assert.Equal(42, read.AuditMaxIterations);
+        Assert.Equal("hard", read.AuditComplexity);
+    }
+
+    [Fact]
     public async Task ListDispatchEligible_OrdersHighestFirstThenFifo()
     {
         var t0 = DateTimeOffset.UtcNow;
