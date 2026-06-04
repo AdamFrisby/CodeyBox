@@ -66,6 +66,172 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
     }
 
     [Fact]
+    public async Task QueuedPickup_MissingWorkBranchCreatesBranchBeforeWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/recovered-missing-branch");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
+        Assert.False(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+
+        var beforeWorkCalls = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            beforeWorkCalls++;
+            await AssertSandboxSeesResetOriginWorkBranchAsync(
+                sandbox, workingDirectory, item.WorkBranch!, expectPriorFileAbsent: false, ct);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work after missing branch recovery\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, beforeWorkCalls);
+        Assert.True(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("work after missing branch recovery\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task QueuedPickup_NonOwnedExistingWorkBranchIsResetBeforeWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/recovered-anomalous-branch") with { RecoveryAttempts = 1 };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "prior.txt", "prior attempt\n", "prior attempt");
+
+        var beforeWorkCalls = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            beforeWorkCalls++;
+            await AssertSandboxSeesResetOriginWorkBranchAsync(
+                sandbox, workingDirectory, item.WorkBranch!, expectPriorFileAbsent: true, ct);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work after anomalous branch recovery\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, beforeWorkCalls);
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("work after anomalous branch recovery\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+        var priorOnBranch = await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:prior.txt");
+        Assert.NotEqual(0, priorOnBranch.code);
+    }
+
+    [Fact]
+    public async Task QueuedResume_PreservesExistingWorkBranchBeforeWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-resume") with
+        {
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var preservedTip = await CommitToBareBranchAsync(
+            barePath, item.WorkBranch!, "preserved.txt", "preserved work\n", "preserved work");
+
+        string? observedHead = null;
+        string? observedPreservedFile = null;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var head = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "HEAD"],
+            }, ct);
+            observedHead = head.Stdout.Trim();
+
+            var preserved = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/preserved.txt"],
+            }, ct);
+            observedPreservedFile = preserved.Stdout;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "continued work\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(final.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(preservedTip, observedHead);
+        Assert.Equal("preserved work\n", observedPreservedFile);
+        Assert.Equal(preservedTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("preserved work\n", await ShowAsync(barePath, $"{item.WorkBranch}:preserved.txt"));
+        Assert.Equal("continued work\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task QueuedResume_MissingPreservedWorkBranchResetsAndRunsWork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-resume-missing") with
+        {
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
+        Assert.False(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+
+        var beforeWorkCalls = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            beforeWorkCalls++;
+            await AssertSandboxSeesResetOriginWorkBranchAsync(
+                sandbox, workingDirectory, item.WorkBranch!, expectPriorFileAbsent: false, ct);
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work after missing preserved branch\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(final.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(1, beforeWorkCalls);
+        Assert.True(await tp.GitHost.BranchExistsAsync(repoId, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("work after missing preserved branch\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task QueuedExplicitNonOwnedExistingWorkBranchWithoutRecoveryIsPreserved()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/operator-managed");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var existingTip = await CommitToBareBranchAsync(
+            barePath, item.WorkBranch!, "operator.txt", "operator work\n", "operator work");
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent continuation\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(existingTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.Equal("operator work\n", await ShowAsync(barePath, $"{item.WorkBranch}:operator.txt"));
+        Assert.Equal("agent continuation\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
     public async Task RebaseConflictCanRouteThroughScopeFenceResolution()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -508,6 +674,36 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
 
     private static async Task<string> GitStdoutTrimAsync(string repoPath, params string[] args)
         => (await GitStdoutAsync(repoPath, args)).Trim();
+
+    private static async Task AssertSandboxSeesResetOriginWorkBranchAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string workBranch,
+        bool expectPriorFileAbsent,
+        CancellationToken ct)
+    {
+        var script = """
+            set -eu
+            workdir="$1"
+            branch="$2"
+            expect_prior_absent="$3"
+            base="$(git -C "$workdir" rev-parse origin/main)"
+            head="$(git -C "$workdir" rev-parse HEAD)"
+            work="$(git -C "$workdir" rev-parse "origin/$branch")"
+            test "$head" = "$base"
+            test "$work" = "$base"
+            if [ "$expect_prior_absent" = "true" ]; then
+              test ! -e "$workdir/prior.txt"
+            fi
+            """;
+        var observed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", script, "sh", workingDirectory, workBranch, expectPriorFileAbsent ? "true" : "false"],
+        }, ct);
+        if (!observed.Success)
+            throw new InvalidOperationException(
+                $"agent did not see reset origin work branch '{workBranch}': {observed.Stdout}{observed.Stderr}");
+    }
 
     private static async Task<IReadOnlyList<CommitSnapshot>> CommitSnapshotsAsync(string repoPath, string revisionRange)
     {

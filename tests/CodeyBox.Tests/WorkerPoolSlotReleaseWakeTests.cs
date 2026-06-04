@@ -311,12 +311,24 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
+        WorkItemId? pauseOnReserve = null;
+        var pauseApplied = false;
+        var reservedSecond = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
                 MinSpawnInterval = TimeSpan.FromSeconds(2),
+                OnWorkerReservedForTest = id =>
+                {
+                    if (id != pauseOnReserve || pauseApplied)
+                        return Task.CompletedTask;
+
+                    pauseApplied = true;
+                    reservedSecond.TrySetResult();
+                    return controller.PauseAsync("pause after pickup during spawn pacing");
+                },
             },
             NullLogger<OrchestratorService>.Instance,
             queueController: controller);
@@ -327,6 +339,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var now = DateTimeOffset.UtcNow;
         var first = MakeItem(createdAt: now);
         var second = MakeItem(createdAt: now.AddMilliseconds(1));
+        pauseOnReserve = second.Id;
         await _store.CreateAsync(first);
         await _store.CreateAsync(second);
         await queue.EnqueueAsync(first.Id);
@@ -335,11 +348,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         pipeline.Release(first.Id);
         Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
 
-        Assert.True(
-            await WaitUntilAsync(() => svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
-            "The second item should be reserved before the spawn-pacing delay completes.");
+        await reservedSecond.Task.WaitAsync(DispatchWaitTimeout);
 
-        await controller.PauseAsync("pause after pickup during spawn pacing");
         Assert.True(
             await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
             "The queue-pause branch after spawn pacing must unreserve the item and release the gate.");
@@ -361,12 +371,26 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
-        using var svc = new OrchestratorService(
+        WorkItemId? pauseOnReserve = null;
+        var pauseApplied = false;
+        var reservedSecond = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        OrchestratorService? svcRef = null;
+        using var svc = svcRef = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
                 MinSpawnInterval = TimeSpan.FromSeconds(2),
+                OnWorkerReservedForTest = id =>
+                {
+                    if (id == pauseOnReserve && !pauseApplied)
+                    {
+                        pauseApplied = true;
+                        reservedSecond.TrySetResult();
+                        svcRef!.PauseDispatch();
+                    }
+                    return Task.CompletedTask;
+                },
             },
             NullLogger<OrchestratorService>.Instance);
 
@@ -376,6 +400,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var now = DateTimeOffset.UtcNow;
         var first = MakeItem(createdAt: now);
         var second = MakeItem(createdAt: now.AddMilliseconds(1));
+        pauseOnReserve = second.Id;
         await _store.CreateAsync(first);
         await _store.CreateAsync(second);
         await queue.EnqueueAsync(first.Id);
@@ -384,11 +409,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         pipeline.Release(first.Id);
         Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
 
-        Assert.True(
-            await WaitUntilAsync(() => svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
-            "The second item should be reserved before the spawn-pacing delay completes.");
+        await reservedSecond.Task.WaitAsync(DispatchWaitTimeout);
 
-        svc.PauseDispatch();
         Assert.True(
             await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(4)),
             "The shutdown-pause branch after spawn pacing must unreserve the item and release the gate.");

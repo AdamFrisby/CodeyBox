@@ -106,6 +106,7 @@ public sealed class ResumeEndpointTests : IDisposable
         // Critical: WorkBranch is preserved (the whole point of /resume vs
         // /retry — With(Queued) would have cleared it).
         Assert.Equal(item.WorkBranch, readBack.WorkBranch);
+        Assert.True(readBack.PreserveWorkBranchOnQueuedPickup);
         // Reset fields cleared.
         Assert.Null(readBack.LastError);
         Assert.Null(readBack.CancellationReason);
@@ -153,6 +154,7 @@ public sealed class ResumeEndpointTests : IDisposable
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.WorkComplete, readBack!.State);
         Assert.Equal(item.WorkBranch, readBack.WorkBranch);
+        Assert.False(readBack.PreserveWorkBranchOnQueuedPickup);
 
         var queue = _factory.Services.GetRequiredService<ITaskQueue>();
         Assert.Equal(1, queue.Count);
@@ -175,6 +177,7 @@ public sealed class ResumeEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var readBack = await _factory.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.AuditPassed, readBack!.State);
+        Assert.False(readBack.PreserveWorkBranchOnQueuedPickup);
 
         var queue = _factory.Services.GetRequiredService<ITaskQueue>();
         Assert.Equal(1, queue.Count);

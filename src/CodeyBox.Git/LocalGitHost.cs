@@ -1,5 +1,6 @@
-using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
@@ -19,15 +20,33 @@ public sealed class LocalGitHost : IGitHost
     private static readonly Regex UrlUserInfoPattern = new(
         @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    // git update-ref treats an all-zero old oid as "create this ref only if it
+    // does not already exist"; bare repos here use the normal 40-hex SHA-1 oid.
+    private const string GitNullObjectId = "0000000000000000000000000000000000000000";
+    private const int GitStartTextFileBusyMaxAttempts = 8;
+    private const int GitStartTextFileBusyDelayStepMilliseconds = 25;
+    // POSIX ETXTBSY. On Linux, Process.Start surfaces this as Win32Exception(26)
+    // when another process briefly has the executable open for writing.
+    private const int PosixTextFileBusyErrno = 26;
 
     private readonly LocalGitHostOptions _opts;
     private readonly ILogger<LocalGitHost> _log;
     private readonly string _disabledHooksPath;
+    private readonly Func<ProcessStartInfo, ILocalGitProcess> _processFactory;
 
     public LocalGitHost(LocalGitHostOptions opts, ILogger<LocalGitHost> log)
+        : this(opts, log, static psi => new SystemLocalGitProcess(psi))
+    {
+    }
+
+    internal LocalGitHost(
+        LocalGitHostOptions opts,
+        ILogger<LocalGitHost> log,
+        Func<ProcessStartInfo, ILocalGitProcess> processFactory)
     {
         _opts = opts;
         _log = log;
+        _processFactory = processFactory ?? throw new ArgumentNullException(nameof(processFactory));
         Directory.CreateDirectory(_opts.RootDirectory);
         _disabledHooksPath = Path.Combine(_opts.RootDirectory, ".codeybox-disabled-hooks");
         Directory.CreateDirectory(_disabledHooksPath);
@@ -592,18 +611,36 @@ public sealed class LocalGitHost : IGitHost
                     workBranch, repositoryId, oldSha, baseBranch, baseSha);
             }
         }
+        else
+        {
+            var update = await RunGitAsync(
+                workdir: path, ct,
+                "update-ref", $"refs/heads/{workBranch}", baseSha, GitNullObjectId);
+            if (update.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"git update-ref to create '{workBranch}' at base '{baseBranch}' ({baseSha}) failed: {update.Stderr}");
+            }
+
+            _log.LogInformation(
+                "Created work branch '{WorkBranch}' in bare repo {RepoId} at base '{BaseBranch}' tip {BaseTip} for fresh work-phase entry",
+                workBranch, repositoryId, baseBranch, baseSha);
+        }
 
         var verify = await RunGitAsync(
             workdir: path, ct,
             "rev-parse", "--verify", $"refs/heads/{workBranch}^{{commit}}");
-        if (verify.ExitCode == 0)
+        if (verify.ExitCode != 0)
         {
-            var verifiedSha = verify.Stdout.Trim();
-            if (!string.Equals(verifiedSha, baseSha, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"work branch '{workBranch}' tip after reset is {verifiedSha}, expected base '{baseBranch}' tip {baseSha}");
-            }
+            throw new InvalidOperationException(
+                $"work branch '{workBranch}' did not resolve after reset to base '{baseBranch}': {verify.Stderr}");
+        }
+
+        var verifiedSha = verify.Stdout.Trim();
+        if (!string.Equals(verifiedSha, baseSha, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"work branch '{workBranch}' tip after reset is {verifiedSha}, expected base '{baseBranch}' tip {baseSha}");
         }
     }
 
@@ -670,7 +707,7 @@ public sealed class LocalGitHost : IGitHost
 
         var psi = new ProcessStartInfo
         {
-            FileName = "git",
+            FileName = _opts.GitExecutable,
             WorkingDirectory = path,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -684,8 +721,28 @@ public sealed class LocalGitHost : IGitHost
         psi.ArgumentList.Add("--name-only");
         psi.ArgumentList.Add(treeish);
 
-        using var p = new System.Diagnostics.Process { StartInfo = psi };
-        p.Start();
+        ILocalGitProcess? p = null;
+        for (var attempt = 1; ; attempt++)
+        {
+            p = _processFactory(psi);
+            try
+            {
+                p.Start();
+                break;
+            }
+            catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
+            {
+                p.Dispose();
+                p = null;
+                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+            }
+            catch
+            {
+                p.Dispose();
+                throw;
+            }
+        }
+        using var _p = p;
 
         var results = new List<string>(Math.Min(64, maxResults));
         var capExceeded = false;
@@ -1073,7 +1130,7 @@ public sealed class LocalGitHost : IGitHost
     {
         var psi = new ProcessStartInfo
         {
-            FileName = "git",
+            FileName = _opts.GitExecutable,
             WorkingDirectory = workdir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -1086,12 +1143,41 @@ public sealed class LocalGitHost : IGitHost
         if (extraEnv is not null)
             foreach (var (k, v) in extraEnv) psi.EnvironmentVariables[k] = v;
 
-        using var p = new System.Diagnostics.Process { StartInfo = psi };
-        p.Start();
-        var stdout = await p.StandardOutput.ReadToEndAsync(ct);
-        var stderr = await p.StandardError.ReadToEndAsync(ct);
-        await p.WaitForExitAsync(ct);
-        return (p.ExitCode, stdout, stderr);
+        for (var attempt = 1; ; attempt++)
+        {
+            using var p = _processFactory(psi);
+            try
+            {
+                p.Start();
+            }
+            catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
+            {
+                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+                continue;
+            }
+
+            var stdout = await p.StandardOutput.ReadToEndAsync(ct);
+            var stderr = await p.StandardError.ReadToEndAsync(ct);
+            await p.WaitForExitAsync(ct);
+            return (p.ExitCode, stdout, stderr);
+        }
+    }
+
+    private static bool IsTextFileBusy(Win32Exception ex)
+        => ex.NativeErrorCode == PosixTextFileBusyErrno
+            || ex.Message.Contains("Text file busy", StringComparison.Ordinal);
+
+    private sealed class SystemLocalGitProcess(ProcessStartInfo startInfo) : ILocalGitProcess
+    {
+        private readonly System.Diagnostics.Process _process = new() { StartInfo = startInfo };
+
+        public TextReader StandardOutput => _process.StandardOutput;
+        public TextReader StandardError => _process.StandardError;
+        public int ExitCode => _process.ExitCode;
+        public void Start() => _process.Start();
+        public Task WaitForExitAsync(CancellationToken ct) => _process.WaitForExitAsync(ct);
+        public void Kill(bool entireProcessTree) => _process.Kill(entireProcessTree);
+        public void Dispose() => _process.Dispose();
     }
 
     private sealed class RepositoryLockState
@@ -1128,9 +1214,20 @@ public sealed class LocalGitHost : IGitHost
     }
 }
 
+internal interface ILocalGitProcess : IDisposable
+{
+    TextReader StandardOutput { get; }
+    TextReader StandardError { get; }
+    int ExitCode { get; }
+    void Start();
+    Task WaitForExitAsync(CancellationToken ct);
+    void Kill(bool entireProcessTree);
+}
+
 public sealed record LocalGitHostOptions
 {
     public required string RootDirectory { get; init; }
+    public string GitExecutable { get; init; } = "git";
     public string FallbackDefaultBranch { get; init; } = "main";
 
     /// <summary>

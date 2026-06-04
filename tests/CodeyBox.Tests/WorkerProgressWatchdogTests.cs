@@ -137,6 +137,27 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(1, _queue.Count);
     }
 
+    [Fact]
+    public async Task Watchdog_WorkingToQueuedRecoveryClearsPreserveBranchIntent()
+    {
+        var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
+        var item = MakeItem(WorkItemState.Working, staleUpdatedAt) with
+        {
+            WorkBranch = "feature/operator-resume",
+            PreserveWorkBranchOnQueuedPickup = true,
+        };
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Null(after.WorkBranch);
+        Assert.False(after.PreserveWorkBranchOnQueuedPickup);
+        Assert.Equal(1, _queue.Count);
+    }
+
     // ── (b) no-stream-pre-agent-hang ─────────────────────────────────────────
 
     [Fact]

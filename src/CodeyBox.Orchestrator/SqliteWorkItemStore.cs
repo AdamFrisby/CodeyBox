@@ -221,6 +221,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             RunMigration("ALTER TABLE work_items ADD COLUMN template_entry_index INTEGER;");
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_template_source ON work_items(template_name, template_entry_index) WHERE template_name IS NOT NULL;");
 
+            // One-shot queued pickup policy used by operator resume-from-work.
+            // Default 0 preserves existing retry/fresh-work reset behaviour.
+            RunMigration("ALTER TABLE work_items ADD COLUMN preserve_work_branch_on_queued_pickup INTEGER NOT NULL DEFAULT 0;");
+
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
             // restart-recovery for the same iteration) overwrites the row via
@@ -353,7 +357,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
                         job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
-                        re_check_verdicts_json, template_name, template_entry_index)
+                        re_check_verdicts_json, template_name, template_entry_index,
+                        preserve_work_branch_on_queued_pickup)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
@@ -362,7 +367,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
                         $job_type, $check_spec, $check_verdict, $origin_check,
-                        $re_check_verdicts, $template_name, $template_entry_index);
+                        $re_check_verdicts, $template_name, $template_entry_index,
+                        $preserve_work_branch_on_queued_pickup);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -480,7 +486,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
                     template_name = $template_name,
-                    template_entry_index = $template_entry_index
+                    template_entry_index = $template_entry_index,
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -540,7 +547,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
                     template_name = $template_name,
-                    template_entry_index = $template_entry_index
+                    template_entry_index = $template_entry_index,
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -1414,6 +1422,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             item.ReCheckVerdicts.Count == 0 ? "[]" : JsonSerializer.Serialize(item.ReCheckVerdicts));
         cmd.Parameters.AddWithValue("$template_name", (object?)item.TemplateName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$template_entry_index", (object?)item.TemplateEntryIndex ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$preserve_work_branch_on_queued_pickup", item.PreserveWorkBranchOnQueuedPickup ? 1 : 0);
     }
 
     private static WorkItem Read(SqliteDataReader r) => new()
@@ -1474,6 +1483,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         ReCheckVerdicts = ReadReCheckVerdicts(r),
         TemplateName = ReadNullableString(r, "template_name"),
         TemplateEntryIndex = ReadNullableInt32(r, "template_entry_index"),
+        PreserveWorkBranchOnQueuedPickup = ReadInt32OrDefault(r, "preserve_work_branch_on_queued_pickup", defaultValue: 0) != 0,
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)

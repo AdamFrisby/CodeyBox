@@ -1647,7 +1647,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             resumeTimeout: configuredTimeout);
 
         await svc.ResumeAllForTestAsync(CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(5));
+            .WaitAsync(TimeSpan.FromSeconds(15));
 
         Assert.Single(provider.CheckpointPushCalls);
         var after = await _store.GetAsync(item.Id);

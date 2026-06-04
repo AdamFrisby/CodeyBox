@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -5,9 +7,10 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Direct coverage for the two <see cref="LocalGitHost"/> methods added for the
-/// auto-merge race recovery path: <see cref="LocalGitHost.FetchUpstreamBranchAsync"/>
-/// and <see cref="LocalGitHost.SetBranchToCommitAsync"/>. The orchestrator
+/// Direct coverage for <see cref="LocalGitHost"/> methods added for recovery
+/// paths: <see cref="LocalGitHost.FetchUpstreamBranchAsync"/>,
+/// <see cref="LocalGitHost.SetBranchToCommitAsync"/> and
+/// <see cref="LocalGitHost.ResetWorkBranchToBaseAsync"/>. The orchestrator
 /// integration test (UpstreamAutoMergeRaceRecoveryTests) substitutes a fake
 /// upstream that bypasses these methods entirely, so they need their own
 /// targeted tests — otherwise a regression in (say) the refspec polarity would
@@ -24,12 +27,19 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         catch { }
     }
 
-    private LocalGitHost CreateGitHost()
+    private LocalGitHost CreateGitHost(
+        string? gitExecutable = null,
+        Func<ProcessStartInfo, ILocalGitProcess>? processFactory = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
-        return new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = gitRoot },
-            NullLogger<LocalGitHost>.Instance);
+        var opts = new LocalGitHostOptions
+        {
+            RootDirectory = gitRoot,
+            GitExecutable = gitExecutable ?? "git",
+        };
+        return processFactory is null
+            ? new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance)
+            : new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance, processFactory);
     }
 
     private static IReadOnlyDictionary<string, string> EmptyEnv()
@@ -237,6 +247,169 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     // -------------------------------------------------------------------------
+    // ResetWorkBranchToBaseAsync
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task ResetWorkBranchToBaseAsync_ThrowsWhenPostResetVerificationCannotResolveWorkBranch()
+    {
+        // Simulate a race/corruption shape where update-ref succeeds but the
+        // work branch disappears before the post-reset rev-parse. The method
+        // must fail loudly instead of returning as if the reset succeeded.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const string workBranch = "feature/post-reset-verify-vanished";
+        var gitWrapper = Path.Combine(_workspace, "git-wrapper-" + Guid.NewGuid().ToString("N")[..8], "git");
+        await WriteExecutableScriptAsync(
+            gitWrapper,
+            $$"""
+            #!/usr/bin/env bash
+            target='refs/heads/{{workBranch}}'
+            if [ "${3:-}" = "update-ref" ] && [ "${4:-}" = "$target" ]; then
+                git "$@"
+                rc=$?
+                if [ "$rc" -eq 0 ]; then
+                    git -c core.hooksPath=/dev/null update-ref -d "$target" >/dev/null 2>&1 || true
+                fi
+                exit "$rc"
+            fi
+            exec git "$@"
+            """);
+
+        var gitHost = CreateGitHost(gitWrapper);
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        Assert.False(await gitHost.BranchExistsAsync(repoId, workBranch));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, "main"));
+
+        Assert.Contains("did not resolve after reset to base", ex.Message, StringComparison.Ordinal);
+        Assert.False(await gitHost.BranchExistsAsync(repoId, workBranch));
+    }
+
+    // -------------------------------------------------------------------------
+    // RunGitAsync Process.Start ETXTBSY retry
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RunGitAsync_RetriesTextFileBusyProcessStartAndSucceeds()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return starts == 1
+                ? new FakeLocalGitProcess(startException: new Win32Exception(26, "Text file busy"))
+                : new FakeLocalGitProcess(exitCode: 0);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.True(exists);
+        Assert.Equal(2, starts);
+    }
+
+    [Fact]
+    public async Task RunGitAsync_RetriesTextFileBusyProcessStartByMessageWhenErrnoDiffers()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return starts == 1
+                ? new FakeLocalGitProcess(startException: new Win32Exception(11, "Text file busy"))
+                : new FakeLocalGitProcess(exitCode: 0);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.True(exists);
+        Assert.Equal(2, starts);
+    }
+
+    [Fact]
+    public async Task RunGitAsync_TextFileBusyProcessStartAfterRetryCap_Propagates()
+    {
+        var starts = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return new FakeLocalGitProcess(startException: new Win32Exception(26, "Text file busy"));
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var ex = await Assert.ThrowsAsync<Win32Exception>(
+            () => gitHost.BranchExistsAsync(repoId, "main"));
+
+        Assert.Equal(26, ex.NativeErrorCode);
+        Assert.Equal(8, starts);
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_RetriesTextFileBusyProcessStartAndUsesConfiguredGitExecutable()
+    {
+        var starts = 0;
+        var disposals = 0;
+        ProcessStartInfo? observedStartInfo = null;
+        var gitExecutable = Path.Combine(_workspace, "custom-git");
+        var gitHost = CreateGitHost(
+            gitExecutable,
+            processFactory: psi =>
+            {
+                starts++;
+                observedStartInfo = psi;
+                return starts == 1
+                    ? new FakeLocalGitProcess(
+                        startException: new Win32Exception(26, "Text file busy"),
+                        onDispose: () => disposals++)
+                    : new FakeLocalGitProcess(
+                        stdout: "src/App.cs\nREADME.md\n",
+                        exitCode: 0,
+                        onDispose: () => disposals++);
+            });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var matches = await gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10);
+
+        Assert.Equal(["src/App.cs"], matches);
+        Assert.Equal(2, starts);
+        Assert.Equal(2, disposals);
+        Assert.NotNull(observedStartInfo);
+        Assert.Equal(gitExecutable, observedStartInfo.FileName);
+        Assert.Contains("ls-tree", observedStartInfo.ArgumentList);
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_TextFileBusyProcessStartAfterRetryCap_DisposesAndPropagates()
+    {
+        var starts = 0;
+        var disposals = 0;
+        var gitHost = CreateGitHost(processFactory: _ =>
+        {
+            starts++;
+            return new FakeLocalGitProcess(
+                startException: new Win32Exception(26, "Text file busy"),
+                onDispose: () => disposals++);
+        });
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var ex = await Assert.ThrowsAsync<Win32Exception>(
+            () => gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10));
+
+        Assert.Equal(26, ex.NativeErrorCode);
+        Assert.Equal(8, starts);
+        Assert.Equal(8, disposals);
+    }
+
+    // -------------------------------------------------------------------------
     // helpers
     // -------------------------------------------------------------------------
 
@@ -269,5 +442,49 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         var sha = await RevParse(clone, "HEAD");
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
         return sha;
+    }
+
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    private static async Task WriteExecutableScriptAsync(string path, string contents)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        await File.WriteAllTextAsync(tempPath, contents);
+        File.SetUnixFileMode(
+            tempPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(tempPath, path);
+    }
+
+    private sealed class FakeLocalGitProcess(
+        int exitCode = 0,
+        string stdout = "",
+        string stderr = "",
+        Win32Exception? startException = null,
+        Action? onDispose = null) : ILocalGitProcess
+    {
+        private readonly StringReader _stdout = new(stdout);
+        private readonly StringReader _stderr = new(stderr);
+
+        public TextReader StandardOutput => _stdout;
+        public TextReader StandardError => _stderr;
+        public int ExitCode { get; } = exitCode;
+
+        public void Start()
+        {
+            if (startException is not null)
+                throw startException;
+        }
+
+        public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public void Kill(bool entireProcessTree) { }
+
+        public void Dispose()
+        {
+            _stdout.Dispose();
+            _stderr.Dispose();
+            onDispose?.Invoke();
+        }
     }
 }

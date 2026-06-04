@@ -40,6 +40,18 @@ public sealed record WorkItem
     public string? WorkBranch { get; init; }
 
     /// <summary>
+    /// One-shot pickup policy for operator resume-from-work. When true and the
+    /// item is queued, the next work-phase pickup keeps an existing work branch
+    /// instead of resetting it to base. <see cref="With(WorkItemState)"/> preserves
+    /// the flag across Queued→Queued transitions only while the target work branch
+    /// remains recorded (so a cascade re-recovery keeps operator intent) and clears
+    /// it whenever the branch is cleared. The watchdog Working→Queued recovery also
+    /// clears it because that path regenerates the work branch and the prior
+    /// preserve-target is lost.
+    /// </summary>
+    public bool PreserveWorkBranchOnQueuedPickup { get; init; }
+
+    /// <summary>
     /// Agent preference for this work item. When no <see cref="AgentClassId"/> is set,
     /// overrides the project's default agent. When <see cref="AgentClassId"/> is set,
     /// this field is <b>not consulted</b> during class routing: members are chosen purely
@@ -439,7 +451,15 @@ public sealed record WorkItem
         WorkItemCancellationReason? cancellationReason = null,
         string? failureKind = null,
         DateTimeOffset? quotaResetAt = null,
-        string? cancellationSource = null) => this with
+        string? cancellationSource = null)
+    {
+        var preserveQueuedPickup =
+            state == WorkItemState.Queued
+            && State == WorkItemState.Queued
+            && PreserveWorkBranchOnQueuedPickup
+            && !string.IsNullOrWhiteSpace(WorkBranch);
+
+        return this with
         {
             State = state,
             LastError = error,
@@ -465,10 +485,12 @@ public sealed record WorkItem
             StartedAt = state == WorkItemState.Queued ? null : StartedAt,
             // Clear WorkBranch when re-queuing from Working: the in-flight branch is
             // gone; the next pickup generates a fresh one.
-            WorkBranch = state == WorkItemState.Queued ? null : WorkBranch,
+            WorkBranch = state == WorkItemState.Queued && !preserveQueuedPickup ? null : WorkBranch,
+            PreserveWorkBranchOnQueuedPickup = preserveQueuedPickup,
             PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
             PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
         };
+    }
 
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;

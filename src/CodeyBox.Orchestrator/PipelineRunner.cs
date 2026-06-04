@@ -460,6 +460,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
             var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
             var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
+            var hadRecordedWorkBranchAtEntry = !string.IsNullOrWhiteSpace(item.WorkBranch);
             var workBranch = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
@@ -489,6 +490,14 @@ public sealed class PipelineRunner : IPipelineRunner
             // retried agent inspects the work tree, sees its own prior work
             // already applied, and exits without writing anything, producing
             // the fail-quiet "Agent produced no changes to commit" symptom.
+            // Existing explicit/non-owned queued branches remain protected
+            // unless this is a watchdog/dead-worker recovery attempt. Operator
+            // resume-from-work is explicit: ResumeAsync marks Queued entries
+            // that intentionally preserve an existing work branch so the work
+            // agent can continue on top of it. If a preserved branch
+            // disappeared before pickup, there is nothing left to preserve and
+            // the reset path creates it from base instead of silently returning
+            // to Queued.
             // For non-Queued entries (resume from audit/merge/upstream) the
             // existing rebase preserves prior phase commits as intended.
             //
@@ -500,12 +509,36 @@ public sealed class PipelineRunner : IPipelineRunner
             // compile error nor reporting it.
             using (BeginPhaseScope(item, "pickup"))
             {
-                if (entry is WorkItemState.Queued
-                    && IsPickupRebaseOwnedWorkBranch(item.Id, workBranch))
+                if (entry is WorkItemState.Queued)
                 {
-                    await _requiredBuildGate.EnforceBeforePickupResetAsync(
-                        item, project, _gitHost, repoId, baseBranch, workBranch, ct);
-                    await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
+                    var branchExists = await _gitHost.BranchExistsAsync(repoId, workBranch, ct);
+                    var preserveExistingWorkBranch = branchExists
+                        && ShouldPreserveQueuedWorkBranch(item, workBranch, hadRecordedWorkBranchAtEntry);
+                    if (item.PreserveWorkBranchOnQueuedPickup && !branchExists)
+                    {
+                        _log.LogWarning(
+                            "Work item {WorkItemId} requested queued pickup preservation for branch {WorkBranch}, but the branch is missing; resetting it to base {BaseBranch}",
+                            item.Id, workBranch, baseBranch);
+                    }
+
+                    if (preserveExistingWorkBranch)
+                    {
+                        if (!item.PreserveWorkBranchOnQueuedPickup)
+                        {
+                            await _requiredBuildGate.EnforceBeforePickupResetAsync(
+                                item, project, _gitHost, repoId, baseBranch, workBranch, ct);
+                        }
+
+                        _log.LogInformation(
+                            "Preserving work branch {WorkBranch} for queued pickup of work item {WorkItemId}",
+                            workBranch, item.Id);
+                    }
+                    else
+                    {
+                        await _requiredBuildGate.EnforceBeforePickupResetAsync(
+                            item, project, _gitHost, repoId, baseBranch, workBranch, ct);
+                        await _gitHost.ResetWorkBranchToBaseAsync(repoId, workBranch, baseBranch, ct);
+                    }
                 }
                 else if (!skipWork || !skipAudit || !skipMerge)
                 {
@@ -1541,6 +1574,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
     private static bool IsPickupRebaseOwnedWorkBranch(WorkItemId id, string workBranch)
         => string.Equals(workBranch, DefaultWorkBranchFor(id), StringComparison.Ordinal);
+
+    private static bool ShouldPreserveQueuedWorkBranch(
+        WorkItem item,
+        string workBranch,
+        bool hadRecordedWorkBranchAtEntry)
+        => item.PreserveWorkBranchOnQueuedPickup
+            || (hadRecordedWorkBranchAtEntry
+                && item.RecoveryAttempts == 0
+                && !IsPickupRebaseOwnedWorkBranch(item.Id, workBranch));
 
     private static void ValidatePickupRebaseWorkBranch(WorkItem item, string baseBranch, string workBranch)
     {

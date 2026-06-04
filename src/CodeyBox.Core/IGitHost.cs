@@ -347,10 +347,10 @@ public interface IGitHost
     /// <summary>
     /// Resets <paramref name="workBranch"/> in the host bare repo so it points
     /// at <paramref name="baseBranch"/>'s head, discarding any prior-attempt
-    /// commits on the work branch. If the work branch does not exist, this is
-    /// a no-op. The base branch must resolve to a commit; otherwise the call
-    /// throws. Implementations must verify the post-reset tip and fail loudly
-    /// if it does not equal the base head.
+    /// commits on the work branch. If the work branch does not exist, it is
+    /// created at the base tip. The base branch must resolve to a commit;
+    /// otherwise the call throws. Implementations must verify the post-reset
+    /// tip and fail loudly if it does not equal the base head.
     ///
     /// Called from the retry-from-work flow so the agent's next invocation
     /// observes a pristine base state — the bug this guards against is a

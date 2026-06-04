@@ -131,7 +131,11 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         Assert.True(
             elapsed.Elapsed < TimeSpan.FromSeconds(10),
             $"StopAsync should return before the host stop token while a worker ignores shutdown; elapsed {elapsed.Elapsed}");
-        await pipeline.HostShutdownObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // The worker continuation that flips HostShutdownWasCancelled runs on the
+        // threadpool independently of StopAsync's drain wait, so under parallel
+        // test load it may not have been scheduled by the time StopAsync returns.
+        // Wait for the explicit observed signal rather than the derived bool.
+        await pipeline.ShutdownObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.True(pipeline.HostShutdownWasCancelled);
 
         var after = Assert.IsType<WorkItem>(await _store.GetAsync(item.Id));
@@ -204,7 +208,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
         public ShutdownIgnoringWorkingPipeline(IWorkItemStore store) => _store = store;
 
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public TaskCompletionSource HostShutdownObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ShutdownObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Exited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool HostShutdownWasCancelled { get; private set; }
@@ -222,7 +226,7 @@ public sealed class OrchestratorHostShutdownTokenTests : IDisposable
                 catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
                 {
                     HostShutdownWasCancelled = true;
-                    HostShutdownObserved.SetResult();
+                    ShutdownObserved.TrySetResult();
                     await Release.Task;
                     var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
                     await _store.UpdateAsync(current.With(WorkItemState.Done), CancellationToken.None);

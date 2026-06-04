@@ -164,21 +164,18 @@ public sealed class RetryFromWorkResetTests : IDisposable
     }
 
     [Fact]
-    public async Task ExplicitNonOwnedWorkBranchIsNotResetOnQueuedEntry()
+    public async Task RecoveredExplicitNonOwnedWorkBranchIsResetOnQueuedEntry()
     {
-        // Operator-managed (non-default) work branches stay outside the
-        // server-owned namespace; the reset must not touch them even on
-        // a Queued retry.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
-        var item = NewItem("feature/operator-managed");
+        var item = NewItem("feature/operator-managed") with { RecoveryAttempts = 1 };
         var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
         var barePath = tp.GitHost.GetRepoPath(repoId);
+        var baseTip = await RevParseAsync(barePath, "main");
         var existingTip = await CommitToBareBranchAsync(
             barePath, item.WorkBranch!, "operator.txt", "operator content\n", "operator setup");
 
-        // Agent makes a no-op work plan; the pipeline will keep the operator content.
         tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "agent addition\n"));
 
         await tp.Store.CreateAsync(item);
@@ -186,10 +183,42 @@ public sealed class RetryFromWorkResetTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
-        // First parent of HEAD must be the operator-set tip (agent stacked on top, no reset).
-        Assert.Equal(existingTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
-        Assert.Equal("operator content\n", await ShowAsync(barePath, $"{item.WorkBranch}:operator.txt"));
+        Assert.NotEqual(existingTip, await RevParseAsync(barePath, item.WorkBranch!));
+        Assert.Equal(baseTip, await RevParseAsync(barePath, $"{item.WorkBranch}~1"));
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:operator.txt")).code);
+        Assert.NotEqual(0, (await TestSupport.RunGitNoThrow(barePath, "show", "main:operator.txt")).code);
         Assert.Equal("agent addition\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));
+    }
+
+    [Fact]
+    public async Task MissingWorkBranchResetFailureFailsItemInsteadOfLeavingQueued()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+
+        var item = NewItem("feature/missing-reset-failure");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        var lockPath = Path.Combine(barePath, "refs", "heads", "feature", "missing-reset-failure.lock");
+        Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
+        await File.WriteAllTextAsync(lockPath, "stale lock\n");
+
+        var agentInvoked = false;
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            agentInvoked = true;
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "should not run\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("git update-ref to create", final.LastError);
+        Assert.Contains(item.WorkBranch!, final.LastError);
+        Assert.False(agentInvoked);
     }
 
     private async Task<string> CommitToBareBranchAsync(

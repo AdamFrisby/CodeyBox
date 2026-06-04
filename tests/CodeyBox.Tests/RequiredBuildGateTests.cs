@@ -47,7 +47,7 @@ public sealed class RequiredBuildGateTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("work left the branch non-compiling", final.LastError);
+        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
         Assert.Contains("error CS1061", final.LastError);
         Assert.Equal("build", final.FailureKind);
         Assert.DoesNotContain("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
@@ -96,6 +96,43 @@ public sealed class RequiredBuildGateTests : IDisposable
         // compile rather than finding a pristine base tip.
         var workTipFile = await TestSupport.RunGit(
             barePath, "show", $"{item.WorkBranch}:build.fail");
+        Assert.Equal(0, workTipFile.code);
+        Assert.Equal("broken\n", workTipFile.stdout);
+    }
+
+    [Fact]
+    public async Task RetryFromWork_RecoveredNonOwnedBrokenBranch_FailsBeforePickupReset()
+    {
+        // Recovered queued items with non-owned/anomalous branches now take the
+        // reset path, but the build gate still has to inspect the existing
+        // broken branch before that reset erases it.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/recovered-anomalous-broken") with { RecoveryAttempts = 1 };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath, item.WorkBranch!, "build.fail", "broken\n", "broken recovered anomalous branch");
+        var brokenTip = await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!);
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("retry-from-work received a non-compiling branch", final.LastError);
+        Assert.Contains("error CS1061", final.LastError);
+        Assert.Equal("build", final.FailureKind);
+
+        var workTip = await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!);
+        Assert.Equal(brokenTip.stdout.Trim(), workTip.stdout.Trim());
+        var workTipFile = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:build.fail");
         Assert.Equal(0, workTipFile.code);
         Assert.Equal("broken\n", workTipFile.stdout);
     }
