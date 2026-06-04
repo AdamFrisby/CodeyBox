@@ -315,7 +315,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
-    public async Task Watchdog_StableActiveSandboxSignal_RefreshesProgress()
+    public async Task Watchdog_StableActiveSandboxSignal_DoesNotRefreshProgressForever()
     {
         var staleUpdatedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45);
         var item = MakeItem(WorkItemState.Working, staleUpdatedAt);
@@ -340,16 +340,13 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Empty(_slotReleaser.Releases);
         Assert.Single(await _registry.ListAsync());
 
-        for (var i = 0; i < 3; i++)
-        {
-            await Task.Delay(TimeSpan.FromMilliseconds(40));
-            await watchdog.RunOnceAsync(CancellationToken.None);
-        }
+        await Task.Delay(TimeSpan.FromMilliseconds(40));
+        await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Working, after!.State);
-        Assert.Empty(_slotReleaser.Releases);
-        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
     }
 
     [Fact]
@@ -537,6 +534,24 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.NotNull(first);
         Assert.NotNull(replacement);
         Assert.Equal("active-sandbox", replacement!.Reason);
+    }
+
+    [Fact]
+    public async Task DefaultActivitySource_StableActiveSandboxSet_ReturnsNoActivity()
+    {
+        var itemId = WorkItemId.New();
+        var provider = new ActiveSandboxProviderStub(itemId);
+        var source = new DefaultWorkerProgressActivitySource(provider);
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: false,
+            ActiveSandboxProgressSignalEnabled: true);
+        var worker = WorkerForItem("stable-sandbox-test", itemId);
+
+        var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        var second = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.NotNull(first);
+        Assert.Null(second);
     }
 
     [Fact]

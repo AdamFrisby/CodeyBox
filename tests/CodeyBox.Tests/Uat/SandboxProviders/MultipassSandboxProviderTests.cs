@@ -3408,6 +3408,85 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ActiveSandboxProgressProjection_PopulatesOnCreateWithWorkItemAndClearsOnDispose()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-progress"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+        var workItemId = WorkItemId.New();
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+        });
+
+        try
+        {
+            var progress = ((IActiveSandboxProgressProvider)provider).SnapshotActiveSandboxProgress();
+            var entry = Assert.Single(progress);
+            Assert.Equal(workItemId, entry.WorkItemId);
+            Assert.Equal(sandbox.Id, entry.SandboxId);
+            Assert.Equal("active", entry.Status);
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+
+        Assert.Empty(((IActiveSandboxProgressProvider)provider).SnapshotActiveSandboxProgress());
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithTimingWorkItemId_TagsHostCommandsAndGuestEnvironment()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var runner = BuildSuccessfulCreateRunner(states);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-timing-env"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+        var workItemId = WorkItemId.New();
+
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            TimingWorkItemId = workItemId,
+            Environment = new Dictionary<string, string> { ["CALLER_ENV"] = "kept" },
+        });
+
+        try
+        {
+            var provisioningCalls = runner.Calls
+                .Where(call => call.Argv.Count >= 2 && call.Argv[1] != "version")
+                .ToArray();
+            Assert.NotEmpty(provisioningCalls);
+            Assert.All(provisioningCalls, call =>
+            {
+                Assert.NotNull(call.Environment);
+                Assert.Equal(
+                    workItemId.ToString(),
+                    call.Environment![SandboxConventions.WorkItemIdEnvironmentVariable]);
+            });
+
+            var transfer = Assert.Single(runner.Calls, call =>
+                call.Argv is [_, "transfer", _, var destination]
+                && destination.EndsWith(":.codeybox-env", StringComparison.Ordinal));
+            var envFile = transfer.Argv[2];
+            var envContent = await File.ReadAllTextAsync(envFile);
+            Assert.Contains($"{SandboxConventions.WorkItemIdEnvironmentVariable}='{workItemId}'", envContent);
+            Assert.Contains("CALLER_ENV='kept'", envContent);
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_ForTrackedActiveVm_ClearsOwnerSnapshot()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);

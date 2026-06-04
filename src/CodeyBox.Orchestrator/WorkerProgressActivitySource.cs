@@ -117,9 +117,7 @@ public sealed class DefaultWorkerProgressActivitySource : IWorkerProgressActivit
             return true;
         }
 
-        _activeSandboxSamples[itemId] = sample;
-        reason = "active-sandbox";
-        return true;
+        return false;
     }
 
     private bool TryObserveProcessCpu(WorkItemId itemId, out string reason)

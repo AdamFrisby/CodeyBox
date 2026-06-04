@@ -11,6 +11,8 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 {
     private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan NoDispatchQuietPeriod = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan SpawnPacingDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SpawnPacingEarlyExitTimeout = TimeSpan.FromSeconds(4);
 
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-slot-release-wake-{Guid.NewGuid():N}.db");
@@ -316,7 +318,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
-                MinSpawnInterval = TimeSpan.FromSeconds(2),
+                MinSpawnInterval = SpawnPacingDelay,
             },
             NullLogger<OrchestratorService>.Instance,
             queueController: controller);
@@ -332,6 +334,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await queue.EnqueueAsync(first.Id);
 
         Assert.True(await pipeline.WaitForEnteredAsync(first.Id, DispatchWaitTimeout));
+        svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow);
         pipeline.Release(first.Id);
         Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
 
@@ -341,10 +344,11 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         await controller.PauseAsync("pause after pickup during spawn pacing");
         Assert.True(
-            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), SpawnPacingEarlyExitTimeout),
             "The queue-pause branch after spawn pacing must unreserve the item and release the gate.");
         Assert.False(pipeline.HasEntered(second.Id));
 
+        svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow - SpawnPacingDelay);
         await controller.ResumeAsync();
         Assert.True(
             await pipeline.WaitForEnteredAsync(second.Id, DispatchWaitTimeout),
@@ -366,7 +370,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
-                MinSpawnInterval = TimeSpan.FromSeconds(2),
+                MinSpawnInterval = SpawnPacingDelay,
             },
             NullLogger<OrchestratorService>.Instance);
 
@@ -381,6 +385,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         await queue.EnqueueAsync(first.Id);
 
         Assert.True(await pipeline.WaitForEnteredAsync(first.Id, DispatchWaitTimeout));
+        svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow);
         pipeline.Release(first.Id);
         Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
 
@@ -390,7 +395,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         svc.PauseDispatch();
         Assert.True(
-            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(4)),
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), SpawnPacingEarlyExitTimeout),
             "The shutdown-pause branch after spawn pacing must unreserve the item and release the gate.");
         Assert.False(
             await pipeline.WaitForEnteredAsync(second.Id, NoDispatchQuietPeriod),

@@ -2933,16 +2933,35 @@ test "$work" = present && test "$exec_wrapper" = present
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
-        WorkItemId? workItemId = null) =>
-        MultipassDaemonRetry.RunWithRetryAsync(
+        WorkItemId? workItemId = null)
+    {
+        var environment = BuildHostProcessEnvironment(workItemId);
+        return MultipassDaemonRetry.RunWithRetryAsync(
             argv,
-            ctInner => _runner.RunAsync(argv, stdin, ctInner),
+            ctInner => _runner.RunAsync(argv, stdin, ctInner, environment: environment),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,
             workItemId,
             ct,
             _daemonRetryPolicy);
+    }
+
+    private static IReadOnlyDictionary<string, string>? BuildHostProcessEnvironment(WorkItemId? workItemId)
+    {
+        if (workItemId is not { } owner)
+            return null;
+
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is string key && entry.Value is string value)
+                environment[key] = value;
+        }
+
+        environment[SandboxConventions.WorkItemIdEnvironmentVariable] = owner.ToString();
+        return environment;
+    }
 
     private async Task<ProcessRunResult> RunProvisioningAsync(
         MultipassSandboxOptions opts,

@@ -1011,6 +1011,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal void MarkDeferredForTest(WorkItemId id) => _deferredItems[id] = 0;
     internal bool IsDeferredForTest(WorkItemId id) => _deferredItems.ContainsKey(id);
     internal bool IsActiveForTest(WorkItemId id) => _activeItems.ContainsKey(id);
+    internal void SetLastSpawnAtForTest(DateTimeOffset at)
+    {
+        lock (_spawnTimeLock) { _lastSpawnAtTicks = at.Ticks; }
+    }
 
     internal IReadOnlyCollection<WorkItemId> ActiveWorkItemIdsForHealthCheck() =>
         _activeItems.Keys.ToList();

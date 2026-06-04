@@ -17,7 +17,7 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
     [Fact]
     public void ProgramWiresActivitySourceIntoWorkerProgressWatchdog()
     {
-        using var factory = new WorkerProgressWatchdogWiringFactory();
+        using var factory = new WorkerProgressWatchdogWiringFactory(new ProgressProvider());
 
         var activitySource = factory.Services.GetRequiredService<IWorkerProgressActivitySource>();
         var progressProvider = factory.Services.GetRequiredService<IActiveSandboxProgressProvider>();
@@ -30,6 +30,20 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         Assert.Same(progressProvider, FieldValue(defaultSource, "_activeSandboxProvider"));
     }
 
+    [Fact]
+    public void ProgramFallsBackToNullActiveSandboxProgressProvider()
+    {
+        using var factory = new WorkerProgressWatchdogWiringFactory(new PlainProvider());
+
+        var activitySource = factory.Services.GetRequiredService<IWorkerProgressActivitySource>();
+        var progressProvider = factory.Services.GetRequiredService<IActiveSandboxProgressProvider>();
+
+        Assert.Same(NullActiveSandboxProgressProvider.Instance, progressProvider);
+
+        var defaultSource = Assert.IsType<DefaultWorkerProgressActivitySource>(activitySource);
+        Assert.Same(progressProvider, FieldValue(defaultSource, "_activeSandboxProvider"));
+    }
+
     private static object? FieldValue(object instance, string name)
     {
         var field = instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
@@ -37,12 +51,12 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         return field.GetValue(instance);
     }
 
-    private sealed class WorkerProgressWatchdogWiringFactory : WebApplicationFactory<Program>
+    private sealed class WorkerProgressWatchdogWiringFactory(ISandboxProvider provider) : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-progress-watchdog-wiring-{Guid.NewGuid():N}.db");
 
-        public ProgressProvider Provider { get; } = new();
+        public ISandboxProvider Provider { get; } = provider;
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -92,5 +106,18 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 
         public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() => [];
+    }
+
+    public sealed class PlainProvider : ISandboxProvider
+    {
+        public string Name => "plain-provider-test";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 }
