@@ -6,6 +6,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
 {
     private readonly SqliteConnection _conn;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteQuotaFailureStore(string path)
@@ -65,24 +66,32 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
 
     private async Task RecordCoreAsync(AgentKind agent, string? modelId, ProjectId? projectId, QuotaFailureKind kind, DateTimeOffset observedAt, CancellationToken ct)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO quota_failures (agent, model_id, project_id, failure_kind, observed_at)
-                VALUES ($agent, $model_id, $project_id, $failure_kind, $observed_at);
-                """;
-            cmd.Parameters.AddWithValue("$agent", agent.Value);
-            cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
-            cmd.Parameters.AddWithValue("$project_id", projectId is null ? DBNull.Value : projectId.Value.Value);
-            cmd.Parameters.AddWithValue("$failure_kind", kind.ToString());
-            cmd.Parameters.AddWithValue("$observed_at", observedAt.ToUniversalTime().ToString("O"));
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _lock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO quota_failures (agent, model_id, project_id, failure_kind, observed_at)
+                    VALUES ($agent, $model_id, $project_id, $failure_kind, $observed_at);
+                    """;
+                cmd.Parameters.AddWithValue("$agent", agent.Value);
+                cmd.Parameters.AddWithValue("$model_id", modelId is null ? DBNull.Value : modelId);
+                cmd.Parameters.AddWithValue("$project_id", projectId is null ? DBNull.Value : projectId.Value.Value);
+                cmd.Parameters.AddWithValue("$failure_kind", kind.ToString());
+                cmd.Parameters.AddWithValue("$observed_at", observedAt.ToUniversalTime().ToString("O"));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
@@ -96,7 +105,7 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         DateTimeOffset now,
         CancellationToken ct)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             var cutoff = now.ToUniversalTime() - window;
@@ -117,13 +126,13 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<DateTimeOffset?> GetMostRecentAsync(AgentKind agent, string? modelId, TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             var cutoff = now.ToUniversalTime() - window;
@@ -146,13 +155,13 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<IReadOnlyList<QuotaFailureObservation>> ListRecentAsync(TimeSpan window, DateTimeOffset now, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             var cutoff = now.ToUniversalTime() - window;
@@ -187,29 +196,38 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task PruneOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM quota_failures WHERE observed_at < $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToUniversalTime().ToString("O"));
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _lock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "DELETE FROM quota_failures WHERE observed_at < $cutoff;";
+                cmd.Parameters.AddWithValue("$cutoff", cutoff.ToUniversalTime().ToString("O"));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public void Dispose()
     {
         _conn.Dispose();
+        _connectionLock.Dispose();
         _lock.Dispose();
     }
 

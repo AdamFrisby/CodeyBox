@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -54,8 +55,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             });
         }
 
-        using var gate = SqliteDatabaseWriteGate.ForPath(_dbPath);
-        gate.Wait();
+        var maintenance = await LongMaintenanceWriter.OpenAsync(_dbPath);
 
         var heartbeatBefore = DateTimeOffset.UtcNow;
         var postTasks = Enumerable.Range(0, 8)
@@ -93,10 +93,20 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         try
         {
             await Task.Delay(100);
+            var allWrites = postTasks
+                .Select(t => (Task)t)
+                .Concat(heartbeatTasks)
+                .Concat(timingTasks)
+                .Append(pruneTask)
+                .ToArray();
+            Assert.False(
+                allWrites.All(t => t.IsCompleted),
+                "The real SQLite write transaction should hold at least one concurrent writer until it is released.");
+            Assert.DoesNotContain(allWrites, t => t.IsFaulted);
         }
         finally
         {
-            gate.Release();
+            await maintenance.DisposeAsync();
         }
 
         var responses = await Task.WhenAll(postTasks).WaitAsync(TimeSpan.FromSeconds(15));
@@ -135,4 +145,88 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         Title = title,
         Prompt = "p",
     };
+
+    private sealed class LongMaintenanceWriter : IAsyncDisposable
+    {
+        private readonly SqliteDatabaseWriteGate _gate;
+        private readonly SqliteConnection _conn;
+        private int _released;
+
+        private LongMaintenanceWriter(SqliteDatabaseWriteGate gate, SqliteConnection conn)
+        {
+            _gate = gate;
+            _conn = conn;
+        }
+
+        public static async Task<LongMaintenanceWriter> OpenAsync(string dbPath)
+        {
+            var gate = SqliteDatabaseWriteGate.ForPath(dbPath);
+            gate.Wait();
+            var conn = new SqliteConnection($"Data Source={dbPath}");
+
+            try
+            {
+                await conn.OpenAsync();
+
+                using (var pragma = conn.CreateCommand())
+                {
+                    pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                    await pragma.ExecuteNonQueryAsync();
+                }
+
+                using (var create = conn.CreateCommand())
+                {
+                    create.CommandText = """
+                        CREATE TABLE IF NOT EXISTS write_gate_maintenance_lock (
+                            id INTEGER PRIMARY KEY,
+                            touched_at TEXT NOT NULL
+                        );
+                        """;
+                    await create.ExecuteNonQueryAsync();
+                }
+
+                using (var begin = conn.CreateCommand())
+                {
+                    begin.CommandText = "BEGIN IMMEDIATE;";
+                    await begin.ExecuteNonQueryAsync();
+                }
+
+                using var touch = conn.CreateCommand();
+                touch.CommandText = """
+                    INSERT INTO write_gate_maintenance_lock (id, touched_at)
+                    VALUES (1, $touched_at)
+                    ON CONFLICT(id) DO UPDATE SET touched_at = excluded.touched_at;
+                    """;
+                touch.Parameters.AddWithValue("$touched_at", DateTimeOffset.UtcNow.ToString("O"));
+                await touch.ExecuteNonQueryAsync();
+                return new LongMaintenanceWriter(gate, conn);
+            }
+            catch
+            {
+                await conn.DisposeAsync();
+                gate.Release();
+                gate.Dispose();
+                throw;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _released, 1) != 0)
+                return;
+
+            try
+            {
+                using var rollback = _conn.CreateCommand();
+                rollback.CommandText = "ROLLBACK;";
+                await rollback.ExecuteNonQueryAsync();
+            }
+            finally
+            {
+                await _conn.DisposeAsync();
+                _gate.Release();
+                _gate.Dispose();
+            }
+        }
+    }
 }

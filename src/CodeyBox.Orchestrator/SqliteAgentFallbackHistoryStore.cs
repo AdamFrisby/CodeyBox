@@ -12,6 +12,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore, IDisposable
 {
     private readonly SqliteConnection _conn;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteAgentFallbackHistoryStore(string path)
@@ -59,37 +60,45 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
 
     public async Task RecordAsync(AgentFallbackRecord record, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO agent_fallback_history
-                    (id, work_item_id, phase, iteration, from_agent, from_model, to_agent, to_model, reason, occurred_at)
-                VALUES
-                    ($id, $wid, $phase, $iter, $fa, $fm, $ta, $tm, $reason, $at);
-                """;
-            cmd.Parameters.AddWithValue("$id", record.Id.ToString());
-            cmd.Parameters.AddWithValue("$wid", record.WorkItemId.ToString());
-            cmd.Parameters.AddWithValue("$phase", record.Phase);
-            cmd.Parameters.AddWithValue("$iter", (object?)record.Iteration ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$fa", record.FromAgent.Value);
-            cmd.Parameters.AddWithValue("$fm", (object?)record.FromModel ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$ta", record.ToAgent is { } toa ? toa.Value : DBNull.Value);
-            cmd.Parameters.AddWithValue("$tm", (object?)record.ToModel ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$reason", record.Reason);
-            cmd.Parameters.AddWithValue("$at", record.OccurredAt.ToUniversalTime().ToString("O"));
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _lock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO agent_fallback_history
+                        (id, work_item_id, phase, iteration, from_agent, from_model, to_agent, to_model, reason, occurred_at)
+                    VALUES
+                        ($id, $wid, $phase, $iter, $fa, $fm, $ta, $tm, $reason, $at);
+                    """;
+                cmd.Parameters.AddWithValue("$id", record.Id.ToString());
+                cmd.Parameters.AddWithValue("$wid", record.WorkItemId.ToString());
+                cmd.Parameters.AddWithValue("$phase", record.Phase);
+                cmd.Parameters.AddWithValue("$iter", (object?)record.Iteration ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$fa", record.FromAgent.Value);
+                cmd.Parameters.AddWithValue("$fm", (object?)record.FromModel ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$ta", record.ToAgent is { } toa ? toa.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("$tm", (object?)record.ToModel ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$reason", record.Reason);
+                cmd.Parameters.AddWithValue("$at", record.OccurredAt.ToUniversalTime().ToString("O"));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<IReadOnlyList<AgentFallbackRecord>> ListByWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -121,13 +130,14 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public void Dispose()
     {
         _conn.Dispose();
+        _connectionLock.Dispose();
         _lock.Dispose();
     }
 }

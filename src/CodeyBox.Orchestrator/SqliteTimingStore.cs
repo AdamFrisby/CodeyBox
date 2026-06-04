@@ -16,6 +16,7 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
 {
     private readonly string _path;
     private readonly SqliteConnection _conn;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly SqliteCommand _insertCmd;
     private readonly SqliteCommand _updateCmd;
@@ -92,45 +93,61 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
 
     public async Task BeginAsync(TimingRecord record, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            _insertCmd.Parameters["$id"].Value = record.Id;
-            _insertCmd.Parameters["$wid"].Value = record.WorkItemId.ToString();
-            _insertCmd.Parameters["$phase"].Value = record.Phase;
-            _insertCmd.Parameters["$iter"].Value = record.Iteration.HasValue
-                ? (object)record.Iteration.Value
-                : DBNull.Value;
-            _insertCmd.Parameters["$step"].Value = record.Step;
-            _insertCmd.Parameters["$started"].Value = record.StartedAt.ToString("O");
-            _insertCmd.Parameters["$meta"].Value = record.MetadataJson;
-            await _insertCmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                _insertCmd.Parameters["$id"].Value = record.Id;
+                _insertCmd.Parameters["$wid"].Value = record.WorkItemId.ToString();
+                _insertCmd.Parameters["$phase"].Value = record.Phase;
+                _insertCmd.Parameters["$iter"].Value = record.Iteration.HasValue
+                    ? (object)record.Iteration.Value
+                    : DBNull.Value;
+                _insertCmd.Parameters["$step"].Value = record.Step;
+                _insertCmd.Parameters["$started"].Value = record.StartedAt.ToString("O");
+                _insertCmd.Parameters["$meta"].Value = record.MetadataJson;
+                await _insertCmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task EndAsync(string id, DateTimeOffset endedAt, long durationMs, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            _updateCmd.Parameters["$ended"].Value = endedAt.ToString("O");
-            _updateCmd.Parameters["$dur"].Value = durationMs;
-            _updateCmd.Parameters["$id"].Value = id;
-            await _updateCmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                _updateCmd.Parameters["$ended"].Value = endedAt.ToString("O");
+                _updateCmd.Parameters["$dur"].Value = durationMs;
+                _updateCmd.Parameters["$id"].Value = id;
+                await _updateCmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<IReadOnlyList<TimingRecord>> GetByWorkItemAsync(WorkItemId id, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -150,23 +167,31 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task DeleteByWorkItemAsync(WorkItemId id, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM work_item_timings WHERE work_item_id = $wid";
-            cmd.Parameters.AddWithValue("$wid", id.ToString());
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _writeLock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "DELETE FROM work_item_timings WHERE work_item_id = $wid";
+                cmd.Parameters.AddWithValue("$wid", id.ToString());
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            _connectionLock.Release();
         }
     }
 
@@ -220,6 +245,7 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
         _insertCmd.Dispose();
         _updateCmd.Dispose();
         _conn.Dispose();
+        _connectionLock.Dispose();
         _writeLock.Dispose();
     }
 }

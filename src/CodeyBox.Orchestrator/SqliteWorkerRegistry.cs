@@ -12,19 +12,28 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
+    private const int SqliteBusy = 5;
+    private const int SqliteLocked = 6;
+
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly ILogger<SqliteWorkerRegistry>? _logger;
+    private readonly int _commandTimeoutSeconds;
     private int _disposed;
 
-    public SqliteWorkerRegistry(string path, ILogger<SqliteWorkerRegistry>? logger = null)
+    public SqliteWorkerRegistry(
+        string path,
+        ILogger<SqliteWorkerRegistry>? logger = null,
+        int busyTimeoutMilliseconds = 30000)
     {
         _logger = logger;
+        _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(Math.Max(1, busyTimeoutMilliseconds) / 1000.0));
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
         _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        var initialized = false;
         _writeLock.Wait();
         try
         {
@@ -32,7 +41,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
             using (var pragma = _conn.CreateCommand())
             {
-                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000;";
+                pragma.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={Math.Max(0, busyTimeoutMilliseconds)};";
                 pragma.ExecuteNonQuery();
             }
 
@@ -49,10 +58,16 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                 CREATE INDEX IF NOT EXISTS idx_worker_heartbeat ON worker_registry(last_heartbeat_at);
                 """;
             cmd.ExecuteNonQuery();
+            initialized = true;
         }
         finally
         {
             _writeLock.Release();
+            if (!initialized)
+            {
+                _conn.Dispose();
+                _writeLock.Dispose();
+            }
         }
     }
 
@@ -83,9 +98,9 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Fail-soft: any storage exception is caught and logged as a warning;
-    /// the caller retries on the next heartbeat interval. Only intentional
-    /// cancellation (<see cref="OperationCanceledException"/>) propagates.
+    /// Fail-soft only for transient SQLite writer contention. The caller retries
+    /// on the next heartbeat interval, while non-transient storage failures still
+    /// propagate to avoid reporting success when the row could not be persisted.
     /// </remarks>
     public async Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
     {
@@ -95,6 +110,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
             try
             {
                 using var cmd = _conn.CreateCommand();
+                cmd.CommandTimeout = _commandTimeoutSeconds;
                 cmd.CommandText = """
                     UPDATE worker_registry
                     SET last_heartbeat_at = $hb, current_work_item_id = $item
@@ -110,8 +126,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                 _writeLock.Release();
             }
         }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (IsTransientHeartbeatStorageFailure(ex))
         {
             _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId}; will retry on next interval", workerId);
         }
@@ -268,4 +283,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         LastHeartbeatAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("last_heartbeat_at")), System.Globalization.CultureInfo.InvariantCulture),
         CurrentWorkItemId = r.IsDBNull(r.GetOrdinal("current_work_item_id")) ? null : r.GetString(r.GetOrdinal("current_work_item_id")),
     };
+
+    private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
+        ex is SqliteException { SqliteErrorCode: SqliteBusy or SqliteLocked };
 }

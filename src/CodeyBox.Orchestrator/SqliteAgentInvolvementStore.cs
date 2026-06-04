@@ -12,6 +12,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDisposable
 {
     private readonly SqliteConnection _conn;
+    private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
 
     public SqliteAgentInvolvementStore(string path)
@@ -58,61 +59,77 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
 
     public async Task RecordStartAsync(AgentInvolvement entry, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT INTO agent_involvement
-                    (id, work_item_id, agent_kind, model_id, phase, started_at, ended_at, iteration, outcome)
-                VALUES
-                    ($id, $wid, $agent, $model, $phase, $started, $ended, $iter, $outcome);
-                """;
-            cmd.Parameters.AddWithValue("$id", entry.Id.ToString());
-            cmd.Parameters.AddWithValue("$wid", entry.WorkItemId.ToString());
-            cmd.Parameters.AddWithValue("$agent", entry.AgentKind.Value);
-            cmd.Parameters.AddWithValue("$model", (object?)entry.ModelId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$phase", entry.Phase);
-            cmd.Parameters.AddWithValue("$started", entry.StartedAt.ToUniversalTime().ToString("O"));
-            cmd.Parameters.AddWithValue("$ended", entry.EndedAt is { } e ? e.ToUniversalTime().ToString("O") : DBNull.Value);
-            cmd.Parameters.AddWithValue("$iter", (object?)entry.Iteration ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$outcome", (object?)entry.Outcome ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _lock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO agent_involvement
+                        (id, work_item_id, agent_kind, model_id, phase, started_at, ended_at, iteration, outcome)
+                    VALUES
+                        ($id, $wid, $agent, $model, $phase, $started, $ended, $iter, $outcome);
+                    """;
+                cmd.Parameters.AddWithValue("$id", entry.Id.ToString());
+                cmd.Parameters.AddWithValue("$wid", entry.WorkItemId.ToString());
+                cmd.Parameters.AddWithValue("$agent", entry.AgentKind.Value);
+                cmd.Parameters.AddWithValue("$model", (object?)entry.ModelId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$phase", entry.Phase);
+                cmd.Parameters.AddWithValue("$started", entry.StartedAt.ToUniversalTime().ToString("O"));
+                cmd.Parameters.AddWithValue("$ended", entry.EndedAt is { } e ? e.ToUniversalTime().ToString("O") : DBNull.Value);
+                cmd.Parameters.AddWithValue("$iter", (object?)entry.Iteration ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$outcome", (object?)entry.Outcome ?? DBNull.Value);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task FinalizeAsync(Guid id, DateTimeOffset endedAt, string outcome, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
-            using var cmd = _conn.CreateCommand();
-            // Only stamp completion once: the WHERE ended_at IS NULL guard keeps
-            // a redundant or racing finalize from rewriting an already-closed
-            // entry, preserving the immutable-identity invariant.
-            cmd.CommandText = """
-                UPDATE agent_involvement
-                SET ended_at = $ended, outcome = $outcome
-                WHERE id = $id AND ended_at IS NULL;
-                """;
-            cmd.Parameters.AddWithValue("$id", id.ToString());
-            cmd.Parameters.AddWithValue("$ended", endedAt.ToUniversalTime().ToString("O"));
-            cmd.Parameters.AddWithValue("$outcome", outcome);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await _lock.WaitAsync(ct);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                // Only stamp completion once: the WHERE ended_at IS NULL guard keeps
+                // a redundant or racing finalize from rewriting an already-closed
+                // entry, preserving the immutable-identity invariant.
+                cmd.CommandText = """
+                    UPDATE agent_involvement
+                    SET ended_at = $ended, outcome = $outcome
+                    WHERE id = $id AND ended_at IS NULL;
+                    """;
+                cmd.Parameters.AddWithValue("$id", id.ToString());
+                cmd.Parameters.AddWithValue("$ended", endedAt.ToUniversalTime().ToString("O"));
+                cmd.Parameters.AddWithValue("$outcome", outcome);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public async Task<IReadOnlyList<AgentInvolvement>> ListByWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
     {
-        await _lock.WaitAsync(ct);
+        await _connectionLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -143,13 +160,14 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         }
         finally
         {
-            _lock.Release();
+            _connectionLock.Release();
         }
     }
 
     public void Dispose()
     {
         _conn.Dispose();
+        _connectionLock.Dispose();
         _lock.Dispose();
     }
 }
