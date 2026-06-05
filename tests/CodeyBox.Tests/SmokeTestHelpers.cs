@@ -116,9 +116,17 @@ internal sealed class PausingTargetInVmSmokeGate : IInVmSmokeGate
 /// </summary>
 internal sealed class FakeSmokeProbe : IAgentSmokeProbe
 {
+    private int _callCount;
+    private int _shouldPass;
+
     public AgentKind Kind { get; }
-    public bool ShouldPass { get; set; }
-    public int CallCount { get; private set; }
+    public bool ShouldPass
+    {
+        get => Volatile.Read(ref _shouldPass) != 0;
+        set => Volatile.Write(ref _shouldPass, value ? 1 : 0);
+    }
+
+    public int CallCount => Volatile.Read(ref _callCount);
 
     public FakeSmokeProbe(AgentKind kind, bool shouldPass = true)
     {
@@ -128,7 +136,7 @@ internal sealed class FakeSmokeProbe : IAgentSmokeProbe
 
     public Task<AgentSmokeResult> SmokeTestAsync(AgentCredential credential, CancellationToken ct)
     {
-        CallCount++;
+        Interlocked.Increment(ref _callCount);
         var result = ShouldPass
             ? new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10))
             : new AgentSmokeResult(false, "auth", TimeSpan.FromMilliseconds(10));

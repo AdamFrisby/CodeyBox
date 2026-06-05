@@ -438,6 +438,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         AgentKind.Gemini.Value,
         AgentKind.Cursor.Value,
         AgentKind.Opencode.Value,
+        AgentKind.Copilot.Value,
     };
 
     [Fact]
