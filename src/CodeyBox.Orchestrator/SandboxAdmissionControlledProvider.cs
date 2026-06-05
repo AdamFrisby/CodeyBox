@@ -17,7 +17,7 @@ internal interface ISandboxAdmissionSnapshot
 /// disposed, so worker, audit, merge, smoke, and verifier call sites all share
 /// the same VM budget without each call site knowing about the policy.
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;
@@ -30,6 +30,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private readonly IDiskGuardedSandboxProvider? _diskGuardedProvider;
     private readonly IBaselineImageResolver? _baselineResolver;
     private readonly IBaselineImageProvisioner? _baselineProvisioner;
+    private readonly IActiveSandboxProgressProvider? _progressProvider;
 
     private SandboxAdmissionControlledProvider(
         ISandboxProvider inner,
@@ -49,6 +50,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _diskGuardedProvider = inner as IDiskGuardedSandboxProvider;
         _baselineResolver = inner as IBaselineImageResolver;
         _baselineProvisioner = inner as IBaselineImageProvisioner;
+        _progressProvider = inner as IActiveSandboxProgressProvider;
     }
 
     public static ISandboxProvider Wrap(ISandboxProvider inner, int maxConcurrentSandboxes, ILogger log)
@@ -125,7 +127,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                 ex,
                 "Retaining sandbox admission token after create failure because sandbox {SandboxName} may still exist",
                 ex.RetainedSandboxName);
-            _disposedSandboxAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            RetainDeferredProvisioningAdmission(ex, lease);
             throw;
         }
         catch
@@ -152,6 +154,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
         (_active ?? throw new NotSupportedException("The wrapped sandbox provider does not expose active sandboxes.")).Snapshot();
+
+    public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
+        _progressProvider?.SnapshotActiveSandboxProgress() ?? [];
 
     public async Task ResumeSandboxAsync(string name, CancellationToken ct)
     {
@@ -345,6 +350,22 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             return true;
         }
     }
+
+    private void RetainDeferredProvisioningAdmission(
+        SandboxProvisioningDeferredException ex,
+        SandboxAdmissionLease lease)
+    {
+        if (IsRetainedBaselineProvisioning(ex) && _baselineResolver is not null)
+        {
+            _disposedBaselineAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            return;
+        }
+
+        _disposedSandboxAdmissions.Retain(ex.RetainedSandboxName!, lease);
+    }
+
+    private static bool IsRetainedBaselineProvisioning(SandboxProvisioningDeferredException ex) =>
+        ex.Operation.StartsWith("baseline-", StringComparison.Ordinal);
 
     [Flags]
     private enum ProviderCapabilities
