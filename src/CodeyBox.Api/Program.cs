@@ -904,9 +904,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         // is fully synchronous, and only a stale-token miss blocks the thread
         // on the OAuth refresh round-trip (bounded by the agent-quota client's
         // 10s timeout).
-        () => new AgentQuotaCredentials(
-            tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
-                ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
+                    ?? Environment.GetEnvironmentVariable("CODEYBOX_CLAUDE_API_KEY")))
+            ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<ClaudeQuotaProbe>(),
         // Resilience knobs are read on every probe call so values bound from
@@ -934,13 +937,15 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var tokenSource = sp.GetRequiredService<ICodexQuotaTokenSource>();
     var probe = new CodexQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        () =>
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () =>
         {
             var codexAuth = tokenSource.GetTokensAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult();
             return new AgentQuotaCredentials(
                 codexAuth.AccessToken ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_API_KEY"),
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
-        },
+        }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
@@ -957,9 +962,12 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var tokenSource = sp.GetRequiredService<IGeminiQuotaTokenSource>();
     var probe = new GeminiQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        () => new AgentQuotaCredentials(
-            tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
-                ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
+                    ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
+            ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
@@ -971,10 +979,13 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
     var source = sp.GetRequiredService<CursorCredentialFileSource>();
     var probe = new CursorQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        () => new AgentQuotaCredentials(
-            CredentialFileTokenExtractor.ExtractCursorAccessToken(source.GetRaw())
-                ?? CredentialFileTokenExtractor.ExtractCursorAccessToken(
-                    Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_JSON"))),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                CredentialFileTokenExtractor.ExtractCursorAccessToken(source.GetRaw())
+                    ?? CredentialFileTokenExtractor.ExtractCursorAccessToken(
+                        Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_JSON"))))
+            ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
@@ -995,7 +1006,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 
     // Build and validate the catalog. Shared with AgentConfigHotReload so a
     // reload of CodeyBox:AgentClasses runs the same validation rules.
-    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, startupLog);
+    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, cbOpts.AgentInstances, startupLog);
     var subscriptionMembers = catalog.Sum(c => c.Members.Count(m => m.Billing == AgentBilling.Subscription));
     startupLog.LogInformation("Quota gate enabled for {Count} subscription members", subscriptionMembers);
 
@@ -3044,6 +3055,13 @@ namespace CodeyBox.Api
         /// </summary>
         public List<AgentClassOptions> AgentClasses { get; set; } = [];
 
+        /// <summary>
+        /// Optional reusable agent instances. AgentClass members can reference
+        /// these by InstanceId, allowing multiple subscriptions for the same
+        /// agent kind to be pooled independently.
+        /// </summary>
+        public List<AgentInstanceOptions> AgentInstances { get; set; } = [];
+
         /// <summary>Quota router tuning knobs.</summary>
         public QuotaRouterConfig QuotaRouter { get; set; } = new();
 
@@ -3538,15 +3556,61 @@ namespace CodeyBox.Api
         public List<AgentMembershipOptions> Members { get; set; } = [];
     }
 
+    /// <summary>Config binding for a reusable routable agent instance.</summary>
+    public sealed class AgentInstanceOptions
+    {
+        /// <summary>
+        /// Stable instance id. Values without a slash are rendered as
+        /// <c>{Agent}/{Id}</c>; values that already contain a slash are used as
+        /// full route keys.
+        /// </summary>
+        public string Id { get; set; } = string.Empty;
+
+        /// <summary>Underlying agent kind, e.g. "claude", "codex".</summary>
+        public string Agent { get; set; } = string.Empty;
+
+        /// <summary>Host OAuth/auth JSON file for this instance.</summary>
+        public string? CredentialFilePath { get; set; }
+
+        /// <summary>Host env var containing a raw token/API key for this instance.</summary>
+        public string? TokenEnvironmentVariable { get; set; }
+
+        /// <summary>Host env var containing CLI auth JSON for this instance.</summary>
+        public string? AuthJsonEnvironmentVariable { get; set; }
+
+        /// <summary>Optional companion settings file, used by Gemini OAuth.</summary>
+        public string? SettingsFilePath { get; set; }
+
+        /// <summary>Optional sandbox destination path for file-materializing runners.</summary>
+        public string? DestinationPath { get; set; }
+
+        /// <summary>Optional override for the sandbox env var used for token injection.</summary>
+        public string? SandboxEnvironmentVariable { get; set; }
+    }
+
     /// <summary>Config binding for one member of an agent class.</summary>
     public sealed class AgentMembershipOptions
     {
         /// <summary>Agent kind value, e.g. "claude", "codex".</summary>
         public string Agent { get; set; } = string.Empty;
+        /// <summary>Optional instance id or route key. Null means the default per-kind instance.</summary>
+        public string? InstanceId { get; set; }
         /// <summary>"Subscription" or "PayPerApi".</summary>
         public string Billing { get; set; } = "Subscription";
         /// <summary>Optional model override, e.g. "claude-opus-4-7".</summary>
         public string? ModelId { get; set; }
+        /// <summary>Inline host OAuth/auth JSON file for this member instance.</summary>
+        public string? CredentialFilePath { get; set; }
+        /// <summary>Inline host env var containing a raw token/API key for this member instance.</summary>
+        public string? TokenEnvironmentVariable { get; set; }
+        /// <summary>Inline host env var containing CLI auth JSON for this member instance.</summary>
+        public string? AuthJsonEnvironmentVariable { get; set; }
+        /// <summary>Inline companion settings file, used by Gemini OAuth.</summary>
+        public string? SettingsFilePath { get; set; }
+        /// <summary>Inline sandbox destination path for file-materializing runners.</summary>
+        public string? DestinationPath { get; set; }
+        /// <summary>Inline override for the sandbox env var used for token injection.</summary>
+        public string? SandboxEnvironmentVariable { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
         /// See docs/agent-classes.md for recommended seed values.

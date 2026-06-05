@@ -31,12 +31,15 @@ Hot-reloadable today:
   cap-aware routing) through a shared snapshot. `MaxConcurrent` values **must
   be >= 1**; `<= 0` is rejected (the prior view is retained on hot-reload).
   To leave an agent uncapped, **omit** the entry — do NOT set `MaxConcurrent: 0`.
+  Keys may be either bare agent kinds (`claude`) or instance route keys
+  (`claude/acct-a`) when `AgentClasses` uses multiple credentials for the same
+  kind. Route-key caps are applied before bare-kind fallback caps.
   To stop dispatch to an agent, remove it from `AgentClasses[*].Members` or
   pause the queue. The resolved caps are logged at orchestrator startup and on
   every successful hot-reload so the effective value is visible to operators.
-- `AgentClasses` + `AgentScoreModifiers` — re-applied via `AgentConfigHotReload`
-  to the live `AgentClassRouter` catalog. In-flight routing calls finish against
-  the snapshot they started with.
+- `AgentClasses` + `AgentInstances` + `AgentScoreModifiers` — re-applied via
+  `AgentConfigHotReload` to the live `AgentClassRouter` catalog. In-flight
+  routing calls finish against the snapshot they started with.
 - `AgentBurnEstimator` — re-applied via `AgentConfigHotReload` to the live
   burn-estimator (per-window token budgets, default burn percentages). Agents
   with samples but no positive `WindowTokenBudget` fail open until a budget is

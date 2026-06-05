@@ -1452,9 +1452,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // includes the agent's API endpoints. We fall back through the
             // audit profiles for the baseline-clone fast path when Work is
             // unconfigured.
-            var credential = _credentials is IProjectAwareCredentialProvider pacRebase
-                ? await pacRebase.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-                : await _credentials.GetAsync(runner.Kind, ct);
+            var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
             var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
                 ?? project.NetworkProfiles.AuditTool;
@@ -1935,7 +1933,7 @@ public sealed class PipelineRunner : IPipelineRunner
         AgenticConflictResolverOperation operation = AgenticConflictResolverOperation.Rebase)
     {
         var classId = item.AgentClassId ?? project.DefaultAgentClass;
-        var seenKinds = new HashSet<AgentKind>();
+        var seenMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
         (AgentKind Agent, string Reason)? pausedCandidate = null;
@@ -1946,7 +1944,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var resolverPrimary = primaryRunner;
         var resolverPrimaryModelId = item.ModelId;
         var resolverPrimaryReasoningMode = item.ReasoningMode;
-        var resolverPrimaryMember = FindCandidateMember(primaryRunner.Kind, item.ModelId);
+        var resolverPrimaryMember = FindCandidateMember(primaryRunner.Kind, item.ModelId, item.AgentInstanceId);
 
         if (project.Audit.AuditAgent is { } auditKind && auditKind != primaryRunner.Kind)
         {
@@ -1977,12 +1975,12 @@ public sealed class PipelineRunner : IPipelineRunner
             foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
                 item, project, ct, resolverSmokeTarget))
             {
-                if (seenKinds.Contains(member.Agent))
+                if (seenMembers.Contains(member.RouteKey))
                     continue;
                 if (!_agents.TryGet(member.Agent, out var memberRunner))
                 {
-                    seenKinds.Add(member.Agent);
-                    skipReasons.Add($"{member.Agent.Value}: no runner registered");
+                    seenMembers.Add(member.RouteKey);
+                    skipReasons.Add($"{member.RouteKey}: no runner registered");
                     continue;
                 }
 
@@ -2020,7 +2018,7 @@ public sealed class PipelineRunner : IPipelineRunner
         const int capSortPreferred = 0;
         const int capSortDeprioritized = 1;
         var ordered = collected
-            .Select((c, idx) => (Candidate: c, Index: idx, AtCap: IsAtAgentCap(c.Runner.Kind)))
+            .Select((c, idx) => (Candidate: c, Index: idx, AtCap: IsCandidateAtCap(c)))
             .OrderBy(t => t.AtCap ? capSortDeprioritized : capSortPreferred)
             .ThenBy(t => t.Index)
             .Select(t => t.Candidate)
@@ -2031,12 +2029,13 @@ public sealed class PipelineRunner : IPipelineRunner
         if (auditRebaseRouting && first.Runner.Kind != resolverPrimary.Kind)
         {
             var resolverPrimaryAtCap = collected.Any(c => c.Runner.Kind == resolverPrimary.Kind)
-                && IsAtAgentCap(resolverPrimary.Kind);
-            if (resolverPrimaryAtCap && !IsAtAgentCap(first.Runner.Kind))
+                && resolverPrimaryMember is { } primaryMember
+                && IsAtAgentCap(primaryMember);
+            if (resolverPrimaryAtCap && resolverPrimaryMember is { } reroutedMember && !IsCandidateAtCap(first))
             {
                 AuditLog.RebaseResolverAgentCapReroute(
                     resolverPrimary.Kind, first.Runner.Kind,
-                    GetRunningSafe(resolverPrimary.Kind), GetCapSafe(resolverPrimary.Kind));
+                    GetRunningSafe(reroutedMember), GetCapSafe(reroutedMember));
             }
             else if (resolverPrimaryRejectedReason is not null)
             {
@@ -2044,10 +2043,17 @@ public sealed class PipelineRunner : IPipelineRunner
                     resolverPrimary.Kind, first.Runner.Kind, $"{resolverPrimaryRejectedReason}; using class member");
             }
         }
-        if (auditRebaseRouting && ordered.All(c => IsAtAgentCap(c.Runner.Kind)))
+        if (auditRebaseRouting && ordered.All(IsCandidateAtCap))
         {
+            var firstMemberForCap = CandidateMembershipForCap(first);
             AuditLog.RebaseResolverAllAtCap(
-                first.Runner.Kind, GetRunningSafe(first.Runner.Kind), GetCapSafe(first.Runner.Kind));
+                first.Runner.Kind,
+                firstMemberForCap is not null
+                    ? GetRunningSafe(firstMemberForCap)
+                    : GetRunningSafe(first.Runner.Kind),
+                firstMemberForCap is not null
+                    ? GetCapSafe(firstMemberForCap)
+                    : GetCapSafe(first.Runner.Kind));
         }
         return ordered;
 
@@ -2058,7 +2064,9 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentMembership? configuredMember,
             CancellationToken token)
         {
-            if (!seenKinds.Add(candidate.Kind))
+            var quotaMember = BuildQuotaMember(candidate, configuredMember, modelId, reasoningMode);
+            var routeKey = quotaMember.RouteKey;
+            if (!seenMembers.Add(routeKey))
                 return null;
 
             var smokeAvailability = await EnsureAgentSmokeAvailableAsync(candidate.Kind, resolverSmokeTarget, token);
@@ -2078,7 +2086,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 return reason;
             }
 
-            var quotaMember = BuildQuotaMember(candidate, configuredMember, modelId, reasoningMode);
             var (quotaOk, quotaReason) = await EvaluateAuditCandidateQuotaAsync(candidate.Kind, quotaMember, token);
             if (!quotaOk)
             {
@@ -2088,21 +2095,47 @@ public sealed class PipelineRunner : IPipelineRunner
                 return reason;
             }
 
-            var credential = await ResolveAgentCredentialAsync(candidate.Kind, project, token);
-            collected.Add(new AgenticConflictResolverCandidate(candidate, credential, modelId, reasoningMode));
+            var credential = await ResolveAgentCredentialAsync(quotaMember, project, token);
+            collected.Add(new AgenticConflictResolverCandidate(
+                candidate,
+                credential,
+                modelId,
+                reasoningMode,
+                quotaMember.RouteKey));
             return null;
         }
 
-        AgentMembership? FindCandidateMember(AgentKind kind, string? modelId)
+        AgentMembership? FindCandidateMember(AgentKind kind, string? modelId, string? instanceId = null)
         {
             if (_classRouter is null || classId is null)
                 return null;
             if (!string.IsNullOrWhiteSpace(modelId))
             {
-                return _classRouter.FindMember(classId, kind, modelId)
-                    ?? _classRouter.FindMember(classId, kind, modelId: null);
+                return _classRouter.FindMember(classId, kind, modelId, instanceId)
+                    ?? _classRouter.FindMember(classId, kind, modelId: null, instanceId);
             }
-            return _classRouter.FindMember(classId, kind, modelId: null);
+            return _classRouter.FindMember(classId, kind, modelId: null, instanceId);
+        }
+
+        bool IsCandidateAtCap(AgenticConflictResolverCandidate candidate)
+        {
+            return CandidateMembershipForCap(candidate) is { } member
+                ? IsAtAgentCap(member)
+                : IsAtAgentCap(candidate.Runner.Kind);
+        }
+
+        static AgentMembership? CandidateMembershipForCap(AgenticConflictResolverCandidate candidate)
+        {
+            return candidate.AgentInstanceId is null
+                ? null
+                : new AgentMembership
+                {
+                    Agent = candidate.Runner.Kind,
+                    InstanceId = candidate.AgentInstanceId,
+                    Billing = AgentBilling.Subscription,
+                    ModelId = candidate.ModelId,
+                    QualityScore = 100,
+                };
         }
 
         AgentMembership BuildQuotaMember(
@@ -2149,6 +2182,14 @@ public sealed class PipelineRunner : IPipelineRunner
         return _agentRunningCounters.GetRunning(agent) >= cap;
     }
 
+    private bool IsAtAgentCap(AgentMembership member)
+    {
+        var cap = GetCapSafe(member);
+        if (cap <= 0) return false;
+        if (_agentRunningCounters is null) return false;
+        return _agentRunningCounters.GetRunning(member) >= cap;
+    }
+
     private int GetCapSafe(AgentKind agent)
     {
         // Bind the snapshot reference once so a concurrent ApplyConcurrencyReload
@@ -2164,8 +2205,28 @@ public sealed class PipelineRunner : IPipelineRunner
             : 0;
     }
 
+    private int GetCapSafe(AgentMembership member)
+    {
+        var opts = _concurrencySnapshot?.Current;
+        if (opts is null)
+            return 0;
+
+        if (opts.Members.TryGetValue(member.RouteKey, out var exact)
+            && exact is { MaxConcurrent: > 0 })
+            return exact.MaxConcurrent;
+
+        if (opts.Members.TryGetValue(member.Agent.Value, out var byKind)
+            && byKind is { MaxConcurrent: > 0 })
+            return byKind.MaxConcurrent;
+
+        return 0;
+    }
+
     private int GetRunningSafe(AgentKind agent) =>
         _agentRunningCounters?.GetRunning(agent) ?? 0;
+
+    private int GetRunningSafe(AgentMembership member) =>
+        _agentRunningCounters?.GetRunning(member) ?? 0;
 
     private static async Task<bool> FetchOriginBranchAsync(ISandbox sandbox, string branch, bool required, CancellationToken ct)
     {
@@ -2289,13 +2350,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken hostShutdownToken,
         int? iteration = null)
     {
-        // Apply per-project credential plugin ordering when configured.
-        // IProjectAwareCredentialProvider is implemented by ChainedCredentialProvider
-        // in production; test stubs that inject a plain ICredentialProvider fall back
-        // to the global chain automatically.
-        var credential = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(runner.Kind, ct);
+        var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
         var agentPhase = isInitial ? "work" : "rework";
 
@@ -2538,7 +2593,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (streamCapture is null)
             await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-            runner.Kind, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
+            runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
         agentSw.Stop();
         // Feed the availability registry so the fast-fail circuit breaker can
         // exclude an agent that exits non-zero in under FastFailThresholdSeconds
@@ -2867,9 +2922,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item, Project project, IAgentRunner agentRunner,
         string repoId, string baseBranch, string prompt, CancellationToken ct)
     {
-        var credential = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(agentRunner.Kind, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(agentRunner.Kind, ct);
+        var credential = await ResolveAgentCredentialAsync(agentRunner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
         var spec = BuildSandboxSpec(
@@ -3242,9 +3295,7 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item, Project project, IAgentRunner agentRunner,
         string repoId, string workBranch, string prompt, CancellationToken ct)
     {
-        var credential = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(agentRunner.Kind, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(agentRunner.Kind, ct);
+        var credential = await ResolveAgentCredentialAsync(agentRunner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
 
         var spec = BuildSandboxSpec(
@@ -4237,19 +4288,19 @@ public sealed class PipelineRunner : IPipelineRunner
         // ResolveAuditAgentRunnerAsync returns null. Drop the auditor entirely
         // for this iteration; the remaining auditors still run and the work
         // item keeps progressing instead of parking on quota.
-        var resolved = new List<(IAuditor Auditor, IAgentRunner Runner)>(auditors.Count);
+        var resolved = new List<(IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member)>(auditors.Count);
         foreach (var a in auditors)
         {
             if (a.Required.HasFlag(AuditCapabilities.AgentCredentials))
             {
-                var runner = await ResolveAuditAgentRunnerAsync(item, project, a.Name, a.Required, workRunner, ct);
-                if (runner is null)
+                var selection = await ResolveAuditAgentRunnerAsync(item, project, a.Name, a.Required, workRunner, ct);
+                if (selection is null)
                     continue;
-                resolved.Add((a, runner));
+                resolved.Add((a, selection.Runner, selection.Member));
             }
             else
             {
-                resolved.Add((a, workRunner));
+                resolved.Add((a, workRunner, null));
             }
         }
 
@@ -4260,9 +4311,9 @@ public sealed class PipelineRunner : IPipelineRunner
         var byCaps = resolved
             .GroupBy(x => (
                 Caps: x.Auditor.Required,
-                Kind: x.Auditor.Required.HasFlag(AuditCapabilities.AgentCredentials)
-                    ? x.Runner.Kind
-                    : default(AgentKind)))
+                RouteKey: x.Auditor.Required.HasFlag(AuditCapabilities.AgentCredentials)
+                    ? x.Member?.RouteKey ?? x.Runner.Kind.Value
+                    : string.Empty))
             .ToList();
 
         foreach (var group in byCaps)
@@ -4272,13 +4323,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
             // All auditors in this group share the same runner kind; pick from first.
             var groupRunner = needsCreds ? group.First().Runner : workRunner;
+            var groupMember = needsCreds ? group.First().Member : null;
             // Tool-only auditors get the project's "audit-tool" profile
             // (typically isolated/no-egress); LLM-driven auditors get the
             // "audit-agent" profile (typically same as the work profile).
             AgentCredential? credential = needsCreds
-                ? (_credentials is IProjectAwareCredentialProvider pac1
-                    ? await pac1.GetAsync(groupRunner.Kind, project.CredentialProviderPriority, ct)
-                    : await _credentials.GetAsync(groupRunner.Kind, ct))
+                ? groupMember is not null
+                    ? await ResolveAgentCredentialAsync(groupMember, project, ct)
+                    : await ResolveAgentCredentialAsync(groupRunner.Kind, project, item, ct)
                 : null;
             var access = _gitHost.GetSandboxAccess(repoId);
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(
@@ -4306,9 +4358,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
 
-                foreach (var (auditor, runner) in toolPairs)
+                foreach (var (auditor, runner, member) in toolPairs)
                 {
-                    var run = await ExecAuditorAsync(sandbox, auditor, runner, workRunner, credential, ctx, ct);
+                    var run = await ExecAuditorAsync(
+                        sandbox,
+                        auditor,
+                        runner,
+                        workRunner,
+                        credential,
+                        member?.RouteKey,
+                        ctx,
+                        ct);
                     await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
                     if (needsCreds && runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= runner.Kind;
@@ -4347,13 +4407,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 }
 
                 async Task<AuditorRunRecord> RunLlmPairOnceAsync(
-                    (IAuditor Auditor, IAgentRunner Runner) pair,
+                    (IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member) pair,
                     IAgentRunner candidateRunner,
                     WorkItem trialItem,
                     CancellationToken attemptCt)
                 {
                     var candidateCredential = needsCreds
-                        ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, attemptCt)
+                        ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
                     var candidateSpec = BuildLlmSandboxSpec(candidateCredential);
                     await using var sandbox = await _sandboxes.CreateAsync(candidateSpec, attemptCt);
@@ -4372,12 +4432,13 @@ public sealed class PipelineRunner : IPipelineRunner
                         candidateRunner,
                         workRunner,
                         candidateCredential,
+                        trialItem.AgentInstanceId,
                         candidateCtx,
                         attemptCt);
                 }
 
                 async Task<AuditorRunRecord> RunLlmPairAttemptAsync(
-                    (IAuditor Auditor, IAgentRunner Runner) pair,
+                    (IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member) pair,
                     IAgentRunner candidateRunner,
                     WorkItem trialItem,
                     CancellationToken attemptCt)
@@ -4404,7 +4465,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     return run;
                 }
 
-                Task<AuditorRunRecord> RunLlmPairAsync((IAuditor Auditor, IAgentRunner Runner) pair)
+                Task<AuditorRunRecord> RunLlmPairAsync((IAuditor Auditor, IAgentRunner Runner, AgentMembership? Member) pair)
                 {
                     return InvokeAgentWithQuotaFallbackAsync(
                         item,
@@ -4414,10 +4475,11 @@ public sealed class PipelineRunner : IPipelineRunner
                         (candidateRunner, trialItem, attemptCt) => RunLlmPairAttemptAsync(pair, candidateRunner, trialItem, attemptCt),
                         ct,
                         initialRunnerOverride: pair.Runner,
-                        initialMemberOverride: _classRouter?.FindMember(
+                        initialMemberOverride: pair.Member ?? _classRouter?.FindMember(
                             item.AgentClassId ?? project.DefaultAgentClass ?? string.Empty,
                             pair.Runner.Kind,
-                            modelId: null),
+                            modelId: null,
+                            instanceId: item.AgentInstanceId),
                         // ExecAuditorAsync records one involvement row per auditor
                         // sandbox run (incl. the transient retry), so the wrapper
                         // must not also record one per attempt — that would
@@ -4485,6 +4547,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentRunner runner,
         IAgentRunner workRunner,
         AgentCredential? credential,
+        string? agentInstanceId,
         AuditContext ctx,
         CancellationToken ct)
     {
@@ -4521,7 +4584,11 @@ public sealed class PipelineRunner : IPipelineRunner
         var timingScope = await TimingScope.BeginAsync(
             _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
-            metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
+            metadata: new Dictionary<string, object>
+            {
+                ["agent"] = runner.Kind.Value,
+                ["agent.instance"] = agentInstanceId ?? runner.Kind.Value,
+            },
             log: _log,
             activitySource: CodeyBoxActivities.Audit);
         // Record one involvement row per auditor sandbox run. ExecAuditorAsync is
@@ -4530,7 +4597,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // "Running auditor" log line above and a history row — and an
         // auditor-identifying phase the plain "audit" label could not provide.
         var involvementId = await RecordInvolvementStartAsync(
-            ctx.WorkItemId, runner.Kind, auditorCtx.ModelId, $"audit:{auditor.Name}", ctx.Iteration);
+            ctx.WorkItemId, runner.Kind, agentInstanceId, auditorCtx.ModelId, $"audit:{auditor.Name}", ctx.Iteration);
         AuditResult result;
         try
         {
@@ -4556,7 +4623,15 @@ public sealed class PipelineRunner : IPipelineRunner
             new KeyValuePair<string, object?>("auditor.name", auditor.Name),
             new KeyValuePair<string, object?>("auditor.kind", auditor.Kind),
             new KeyValuePair<string, object?>("iteration", ctx.Iteration.ToString()));
-        return new AuditorRunRecord(auditor, runner, result, startedAt, sw.Elapsed, timingScope.ElapsedMs, streamCapture is not null);
+        return new AuditorRunRecord(
+            auditor,
+            runner,
+            agentInstanceId,
+            result,
+            startedAt,
+            sw.Elapsed,
+            timingScope.ElapsedMs,
+            streamCapture is not null);
     }
 
     /// <summary>
@@ -4586,7 +4661,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // same-kind audit spend under the runner default instead of ctx.ModelId,
             // understating the gated window and fail-opening the spend cap.
             await TryRecordCostAsync(run.Result.RawOutput, null,
-                run.Runner.Kind, ctx.WorkItemId, "audit", ctx.Iteration,
+                run.Runner.Kind, run.AgentInstanceId, ctx.WorkItemId, "audit", ctx.Iteration,
                 run.StartedAt, run.StartedAt + run.Elapsed,
                 ResolveAuditUsageModelId(run.Runner, workRunner.Kind, ctx.ModelId));
         }
@@ -4647,6 +4722,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private sealed record AuditorRunRecord(
         IAuditor Auditor,
         IAgentRunner Runner,
+        string? AgentInstanceId,
         AuditResult Result,
         DateTimeOffset StartedAt,
         TimeSpan Elapsed,
@@ -4758,7 +4834,9 @@ public sealed class PipelineRunner : IPipelineRunner
     /// "any class member is eligible" behaviour for backward compatibility.
     /// </para>
     /// </summary>
-    private async Task<IAgentRunner?> ResolveAuditAgentRunnerAsync(
+    private sealed record AuditAgentSelection(IAgentRunner Runner, AgentMembership? Member);
+
+    private async Task<AuditAgentSelection?> ResolveAuditAgentRunnerAsync(
         WorkItem item,
         Project project,
         string auditorName,
@@ -4798,17 +4876,18 @@ public sealed class PipelineRunner : IPipelineRunner
             // No explicit override (or it was demoted by the capability gate).
             // Legacy path: no audit pool active → use work agent.
             if (auditPool is null)
-                return WorkRunnerForAuditUnlessPaused(workRunner, auditorName);
+                return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
             // Audit pool active: the work agent is only safe if it carries
             // the audit tag itself. Otherwise we must walk the class chain
             // for a tagged substitute — falling back to workRunner here
             // would breach the AC (a non-audit-capable agent must NEVER be
             // selected for auditing). The walk runs the full quota /
             // availability gate on each candidate.
-            if (auditPool.Contains(workRunner.Kind)
+            var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
+            if ((workMember?.HasCapability(WellKnownCapabilities.Audit) ?? auditPool.Contains(workRunner.Kind))
                 && GetAgentPausedReason(workRunner.Kind) is null)
             {
-                return workRunner;
+                return new AuditAgentSelection(workRunner, workMember);
             }
             return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
         }
@@ -4823,10 +4902,20 @@ public sealed class PipelineRunner : IPipelineRunner
             // the audit-capable pool for a tagged substitute instead.
             if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
                 return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return WorkRunnerForAuditUnlessPaused(workRunner, auditorName);
+            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
         }
 
-        var preferredCred = await ResolveAgentCredentialAsync(preferredKind.Value, project, ct);
+        var preferredMember = classId is not null
+            ? _classRouter?.FindMember(
+                  classId,
+                  preferredKind.Value,
+                  modelId: null,
+                  instanceId: preferredKind.Value == item.Agent ? item.AgentInstanceId : null)
+              ?? _classRouter?.FindMember(classId, preferredKind.Value, modelId: null)
+            : null;
+        var preferredCred = preferredMember is not null
+            ? await ResolveAgentCredentialAsync(preferredMember, project, ct)
+            : await ResolveAgentCredentialAsync(preferredKind.Value, project, item, ct);
         if (preferredCred is null)
         {
             _log.LogWarning(
@@ -4835,12 +4924,9 @@ public sealed class PipelineRunner : IPipelineRunner
             // Same capability gate as the unregistered-preferred branch above.
             if (auditPool is not null && !auditPool.Contains(workRunner.Kind))
                 return await SelectFromAuditCapablePoolAsync(item, project, auditorName, classId!, ct);
-            return WorkRunnerForAuditUnlessPaused(workRunner, auditorName);
+            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
         }
 
-        var preferredMember = classId is not null
-            ? _classRouter?.FindMember(classId, preferredKind.Value, modelId: null)
-            : null;
         var preferredProbeMember = preferredMember ?? new AgentMembership
         {
             Agent = preferredKind.Value,
@@ -4879,7 +4965,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 preferredKind.Value, preferredProbeMember, ct);
         }
         if (preferredPauseReason is null && preferredAvailable && preferredOk)
-            return preferredRunner;
+            return new AuditAgentSelection(preferredRunner, preferredMember);
 
         if (preferredPauseReason is null)
         {
@@ -4897,7 +4983,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is null || classId is null)
         {
             AuditLog.QuotaAuditFallthrough(preferredKind.Value, workRunner.Kind, auditorName);
-            return WorkRunnerForAuditUnlessPaused(workRunner, auditorName);
+            return WorkRunnerForAuditUnlessPaused(item, project, workRunner, auditorName);
         }
 
         // Walk the work item's class chain for an unexhausted candidate.
@@ -4910,14 +4996,15 @@ public sealed class PipelineRunner : IPipelineRunner
             : 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct, auditSmokeTarget))
         {
-            if (member.Agent == preferredKind.Value)
+            if (preferredMember is not null
+                && string.Equals(member.RouteKey, preferredMember.RouteKey, StringComparison.OrdinalIgnoreCase))
                 continue;   // already counted above
             // Audit-capability gate: when the pool is active, restrict the
             // walk to tagged members so a non-audit-capable member is NEVER
             // picked for auditing — even when it is the only one with quota.
             // Mid-iteration fallback in InvokeAgentWithQuotaFallbackAsync
             // enforces the same gate via requireAuditCapability.
-            if (auditPool is not null && !auditPool.Contains(member.Agent))
+            if (auditPool is not null && !member.HasCapability(WellKnownCapabilities.Audit))
             {
                 _log.LogDebug(
                     "Class '{ClassId}' member '{Member}' not tagged 'audit'; skipping for auditor '{Auditor}'",
@@ -4931,7 +5018,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     classId, member.Agent.Value, auditorName);
                 continue;
             }
-            var memberCred = await ResolveAgentCredentialAsync(member.Agent, project, ct);
+            var memberCred = await ResolveAgentCredentialAsync(member, project, ct);
             if (memberCred is null)
             {
                 _log.LogWarning(
@@ -4956,7 +5043,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // walk, naming workRunner — incorrect when the chain picks a
             // different member.
             AuditLog.QuotaAuditFallthrough(preferredKind.Value, member.Agent, auditorName);
-            return memberRunner;
+            return new AuditAgentSelection(memberRunner, member);
         }
 
         // The work agent is one of the class members (the work-phase router
@@ -4974,13 +5061,15 @@ public sealed class PipelineRunner : IPipelineRunner
         return null;
     }
 
-    private IAgentRunner? WorkRunnerForAuditUnlessPaused(
+    private AuditAgentSelection? WorkRunnerForAuditUnlessPaused(
+        WorkItem item,
+        Project project,
         IAgentRunner workRunner,
         string auditorName)
     {
         var pauseReason = GetAgentPausedReason(workRunner.Kind);
         if (pauseReason is null)
-            return workRunner;
+            return new AuditAgentSelection(workRunner, TryResolveSelectedMember(workRunner.Kind, project, item));
 
         _log.LogWarning(
             "LLM auditor '{Auditor}' waiting: work agent '{Agent}' is {Reason}",
@@ -5010,7 +5099,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// Returns null when no audit-capable candidate is available; the caller
     /// then skips the auditor for this iteration.
     /// </summary>
-    private async Task<IAgentRunner?> SelectFromAuditCapablePoolAsync(
+    private async Task<AuditAgentSelection?> SelectFromAuditCapablePoolAsync(
         WorkItem item, Project project, string auditorName, string classId, CancellationToken ct)
     {
         if (_classRouter is null) return null;
@@ -5026,7 +5115,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     classId, member.Agent.Value, auditorName);
                 continue;
             }
-            var memberCred = await ResolveAgentCredentialAsync(member.Agent, project, ct);
+            var memberCred = await ResolveAgentCredentialAsync(member, project, ct);
             if (memberCred is null)
             {
                 _log.LogWarning(
@@ -5046,7 +5135,7 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogInformation(
                 "Routing auditor '{Auditor}' to audit-capable class member '{Member}'",
                 auditorName, member.Agent.Value);
-            return memberRunner;
+            return new AuditAgentSelection(memberRunner, member);
         }
         // LlmAuditorSkippedQuota names "quota" — only emit when at least one
         // candidate was actually quota-rejected. When the pool is empty or
@@ -5270,9 +5359,51 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private Task<AgentCredential?> ResolveAgentCredentialAsync(AgentKind kind, Project project, CancellationToken ct)
-        => _credentials is IProjectAwareCredentialProvider pac
-            ? pac.GetAsync(kind, project.CredentialProviderPriority, ct)
-            : _credentials.GetAsync(kind, ct);
+        => ResolveAgentCredentialAsync(kind, project, item: null, ct);
+
+    private async Task<AgentCredential?> ResolveAgentCredentialAsync(
+        AgentKind kind,
+        Project project,
+        WorkItem? item,
+        CancellationToken ct)
+    {
+        if (item is not null && TryResolveSelectedMember(kind, project, item) is { } member
+            && member.CredentialReference is not null)
+        {
+            var credential = await AgentInstanceCredentialResolver.ResolveCredentialAsync(member, ct).ConfigureAwait(false);
+            if (credential is not null)
+                return credential;
+        }
+
+        return _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(kind, project.CredentialProviderPriority, ct).ConfigureAwait(false)
+            : await _credentials.GetAsync(kind, ct).ConfigureAwait(false);
+    }
+
+    private async Task<AgentCredential?> ResolveAgentCredentialAsync(
+        AgentMembership member,
+        Project project,
+        CancellationToken ct)
+    {
+        if (member.CredentialReference is not null)
+        {
+            var credential = await AgentInstanceCredentialResolver.ResolveCredentialAsync(member, ct).ConfigureAwait(false);
+            if (credential is not null)
+                return credential;
+        }
+
+        return await ResolveAgentCredentialAsync(member.Agent, project, ct).ConfigureAwait(false);
+    }
+
+    private AgentMembership? TryResolveSelectedMember(AgentKind kind, Project project, WorkItem item)
+    {
+        if (_classRouter is null)
+            return null;
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        return classId is null
+            ? null
+            : _classRouter.FindMember(classId, kind, item.ModelId, item.AgentInstanceId);
+    }
 
     /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
@@ -5344,7 +5475,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // recording here as well would double-count.
             var involvementId = recordInvolvement
                 ? await RecordInvolvementStartAsync(
-                    item.Id, runner.Kind, trialItem.ModelId, phase, iteration)
+                    item.Id, runner.Kind, trialItem.AgentInstanceId, trialItem.ModelId, phase, iteration)
                 : null;
             using var attempt = phaseCancellation is not null && attemptTimeout is { } perAttempt
                 ? phaseCancellation.BeginAttemptTimeout(perAttempt)
@@ -5357,6 +5488,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 invSpan.SetTag("codeybox.work_item_id", item.Id.ToString());
                 invSpan.SetTag("codeybox.phase", phase);
                 invSpan.SetTag("codeybox.agent", runner.Kind.Value);
+                invSpan.SetTag("codeybox.agent_instance", trialItem.AgentInstanceId ?? runner.Kind.Value);
                 invSpan.SetTag("codeybox.model", modelTag);
                 invSpan.SetTag("codeybox.agent_class", agentClassTag);
                 if (iteration is not null) invSpan.SetTag("codeybox.iteration", iteration.Value.ToString());
@@ -5402,6 +5534,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 invSpan?.SetTag("codeybox.outcome", outcome);
                 CodeyBoxMeters.AgentInvocations.Add(1,
                     new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
+                    new KeyValuePair<string, object?>("agent.instance", trialItem.AgentInstanceId ?? runner.Kind.Value),
                     new KeyValuePair<string, object?>("model", modelTag),
                     new KeyValuePair<string, object?>("agent_class", agentClassTag),
                     new KeyValuePair<string, object?>("phase", phase),
@@ -5427,6 +5560,7 @@ public sealed class PipelineRunner : IPipelineRunner
             : item with
             {
                 Agent = initialAgent,
+                AgentInstanceId = initialMemberOverride?.RouteKey ?? item.AgentInstanceId,
                 ModelId = initialMemberOverride?.ModelId ?? item.ModelId,
                 ReasoningMode = initialMemberOverride?.ReasoningMode ?? item.ReasoningMode,
             };
@@ -5473,10 +5607,9 @@ public sealed class PipelineRunner : IPipelineRunner
         // could spill to a Gemini member which the operator never authorised
         // for auditing. Null pool = no opt-in for this class → legacy
         // unfiltered fallback (matches ResolveAuditAgentRunnerAsync gating).
-        IReadOnlySet<AgentKind>? requiredCapabilityPool = requireCapability is null
-            ? null
-            : _classRouter.GetCapabilityPool(classId, requireCapability);
-        var triedKeys = new HashSet<(AgentKind, string)>();
+        var requiredCapabilityPoolActive = requireCapability is not null
+            && _classRouter.GetCapabilityPool(classId, requireCapability) is not null;
+        var triedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var triedCount = 0;
         DateTimeOffset? earliestReset = null;
         var sawQuotaBlockedCandidate = false;
@@ -5488,15 +5621,19 @@ public sealed class PipelineRunner : IPipelineRunner
         // back to a synthesised placeholder when the catalog has no matching row —
         // e.g. tests that exercise the wrapper without a fully-populated class.
         var currentMember = initialMemberOverride
-            ?? _classRouter.FindMember(classId, initialAgent, item.ModelId)
+            ?? _classRouter.FindMember(classId, initialAgent, item.ModelId, item.AgentInstanceId)
             ?? new AgentMembership
             {
                 Agent = initialAgent,
+                InstanceId = item.AgentInstanceId,
                 ModelId = item.ModelId,
                 ReasoningMode = item.ReasoningMode,
                 Billing = AgentBilling.Subscription,
                 QualityScore = 100,
             };
+
+        static string TriedMemberKey(AgentMembership member) =>
+            $"{member.RouteKey}\0{member.ModelId ?? string.Empty}";
 
         async Task MoveToNextMemberOrThrowAsync(
             string safeReason,
@@ -5546,14 +5683,14 @@ public sealed class PipelineRunner : IPipelineRunner
             AgentMembership? nextMember = null;
             foreach (var candidate in candidates)
             {
-                var key = (candidate.Agent, candidate.ModelId ?? string.Empty);
+                var key = TriedMemberKey(candidate);
                 if (triedKeys.Contains(key)) continue;
                 // Capability-pool filter (e.g. audit). When the pool is active,
                 // a candidate outside it must NEVER be chosen for the spill —
                 // matches the resolve-time gate in ResolveAuditAgentRunnerAsync
                 // so the work item never ends up on an agent the operator did
                 // not tag for this phase.
-                if (requiredCapabilityPool is not null && !requiredCapabilityPool.Contains(candidate.Agent))
+                if (requiredCapabilityPoolActive && !candidate.HasCapability(requireCapability!))
                 {
                     _log.LogDebug(
                         "Class '{ClassId}' member '{Agent}' not in '{Capability}' pool; skipping for fallback (work item {WorkItemId})",
@@ -5633,7 +5770,8 @@ public sealed class PipelineRunner : IPipelineRunner
                                 ToAgent: null,
                                 ToModel: null,
                                 Reason: safeReason,
-                                OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
+                                OccurredAt: DateTimeOffset.UtcNow,
+                                FromInstanceId: currentMember.RouteKey), CancellationToken.None);
                         }
                         catch (Exception histEx)
                         {
@@ -5714,6 +5852,7 @@ public sealed class PipelineRunner : IPipelineRunner
             var trialItem = item with
             {
                 Agent = nextMember.Agent,
+                AgentInstanceId = nextMember.RouteKey,
                 ModelId = nextMember.ModelId,
                 ReasoningMode = nextMember.ReasoningMode,
             };
@@ -5732,7 +5871,9 @@ public sealed class PipelineRunner : IPipelineRunner
                         ToAgent: nextMember.Agent,
                         ToModel: nextMember.ModelId,
                         Reason: safeReason,
-                        OccurredAt: DateTimeOffset.UtcNow), CancellationToken.None);
+                        OccurredAt: DateTimeOffset.UtcNow,
+                        FromInstanceId: currentMember.RouteKey,
+                        ToInstanceId: nextMember.RouteKey), CancellationToken.None);
                 }
                 catch (Exception histEx)
                 {
@@ -5773,7 +5914,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         while (true)
         {
-            triedKeys.Add((currentMember.Agent, currentMember.ModelId ?? string.Empty));
+            triedKeys.Add(TriedMemberKey(currentMember));
             triedCount++;
 
             var smokeAvailability = await EnsureAgentSmokeAvailableAsync(currentRunner.Kind, fallbackSmokeTarget, ct);
@@ -5843,7 +5984,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// fallback-history recording.
     /// </summary>
     private async Task<Guid?> RecordInvolvementStartAsync(
-        WorkItemId workItemId, AgentKind agent, string? modelId, string phase, int? iteration)
+        WorkItemId workItemId, AgentKind agent, string? agentInstanceId, string? modelId, string phase, int? iteration)
     {
         if (_involvement is null) return null;
 
@@ -5851,6 +5992,7 @@ public sealed class PipelineRunner : IPipelineRunner
             Id: Guid.NewGuid(),
             WorkItemId: workItemId,
             AgentKind: agent,
+            AgentInstanceId: agentInstanceId,
             ModelId: modelId,
             Phase: phase,
             StartedAt: DateTimeOffset.UtcNow,
@@ -6147,9 +6289,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var credential = _credentials is IProjectAwareCredentialProvider pac
-            ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-            : await _credentials.GetAsync(runner.Kind, ct);
+        var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
         var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
         var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
@@ -6329,7 +6469,9 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!mergeStructuredStreamCaptured)
                 await EmitToolCallCountsAsync(chosenMergeRunner.Kind, agentResult.Stdout, item.Id, "merge", mergeExecElapsedMs, ct);
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                chosenMergeRunner.Kind, item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
+                chosenMergeRunner.Kind,
+                chosenMergeRunner.Kind == item.Agent ? item.AgentInstanceId : null,
+                item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
             mergeSw.Stop();
             if (_availability is { } regOnMergeFinish)
             {
@@ -7946,9 +8088,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var isolatedRepoPath = await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct);
         try
         {
-            var credential = _credentials is IProjectAwareCredentialProvider pac
-                ? await pac.GetAsync(runner.Kind, project.CredentialProviderPriority, ct)
-                : await _credentials.GetAsync(runner.Kind, ct);
+            var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
             var access = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
             var conflictReworkTarget = new SandboxTarget(
                 project.NetworkProfiles.Rework ?? project.NetworkProfiles.Work,
@@ -8030,7 +8170,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // involvement row directly — otherwise this real sandbox run would
             // leave no audit-trail entry and break operator attribution.
             var conflictInvolvementId = await RecordInvolvementStartAsync(
-                item.Id, runner.Kind, item.ModelId, ConflictReworkPhaseKey, iteration: null);
+                item.Id, runner.Kind, item.AgentInstanceId, item.ModelId, ConflictReworkPhaseKey, iteration: null);
             try
             {
                 agentResult = await runner.RunAsync(
@@ -8057,7 +8197,7 @@ public sealed class PipelineRunner : IPipelineRunner
             stopwatch.Stop();
             var endedAt = DateTimeOffset.UtcNow;
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
-                runner.Kind, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt,
+                runner.Kind, item.AgentInstanceId, item.Id, ConflictReworkPhaseKey, iteration: null, startedAt, endedAt,
                 ResolveObservedModelId(runner, item.ModelId));
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
@@ -9770,6 +9910,7 @@ Original merge-phase failure (for context):
         string? stdout,
         string? stderr,
         AgentKind agentKind,
+        string? agentInstanceId,
         WorkItemId workItemId,
         string phase,
         int? iteration,
@@ -9808,6 +9949,7 @@ Original merge-phase failure (for context):
                 Phase = phase,
                 Iteration = iteration,
                 AgentKind = agentKind.Value,
+                AgentInstanceId = agentInstanceId,
                 ModelId = snapshot.ModelId,
                 InputTokens = snapshot.InputTokens,
                 CachedInputTokens = snapshot.CachedInputTokens,
@@ -9821,14 +9963,15 @@ Original merge-phase failure (for context):
             // the per-work-item cost rows (no double-counting — one emit per row).
             var model = snapshot.ModelId ?? "(default)";
             var agentTag = new KeyValuePair<string, object?>("agent.kind", agentKind.Value);
+            var agentInstanceTag = new KeyValuePair<string, object?>("agent.instance", agentInstanceId ?? agentKind.Value);
             var modelTag = new KeyValuePair<string, object?>("model", model);
-            CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, modelTag,
+            CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, agentInstanceTag, modelTag,
                 new KeyValuePair<string, object?>("token_type", "input"));
-            CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, modelTag,
+            CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, agentInstanceTag, modelTag,
                 new KeyValuePair<string, object?>("token_type", "cached_input"));
-            CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, modelTag,
+            CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, agentInstanceTag, modelTag,
                 new KeyValuePair<string, object?>("token_type", "output"));
-            CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, modelTag);
+            CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, agentInstanceTag, modelTag);
         }
         catch (Exception ex)
         {
@@ -9841,7 +9984,7 @@ Original merge-phase failure (for context):
             try
             {
                 await _usageStore.RecordAsync(
-                    BuildUsageEvent(agentKind, dispatchModelId, snapshot, usd, workItemId, endedAt),
+                    BuildUsageEvent(agentKind, agentInstanceId, dispatchModelId, snapshot, usd, workItemId, endedAt),
                     CancellationToken.None);
             }
             catch (Exception ex)
@@ -9881,11 +10024,22 @@ Original merge-phase failure (for context):
         AgentCostSnapshot snapshot,
         decimal usd,
         WorkItemId workItemId,
+        DateTimeOffset endedAt) =>
+        BuildUsageEvent(agentKind, null, dispatchModelId, snapshot, usd, workItemId, endedAt);
+
+    internal static AgentUsageEvent BuildUsageEvent(
+        AgentKind agentKind,
+        string? agentInstanceId,
+        string? dispatchModelId,
+        AgentCostSnapshot snapshot,
+        decimal usd,
+        WorkItemId workItemId,
         DateTimeOffset endedAt) => new()
         {
             Id = Guid.NewGuid().ToString(),
             TimeUtc = endedAt,
             AgentKind = agentKind.Value,
+            AgentInstanceId = agentInstanceId,
             ModelId = dispatchModelId,
             InputTokens = Math.Max(0, snapshot.InputTokens),
             CachedInputTokens = Math.Max(0, snapshot.CachedInputTokens),

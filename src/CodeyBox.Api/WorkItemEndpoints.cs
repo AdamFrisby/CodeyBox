@@ -266,7 +266,8 @@ internal static class WorkItemEndpoints
             StartedAt: r.StartedAt,
             EndedAt: r.EndedAt,
             Iteration: r.Iteration,
-            Outcome: r.Outcome);
+            Outcome: r.Outcome,
+            AgentInstanceId: r.AgentInstanceId);
 
     /// <summary>
     /// The agent that ran the original implementation. Distinct from
@@ -305,7 +306,9 @@ internal static class WorkItemEndpoints
             ToAgent: r.ToAgent?.Value,
             ToModel: r.ToModel,
             Reason: r.Reason,
-            OccurredAt: r.OccurredAt);
+            OccurredAt: r.OccurredAt,
+            FromInstanceId: r.FromInstanceId,
+            ToInstanceId: r.ToInstanceId);
 
     /// <summary>
     /// List all work items that directly depend on the given item. Useful for
@@ -1887,6 +1890,7 @@ internal static class WorkItemEndpoints
             Verdict: item.Verdict,
             OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString(),
             ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
+            AgentInstanceId: item.AgentInstanceId,
             TemplateName: item.TemplateName,
             TemplateEntryIndex: item.TemplateEntryIndex);
     }
@@ -2279,6 +2283,8 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     IReadOnlyList<AgentInvolvementDto>? AgentHistory = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? AgentInstanceId = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? WorkAgent = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? TemplateName = null,
@@ -2298,7 +2304,8 @@ public sealed record AgentInvolvementDto(
     DateTimeOffset StartedAt,
     DateTimeOffset? EndedAt,
     int? Iteration,
-    string? Outcome);
+    string? Outcome,
+    string? AgentInstanceId = null);
 
 public sealed record AgentFallbackDto(
     string Id,
@@ -2309,7 +2316,9 @@ public sealed record AgentFallbackDto(
     string? ToAgent,
     string? ToModel,
     string Reason,
-    DateTimeOffset OccurredAt);
+    DateTimeOffset OccurredAt,
+    string? FromInstanceId = null,
+    string? ToInstanceId = null);
 
 public sealed record ProjectDto(
     string Id,

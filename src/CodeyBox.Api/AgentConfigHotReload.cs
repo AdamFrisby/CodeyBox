@@ -151,7 +151,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var initial = _monitor.CurrentValue;
         _lastConcurrency = SerializeConcurrency(initial.AgentConcurrency);
         _lastBurn = SerializeBurn(initial.AgentBurnEstimator);
-        _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentScoreModifiers);
+        _lastRouter = SerializeRouterInputs(initial.AgentClasses, initial.AgentInstances, initial.AgentScoreModifiers);
         _lastPricing = SerializePricing(initial.AgentPricing);
         _lastBudgets = SerializeBudgets(initial.AgentBudgets);
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
@@ -510,14 +510,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private void ApplyRouterIfChanged(CodeyBoxOptions opts)
     {
-        var next = SerializeRouterInputs(opts.AgentClasses, opts.AgentScoreModifiers);
+        var next = SerializeRouterInputs(opts.AgentClasses, opts.AgentInstances, opts.AgentScoreModifiers);
         if (string.Equals(_lastRouter, next, StringComparison.Ordinal))
             return;
 
         var prev = _lastRouter;
         try
         {
-            var catalog = AgentClassesConfigBuilder.Build(opts.AgentClasses, _log);
+            var catalog = AgentClassesConfigBuilder.Build(opts.AgentClasses, opts.AgentInstances, _log);
             var todModifiers = AgentClassesConfigBuilder.BuildTodModifiers(opts.AgentScoreModifiers, _log);
             _router.ApplyConfigReload(catalog, todModifiers);
             _lastRouter = next;
@@ -722,10 +722,26 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
     private static string SerializeRouterInputs(
         List<AgentClassOptions> classes,
+        List<AgentInstanceOptions> instances,
         AgentScoreModifiersOptions modifiers) =>
         JsonSerializer.Serialize(
             new
             {
+                Instances = instances
+                    .Select(i => new
+                    {
+                        i.Id,
+                        i.Agent,
+                        i.CredentialFilePath,
+                        i.TokenEnvironmentVariable,
+                        i.AuthJsonEnvironmentVariable,
+                        i.SettingsFilePath,
+                        i.DestinationPath,
+                        i.SandboxEnvironmentVariable,
+                    })
+                    .OrderBy(i => i.Id, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(i => i.Agent, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
                 Classes = classes
                     .Select(c => new
                     {
@@ -735,8 +751,15 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                             .Select(m => new
                             {
                                 m.Agent,
+                                m.InstanceId,
                                 m.Billing,
                                 m.ModelId,
+                                m.CredentialFilePath,
+                                m.TokenEnvironmentVariable,
+                                m.AuthJsonEnvironmentVariable,
+                                m.SettingsFilePath,
+                                m.DestinationPath,
+                                m.SandboxEnvironmentVariable,
                                 m.QualityScore,
                                 m.ReasoningMode,
                                 Capabilities = m.Capabilities

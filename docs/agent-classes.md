@@ -40,6 +40,74 @@ Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
 }
 ```
 
+### Multiple instances of the same agent kind
+
+A class member can name a stable `InstanceId`, turning the member into a
+separate routable instance such as `claude/acct-a`. Use this when you have
+multiple subscriptions for the same CLI kind and want CodeyBox to pool them.
+The router tracks quota, concurrency, fallback history, usage, and cost rows
+by instance route key while execution still runs the same underlying agent CLI.
+
+Reusable instance credentials can be declared under `CodeyBox:AgentInstances`
+and referenced from class members by `InstanceId`:
+
+```json
+{
+  "CodeyBox": {
+    "AgentInstances": [
+      {
+        "Agent": "claude",
+        "Id": "acct-a",
+        "CredentialFilePath": "/var/lib/codeybox/credentials/claude-acct-a.json"
+      },
+      {
+        "Agent": "claude",
+        "Id": "acct-b",
+        "TokenEnvironmentVariable": "CLAUDE_ACCT_B_TOKEN"
+      }
+    ],
+    "AgentClasses": [
+      {
+        "Id": "frontier-coding",
+        "Members": [
+          { "Agent": "claude", "InstanceId": "acct-a", "Billing": "Subscription", "QualityScore": 100 },
+          { "Agent": "claude", "InstanceId": "acct-b", "Billing": "Subscription", "QualityScore": 99 },
+          { "Agent": "codex",  "Billing": "Subscription", "QualityScore": 100 }
+        ]
+      }
+    ],
+    "AgentConcurrency": {
+      "Members": {
+        "claude/acct-a": { "MaxConcurrent": 1 },
+        "claude/acct-b": { "MaxConcurrent": 1 },
+        "codex": { "MaxConcurrent": 1 }
+      }
+    }
+  }
+}
+```
+
+When `claude/acct-a` is exhausted or rate-limited, fallback can move to
+`claude/acct-b` before trying a weaker or different kind. The VM receives only
+the selected instance's credential bundle for that invocation.
+
+For simple single-credential deployments, omit `InstanceId` and
+`AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
+and behavior is unchanged.
+
+Credential fields can also be declared inline on a member when you do not need
+a reusable top-level instance:
+
+```json
+{
+  "Agent": "codex",
+  "InstanceId": "team-a",
+  "Billing": "Subscription",
+  "QualityScore": 100,
+  "AuthJsonEnvironmentVariable": "CODEX_TEAM_A_AUTH_JSON"
+}
+```
+
 ### Slotting opencode
 
 opencode fronts multiple model providers (DeepSeek, Anthropic, OpenAI, …)
@@ -96,8 +164,15 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 | Field | Required | Description |
 |-------|----------|-------------|
 | `Agent` | yes | Agent kind value: `claude`, `codex`, `copilot`, `gemini`, or any custom kind. |
+| `InstanceId` | no | Stable instance id for pooling multiple credentials of the same kind. `acct-a` resolves to route key `agent/acct-a`; a full `agent/acct-a` route key is also accepted when its prefix matches `Agent`. |
 | `Billing` | yes | `Subscription` or `PayPerApi` (see below). |
 | `ModelId` | no | Optional model override passed to the agent CLI as `--model`. |
+| `CredentialFilePath` | no | Inline host OAuth/auth JSON file for this member instance. |
+| `TokenEnvironmentVariable` | no | Inline host environment variable containing a raw token or API key for this member instance. |
+| `AuthJsonEnvironmentVariable` | no | Inline host environment variable containing CLI auth JSON for this member instance. |
+| `SettingsFilePath` | no | Optional companion settings file, currently used by Gemini OAuth. |
+| `DestinationPath` | no | Optional sandbox destination path for file-materializing runners. |
+| `SandboxEnvironmentVariable` | no | Optional override for the sandbox environment variable used for token injection. |
 | `QualityScore` | **yes** | Operator-curated capability score on a 0–200 scale. No silent default; startup rejects missing scores with a migration message. |
 | `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
 | `Capabilities` | no | List of clearance/trust tags this member is allowed to handle (e.g. `["sensitive", "architectural"]`). Default empty — a member with no tags can only run work items that require no tags. See [Capability gate](#capability-gate) below. |
@@ -325,8 +400,8 @@ On every pickup attempt for a work item with an `AgentClassId`:
    then original config order.
 5. **Probe quota** in sorted order:
    - `PayPerApi` → treat as available (no HTTP call).
-   - `Subscription` → call the registered `IAgentQuotaProbe`, cache result for
-     `QuotaCacheTtl` (default 60 s).
+   - `Subscription` → call the registered `IAgentQuotaProbe` for that member
+     instance, cache result for `QuotaCacheTtl` (default 60 s).
    - If `ModelId` is set and the snapshot includes `PerModel[ModelId]`, gate
      on the model bucket instead of the overall quota.
    - Unknown (`AvailablePct < 0`) follows `UnknownPolicy` (`UseObservedFailures`
@@ -515,6 +590,10 @@ At startup the orchestrator validates the `AgentClasses` config:
 - Each member `Billing` is `Subscription` or `PayPerApi`.
 - Each member has a `QualityScore` in 0–200. Missing scores are **rejected**
   with a migration message: add `QualityScore=N; see docs/agent-classes.md`.
+- Duplicate `(route key, ModelId)` members are rejected. To pool multiple
+  same-kind subscriptions, give them distinct `InstanceId` values.
+- Full route-key instance ids such as `claude/acct-a` must have a prefix that
+  matches the member or instance `Agent`.
 - Gemini members with `QualityScore ≥ 90` must have `ReasoningMode="high"`.
 - A class with only Subscription members emits a startup **warning**:
   > AgentClass 'X' has no PayPerApi fallback — items may wait indefinitely

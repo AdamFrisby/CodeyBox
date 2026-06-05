@@ -31,6 +31,26 @@ public sealed record AgentMembership
     public required AgentBilling Billing { get; init; }
 
     /// <summary>
+    /// Optional stable instance identifier for this membership. Null means the
+    /// default single instance for <see cref="Agent"/>; named instances route as
+    /// <c>{agent}/{instance}</c> via <see cref="RouteKey"/>.
+    /// </summary>
+    public string? InstanceId { get; init; }
+
+    /// <summary>
+    /// Per-instance credential source. When null, the legacy per-kind
+    /// credential chain is used.
+    /// </summary>
+    public AgentCredentialReference? CredentialReference { get; init; }
+
+    /// <summary>
+    /// Stable routing/accounting key for this member. Default legacy members
+    /// return the bare agent kind (for example <c>claude</c>); named members
+    /// return <c>claude/acct-a</c>.
+    /// </summary>
+    public string RouteKey => AgentInstanceIds.RouteKey(Agent, InstanceId);
+
+    /// <summary>
     /// Optional model override, e.g. "claude-opus-4-7", "codex-5.5". When set,
     /// the orchestrator passes <c>--model &lt;ModelId&gt;</c> to the agent CLI.
     /// Null means the agent uses its own default. Copilot ignores this field
@@ -113,6 +133,83 @@ public enum AgentBilling
     /// the call to fail. The orchestrator never waits for PayPerApi members.
     /// </summary>
     PayPerApi,
+}
+
+/// <summary>
+/// A configured credential source for one routable agent instance. Exactly how
+/// the source is materialized is agent-specific: file-based CLIs receive the
+/// file JSON through their existing sandbox env vars, token-based CLIs receive
+/// the selected token under the CLI's expected env var.
+/// </summary>
+public sealed record AgentCredentialReference
+{
+    /// <summary>Host file containing OAuth/auth JSON for this instance.</summary>
+    public string? FilePath { get; init; }
+
+    /// <summary>Host env var containing a raw access token or API key.</summary>
+    public string? TokenEnvironmentVariable { get; init; }
+
+    /// <summary>Host env var containing CLI auth JSON for this instance.</summary>
+    public string? AuthJsonEnvironmentVariable { get; init; }
+
+    /// <summary>Optional companion settings file, used by Gemini OAuth.</summary>
+    public string? SettingsFilePath { get; init; }
+
+    /// <summary>Optional sandbox destination path for file-materializing runners.</summary>
+    public string? DestinationPath { get; init; }
+
+    /// <summary>Optional override for the sandbox env var used for token injection.</summary>
+    public string? SandboxEnvironmentVariable { get; init; }
+
+    public bool HasAnyReference =>
+        !string.IsNullOrWhiteSpace(FilePath)
+        || !string.IsNullOrWhiteSpace(TokenEnvironmentVariable)
+        || !string.IsNullOrWhiteSpace(AuthJsonEnvironmentVariable)
+        || !string.IsNullOrWhiteSpace(SettingsFilePath)
+        || !string.IsNullOrWhiteSpace(DestinationPath)
+        || !string.IsNullOrWhiteSpace(SandboxEnvironmentVariable);
+}
+
+/// <summary>Helpers for stable agent instance route keys.</summary>
+public static class AgentInstanceIds
+{
+    public static string RouteKey(AgentKind kind, string? instanceId)
+    {
+        var agent = kind.Value.Trim();
+        var id = NormalizeInstanceId(instanceId);
+        if (id is null)
+            return agent;
+
+        return id.Contains('/', StringComparison.Ordinal)
+            ? id
+            : $"{agent}/{id}";
+    }
+
+    public static string? NormalizeInstanceId(string? instanceId)
+    {
+        if (string.IsNullOrWhiteSpace(instanceId))
+            return null;
+        return instanceId.Trim();
+    }
+
+    public static string KindFromRouteKey(string routeKey)
+    {
+        var trimmed = routeKey.Trim();
+        var slash = trimmed.IndexOf('/');
+        return slash < 0 ? trimmed : trimmed[..slash];
+    }
+
+    public static bool Matches(AgentMembership member, string? routeKeyOrInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(routeKeyOrInstanceId))
+            return false;
+
+        var candidate = routeKeyOrInstanceId.Trim();
+        return string.Equals(member.RouteKey, candidate, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(member.InstanceId, candidate, StringComparison.OrdinalIgnoreCase)
+            || (candidate.Contains('/', StringComparison.Ordinal)
+                && string.Equals(RouteKey(member.Agent, candidate), member.RouteKey, StringComparison.OrdinalIgnoreCase));
+    }
 }
 
 /// <summary>Convenience helpers for inspecting <see cref="AgentMembership"/> capability tags.</summary>

@@ -27,17 +27,17 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     internal const string UsageEndpoint = "https://api.anthropic.com/api/oauth/usage";
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
+    private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly Func<ClaudeQuotaProbeResilienceOptions> _resilienceProvider;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ClaudeQuotaProbe> _log;
 
-    // Single-entry cache: (token, snapshot, expiry). Protected by _lock.
-    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Single-entry cache: (route key, token, snapshot, expiry). Protected by _lock.
+    private (string RouteKey, string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     // Last successful fetch's underlying snapshot + when it was captured.
     // Surfaced as a stale-but-retained reading on transient failures.
-    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset CapturedAt)? _lastKnownGood;
+    private (string RouteKey, string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset CapturedAt)? _lastKnownGood;
     private int _consecutiveFailures;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
@@ -62,6 +62,15 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         Func<AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<ClaudeQuotaProbe> log)
+        : this(httpClientFactory, _ => credentialsProvider(), cacheTtl, log)
+    {
+    }
+
+    public ClaudeQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<ClaudeQuotaProbe> log)
         : this(httpClientFactory, credentialsProvider, cacheTtl, log,
                resilienceProvider: null, timeProvider: null)
     {
@@ -70,6 +79,17 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     public ClaudeQuotaProbe(
         IHttpClientFactory httpClientFactory,
         Func<AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<ClaudeQuotaProbe> log,
+        Func<ClaudeQuotaProbeResilienceOptions>? resilienceProvider,
+        TimeProvider? timeProvider)
+        : this(httpClientFactory, _ => credentialsProvider(), cacheTtl, log, resilienceProvider, timeProvider)
+    {
+    }
+
+    public ClaudeQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<ClaudeQuotaProbe> log,
         Func<ClaudeQuotaProbeResilienceOptions>? resilienceProvider,
@@ -85,10 +105,11 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        var credentials = _credentialsProvider();
+        var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
+        var routeKey = member.RouteKey;
 
         AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct);
@@ -96,6 +117,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         {
             var now = _timeProvider.GetUtcNow();
             if (_cache is { } entry
+                && string.Equals(entry.RouteKey, routeKey, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
                 && now < entry.ExpiresAt)
             {
@@ -103,8 +125,8 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
             }
             else
             {
-                snapshot = await FetchWithResilienceAsync(token, ct);
-                _cache = (token, snapshot, _timeProvider.GetUtcNow() + _cacheTtl);
+                snapshot = await FetchWithResilienceAsync(routeKey, token, ct);
+                _cache = (routeKey, token, snapshot, _timeProvider.GetUtcNow() + _cacheTtl);
             }
         }
         finally
@@ -183,7 +205,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     /// exponential backoff. On terminal failure, retains a stale last-known-good
     /// snapshot until either too many consecutive failures or staleness expiry.
     /// </summary>
-    private async Task<AgentQuotaSnapshot> FetchWithResilienceAsync(string token, CancellationToken ct)
+    private async Task<AgentQuotaSnapshot> FetchWithResilienceAsync(string routeKey, string token, CancellationToken ct)
     {
         var opts = _resilienceProvider();
         var totalAttempts = Math.Max(1, opts.MaxRetries + 1);
@@ -207,7 +229,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
                 // AvailablePct=-1, and retaining that as "last-known-good" would
                 // disable the staleness floor itself.
                 if (last.Snapshot!.AvailablePct >= 0)
-                    _lastKnownGood = (token, last.Snapshot!, _timeProvider.GetUtcNow());
+                    _lastKnownGood = (routeKey, token, last.Snapshot!, _timeProvider.GetUtcNow());
                 return last.Snapshot!;
             }
             if (last.Outcome == ProbeOutcome.PermanentFailure)
@@ -226,7 +248,7 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
         // as ONE consecutive failure (the inner retries already burned).
         _consecutiveFailures++;
 
-        return BuildStaleOrUnknown(token, last.Reason ?? "network error", opts);
+        return BuildStaleOrUnknown(routeKey, token, last.Reason ?? "network error", opts);
     }
 
     private async Task<ProbeAttemptResult> ProbeOnceAsync(string token, CancellationToken ct)
@@ -268,11 +290,14 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe
     }
 
     private AgentQuotaSnapshot BuildStaleOrUnknown(
+        string routeKey,
         string token,
         string reason,
         ClaudeQuotaProbeResilienceOptions opts)
     {
-        if (_lastKnownGood is { } lkg && string.Equals(lkg.AccessToken, token, StringComparison.Ordinal))
+        if (_lastKnownGood is { } lkg
+            && string.Equals(lkg.RouteKey, routeKey, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(lkg.AccessToken, token, StringComparison.Ordinal))
         {
             var age = _timeProvider.GetUtcNow() - lkg.CapturedAt;
             if (_consecutiveFailures <= opts.MaxConsecutiveFailures && age <= opts.MaxStaleness)

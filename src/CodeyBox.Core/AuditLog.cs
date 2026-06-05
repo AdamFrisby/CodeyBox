@@ -945,6 +945,11 @@ public static class AuditLog
             .Information("Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
                 agent.Value, classId, availablePct, resetAt, notes);
 
+    public static void QuotaProbed(AgentKind agent, string instanceId, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>
+        Audit("quota_router.probed")
+            .Information("Quota probe: agent={Agent} instance={AgentInstance} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
+                agent.Value, instanceId, classId, availablePct, resetAt, notes);
+
     public static void QuotaRouterWaiting(string classId, WorkItemId id, TimeSpan recheckIn) =>
         Audit("quota_router.waiting")
             .Warning("Quota router: work item {WorkItemId} waiting — all members of class '{ClassId}' are exhausted; recheck in {RecheckMs}ms",

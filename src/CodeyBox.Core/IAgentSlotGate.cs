@@ -32,9 +32,21 @@ public interface IAgentSlotGate
     bool TryReserve(AgentKind agent);
 
     /// <summary>
+    /// Atomically tries to reserve a slot for a specific routed member
+    /// instance. Implementations that have not opted into instance accounting
+    /// fall back to the per-kind gate.
+    /// </summary>
+    bool TryReserve(AgentMembership member) => TryReserve(member.Agent);
+
+    /// <summary>
     /// Releases a slot previously reserved via <see cref="TryReserve"/>.
     /// Calling Release without a prior successful TryReserve is undefined
     /// behaviour (and will under-count in-flight workers).
     /// </summary>
     void Release(AgentKind agent);
+
+    /// <summary>
+    /// Releases a slot previously reserved via <see cref="TryReserve(AgentMembership)"/>.
+    /// </summary>
+    void Release(AgentMembership member) => Release(member.Agent);
 }

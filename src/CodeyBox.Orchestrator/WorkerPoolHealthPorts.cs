@@ -27,6 +27,8 @@ public sealed record WorkerPoolHealthCandidate(WorkItemId Id, WorkItemState Stat
 public interface IAgentCapacitySnapshot
 {
     bool HasCapacity(AgentKind agent);
+
+    bool HasCapacity(AgentMembership member) => HasCapacity(member.Agent);
 }
 
 public enum AgentRoutingReadinessState

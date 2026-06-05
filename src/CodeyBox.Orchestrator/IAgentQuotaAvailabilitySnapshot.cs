@@ -18,6 +18,16 @@ public interface IAgentQuotaAvailabilitySnapshot
     /// probe has run.
     /// </summary>
     IReadOnlyList<(AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailability();
+
+    /// <summary>
+    /// Instance-aware variant of <see cref="SnapshotQuotaAvailability"/>.
+    /// Implementations that do not track instances return the legacy kind as
+    /// the instance id.
+    /// </summary>
+    IReadOnlyList<(string InstanceId, AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailabilityByInstance() =>
+        SnapshotQuotaAvailability()
+            .Select(row => (row.Agent.Value, row.Agent, row.ModelId, row.AvailablePct))
+            .ToList();
 }
 
 /// <summary>

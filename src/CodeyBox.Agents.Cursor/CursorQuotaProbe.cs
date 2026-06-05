@@ -60,11 +60,11 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
     ];
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
+    private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<CursorQuotaProbe> _log;
 
-    private (string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    private (string RouteKey, string AccessToken, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     private readonly HashSet<(string Token, string ModelId)> _loggedMissingModels = new();
@@ -86,6 +86,15 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         Func<AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<CursorQuotaProbe> log)
+        : this(httpClientFactory, _ => credentialsProvider(), cacheTtl, log)
+    {
+    }
+
+    public CursorQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<CursorQuotaProbe> log)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
@@ -95,16 +104,18 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        var credentials = _credentialsProvider();
+        var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
+        var routeKey = member.RouteKey;
 
         AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct);
         try
         {
             if (_cache is { } entry
+                && string.Equals(entry.RouteKey, routeKey, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
                 && DateTimeOffset.UtcNow < entry.ExpiresAt)
             {
@@ -113,7 +124,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             else
             {
                 snapshot = await FetchAsync(token, ct);
-                _cache = (token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+                _cache = (routeKey, token, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             }
         }
         finally

@@ -26,7 +26,8 @@ public sealed record AgentInvolvement(
     DateTimeOffset StartedAt,
     DateTimeOffset? EndedAt,
     int? Iteration,
-    string? Outcome);
+    string? Outcome,
+    string? AgentInstanceId = null);
 
 /// <summary>
 /// Durable, append-only store of per-phase agent involvement. Surfaced on the

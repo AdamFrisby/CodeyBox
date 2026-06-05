@@ -21,6 +21,13 @@ public interface IAgentRunningCounters
     int GetRunning(AgentKind agent);
 
     /// <summary>
+    /// Returns the number of workers currently running on a specific routed
+    /// member instance. Implementations that have not opted into instance
+    /// accounting fall back to the per-kind count.
+    /// </summary>
+    int GetRunning(AgentMembership member) => GetRunning(member.Agent);
+
+    /// <summary>
     /// Snapshot of every agent kind that has currently-in-flight items.
     /// Empty when nothing is running.
     /// </summary>
