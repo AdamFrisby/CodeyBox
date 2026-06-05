@@ -2156,7 +2156,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (_classRouter is not null && classId is not null)
         {
             foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(
-                item, project, ct, resolverSmokeTarget))
+                item, project, ct, resolverSmokeTarget, requireQuota: false))
             {
                 if (seenMembers.Contains(member.RouteKey))
                     continue;
@@ -5576,7 +5576,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (budgetPct < 0)
                 return (true, "no probe registered");
 
-            var budgetQuota = new EffectiveQuota(budgetPct, budget?.ResetAt, null, budget?.Windows);
+            var budgetQuota = new EffectiveQuota(budgetPct, null, null, budget?.Windows);
             return EvaluateAuditQuotaGate(member, budgetQuota, budgetOnly: true);
         }
 
@@ -6080,7 +6080,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         candidate,
                         new EffectiveQuota(
                             budgetPct,
-                            budgetSnapshot.ResetAt,
+                            null,
                             null,
                             budgetSnapshot.Windows),
                         DateTimeOffset.UtcNow);

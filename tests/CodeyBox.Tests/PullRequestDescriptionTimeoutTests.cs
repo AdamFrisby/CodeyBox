@@ -14,6 +14,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PullRequestDescriptionTimeoutTests
 {
+    private static readonly TimeSpan TestHangGuard = TimeSpan.FromSeconds(30);
+
     private static readonly GitHubUpstreamOptions TimeoutOpts = new()
     {
         Owner = "myorg",
@@ -62,7 +64,7 @@ public sealed class PullRequestDescriptionTimeoutTests
 
         // Must not hang indefinitely — the timeout cancels the generator.
         var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(30)); // Guard so the test itself doesn't hang.
+            .WaitAsync(TestHangGuard); // Guard so the test itself doesn't hang.
 
         Assert.True(outcome.BranchPushed);
         Assert.NotNull(outcome.PullRequestUrl);
@@ -84,7 +86,7 @@ public sealed class PullRequestDescriptionTimeoutTests
         // contention; the happy path still resolves within tens of ms once the
         // 50 ms generator timeout fires.
         await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(30));
+            .WaitAsync(TestHangGuard);
 
         Assert.Single(handler.RequestBodies);
         Assert.Contains("Static description", handler.RequestBodies[0]);
@@ -106,7 +108,7 @@ public sealed class PullRequestDescriptionTimeoutTests
         // contention; the happy path still resolves within tens of ms once the
         // 50 ms generator timeout fires.
         await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(30));
+            .WaitAsync(TestHangGuard);
 
         Assert.Contains("Co-Authored-By: CodeyBox", handler.RequestBodies[0]);
     }

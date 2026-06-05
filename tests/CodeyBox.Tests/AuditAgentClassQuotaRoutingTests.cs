@@ -578,6 +578,43 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         Assert.Equal([AgentKind.Gemini], auditor.Invocations);
     }
 
+    [Fact]
+    public async Task NoAuditProbe_BudgetResetDoesNotDriveProviderRampFloor()
+    {
+        // With no real audit probe, a local budget is the only concrete gate.
+        // Its reset timestamp is not a provider quota-window reset, so the gate
+        // must fall back to MinQuotaPct instead of applying the early-window
+        // StartFloorPct ramp. Budget 20% is healthy against MinQuotaPct=10 but
+        // would be rejected against StartFloorPct=25 if the reset leaked through.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RecordingLlmAuditor("security:llm-review");
+        var auditOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        using var fix = BuildFixture(seed, auditor,
+            classMembers: [AgentKind.Gemini, AgentKind.Codex],
+            quotas: new() { [AgentKind.Gemini] = 80.0, [AgentKind.Codex] = 80.0 },
+            budgetProvider: new FakeBudgetProvider(
+                new() { [AgentKind.Gemini] = 20.0 },
+                resetAt: DateTimeOffset.UtcNow + TimeSpan.FromDays(7)),
+            registerAuditProbes: false,
+            auditQuotaOptions: auditOptions);
+        fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([AgentKind.Gemini], auditor.Invocations);
+    }
+
     // ── Harness ─────────────────────────────────────────────────────────────
 
     private RoutingFixture BuildFixture(

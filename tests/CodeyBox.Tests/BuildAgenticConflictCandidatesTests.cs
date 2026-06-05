@@ -434,6 +434,59 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
     }
 
     [Fact]
+    public async Task ClassFallback_UsesAuditQuotaPolicyRatherThanRouterPrefilter()
+    {
+        // The work router's global early-window ramp would reject Codex at 1%.
+        // The conflict resolver has explicit audit quota options that lower the
+        // Codex floor to 1%, so OrderedFallbackCandidatesAsync must only smoke-
+        // check candidates here and leave quota gating to the audit policy.
+        var primary = new FakeAgentRunner(AgentKind.Claude);
+        var codex = new FakeAgentRunner(AgentKind.Codex);
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        var auditOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        auditOptions.FloorByAgent[AgentKind.Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+
+        var fixture = BuildFixture(
+            runners: [primary, codex],
+            members: [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 90 },
+            ],
+            quotaProbes: [
+                new StaticQuotaProbe(AgentKind.Claude, 80.0, reset),
+                new StaticQuotaProbe(AgentKind.Codex, 1.0, reset),
+            ],
+            routerQuotaOptions: routerOptions,
+            auditQuotaOptions: auditOptions);
+
+        var item = NewItem(AgentKind.Claude);
+        await fixture.Store.CreateAsync(item);
+
+        var candidates = await fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
+            item, fixture.Project, primary, CancellationToken.None);
+
+        Assert.Contains(candidates, c => c.Runner.Kind == AgentKind.Codex);
+    }
+
+    [Fact]
     public async Task RebaseSmokeGateUsesRebaseSandboxProfileFallback_AndRejectsBenchedResolver()
     {
         var primary = new FakeAgentRunner(AgentKind.Claude);
@@ -579,7 +632,10 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         AgentConcurrencyOptions? agentConcurrency = null,
         IAgentBudgetProvider? budgetProvider = null,
         ProjectNetworkProfiles? networkProfiles = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IReadOnlyList<IAgentQuotaProbe>? quotaProbes = null,
+        QuotaRouterOptions? routerQuotaOptions = null,
+        QuotaRouterOptions? auditQuotaOptions = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -598,8 +654,8 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         };
         var router = new AgentClassRouter(
             [agentClass],
-            probes: [],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            probes: quotaProbes ?? [],
+            routerQuotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance);
 
         var project = new Project
@@ -631,7 +687,8 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
             classRouter: router,
             agentRunningCounters: runningCounters,
             agentConcurrency: agentConcurrency,
-            auditQuotaOptions: new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            auditQuotaProbes: quotaProbes,
+            auditQuotaOptions: auditQuotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 },
             budgetProvider: budgetProvider,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
@@ -724,6 +781,28 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         }
         public Task<IReadOnlyList<AgentBudgetUsageView>> SummariseAllAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<AgentBudgetUsageView>>([]);
+    }
+
+    private sealed class StaticQuotaProbe : IAgentQuotaProbe
+    {
+        private readonly double _availablePct;
+        private readonly DateTimeOffset? _resetAt;
+
+        public StaticQuotaProbe(AgentKind kind, double availablePct, DateTimeOffset? resetAt = null)
+        {
+            Kind = kind;
+            _availablePct = availablePct;
+            _resetAt = resetAt;
+        }
+
+        public AgentKind Kind { get; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(new AgentQuotaSnapshot
+            {
+                AvailablePct = _availablePct,
+                ResetAt = _resetAt,
+            });
     }
 
 }
