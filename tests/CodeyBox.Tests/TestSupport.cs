@@ -107,7 +107,8 @@ internal static class TestSupport
         ITaskQueue? taskQueue = null,
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         IAgentInvolvementStore? involvement = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IAuditProgressStore? auditProgressOverride = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -193,7 +194,8 @@ internal static class TestSupport
                 resolvedOptions),
             dispatchAvailability: inVmSmokeGate is null
                 ? null
-                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate));
+                : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            auditProgress: auditProgressOverride ?? store);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

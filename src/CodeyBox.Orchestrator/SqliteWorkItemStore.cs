@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
 using CodeyBox.Core;
 
@@ -10,8 +11,12 @@ namespace CodeyBox.Orchestrator;
 /// Schema is created on first use; intentionally minimal — most fields are
 /// stored as columns so the orchestrator can query by state at startup.
 /// </summary>
-public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
+public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, IDisposable
 {
+    private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() },
+    };
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
@@ -64,6 +69,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             // Additive migration: add depends_on_json column if it doesn't exist yet.
             // Existing rows get the default '[]' so behaviour is unchanged.
             RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
+
+            // Workflow-owned audit progress history. This is separate from
+            // audit_reports, which is diagnostic storage and may be retention-swept.
+            using (var auditProgressCmd = _conn.CreateCommand())
+            {
+                auditProgressCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS work_item_audit_progress (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        work_attempt_started_at TEXT NOT NULL,
+                        iteration INTEGER NOT NULL,
+                        max_iterations INTEGER NOT NULL,
+                        blocking_findings INTEGER NOT NULL,
+                        non_blocking_findings INTEGER NOT NULL,
+                        blocking_finding_ids_json TEXT NOT NULL,
+                        blocking_findings_json TEXT NOT NULL,
+                        findings_json TEXT NOT NULL,
+                        work_branch_tip TEXT,
+                        recorded_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, work_attempt_started_at, iteration)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_work_item_audit_progress_attempt
+                        ON work_item_audit_progress(work_item_id, work_attempt_started_at, iteration);
+                    """;
+                auditProgressCmd.ExecuteNonQuery();
+            }
 
             // Additive migration: add agent_class_id column for quota-aware routing.
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
@@ -153,6 +183,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
             // Additive migration: dispatch priority. Default 0 preserves FIFO behaviour
             // for existing rows. Higher values pick up first; ties break by created_at ASC.
             RunMigration("ALTER TABLE work_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;");
+
+            // Explicit per-item audit budget knobs. Nullable: existing rows use the
+            // project audit profile's max iteration policy.
+            RunMigration("ALTER TABLE work_items ADD COLUMN audit_max_iterations INTEGER;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN audit_complexity TEXT;");
 
             // Index for the priority-aware pickup query: state filter first, then priority,
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
@@ -354,6 +389,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
+                        audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
                         job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
@@ -364,6 +400,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
+                        $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
                         $job_type, $check_spec, $check_verdict, $origin_check,
@@ -442,14 +479,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
-            // prompt / prompt_revision / priority / external_id(s) are excluded
+            // prompt / prompt_revision / priority / audit budget / external_id(s) are excluded
             // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
             // snapshot taken at pickup time; writing those columns from the
             // snapshot would clobber a concurrent PUT /workitems/{id}/prompt,
-            // POST /workitems/{id}/priority, or PATCH /workitems/{id}/external-ids
+            // POST /workitems/{id}/priority, PATCH /workitems/{id} audit budget,
+            // or PATCH /workitems/{id}/external-ids
             // that landed mid-pipeline. Use TryReplacePromptAsync /
-            // UpdatePriorityAsync / ReplaceExternalIdsAsync to mutate them safely;
-            // routine state transitions leave them alone.
+            // UpdatePriorityAsync / UpdateAuditBudgetAsync /
+            // ReplaceExternalIdsAsync to mutate them safely; routine state
+            // transitions leave them alone.
             cmd.CommandText = """
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
@@ -509,7 +548,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         try
         {
             using var cmd = _conn.CreateCommand();
-            // See UpdateAsync — prompt / prompt_revision / priority / external_id(s)
+            // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s)
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
             cmd.CommandText = """
                 UPDATE work_items SET
@@ -728,6 +767,65 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
             throw HandleDiskFull("UpdateDependsOnAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+        WorkItemId id,
+        int? auditMaxIterations,
+        string? auditComplexity,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            WorkItem? current;
+            using (var read = _conn.CreateCommand())
+            {
+                read.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+                read.Parameters.AddWithValue("$id", id.ToString());
+                using var reader = await read.ExecuteReaderAsync(ct);
+                current = await reader.ReadAsync(ct) ? Read(reader) : null;
+            }
+
+            if (current is null)
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null);
+
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+
+            if (WorkItemDependencies.TerminalStates.Contains(current.State))
+                return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.TerminalState, current);
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    audit_max_iterations = $audit_max_iterations,
+                    audit_complexity = $audit_complexity,
+                    updated_at = $updated_at
+                WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$audit_max_iterations", (object?)auditMaxIterations ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$audit_complexity", (object?)auditComplexity ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$updated_at", updatedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            var updated = current with
+            {
+                AuditMaxIterations = auditMaxIterations,
+                AuditComplexity = auditComplexity,
+                UpdatedAt = updatedAt,
+            };
+            return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.Updated, updated);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("UpdateAuditBudgetAsync", sqlex);
         }
         finally
         {
@@ -1346,6 +1444,91 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         return results;
     }
 
+    public async Task RecordAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        AuditProgressRecord progress,
+        DateTimeOffset recordedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO work_item_audit_progress (
+                    work_item_id, work_attempt_started_at, iteration, max_iterations,
+                    blocking_findings, non_blocking_findings, blocking_finding_ids_json,
+                    blocking_findings_json, findings_json, work_branch_tip, recorded_at)
+                VALUES (
+                    $wi, $attempt, $iter, $max, $blocking, $non_blocking, $blocking_ids,
+                    $blocking_findings, $findings, $tip, $recorded_at)
+                ON CONFLICT(work_item_id, work_attempt_started_at, iteration) DO UPDATE SET
+                    max_iterations = excluded.max_iterations,
+                    blocking_findings = excluded.blocking_findings,
+                    non_blocking_findings = excluded.non_blocking_findings,
+                    blocking_finding_ids_json = excluded.blocking_finding_ids_json,
+                    blocking_findings_json = excluded.blocking_findings_json,
+                    findings_json = excluded.findings_json,
+                    work_branch_tip = excluded.work_branch_tip,
+                    recorded_at = excluded.recorded_at;
+                """;
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+            cmd.Parameters.AddWithValue("$iter", progress.Iteration);
+            cmd.Parameters.AddWithValue("$max", progress.MaxIterations);
+            cmd.Parameters.AddWithValue("$blocking", progress.BlockingFindings);
+            cmd.Parameters.AddWithValue("$non_blocking", progress.NonBlockingFindings);
+            cmd.Parameters.AddWithValue("$blocking_ids", JsonSerializer.Serialize(progress.BlockingFindingIds, JsonOpts));
+            cmd.Parameters.AddWithValue("$blocking_findings", JsonSerializer.Serialize(progress.BlockingFindingsDetails, JsonOpts));
+            cmd.Parameters.AddWithValue("$findings", JsonSerializer.Serialize(progress.Findings, JsonOpts));
+            cmd.Parameters.AddWithValue("$tip", (object?)progress.WorkBranchTip ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$recorded_at", recordedAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("RecordAuditProgressAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<AuditProgressRecord>> GetAuditProgressAsync(
+        WorkItemId workItemId,
+        DateTimeOffset? workAttemptStartedAt,
+        CancellationToken ct = default)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
+                   blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip
+            FROM work_item_audit_progress
+            WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
+            ORDER BY iteration ASC;
+            """;
+        cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+        cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
+
+        var results = new List<AuditProgressRecord>();
+        using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            results.Add(new AuditProgressRecord(
+                Iteration: reader.GetInt32(0),
+                MaxIterations: reader.GetInt32(1),
+                BlockingFindings: reader.GetInt32(2),
+                NonBlockingFindings: reader.GetInt32(3),
+                BlockingFindingIds: DeserializeStringList(reader.GetString(4)),
+                BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(5)),
+                Findings: DeserializeAuditProgressFindings(reader.GetString(6)),
+                WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7)));
+        }
+        return results;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -1353,6 +1536,106 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
 
         _conn.Dispose();
         _writeLock.Dispose();
+    }
+
+    private static string AuditProgressAttemptKey(DateTimeOffset? workAttemptStartedAt)
+        => workAttemptStartedAt?.ToString("O") ?? "";
+
+    private static IReadOnlyList<string> DeserializeStringList(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(json, JsonOpts) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static IReadOnlyList<AuditProgressFinding> DeserializeAuditProgressFindings(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var findings = new List<AuditProgressFinding>();
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var auditorName = ReadStringProperty(element, "auditorName")
+                    ?? ReadStringProperty(element, "auditor")
+                    ?? string.Empty;
+                findings.Add(new AuditProgressFinding(
+                    auditorName,
+                    ReadAuditSeverity(element),
+                    ReadStringProperty(element, "title") ?? string.Empty,
+                    ReadStringProperty(element, "description") ?? string.Empty,
+                    ReadStringProperty(element, "location")));
+            }
+
+            return findings;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static string? ReadStringProperty(JsonElement element, string name)
+    {
+        if (!TryGetPropertyIgnoreCase(element, name, out var property)
+            || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        return property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : property.ToString();
+    }
+
+    private static AuditSeverity ReadAuditSeverity(JsonElement element)
+    {
+        if (!TryGetPropertyIgnoreCase(element, "severity", out var property))
+            return AuditSeverity.Info;
+
+        if (property.ValueKind == JsonValueKind.String
+            && Enum.TryParse<AuditSeverity>(property.GetString(), ignoreCase: true, out var parsedString))
+        {
+            return parsedString;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number
+            && property.TryGetInt32(out var parsedNumber)
+            && Enum.IsDefined(typeof(AuditSeverity), parsedNumber))
+        {
+            return (AuditSeverity)parsedNumber;
+        }
+
+        return AuditSeverity.Info;
+    }
+
+    private static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement property)
+    {
+        if (element.TryGetProperty(name, out property))
+            return true;
+
+        foreach (var candidate in element.EnumerateObject())
+        {
+            if (string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                property = candidate.Value;
+                return true;
+            }
+        }
+
+        property = default;
+        return false;
     }
 
     private static void Bind(SqliteCommand cmd, WorkItem item)
@@ -1404,6 +1687,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$priority", item.Priority);
+        cmd.Parameters.AddWithValue("$audit_max_iterations", (object?)item.AuditMaxIterations ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$audit_complexity", (object?)item.AuditComplexity ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cancellation_source", (object?)item.CancellationSource ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_cancel_retries", item.TransientCancelRetries);
         cmd.Parameters.AddWithValue("$prompt_revision", item.PromptRevision);
@@ -1470,6 +1755,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IDisposable
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
         Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
+        AuditMaxIterations = ReadNullableInt32(r, "audit_max_iterations"),
+        AuditComplexity = ReadNullableString(r, "audit_complexity"),
         CancellationSource = ReadNullableString(r, "cancellation_source"),
         TransientCancelRetries = ReadInt32OrDefault(r, "transient_cancel_retries", defaultValue: 0),
         PromptRevision = ReadInt32OrDefault(r, "prompt_revision", defaultValue: 1),

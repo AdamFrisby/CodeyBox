@@ -462,6 +462,7 @@ public sealed class StubWorkItemStore : IWorkItemStore
     public Task UpdateAsync(WorkItem item, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
+    public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => throw new NotImplementedException();
     public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => throw new NotImplementedException();
     public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotImplementedException();

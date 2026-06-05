@@ -56,6 +56,27 @@ public readonly record struct DependsOnUpdateResult(
     IReadOnlyList<WorkItemId>? OldDependsOn);
 
 /// <summary>
+/// Outcome of <see cref="IWorkItemStore.UpdateAuditBudgetAsync"/>.
+/// </summary>
+public enum AuditBudgetUpdateOutcome
+{
+    /// <summary>The row was updated and the new audit budget fields are persisted.</summary>
+    Updated,
+    /// <summary>The row no longer exists.</summary>
+    NotFound,
+    /// <summary>The row exists but is in a terminal state; no write was issued.</summary>
+    TerminalState,
+}
+
+/// <summary>
+/// Result returned by <see cref="IWorkItemStore.UpdateAuditBudgetAsync"/>.
+/// <see cref="Item"/> is populated on <see cref="AuditBudgetUpdateOutcome.Updated"/>
+/// and on <see cref="AuditBudgetUpdateOutcome.TerminalState"/> so callers can
+/// return the current state to the client; null on <see cref="AuditBudgetUpdateOutcome.NotFound"/>.
+/// </summary>
+public readonly record struct AuditBudgetUpdateResult(AuditBudgetUpdateOutcome Outcome, WorkItem? Item);
+
+/// <summary>
 /// Snapshot of a single dispatched iteration. <see cref="PromptRevisionAtDispatch"/>
 /// is the value of <see cref="WorkItem.PromptRevision"/> at the moment the iteration
 /// was handed to the agent; the orchestrator compares it against the trailer on the
@@ -76,17 +97,21 @@ public interface IWorkItemStore
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
-    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>.
-    /// Use <see cref="UpdatePriorityAsync"/> for priority changes and
-    /// <see cref="TryReplacePromptAsync"/> for prompt changes so worker writes
-    /// from stale in-memory snapshots cannot revert a concurrent PATCH /priority
-    /// or PUT /workitems/{id}/prompt update.
+    /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
+    /// <see cref="WorkItem.AuditMaxIterations"/>, and
+    /// <see cref="WorkItem.AuditComplexity"/>. Use <see cref="UpdatePriorityAsync"/>,
+    /// <see cref="TryReplacePromptAsync"/>, and <see cref="UpdateAuditBudgetAsync"/>
+    /// for those fields so worker writes from stale in-memory snapshots cannot
+    /// revert concurrent PATCH /priority, PUT /workitems/{id}/prompt, or audit-budget
+    /// updates.
     /// </summary>
     Task UpdateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
-    /// <see cref="WorkItem.Prompt"/>, and <see cref="WorkItem.PromptRevision"/>
-    /// only when the persisted state still matches <paramref name="onlyIfState"/>.
+    /// <see cref="WorkItem.Prompt"/>, <see cref="WorkItem.PromptRevision"/>,
+    /// <see cref="WorkItem.AuditMaxIterations"/>, and
+    /// <see cref="WorkItem.AuditComplexity"/> only when the persisted state still
+    /// matches <paramref name="onlyIfState"/>.
     /// Returns true if the row was updated.
     /// </summary>
     Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default);
@@ -118,6 +143,23 @@ public interface IWorkItemStore
     Task<DependsOnUpdateResult> UpdateDependsOnAsync(
         WorkItemId id,
         IReadOnlyList<WorkItemId> dependsOn,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Partial UPDATE that touches only the audit-budget fields and
+    /// <c>updated_at</c>. Used by PATCH /workitems/{id} so an operator can raise
+    /// or label the audit budget on an in-flight item without writing stale
+    /// pipeline-owned columns such as <c>state</c>, <c>started_at</c>, agent log
+    /// paths, quota fields, or merge metadata.
+    ///
+    /// Returns <see cref="AuditBudgetUpdateOutcome.TerminalState"/> when the row
+    /// is in a terminal state; budget edits cannot affect closed work.
+    /// </summary>
+    Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+        WorkItemId id,
+        int? auditMaxIterations,
+        string? auditComplexity,
         DateTimeOffset updatedAt,
         CancellationToken ct = default);
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);

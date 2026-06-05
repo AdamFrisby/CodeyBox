@@ -8,6 +8,8 @@ namespace CodeyBox.Tests;
 
 public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 {
+    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-pool-health-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -118,7 +120,10 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         {
             await _queue.EnqueueAsync(item.Id);
             await orchestrator.StartAsync(CancellationToken.None);
-            await blocking.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.True(
+                await WaitUntilAsync(() => orchestrator.IsActiveForTest(item.Id), DispatchWaitTimeout),
+                "Expected dispatch to reserve the item before watchdog evaluation.");
 
             var health = BuildHealthSource(orchestrator: orchestrator);
             var candidates = await health.ListRunnableCandidatesAsync(10, CancellationToken.None);
@@ -143,27 +148,19 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             blocking.Release.TrySetResult();
             try
             {
-                await WaitUntilAsync(
-                    () => orchestrator.CurrentlyRunningTotal == 0,
-                    TimeSpan.FromSeconds(10));
-                using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                Assert.True(
+                    await WaitUntilAsync(
+                        () => !orchestrator.IsActiveForTest(item.Id)
+                            && orchestrator.CurrentlyRunningTotal == 0,
+                        DispatchWaitTimeout),
+                    "Expected active worker to drain before stopping the orchestrator.");
+                using var stopCts = new CancellationTokenSource(DispatchWaitTimeout);
                 await orchestrator.StopAsync(stopCts.Token);
             }
             finally
             {
                 orchestrator.Dispose();
             }
-        }
-    }
-
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
-    {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (!condition())
-        {
-            if (DateTimeOffset.UtcNow >= deadline)
-                throw new TimeoutException("Timed out waiting for condition.");
-            await Task.Delay(TimeSpan.FromMilliseconds(25));
         }
     }
 
@@ -651,6 +648,20 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
     private static WorkerPoolHealthCandidate Candidate(WorkItem item) =>
         new(item.Id, item.State);
+
+    private static async Task<bool> WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (predicate())
+                return true;
+
+            await Task.Delay(25);
+        }
+
+        return predicate();
+    }
 
     private sealed class NoopPipeline : IPipelineRunner
     {

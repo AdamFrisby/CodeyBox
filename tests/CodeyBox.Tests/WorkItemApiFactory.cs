@@ -24,6 +24,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
     public SqliteWorkItemStore Store { get; }
     public string? TemplateDirectory { get; set; }
     public int? MaxTemplateChecks { get; set; }
+    public Func<SqliteWorkItemStore, IWorkItemStore>? WorkItemStoreDecorator { get; set; }
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
@@ -79,7 +80,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 
             // Replace the persistent store with our pre-created test instance.
             services.RemoveAll<IWorkItemStore>();
-            services.AddSingleton<IWorkItemStore>(Store);
+            services.AddSingleton<IWorkItemStore>(WorkItemStoreDecorator?.Invoke(Store) ?? Store);
 
             // Replace the file-backed project repository with an in-memory stub.
             // "test-project" is the primary project used by most tests.

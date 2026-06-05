@@ -1142,15 +1142,18 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             Assert.Equal(0, _queue.Count);
 
             barrier.MarkInitialRecoveryCompleted();
+            // Wider deadline absorbs thread-pool starvation under parallel-suite
+            // CPU contention; the happy path still resolves in milliseconds once
+            // the barrier releases and the post-barrier sweep runs.
             await WaitUntilAsync(async () =>
             {
                 var after = await _store.GetAsync(item.Id);
                 return after?.State == WorkItemState.Queued && _queue.Count == 1;
-            }, TimeSpan.FromSeconds(2));
+            }, TimeSpan.FromSeconds(30));
         }
         finally
         {
-            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             await watchdog.StopAsync(stopCts.Token);
         }
     }

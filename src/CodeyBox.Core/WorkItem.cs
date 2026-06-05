@@ -263,6 +263,25 @@ public sealed record WorkItem
     public int Priority { get; init; } = 0;
 
     /// <summary>
+    /// Optional per-item audit iteration ceiling. When set, this overrides the
+    /// project profile's default max when it is higher, allowing intentionally
+    /// hard items to receive a larger audit budget without encoding that policy
+    /// into dispatch priority. Raising the budget above the project default also
+    /// requires the project audit profile's
+    /// <see cref="ProjectAudit.BudgetOverrideMaxIterations"/> cap to allow that
+    /// higher value.
+    /// </summary>
+    public int? AuditMaxIterations { get; init; }
+
+    /// <summary>
+    /// Optional operator-supplied complexity label used with
+    /// <see cref="ProjectAudit.ComplexityIterationBudgets"/>. Null means the
+    /// project default audit budget applies unless <see cref="AuditMaxIterations"/>
+    /// is set.
+    /// </summary>
+    public string? AuditComplexity { get; init; }
+
+    /// <summary>
     /// UTC timestamp when this work item was first picked up by a worker
     /// (transitioned out of Queued state). Null until the worker commits to
     /// running it. Used for per-project budget window calculations.

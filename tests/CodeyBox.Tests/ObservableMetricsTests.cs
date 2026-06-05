@@ -323,6 +323,7 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => throw new NotSupportedException();
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => throw new NotSupportedException();
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotSupportedException();

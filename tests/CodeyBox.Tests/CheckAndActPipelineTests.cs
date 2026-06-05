@@ -1148,6 +1148,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
         public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) => _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
         public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
         public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) => _inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
         public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => _inner.GetAsync(id, ct);
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => _inner.ListAsync(ct);
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => _inner.ListByStateAsync(state, ct);

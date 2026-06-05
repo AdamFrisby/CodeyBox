@@ -344,6 +344,7 @@ public sealed record ProjectPrDescription
 public sealed record ProjectAudit
 {
     public const string DefaultProfileName = "default";
+    public const int MaxIterationBudget = 100;
 
     /// <summary>
     /// Project-default audit profile name. <c>default</c> uses the fields on this
@@ -361,6 +362,24 @@ public sealed record ProjectAudit
         = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase);
 
     public int MaxIterations { get; init; } = 10;
+
+    /// <summary>
+    /// Project-specific upper bound for work-item audit budget overrides and
+    /// caller-selected complexity budgets. Null means overrides may not raise
+    /// the effective budget above <see cref="MaxIterations"/>. Operators must
+    /// set this explicitly to allow per-item or per-complexity elevation.
+    /// </summary>
+    public int? BudgetOverrideMaxIterations { get; init; }
+
+    /// <summary>
+    /// Optional per-complexity audit iteration ceilings. Keys are operator-defined
+    /// labels carried by <see cref="WorkItem.AuditComplexity"/>. Values are total
+    /// iteration budgets, not bonuses; the runner uses the largest of the project
+    /// default, the matched complexity budget, and the per-item budget.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> ComplexityIterationBudgets { get; init; }
+        = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
     public AuditSeverity FailingSeverity { get; init; } = AuditSeverity.Error;
     // 120 min: no audit run has ever genuinely hung; prior 30 min cap clipped large refactors.
     // Project config overrides this when set.

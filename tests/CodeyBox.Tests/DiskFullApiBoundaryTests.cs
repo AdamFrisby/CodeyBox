@@ -214,6 +214,8 @@ public sealed class DiskFullApiBoundaryTests
             => Task.FromResult(new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null));
         public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default)
             => Task.FromResult(new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null));
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default)
+            => Task.FromResult(new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null));
         public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Empty();
         public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) => Task.FromResult(0);
@@ -266,6 +268,8 @@ public sealed class DiskFullApiBoundaryTests
             => Task.FromResult(new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null));
         public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default)
             => Task.FromResult(new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null));
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default)
+            => Task.FromResult(new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null));
         public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => Task.FromResult<WorkItem?>(null);
         public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => Empty();
         public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => Empty();

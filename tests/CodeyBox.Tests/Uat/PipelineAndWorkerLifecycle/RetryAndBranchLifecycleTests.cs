@@ -267,6 +267,42 @@ public sealed class RetryAndBranchLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task RetryEndpointWithoutBody_WhenParkedNeedsOperatorInputWithPriorCommits_AutoPicksAudit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = new Project
+        {
+            Id = PipelineLifecycleUatHelpers.TestProjectId,
+            DisplayName = "Retry endpoint UAT",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+        };
+        using var factory = new WorkItemApiFactory(null, project);
+        using var client = factory.CreateClient();
+        var gitHost = factory.Services.GetRequiredService<IGitHost>();
+        const string workBranch = "codeybox/http-parked-priorcommits";
+        var item = PipelineLifecycleUatHelpers.NewItem(workBranch) with
+        {
+            State = WorkItemState.NeedsOperatorInput,
+            LastError = "audit reached max iterations with progress",
+        };
+        await factory.Store.CreateAsync(item);
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await AddCommitsToBareBranchAsync(_workspace, gitHost.GetRepoPath(repoId), workBranch, "main", count: 2);
+
+        var response = await client.PostAsync($"/workitems/{item.Id}/retry", content: null);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("auto", body.RootElement.GetProperty("from").GetString());
+        Assert.Equal("audit", body.RootElement.GetProperty("actualFrom").GetString());
+        Assert.Equal("WorkComplete", body.RootElement.GetProperty("state").GetString());
+        var stored = await factory.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, stored!.State);
+        Assert.Equal(workBranch, stored.WorkBranch);
+    }
+
+    [Fact]
     public async Task RetryEndpointWithExplicitFromWork_OverridesAutoPickWhenWorkBranchHasPriorCommits()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

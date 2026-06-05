@@ -83,6 +83,65 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RecordAuditProgressAsync_ReplacesExistingIterationRow()
+    {
+        var item = Sample();
+        await _store.CreateAsync(item);
+        var attemptStartedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+
+        await _store.RecordAuditProgressAsync(
+            item.Id,
+            attemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 2,
+                MaxIterations: 3,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["old-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("old-auditor", AuditSeverity.Error, "old blocker", "old", "src/Old.cs:1"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("old-auditor", AuditSeverity.Error, "old blocker", "old", "src/Old.cs:1"),
+                ],
+                WorkBranchTip: "old-tip"),
+            DateTimeOffset.UtcNow);
+        await _store.RecordAuditProgressAsync(
+            item.Id,
+            attemptStartedAt,
+            new AuditProgressRecord(
+                Iteration: 2,
+                MaxIterations: 4,
+                BlockingFindings: 1,
+                NonBlockingFindings: 1,
+                BlockingFindingIds: ["new-id"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("new-auditor", AuditSeverity.Error, "new blocker", "new", "src/New.cs:2"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("new-auditor", AuditSeverity.Error, "new blocker", "new", "src/New.cs:2"),
+                    new AuditProgressFinding("new-auditor", AuditSeverity.Warning, "new warning", "warn", "src/Warn.cs:3"),
+                ],
+                WorkBranchTip: "new-tip"),
+            DateTimeOffset.UtcNow.AddSeconds(1));
+
+        var records = await _store.GetAuditProgressAsync(item.Id, attemptStartedAt);
+
+        var record = Assert.Single(records);
+        Assert.Equal(2, record.Iteration);
+        Assert.Equal(4, record.MaxIterations);
+        Assert.Equal(["new-id"], record.BlockingFindingIds);
+        Assert.Equal("new-tip", record.WorkBranchTip);
+        Assert.Equal("new blocker", Assert.Single(record.BlockingFindingsDetails).Title);
+        Assert.Equal(2, record.Findings.Count);
+        Assert.Contains(record.Findings, f => f.Title == "new warning" && f.Severity == AuditSeverity.Warning);
+    }
+
+    [Fact]
     public async Task ListByStateAsync_FiltersCorrectly()
     {
         var working = Sample();

@@ -36,6 +36,10 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class PipelineRunner : IPipelineRunner
 {
+    private const int AuditEscalationHistoryLimit = 25;
+    private const int AuditEscalationFindingsPerIterationLimit = 20;
+    private const int AuditEscalationFindingDescriptionLimit = 2000;
+
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
     private readonly IAgentRegistry _agents;
@@ -51,6 +55,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly CredentialSmokeGate? _smokeGate;
     private readonly ISuggestionStore? _suggestions;
     private readonly IAuditReportStore? _auditReports;
+    private readonly IAuditProgressStore? _auditProgress;
     private readonly ITimingStore? _timings;
     private readonly IWorkItemCostStore? _costStore;
     private readonly IAgentUsageStore? _usageStore;
@@ -206,7 +211,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentInvolvementStore? involvement = null,
         Func<WorkerProgressWatchdogOptions>? watchdogOptionsAccessor = null,
         IRequiredBuildVerifier? requiredBuildVerifier = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IAuditProgressStore? auditProgress = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -252,6 +258,9 @@ public sealed class PipelineRunner : IPipelineRunner
         _smokeGate = smokeGate;
         _suggestions = suggestions;
         _auditReports = auditReports;
+        // Null intentionally disables durable audit-progress history for narrow
+        // test fixtures; production DI wires this dependency explicitly.
+        _auditProgress = auditProgress;
         // PayPerApi and Null probes are routing utilities, not real quota sources —
         // exclude them so only genuine subscription probes gate the audit agent
         // and only genuine subscription probes receive mid-iteration write-back.
@@ -557,10 +566,10 @@ public sealed class PipelineRunner : IPipelineRunner
             if (!skipWork)
             {
                 using var workPhaseScope = BeginPhaseScope(item, "work");
-                await PublishIterationStartedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber, ct);
+                await PublishIterationStartedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase, ct);
                 var workIterationStart = DateTimeOffset.UtcNow;
                 await _store.RecordIterationDispatchAsync(
-                    item.Id, WorkPhaseIterationNumber, item.PromptRevision, workIterationStart, ct);
+                    item.Id, AuditProgressIterationNumbers.WorkPhase, item.PromptRevision, workIterationStart, ct);
                 await Transition(item, WorkItemState.Working, ct, project);
                 string? workAgentStdout = null;
                 using (var workPhase = new PhaseCancellation("work", ct, _opts.TimeProvider))
@@ -594,7 +603,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     }
                 }
                 await Transition(item, WorkItemState.WorkComplete, ct, project);
-                await PublishIterationCompletedAsync(item, project, IterationPhase.Work, WorkPhaseIterationNumber,
+                await PublishIterationCompletedAsync(item, project, IterationPhase.Work, AuditProgressIterationNumbers.WorkPhase,
                     repoId, workBranch, workIterationStart, ct);
                 if (resumingPreempt)
                 {
@@ -1001,6 +1010,16 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (RequiredBuildVerificationUnavailableException ex)
         {
             _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (AuditHistoryLoadFailedException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not load persisted audit history", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (AuditHistoryPersistenceFailedException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not persist audit progress", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (TerminalQuotaError ex)
@@ -2073,7 +2092,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // The orchestrator records this row before transitioning the item to
         // Working/Reworking; a concurrent PUT /workitems/{id}/prompt cannot
         // change what we read here.
-        var dispatchIteration = isInitial ? WorkPhaseIterationNumber : (iteration ?? WorkPhaseIterationNumber);
+        var dispatchIteration = isInitial ? AuditProgressIterationNumbers.WorkPhase : (iteration ?? AuditProgressIterationNumbers.WorkPhase);
         var promptRevisionAtDispatch = await ResolveIterationRevisionAsync(item, dispatchIteration, ct);
 
         var extraEnv = new Dictionary<string, string>
@@ -3340,8 +3359,23 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var maxIterations = Math.Max(1, project.Audit.MaxIterations);
-        for (var iteration = 1; iteration <= maxIterations; iteration++)
+        var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+        var priorAuditHistory = await LoadPersistedAuditProgressHistoryAsync(item, currentWorkAttemptStartedAt, ct);
+        var maxIterations = ResolveAuditMaxIterations(item, project, priorAuditHistory);
+        var auditHistory = priorAuditHistory
+            .Select(h => h with { MaxIterations = maxIterations })
+            .ToList();
+        var startIteration = auditHistory.Count == 0 ? 1 : auditHistory.Max(h => h.Iteration) + 1;
+
+        if (startIteration > maxIterations)
+            return await HandleExhaustedPersistedAuditHistoryAsync(item, project, auditHistory, ct);
+
+        var resumeReworkParked = await RunMissingAuditResumeReworkAsync(
+            item, project, runner, repoId, baseBranch, workBranch,
+            auditHistory, startIteration, maxIterations, ct, hostShutdownToken);
+        if (resumeReworkParked) return true;
+
+        for (var iteration = startIteration; iteration <= maxIterations; iteration++)
         {
             if (hostShutdownToken.IsCancellationRequested)
                 throw new OperationCanceledException(hostShutdownToken);
@@ -3407,6 +3441,11 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
             var nonBlocking = findings.Count - blocking.Count;
+            var workBranchTip = await TryResolveWorkBranchTipAsync(repoId, workBranch, ct);
+            var progressSnapshot = BuildAuditProgressSnapshot(
+                iteration, maxIterations, findings, blocking, nonBlocking, workBranchTip);
+            auditHistory.Add(progressSnapshot);
+            await PersistAuditProgressAsync(item, currentWorkAttemptStartedAt, progressSnapshot, ct);
 
             AuditLog.AuditIterationComplete(iteration, maxIterations, blocking.Count, nonBlocking);
             CodeyBoxMeters.AuditBlockingFindings.Record(blocking.Count,
@@ -3444,8 +3483,16 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (iteration == maxIterations)
             {
-                AuditLog.AuditFailed(iteration, blocking.Count);
+                if (HasAuditConvergenceProgress(auditHistory))
+                {
+                    CodeyBoxMeters.AuditIterations.Add(1,
+                        new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+                    await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+                    return true;
+                }
+
                 CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+                AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
@@ -3471,65 +3518,476 @@ public sealed class PipelineRunner : IPipelineRunner
             // Rework following audit iteration N is the input that will be
             // evaluated by audit iteration N+1, so emit it as iteration N+1.
             var reworkIterationNumber = iteration + 1;
-            // Audit-driven rework is the primary rework path; open a phase.rework
-            // span and record codeybox.phase.duration_ms{phase=rework} so rework
-            // telemetry matches the documented trace tree (the resume-preempt
-            // path opens its own scope independently).
-            using var reworkPhaseScope = BeginPhaseScope(item, "rework");
-            await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
-            var reworkStart = DateTimeOffset.UtcNow;
-            // Snapshot the prompt and revision now, before the rework agent runs.
-            // A concurrent PUT /workitems/{id}/prompt landing during this iteration
-            // will bump the revision but must not be attributed to it. The
-            // re-read also ensures the agent receives the LATEST prompt content,
-            // not the orchestrator's stale in-memory snapshot — otherwise the
-            // dispatch row, env-var, and trailer would all agree on revision N
-            // while the agent was looking at revision N-1's text, defeating the
-            // entire point of Layer 1.
-            var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
-            await _store.RecordIterationDispatchAsync(
-                item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
-            await Transition(item, WorkItemState.Reworking, ct, project);
-            var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
-                ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
-                : (IReadOnlyList<WorkItemQuestion>)[];
-            var reworkPrompt = ReworkPromptBuilder.Build(freshForRework.Prompt, findings, iteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
-            using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
-            reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
-            reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
-            var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
-            string? reworkStdout;
-            try
-            {
-                reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
-                    async (workerRunner, trialItem, attemptCt) =>
-                        await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
-                            phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
-                                reworkPrompt, isInitial: false,
-                                networkProfile: sandboxTarget.NetworkProfile,
-                                sandboxFlavor: sandboxTarget.Flavor,
-                                project: project,
-                                phaseCt,
-                                hostShutdownToken,
-                                iteration: reworkIterationNumber),
-                            workToken: attemptCt),
-                    ct,
-                    phaseCancellation: reworkPhase,
-                    attemptTimeout: item.WorkTimeout);
-            }
-            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
-            {
-                throw reworkPhase.Wrap(oce);
-            }
-            await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
-                repoId, workBranch, reworkStart, ct);
-            if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
-            {
-                var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
-                if (parked) return true;
-            }
+            var parked = await RunAuditReworkAsync(
+                item, project, runner, repoId, baseBranch, workBranch,
+                findings, iteration, reworkIterationNumber, maxIterations, ct, hostShutdownToken);
+            if (parked) return true;
         }
         return false;
+    }
+
+    private async Task<bool> HandleExhaustedPersistedAuditHistoryAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        CancellationToken ct)
+    {
+        if (auditHistory.Count == 0 || auditHistory[^1].BlockingFindings == 0)
+            return false;
+
+        if (HasAuditConvergenceProgress(auditHistory))
+        {
+            CodeyBoxMeters.AuditIterations.Add(1,
+                new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+            await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+            return true;
+        }
+
+        var last = auditHistory[^1];
+        CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+        AuditLog.AuditFailed(last.Iteration, last.BlockingFindings);
+        var summary = string.Join("; ", last.BlockingFindingsDetails
+            .Take(5)
+            .Select(f => $"[{f.AuditorName}] {f.Title}"));
+        throw new AuditFailedException(
+            $"Audit did not pass after {last.Iteration} iterations. {last.BlockingFindings} blocking finding(s): {summary}");
+    }
+
+    private async Task<bool> RunMissingAuditResumeReworkAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        int startIteration,
+        int maxIterations,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        if (auditHistory.Count == 0)
+            return false;
+
+        var last = auditHistory[^1];
+        if (last.BlockingFindings == 0)
+            return false;
+
+        var iterations = await _store.GetIterationsAsync(item.Id, ct);
+        if (iterations.Any(i => i.Iteration == startIteration))
+            return false;
+
+        var findings = last.Findings
+            .Select(ToAuditFinding)
+            .ToList();
+        _log.LogInformation(
+            "Resuming work item {Id} from parked audit history by reworking iteration {AuditIteration} findings before audit iteration {NextIteration}",
+            item.Id, last.Iteration, startIteration);
+
+        await MaybeIncrementalRebaseAsync(item, runner, repoId, baseBranch, workBranch, project, ct);
+        return await RunAuditReworkAsync(
+            item, project, runner, repoId, baseBranch, workBranch,
+            findings, last.Iteration, startIteration, maxIterations, ct, hostShutdownToken);
+    }
+
+    private async Task<bool> RunAuditReworkAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        IReadOnlyList<AuditFinding> findings,
+        int auditIteration,
+        int reworkIterationNumber,
+        int maxIterations,
+        CancellationToken ct,
+        CancellationToken hostShutdownToken)
+    {
+        // Audit-driven rework is the primary rework path; open a phase.rework
+        // span and record codeybox.phase.duration_ms{phase=rework} so rework
+        // telemetry matches the documented trace tree (the resume-preempt
+        // path opens its own scope independently).
+        using var reworkPhaseScope = BeginPhaseScope(item, "rework");
+        await PublishIterationStartedAsync(item, project, IterationPhase.Rework, reworkIterationNumber, ct);
+        var reworkStart = DateTimeOffset.UtcNow;
+        // Snapshot the prompt and revision now, before the rework agent runs.
+        // A concurrent PUT /workitems/{id}/prompt landing during this iteration
+        // will bump the revision but must not be attributed to it. The
+        // re-read also ensures the agent receives the LATEST prompt content,
+        // not the orchestrator's stale in-memory snapshot — otherwise the
+        // dispatch row, env-var, and trailer would all agree on revision N
+        // while the agent was looking at revision N-1's text, defeating the
+        // entire point of Layer 1.
+        var freshForRework = await _store.GetAsync(item.Id, ct) ?? item;
+        await _store.RecordIterationDispatchAsync(
+            item.Id, reworkIterationNumber, freshForRework.PromptRevision, reworkStart, ct);
+        await Transition(item, WorkItemState.Reworking, ct, project);
+        var answeredQuestions = project.AllowAgentQuestions && _questionStore is not null
+            ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
+            : (IReadOnlyList<WorkItemQuestion>)[];
+        var reworkPrompt = ReworkPromptBuilder.Build(
+            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
+        using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
+        reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(item.WorkTimeout));
+        reworkPhase.HookHostShutdown(hostShutdownToken, _opts.ShutdownGrace);
+        var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Rework);
+        string? reworkStdout;
+        try
+        {
+            reworkStdout = await InvokeAgentWithQuotaFallbackAsync(item, project, "rework", iteration: reworkIterationNumber,
+                async (workerRunner, trialItem, attemptCt) =>
+                    await RunWithStuckProbeAsync(trialItem, project, workerRunner.Kind, "rework", reworkPhase, ct,
+                        phaseCt => RunAgentPhaseAsync(trialItem, workerRunner, repoId, baseBranch, workBranch,
+                            reworkPrompt, isInitial: false,
+                            networkProfile: sandboxTarget.NetworkProfile,
+                            sandboxFlavor: sandboxTarget.Flavor,
+                            project: project,
+                            phaseCt,
+                            hostShutdownToken,
+                            iteration: reworkIterationNumber),
+                        workToken: attemptCt),
+                ct,
+                phaseCancellation: reworkPhase,
+                attemptTimeout: item.WorkTimeout);
+        }
+        catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+        {
+            throw reworkPhase.Wrap(oce);
+        }
+
+        await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
+            repoId, workBranch, reworkStart, ct);
+        if (project.AllowAgentQuestions && _questionStore is not null && reworkStdout is not null)
+        {
+            var parked = await TryParkForQuestionsAsync(item, project, reworkStdout, ct);
+            if (parked) return true;
+        }
+
+        return false;
+    }
+
+    private async Task ParkAuditMaxIterationsForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        CancellationToken ct)
+    {
+        var last = history[^1];
+        var message = BuildAuditMaxIterationEscalationMessage(history);
+        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+
+        await RunBoundedPostAgentAsync(item.Id, "audit-max-iterations-escalate", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var parked = current.With(WorkItemState.NeedsOperatorInput, message);
+            var updated = await _store.TryUpdateIfStateAsync(parked, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation(
+                    "Work item {Id} state changed concurrently; skipping audit max-iteration escalation",
+                    item.Id);
+                return;
+            }
+
+            _log.LogWarning(
+                "Work item {Id} reached audit iteration ceiling {Iteration}/{MaxIterations} while still showing progress; parked for operator review",
+                item.Id, last.Iteration, last.MaxIterations);
+            AuditLog.WorkItemTransitioned(item.Id, "NeedsOperatorInput (audit max iterations with progress)");
+            CodeyBoxMeters.PipelineTransitions.Add(1,
+                new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
+
+            var usage = await TryGetUsageSummaryAsync(item.Id);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.needs_operator_input",
+                WorkItem = parked,
+                Project = project,
+                Details = details,
+                Usage = usage?.Iteration,
+                UsageTotal = usage?.Total,
+            }, CancellationToken.None);
+        });
+    }
+
+    private static AuditProgressSnapshot BuildAuditProgressSnapshot(
+        int iteration,
+        int maxIterations,
+        IReadOnlyList<AuditFinding> findings,
+        IReadOnlyList<AuditFinding> blocking,
+        int nonBlocking,
+        string? workBranchTip)
+    {
+        return new AuditProgressSnapshot(
+            iteration,
+            maxIterations,
+            blocking.Count,
+            nonBlocking,
+            FingerprintFindings(blocking),
+            blocking.Select(ToProgressFinding).ToList(),
+            findings.Select(ToProgressFinding).ToList(),
+            workBranchTip);
+    }
+
+    private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
+        => BuildAuditProgressSignals(history).Count > 0;
+
+    private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
+        WorkItem item,
+        DateTimeOffset? currentWorkAttemptStartedAt,
+        CancellationToken ct)
+    {
+        if (_auditProgress is null || item.State != WorkItemState.WorkComplete)
+            return [];
+
+        IReadOnlyList<AuditProgressRecord> records;
+        try
+        {
+            records = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new AuditHistoryLoadFailedException(
+                $"failed to load durable audit progress history for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
+                ex);
+        }
+
+        return records
+            .Where(r => r.Iteration > 0)
+            .OrderBy(r => r.Iteration)
+            .Select(r => new AuditProgressSnapshot(
+                r.Iteration,
+                r.MaxIterations,
+                r.BlockingFindings,
+                r.NonBlockingFindings,
+                r.BlockingFindingIds,
+                r.BlockingFindingsDetails,
+                r.Findings,
+                r.WorkBranchTip))
+            .ToList();
+    }
+
+    private async Task PersistAuditProgressAsync(
+        WorkItem item,
+        DateTimeOffset? currentWorkAttemptStartedAt,
+        AuditProgressSnapshot progress,
+        CancellationToken ct)
+    {
+        if (_auditProgress is null)
+            return;
+
+        try
+        {
+            await _auditProgress.RecordAuditProgressAsync(
+                item.Id,
+                currentWorkAttemptStartedAt,
+                new AuditProgressRecord(
+                    progress.Iteration,
+                    progress.MaxIterations,
+                    progress.BlockingFindings,
+                    progress.NonBlockingFindings,
+                    progress.BlockingFindingIds,
+                    progress.BlockingFindingsDetails,
+                    progress.Findings,
+                    progress.WorkBranchTip),
+                DateTimeOffset.UtcNow,
+                ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new AuditHistoryPersistenceFailedException(
+                $"failed to persist durable audit progress for work item {item.Id}; retry cannot safely continue without prior audit trajectory",
+                ex);
+        }
+    }
+
+    private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
+        WorkItemId workItemId,
+        CancellationToken ct)
+    {
+        var iterations = await _store.GetIterationsAsync(workItemId, ct);
+        return iterations
+            .Where(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .OrderByDescending(i => i.DispatchedAt)
+            .Select(i => (DateTimeOffset?)i.DispatchedAt)
+            .FirstOrDefault();
+    }
+
+    private static int ResolveAuditMaxIterations(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> priorAuditHistory)
+    {
+        var projectBudget = Math.Clamp(project.Audit.MaxIterations, 1, ProjectAudit.MaxIterationBudget);
+        var maxIterations = ResolveConfiguredAuditIterationBudget(item, project.Audit, projectBudget);
+
+        if (priorAuditHistory.Count > 0)
+        {
+            // Retrying an item parked at the audit ceiling is an explicit
+            // operator re-drive, so continue from the prior trajectory even
+            // when static per-item budget overrides are capped at project
+            // defaults.
+            var priorMaxIteration = priorAuditHistory.Max(h => h.Iteration);
+            maxIterations = Math.Max(maxIterations, priorMaxIteration + projectBudget);
+        }
+
+        return Math.Min(ProjectAudit.MaxIterationBudget, maxIterations);
+    }
+
+    private static int ResolveConfiguredAuditIterationBudget(
+        WorkItem item,
+        ProjectAudit audit,
+        int projectBudget)
+    {
+        var overrideCap = ResolveAuditBudgetOverrideCap(audit, projectBudget);
+        var requestedOverride = Math.Max(
+            item.AuditMaxIterations.GetValueOrDefault(),
+            ResolveComplexityAuditIterationBudget(item.AuditComplexity, audit).GetValueOrDefault());
+        return Math.Max(projectBudget, Math.Min(overrideCap, requestedOverride));
+    }
+
+    private static int ResolveAuditBudgetOverrideCap(ProjectAudit audit, int projectBudget)
+        => Math.Clamp(
+            audit.BudgetOverrideMaxIterations.GetValueOrDefault(projectBudget),
+            projectBudget,
+            ProjectAudit.MaxIterationBudget);
+
+    private static int? ResolveComplexityAuditIterationBudget(string? complexity, ProjectAudit audit)
+        => string.IsNullOrWhiteSpace(complexity)
+            ? null
+            : audit.ComplexityIterationBudgets.TryGetValue(complexity.Trim(), out var budget) && budget > 0
+                ? budget
+                : null;
+
+    private async Task<string?> TryResolveWorkBranchTipAsync(
+        string repoId,
+        string workBranch,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await _gitHost.ResolveCommitAsync(repoId, $"refs/heads/{workBranch}", ct);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException)
+        {
+            _log.LogDebug(ex, "Could not resolve work branch tip for audit progress detection in repo {RepoId} branch {WorkBranch}", repoId, workBranch);
+            return null;
+        }
+    }
+
+    private static IReadOnlyList<string> FingerprintFindings(IReadOnlyList<AuditFinding> findings)
+        => findings
+            .Select(f =>
+            {
+                var (files, _) = ParseLocation(f.Location);
+                return FindingIdComputer.Compute(f.AuditorName, f.Title, files);
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToList();
+
+    private static AuditProgressFinding ToProgressFinding(AuditFinding finding) => new(
+        finding.AuditorName,
+        finding.Severity,
+        finding.Title,
+        finding.Description,
+        finding.Location);
+
+    private static AuditFinding ToAuditFinding(AuditProgressFinding finding) => new(
+        finding.AuditorName,
+        finding.Severity,
+        finding.Title,
+        finding.Description,
+        finding.Location);
+
+    private static AuditFindingPayload ToEscalationWebhookFinding(AuditProgressFinding finding) => new()
+    {
+        Auditor = finding.AuditorName,
+        Severity = finding.Severity.ToString(),
+        Title = finding.Title,
+        Description = TruncateForEscalation(finding.Description),
+        Location = finding.Location,
+    };
+
+    private static string TruncateForEscalation(string value)
+        => value.Length <= AuditEscalationFindingDescriptionLimit
+            ? value
+            : value[..AuditEscalationFindingDescriptionLimit] + "...";
+
+    private static string BuildAuditMaxIterationEscalationMessage(
+        IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var summary = string.Join("; ", last.BlockingFindingsDetails
+            .Take(5)
+            .Select(f => $"[{f.AuditorName}] {f.Title}"));
+
+        return
+            $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
+            $"{last.BlockingFindings} blocking finding(s) remain: {summary}";
+    }
+
+    private static AuditMaxIterationsEscalationDetails BuildAuditMaxIterationEscalationDetails(
+        WorkItemId workItemId,
+        IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var signals = BuildAuditProgressSignals(history);
+        var emittedHistory = history.TakeLast(AuditEscalationHistoryLimit).ToList();
+        return new AuditMaxIterationsEscalationDetails
+        {
+            WorkItemId = workItemId.ToString(),
+            Iteration = last.Iteration,
+            MaxIterations = last.MaxIterations,
+            BlockingFindings = last.BlockingFindings,
+            NonBlockingFindings = last.NonBlockingFindings,
+            ProgressObserved = signals.Count > 0,
+            ProgressSignals = signals,
+            History = emittedHistory.Select(h => new AuditProgressIterationDetails
+            {
+                Iteration = h.Iteration,
+                BlockingFindings = h.BlockingFindings,
+                NonBlockingFindings = h.NonBlockingFindings,
+                BlockingFindingsDetails = h.BlockingFindingsDetails
+                    .Take(AuditEscalationFindingsPerIterationLimit)
+                    .Select(ToEscalationWebhookFinding)
+                    .ToList(),
+                Findings = h.Findings
+                    .Take(AuditEscalationFindingsPerIterationLimit)
+                    .Select(ToEscalationWebhookFinding)
+                    .ToList(),
+            }).ToList(),
+            RemainingBlockingFindings = last.BlockingFindingsDetails
+                .Take(AuditEscalationFindingsPerIterationLimit)
+                .Select(ToEscalationWebhookFinding)
+                .ToList(),
+            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
+        };
+    }
+
+    private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        if (history.Count < 2)
+            return [];
+
+        var last = history[^1];
+        var signals = new List<string>();
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings > last.BlockingFindings))
+            signals.Add("blocking_findings_decreased");
+
+        var lastTotal = last.BlockingFindings + last.NonBlockingFindings;
+        if (history.Take(history.Count - 1).Any(h => h.BlockingFindings + h.NonBlockingFindings > lastTotal))
+            signals.Add("total_findings_decreased");
+
+        var lastIds = last.BlockingFindingIds.ToHashSet(StringComparer.Ordinal);
+        if (history.Take(history.Count - 1).Any(h => !h.BlockingFindingIds.ToHashSet(StringComparer.Ordinal).SetEquals(lastIds)))
+            signals.Add("blocking_findings_changed");
+
+        if (last.WorkBranchTip is { } lastTip
+            && history.Take(history.Count - 1).Any(h => h.WorkBranchTip is { } tip && !string.Equals(tip, lastTip, StringComparison.Ordinal)))
+            signals.Add("work_branch_tip_changed");
+
+        return signals;
     }
 
     private async Task<(IReadOnlyList<AuditFinding> Findings, AgentKind? ActiveAuditAgentKind)> CollectFindingsAsync(
@@ -4019,11 +4477,13 @@ public sealed class PipelineRunner : IPipelineRunner
             };
             await _auditReports.CreateAsync(report, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Non-fatal: audit report persistence must never abort the pipeline.
-            _log.LogWarning(ex, "Failed to persist audit report for auditor '{Auditor}' iteration {Iter}",
-                auditor.Name, ctx.Iteration);
+            _log.LogWarning(ex,
+                "Failed to persist diagnostic audit report for auditor {AuditorName} iteration {Iteration} on work item {WorkItemId}",
+                auditor.Name,
+                ctx.Iteration,
+                ctx.WorkItemId);
         }
     }
 
@@ -8267,11 +8727,6 @@ Original merge-phase failure (for context):
     // token fires we rethrow so the pipeline can unwind for shutdown rather
     // than absorbing the signal.
 
-    // Work-phase events nominally have no iteration number ("work runs once").
-    // We align them with iteration=1 so audit-iter-1's input is the same number
-    // as the work that produced it — keeps tracker pairing simple.
-    private const int WorkPhaseIterationNumber = 1;
-
     /// <summary>Explicit map from <see cref="AuditSeverity"/> to the wire string
     /// documented in webhooks.md. Keeps the contract stable independently of
     /// any future enum rename.</summary>
@@ -9227,6 +9682,18 @@ internal sealed class RequiredBuildVerificationUnavailableException : Exception
         : base(message, innerException) { }
 }
 
+internal sealed class AuditHistoryLoadFailedException : Exception
+{
+    public AuditHistoryLoadFailedException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
+internal sealed class AuditHistoryPersistenceFailedException : Exception
+{
+    public AuditHistoryPersistenceFailedException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
 {
     public SandboxPushReconcileConflictException(string branch, string strategy)
@@ -9301,6 +9768,16 @@ internal sealed record AuditIterationDetails(
     /// Receivers that do not care about this field ignore it safely.
     /// </summary>
     string? AuditAgentKind = null);
+
+internal sealed record AuditProgressSnapshot(
+    int Iteration,
+    int MaxIterations,
+    int BlockingFindings,
+    int NonBlockingFindings,
+    IReadOnlyList<string> BlockingFindingIds,
+    IReadOnlyList<AuditProgressFinding> BlockingFindingsDetails,
+    IReadOnlyList<AuditProgressFinding> Findings,
+    string? WorkBranchTip);
 
 internal sealed record SuggestionWebhookDetails(
     string Id,

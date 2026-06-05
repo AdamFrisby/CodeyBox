@@ -1601,6 +1601,13 @@ builder.Services.AddSingleton<IWorkItemStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(opts.StateDatabasePath);
 });
+// Workflow-owned durable audit progress shares the same SqliteWorkItemStore
+// instance. Registered explicitly (rather than relying on a runtime `as`
+// cast inside PipelineRunner / WorkItemRetrier) so an alternate IWorkItemStore
+// composition fails DI resolution loud instead of silently degrading the
+// audit-progress feature to a no-op.
+builder.Services.AddSingleton<IAuditProgressStore>(sp =>
+    (IAuditProgressStore)sp.GetRequiredService<IWorkItemStore>());
 builder.Services.AddSingleton<IIdempotencyStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1891,9 +1898,10 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetRequiredService<IGitHost>(),
     sp.GetRequiredService<ILogger<WorkItemRetrier>>(),
     sp.GetRequiredService<IAgentStreamSummaryStore>(),
-    sp.GetService<IAuditReportStore>(),
     sp.GetRequiredService<IProjectRepository>(),
-    sp.GetRequiredService<IReleaseStore>()));
+    sp.GetRequiredService<IReleaseStore>(),
+    sp.GetService<IWorkItemQuestionStore>(),
+    sp.GetRequiredService<IAuditProgressStore>()));
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -1943,7 +1951,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     // transition without restart, mirroring the watchdog's own sweep accessor.
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
-    dispatchAvailability: sp.GetService<IAgentDispatchAvailability>()));
+    dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
+    auditProgress: sp.GetRequiredService<IAuditProgressStore>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

@@ -363,6 +363,10 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         // taken whole from whichever side defines them — we don't try to
         // append defaults to project lists, which would be surprising.
         var mergedMaxIter = project?.MaxIterations ?? defaults?.MaxIterations ?? 3;
+        var mergedBudgetOverrideMax = project?.BudgetOverrideMaxIterations ?? defaults?.BudgetOverrideMaxIterations;
+        var mergedComplexityBudgets = MergeComplexityIterationBudgets(
+            defaults?.ComplexityIterationBudgets,
+            project?.ComplexityIterationBudgets);
         var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 120;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
@@ -402,6 +406,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         {
             Profile = selectedProfile,
             MaxIterations = mergedMaxIter,
+            BudgetOverrideMaxIterations = mergedBudgetOverrideMax,
+            ComplexityIterationBudgets = mergedComplexityBudgets,
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
             StopOnFirstFailure = mergedStopOnFirst,
@@ -464,6 +470,11 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         {
             Profile = audit.Profile,
             MaxIterations = audit.MaxIterations,
+            BudgetOverrideMaxIterations = audit.BudgetOverrideMaxIterations,
+            ComplexityIterationBudgets = audit.ComplexityIterationBudgets.ToDictionary(
+                kvp => kvp.Key,
+                kvp => kvp.Value,
+                StringComparer.OrdinalIgnoreCase),
             FailingSeverity = audit.FailingSeverity.ToString(),
             PerIterationTimeoutMinutes = (int)audit.PerIterationTimeout.TotalMinutes,
             StopOnFirstFailure = audit.StopOnFirstFailure,
@@ -530,6 +541,26 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 Severity = p.Severity,
             }).ToList(),
         };
+
+    private static IReadOnlyDictionary<string, int> MergeComplexityIterationBudgets(
+        Dictionary<string, int>? defaults,
+        Dictionary<string, int>? project)
+    {
+        var merged = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (key, value) in defaults)
+                if (!string.IsNullOrWhiteSpace(key) && value > 0)
+                    merged[key.Trim()] = value;
+        }
+        if (project is not null)
+        {
+            foreach (var (key, value) in project)
+                if (!string.IsNullOrWhiteSpace(key) && value > 0)
+                    merged[key.Trim()] = value;
+        }
+        return merged;
+    }
 
     private static IReadOnlyDictionary<string, ProjectLanguagePresetOverride> MergeLanguageOverrides(
         Dictionary<string, ProjectLanguagePresetOverrideConfig>? defaults,

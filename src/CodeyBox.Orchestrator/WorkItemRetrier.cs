@@ -4,8 +4,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Consolidates retry logic for terminal work items, ensuring consistent state
-/// transitions, audit logs, and side effects (e.g. stream summary deletion).
+/// Consolidates retry logic for terminal and operator-parked work items,
+/// ensuring consistent state transitions, audit logs, and side effects (e.g.
+/// stream summary deletion).
 /// </summary>
 public sealed class WorkItemRetrier
 {
@@ -13,9 +14,10 @@ public sealed class WorkItemRetrier
     private readonly ITaskQueue _queue;
     private readonly IGitHost _gitHost;
     private readonly IAgentStreamSummaryStore? _streamSummaries;
-    private readonly IAuditReportStore? _auditReports;
+    private readonly IAuditProgressStore? _auditProgress;
     private readonly IProjectRepository? _projects;
     private readonly IReleaseStore? _releases;
+    private readonly IWorkItemQuestionStore? _questions;
     private readonly ILogger<WorkItemRetrier> _log;
 
     public WorkItemRetrier(
@@ -24,26 +26,48 @@ public sealed class WorkItemRetrier
         IGitHost gitHost,
         ILogger<WorkItemRetrier> log,
         IAgentStreamSummaryStore? streamSummaries = null,
-        IAuditReportStore? auditReports = null,
         IProjectRepository? projects = null,
-        IReleaseStore? releases = null)
+        IReleaseStore? releases = null,
+        IWorkItemQuestionStore? questions = null,
+        IAuditProgressStore? auditProgress = null)
     {
         _store = store;
         _queue = queue;
         _gitHost = gitHost;
         _streamSummaries = streamSummaries;
-        _auditReports = auditReports;
+        // Null intentionally disables durable audit-progress history for narrow
+        // test fixtures; production DI wires this dependency explicitly.
+        _auditProgress = auditProgress;
         _projects = projects;
         _releases = releases;
+        _questions = questions;
         _log = log;
     }
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom)> RetryAsync(
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
         WorkItem item,
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
     {
+        if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
+        {
+            var openQuestions = (await _questions.ListByWorkItemAsync(item.Id.ToString(), ct))
+                .Where(q => string.Equals(q.State, "open", StringComparison.Ordinal))
+                .Select(q => q.QuestionId)
+                .Take(5)
+                .ToArray();
+            if (openQuestions.Length > 0)
+            {
+                return (
+                    false,
+                    "cannot retry item while operator questions are open; answer or dismiss them first",
+                    null,
+                    null,
+                    openQuestions);
+            }
+        }
+
         // A null/blank `from` means "operator did not specify" — auto-pick
         // based on work-branch state. Explicit values (including from the
         // quota auto-retry scheduler, which always passes a normalized phase)
@@ -58,7 +82,7 @@ public sealed class WorkItemRetrier
             catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
             {
                 _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
-                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null);
+                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null, null);
             }
         }
 
@@ -73,7 +97,7 @@ public sealed class WorkItemRetrier
         };
 
         if (resumeState is null)
-            return (false, $"invalid 'from' value '{from}'", null, null);
+            return (false, $"invalid 'from' value '{from}'", null, null, null);
 
         var actualFrom = requestedFrom;
 
@@ -82,7 +106,7 @@ public sealed class WorkItemRetrier
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
-                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null);
+                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null, null);
 
             // The work branch must also exist — earlier work-phase failures can
             // leave the item in Failed without ever producing a commit, in which
@@ -114,11 +138,14 @@ public sealed class WorkItemRetrier
         };
 
         // Atomic conditional update to prevent race conditions.
-        // We retry from Failed, AuditFailed, MergeConflictResolutionFailed, Cancelled, or AbandonedAfterRecoveryAttempts.
+        // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
+        // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
+        // WaitingForQuotaReset. Eligibility gates that must apply across HTTP,
+        // scheduler, and operator paths live in this retrier before the write.
         var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
-            return (false, "work item state changed concurrently; retry aborted", null, null);
+            return (false, "work item state changed concurrently; retry aborted", null, null, null);
         }
 
         if (_streamSummaries is not null)
@@ -155,17 +182,17 @@ public sealed class WorkItemRetrier
                 _log.LogWarning(ex,
                     "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
                     item.Id, resumeState.Value, item.State);
-                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom);
+                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom, null);
             }
 
             _log.LogError(ex,
                 "Retry of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
                 item.Id, resumeState.Value);
-            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom);
+            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom, null);
         }
 
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
-        return (true, null, resumeState, actualFrom);
+        return (true, null, resumeState, actualFrom, null);
     }
 
     /// <summary>
@@ -326,18 +353,18 @@ public sealed class WorkItemRetrier
             return new ResumeOutcome(ResumeStatus.PreconditionFailed, preconditionMessage, null, null);
 
         // from=audit / from=merge bypass the work phase, so the existing
-        // commits on the work-branch must already be auditable. The cheapest
-        // signal is the audit-reports table: a non-empty set proves the audit
-        // phase ran at least once on these commits. If it hasn't, force the
-        // operator through from=work (which produces a rework iteration on top
-        // of the prior commits) rather than running auditors on a clean diff.
-        if (resumeState.Value != WorkItemState.Queued && _auditReports is not null)
+        // commits on the work branch must already have durable workflow-owned
+        // audit progress. Audit reports are diagnostic rows and may be
+        // retention-swept, so they are deliberately not used as a resume
+        // precondition.
+        if (resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
         {
-            var reports = await _auditReports.GetByWorkItemAsync(item.Id.ToString(), ct);
-            if (reports.Count == 0)
+            var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
+            var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
+            if (progress.Count == 0)
                 return new ResumeOutcome(
                     ResumeStatus.Conflict,
-                    $"cannot resume from '{requestedFrom}': work-branch has never reached an audit-passing state (no prior audit reports). Use from=work to produce an auditable rework iteration first.",
+                    $"cannot resume from '{requestedFrom}': work branch has no durable audit progress. Use from=work to produce an auditable rework iteration first.",
                     null,
                     null);
         }
@@ -388,5 +415,17 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemResumed(resumed.Id, requestedFrom, reason);
 
         return new ResumeOutcome(ResumeStatus.Ok, null, resumed, resumeState);
+    }
+
+    private async Task<DateTimeOffset?> ResolveCurrentWorkAttemptStartedAtAsync(
+        WorkItemId workItemId,
+        CancellationToken ct)
+    {
+        var iterations = await _store.GetIterationsAsync(workItemId, ct);
+        return iterations
+            .Where(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .OrderByDescending(i => i.DispatchedAt)
+            .Select(i => (DateTimeOffset?)i.DispatchedAt)
+            .FirstOrDefault();
     }
 }

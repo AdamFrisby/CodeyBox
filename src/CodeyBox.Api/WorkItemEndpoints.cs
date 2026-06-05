@@ -343,7 +343,7 @@ internal static class WorkItemEndpoints
     }
 
     /// <summary>
-    /// Retry a terminal-failed work item from a specific phase. Resets the
+    /// Retry a terminal-failed or operator-parked work item from a specific phase. Resets the
     /// state to the matching pre-phase marker and re-enqueues; the pipeline
     /// runner gates each phase by entry state, so earlier phases are
     /// skipped (their output — branch / merged base — is still in the bare
@@ -359,15 +359,17 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        // Only resume from terminal-failed states or the parked
-        // WaitingForQuotaReset state (operator override of the scheduler).
+        // Only resume from terminal-failed states or parked states
+        // (NeedsOperatorInput for operator triage, WaitingForQuotaReset for
+        // operator override of the scheduler).
         // Done items have nothing to retry; other non-terminal states would
         // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts
+            or WorkItemState.NeedsOperatorInput
             or WorkItemState.WaitingForQuotaReset))
-            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed items can be retried" });
+            return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
 
         // Pass body.From through verbatim (including null) so the retrier can
         // auto-pick when the operator didn't specify a phase — defaulting at
@@ -378,10 +380,13 @@ internal static class WorkItemEndpoints
         var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
             ? null
             : body!.From!.Trim().ToLowerInvariant();
-        var (success, error, resumeState, actualFrom) = await retrier.RetryAsync(item, requestedFrom, trigger: "manual", ct);
+        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(item, requestedFrom, trigger: "manual", ct);
 
         if (!success)
         {
+            if (openQuestions is { Count: > 0 })
+                return Results.Conflict(new { error, openQuestions });
+
             if (error!.Contains("no longer exists"))
                 return Results.Conflict(new { error, hint = "retry with from=\"work\" to start over from a fresh clone" });
 
@@ -791,7 +796,7 @@ internal static class WorkItemEndpoints
     ///   - 400 if 'from' is not one of work/audit/merge or the reason violates
     ///     the length/control-character guard shared with /queue/pause.
     ///   - 409 if the item is not in Cancelled state, or if from=audit/merge
-    ///     was requested but no prior audit reports exist (work-branch never
+    ///     was requested but no durable audit progress exists (work-branch never
     ///     reached an auditable state).
     ///   - 412 if the bare repo or the work-branch ref is no longer present
     ///     (resume cannot reconstruct the prior agent work; the operator must
@@ -871,9 +876,9 @@ internal static class WorkItemEndpoints
     /// prompt, agent, work/merge timeouts, min model score, required
     /// capabilities) are Queued-only — they affect a running pipeline so the
     /// endpoint rejects 409 once dispatch starts. <see cref="PatchWorkItemRequest.DependsOn"/>
-    /// is the exception: it's a replace-set edit allowed on any non-terminal
-    /// state (Queued / Working / Auditing / …), persisted via a partial
-    /// UPDATE that does not stomp <c>state</c> and friends.
+    /// and the audit-budget fields are the exceptions: they are allowed on any
+    /// non-terminal state (Queued / Working / Auditing / …), persisted via
+    /// partial UPDATEs that do not stomp <c>state</c> and friends.
     ///
     /// Timeout / score fields are clamped using the same bounds as creation —
     /// out-of-range values do not error, they pin to the boundary so an
@@ -897,7 +902,7 @@ internal static class WorkItemEndpoints
         if (err is not null) return err;
 
         var depsPatch = body.DependsOn is not null;
-        var nonDepPatch =
+        var queuedOnlyPatch =
             body.Title is not null
             || body.Prompt is not null
             || body.Agent is not null
@@ -905,6 +910,8 @@ internal static class WorkItemEndpoints
             || body.MergeTimeoutMinutes is not null
             || body.MinModelScore is not null
             || body.RequiredCapabilities is not null;
+        var auditBudgetPatch = body.AuditMaxIterations is not null
+            || body.AuditComplexity is not null;
 
         // ── State pre-checks: surface 409 before any write ────────────────────
         // DependsOn is allowed on any non-terminal state — adding a dependency
@@ -915,7 +922,12 @@ internal static class WorkItemEndpoints
             {
                 error = $"cannot edit dependencies of work item in terminal state '{item.State}'",
             });
-        if (nonDepPatch && item!.State != WorkItemState.Queued)
+        if (auditBudgetPatch && WorkItemDependencies.TerminalStates.Contains(item!.State))
+            return Results.Conflict(new
+            {
+                error = $"cannot edit audit budget of work item in terminal state '{item.State}'",
+            });
+        if (queuedOnlyPatch && item!.State != WorkItemState.Queued)
             return Results.Conflict(new
             {
                 error = $"cannot edit item in state {item.State}; only Queued items are editable",
@@ -989,23 +1001,69 @@ internal static class WorkItemEndpoints
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
         }
 
+        if (body.AuditMaxIterations is { } auditMaxIterations)
+        {
+            var auditMaxIterationsError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditMaxIterations);
+            if (auditMaxIterationsError is not null)
+                return Results.BadRequest(new { error = auditMaxIterationsError });
+            updated = updated with { AuditMaxIterations = auditMaxIterations, UpdatedAt = now };
+        }
+
+        if (body.AuditComplexity is not null)
+        {
+            var (normalised, complexityErr) = AuditBudgetRequestValidation.NormaliseAuditComplexity(body.AuditComplexity);
+            if (complexityErr is not null) return Results.BadRequest(new { error = complexityErr });
+            updated = updated with { AuditComplexity = normalised, UpdatedAt = now };
+        }
+
         IReadOnlyList<WorkItemId> oldDependsOn = updated.DependsOn;
         if (depsPatch)
             updated = updated with { DependsOn = newDependsOn!, UpdatedAt = now };
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Non-dep fields are Queued-only and go through the full-row UPDATE.
-        // A dep-only edit on a non-Queued non-terminal item (Working, Auditing,
-        // etc.) takes the partial-UPDATE path so we don't stomp state/started_at.
-        if (nonDepPatch)
+        // Queued-only fields go through the full-row UPDATE, but audit-budget
+        // fields are restored to their original values for that write and then
+        // persisted through UpdateAuditBudgetAsync below. That keeps the audit
+        // budget path partial even when an operator sends it alongside a queued
+        // title/timeout/etc edit.
+        if (queuedOnlyPatch)
         {
+            var queuedUpdate = auditBudgetPatch
+                ? updated with
+                {
+                    AuditMaxIterations = item!.AuditMaxIterations,
+                    AuditComplexity = item!.AuditComplexity,
+                }
+                : updated;
             // TryUpdateIfStateAsync guards against a race where the orchestrator picks
             // up the item between the GetAsync above and this write.
-            var written = await store.TryUpdateIfStateAsync(updated, WorkItemState.Queued, ct);
+            var written = await store.TryUpdateIfStateAsync(queuedUpdate, WorkItemState.Queued, ct);
             if (!written)
                 return Results.Conflict(new { error = "item transitioned out of Queued state before the update could be written" });
         }
-        else if (depsPatch)
+        if (auditBudgetPatch)
+        {
+            var budgetResult = await store.UpdateAuditBudgetAsync(
+                updated.Id,
+                updated.AuditMaxIterations,
+                updated.AuditComplexity,
+                now,
+                ct);
+            switch (budgetResult.Outcome)
+            {
+                case AuditBudgetUpdateOutcome.NotFound:
+                    return Results.NotFound(new { error = $"work item '{id}' no longer exists" });
+                case AuditBudgetUpdateOutcome.TerminalState:
+                    return Results.Conflict(new
+                    {
+                        error = $"work item transitioned to terminal state '{budgetResult.Item!.State}' before audit budget could be updated",
+                    });
+                case AuditBudgetUpdateOutcome.Updated:
+                    updated = budgetResult.Item ?? updated;
+                    break;
+            }
+        }
+        if (depsPatch && !queuedOnlyPatch)
         {
             var depResult = await store.UpdateDependsOnAsync(updated.Id, newDependsOn!, now, ct);
             switch (depResult.Outcome)
@@ -1019,9 +1077,10 @@ internal static class WorkItemEndpoints
                     });
             }
             oldDependsOn = depResult.OldDependsOn ?? oldDependsOn;
+            updated = depResult.Item ?? updated with { DependsOn = newDependsOn!, UpdatedAt = now };
         }
 
-        if (nonDepPatch)
+        if (queuedOnlyPatch || auditBudgetPatch)
         {
             AuditLog.WorkItemPatched(
                 updated.Id,
@@ -1031,7 +1090,8 @@ internal static class WorkItemEndpoints
                 workTimeoutChanged: body.WorkTimeoutMinutes is not null,
                 mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
                 minModelScoreChanged: body.MinModelScore is not null,
-                requiredCapabilitiesChanged: body.RequiredCapabilities is not null);
+                requiredCapabilitiesChanged: body.RequiredCapabilities is not null,
+                auditBudgetChanged: auditBudgetPatch);
         }
         if (depsPatch)
             AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
@@ -1806,6 +1866,8 @@ internal static class WorkItemEndpoints
             Usage: usage?.Iteration,
             UsageTotal: usage?.Total,
             Priority: item.Priority,
+            AuditMaxIterations: item.AuditMaxIterations,
+            AuditComplexity: item.AuditComplexity,
             CancellationSource: item.CancellationSource,
             TransientCancelRetries: item.TransientCancelRetries,
             PromptRevision: item.PromptRevision,
@@ -2023,6 +2085,8 @@ public sealed record CreateWorkItemRequest(
     int? MinModelScore = null,
     string? ReleaseId = null,
     int? Priority = null,
+    int? AuditMaxIterations = null,
+    string? AuditComplexity = null,
     // Namespaced external IDs. The legacy singular `ExternalId` field is
     // accepted as a write-shortcut stored under namespace 'legacy'. Sending
     // both is allowed only when they agree; conflicting values 400.
@@ -2074,6 +2138,8 @@ public sealed record PatchWorkItemRequest(
     int? MergeTimeoutMinutes = null,
     int? MinModelScore = null,
     IReadOnlyList<string>? RequiredCapabilities = null,
+    int? AuditMaxIterations = null,
+    string? AuditComplexity = null,
     // Replace-set dependency edit. Same string-format and validation rules
     // as the create handler: each entry is a GUID, a namespaced
     // 'ns:value' externalId, or a bare externalId (unambiguous within the
@@ -2154,6 +2220,8 @@ public sealed record WorkItemDto(
     WorkItemUsageTotal? UsageTotal = null,
     IReadOnlyList<AgentFallbackDto>? FallbackHistory = null,
     int Priority = 0,
+    int? AuditMaxIterations = null,
+    string? AuditComplexity = null,
     string? CancellationSource = null,
     int TransientCancelRetries = 0,
     int PromptRevision = 1,

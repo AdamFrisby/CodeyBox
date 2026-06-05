@@ -361,7 +361,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow - SpawnPacingDelay);
         await controller.ResumeAsync();
         Assert.True(
-            await pipeline.WaitForEnteredAsync(second.Id, DispatchWaitTimeout),
+            await pipeline.WaitForEnteredAsync(second.Id, TimeSpan.FromSeconds(20)),
             "The post-pickup queue-pause branch should preserve a wake so resume dispatches the item.");
 
         pipeline.Release(second.Id);

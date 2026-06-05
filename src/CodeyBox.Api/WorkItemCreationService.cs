@@ -243,6 +243,24 @@ internal sealed class WorkItemCreationService
             priority = p;
         }
 
+        int? auditMaxIterations = null;
+        if (req.AuditMaxIterations is { } auditBudget)
+        {
+            var auditBudgetError = AuditBudgetRequestValidation.ValidateAuditMaxIterations(auditBudget);
+            if (auditBudgetError is not null)
+                return Error(auditBudgetError);
+            auditMaxIterations = auditBudget;
+        }
+
+        string? auditComplexity = null;
+        if (req.AuditComplexity is not null)
+        {
+            var (normalised, complexityError) = AuditBudgetRequestValidation.NormaliseAuditComplexity(req.AuditComplexity);
+            if (complexityError is not null)
+                return Error(complexityError);
+            auditComplexity = normalised;
+        }
+
         IReadOnlyList<string> requiredCapabilities = [];
         if (req.RequiredCapabilities is { } reqCaps)
         {
@@ -331,6 +349,8 @@ internal sealed class WorkItemCreationService
             DependsOn = dependsOnIds,
             QueuePosition = DateTimeOffset.UtcNow.Ticks,
             Priority = priority,
+            AuditMaxIterations = auditMaxIterations,
+            AuditComplexity = auditComplexity,
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,

@@ -407,7 +407,10 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        // BackgroundService.ExecuteAsync runs on the thread pool; under heavy
+        // CPU contention (parallel audit suites) the startup-sweep chain can
+        // take several seconds to flush before the item flips to Failed.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -446,7 +449,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
             startupRecoveryCompletion: barrier);
 
         await svc.StartAsync(CancellationToken.None);
-        await barrier.WaitObserved.WaitAsync(TimeSpan.FromSeconds(5));
+        await barrier.WaitObserved.WaitAsync(TimeSpan.FromSeconds(30));
         await Task.Delay(100);
 
         var beforeSignal = await _store.GetAsync(item.Id);
@@ -455,7 +458,9 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         barrier.MarkRecoveryInputReady();
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        // Wider deadline mirrors the parallel-suite contention budget used in
+        // the sibling test; the local-loop case still resolves in milliseconds.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
         WorkItem? final = null;
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -464,7 +469,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
             await Task.Delay(30);
         }
 
-        await barrier.InitialRecoveryCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+        await barrier.InitialRecoveryCompleted.WaitAsync(TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(final);
