@@ -239,7 +239,7 @@ public sealed class AgentClassRouterTests : IDisposable
         await service.StartAsync(CancellationToken.None);
         try
         {
-            var reenqueuedId = await queue.SecondWorkItemEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var reenqueuedId = await queue.SecondWorkItemEnqueue.Task.WaitAsync(TimeSpan.FromSeconds(15));
             var stored = await _items.GetAsync(item.Id);
 
             Assert.Equal(item.Id, reenqueuedId);

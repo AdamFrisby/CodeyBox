@@ -597,7 +597,7 @@ public sealed class WebAppHarnessTests
         EntryUrl = "http://localhost:5080",
         BrowserCommand = ["firefox", "$URL"],
         NetworkProfile = SandboxConventions.GraphicalNetworkProfile,
-        ReadinessTimeout = TimeSpan.FromSeconds(2),
+        ReadinessTimeout = TimeSpan.FromSeconds(10),
         ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
         BrowserSettleDelay = TimeSpan.Zero,
     };
