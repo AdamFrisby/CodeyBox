@@ -1855,7 +1855,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
     {
         if (!extractors.ContainsKey(kind))
             startupLog.LogWarning(
-                "No cost extractor registered for agent '{Agent}'; cost data will not be captured for this agent", kind.Value);
+                "No cost extractor registered for agent '{Agent}'; token usage will not be extracted, but completed invocations still record elapsed fallback cost rows", kind.Value);
     }
     return extractors;
 });

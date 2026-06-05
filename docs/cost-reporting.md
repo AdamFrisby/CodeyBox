@@ -6,12 +6,13 @@ to run?" with per-phase and per-agent breakdowns.
 
 ## Overview
 
-Every agent invocation (work, rework, audit LLM auditors, merge) attempts
-to extract token usage from the agent CLI's output and store a cost row in
-the `work_item_costs` SQLite table. When a registered extractor cannot find
-tokens, the pipeline still writes a zero-token, $0 row with the invocation
-timestamps so elapsed agent time and run count remain visible. Costs are
-surfaced via two REST endpoints and an admin dashboard "Costs" tab.
+Every agent invocation (work, rework, check, post-act re-check, audit LLM
+auditors, merge) attempts to extract token usage from the agent CLI's output
+and store a cost row in the `work_item_costs` SQLite table. When no extractor
+is registered, an extractor cannot find tokens, or an extractor throws, the
+pipeline still writes a zero-token, $0 row with the invocation timestamps so
+elapsed agent time and run count remain visible. Costs are surfaced via two
+REST endpoints and an admin dashboard "Costs" tab.
 
 Cost writes are **best-effort**: any failure during extraction or storage
 is logged at Warning level and does not abort the pipeline phase.
@@ -22,6 +23,8 @@ is logged at Warning level and does not abort the pipeline phase.
 |---|---|
 | `work` | Initial work agent run |
 | `rework` | Subsequent work agent runs after an audit failure |
+| `check` | Initial CheckAndAct read-only agent run |
+| `post-act-recheck` | CheckAndAct follow-up validation after remediation |
 | `audit` | LLM-backed auditors (`needsCredentials == true`); one row per auditor invocation |
 | `merge` | Merge agent run |
 
@@ -112,13 +115,12 @@ Rules:
 Each supported agent kind has a dedicated `IAgentCostExtractor`
 implementation that parses the agent CLI's stdout and stderr.
 
-If an extractor is registered for an agent kind but returns `null`, the
-pipeline records an elapsed-time fallback row: `input_tokens = 0`,
-`cached_input_tokens = 0`, `output_tokens = 0`, `estimated_usd = 0`, and
-`raw_metadata_json.source = "extractor_null_elapsed_fallback"`. The row's
-`started_at` / `ended_at` still feed `usageTotal.elapsedMs`, the cost API's
-`elapsedMs`, and invocation counts. If no extractor is registered at all, no
-cost row is written.
+If an extractor is missing, returns `null`, or throws, the pipeline records an
+elapsed-time fallback row: `input_tokens = 0`, `cached_input_tokens = 0`,
+`output_tokens = 0`, `estimated_usd = 0`, and
+`raw_metadata_json.source = "elapsed_fallback"`. The row's `started_at` /
+`ended_at` still feed `usageTotal.elapsedMs`, the cost API's `elapsedMs`, and
+invocation counts.
 
 ### Claude (`ClaudeCostExtractor`)
 
