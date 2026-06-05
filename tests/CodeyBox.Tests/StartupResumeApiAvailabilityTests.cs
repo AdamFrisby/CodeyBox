@@ -60,7 +60,7 @@ public sealed class StartupResumeApiAvailabilityTests
         try
         {
             var availabilityDeadline = mode == SandboxResumeMode.Background
-                ? configuredTimeout + TimeSpan.FromSeconds(20)
+                ? configuredTimeout
                 : configuredTimeout + TimeSpan.FromSeconds(7);
             response = await Task.Run(async () =>
             {
@@ -75,11 +75,8 @@ public sealed class StartupResumeApiAvailabilityTests
             response.EnsureSuccessStatusCode();
             if (mode == SandboxResumeMode.Background)
             {
-                if (behavior == "hang")
-                {
-                    Assert.True(sw.Elapsed < configuredTimeout,
-                        $"GET /quota was not served before configured startup resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
-                }
+                Assert.True(sw.Elapsed < configuredTimeout,
+                    $"GET /quota was not served before configured startup resume timeout {configuredTimeout}; elapsed {sw.Elapsed}");
             }
             else
             {

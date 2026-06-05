@@ -203,7 +203,7 @@ public sealed class CodexStreamParserTests
         Assert.Equal("unified_exec", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
         Assert.Equal(2, tool.OutputBytes);
-        Assert.Equal(50, summary.InputTokens);
+        Assert.Equal(44, summary.InputTokens);
         Assert.Equal(9, summary.OutputTokens);
         Assert.Equal(6, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
@@ -230,7 +230,7 @@ public sealed class CodexStreamParserTests
         Assert.Equal("call_1", tool.ToolUseId);
         Assert.Equal("shell", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
-        Assert.Equal(30, summary.InputTokens);
+        Assert.Equal(28, summary.InputTokens);
         Assert.Equal(4, summary.OutputTokens);
         Assert.Equal(2, summary.CachedInputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);
@@ -270,7 +270,7 @@ public sealed class CodexStreamParserTests
             Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
-            Assert.Equal(29990, summary.InputTokens);
+            Assert.Equal(11814, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);

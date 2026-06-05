@@ -99,11 +99,11 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
     {
         if (!root.TryGetProperty("usage", out var usage)) return null;
 
-        int input = 0, cached = 0, output = 0;
+        int totalInput = 0, cached = 0, output = 0;
         string? modelId = null;
 
-        if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.TryGetInt32(out var ptv)) input = ptv;
-        else if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) input = itv;
+        if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.TryGetInt32(out var ptv)) totalInput = ptv;
+        else if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) totalInput = itv;
 
         if (usage.TryGetProperty("completion_tokens", out var ct) && ct.TryGetInt32(out var ctv)) output = ctv;
         else if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
@@ -116,7 +116,9 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
             modelId = raw is { Length: > MaxModelIdLength } ? raw[..MaxModelIdLength] : raw;
         }
 
-        if (input == 0 && output == 0) return null;
+        var input = FreshInputTokens(totalInput, cached);
+
+        if (input == 0 && cached == 0 && output == 0) return null;
         return new AgentCostSnapshot(input, cached, output, modelId);
     }
 
@@ -168,4 +170,7 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         var cleaned = s.Replace(",", "", StringComparison.Ordinal);
         return int.TryParse(cleaned, out var v) ? v : 0;
     }
+
+    private static int FreshInputTokens(int totalInput, int cached)
+        => Math.Max(0, totalInput - cached);
 }

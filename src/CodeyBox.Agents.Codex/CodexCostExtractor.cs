@@ -19,8 +19,6 @@ namespace CodeyBox.Agents.Codex;
 /// </summary>
 public sealed class CodexCostExtractor : IAgentCostExtractor
 {
-    private const int MaxUsageSearchDepth = 8;
-
     public AgentKind Kind => AgentKind.Codex;
 
     public ModelRateConfig? DefaultPricing { get; } = new()
@@ -98,18 +96,10 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
 
     private static AgentCostSnapshot? ExtractFromDoc(JsonElement root)
     {
-        if (!TryGetUsage(root, out var usage, depth: 0)) return null;
+        var usage = CodexUsageParser.TryExtract(root);
+        if (usage is null) return null;
 
-        int totalInput = 0, output = 0;
         string? modelId = null;
-
-        if (usage.TryGetProperty("prompt_tokens", out var pt) && TryGetNonNegativeInt32(pt, out var ptv)) totalInput = ptv;
-        else if (usage.TryGetProperty("input_tokens", out var it) && TryGetNonNegativeInt32(it, out var itv)) totalInput = itv;
-
-        if (usage.TryGetProperty("completion_tokens", out var ct) && TryGetNonNegativeInt32(ct, out var ctv)) output = ctv;
-        else if (usage.TryGetProperty("output_tokens", out var ot) && TryGetNonNegativeInt32(ot, out var otv)) output = otv;
-
-        var cached = TryReadCachedInputTokens(usage);
 
         if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
@@ -117,80 +107,11 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             modelId = raw is { Length: > 128 } ? raw[..128] : raw;
         }
 
-        var input = FreshInputTokens(totalInput, cached);
-
-        if (input == 0 && cached == 0 && output == 0) return null;
-        return new AgentCostSnapshot(input, cached, output, modelId);
-    }
-
-    private static bool TryGetUsage(JsonElement root, out JsonElement usage, int depth)
-    {
-        if (depth > MaxUsageSearchDepth)
-        {
-            usage = default;
-            return false;
-        }
-
-        if (root.ValueKind == JsonValueKind.Object)
-        {
-            if (TryGetUsageObject(root, "usage", out usage)) return true;
-            if (TryGetUsageObject(root, "token_usage", out usage)) return true;
-            if (TryGetUsageObject(root, "total_token_usage", out usage)) return true;
-
-            if (root.TryGetProperty("payload", out var payload) && TryGetUsage(payload, out usage, depth + 1)) return true;
-            if (root.TryGetProperty("item", out var item) && TryGetUsage(item, out usage, depth + 1)) return true;
-            if (root.TryGetProperty("info", out var info) && TryGetUsage(info, out usage, depth + 1)) return true;
-        }
-
-        usage = default;
-        return false;
-    }
-
-    private static bool TryGetUsageObject(JsonElement root, string propertyName, out JsonElement usage)
-    {
-        if (root.TryGetProperty(propertyName, out usage) && usage.ValueKind == JsonValueKind.Object)
-            return true;
-
-        usage = default;
-        return false;
-    }
-
-    private static bool TryGetNonNegativeInt32(JsonElement element, out int value)
-    {
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value) && value >= 0)
-            return true;
-
-        value = 0;
-        return false;
-    }
-
-    private static int TryReadCachedInputTokens(JsonElement usage)
-    {
-        if (usage.TryGetProperty("cached_input_tokens", out var cachedInput)
-            && TryGetNonNegativeInt32(cachedInput, out var cachedInputValue))
-            return cachedInputValue;
-
-        if (usage.TryGetProperty("prompt_tokens_details", out var promptDetails)
-            && promptDetails.ValueKind == JsonValueKind.Object
-            && promptDetails.TryGetProperty("cached_tokens", out var promptCached)
-            && TryGetNonNegativeInt32(promptCached, out var promptCachedValue))
-            return promptCachedValue;
-
-        if (usage.TryGetProperty("input_tokens_details", out var inputDetails)
-            && inputDetails.ValueKind == JsonValueKind.Object
-            && inputDetails.TryGetProperty("cached_tokens", out var inputCached)
-            && TryGetNonNegativeInt32(inputCached, out var inputCachedValue))
-            return inputCachedValue;
-
-        if (usage.TryGetProperty("cache_read_input_tokens", out var cacheRead)
-            && TryGetNonNegativeInt32(cacheRead, out var cacheReadValue))
-            return cacheReadValue;
-
-        if (usage.TryGetProperty("cached_tokens", out var cached)
-            && TryGetNonNegativeInt32(cached, out var cachedValue))
-            return cachedValue;
-
-        return 0;
+        return new AgentCostSnapshot(
+            usage.Value.InputTokens,
+            usage.Value.CachedInputTokens,
+            usage.Value.OutputTokens,
+            modelId);
     }
 
     private static AgentCostSnapshot? TryParseHumanReadable(string? text)

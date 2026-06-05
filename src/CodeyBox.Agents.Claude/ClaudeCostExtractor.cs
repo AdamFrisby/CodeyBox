@@ -81,18 +81,14 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
 
                 if (type == "result" && root.TryGetProperty("usage", out var usage))
                 {
-                    // Anthropic splits prompt input into three buckets: input_tokens
-                    // (fresh), cache_creation_input_tokens (tokens written to cache
-                    // this turn — priced higher than fresh), and cache_read_input_tokens
-                    // (read from cache — cheap). Claude stores the total input bucket
-                    // so the calculator derives the billable fresh portion as
-                    // InputTokens - CachedInputTokens. Dropping cache_creation_input_tokens
-                    // (as the extractor used to) made the recorded input ~0 relative to
-                    // cached and zeroed out the cache-creation cost component.
+                    // Anthropic splits prompt input into fresh, cache-write, and
+                    // cache-read buckets. AgentCostSnapshot.InputTokens is the
+                    // non-cache-read billing bucket, so include cache creation
+                    // alongside fresh input while keeping cache reads separate.
                     var freshInput = usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv) ? itv : 0;
                     var cacheCreation = usage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.TryGetInt32(out var cctv) ? cctv : 0;
                     var cacheRead = usage.TryGetProperty("cache_read_input_tokens", out var ct) && ct.TryGetInt32(out var ctv) ? ctv : 0;
-                    inputTokens = freshInput + cacheCreation + cacheRead;
+                    inputTokens = freshInput + cacheCreation;
                     outputTokens = usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv) ? otv : 0;
                     cachedTokens = cacheRead;
                     foundUsage = true;
@@ -126,7 +122,7 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
             var cachedM = CachedPattern.Match(text);
             var cached = cachedM.Success ? ParseTokenCount(cachedM.Groups[1].Value) : 0;
             if (input > 0 || output > 0)
-                return new AgentCostSnapshot(input, cached, output, null);
+                return new AgentCostSnapshot(FreshInputTokens(input, cached), cached, output, null);
         }
 
         var tiM = TotalInputPattern.Match(text);
@@ -138,7 +134,7 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
             var tcM = TotalCachedPattern.Match(text);
             var cached = tcM.Success ? ParseTokenCount(tcM.Groups[1].Value) : 0;
             if (input > 0 || output > 0)
-                return new AgentCostSnapshot(input, cached, output, null);
+                return new AgentCostSnapshot(FreshInputTokens(input, cached), cached, output, null);
         }
 
         return null;
@@ -149,4 +145,7 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
         var cleaned = s.Replace(",", "", StringComparison.Ordinal);
         return int.TryParse(cleaned, out var v) ? v : 0;
     }
+
+    private static int FreshInputTokens(int totalInput, int cached)
+        => Math.Max(0, totalInput - cached);
 }

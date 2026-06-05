@@ -136,6 +136,19 @@ public sealed class CodexCostExtractorTests
     }
 
     [Fact]
+    public void Json_CachedTokensEqualInputTotal_RecordsCachedOnlyInput()
+    {
+        var stdout = """{"usage":{"prompt_tokens":1000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":1000}}}""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(0, result.InputTokens);
+        Assert.Equal(1000, result.CachedInputTokens);
+        Assert.Equal(7, result.OutputTokens);
+    }
+
+    [Fact]
     public void HumanReadable_ParsesPromptAndCompletionLines()
     {
         var stdout = "Prompt tokens: 12,345 / Completion tokens: 678";

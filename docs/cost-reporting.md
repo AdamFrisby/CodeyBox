@@ -39,20 +39,16 @@ plan — even when the agent is run under a subscription plan.  This makes
 costs comparable across agents and over time, and ensures that a "free"
 cached token still shows as a fraction of its list-price value.
 
-For providers that store cached tokens as a subset of `input_tokens`, the
+Extractors normalize provider usage before storage: `input_tokens` is the
+non-cached input bucket billed at the normal input rate, and
+`cached_input_tokens` is billed separately at the cached input rate. The
 formula is:
 
 ```
-billable_input  = input_tokens - cached_input_tokens
-estimated_usd   = (billable_input / 1_000_000) × input_rate_per_m
+estimated_usd   = (input_tokens / 1_000_000) × input_rate_per_m
                 + (cached_input_tokens / 1_000_000) × cached_rate_per_m
                 + (output_tokens / 1_000_000) × output_rate_per_m
 ```
-
-Codex is normalized before pricing: Codex/OpenAI prompt totals include
-cached tokens, so `CodexCostExtractor` stores only the fresh remainder in
-`input_tokens` and the cached subset in `cached_input_tokens`. The
-calculator bills Codex `input_tokens` directly as the fresh input bucket.
 
 ## Database schema
 
@@ -140,11 +136,10 @@ Primary: scans the agent's NDJSON stdout for a `result` event with a
 Anthropic splits prompt input into three buckets: `input_tokens` (truly
 novel content), `cache_creation_input_tokens` (tokens written to cache
 this turn — priced higher than fresh on the API), and
-`cache_read_input_tokens` (read from cache — cheap). The extractor sums
-all three into `input_tokens` (the column / `AgentCostSnapshot.InputTokens`)
-so the calculator's `billable_input = input_tokens - cached_input_tokens`
-formula bills both the fresh portion and `cache_creation` at the fresh
-input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
+`cache_read_input_tokens` (read from cache — cheap). The extractor stores
+`input_tokens + cache_creation_input_tokens` in the `input_tokens` column so
+both the fresh portion and `cache_creation` are billed at the configured
+normal input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
 
 Fallback: scans stderr/stdout for the human-readable footer line emitted
 when `--output-format stream-json` is not used:

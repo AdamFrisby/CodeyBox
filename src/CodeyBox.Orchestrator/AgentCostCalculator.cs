@@ -140,10 +140,7 @@ public sealed class AgentCostCalculator
         var rate = ResolveRate(opts, kind, snapshot.ModelId);
         if (rate is null) return 0m;
 
-        // Codex extractor stores OpenAI prompt totals as fresh input + cached input.
-        var billableInput = kind == AgentKind.Codex
-            ? Math.Max(0, snapshot.InputTokens)
-            : Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
+        var billableInput = Math.Max(0, snapshot.InputTokens);
         var cost =
             (decimal)billableInput * (decimal)rate.InputPerMillion / 1_000_000m
             + (decimal)snapshot.CachedInputTokens * (decimal)rate.CachedInputPerMillion / 1_000_000m

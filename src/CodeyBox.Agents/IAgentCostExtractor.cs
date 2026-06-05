@@ -29,8 +29,8 @@ public interface IAgentCostExtractor
 /// <summary>
 /// Token snapshot extracted from a single agent CLI invocation.
 /// </summary>
-/// <param name="InputTokens">Provider-normalized input tokens recorded for storage and reporting.</param>
-/// <param name="CachedInputTokens">Cached input tokens recorded separately when the provider reports them.</param>
+/// <param name="InputTokens">Non-cached input tokens recorded for storage, reporting, and normal input-rate billing.</param>
+/// <param name="CachedInputTokens">Cached input tokens recorded separately for cached input-rate billing.</param>
 /// <param name="OutputTokens">Output tokens.</param>
 /// <param name="ModelId">Provider model identifier, when available.</param>
 public sealed record AgentCostSnapshot(

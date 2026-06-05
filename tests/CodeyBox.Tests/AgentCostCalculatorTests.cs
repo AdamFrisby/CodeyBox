@@ -36,12 +36,12 @@ public sealed class AgentCostCalculatorTests
     [Fact]
     public void KnownModel_CalculatesCorrectUsd()
     {
-        // Billable input = 12345 - 5000 = 7345 → 7345 * 15.0 / 1_000_000 = 0.110175
+        // Fresh input = 7345 → 7345 * 15.0 / 1_000_000 = 0.110175
         // Cached = 5000 * 1.50 / 1_000_000 = 0.0075
         // Output = 678 * 75.0 / 1_000_000 = 0.050850
         // Total = 0.168525
         var calculator = new AgentCostCalculator(MakeOpts());
-        var snapshot = new AgentCostSnapshot(InputTokens: 12345, CachedInputTokens: 5000, OutputTokens: 678, ModelId: "claude-opus-4-7");
+        var snapshot = new AgentCostSnapshot(InputTokens: 7345, CachedInputTokens: 5000, OutputTokens: 678, ModelId: "claude-opus-4-7");
 
         var result = calculator.Calculate(snapshot, AgentKind.Claude);
 

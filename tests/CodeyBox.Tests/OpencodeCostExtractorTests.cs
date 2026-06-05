@@ -72,7 +72,7 @@ public sealed class OpencodeCostExtractorTests
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
-        Assert.Equal(82750, result!.InputTokens);
+        Assert.Equal(750, result!.InputTokens);
         Assert.Equal(82000, result.CachedInputTokens);
         Assert.Equal(290, result.OutputTokens);
     }
@@ -85,7 +85,7 @@ public sealed class OpencodeCostExtractorTests
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
-        Assert.Equal(82750, result!.InputTokens);
+        Assert.Equal(750, result!.InputTokens);
         Assert.Equal(82000, result.CachedInputTokens);
         Assert.Equal(290, result.OutputTokens);
     }
