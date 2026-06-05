@@ -107,6 +107,12 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
+    public void StatelessAdapter_Constructor_RejectsNullInnerRunner()
+    {
+        Assert.Throws<ArgumentNullException>(() => new StatelessSessionAgentRunner(null!));
+    }
+
+    [Fact]
     public async Task StatelessAdapter_OpenSession_RejectsInvalidInputs()
     {
         var runner = new StatelessSessionAgentRunner(new RecordingAgentRunner());
@@ -115,6 +121,12 @@ public sealed class AgentSessionRunnerTests
             () => runner.OpenSessionAsync(null!, "/work", credential: null));
         await Assert.ThrowsAsync<ArgumentException>(
             () => runner.OpenSessionAsync(new RecordingSandbox("vm-open-blank"), " ", credential: null));
+
+        var blankSandboxRefRunner = new StatelessSessionAgentRunner(
+            new RecordingAgentRunner(),
+            sandboxRefFactory: static _ => new AgentSessionSandboxRef(" "));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => blankSandboxRefRunner.OpenSessionAsync(new RecordingSandbox("vm-open-blank-ref"), "/work", credential: null));
 
         using var cts = new CancellationTokenSource();
         cts.Cancel();
@@ -140,6 +152,34 @@ public sealed class AgentSessionRunnerTests
             () => runner.SendTurnAsync(handle, "prompt", ct: cts.Token));
 
         Assert.Empty(inner.Calls);
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_LifecycleOperations_RejectNullHandlesAndCancellation()
+    {
+        var runner = new StatelessSessionAgentRunner(new RecordingAgentRunner());
+        var sandbox = new RecordingSandbox("vm-lifecycle-validation");
+        var handle = await runner.OpenSessionAsync(sandbox, "/work", credential: null);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => runner.SuspendSessionAsync(null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => runner.ResumeSessionAsync(null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => runner.CloseSessionAsync(null!));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => runner.SuspendSessionAsync(handle, cts.Token));
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => runner.ResumeSessionAsync(handle, cts.Token));
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => runner.CloseSessionAsync(handle, cts.Token));
+
+        Assert.Equal(0, sandbox.DisposeCount);
+        await runner.CloseSessionAsync(handle);
+        Assert.Equal(1, sandbox.DisposeCount);
     }
 
     [Fact]
@@ -212,6 +252,64 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
+    public async Task StatelessAdapter_ReattachWithThrowingCredentialResolver_DisposesSandbox()
+    {
+        var sandbox = new RecordingSandbox("vm-credential-throws");
+        var runner = new StatelessSessionAgentRunner(
+            new RecordingAgentRunner(),
+            sandboxReattacher: (_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult<ISandbox>(sandbox);
+            },
+            credentialResolver: static (_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                throw new InvalidOperationException("credential unavailable");
+            });
+        var handle = new AgentSessionHandle(
+            AgentKind.Claude,
+            "stateless-claude-credential-throws",
+            new AgentSessionSandboxRef("vm-credential-throws"),
+            "/work");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => runner.ResumeSessionAsync(handle));
+
+        Assert.Contains("credential unavailable", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, sandbox.DisposeCount);
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_ReattachWithWrongCredentialKind_RejectsAndDisposesSandbox()
+    {
+        var sandbox = new RecordingSandbox("vm-wrong-credential");
+        var runner = new StatelessSessionAgentRunner(
+            new RecordingAgentRunner(),
+            sandboxReattacher: (_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult<ISandbox>(sandbox);
+            },
+            credentialResolver: static (_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult<AgentCredential?>(MakeCredential("wrong-agent", AgentKind.Codex));
+            });
+        var handle = new AgentSessionHandle(
+            AgentKind.Claude,
+            "stateless-claude-wrong-credential",
+            new AgentSessionSandboxRef("vm-wrong-credential"),
+            "/work");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => runner.ResumeSessionAsync(handle));
+
+        Assert.Contains("Credential resolver returned credentials", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, sandbox.DisposeCount);
+    }
+
+    [Fact]
     public async Task StatelessAdapter_PersistedHandleWithoutReattacher_RejectsOperations()
     {
         var runner = new StatelessSessionAgentRunner(new RecordingAgentRunner());
@@ -227,6 +325,28 @@ public sealed class AgentSessionRunnerTests
             () => runner.SendTurnAsync(handle, "prompt"));
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => runner.CloseSessionAsync(handle));
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_NullReattacherResult_RejectsPersistedHandle()
+    {
+        var runner = new StatelessSessionAgentRunner(
+            new RecordingAgentRunner(),
+            sandboxReattacher: static (_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult<ISandbox>(null!);
+            });
+        var handle = new AgentSessionHandle(
+            AgentKind.Claude,
+            "stateless-claude-null-sandbox",
+            new AgentSessionSandboxRef("vm-null-sandbox"),
+            "/work");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => runner.ResumeSessionAsync(handle));
+
+        Assert.Contains("reattacher returned null", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -331,9 +451,9 @@ public sealed class AgentSessionRunnerTests
         Assert.Throws<ArgumentNullException>(() => runner.AsSessionRunner());
     }
 
-    private static AgentCredential MakeCredential(string value) =>
+    private static AgentCredential MakeCredential(string value, AgentKind? agentKind = null) =>
         new(
-            AgentKind.Claude,
+            agentKind ?? AgentKind.Claude,
             new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["TOKEN"] = value,

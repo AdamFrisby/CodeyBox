@@ -270,20 +270,30 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
             if (_sessions.TryGetValue(sessionHandle.SessionId, out state))
                 return state;
 
-            var sandbox = await _sandboxReattacher(sessionHandle.Sandbox, ct);
-            if (sandbox is null)
-                throw new InvalidOperationException("The configured sandbox reattacher returned null.");
+            ISandbox? sandbox = null;
+            try
+            {
+                sandbox = await _sandboxReattacher(sessionHandle.Sandbox, ct);
+                if (sandbox is null)
+                    throw new InvalidOperationException("The configured sandbox reattacher returned null.");
 
-            var credential = _credentialResolver is null
-                ? null
-                : await _credentialResolver(sessionHandle.RunnerKind, ct);
-            if (credential is not null && credential.Agent != sessionHandle.RunnerKind)
-                throw new InvalidOperationException(
-                    $"Credential resolver returned credentials for '{credential.Agent}', not '{sessionHandle.RunnerKind}'.");
+                var credential = _credentialResolver is null
+                    ? null
+                    : await _credentialResolver(sessionHandle.RunnerKind, ct);
+                if (credential is not null && credential.Agent != sessionHandle.RunnerKind)
+                    throw new InvalidOperationException(
+                        $"Credential resolver returned credentials for '{credential.Agent}', not '{sessionHandle.RunnerKind}'.");
 
-            state = new StatelessSessionState(sandbox, credential);
-            _sessions[sessionHandle.SessionId] = state;
-            return state;
+                state = new StatelessSessionState(sandbox, credential);
+                _sessions[sessionHandle.SessionId] = state;
+                sandbox = null;
+                return state;
+            }
+            finally
+            {
+                if (sandbox is not null)
+                    await sandbox.DisposeAsync();
+            }
         }
         finally
         {
