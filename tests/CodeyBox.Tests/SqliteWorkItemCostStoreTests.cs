@@ -262,8 +262,8 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.False(summaries.ContainsKey(withoutCosts));
         Assert.False(summaries.ContainsKey(unknown));
         // Single-row work cost: iter delta == total.
-        Assert.Equal(12345, summaries[withCostsA].Iteration.TokensInput);
-        Assert.Equal(12345, summaries[withCostsA].Total.TokensInput);
+        Assert.Equal(12845, summaries[withCostsA].Iteration.TokensInput);
+        Assert.Equal(12845, summaries[withCostsA].Total.TokensInput);
     }
 
     [Fact]

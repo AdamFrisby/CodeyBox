@@ -27,6 +27,10 @@ public sealed record WorkItemCost
     /// </summary>
     public string? ModelId { get; init; }
 
+    /// <summary>
+    /// Non-cached input token bucket used for normal input-rate billing. Public
+    /// total-input reporting adds <see cref="CachedInputTokens"/>.
+    /// </summary>
     public required int InputTokens { get; init; }
     public int CachedInputTokens { get; init; }
     public required int OutputTokens { get; init; }

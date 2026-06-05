@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Codex;
 
@@ -114,7 +115,7 @@ internal static class CodexUsageParser
         }
 
         usage = new CodexTokenUsage(
-            InputTokens: Math.Max(0, totalInput - cached),
+            InputTokens: TokenUsageAccounting.FreshInputTokens(totalInput, cached),
             CachedInputTokens: cached,
             OutputTokens: output);
         return usage.InputTokens > 0 || usage.CachedInputTokens > 0 || usage.OutputTokens > 0;
@@ -144,10 +145,6 @@ internal static class CodexUsageParser
 
         if (TryReadDetailsCachedTokens(usage, "input_tokens_details", out var inputCachedValue))
             return inputCachedValue;
-
-        if (usage.TryGetProperty("cache_read_input_tokens", out var cacheRead)
-            && TryGetNonNegativeInt32(cacheRead, out var cacheReadValue))
-            return cacheReadValue;
 
         if (usage.TryGetProperty("cached_tokens", out var cached)
             && TryGetNonNegativeInt32(cached, out var cachedValue))

@@ -42,7 +42,7 @@ public sealed class WorkItemEndpointIncludesUsageTests : IClassFixture<CostsApiF
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         var usage = body.GetProperty("usage");
         Assert.Equal(2, usage.GetProperty("iteration").GetInt32());
-        Assert.Equal(8000 + 1500, usage.GetProperty("tokensInput").GetInt32());
+        Assert.Equal(8000 + 750 + 1500, usage.GetProperty("tokensInput").GetInt32());
         Assert.Equal(900 + 80, usage.GetProperty("tokensOutput").GetInt32());
         Assert.Equal(0, usage.GetProperty("tokensReasoning").GetInt32());
         // End-to-end propagation of cached tokens (iter 2 = 750 from rework row).
@@ -50,7 +50,7 @@ public sealed class WorkItemEndpointIncludesUsageTests : IClassFixture<CostsApiF
         Assert.Equal(0.23, usage.GetProperty("costUsd").GetDouble(), precision: 4);
 
         var total = body.GetProperty("usageTotal");
-        Assert.Equal(5000 + 2000 + 8000 + 1500, total.GetProperty("tokensInput").GetInt32());
+        Assert.Equal(5000 + 250 + 2000 + 8000 + 750 + 1500, total.GetProperty("tokensInput").GetInt32());
         Assert.Equal(500 + 100 + 900 + 80, total.GetProperty("tokensOutput").GetInt32());
         // Cumulative cached = 250 (work) + 750 (rework) = 1000.
         Assert.Equal(1000, total.GetProperty("tokensCached").GetInt32());
@@ -111,12 +111,12 @@ public sealed class WorkItemEndpointIncludesUsageTests : IClassFixture<CostsApiF
 
         var usage = withRow!.Value.GetProperty("usage");
         Assert.Equal(1, usage.GetProperty("iteration").GetInt32());
-        Assert.Equal(1234, usage.GetProperty("tokensInput").GetInt32());
+        Assert.Equal(1234 + 99, usage.GetProperty("tokensInput").GetInt32());
         Assert.Equal(56, usage.GetProperty("tokensOutput").GetInt32());
         Assert.Equal(99, usage.GetProperty("tokensCached").GetInt32());
 
         var total = withRow.Value.GetProperty("usageTotal");
-        Assert.Equal(1234, total.GetProperty("tokensInput").GetInt32());
+        Assert.Equal(1234 + 99, total.GetProperty("tokensInput").GetInt32());
 
         // The item with no costs must not have a usage/usageTotal block at all.
         Assert.False(withoutRow!.Value.TryGetProperty("usage", out _),

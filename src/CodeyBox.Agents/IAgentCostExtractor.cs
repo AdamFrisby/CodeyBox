@@ -29,10 +29,15 @@ public interface IAgentCostExtractor
 /// <summary>
 /// Token snapshot extracted from a single agent CLI invocation.
 /// </summary>
-/// <param name="InputTokens">Non-cached input tokens recorded for storage, reporting, and normal input-rate billing.</param>
+/// <param name="InputTokens">Non-cached input tokens for normal input-rate billing.</param>
 /// <param name="CachedInputTokens">Cached input tokens recorded separately for cached input-rate billing.</param>
 /// <param name="OutputTokens">Output tokens.</param>
 /// <param name="ModelId">Provider model identifier, when available.</param>
+/// <remarks>
+/// Public total-input reporting should add <see cref="InputTokens"/> and
+/// <see cref="CachedInputTokens"/> through <see cref="TokenUsageAccounting"/>;
+/// cost calculation charges the two buckets separately.
+/// </remarks>
 public sealed record AgentCostSnapshot(
     int InputTokens,
     int CachedInputTokens,

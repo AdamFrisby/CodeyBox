@@ -8,7 +8,7 @@
       "gemini": "https://ai.google.dev/gemini-api/docs/pricing"
     },
     "notes": {
-      "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution matches when usage reports the full prompt side (input + cache read) plus output.",
+      "opencode": "OpenCode Go is subscription-priced ($12 per 5h usage budget on https://opencode.ai/docs/go). Each model entry uses one subscription-equivalent USD/M rate for input, cached input, and output: ($12 ÷ requests-per-5h) ÷ ((typical input + cached + output tokens per request) ÷ 1e6), using the request limits and typical token mix published on that page. Keys use opencode-go/<model-id>. Cost attribution charges the stored non-cached input bucket and cached input bucket separately; public total-input reporting adds them.",
       "claude": "Cache-hit (read) rate captured under cachedInputPerMillion. Cache-write rates (1.25x base for 5m, 2x for 1h) are not represented; cost framework treats CachedInputTokens as read-side discount.",
       "codex":  "gpt-5.5 short-context rate ($5/$30). codex-5.5 aliases the same rate for CLI JSON attribution. Long-context tier (above ~270k input tokens) is not represented.",
       "gemini": "gemini-3-flash-preview is the default AgentClasses model. Pro preview models use short-context rates (<= 200k tokens); long-context tier (>200k) is not represented.",

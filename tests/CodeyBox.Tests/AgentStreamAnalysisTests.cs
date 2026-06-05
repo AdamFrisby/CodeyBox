@@ -237,6 +237,23 @@ public sealed class CodexStreamParserTests
     }
 
     [Fact]
+    public async Task ParseAsync_RecordsUsageFromNestedItemEvents()
+    {
+        var parser = new CodexStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"thread.started","timestamp":"2026-01-01T00:00:00Z","thread_id":"thread_1"}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:01Z","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}],"usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(600, summary.InputTokens);
+        Assert.Equal(400, summary.CachedInputTokens);
+        Assert.Equal(7, summary.OutputTokens);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
     public async Task ParseAsync_UsesCodexTimingFieldsWhenEventsDoNotHaveTopLevelTimestamps()
     {
         var parser = new CodexStreamParser();

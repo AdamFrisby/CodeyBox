@@ -253,7 +253,7 @@ public sealed class CostAndTimingDiagnosticsUatTests : IDisposable
         timings.EnsureSuccessStatusCode();
         var costsJson = await costs.ReadJsonAsync();
         var timingsJson = await timings.ReadJsonAsync();
-        Assert.Equal(100, costsJson.GetProperty("totals").GetProperty("inputTokens").GetInt32());
+        Assert.Equal(120, costsJson.GetProperty("totals").GetProperty("inputTokens").GetInt32());
         Assert.True(costsJson.GetProperty("byPhase").TryGetProperty("work", out _));
         Assert.Equal(500, timingsJson.GetProperty("totalDurationMs").GetInt64());
         Assert.True(timingsJson.GetProperty("byPhase").TryGetProperty("audit", out _));

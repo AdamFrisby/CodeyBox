@@ -123,7 +123,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (promptM.Success && completionM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = FreshInputTokens(ParseTokenCount(promptM.Groups[1].Value), cached);
+            var input = TokenUsageAccounting.FreshInputTokens(ParseTokenCount(promptM.Groups[1].Value), cached);
             var output = ParseTokenCount(completionM.Groups[1].Value);
             return new AgentCostSnapshot(input, cached, output, null);
         }
@@ -133,7 +133,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (inputM.Success && outputM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = FreshInputTokens(ParseTokenCount(inputM.Groups[1].Value), cached);
+            var input = TokenUsageAccounting.FreshInputTokens(ParseTokenCount(inputM.Groups[1].Value), cached);
             var output = ParseTokenCount(outputM.Groups[1].Value);
             if (input > 0 || cached > 0 || output > 0)
                 return new AgentCostSnapshot(input, cached, output, null);
@@ -151,9 +151,6 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         var compact = CachedPattern.Match(text);
         return compact.Success ? ParseTokenCount(compact.Groups[1].Value) : 0;
     }
-
-    private static int FreshInputTokens(int totalInput, int cached)
-        => Math.Max(0, totalInput - cached);
 
     private static int ParseTokenCount(string s)
     {

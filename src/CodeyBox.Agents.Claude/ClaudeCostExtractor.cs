@@ -122,7 +122,7 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
             var cachedM = CachedPattern.Match(text);
             var cached = cachedM.Success ? ParseTokenCount(cachedM.Groups[1].Value) : 0;
             if (input > 0 || output > 0)
-                return new AgentCostSnapshot(FreshInputTokens(input, cached), cached, output, null);
+                return new AgentCostSnapshot(TokenUsageAccounting.FreshInputTokens(input, cached), cached, output, null);
         }
 
         var tiM = TotalInputPattern.Match(text);
@@ -134,7 +134,7 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
             var tcM = TotalCachedPattern.Match(text);
             var cached = tcM.Success ? ParseTokenCount(tcM.Groups[1].Value) : 0;
             if (input > 0 || output > 0)
-                return new AgentCostSnapshot(FreshInputTokens(input, cached), cached, output, null);
+                return new AgentCostSnapshot(TokenUsageAccounting.FreshInputTokens(input, cached), cached, output, null);
         }
 
         return null;
@@ -146,6 +146,4 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
         return int.TryParse(cleaned, out var v) ? v : 0;
     }
 
-    private static int FreshInputTokens(int totalInput, int cached)
-        => Math.Max(0, totalInput - cached);
 }

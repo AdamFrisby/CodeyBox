@@ -78,14 +78,14 @@ public sealed class WorkItemUsageAggregatorTests
 
         Assert.Equal(2, summary.Iteration.Iteration);
         // iter 2 = rework(2) + audit(2) + merge(folded)
-        Assert.Equal(8000 + 1500 + 100, summary.Iteration.TokensInput);
+        Assert.Equal(8000 + 500 + 1500 + 100, summary.Iteration.TokensInput);
         Assert.Equal(900 + 80 + 10, summary.Iteration.TokensOutput);
         Assert.Equal(500, summary.Iteration.TokensCached);
         Assert.Equal(0.231, summary.Iteration.CostUsd, precision: 4);
         Assert.Equal((long)((6.0 + 1.5 + 0.5) * 1000), summary.Iteration.ElapsedMs);
 
         // total = every row
-        Assert.Equal(5000 + 2000 + 8000 + 1500 + 100, summary.Total.TokensInput);
+        Assert.Equal(5000 + 2000 + 8000 + 500 + 1500 + 100, summary.Total.TokensInput);
         Assert.Equal(500 + 100 + 900 + 80 + 10, summary.Total.TokensOutput);
         Assert.Equal(500, summary.Total.TokensCached);
         Assert.Equal(0.371, summary.Total.CostUsd, precision: 4);

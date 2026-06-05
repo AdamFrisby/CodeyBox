@@ -120,7 +120,7 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         }
 
         var input = cachedIncludedInInputTotal
-            ? FreshInputTokens(totalInput, cached)
+            ? TokenUsageAccounting.FreshInputTokens(totalInput, cached)
             : totalInput;
 
         if (input == 0 && cached == 0 && output == 0) return null;
@@ -182,6 +182,4 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         return int.TryParse(cleaned, out var v) ? v : 0;
     }
 
-    private static int FreshInputTokens(int totalInput, int cached)
-        => Math.Max(0, totalInput - cached);
 }

@@ -66,7 +66,6 @@ public sealed class CodexCostExtractorTests
 
     [Theory]
     [InlineData("""{"usage":{"input_tokens":1000,"output_tokens":7,"input_tokens_details":{"cached_tokens":400}}}""")]
-    [InlineData("""{"usage":{"input_tokens":1000,"output_tokens":7,"cache_read_input_tokens":400}}""")]
     [InlineData("""{"usage":{"input_tokens":1000,"output_tokens":7,"cached_tokens":400}}""")]
     public void Json_CachedTokenAliases_RecordCachedTokens(string stdout)
     {
@@ -81,6 +80,7 @@ public sealed class CodexCostExtractorTests
     [Theory]
     [InlineData("""{"token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}""")]
     [InlineData("""{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}""")]
+    [InlineData("""{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}""")]
     [InlineData("""{"item":{"usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}}""")]
     [InlineData("""{"info":{"usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}}""")]
     public void Json_UsageWrapperAliases_RecordUsage(string stdout)

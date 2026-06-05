@@ -60,7 +60,7 @@ public sealed class CostCaptureAndBudgetUatTests : IDisposable
 
         response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
-        Assert.Equal(200, json.GetProperty("totals").GetProperty("inputTokens").GetInt64());
+        Assert.Equal(240, json.GetProperty("totals").GetProperty("inputTokens").GetInt64());
         Assert.Equal(40, json.GetProperty("totals").GetProperty("cachedInputTokens").GetInt64());
         Assert.Equal(60, json.GetProperty("totals").GetProperty("outputTokens").GetInt64());
         Assert.Equal(0.75, json.GetProperty("totals").GetProperty("estimatedUsd").GetDouble(), precision: 5);
