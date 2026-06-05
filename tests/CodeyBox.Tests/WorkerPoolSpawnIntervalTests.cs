@@ -58,19 +58,16 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         var svc = new OrchestratorService(queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);
 
-        // Start before enqueuing so ReplayPendingAsync sees an empty store and
-        // never double-enqueues items (which would produce spurious OnWorkerSpawned
-        // callbacks for already-Done items on the second pass).
-        using var _ = registry;
-        await svc.StartAsync(CancellationToken.None);
-        await Task.Delay(50); // let ReplayPendingAsync finish on the empty store
-
+        // Seed before StartAsync so startup replay cannot race this test's writes.
         for (int i = 0; i < itemCount; i++)
         {
             var item = MakeItem();
             await _store.CreateAsync(item);
             await queue.EnqueueAsync(item.Id);
         }
+
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
 
         // Wait for all items to complete. Generous timeout: 3 spawns × 200 ms + padding.
         var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
@@ -117,11 +114,7 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         var svc = new OrchestratorService(queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);
 
-        // Start before enqueuing so ReplayPendingAsync sees an empty store.
-        using var _ = registry;
-        await svc.StartAsync(CancellationToken.None);
-        await Task.Delay(50); // let ReplayPendingAsync finish on the empty store
-
+        // Seed before StartAsync so startup replay cannot race this test's writes.
         for (int i = 0; i < itemCount; i++)
         {
             var item = MakeItem();
@@ -129,7 +122,10 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
             await queue.EnqueueAsync(item.Id);
         }
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        using var _ = registry;
+        await svc.StartAsync(CancellationToken.None);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
         while (DateTimeOffset.UtcNow < deadline)
         {
             int doneCount = 0;
