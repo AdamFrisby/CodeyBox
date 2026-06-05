@@ -5,6 +5,7 @@ using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
+[Collection("Background service timing")]
 public sealed class OrchestratorHostShutdownTokenTests : IDisposable
 {
     private readonly string _dbPath =

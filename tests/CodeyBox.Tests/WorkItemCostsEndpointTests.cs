@@ -105,9 +105,20 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
 
         var byPhase = body.GetProperty("byPhase");
         Assert.True(byPhase.TryGetProperty("work", out var work));
-        Assert.True(byPhase.TryGetProperty("audit", out _));
+        Assert.True(byPhase.TryGetProperty("audit", out var audit));
         Assert.Equal(10000, work.GetProperty("elapsedMs").GetInt64());
         Assert.Equal(1, work.GetProperty("invocationCount").GetInt32());
+
+        var auditIter = Assert.Single(audit.GetProperty("byIteration").EnumerateArray());
+        Assert.Equal(1, auditIter.GetProperty("iteration").GetInt32());
+        Assert.Equal(5000, auditIter.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(1, auditIter.GetProperty("invocationCount").GetInt32());
+
+        var agent = Assert.Single(body.GetProperty("byAgent").EnumerateArray());
+        Assert.Equal("claude", agent.GetProperty("agent").GetString());
+        Assert.Equal("claude-opus-4-7", agent.GetProperty("modelId").GetString());
+        Assert.Equal(15000, agent.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(2, agent.GetProperty("invocationCount").GetInt32());
     }
 
     [Fact]
@@ -163,27 +174,56 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
     }
 
     [Fact]
-    public async Task GetProjectCosts_ReturnsTotalsForDateRange()
+    public async Task GetProjectCosts_ReturnsTotalsAndNestedElapsedAggregatesForDateRange()
     {
-        var item = CreateItem(projectId: "proj-costs-test");
-        await _factory.Store.CreateAsync(item);
+        var itemA = CreateItem(projectId: "proj-costs-test");
+        var itemB = CreateItem(projectId: "proj-costs-test");
+        await _factory.Store.CreateAsync(itemA);
+        await _factory.Store.CreateAsync(itemB);
 
-        var cost = new WorkItemCost
+        var now = DateTimeOffset.Parse("2026-06-02T12:00:00Z");
+        await _factory.CostStore.RecordAsync(new WorkItemCost
         {
             Id = Guid.NewGuid().ToString("N"),
-            WorkItemId = item.Id.ToString(),
+            WorkItemId = itemA.Id.ToString(),
             Phase = "work",
             AgentKind = "claude",
+            ModelId = "claude-opus-4-7",
             InputTokens = 1000,
             OutputTokens = 200,
             EstimatedUsd = 0.03,
-            StartedAt = DateTimeOffset.UtcNow.AddSeconds(-5),
-            EndedAt = DateTimeOffset.UtcNow,
-        };
-        await _factory.CostStore.RecordAsync(cost);
+            StartedAt = now.AddSeconds(-12),
+            EndedAt = now.AddSeconds(-7),
+        });
+        await _factory.CostStore.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = itemA.Id.ToString(),
+            Phase = "audit",
+            AgentKind = "claude",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 500,
+            OutputTokens = 100,
+            EstimatedUsd = 0.02,
+            StartedAt = now.AddSeconds(-7),
+            EndedAt = now,
+        });
+        await _factory.CostStore.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = itemB.Id.ToString(),
+            Phase = "work",
+            AgentKind = "cursor",
+            ModelId = "cursor-model",
+            InputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            StartedAt = now.AddSeconds(-3),
+            EndedAt = now,
+        });
 
-        var from = DateTimeOffset.UtcNow.AddDays(-1).ToString("O");
-        var to = DateTimeOffset.UtcNow.AddDays(1).ToString("O");
+        var from = now.AddMinutes(-1).ToString("O");
+        var to = now.AddMinutes(1).ToString("O");
 
         var client = _factory.CreateClient();
         var resp = await client.GetAsync($"/projects/proj-costs-test/costs?from={Uri.EscapeDataString(from)}&to={Uri.EscapeDataString(to)}");
@@ -191,9 +231,25 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
 
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("proj-costs-test", body.GetProperty("projectId").GetString());
-        Assert.Equal(1000, body.GetProperty("totals").GetProperty("inputTokens").GetInt32());
-        Assert.True(body.GetProperty("totals").GetProperty("elapsedMs").GetInt64() > 0);
-        Assert.Equal(1, body.GetProperty("totals").GetProperty("invocationCount").GetInt32());
+        Assert.Equal(1500, body.GetProperty("totals").GetProperty("inputTokens").GetInt32());
+        Assert.Equal(15000, body.GetProperty("totals").GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(3, body.GetProperty("totals").GetProperty("invocationCount").GetInt32());
+
+        var byAgent = body.GetProperty("byAgent").EnumerateArray().ToList();
+        var claude = Assert.Single(byAgent, a => a.GetProperty("agent").GetString() == "claude");
+        Assert.Equal(12000, claude.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(2, claude.GetProperty("invocationCount").GetInt32());
+        var cursor = Assert.Single(byAgent, a => a.GetProperty("agent").GetString() == "cursor");
+        Assert.Equal(3000, cursor.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(1, cursor.GetProperty("invocationCount").GetInt32());
+
+        var byWorkItem = body.GetProperty("byWorkItem").EnumerateArray().ToList();
+        var itemAJson = Assert.Single(byWorkItem, w => w.GetProperty("workItemId").GetString() == itemA.Id.ToString());
+        Assert.Equal(12000, itemAJson.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(2, itemAJson.GetProperty("invocationCount").GetInt32());
+        var itemBJson = Assert.Single(byWorkItem, w => w.GetProperty("workItemId").GetString() == itemB.Id.ToString());
+        Assert.Equal(3000, itemBJson.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(1, itemBJson.GetProperty("invocationCount").GetInt32());
     }
 
     private static WorkItem CreateItem(string projectId = "test-project") => new()

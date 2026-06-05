@@ -14,6 +14,7 @@ namespace CodeyBox.Tests;
 /// per-baseline caching, and the rule that infra failures must not exclude a
 /// working agent.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class InVmSmokeProberTests
 {
     private static readonly InVmSmokeSandboxTarget WorkTarget =

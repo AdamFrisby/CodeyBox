@@ -276,6 +276,29 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task GetAvgTokensPerItemAsync_ExcludesExtractorNullElapsedFallbackRows()
+    {
+        var itemId = "fallback-only";
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            AgentKind = "cursor",
+            ModelId = "cursor-model",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"extractor_null_elapsed_fallback"}""",
+        });
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("cursor", 10);
+
+        Assert.Equal(0, avg);
+        Assert.Equal(0, samples);
+    }
+
+    [Fact]
     public async Task GetAvgTokensPerItemAsync_FiltersByAgentKind()
     {
         var itemA = "item-codex";

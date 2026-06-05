@@ -314,6 +314,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                 JOIN work_items w ON w.id = c.work_item_id
                 WHERE c.agent_kind = $kind
                   AND w.state = $done
+                  AND c.raw_metadata_json NOT LIKE '%"extractor_null_elapsed_fallback"%'
                 GROUP BY c.work_item_id
                 ORDER BY latest DESC
                 LIMIT $lim

@@ -10,6 +10,7 @@ namespace CodeyBox.Tests;
 /// in-memory store + queue and a pipeline that blocks until released so we
 /// can pin items into "running" state and inspect the per-agent counts.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class OrchestratorPerAgentConcurrencyTests : IDisposable
 {
     private static readonly AgentKind Codex = AgentKind.Codex;

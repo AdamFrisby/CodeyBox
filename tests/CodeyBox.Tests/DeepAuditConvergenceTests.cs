@@ -14,6 +14,7 @@ namespace CodeyBox.Tests;
 /// the release transitions to Released and a remediation work item is dispatched
 /// between iterations.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class DeepAuditConvergenceTests : IDisposable
 {
     private const string AuditorName = "test-convergence-auditor";

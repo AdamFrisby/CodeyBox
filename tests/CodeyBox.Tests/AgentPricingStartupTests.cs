@@ -77,6 +77,19 @@ public sealed class AgentPricingStartupTests : IClassFixture<AgentPricingStartup
 
         Assert.Equal(5.0m, cost);
     }
+
+    [Fact]
+    public void ProductionCostExtractorMap_IncludesCopilotElapsedFallbackExtractor()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var extractors = scope.ServiceProvider.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
+
+        var extractor = Assert.IsType<CodeyBox.Agents.Copilot.CopilotCostExtractor>(
+            extractors[AgentKind.Copilot]);
+
+        Assert.Null(extractor.DefaultPricing);
+        Assert.Null(extractor.TryExtract("no usage footer", null));
+    }
 }
 
 /// <summary>

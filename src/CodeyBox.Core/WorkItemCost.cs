@@ -21,7 +21,10 @@ public sealed record WorkItemCost
     /// <summary>Routed agent instance, e.g. "claude/acct-a"; null for legacy/default rows.</summary>
     public string? AgentInstanceId { get; init; }
 
-    /// <summary>Model identifier reported by the CLI (e.g. "claude-opus-4-7"). Null when unknown.</summary>
+    /// <summary>
+    /// Model identifier reported by the CLI when usage data is parsed; elapsed
+    /// fallback rows use the dispatched/resolved model id. Null when unknown.
+    /// </summary>
     public string? ModelId { get; init; }
 
     public required int InputTokens { get; init; }

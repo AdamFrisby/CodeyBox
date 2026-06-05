@@ -137,6 +137,76 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Constructor_MigratesOldUsageTableShape_ThenRecordsTimingMetadata()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-usage-migration-{Guid.NewGuid():N}.db");
+        try
+        {
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await using var create = conn.CreateCommand();
+                create.CommandText = """
+                    CREATE TABLE agent_usage_events (
+                        id                  TEXT PRIMARY KEY,
+                        time_utc            TEXT NOT NULL,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        cost_microcents     INTEGER NOT NULL DEFAULT 0,
+                        work_item_id        TEXT
+                    );
+                    """;
+                await create.ExecuteNonQueryAsync();
+            }
+
+            using var migrated = new SqliteAgentUsageStore(dbPath);
+            var started = DateTimeOffset.Parse("2026-06-01T01:00:00Z");
+            var ended = started.AddMilliseconds(1234);
+            var id = Guid.NewGuid().ToString("N");
+            await migrated.RecordAsync(new AgentUsageEvent
+            {
+                Id = id,
+                TimeUtc = ended,
+                AgentKind = "copilot",
+                ModelId = "copilot-model",
+                Phase = "work",
+                StartedUtc = started,
+                EndedUtc = ended,
+                ElapsedMs = 1234,
+                InputTokens = 0,
+                CachedInputTokens = 0,
+                OutputTokens = 0,
+                CostMicroCents = 0,
+                WorkItemId = "wi-migrated",
+            });
+
+            await using var verify = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            await verify.OpenAsync();
+            await using var cmd = verify.CreateCommand();
+            cmd.CommandText = """
+                SELECT phase, started_utc, ended_utc, elapsed_ms
+                FROM agent_usage_events
+                WHERE id = $id
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+
+            await using var reader = await cmd.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal("work", reader.GetString(0));
+            Assert.Equal(started.ToString("O"), reader.GetString(1));
+            Assert.Equal(ended.ToString("O"), reader.GetString(2));
+            Assert.Equal(1234, reader.GetInt64(3));
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
     public async Task SumWindow_NoRows_ReturnsZero()
     {
         var now = DateTimeOffset.UtcNow;
