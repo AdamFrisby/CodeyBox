@@ -10,11 +10,6 @@ internal interface ISandboxAdmissionSnapshot
     int MaxConcurrentSandboxes { get; }
 }
 
-internal interface ISandboxResumeAdmissionTracker
-{
-    void ReleaseResumeAdmission(string name);
-}
-
 /// <summary>
 /// Decorates an <see cref="ISandboxProvider"/> with a process-wide live-sandbox
 /// admission gate. The token is acquired before the inner provider starts
@@ -122,6 +117,16 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             _active?.Track(spec, controlled);
             return controlled;
         }
+        catch (SandboxProvisioningDeferredException ex)
+            when (!string.IsNullOrWhiteSpace(ex.RetainedSandboxName))
+        {
+            _log.LogWarning(
+                ex,
+                "Retaining sandbox admission token after create failure because sandbox {SandboxName} may still exist",
+                ex.RetainedSandboxName);
+            _disposedSandboxAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            throw;
+        }
         catch
         {
             lease.Dispose();
@@ -172,11 +177,6 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
                 resumeAdmissions.CancelPending(name);
             }
         }
-    }
-
-    public void ReleaseResumeAdmission(string name)
-    {
-        _resumeAdmissions?.Release(name);
     }
 
     public Task<int?> WaitForAdoptedAgentCompletionAsync(
@@ -268,28 +268,57 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
         return capabilities switch
         {
-            SandboxCapabilities.None => new AdmissionControlledSandbox(sandbox, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Preemptible => new AdmissionControlledPreemptibleSandbox(sandbox, preemptible!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Suspendable => new AdmissionControlledSuspendableSandbox(sandbox, suspendable!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Shutdown => new AdmissionControlledShutdownSandbox(sandbox, shutdown!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable => new AdmissionControlledPreemptibleSuspendableSandbox(sandbox, preemptible!, suspendable!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Shutdown => new AdmissionControlledPreemptibleShutdownSandbox(sandbox, preemptible!, shutdown!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledSuspendableShutdownSandbox(sandbox, suspendable!, shutdown!, lease, OnSandboxDisposed, _log),
-            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledFullSandbox(sandbox, preemptible!, suspendable!, shutdown!, lease, OnSandboxDisposed, _log),
+            SandboxCapabilities.None => new AdmissionControlledSandbox(sandbox, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Preemptible => new AdmissionControlledPreemptibleSandbox(sandbox, preemptible!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Suspendable => new AdmissionControlledSuspendableSandbox(sandbox, suspendable!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Shutdown => new AdmissionControlledShutdownSandbox(sandbox, shutdown!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable => new AdmissionControlledPreemptibleSuspendableSandbox(sandbox, preemptible!, suspendable!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Shutdown => new AdmissionControlledPreemptibleShutdownSandbox(sandbox, preemptible!, shutdown!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledSuspendableShutdownSandbox(sandbox, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, _log),
+            SandboxCapabilities.Preemptible | SandboxCapabilities.Suspendable | SandboxCapabilities.Shutdown => new AdmissionControlledFullSandbox(sandbox, preemptible!, suspendable!, shutdown!, lease, OnSandboxDisposedAsync, _log),
             _ => throw new InvalidOperationException($"Unhandled sandbox capability set: {capabilities}"),
         };
     }
 
-    private void OnSandboxDisposed(
+    private async ValueTask OnSandboxDisposedAsync(
         ISandbox sandbox,
         SandboxAdmissionLease lease,
-        bool releaseAdmission)
+        bool innerDisposeSucceeded)
     {
         _active?.Remove(sandbox);
+        var releaseAdmission = false;
+        if (innerDisposeSucceeded)
+            releaseAdmission = !await IsManagedSandboxStillPresentAsync(sandbox.Id).ConfigureAwait(false);
+
         if (releaseAdmission)
             lease.Dispose();
         else
+        {
+            if (innerDisposeSucceeded)
+            {
+                _log.LogWarning(
+                    "Retaining sandbox admission token after dispose for sandbox {SandboxId} because provider inventory still lists it or could not prove it absent",
+                    sandbox.Id);
+            }
             _disposedSandboxAdmissions.Retain(sandbox.Id, lease);
+        }
+    }
+
+    private async Task<bool> IsManagedSandboxStillPresentAsync(string name)
+    {
+        try
+        {
+            var managed = await _inner.ListAllManagedAsync(CancellationToken.None).ConfigureAwait(false);
+            return managed.Any(info => string.Equals(info.Name, name, StringComparison.Ordinal));
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not verify whether sandbox {SandboxId} still exists; retaining sandbox admission token",
+                name);
+            return true;
+        }
     }
 
     [Flags]
@@ -317,7 +346,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class SuspendingProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider
     { }
 
     private sealed class DiskGuardProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -333,7 +362,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class ActiveSuspendingProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider
     { }
 
     private sealed class ActiveDiskGuardProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -349,15 +378,15 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class SuspendingDiskGuardProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider
     { }
 
     private sealed class SuspendingBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageResolver
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageResolver
     { }
 
     private sealed class SuspendingBaselineProvisionerProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageProvisioner
     { }
 
     private sealed class DiskGuardBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -373,15 +402,15 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class ActiveSuspendingDiskGuardProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider
     { }
 
     private sealed class ActiveSuspendingBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageResolver
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver
     { }
 
     private sealed class ActiveSuspendingBaselineProvisionerProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageProvisioner
     { }
 
     private sealed class ActiveDiskGuardBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -397,15 +426,15 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class SuspendingDiskGuardBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageResolver
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver
     { }
 
     private sealed class SuspendingDiskGuardBaselineProvisionerProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner
     { }
 
     private sealed class SuspendingBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageResolver, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
     { }
 
     private sealed class DiskGuardBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -413,15 +442,15 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class ActiveSuspendingDiskGuardBaselineResolverProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageResolver
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver
     { }
 
     private sealed class ActiveSuspendingDiskGuardBaselineProvisionerProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner
     { }
 
     private sealed class ActiveSuspendingBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IBaselineImageResolver, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
     { }
 
     private sealed class ActiveDiskGuardBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
@@ -429,11 +458,11 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     { }
 
     private sealed class SuspendingDiskGuardBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
     { }
 
     private sealed class ActiveSuspendingDiskGuardBaselineProvider(ISandboxProvider inner, SandboxAdmissionGate gate, ILogger log)
-        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, ISandboxResumeAdmissionTracker, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
+        : SandboxAdmissionControlledProvider(inner, gate, log), IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner
     { }
 
     private sealed class ActiveSandboxTracker
@@ -675,14 +704,14 @@ internal class AdmissionControlledSandbox : ISandbox
 {
     private readonly ISandbox _inner;
     private readonly SandboxAdmissionLease _lease;
-    private readonly Action<ISandbox, SandboxAdmissionLease, bool> _onDisposed;
+    private readonly Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> _onDisposed;
     private readonly ILogger _log;
     private int _disposed;
 
     public AdmissionControlledSandbox(
         ISandbox inner,
         SandboxAdmissionLease lease,
-        Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+        Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
         ILogger log)
     {
         ArgumentNullException.ThrowIfNull(inner);
@@ -718,18 +747,11 @@ internal class AdmissionControlledSandbox : ISandbox
             return;
 
         Exception? disposeFailure = null;
-        var releaseAdmission = false;
+        var innerDisposeSucceeded = false;
         try
         {
             await _inner.DisposeAsync().ConfigureAwait(false);
-            releaseAdmission = _inner is not IHostSandboxLifecycleStatus lifecycle
-                || lifecycle.HostSandboxDisposed;
-            if (!releaseAdmission)
-            {
-                _log.LogWarning(
-                    "Retaining sandbox admission token after dispose for sandbox {SandboxId} because the host sandbox still exists",
-                    Id);
-            }
+            innerDisposeSucceeded = true;
         }
         catch (Exception ex)
         {
@@ -744,7 +766,7 @@ internal class AdmissionControlledSandbox : ISandbox
         {
             try
             {
-                _onDisposed(this, _lease, releaseAdmission);
+                await _onDisposed(this, _lease, innerDisposeSucceeded).ConfigureAwait(false);
             }
             catch (Exception releaseEx)
             {
@@ -763,7 +785,7 @@ internal sealed class AdmissionControlledPreemptibleSandbox(
     ISandbox inner,
     IPreemptibleSandbox preemptible,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), IPreemptibleSandbox
 {
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
@@ -774,7 +796,7 @@ internal sealed class AdmissionControlledShutdownSandbox(
     ISandbox inner,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), IShutdownTeardownSandbox
 {
     public bool IsOwnedByShutdownHandler => shutdown.IsOwnedByShutdownHandler;
@@ -786,7 +808,7 @@ internal sealed class AdmissionControlledSuspendableSandbox(
     ISandbox inner,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log) : AdmissionControlledSandbox(inner, lease, onDisposed, log), ISuspendableSandbox
 {
     public bool IsSuspended => suspendable.IsSuspended;
@@ -802,7 +824,7 @@ internal sealed class AdmissionControlledPreemptibleSuspendableSandbox(
     IPreemptibleSandbox preemptible,
     ISuspendableSandbox suspendable,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, log),
         IPreemptibleSandbox,
@@ -824,7 +846,7 @@ internal sealed class AdmissionControlledPreemptibleShutdownSandbox(
     IPreemptibleSandbox preemptible,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, log),
         IPreemptibleSandbox,
@@ -843,7 +865,7 @@ internal sealed class AdmissionControlledSuspendableShutdownSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, log),
         ISuspendableSandbox,
@@ -867,7 +889,7 @@ internal sealed class AdmissionControlledFullSandbox(
     ISuspendableSandbox suspendable,
     IShutdownTeardownSandbox shutdown,
     SandboxAdmissionLease lease,
-    Action<ISandbox, SandboxAdmissionLease, bool> onDisposed,
+    Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> onDisposed,
     ILogger log)
     : AdmissionControlledSandbox(inner, lease, onDisposed, log),
         IPreemptibleSandbox,

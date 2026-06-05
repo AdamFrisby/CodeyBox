@@ -106,6 +106,30 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task CreateFailureWithRetainedSandbox_RetainsAdmissionUntilLeakDisposal()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            FailNextCreateRetainedSandboxName = "sandbox-retained",
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provider.CreateAsync(Spec()));
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var queued = provider.CreateAsync(Spec(), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queued.IsCompleted);
+
+        await provider.DisposeLeakedAsync("sandbox-retained", CancellationToken.None);
+        await using var next = await queued.WaitAsync(TestDeadline);
+
+        Assert.Equal(["sandbox-retained"], inner.DisposedLeaks);
+        Assert.Equal(2, inner.CreateAttempts);
+    }
+
+    [Fact]
     public async Task DisposeFailure_RetainsAdmissionTokenUntilManagedVmDisappears()
     {
         var inner = new CountingSandboxProvider { ThrowOnNextSandboxDispose = true };
@@ -209,7 +233,7 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
-    public async Task ReleaseResumeAdmission_ReleasesRetainedResumeLease()
+    public async Task DisposeLeakedAsync_ReleasesRetainedResumeLease()
     {
         var inner = new CountingSandboxProvider();
         inner.ManagedSandboxes =
@@ -219,7 +243,6 @@ public sealed class SandboxAdmissionControlledProviderTests
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
         var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
-        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
 
         await suspending.ResumeSandboxAsync("codeybox-resume", CancellationToken.None);
 
@@ -230,14 +253,14 @@ public sealed class SandboxAdmissionControlledProviderTests
         await Task.Delay(50);
         Assert.False(queuedCreate.IsCompleted);
 
-        resumeTracker.ReleaseResumeAdmission("codeybox-resume");
+        await provider.DisposeLeakedAsync("codeybox-resume", CancellationToken.None);
         await using var sandbox = await queuedCreate.WaitAsync(TestDeadline);
 
         Assert.Equal(1, admission.CurrentAdmittedSandboxes);
     }
 
     [Fact]
-    public async Task ResumeAdmissionReleaseBeforeProviderCompletes_ReleasesLeaseIfResumeEventuallySucceeds()
+    public async Task DisposeLeakedBeforeResumeCompletes_ReleasesLeaseIfResumeEventuallySucceeds()
     {
         var inner = new CountingSandboxProvider { BlockResume = true };
         inner.ManagedSandboxes =
@@ -247,14 +270,13 @@ public sealed class SandboxAdmissionControlledProviderTests
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
         var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
-        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
         using var resumeCts = new CancellationTokenSource();
 
         var resume = suspending.ResumeSandboxAsync("codeybox-slow-resume", resumeCts.Token);
         await inner.ResumeStarted.Task.WaitAsync(TestDeadline);
         Assert.Equal(1, admission.CurrentAdmittedSandboxes);
 
-        resumeTracker.ReleaseResumeAdmission("codeybox-slow-resume");
+        await provider.DisposeLeakedAsync("codeybox-slow-resume", CancellationToken.None);
         await resumeCts.CancelAsync();
         inner.AllowResume.SetResult();
         await resume.WaitAsync(TestDeadline);
@@ -313,10 +335,9 @@ public sealed class SandboxAdmissionControlledProviderTests
         var disk = Assert.IsAssignableFrom<IDiskGuardedSandboxProvider>(provider);
         var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(provider);
         var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
-        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
 
         await suspending.ResumeSandboxAsync("codeybox-cap", CancellationToken.None);
-        resumeTracker.ReleaseResumeAdmission("codeybox-cap");
+        await provider.DisposeLeakedAsync("codeybox-cap", CancellationToken.None);
         Assert.Equal(1, inner.ResumeCalls);
 
         Assert.Equal(17, await suspending.WaitForAdoptedAgentCompletionAsync(
@@ -423,10 +444,9 @@ public sealed class SandboxAdmissionControlledProviderTests
         var inner = new SuspendingOnlyProvider();
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
-        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
 
         await suspending.ResumeSandboxAsync("codeybox-suspending", CancellationToken.None);
-        resumeTracker.ReleaseResumeAdmission("codeybox-suspending");
+        await provider.DisposeLeakedAsync("codeybox-suspending", CancellationToken.None);
 
         Assert.Equal(1, inner.ResumeCalls);
         Assert.False(provider is IActiveSandboxProvider);
@@ -451,10 +471,8 @@ public sealed class SandboxAdmissionControlledProviderTests
         var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
         var active = Assert.IsAssignableFrom<IActiveSandboxProvider>(provider);
         var suspending = Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
-        var resumeTracker = Assert.IsAssignableFrom<ISandboxResumeAdmissionTracker>(provider);
 
         await suspending.ResumeSandboxAsync("codeybox-active-suspending", CancellationToken.None);
-        resumeTracker.ReleaseResumeAdmission("codeybox-active-suspending");
         await provider.DisposeLeakedAsync("codeybox-active-suspending", CancellationToken.None);
         await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
 
@@ -475,6 +493,139 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.Equal(1, inner.DiskSampleCalls);
         Assert.False(provider is ISuspendingSandboxProvider);
     }
+
+    public static IEnumerable<object[]> ProviderCapabilityCases()
+    {
+        for (var value = 0; value < 32; value++)
+            yield return [(ProviderCapabilitySet)value];
+    }
+
+    [Theory]
+    [MemberData(nameof(ProviderCapabilityCases))]
+    public async Task Wrap_PreservesEveryProviderCapabilityCombination(ProviderCapabilitySet capabilities)
+    {
+        var inner = CreateProviderFor(capabilities);
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 2, NullLogger.Instance);
+
+        Assert.Equal(capabilities.HasFlag(ProviderCapabilitySet.Active), provider is IActiveSandboxProvider);
+        Assert.Equal(capabilities.HasFlag(ProviderCapabilitySet.Suspending), provider is ISuspendingSandboxProvider);
+        Assert.Equal(capabilities.HasFlag(ProviderCapabilitySet.DiskGuard), provider is IDiskGuardedSandboxProvider);
+        Assert.Equal(capabilities.HasFlag(ProviderCapabilitySet.BaselineResolver), provider is IBaselineImageResolver);
+        Assert.Equal(capabilities.HasFlag(ProviderCapabilitySet.BaselineProvisioner), provider is IBaselineImageProvisioner);
+
+        if (provider is ISuspendingSandboxProvider suspending)
+        {
+            await suspending.ResumeSandboxAsync($"codeybox-resume-{(int)capabilities}", CancellationToken.None);
+            await provider.DisposeLeakedAsync($"codeybox-resume-{(int)capabilities}", CancellationToken.None);
+            Assert.Equal(1, inner.ResumeCalls);
+        }
+
+        if (provider is IDiskGuardedSandboxProvider disk)
+        {
+            Assert.Single(disk.SampleDiskGuardState());
+            Assert.Equal(1, inner.DiskSampleCalls);
+        }
+
+        if (provider is IBaselineImageResolver resolver)
+        {
+            Assert.Equal("baseline", resolver.ResolveBaselineRef("default", SandboxProfileFlavor.Headless));
+            Assert.Empty(await resolver.ListBaselineImagesAsync(CancellationToken.None));
+            await resolver.DisposeBaselineImageAsync("baseline", CancellationToken.None);
+            Assert.Equal(1, inner.ResolveBaselineCalls);
+            Assert.Equal(1, inner.ListBaselineCalls);
+            Assert.Equal(1, inner.DisposeBaselineCalls);
+        }
+
+        if (provider is IBaselineImageProvisioner provisioner)
+        {
+            Assert.Equal("baseline", await provisioner.EnsureBaselineImageAsync(
+                "default",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+            Assert.Equal(1, inner.EnsureBaselineCalls);
+        }
+
+        await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
+        if (provider is IActiveSandboxProvider active)
+            Assert.Single(active.SnapshotActiveSandboxes());
+    }
+
+    public static IEnumerable<object[]> SandboxCapabilityCases()
+    {
+        for (var value = 0; value < 8; value++)
+            yield return [(SandboxCapabilitySet)value];
+    }
+
+    [Theory]
+    [MemberData(nameof(SandboxCapabilityCases))]
+    public async Task WrapSandbox_PreservesEverySandboxCapabilityCombination(SandboxCapabilitySet capabilities)
+    {
+        var inner = new SandboxCapabilityProvider(capabilities);
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        Assert.Equal(capabilities.HasFlag(SandboxCapabilitySet.Preemptible), sandbox is IPreemptibleSandbox);
+        Assert.Equal(capabilities.HasFlag(SandboxCapabilitySet.Suspendable), sandbox is ISuspendableSandbox);
+        Assert.Equal(capabilities.HasFlag(SandboxCapabilitySet.Shutdown), sandbox is IShutdownTeardownSandbox);
+
+        if (sandbox is IPreemptibleSandbox preemptible)
+            await preemptible.StopAndPreserveAsync(CancellationToken.None);
+        if (sandbox is ISuspendableSandbox suspendable)
+        {
+            await suspendable.SuspendAsync(CancellationToken.None);
+            Assert.True(suspendable.IsSuspended);
+            Assert.Equal(1024, suspendable.MemoryBytes);
+        }
+        if (sandbox is IShutdownTeardownSandbox shutdown)
+        {
+            shutdown.MarkOwnedByShutdownHandler();
+            Assert.True(shutdown.IsOwnedByShutdownHandler);
+        }
+
+        await sandbox.DisposeAsync();
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        Assert.True(inner.LastSandbox!.Disposed);
+    }
+
+    private static CapabilityProviderBase CreateProviderFor(ProviderCapabilitySet capabilities) => capabilities switch
+    {
+        ProviderCapabilitySet.None => new MatrixNoneProvider(),
+        ProviderCapabilitySet.Active => new MatrixActiveProvider(),
+        ProviderCapabilitySet.Suspending => new MatrixSuspendingProvider(),
+        ProviderCapabilitySet.DiskGuard => new MatrixDiskGuardProvider(),
+        ProviderCapabilitySet.BaselineResolver => new MatrixBaselineResolverProvider(),
+        ProviderCapabilitySet.BaselineProvisioner => new MatrixBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending => new MatrixActiveSuspendingProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.DiskGuard => new MatrixActiveDiskGuardProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.BaselineResolver => new MatrixActiveBaselineResolverProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard => new MatrixSuspendingDiskGuardProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineResolver => new MatrixSuspendingBaselineResolverProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineProvisioner => new MatrixSuspendingBaselineProvisionerProvider(),
+        ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver => new MatrixDiskGuardBaselineResolverProvider(),
+        ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineProvisioner => new MatrixDiskGuardBaselineProvisionerProvider(),
+        ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixBaselineProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard => new MatrixActiveSuspendingDiskGuardProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineResolver => new MatrixActiveSuspendingBaselineResolverProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveSuspendingBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver => new MatrixActiveDiskGuardBaselineResolverProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveDiskGuardBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveBaselineProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver => new MatrixSuspendingDiskGuardBaselineResolverProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineProvisioner => new MatrixSuspendingDiskGuardBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixSuspendingBaselineProvider(),
+        ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixDiskGuardBaselineProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver => new MatrixActiveSuspendingDiskGuardBaselineResolverProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveSuspendingDiskGuardBaselineProvisionerProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveSuspendingBaselineProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveDiskGuardBaselineProvider(),
+        ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixSuspendingDiskGuardBaselineProvider(),
+        ProviderCapabilitySet.Active | ProviderCapabilitySet.Suspending | ProviderCapabilitySet.DiskGuard | ProviderCapabilitySet.BaselineResolver | ProviderCapabilitySet.BaselineProvisioner => new MatrixActiveSuspendingDiskGuardBaselineProvider(),
+        _ => throw new ArgumentOutOfRangeException(nameof(capabilities), capabilities, null),
+    };
 
     private static SandboxSpec Spec(int item = 0, int auditor = -1) => new()
     {
@@ -518,6 +669,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         }
         public IReadOnlyList<ManagedSandboxInfo> ManagedSandboxes { get; set; } = [];
         public bool FailNextCreate { get; set; }
+        public string? FailNextCreateRetainedSandboxName { get; set; }
         public bool ThrowOnNextSandboxDispose { get; set; }
         public bool LeaveHostSandboxAfterNextDispose { get; set; }
 
@@ -531,6 +683,17 @@ public sealed class SandboxAdmissionControlledProviderTests
             {
                 FailNextCreate = false;
                 throw new InvalidOperationException("create failed");
+            }
+            if (FailNextCreateRetainedSandboxName is { } retainedSandboxName)
+            {
+                FailNextCreateRetainedSandboxName = null;
+                throw new SandboxProvisioningDeferredException(
+                    "counting",
+                    "create-cleanup",
+                    "delete-failed",
+                    "create failed and cleanup did not prove removal",
+                    TimeSpan.FromSeconds(1),
+                    retainedSandboxName: retainedSandboxName);
             }
 
             var active = Interlocked.Increment(ref _active);
@@ -641,6 +804,192 @@ public sealed class SandboxAdmissionControlledProviderTests
             return [new DiskGuardSample("/tmp", 1024, 512)];
         }
     }
+
+    [Flags]
+    public enum ProviderCapabilitySet
+    {
+        None = 0,
+        Active = 1,
+        Suspending = 2,
+        DiskGuard = 4,
+        BaselineResolver = 8,
+        BaselineProvisioner = 16,
+    }
+
+    [Flags]
+    public enum SandboxCapabilitySet
+    {
+        None = 0,
+        Preemptible = 1,
+        Suspendable = 2,
+        Shutdown = 4,
+    }
+
+    private sealed class SandboxCapabilityProvider(SandboxCapabilitySet capabilities) : ISandboxProvider
+    {
+        public CapabilitySandboxBase? LastSandbox { get; private set; }
+        public string Name => "sandbox-capability";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            LastSandbox = capabilities switch
+            {
+                SandboxCapabilitySet.None => new MatrixPlainSandbox(),
+                SandboxCapabilitySet.Preemptible => new MatrixPreemptibleSandbox(),
+                SandboxCapabilitySet.Suspendable => new MatrixSuspendableSandbox(),
+                SandboxCapabilitySet.Shutdown => new MatrixShutdownSandbox(),
+                SandboxCapabilitySet.Preemptible | SandboxCapabilitySet.Suspendable => new MatrixPreemptibleSuspendableSandbox(),
+                SandboxCapabilitySet.Preemptible | SandboxCapabilitySet.Shutdown => new MatrixPreemptibleShutdownSandbox(),
+                SandboxCapabilitySet.Suspendable | SandboxCapabilitySet.Shutdown => new MatrixSuspendableShutdownSandbox(),
+                SandboxCapabilitySet.Preemptible | SandboxCapabilitySet.Suspendable | SandboxCapabilitySet.Shutdown => new MatrixFullSandbox(),
+                _ => throw new ArgumentOutOfRangeException(nameof(capabilities), capabilities, null),
+            };
+            return Task.FromResult<ISandbox>(LastSandbox);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private abstract class CapabilitySandboxBase : ISandbox
+    {
+        private bool _suspended;
+        private bool _owned;
+
+        public string Id { get; } = $"sandbox-{Guid.NewGuid():N}";
+        public bool Disposed { get; private set; }
+        public bool IsSuspended => _suspended;
+        public bool IsOwnedByShutdownHandler => _owned || _suspended;
+        public long? MemoryBytes => 1024;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync()
+        {
+            Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+
+        public Task StopAndPreserveAsync(CancellationToken ct = default)
+        {
+            _owned = true;
+            return Task.CompletedTask;
+        }
+
+        public Task SuspendAsync(CancellationToken ct = default)
+        {
+            _suspended = true;
+            return Task.CompletedTask;
+        }
+
+        public void MarkOwnedByShutdownHandler() => _owned = true;
+    }
+
+    private sealed class MatrixPlainSandbox : CapabilitySandboxBase { }
+    private sealed class MatrixPreemptibleSandbox : CapabilitySandboxBase, IPreemptibleSandbox { }
+    private sealed class MatrixSuspendableSandbox : CapabilitySandboxBase, ISuspendableSandbox { }
+    private sealed class MatrixShutdownSandbox : CapabilitySandboxBase, IShutdownTeardownSandbox { }
+    private sealed class MatrixPreemptibleSuspendableSandbox : CapabilitySandboxBase, IPreemptibleSandbox, ISuspendableSandbox { }
+    private sealed class MatrixPreemptibleShutdownSandbox : CapabilitySandboxBase, IPreemptibleSandbox, IShutdownTeardownSandbox { }
+    private sealed class MatrixSuspendableShutdownSandbox : CapabilitySandboxBase, ISuspendableSandbox, IShutdownTeardownSandbox { }
+    private sealed class MatrixFullSandbox : CapabilitySandboxBase, IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox { }
+
+    private abstract class CapabilityProviderBase : PlainCountingProvider
+    {
+        private int _resumeCalls;
+        private int _diskSampleCalls;
+        private int _resolveBaselineCalls;
+        private int _listBaselineCalls;
+        private int _disposeBaselineCalls;
+        private int _ensureBaselineCalls;
+
+        public int ResumeCalls => Volatile.Read(ref _resumeCalls);
+        public int DiskSampleCalls => Volatile.Read(ref _diskSampleCalls);
+        public int ResolveBaselineCalls => Volatile.Read(ref _resolveBaselineCalls);
+        public int ListBaselineCalls => Volatile.Read(ref _listBaselineCalls);
+        public int DisposeBaselineCalls => Volatile.Read(ref _disposeBaselineCalls);
+        public int EnsureBaselineCalls => Volatile.Read(ref _ensureBaselineCalls);
+
+        public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes() =>
+            [];
+
+        public Task ResumeSandboxAsync(string name, CancellationToken ct)
+        {
+            Interlocked.Increment(ref _resumeCalls);
+            return Task.CompletedTask;
+        }
+
+        public IReadOnlyList<DiskGuardSample> SampleDiskGuardState()
+        {
+            Interlocked.Increment(ref _diskSampleCalls);
+            return [new DiskGuardSample("/tmp", 1024, 512)];
+        }
+
+        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+        {
+            Interlocked.Increment(ref _resolveBaselineCalls);
+            return "baseline";
+        }
+
+        public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _listBaselineCalls);
+            return Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);
+        }
+
+        public Task DisposeBaselineImageAsync(string name, CancellationToken ct)
+        {
+            Interlocked.Increment(ref _disposeBaselineCalls);
+            return Task.CompletedTask;
+        }
+
+        public Task<string?> EnsureBaselineImageAsync(
+            string profileName,
+            SandboxProfileFlavor flavor,
+            string? pinnedBaselineRef,
+            CancellationToken ct)
+        {
+            Interlocked.Increment(ref _ensureBaselineCalls);
+            return Task.FromResult<string?>("baseline");
+        }
+    }
+
+    private sealed class MatrixNoneProvider : CapabilityProviderBase { }
+    private sealed class MatrixActiveProvider : CapabilityProviderBase, IActiveSandboxProvider { }
+    private sealed class MatrixSuspendingProvider : CapabilityProviderBase, ISuspendingSandboxProvider { }
+    private sealed class MatrixDiskGuardProvider : CapabilityProviderBase, IDiskGuardedSandboxProvider { }
+    private sealed class MatrixBaselineResolverProvider : CapabilityProviderBase, IBaselineImageResolver { }
+    private sealed class MatrixBaselineProvisionerProvider : CapabilityProviderBase, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveSuspendingProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider { }
+    private sealed class MatrixActiveDiskGuardProvider : CapabilityProviderBase, IActiveSandboxProvider, IDiskGuardedSandboxProvider { }
+    private sealed class MatrixActiveBaselineResolverProvider : CapabilityProviderBase, IActiveSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixActiveBaselineProvisionerProvider : CapabilityProviderBase, IActiveSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixSuspendingDiskGuardProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider { }
+    private sealed class MatrixSuspendingBaselineResolverProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixSuspendingBaselineProvisionerProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixDiskGuardBaselineResolverProvider : CapabilityProviderBase, IDiskGuardedSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixDiskGuardBaselineProvisionerProvider : CapabilityProviderBase, IDiskGuardedSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixBaselineProvider : CapabilityProviderBase, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveSuspendingDiskGuardProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider { }
+    private sealed class MatrixActiveSuspendingBaselineResolverProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixActiveSuspendingBaselineProvisionerProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveDiskGuardBaselineResolverProvider : CapabilityProviderBase, IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixActiveDiskGuardBaselineProvisionerProvider : CapabilityProviderBase, IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveBaselineProvider : CapabilityProviderBase, IActiveSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixSuspendingDiskGuardBaselineResolverProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixSuspendingDiskGuardBaselineProvisionerProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixSuspendingBaselineProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixDiskGuardBaselineProvider : CapabilityProviderBase, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveSuspendingDiskGuardBaselineResolverProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver { }
+    private sealed class MatrixActiveSuspendingDiskGuardBaselineProvisionerProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveSuspendingBaselineProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveDiskGuardBaselineProvider : CapabilityProviderBase, IActiveSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixSuspendingDiskGuardBaselineProvider : CapabilityProviderBase, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
+    private sealed class MatrixActiveSuspendingDiskGuardBaselineProvider : CapabilityProviderBase, IActiveSandboxProvider, ISuspendingSandboxProvider, IDiskGuardedSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner { }
 
     private sealed class CountingSandboxProvider :
         PlainCountingProvider,
@@ -789,13 +1138,11 @@ public sealed class SandboxAdmissionControlledProviderTests
         bool leaveHostSandboxAfterDispose) :
         IPreemptibleSandbox,
         ISuspendableSandbox,
-        IShutdownTeardownSandbox,
-        IHostSandboxLifecycleStatus
+        IShutdownTeardownSandbox
     {
         private int _disposed;
         private bool _ownedByShutdownHandler;
         private bool _suspended;
-        private bool _hostSandboxDisposed;
 
         public Action? OnStopAndPreserve { get; set; }
         public Action? OnSuspend { get; set; }
@@ -808,8 +1155,6 @@ public sealed class SandboxAdmissionControlledProviderTests
         public bool IsSuspended => _suspended;
 
         public long? MemoryBytes => 1024;
-
-        public bool HostSandboxDisposed => _hostSandboxDisposed;
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
@@ -866,10 +1211,7 @@ public sealed class SandboxAdmissionControlledProviderTests
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
                 if (!leaveHostSandboxAfterDispose)
-                {
                     provider.Release();
-                    _hostSandboxDisposed = true;
-                }
                 if (disposeThrows)
                     return ValueTask.FromException(new InvalidOperationException("dispose failed"));
             }

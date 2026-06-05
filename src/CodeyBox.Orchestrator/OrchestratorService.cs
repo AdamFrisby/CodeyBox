@@ -928,6 +928,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
                     try
                     {
+                        if (IsQueuePaused)
+                        {
+                            _log.LogInformation(
+                                "Worker {WorkerId} skipping {Id}: queue paused after spawn reservation but before pipeline start",
+                                workerIndex,
+                                capturedId);
+                            return;
+                        }
                         await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
                     }
                     finally

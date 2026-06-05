@@ -123,17 +123,6 @@ public interface ISandbox : IAsyncDisposable
 }
 
 /// <summary>
-/// Optional lifecycle status for persistent sandbox implementations. Providers
-/// whose <see cref="ISandbox.DisposeAsync"/> can return while the host-side
-/// sandbox still exists expose this so admission control can keep capacity
-/// reserved until leak disposal or inventory reconciliation proves it is gone.
-/// </summary>
-public interface IHostSandboxLifecycleStatus
-{
-    bool HostSandboxDisposed { get; }
-}
-
-/// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
 /// that can preserve an interrupted sandbox should stop it and make subsequent
 /// disposal a no-op so cached state can survive the orchestrator restart.

@@ -417,31 +417,19 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         }
         finally
         {
-            var releaseAdmission = true;
-            var admissionReleasedByDisposal = false;
             if (disposeResumedVm)
-            {
-                (releaseAdmission, admissionReleasedByDisposal) =
-                    await TryDisposeStartupResumedVmAsync(vmName);
-            }
-
-            if (releaseAdmission
-                && !admissionReleasedByDisposal
-                && suspending is ISandboxResumeAdmissionTracker admissionTracker)
-                admissionTracker.ReleaseResumeAdmission(vmName);
+                await TryDisposeStartupResumedVmAsync(vmName);
         }
     }
 
-    private async Task<(bool ReleaseAdmission, bool AdmissionReleasedByDisposal)> TryDisposeStartupResumedVmAsync(
-        string vmName)
+    private async Task TryDisposeStartupResumedVmAsync(string vmName)
     {
         if (_provider is null)
-            return (true, false);
+            return;
 
         try
         {
             await _provider.DisposeLeakedAsync(vmName, CancellationToken.None);
-            return (true, _provider is ISandboxResumeAdmissionTracker);
         }
         catch (Exception ex)
         {
@@ -449,7 +437,6 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
                 ex,
                 "Startup resume could not purge resumed sandbox {VmName}; retaining sandbox admission until leak disposal succeeds or inventory no longer lists it",
                 vmName);
-            return (false, false);
         }
     }
 

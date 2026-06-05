@@ -391,12 +391,24 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 _activeSandboxOwners[name] = new ActiveSandboxOwnerEntry(owner, sandbox);
             return sandbox;
         }
-        catch
+        catch (Exception ex)
         {
             // Best-effort cleanup if launch / mount / transfer half-succeeded.
-            try { await TryDeleteVmAsync(opts, name); }
+            var deleted = false;
+            try { deleted = await TryDeleteVmAsync(opts, name); }
             finally { MarkNoLongerActive(name); }
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
+            if (!deleted && await SandboxMayStillExistAfterFailedDeleteAsync(opts, name))
+            {
+                throw new SandboxProvisioningDeferredException(
+                    Name,
+                    "create-cleanup",
+                    "multipass-delete-purge-failed",
+                    $"create failed and best-effort delete --purge did not prove sandbox {name} was removed: {ex.Message}",
+                    _daemonRetryPolicy.ExhaustedRequeueDelay,
+                    retainedSandboxName: name,
+                    innerException: ex);
+            }
             throw;
         }
     }
@@ -3050,6 +3062,49 @@ test "$work" = present && test "$exec_wrapper" = present
             return false;
         }
     }
+
+    private async Task<bool> SandboxMayStillExistAfterFailedDeleteAsync(
+        MultipassSandboxOptions opts,
+        string name)
+    {
+        try
+        {
+            var info = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "info", name, "--format=json"],
+                stdin: null,
+                ct: CancellationToken.None);
+            if (info.ExitCode == 0)
+                return true;
+            if (IsInstanceNotFound(info.Stderr))
+                return false;
+
+            _log.LogWarning(
+                "Could not prove failed-create sandbox {Name} was absent after delete --purge failed (info exit {ExitCode}): {Stderr}",
+                name,
+                info.ExitCode,
+                info.Stderr);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not prove failed-create sandbox {Name} was absent after delete --purge failed",
+                name);
+            return true;
+        }
+    }
+
+    private static bool IsInstanceNotFound(string? stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr))
+            return false;
+
+        return stderr.Contains("argument not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("instance not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
@@ -3618,7 +3673,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IHostSandboxLifecycleStatus
+internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -3647,7 +3702,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
-    private bool _hostSandboxDisposed;
 
     /// <summary>
     /// True once <see cref="SuspendAsync"/> has frozen this VM's RAM via
@@ -3668,8 +3722,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     /// the VM.
     /// </summary>
     public bool IsOwnedByShutdownHandler => _isSuspended || _ownedByShutdownHandler;
-
-    public bool HostSandboxDisposed => _hostSandboxDisposed;
 
     /// <summary>
     /// Called by <c>SandboxShutdownTeardownService</c> when non-suspend
@@ -4133,7 +4185,6 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             return;
         }
         _disposed = true;
-        _hostSandboxDisposed = true;
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
