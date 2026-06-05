@@ -163,7 +163,8 @@ public sealed class MultipassArgvOverflowTests : IDisposable
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
         {
             Calls.Add(new RecordedCall(
                 argv.ToArray(),

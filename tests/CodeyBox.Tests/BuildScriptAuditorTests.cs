@@ -42,6 +42,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.Equal("/work/repo", build.WorkingDirectory);
         Assert.Equal(BuildScriptAuditor.OutputCaptureMaxBytes, build.MaxStdoutBytes);
         Assert.Equal(BuildScriptAuditor.OutputCaptureMaxBytes, build.MaxStderrBytes);
+        Assert.False(build.KillOnOutputLimit);
     }
 
     [Fact]
@@ -61,8 +62,9 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Equal("build failed", finding.Title);
         Assert.Contains("build.sh exited with code 2", finding.Description);
-        Assert.Contains("compile stdout", finding.Description);
-        Assert.Contains("compile stderr", finding.Description);
+        Assert.DoesNotContain("compile stdout", finding.Description);
+        Assert.DoesNotContain("compile stderr", finding.Description);
+        Assert.Contains("audit raw output", finding.Description);
         Assert.Contains("compile stdout", result.RawOutput);
         Assert.Contains("compile stderr", result.RawOutput);
     }
@@ -273,28 +275,30 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task OutputLimitExceeded_ThrowsCouldNotVerifyInsteadOfFinding()
+    public async Task OutputLimitExceededWithNonZeroExit_EmitsBuildFinding()
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(137, "partial stdout", "", StdoutLimitExceeded: true));
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
-            new BuildScriptAuditor().RunAsync(
-                sandbox,
-                "/work/repo",
-                Ctx()));
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("output exceeded the capture limit", ex.Message);
-        Assert.NotNull(ex.Output);
-        Assert.Contains("stdout truncated", ex.Output!);
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains("build.sh exited with code 137", finding.Description);
+        Assert.Contains("Output beyond", finding.Description);
+        Assert.DoesNotContain("partial stdout", finding.Description);
+        Assert.Contains("stdout truncated", result.RawOutput);
     }
 
     [Theory]
     [InlineData(true, false)]
     [InlineData(false, true)]
-    public async Task OutputLimitExceededWithExitZero_ThrowsCouldNotVerify(bool stdoutLimitExceeded, bool stderrLimitExceeded)
+    public async Task OutputLimitExceededWithExitZero_Passes(bool stdoutLimitExceeded, bool stderrLimitExceeded)
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
@@ -305,16 +309,14 @@ public sealed class BuildScriptAuditorTests : IDisposable
                 StdoutLimitExceeded: stdoutLimitExceeded,
                 StderrLimitExceeded: stderrLimitExceeded));
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
-            new BuildScriptAuditor().RunAsync(
-                sandbox,
-                "/work/repo",
-                Ctx()));
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("output exceeded the capture limit", ex.Message);
-        Assert.NotNull(ex.Output);
-        Assert.Contains(stdoutLimitExceeded ? "stdout truncated" : "stderr truncated", ex.Output!);
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+        Assert.Contains(stdoutLimitExceeded ? "stdout truncated" : "stderr truncated", result.RawOutput);
     }
 
     [Fact]

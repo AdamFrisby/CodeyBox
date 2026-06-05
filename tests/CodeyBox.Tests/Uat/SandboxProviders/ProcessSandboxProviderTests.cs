@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using System.Text;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -169,5 +170,28 @@ public sealed class ProcessSandboxProviderTests : IDisposable
         Assert.False(result.StdoutLimitExceeded);
         Assert.True(result.StderrLimitExceeded);
         Assert.True(result.Stderr.Length <= 128);
+    }
+
+    [Fact]
+    public async Task ExecAsync_OutputLimitCanDiscardWithoutKillingProcess_AndKeepsUtf8Prefix()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '\\303\\251\\360\\237\\231\\202z'; exit 7"],
+            MaxStdoutBytes = 5,
+            KillOnOutputLimit = false,
+        });
+
+        Assert.Equal(7, result.ExitCode);
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.Equal("\u00E9", result.Stdout);
+        Assert.True(Encoding.UTF8.GetByteCount(result.Stdout) <= 5);
     }
 }

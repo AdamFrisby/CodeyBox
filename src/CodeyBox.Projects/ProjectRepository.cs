@@ -494,9 +494,11 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ProjectAuditConfig? defaults,
         ProjectAudit baseAudit)
     {
-        var profiles = new Dictionary<string, ProjectAudit>(
-            AuditProfilePresets.CreateBuiltIns(),
-            StringComparer.OrdinalIgnoreCase);
+        var profiles = AuditProfilePresets.CreateBuiltIns()
+            .ToDictionary(
+                kvp => kvp.Key,
+                kvp => InheritGlobalProfilePolicy(kvp.Value, baseAudit),
+                StringComparer.OrdinalIgnoreCase);
 
         if (defaults?.Profiles is not null)
         {
@@ -524,6 +526,12 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var resolved = ResolveAuditBundle(config, ProjectAuditToConfig(fallback), profileName);
         return resolved with { Profile = profileName };
     }
+
+    private static ProjectAudit InheritGlobalProfilePolicy(ProjectAudit profile, ProjectAudit fallback)
+        => profile with
+        {
+            BuildScriptRequired = fallback.BuildScriptRequired,
+        };
 
     private static ProjectAuditConfig ProjectAuditToConfig(ProjectAudit audit)
         => new()

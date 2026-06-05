@@ -638,7 +638,8 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
             => Task.FromResult(_react(new RecordedCall(argv.ToArray(), stdin)));
     }
 
@@ -658,7 +659,8 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
             => Task.FromResult(new ProcessRunResult(0, "", ""));
     }
 }

@@ -76,7 +76,8 @@ public sealed class DefaultOpencodeCliRunnerTests
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null)
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
         {
             Calls.Add(argv.ToArray());
             Environments.Add(environment);
@@ -94,7 +95,8 @@ public sealed class DefaultOpencodeCliRunnerTests
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null) =>
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true) =>
             Task.FromResult(new ProcessRunResult(0, stdout, stderr));
     }
 
@@ -108,7 +110,8 @@ public sealed class DefaultOpencodeCliRunnerTests
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null) =>
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true) =>
             Task.FromResult(new ProcessRunResult(1, "", "", StartFailed: true));
     }
 }

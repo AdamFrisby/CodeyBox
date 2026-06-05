@@ -1237,7 +1237,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             cmd.CommandText = """
                 SELECT * FROM work_items
-                WHERE suspended_vm_name IS NOT NULL;
+                WHERE suspended_vm_name IS NOT NULL
+                ORDER BY suspended_at IS NULL, suspended_at ASC, created_at ASC, rowid ASC;
                 """;
             using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct)) rows.Add(Read(reader));

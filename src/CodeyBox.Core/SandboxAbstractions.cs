@@ -918,6 +918,7 @@ public sealed record SandboxExec
     public string? Stdin { get; init; }
     public int? MaxStdoutBytes { get; init; }
     public int? MaxStderrBytes { get; init; }
+    public bool KillOnOutputLimit { get; init; } = true;
 
     /// <summary>
     /// Optional callback invoked per stdout chunk as the process emits it.

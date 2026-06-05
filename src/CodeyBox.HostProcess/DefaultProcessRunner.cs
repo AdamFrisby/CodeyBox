@@ -16,7 +16,8 @@ public sealed class DefaultProcessRunner : IProcessRunner
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
         int? maxStderrBytes = null,
-        IReadOnlyDictionary<string, string>? environment = null)
+        IReadOnlyDictionary<string, string>? environment = null,
+        bool killOnOutputLimit = true)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
@@ -79,9 +80,17 @@ public sealed class DefaultProcessRunner : IProcessRunner
             }
 
             limitedStdoutTask = ReadLimitedAsync(
-                p.StandardOutput, maxStdoutBytes, stdoutChunkCallback, KillForLimit, ct);
+                p.StandardOutput,
+                maxStdoutBytes,
+                stdoutChunkCallback,
+                killOnOutputLimit ? KillForLimit : null,
+                ct);
             limitedStderrTask = ReadLimitedAsync(
-                p.StandardError, maxStderrBytes, stderrChunkCallback, KillForLimit, ct);
+                p.StandardError,
+                maxStderrBytes,
+                stderrChunkCallback,
+                killOnOutputLimit ? KillForLimit : null,
+                ct);
         }
         else
         {
@@ -123,22 +132,26 @@ public sealed class DefaultProcessRunner : IProcessRunner
         StreamReader reader,
         int? maxBytes,
         Action<string>? chunkCallback,
-        Action onLimitExceeded,
+        Action? onLimitExceeded,
         CancellationToken ct)
     {
         var output = new StringBuilder();
         var buffer = new char[ReadBufferChars];
         var totalBytes = 0;
+        var limitExceeded = false;
 
         while (true)
         {
             var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
             if (read == 0)
-                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
+                return new LimitedReadResult(output.ToString(), limitExceeded);
 
             var chunk = new string(buffer, 0, read);
             if (maxBytes is { } limit)
             {
+                if (limitExceeded)
+                    continue;
+
                 var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
                 if (totalBytes + chunkBytes > limit)
                 {
@@ -150,8 +163,12 @@ public sealed class DefaultProcessRunner : IProcessRunner
                         chunkCallback?.Invoke(truncated);
                     }
 
-                    onLimitExceeded();
-                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                    totalBytes = limit;
+                    limitExceeded = true;
+                    onLimitExceeded?.Invoke();
+                    if (onLimitExceeded is not null)
+                        return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                    continue;
                 }
 
                 totalBytes += chunkBytes;
@@ -165,12 +182,18 @@ public sealed class DefaultProcessRunner : IProcessRunner
     private static string TakeUtf8Prefix(string value, int maxBytes)
     {
         var used = 0;
-        for (var i = 0; i < value.Length; i++)
+        for (var i = 0; i < value.Length;)
         {
-            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, 1));
+            var charCount = char.IsHighSurrogate(value[i])
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1])
+                    ? 2
+                    : 1;
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, charCount));
             if (used + charBytes > maxBytes)
                 return value[..i];
             used += charBytes;
+            i += charCount;
         }
 
         return value;

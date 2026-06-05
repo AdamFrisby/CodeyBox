@@ -3750,7 +3750,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                     exec.StdoutChunkCallback,
                     exec.StderrChunkCallback,
                     maxStdoutBytes,
-                    maxStderrBytes),
+                    maxStderrBytes,
+                    exec.KillOnOutputLimit),
                 log: _log,
                 description: $"exec on {_name}",
                 ct: ct);
@@ -4039,7 +4040,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         Action<string>? stdoutChunkCallback = null,
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
-        int? maxStderrBytes = null)
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
         var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
         return MultipassDaemonRetry.RunWithRetryAsync(
@@ -4052,7 +4054,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                 stderrChunkCallback,
                 maxStdoutBytes,
                 maxStderrBytes,
-                environment),
+                environment,
+                killOnOutputLimit),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,

@@ -75,6 +75,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = OutputCaptureMaxBytes,
                 MaxStderrBytes = OutputCaptureMaxBytes,
+                KillOnOutputLimit = false,
             }, linkedCts.Token);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
@@ -96,16 +97,14 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         var output = CombinedOutput(result);
         if (result.ExecutionUnavailable)
             throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
-        if (result.OutputLimitExceeded)
-            throw UnavailableFromResult("could-not-verify: build.sh output exceeded the capture limit", result);
         if (IsCouldNotExecute(result))
             throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
-        if (result.Success)
+        if (result.ExitCode == 0)
             return new AuditResult(true, [], RawOutput: output);
 
-        var description = $"build.sh exited with code {result.ExitCode}.";
-        if (!string.IsNullOrWhiteSpace(output))
-            description += "\n\n" + Tail(output.TrimEnd(), FindingOutputMaxChars);
+        var description = $"build.sh exited with code {result.ExitCode}. Captured stdout/stderr are stored as audit raw output.";
+        if (result.OutputLimitExceeded)
+            description += $" Output beyond the first {OutputCaptureMaxBytes} bytes per stream was discarded.";
 
         return new AuditResult(false,
             [

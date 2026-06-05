@@ -225,9 +225,17 @@ internal sealed class BubblewrapSandbox : ISandbox
                 }
 
                 limitedStdoutTask = ReadLimitedAsync(
-                    proc.StandardOutput, exec.MaxStdoutBytes, exec.StdoutChunkCallback, KillForLimit, ct);
+                    proc.StandardOutput,
+                    exec.MaxStdoutBytes,
+                    exec.StdoutChunkCallback,
+                    exec.KillOnOutputLimit ? KillForLimit : null,
+                    ct);
                 limitedStderrTask = ReadLimitedAsync(
-                    proc.StandardError, exec.MaxStderrBytes, exec.StderrChunkCallback, KillForLimit, ct);
+                    proc.StandardError,
+                    exec.MaxStderrBytes,
+                    exec.StderrChunkCallback,
+                    exec.KillOnOutputLimit ? KillForLimit : null,
+                    ct);
             }
             else
             {
@@ -272,23 +280,27 @@ internal sealed class BubblewrapSandbox : ISandbox
         StreamReader reader,
         int? maxBytes,
         Action<string>? chunkCallback,
-        Action onLimitExceeded,
+        Action? onLimitExceeded,
         CancellationToken ct)
     {
         const int readBufferChars = 4096;
         var output = new StringBuilder();
         var buffer = new char[readBufferChars];
         var totalBytes = 0;
+        var limitExceeded = false;
 
         while (true)
         {
             var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
             if (read == 0)
-                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
+                return new LimitedReadResult(output.ToString(), limitExceeded);
 
             var chunk = new string(buffer, 0, read);
             if (maxBytes is { } limit)
             {
+                if (limitExceeded)
+                    continue;
+
                 var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
                 if (totalBytes + chunkBytes > limit)
                 {
@@ -300,8 +312,12 @@ internal sealed class BubblewrapSandbox : ISandbox
                         chunkCallback?.Invoke(truncated);
                     }
 
-                    onLimitExceeded();
-                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                    totalBytes = limit;
+                    limitExceeded = true;
+                    onLimitExceeded?.Invoke();
+                    if (onLimitExceeded is not null)
+                        return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                    continue;
                 }
 
                 totalBytes += chunkBytes;
@@ -315,12 +331,18 @@ internal sealed class BubblewrapSandbox : ISandbox
     private static string TakeUtf8Prefix(string input, int maxBytes)
     {
         var bytes = 0;
-        for (var i = 0; i < input.Length; i++)
+        for (var i = 0; i < input.Length;)
         {
-            var charBytes = Encoding.UTF8.GetByteCount(input.AsSpan(i, 1));
+            var charCount = char.IsHighSurrogate(input[i])
+                && i + 1 < input.Length
+                && char.IsLowSurrogate(input[i + 1])
+                    ? 2
+                    : 1;
+            var charBytes = Encoding.UTF8.GetByteCount(input.AsSpan(i, charCount));
             if (bytes + charBytes > maxBytes)
                 return input[..i];
             bytes += charBytes;
+            i += charCount;
         }
         return input;
     }
