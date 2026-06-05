@@ -4570,11 +4570,18 @@ public sealed class PipelineRunner : IPipelineRunner
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 group.Key.Caps);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
-                hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
-                flavor: sandboxTarget.Flavor,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
-            spec = spec with { Mounts = [.. spec.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }] };
+            SandboxSpec BuildAuditSandboxSpec(SandboxRepositoryAccess repositoryAccess)
+            {
+                var built = BuildSandboxSpec(repositoryAccess, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
+                    hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
+                    flavor: sandboxTarget.Flavor,
+                    baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+                return built with
+                {
+                    Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
+                };
+            }
+            var spec = BuildAuditSandboxSpec(access);
 
             // Within each capability group, split by Kind so tool auditors stay
             // sequential in a shared sandbox while LLM auditors each get their
@@ -4586,14 +4593,16 @@ public sealed class PipelineRunner : IPipelineRunner
             // Tool auditors: one shared sandbox, sequential.
             if (toolPairs.Count > 0)
             {
-                async Task<ISandbox> CreatePreparedToolSandboxAsync()
+                async Task<ISandbox> CreatePreparedToolSandboxAsync(
+                    SandboxRepositoryAccess repositoryAccess,
+                    SandboxSpec sandboxSpec)
                 {
-                    var prepared = await _sandboxes.CreateAsync(spec, ct);
+                    var prepared = await _sandboxes.CreateAsync(sandboxSpec, ct);
                     try
                     {
                         if (credential is not null && credential.Files.Count > 0)
                             await MaterialiseCredentialFilesAsync(prepared, credential, ct);
-                        await Run(prepared, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                        await Run(prepared, "git", "clone", repositoryAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
                         await Run(prepared, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
                         return prepared;
                     }
@@ -4612,21 +4621,44 @@ public sealed class PipelineRunner : IPipelineRunner
                         AuditorRunRecord run;
                         if (auditor is IAuditSandboxIsolation { RequiresFreshSandbox: true })
                         {
-                            await using var isolatedSandbox = await CreatePreparedToolSandboxAsync();
-                            run = await ExecAuditorAsync(
-                                isolatedSandbox,
-                                auditor,
-                                runner,
-                                workRunner,
-                                credential,
-                                member?.RouteKey,
-                                project,
-                                ctx,
-                                ct);
+                            string? isolatedRepoPath = null;
+                            try
+                            {
+                                isolatedRepoPath = await _gitHost.CreateIsolatedRepositoryCloneAsync(repoId, ctx.WorkItemId, ct);
+                                var isolatedAccess = _gitHost.GetIsolatedRepoSandboxAccess(isolatedRepoPath);
+                                var isolatedSpec = BuildAuditSandboxSpec(isolatedAccess);
+                                await using var isolatedSandbox = await CreatePreparedToolSandboxAsync(isolatedAccess, isolatedSpec);
+                                run = await ExecAuditorAsync(
+                                    isolatedSandbox,
+                                    auditor,
+                                    runner,
+                                    workRunner,
+                                    credential,
+                                    member?.RouteKey,
+                                    project,
+                                    ctx,
+                                    ct);
+                            }
+                            catch (Exception ex) when (ex is not OperationCanceledException and not AuditUnavailableException)
+                            {
+                                throw new AuditUnavailableException(
+                                    $"could-not-verify: isolated audit repository setup failed for {auditor.Name}: {SingleLineSummary(ex.Message)}",
+                                    ex);
+                            }
+                            finally
+                            {
+                                if (isolatedRepoPath is not null)
+                                {
+                                    await _gitHost.DisposeIsolatedRepositoryCloneAsync(
+                                        repoId,
+                                        isolatedRepoPath,
+                                        CancellationToken.None);
+                                }
+                            }
                         }
                         else
                         {
-                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync();
+                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync(access, spec);
                             run = await ExecAuditorAsync(
                                 sharedToolSandbox,
                                 auditor,

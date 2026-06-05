@@ -173,6 +173,78 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_MaxStdoutBytes_KillsProviderProcessAndFlagsLimit()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var fakeBwrap = Path.Combine(_workspace, "fake-stdout-bwrap.sh");
+        WriteExecutableScript(fakeBwrap, """
+            #!/bin/sh
+            while :; do printf 1234567890; done
+            """);
+        var provider = new BubblewrapSandboxProvider(
+            new BubblewrapSandboxOptions
+            {
+                BwrapBinary = fakeBwrap,
+                ReadOnlyHostBinds = [],
+            },
+            new RecordingLogger<BubblewrapSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec
+        {
+            Argv = ["ignored"],
+            MaxStdoutBytes = 128,
+            MaxStderrBytes = 128,
+        }, timeout.Token);
+
+        Assert.False(result.Success);
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.False(result.StderrLimitExceeded);
+        Assert.True(result.Stdout.Length <= 128, $"captured {result.Stdout.Length} bytes");
+    }
+
+    [Fact]
+    public async Task ExecAsync_MaxStderrBytes_KillsProviderProcessAndFlagsLimit()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var fakeBwrap = Path.Combine(_workspace, "fake-stderr-bwrap.sh");
+        WriteExecutableScript(fakeBwrap, """
+            #!/bin/sh
+            while :; do printf 1234567890 >&2; done
+            """);
+        var provider = new BubblewrapSandboxProvider(
+            new BubblewrapSandboxOptions
+            {
+                BwrapBinary = fakeBwrap,
+                ReadOnlyHostBinds = [],
+            },
+            new RecordingLogger<BubblewrapSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec
+        {
+            Argv = ["ignored"],
+            MaxStdoutBytes = 128,
+            MaxStderrBytes = 128,
+        }, timeout.Token);
+
+        Assert.False(result.Success);
+        Assert.False(result.StdoutLimitExceeded);
+        Assert.True(result.StderrLimitExceeded);
+        Assert.True(result.Stderr.Length <= 128, $"captured {result.Stderr.Length} bytes");
+    }
+
+    [Fact]
     public async Task Cancellation_KillsProviderProcessTreeAndThrows()
     {
         if (OperatingSystem.IsWindows()) return;

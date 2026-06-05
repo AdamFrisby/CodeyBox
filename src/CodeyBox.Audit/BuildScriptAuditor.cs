@@ -94,15 +94,14 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         }
 
         var output = CombinedOutput(result);
+        if (result.ExecutionUnavailable)
+            throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
+        if (result.OutputLimitExceeded)
+            throw UnavailableFromResult("could-not-verify: build.sh output exceeded the capture limit", result);
         if (result.Success)
             return new AuditResult(true, [], RawOutput: output);
 
-        if (result.ExecutionUnavailable || IsCouldNotExecute(result))
-            throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
-
-        var description = result.OutputLimitExceeded
-            ? $"build.sh output exceeded the per-stream capture limit ({OutputCaptureMaxBytes} bytes) and was terminated. Last observed exit code: {result.ExitCode}."
-            : $"build.sh exited with code {result.ExitCode}.";
+        var description = $"build.sh exited with code {result.ExitCode}.";
         if (!string.IsNullOrWhiteSpace(output))
             description += "\n\n" + Tail(output.TrimEnd(), FindingOutputMaxChars);
 

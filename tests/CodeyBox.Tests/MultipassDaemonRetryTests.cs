@@ -223,6 +223,7 @@ public sealed class MultipassDaemonRetryTests
             InstantPolicy());
 
         Assert.Equal(3, attempts);
+        Assert.True(result.ExecutionUnavailable);
         Assert.Contains("multipass daemon unreachable after 2 retries", result.Stderr);
         Assert.Contains("qemu-process-crashed", result.Stderr);
     }
@@ -245,6 +246,7 @@ public sealed class MultipassDaemonRetryTests
 
         Assert.Contains("multipass transient daemon error after 2 retries", result.Stderr);
         Assert.DoesNotContain("daemon unreachable", result.Stderr);
+        Assert.True(result.ExecutionUnavailable);
     }
 
     [Fact]
@@ -261,6 +263,7 @@ public sealed class MultipassDaemonRetryTests
 
         Assert.True(MultipassDaemonRetry.TryGetRetryExhaustedErrorClass(result, out var errorClass));
         Assert.Equal("multipass-start-argument-not-found", errorClass);
+        Assert.True(result.ExecutionUnavailable);
     }
 
     [Fact]
@@ -337,6 +340,7 @@ public sealed class MultipassDaemonRetryTests
 
         Assert.Contains("multipass daemon unreachable after 2 retries", result.Stderr);
         Assert.Contains("multipass-instance-lock-contention", result.Stderr);
+        Assert.True(result.ExecutionUnavailable);
     }
 
     [Fact]

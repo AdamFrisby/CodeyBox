@@ -164,6 +164,7 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
                 ["CodeyBox:Projects:0:Audit:Profile"] = "uat",
                 ["CodeyBox:Projects:0:Audit:MaxIterations"] = "9",
+                ["CodeyBox:Projects:0:Audit:BuildScriptRequired"] = "true",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:0"] = "security",
                 ["CodeyBox:Projects:0:Audit:Profiles:uat:MaxIterations"] = "5",
                 ["CodeyBox:Projects:0:Audit:Profiles:uat:Languages:0"] = "csharp",
@@ -178,9 +179,11 @@ public sealed class ProjectRepositoryTests
 
         Assert.Equal("uat", p!.Audit.Profile);
         Assert.Equal(9, p.Audit.MaxIterations);
+        Assert.True(p.Audit.BuildScriptRequired);
 
         var uat = p.Audit.ResolveProfile();
         Assert.Equal(5, uat.MaxIterations);
+        Assert.True(uat.BuildScriptRequired);
         Assert.Equal(["csharp"], uat.Languages);
         Assert.Equal(["security"], uat.AuditTypes);
         Assert.Equal("uat security focus", uat.AuditTypeOverrides["security"].ReviewFocus);

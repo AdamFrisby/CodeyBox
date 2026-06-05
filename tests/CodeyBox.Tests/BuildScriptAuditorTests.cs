@@ -132,22 +132,22 @@ public sealed class BuildScriptAuditorTests : IDisposable
     [Theory]
     [InlineData(126)]
     [InlineData(127)]
-    public async Task BuildScriptCannotExecute_ThrowsCouldNotVerifyInsteadOfFinding(int exitCode)
+    public async Task BuildScriptExit126Or127_EmitsBlockingBuildFailedFinding(int exitCode)
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(exitCode, "", "command not found\n"));
 
-        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
-            new BuildScriptAuditor().RunAsync(
-                sandbox,
-                "/work/repo",
-                Ctx()));
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("build.sh could not execute", ex.Message);
-        Assert.Contains($"exit {exitCode}", ex.Message);
-        Assert.Equal(exitCode, ex.ExitCode);
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains($"build.sh exited with code {exitCode}", finding.Description);
+        Assert.Contains("command not found", finding.Description);
     }
 
     [Fact]
@@ -201,6 +201,43 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
+    public async Task PresenceProbeUnexpectedNonOneExit_ThrowsCouldNotVerifyInsteadOfSkip()
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(2, "", "test command failed")
+            : new SandboxExecResult(99, "should not run", ""));
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx(required: false)));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("presence check", ex.Message);
+        Assert.Contains("exit 2", ex.Message);
+        Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
+    }
+
+    [Fact]
+    public async Task PresenceProbeExecutionUnavailable_ThrowsCouldNotVerifyInsteadOfSkip()
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(1, "", "provider unavailable", ExecutionUnavailable: true)
+            : new SandboxExecResult(99, "should not run", ""));
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx(required: false)));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("presence check", ex.Message);
+        Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
+    }
+
+    [Fact]
     public async Task PresenceProbeThrows_ThrowsCouldNotVerifyInsteadOfSkip()
     {
         var sandbox = new ThrowOnPresenceSandbox();
@@ -233,29 +270,28 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task OutputLimitExceeded_IsBlockingFindingWithTruncationNotice()
+    public async Task OutputLimitExceeded_ThrowsCouldNotVerifyInsteadOfFinding()
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(137, "partial stdout", "", StdoutLimitExceeded: true));
 
-        var result = await new BuildScriptAuditor().RunAsync(
-            sandbox,
-            "/work/repo",
-            Ctx());
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal("build failed", finding.Title);
-        Assert.Contains("output exceeded the per-stream capture limit", finding.Description);
-        Assert.Contains("stdout truncated", finding.Description);
-        Assert.Contains("stdout truncated", result.RawOutput);
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("output exceeded the capture limit", ex.Message);
+        Assert.NotNull(ex.Output);
+        Assert.Contains("stdout truncated", ex.Output!);
     }
 
     [Theory]
     [InlineData(true, false)]
     [InlineData(false, true)]
-    public async Task OutputLimitExceededWithExitZero_IsBlockingFinding(bool stdoutLimitExceeded, bool stderrLimitExceeded)
+    public async Task OutputLimitExceededWithExitZero_ThrowsCouldNotVerify(bool stdoutLimitExceeded, bool stderrLimitExceeded)
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
@@ -266,17 +302,16 @@ public sealed class BuildScriptAuditorTests : IDisposable
                 StdoutLimitExceeded: stdoutLimitExceeded,
                 StderrLimitExceeded: stderrLimitExceeded));
 
-        var result = await new BuildScriptAuditor().RunAsync(
-            sandbox,
-            "/work/repo",
-            Ctx());
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal("build failed", finding.Title);
-        Assert.Contains("output exceeded the per-stream capture limit", finding.Description);
-        Assert.Contains("Last observed exit code: 0", finding.Description);
-        Assert.Contains(stdoutLimitExceeded ? "stdout truncated" : "stderr truncated", result.RawOutput);
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("output exceeded the capture limit", ex.Message);
+        Assert.NotNull(ex.Output);
+        Assert.Contains(stdoutLimitExceeded ? "stdout truncated" : "stderr truncated", ex.Output!);
     }
 
     [Fact]
@@ -308,7 +343,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_Exit127_FailsInfrastructureWithoutPersistingCodeFinding()
+    public async Task Pipeline_Exit127_PersistsBlockingBuildFinding()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -335,10 +370,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("could-not-verify", final.LastError);
-        Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build failed", final.LastError);
+        var report = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.Contains(report.Findings, f => f.Title == "build failed");
+        Assert.NotNull(report.RawOutput);
+        Assert.Contains("missing tool", report.RawOutput!);
     }
 
     [Fact]
@@ -424,6 +461,57 @@ public sealed class BuildScriptAuditorTests : IDisposable
             r.RawOutput!.Contains("tampered audit clone"));
         var trailerReport = Assert.Single(reports.Reports, r => r.AuditorName == PromptRevisionTrailerAuditor.AuditorName);
         Assert.Contains(trailerReport.Findings, f => f.Title.Contains($"missing {CodeyBoxTrailers.PromptRevisionTrailerKey}"));
+    }
+
+    [Fact]
+    public async Task Pipeline_BuildScriptCannotPushToDurableWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors:
+            [
+                new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 }),
+                new PromptRevisionTrailerAuditor(),
+            ],
+            maxAuditIterations: 1,
+            auditReportStore: reports,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/build-script-origin-push") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitBuildScriptToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            $"""
+            #!/bin/sh
+            set -eu
+            git config user.email audit@example.invalid
+            git config user.name Audit
+            printf tampered > tampered-by-build.txt
+            git add tampered-by-build.txt
+            git commit -m "tampered durable branch"
+            git push origin HEAD:{item.WorkBranch}
+            echo pushed tampered commit
+            """);
+        var originalTip = (await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!)).stdout.Trim();
+
+        await tp.Store.CreateAsync(item);
+        await tp.Store.RecordIterationDispatchAsync(item.Id, 1, 1, DateTimeOffset.UtcNow, CancellationToken.None);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        var durableTip = (await TestSupport.RunGit(barePath, "rev-parse", item.WorkBranch!)).stdout.Trim();
+        Assert.Equal(originalTip, durableTip);
+        var showTampered = await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:tampered-by-build.txt");
+        Assert.NotEqual(0, showTampered.code);
+        var buildReport = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.NotNull(buildReport.RawOutput);
+        Assert.Contains("pushed tampered commit", buildReport.RawOutput!);
     }
 
     [Fact]

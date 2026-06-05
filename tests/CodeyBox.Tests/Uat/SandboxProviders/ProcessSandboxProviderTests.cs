@@ -146,4 +146,28 @@ public sealed class ProcessSandboxProviderTests : IDisposable
         Assert.False(result.StderrLimitExceeded);
         Assert.True(result.Stdout.Length <= 128);
     }
+
+    [Fact]
+    public async Task ExecAsync_MaxStderrBytes_KillsProcessAndFlagsTruncation()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "while :; do printf build-error >&2; done"],
+            MaxStdoutBytes = 128,
+            MaxStderrBytes = 128,
+        }, timeout.Token);
+
+        Assert.False(result.Success);
+        Assert.False(result.StdoutLimitExceeded);
+        Assert.True(result.StderrLimitExceeded);
+        Assert.True(result.Stderr.Length <= 128);
+    }
 }
