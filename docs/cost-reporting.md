@@ -48,6 +48,12 @@ estimated_usd   = (billable_input / 1_000_000) × input_rate_per_m
                 + (output_tokens / 1_000_000) × output_rate_per_m
 ```
 
+Codex is normalized before this general formula is applied: Codex/OpenAI
+prompt totals include cached tokens, so `CodexCostExtractor` stores only
+the fresh remainder in `input_tokens` and the cached subset in
+`cached_input_tokens`. The calculator bills Codex `input_tokens` directly
+as the fresh input bucket.
+
 ## Database schema
 
 ```sql
@@ -151,16 +157,26 @@ The fallback captures cached token counts when the output includes the "N cached
 
 ### Codex (`CodexCostExtractor`)
 
-Primary: scans stdout for a JSON object with a `usage` key:
+Primary: scans stdout/stderr for a JSON object with a `usage` key. Current
+`codex exec --json` emits a terminal event like:
 
 ```json
-{"usage":{"prompt_tokens":1234,"completion_tokens":567}}
+{"type":"turn.completed","usage":{"input_tokens":10546,"cached_input_tokens":2432,"output_tokens":5}}
 ```
 
-Fallback: scans stdout for a human-readable line like:
+The extractor also accepts the OpenAI usage shape:
+
+```json
+{"usage":{"prompt_tokens":82750,"completion_tokens":290,"prompt_tokens_details":{"cached_tokens":82000}}}
+```
+
+For both shapes, the prompt/input total includes cached tokens, so the
+stored `input_tokens` value is `prompt/input total - cached tokens`.
+
+Fallback: scans stdout/stderr for human-readable token lines like:
 
 ```
-Tokens used: prompt=1234 completion=567
+Prompt tokens: 12,345 / Cached input tokens: 2,000 / Completion tokens: 678
 ```
 
 ### Gemini (`GeminiCostExtractor`)

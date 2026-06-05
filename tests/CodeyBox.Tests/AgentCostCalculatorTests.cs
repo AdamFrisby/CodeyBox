@@ -63,6 +63,32 @@ public sealed class AgentCostCalculatorTests
     }
 
     [Fact]
+    public void CodexCachedInput_ChargesFreshRemainderAndCachedAtSeparateRates()
+    {
+        var calculator = new AgentCostCalculator(MakeOpts());
+        var snapshot = new AgentCostSnapshot(InputTokens: 750, CachedInputTokens: 82000, OutputTokens: 290, ModelId: "codex-unknown");
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        // fresh input: 750 * 5.0 / 1_000_000 = 0.00375
+        // cached: 82_000 * 0.5 / 1_000_000 = 0.041
+        // output: 290 * 25.0 / 1_000_000 = 0.00725
+        // total = 0.052
+        Assert.Equal(0.052000m, result);
+    }
+
+    [Fact]
+    public void CodexCachedOnlyInput_ChargesCachedInput()
+    {
+        var calculator = new AgentCostCalculator(MakeOpts());
+        var snapshot = new AgentCostSnapshot(InputTokens: 0, CachedInputTokens: 82000, OutputTokens: 0, ModelId: "codex-unknown");
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(0.041000m, result);
+    }
+
+    [Fact]
     public void UnknownModelAndNoDefaultRate_FallsBackToProviderDefault()
     {
         var opts = new AgentPricingOptions();
