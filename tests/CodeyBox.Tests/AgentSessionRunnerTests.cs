@@ -239,6 +239,29 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
+    public async Task StatelessAdapter_QueuedTurnAfterCloseRejectsResolvedClosedState()
+    {
+        var inner = new RecordingAgentRunner();
+        var runner = new StatelessSessionAgentRunner(inner);
+        var sandbox = new BlockingDisposeSandbox("vm-close-queued-turn");
+        var handle = await runner.OpenSessionAsync(sandbox, "/work", credential: null);
+
+        var closeTask = runner.CloseSessionAsync(handle);
+        await sandbox.DisposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var queuedTurn = runner.SendTurnAsync(handle, "queued after close");
+        Assert.False(queuedTurn.IsCompleted);
+
+        sandbox.ReleaseDispose.SetResult();
+        await closeTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await queuedTurn);
+        Assert.Contains("closed", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(inner.Calls);
+        Assert.Equal(1, sandbox.DisposeCount);
+    }
+
+    [Fact]
     public async Task StatelessAdapter_CloseFailure_CanBeRetried()
     {
         var runner = new StatelessSessionAgentRunner(new RecordingAgentRunner());
@@ -310,6 +333,12 @@ public sealed class AgentSessionRunnerTests
         Assert.Same(reattachedSandbox, call.Sandbox);
         Assert.Same(resolvedCredential, call.Credential);
         Assert.Equal("after restart", call.Prompt);
+        Assert.Equal(0, reattachedSandbox.DisposeCount);
+
+        await restarted.CloseSessionAsync(persisted);
+
+        Assert.Equal(1, reattachedSandbox.DisposeCount);
+        Assert.Single(reattachedRefs);
     }
 
     [Fact]
@@ -651,6 +680,30 @@ public sealed class AgentSessionRunnerTests
         {
             DisposeCount++;
             return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class BlockingDisposeSandbox(string id) : ISandbox
+    {
+        public string Id { get; } = id;
+        public int DisposeCount { get; private set; }
+        public TaskCompletionSource DisposeStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseDispose { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = exec;
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            DisposeStarted.TrySetResult();
+            return new ValueTask(ReleaseDispose.Task);
         }
     }
 

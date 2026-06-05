@@ -260,8 +260,8 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
             await state.Sandbox.DisposeAsync();
 
             state.Closed = true;
-            _sessions.TryRemove(sessionHandle.SessionId, out _);
             _closedSessions[sessionHandle.SessionId] = 0;
+            _sessions.TryRemove(sessionHandle.SessionId, out _);
             _reattachLocks.TryRemove(sessionHandle.SessionId, out _);
         }
         finally

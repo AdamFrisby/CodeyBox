@@ -171,13 +171,13 @@ public sealed class StartupResumeApiAvailabilityTests
                     ?? throw new InvalidOperationException("Kestrel-backed client did not expose a base address");
                 networkClient = new HttpClient { BaseAddress = baseAddress };
                 return await networkClient.GetAsync("/quota");
-            }).WaitAsync(TimeSpan.FromSeconds(15));
+            }).WaitAsync(TimeSpan.FromSeconds(5));
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
             Assert.True(sw.Elapsed >= reloadedTimeout,
                 $"hot-reloaded Blocking mode was not observed; GET /quota was served before resume timeout {reloadedTimeout}; elapsed {sw.Elapsed}");
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15),
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
                 $"hot-reloaded resume timeout {reloadedTimeout} was not observed; elapsed {sw.Elapsed}");
         }
         finally
@@ -187,11 +187,11 @@ public sealed class StartupResumeApiAvailabilityTests
             bootstrapClient?.Dispose();
         }
 
-        var failed = await WaitForStateAsync(factory.Store, timedOut.Id, WorkItemState.Failed, TimeSpan.FromSeconds(10));
+        var failed = await WaitForStateAsync(factory.Store, timedOut.Id, WorkItemState.Failed, TimeSpan.FromSeconds(2));
         Assert.Null(failed.SuspendedVmName);
         Assert.Contains($"timed out after {reloadedTimeout}", failed.LastError);
 
-        await WaitUntilAsync(() => factory.Provider.AdoptionCalls.Count == 1, TimeSpan.FromSeconds(10));
+        await WaitUntilAsync(() => factory.Provider.AdoptionCalls.Count == 1);
         var adoption = Assert.Single(factory.Provider.AdoptionCalls);
         Assert.Equal("vm-hot-adoption", adoption.VmName);
         Assert.Equal(TimeSpan.FromSeconds(reloadedAdoptionSeconds), adoption.Deadline);
@@ -219,9 +219,9 @@ public sealed class StartupResumeApiAvailabilityTests
         return latest;
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan? timeout = null)
+    private static async Task WaitUntilAsync(Func<bool> condition)
     {
-        var deadline = DateTimeOffset.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(2));
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
         while (DateTimeOffset.UtcNow < deadline)
         {
             if (condition())
