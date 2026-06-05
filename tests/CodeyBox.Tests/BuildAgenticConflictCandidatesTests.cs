@@ -533,7 +533,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
     }
 
     [Fact]
-    public async Task PausedPrimaryAndBudgetBlockedFallback_ThrowsAgentUnavailableNotPaused()
+    public async Task PausedPrimaryAndBudgetBlockedFallback_ThrowsAgentPaused()
     {
         var primary = new FakeAgentRunner(AgentKind.Claude);
         var codex = new FakeAgentRunner(AgentKind.Codex);
@@ -560,12 +560,14 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         var item = NewItem(AgentKind.Claude);
         await fixture.Store.CreateAsync(item);
 
-        var ex = await Assert.ThrowsAsync<AgentUnavailableException>(() =>
+        var ex = await Assert.ThrowsAsync<AgentPausedException>(() =>
             fixture.Pipeline.BuildAgenticConflictCandidatesAsync(
                 item, fixture.Project, primary, CancellationToken.None));
 
-        Assert.Contains("paused by operator", ex.CandidateReasons, StringComparison.Ordinal);
-        Assert.Contains("local budget exhausted", ex.CandidateReasons, StringComparison.Ordinal);
+        Assert.Equal("rebase", ex.Phase);
+        Assert.Equal(AgentKind.Claude, ex.Agent);
+        Assert.Contains("paused by operator", ex.PauseReason, StringComparison.Ordinal);
+        Assert.Contains("local budget exhausted", ex.PauseReason, StringComparison.Ordinal);
     }
 
     // ── Fixture and helpers ────────────────────────────────────────────────

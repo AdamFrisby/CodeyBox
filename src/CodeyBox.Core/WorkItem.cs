@@ -127,6 +127,17 @@ public sealed record WorkItem
     public string? QuotaRetryFrom { get; init; }
 
     /// <summary>
+    /// Agent kind whose operator pause parked this item in
+    /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
+    /// <see cref="Agent"/> because later phases can be blocked by an audit,
+    /// merge, or conflict-rework agent that is not the original work owner.
+    /// Null means the paused blocker set had multiple agents or predates this
+    /// field; the resume scheduler requeues those rows on pause-state changes
+    /// and lets routing decide again.
+    /// </summary>
+    public AgentKind? AgentPauseTarget { get; init; }
+
+    /// <summary>
     /// Why the item was cancelled. Only populated when <see cref="State"/> is
     /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
     /// legacy rows written before this column existed.
@@ -498,6 +509,7 @@ public sealed record WorkItem
             QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
             QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
+            AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             // CancellationSource is preserved on Failed (so triage shows what cancelled the

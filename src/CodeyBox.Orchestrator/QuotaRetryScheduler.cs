@@ -612,60 +612,41 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         string? reason,
         CancellationToken ct)
     {
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var retryFrom = NormalizeRetryFrom(current.QuotaRetryFrom);
         var pausedReason = string.IsNullOrWhiteSpace(reason)
             ? "agent paused by operator"
             : reason.Trim();
-        var next = current.With(
-            WorkItemState.WaitingForAgentResume,
-            $"waiting: agent paused: {pausedReason}") with
-        {
-            FailureKind = null,
-            QuotaResetAt = null,
-            NextQuotaRetryAt = null,
-            QuotaRetryFrom = retryFrom,
-            StartedAt = null,
-        };
-
-        var updated = await _store.TryUpdateIfStateAsync(
-            next,
-            current.State,
-            ct);
-        if (!updated)
-        {
-            _log.LogInformation(
-                "Quota retry skipped WaitingForAgentResume transition for {Id}: state changed",
-                item.Id);
-            return new QuotaRetryAttemptResult("skipped:state-changed", pausedReason);
-        }
-
-        AuditLog.AgentPauseDispatchDeferred(item.Id, pausedReason, retryFrom);
-        if (_webhooks is not null)
+        Project? project = null;
+        if (_projects is not null)
         {
             try
             {
-                var project = _projects is null
-                    ? null
-                    : await _projects.GetAsync(item.ProjectId, CancellationToken.None);
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "work_item.waiting_for_agent_resume",
-                    WorkItem = next,
-                    Project = project,
-                    Details = new { reason = pausedReason, retryFrom },
-                }, CancellationToken.None);
+                project = await _projects.GetAsync(item.ProjectId, CancellationToken.None);
             }
             catch (Exception ex)
             {
                 _log.LogWarning(
                     ex,
-                    "Agent-pause transition for quota retry item {Id} succeeded, but webhook delivery failed",
+                    "Could not load project for agent-pause transition of quota retry item {Id}",
                     item.Id);
             }
         }
 
-        return new QuotaRetryAttemptResult("moved:waiting-for-agent-resume", pausedReason);
+        var result = await WorkItemAgentPauseParking.ParkAsync(
+            _store,
+            _webhooks,
+            _log,
+            item,
+            pausedReason,
+            project,
+            pausedAgent: null,
+            ct,
+            retryFrom: NormalizeRetryFrom(item.QuotaRetryFrom));
+        if (!result.Updated)
+        {
+            return new QuotaRetryAttemptResult("skipped:state-changed", result.Reason);
+        }
+
+        return new QuotaRetryAttemptResult("moved:waiting-for-agent-resume", result.Reason);
     }
 
     private async Task<QuotaRetryAttemptResult> TransitionWaitingItemAtRetryCapAsync(

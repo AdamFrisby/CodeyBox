@@ -358,15 +358,12 @@ internal sealed class WorkItemCreationService
                 return Error("agentControl.action must be 'pause' or 'resume'");
 
             var reason = string.IsNullOrWhiteSpace(control.Reason) ? null : control.Reason.Trim();
-            if (reason is not null)
-            {
-                if (reason.Any(char.IsControl))
-                    return Error("agentControl.reason must not contain control characters");
-                if (reason.Length > 500)
-                    return Error("agentControl.reason must be <= 500 chars");
-            }
             if (action == AgentControlAction.Pause && reason is null)
                 return Error("agentControl.reason is required for pause");
+
+            var reasonValidation = AgentPauseValidation.ValidateOptionalReason(reason, "agentControl.reason");
+            if (reasonValidation is not null)
+                return Error(reasonValidation);
 
             if (control.DurationSeconds is { } seconds && seconds <= 0)
                 return Error("agentControl.durationSeconds must be positive");

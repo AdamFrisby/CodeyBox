@@ -2198,7 +2198,9 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
-        smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>());
+        smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
+        pauses: sp.GetRequiredService<IAgentPauseController>(),
+        agents: sp.GetRequiredService<IAgentRegistry>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2774,7 +2776,7 @@ namespace CodeyBox.Api
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
-    ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
@@ -2854,6 +2856,15 @@ namespace CodeyBox.Api
         /// next dispatched agent run.
         /// </summary>
         public Dictionary<string, string?> AgentDefaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Operator-configured per-agent pauses. Keyed by agent kind value.
+        /// Applied at startup and hot-reloaded by <see cref="AgentConfigHotReload"/>.
+        /// Runtime API/work-item pauses remain persisted in SQLite separately;
+        /// removing an entry here resumes only pauses owned by config.
+        /// </summary>
+        public Dictionary<string, AgentPauseConfig> AgentPauses { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
@@ -3138,6 +3149,31 @@ namespace CodeyBox.Api
         /// dev/UAT hosts still come up.
         /// </summary>
         public bool FailOnUnknownModel { get; set; } = false;
+    }
+
+    /// <summary>
+    /// Per-agent operator pause config. Bound from
+    /// <c>CodeyBox:AgentPauses:{agent}</c>.
+    /// </summary>
+    public sealed class AgentPauseConfig
+    {
+        /// <summary>
+        /// Whether this config entry should pause the agent. Default true so
+        /// a present entry is a pause declaration.
+        /// </summary>
+        public bool Paused { get; set; } = true;
+
+        /// <summary>Operator-visible pause reason.</summary>
+        public string? Reason { get; set; }
+
+        /// <summary>Optional absolute auto-resume time.</summary>
+        public DateTimeOffset? ExpiresAt { get; set; }
+
+        /// <summary>
+        /// Optional relative auto-resume duration in seconds, measured from the
+        /// reload that applies a changed config value.
+        /// </summary>
+        public int? DurationSeconds { get; set; }
     }
 
     /// <summary>

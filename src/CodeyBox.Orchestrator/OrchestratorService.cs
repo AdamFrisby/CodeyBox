@@ -1933,41 +1933,15 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         string reason,
         AgentKind? pausedAgent,
         CancellationToken ct)
-    {
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var retryFrom = AgentPauseResumeMapper.RetryFromForState(current.State);
-        var next = current.With(
-            WorkItemState.WaitingForAgentResume,
-            $"waiting: agent paused: {reason}") with
-        {
-            Agent = pausedAgent,
-            QuotaRetryFrom = retryFrom,
-            StartedAt = null,
-        };
-
-        var updated = await _store.TryUpdateIfStateAsync(
-            next,
-            current.State,
+        => await WorkItemAgentPauseParking.ParkAsync(
+            _store,
+            _webhooks,
+            _log,
+            item,
+            reason,
+            project: null,
+            pausedAgent,
             ct);
-        if (!updated)
-        {
-            _log.LogInformation(
-                "Work item {Id} state changed concurrently; skipping WaitingForAgentResume transition",
-                item.Id);
-            return;
-        }
-
-        AuditLog.AgentPauseDispatchDeferred(item.Id, reason, retryFrom);
-        if (_webhooks is not null)
-        {
-            _ = _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.waiting_for_agent_resume",
-                WorkItem = next,
-                Details = new { reason, retryFrom },
-            }, CancellationToken.None);
-        }
-    }
 
     private sealed class WorkerSlotLease
     {

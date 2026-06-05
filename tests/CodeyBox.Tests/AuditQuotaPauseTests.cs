@@ -236,6 +236,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal(AgentKind.Gemini, final.Agent);
+        Assert.Equal(AgentKind.Codex, final.AgentPauseTarget);
         Assert.Equal("audit", final.QuotaRetryFrom);
         Assert.Empty(auditor.Invocations);
         Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_agent_resume");
@@ -272,7 +274,8 @@ public sealed class AuditQuotaPauseTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
-        Assert.Equal(AgentKind.Codex, final.Agent);
+        Assert.Equal(AgentKind.Gemini, final.Agent);
+        Assert.Equal(AgentKind.Codex, final.AgentPauseTarget);
         Assert.Equal("audit", final.QuotaRetryFrom);
         Assert.Empty(auditor.Invocations);
     }

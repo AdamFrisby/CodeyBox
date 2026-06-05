@@ -17,10 +17,16 @@ public sealed class AgentClassRouterTests
     private static AgentClassRouter BuildRouter(
         IEnumerable<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
-        double minQuotaPct = 10.0)
+        double minQuotaPct = 10.0,
+        IAgentDispatchAvailability? dispatchAvailability = null)
     {
         var opts = new QuotaRouterOptions { MinQuotaPct = minQuotaPct, QuotaRecheckInterval = TimeSpan.FromMinutes(5) };
-        return new AgentClassRouter(catalog.ToList(), probes, opts, NullLogger<AgentClassRouter>.Instance);
+        return new AgentClassRouter(
+            catalog.ToList(),
+            probes,
+            opts,
+            NullLogger<AgentClassRouter>.Instance,
+            dispatchAvailability: dispatchAvailability);
     }
 
     private static WorkItem MakeItem(string? classId = null) => new()
@@ -300,6 +306,32 @@ public sealed class AgentClassRouterTests
             MakeItem("frontier"), null, CancellationToken.None);
 
         Assert.Equal(claudeReset, earliest);
+    }
+
+    [Fact]
+    public async Task ComputeEarliestExhaustedReset_SkipsPausedMembers()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var pausedReset = now.AddMinutes(10);
+        var activeReset = now.AddHours(2);
+        using var pauses = new SqliteAgentPauseController(
+            Path.Combine(Path.GetTempPath(), $"codeybox-router-pauses-{Guid.NewGuid():N}.db"),
+            NullLogger<SqliteAgentPauseController>.Instance);
+        await pauses.PauseAsync(Claude, "reserve for oversight", "test");
+
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = BuildRouter(
+            [cls],
+            [
+                new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = pausedReset }),
+                new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = activeReset }),
+            ],
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+
+        var earliest = await router.ComputeEarliestExhaustedResetAsync(
+            MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(activeReset, earliest);
     }
 
     [Fact]

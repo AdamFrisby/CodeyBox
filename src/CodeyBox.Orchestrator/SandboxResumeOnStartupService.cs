@@ -448,7 +448,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (resumeTask is not null)
-                ObserveProviderTaskException(resumeTask);
+                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -458,7 +458,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (resumeTask is not null)
-                ObserveProviderTaskException(resumeTask);
+                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -712,7 +712,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         try
         {
-            await task.WaitAsync(TimeSpan.FromMilliseconds(100));
+            await task.WaitAsync(TimeSpan.FromMilliseconds(250));
         }
         catch (TimeoutException)
         {

@@ -669,6 +669,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         //  - smoke-excluded: cleared by the in-VM smoke sweep / operator
         //    reset, NOT by quota recovery — don't misreport it as quota.
         //  - quota-below-floor: clears when the quota window resets.
+        if (pausedRejected.Count > 0 && hasSubscription)
+            return BuildPausedWaitDecision();
+
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
         {
@@ -764,7 +767,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             };
         }
 
-        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
+        if (pausedRejected.Count > 0)
             return BuildPausedWaitDecision();
 
         // Build the park interval from whichever blocker is the soonest to clear.

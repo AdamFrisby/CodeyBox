@@ -105,24 +105,14 @@ internal static class AgentPauseEndpoints
 
     private static IResult? ValidateReason(string? reason)
     {
-        if (string.IsNullOrWhiteSpace(reason))
-            return Results.BadRequest(new { error = "reason is required" });
-        if (reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
-        return null;
+        var error = AgentPauseValidation.ValidateRequiredReason(reason, "reason");
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static IResult? ValidateResumeReason(string? reason)
     {
-        if (reason is null)
-            return null;
-        if (reason.Any(char.IsControl))
-            return Results.BadRequest(new { error = "reason must not contain control characters" });
-        if (reason.Length > 500)
-            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
-        return null;
+        var error = AgentPauseValidation.ValidateOptionalReason(reason, "reason");
+        return error is null ? null : Results.BadRequest(new { error });
     }
 
     private static DateTimeOffset? ResolveExpiresAt(PauseAgentRequest body)

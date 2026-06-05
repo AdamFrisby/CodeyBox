@@ -336,9 +336,18 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
+        var validationError = ValidateAgentControlSpec(spec);
+        if (validationError is not null)
+        {
+            await TransitionFailed(item, validationError, CancellationToken.None, project, failureKind: "configuration");
+            return;
+        }
+
         await Transition(item, WorkItemState.Working, ct, project);
         var agent = new AgentKind(spec.Agent.Trim().ToLowerInvariant());
         var actor = $"work-item:{item.Id}";
+        AgentPauseState? pausedState = null;
+        bool resumed = false;
 
         try
         {
@@ -346,49 +355,20 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 case AgentControlAction.Pause:
                     {
-                        if (string.IsNullOrWhiteSpace(spec.Reason))
-                            throw new InvalidOperationException("agentControl.reason is required for pause");
-
                         var expiresAt = spec.ExpiresAt
                             ?? (spec.DurationSeconds is { } seconds
                                 ? DateTimeOffset.UtcNow.AddSeconds(seconds)
                                 : null);
-                        var state = await _agentPauses.PauseAsync(agent, spec.Reason.Trim(), actor, expiresAt, ct);
-                        await _webhooks.PublishAsync(new WebhookEvent
-                        {
-                            Event = "agent.paused",
-                            Details = new
-                            {
-                                agent = state.Agent.Value,
-                                reason = state.PausedReason,
-                                pausedAt = state.PausedAt,
-                                pausedBy = state.PausedBy,
-                                expiresAt = state.ExpiresAt,
-                            },
-                        }, CancellationToken.None);
+                        pausedState = await _agentPauses.PauseAsync(agent, spec.Reason!.Trim(), actor, expiresAt, ct);
                         break;
                     }
                 case AgentControlAction.Resume:
                     {
-                        var wasPaused = await _agentPauses.ResumeAsync(agent, actor, spec.Reason, ct);
-                        if (wasPaused)
-                        {
-                            await _webhooks.PublishAsync(new WebhookEvent
-                            {
-                                Event = "agent.resumed",
-                                Details = new
-                                {
-                                    agent = agent.Value,
-                                    resumedAt = DateTimeOffset.UtcNow,
-                                    resumedBy = actor,
-                                    reason = spec.Reason,
-                                },
-                            }, CancellationToken.None);
-                        }
+                        resumed = await _agentPauses.ResumeAsync(agent, actor, spec.Reason, ct);
                         break;
                     }
                 default:
-                    throw new InvalidOperationException($"unsupported agentControl action '{spec.Action}'");
+                    throw new UnreachableException($"validated unsupported agentControl action '{spec.Action}'");
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -397,11 +377,93 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex)
         {
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "configuration");
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
             return;
         }
 
+        await PublishAgentControlWebhookBestEffortAsync(agent, spec, actor, pausedState, resumed);
         await Transition(item, WorkItemState.Done, ct, project);
+    }
+
+    private static string? ValidateAgentControlSpec(AgentControlSpec spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec.Agent))
+            return "agentControl.agent is required";
+
+        switch (spec.Action)
+        {
+            case AgentControlAction.Pause:
+                if (string.IsNullOrWhiteSpace(spec.Reason))
+                    return "agentControl.reason is required for pause";
+                if (AgentPauseValidation.ValidateOptionalReason(spec.Reason, "agentControl.reason") is { } pauseReasonError)
+                    return pauseReasonError;
+                break;
+            case AgentControlAction.Resume:
+                if (AgentPauseValidation.ValidateOptionalReason(spec.Reason, "agentControl.reason") is { } resumeReasonError)
+                    return resumeReasonError;
+                break;
+            default:
+                return $"unsupported agentControl action '{spec.Action}'";
+        }
+
+        if (spec.DurationSeconds is { } seconds && seconds <= 0)
+            return "agentControl.durationSeconds must be positive";
+        if (spec.DurationSeconds is not null && spec.ExpiresAt is not null)
+            return "agentControl: provide either durationSeconds or expiresAt, not both";
+        if (spec.ExpiresAt is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow)
+            return "agentControl.expiresAt must be in the future";
+
+        return null;
+    }
+
+    private async Task PublishAgentControlWebhookBestEffortAsync(
+        AgentKind agent,
+        AgentControlSpec spec,
+        string actor,
+        AgentPauseState? pausedState,
+        bool resumed)
+    {
+        try
+        {
+            if (pausedState is not null)
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.paused",
+                    Details = new
+                    {
+                        agent = pausedState.Agent.Value,
+                        reason = pausedState.PausedReason,
+                        pausedAt = pausedState.PausedAt,
+                        pausedBy = pausedState.PausedBy,
+                        expiresAt = pausedState.ExpiresAt,
+                    },
+                }, CancellationToken.None);
+                return;
+            }
+
+            if (resumed)
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.resumed",
+                    Details = new
+                    {
+                        agent = agent.Value,
+                        resumedAt = DateTimeOffset.UtcNow,
+                        resumedBy = actor,
+                        reason = spec.Reason,
+                    },
+                }, CancellationToken.None);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Agent control mutation for {Agent} succeeded, but webhook delivery failed",
+                agent.Value);
+        }
     }
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
@@ -1934,8 +1996,13 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (collected.Count == 0)
         {
-            if (pausedCandidate is { } paused && quotaRejectedCount == 0)
-                throw new AgentPausedException(resolverSmokePhase, paused.Agent, paused.Reason);
+            if (pausedCandidate is { } paused)
+            {
+                var pauseReason = quotaRejectedCount == 0
+                    ? paused.Reason
+                    : string.Join("; ", skipReasons);
+                throw new AgentPausedException(resolverSmokePhase, paused.Agent, pauseReason);
+            }
 
             var reasons = skipReasons.Count == 0
                 ? "no candidate runner registered"
@@ -5415,6 +5482,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var sawQuotaBlockedCandidate = false;
         var currentRunner = initialRunner;
         var currentItem = initialItem;
+        AgentKind? pausedFallbackAgent = null;
         // Prefer the catalog's real AgentMembership (correct Billing / QualityScore /
         // ReasoningMode) so probe write-backs receive an accurate record. Only fall
         // back to a synthesised placeholder when the catalog has no matching row —
@@ -5439,6 +5507,8 @@ public sealed class PipelineRunner : IPipelineRunner
             bool pausedRejected = false)
         {
             var fallbackKind = quotaExhausted ? "quota" : pausedRejected ? "paused" : smokeRejected ? "smoke" : "timeout";
+            if (pausedRejected)
+                pausedFallbackAgent ??= currentRunner.Kind;
             if (quotaExhausted)
             {
                 sawQuotaBlockedCandidate = true;
@@ -5584,11 +5654,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     var msg = $"All {triedCount} eligible member(s) of class '{classId}' exhausted or paused mid-{phase}; " +
                               $"last paused rejection: {safeReason}";
-                    throw new AgentClassExhaustedException(classId, phase, triedCount, earliestReset, msg);
+                    throw new AgentPausedException(phase, pausedFallbackAgent ?? currentMember.Agent, msg);
                 }
 
                 if (pausedRejected)
-                    throw new AgentPausedException(phase, currentMember.Agent, safeReason);
+                    throw new AgentPausedException(phase, pausedFallbackAgent ?? currentMember.Agent, safeReason);
 
                 var timeoutPhase = phaseCancellation?.Phase ?? phase;
                 throw new PhaseCancellationException(
@@ -9563,40 +9633,15 @@ Original merge-phase failure (for context):
         string reason,
         Project? project,
         AgentKind? pausedAgent = null)
-    {
-        var ct = CancellationToken.None;
-        var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var retryFrom = AgentPauseResumeMapper.RetryFromForState(current.State);
-        var next = current.With(
-            WorkItemState.WaitingForAgentResume,
-            $"waiting: agent paused: {reason}") with
-        {
-            Agent = pausedAgent ?? current.Agent,
-            FailureKind = null,
-            QuotaResetAt = null,
-            NextQuotaRetryAt = null,
-            QuotaRetryFrom = retryFrom,
-            StartedAt = null,
-        };
-
-        var updated = await _store.TryUpdateIfStateAsync(next, current.State, ct);
-        if (!updated)
-        {
-            _log.LogInformation(
-                "Work item {Id} state changed concurrently; skipping WaitingForAgentResume transition",
-                item.Id);
-            return;
-        }
-
-        AuditLog.AgentPauseDispatchDeferred(item.Id, reason, retryFrom);
-        await _webhooks.PublishAsync(new WebhookEvent
-        {
-            Event = "work_item.waiting_for_agent_resume",
-            WorkItem = next,
-            Project = project,
-            Details = new { reason, retryFrom },
-        }, CancellationToken.None);
-    }
+        => await WorkItemAgentPauseParking.ParkAsync(
+            _store,
+            _webhooks,
+            _log,
+            item,
+            reason,
+            project,
+            pausedAgent,
+            CancellationToken.None);
 
     private async Task TransitionWaitingForQuotaResetAsync(
         WorkItem item,

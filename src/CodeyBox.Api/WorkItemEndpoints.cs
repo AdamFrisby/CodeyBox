@@ -1865,6 +1865,7 @@ internal static class WorkItemEndpoints
             NextQuotaRetryAt: item.NextQuotaRetryAt,
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             QuotaRetryFrom: item.QuotaRetryFrom,
+            AgentPauseTarget: item.AgentPauseTarget?.Value,
             Usage: usage?.Iteration,
             UsageTotal: usage?.Total,
             Priority: item.Priority,
@@ -2249,6 +2250,7 @@ public sealed record WorkItemDto(
     DateTimeOffset? NextQuotaRetryAt = null,
     int QuotaRetryAttempts = 0,
     string? QuotaRetryFrom = null,
+    string? AgentPauseTarget = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemIterationUsage? Usage = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

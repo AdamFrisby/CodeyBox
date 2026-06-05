@@ -152,8 +152,11 @@ public sealed class AgentPauseRetryScheduler : BackgroundService
 
     private async Task<bool> IsResumeTargetStillPausedAsync(WorkItem item, CancellationToken ct)
     {
-        if (item.Agent is { } target)
+        if (item.AgentPauseTarget is { } target)
             return await _pauses.GetAgentStateAsync(target, ct).ConfigureAwait(false) is not null;
+
+        if (item.Agent is { } legacyTarget)
+            return await _pauses.GetAgentStateAsync(legacyTarget, ct).ConfigureAwait(false) is not null;
 
         // Older rows and class-routing rows with multiple paused eligible agents
         // do not carry a single target. Requeue them on pause-state changes and

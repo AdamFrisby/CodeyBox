@@ -241,6 +241,19 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
+    public async Task PauseAgentAsync_NonSuccess_ThrowsWithStatusAndResponseBody()
+    {
+        var (client, _) = Build("""{"error":"reason is required"}""", HttpStatusCode.BadRequest);
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(
+            () => client.PauseAgentAsync("claude", "", null));
+
+        Assert.Equal(HttpStatusCode.BadRequest, ex.StatusCode);
+        Assert.Contains("Pause agent failed (400)", ex.Message);
+        Assert.Contains("reason is required", ex.Message);
+    }
+
+    [Fact]
     public async Task ResumeAgentAsync_PostsEscapedAgent()
     {
         var (client, handler) = Build("""{"agent":"claude/pro","paused":false}""");

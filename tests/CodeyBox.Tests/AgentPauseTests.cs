@@ -136,7 +136,7 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForQuotaRecovery()
+    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForAgentResume()
     {
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
@@ -159,9 +159,27 @@ public sealed class AgentPauseTests : IDisposable
         var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
 
         Assert.True(decision.ShouldWait);
-        Assert.False(decision.WaitingForPausedAgent);
-        Assert.Contains("quota", decision.Reason, StringComparison.OrdinalIgnoreCase);
-        Assert.Empty(decision.PausedAgents);
+        Assert.True(decision.WaitingForPausedAgent);
+        Assert.Contains("paused by operator", decision.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([AgentKind.Codex], decision.PausedAgents);
+    }
+
+    [Fact]
+    public async Task DispatchAvailability_EnsureAvailableAsync_UsesRealPauseController()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Codex, "provider outage", "test");
+        var gate = new CountingSmokeGate();
+        var dispatch = new AgentDispatchAvailability(inVmSmokeGate: gate, pauses: pauses);
+
+        var availability = await dispatch.EnsureAvailableAsync(
+            AgentKind.Codex,
+            new InVmSmokeSandboxTarget(null, SandboxProfileFlavor.Headless),
+            CancellationToken.None);
+
+        Assert.True(AgentDispatchAvailability.IsPausedVerdict(availability));
+        Assert.Contains("provider outage", availability!.Reason);
+        Assert.Equal(0, gate.EnsureCalls);
     }
 
     [Fact]
@@ -476,6 +494,34 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task Worker_AgentControlPauseItem_WebhookFailure_StillCompletesCommittedPause()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, new ThrowingWebhookDispatcher());
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var done = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, done!.State);
+        Assert.Null(done.FailureKind);
+        var paused = await pauses.GetAgentStateAsync(AgentKind.Claude);
+        Assert.NotNull(paused);
+        Assert.Equal("reserve quota", paused!.PausedReason);
+    }
+
+    [Fact]
     public async Task Worker_AgentControlPauseItem_WithoutPauseController_FailsConfiguration()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
@@ -621,6 +667,7 @@ public sealed class AgentPauseTests : IDisposable
         var item = Item(classId: null) with
         {
             Agent = AgentKind.Claude,
+            AgentPauseTarget = AgentKind.Claude,
             State = WorkItemState.WaitingForAgentResume,
             LastError = "waiting: agent paused: paused by operator: operator reserve",
             QuotaRetryFrom = "work",
@@ -679,6 +726,7 @@ public sealed class AgentPauseTests : IDisposable
         var item = Item(classId: null) with
         {
             Agent = AgentKind.Claude,
+            AgentPauseTarget = AgentKind.Claude,
             State = WorkItemState.WaitingForAgentResume,
             LastError = "waiting: agent paused: paused by operator: outage",
             QuotaRetryFrom = "work",
@@ -703,6 +751,7 @@ public sealed class AgentPauseTests : IDisposable
         var item = Item(classId: null) with
         {
             Agent = AgentKind.Claude,
+            AgentPauseTarget = AgentKind.Claude,
             State = WorkItemState.WaitingForAgentResume,
             LastError = "waiting: agent paused: paused by operator: maintenance",
             QuotaRetryFrom = "work",
@@ -718,6 +767,38 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForAgentResume, after!.State);
         Assert.Equal("work", after.QuotaRetryFrom);
         Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
+    public async Task AgentPauseRetryScheduler_UsesPauseTargetInsteadOfWorkAgent()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Codex, "audit paused", "test");
+        await pauses.PauseAsync(AgentKind.Claude, "work paused", "test");
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var item = Item(classId: null) with
+        {
+            Agent = AgentKind.Claude,
+            AgentPauseTarget = AgentKind.Codex,
+            State = WorkItemState.WaitingForAgentResume,
+            LastError = "waiting: agent paused: paused by operator: audit paused",
+            QuotaRetryFrom = "audit",
+        };
+        await store.CreateAsync(item);
+        var scheduler = NewPauseRetryScheduler(store, queue, pauses);
+
+        Assert.Equal(0, await scheduler.RetryWaitingItemsForTestAsync("still-target-paused"));
+
+        await pauses.ResumeAsync(AgentKind.Codex, "test", "audit ready");
+        var retried = await scheduler.RetryWaitingItemsForTestAsync("target-resumed");
+
+        Assert.Equal(1, retried);
+        var resumed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+        Assert.Null(resumed.AgentPauseTarget);
+        Assert.Equal(AgentKind.Claude, resumed.Agent);
+        Assert.Equal(1, queue.Count);
     }
 
     [Theory]
@@ -931,5 +1012,39 @@ public sealed class AgentPauseTests : IDisposable
         public override DateTimeOffset GetUtcNow() => _now;
 
         public void Advance(TimeSpan duration) => _now += duration;
+    }
+
+    private sealed class CountingSmokeGate : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+
+        public int EnsureCalls { get; private set; }
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct = default)
+        {
+            EnsureCalls++;
+            return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct = default)
+            => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher
+    {
+        public Task PublishAsync(WebhookEvent evt, CancellationToken ct = default)
+        {
+            if (evt.Event.StartsWith("agent.", StringComparison.Ordinal))
+                throw new InvalidOperationException("webhook unavailable");
+
+            return Task.CompletedTask;
+        }
     }
 }
