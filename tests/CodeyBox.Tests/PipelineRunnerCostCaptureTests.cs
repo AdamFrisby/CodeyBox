@@ -15,8 +15,8 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies that PipelineRunner writes cost rows via IWorkItemCostStore when
-/// an IAgentCostExtractor returns a snapshot, and does not throw or write rows
-/// when no extractor is registered or the extractor returns null.
+/// an IAgentCostExtractor returns a snapshot or is registered but cannot extract
+/// tokens, and does not throw or write rows when no extractor is registered.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class PipelineRunnerCostCaptureTests : IDisposable
@@ -163,6 +163,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(100, ev.CachedInputTokens);
         Assert.Equal(200, ev.OutputTokens);
         Assert.Equal(item.Id.ToString(), ev.WorkItemId);
+        Assert.Equal("work", ev.Phase);
+        Assert.Equal(costStore.Recorded[0].StartedAt, ev.StartedUtc);
+        Assert.Equal(costStore.Recorded[0].EndedAt, ev.EndedUtc);
+        Assert.True(ev.ElapsedMs > 0);
 
         // The microcent cost and timestamp must be derived from the same recorded
         // cost row (not a different field or scale): CostMicroCents is the cost
@@ -170,6 +174,91 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         var costRow = costStore.Recorded[0];
         Assert.Equal(AgentUsageEvent.UsdToMicroCents((decimal)costRow.EstimatedUsd), ev.CostMicroCents);
         Assert.Equal(costRow.EndedAt, ev.TimeUtc);
+    }
+
+    [Theory]
+    [MemberData(nameof(BuiltInAgentKinds))]
+    public async Task SuccessfulRun_WritesCostAndUsageRows_ForEachAgentKind(string agentKindValue)
+    {
+        var agentKind = new AgentKind(agentKindValue);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore, usageStore: usageStore, agentKind: agentKind);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite($"{agentKindValue}-usage.txt", "usage\n"));
+
+        var item = NewItem($"feature/{agentKindValue}-usage") with { Agent = agentKind };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal(agentKindValue, workRow.AgentKind);
+        Assert.Equal(1000, workRow.InputTokens);
+        Assert.Equal(100, workRow.CachedInputTokens);
+        Assert.Equal(200, workRow.OutputTokens);
+
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+        Assert.Contains(usageStore.Recorded, e =>
+            e.AgentKind == agentKindValue
+            && e.WorkItemId == item.Id.ToString()
+            && e.InputTokens == 1000
+            && e.OutputTokens == 200);
+    }
+
+    [Fact]
+    public async Task RegisteredExtractorReturningNull_WritesElapsedFallbackCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Cursor,
+            extractorReturnsNull: true);
+
+        tp.Agent.BeforeWorkAsync = async (_, _, ct) => await Task.Delay(25, ct);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("cursor-fallback.txt", "fallback\n"));
+
+        var item = NewItem("feature/cursor-fallback") with
+        {
+            Agent = AgentKind.Cursor,
+            ModelId = "cursor-default-model",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("cursor", workRow.AgentKind);
+        Assert.Equal("cursor-default-model", workRow.ModelId);
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.True(workRow.EndedAt > workRow.StartedAt);
+        Assert.Contains("extractor_null_elapsed_fallback", workRow.RawMetadataJson);
+
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("cursor", usage.AgentKind);
+        Assert.Equal("cursor-default-model", usage.ModelId);
+        Assert.Equal("work", usage.Phase);
+        Assert.Equal(workRow.StartedAt, usage.StartedUtc);
+        Assert.Equal(workRow.EndedAt, usage.EndedUtc);
+        Assert.True(usage.ElapsedMs > 0);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.CachedInputTokens);
+        Assert.Equal(0, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+        Assert.Equal(item.Id.ToString(), usage.WorkItemId);
     }
 
     [Fact]
@@ -342,6 +431,15 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         MergeTimeout = TimeSpan.FromMinutes(5),
     };
 
+    public static TheoryData<string> BuiltInAgentKinds() => new()
+    {
+        AgentKind.Claude.Value,
+        AgentKind.Codex.Value,
+        AgentKind.Gemini.Value,
+        AgentKind.Cursor.Value,
+        AgentKind.Opencode.Value,
+    };
+
     [Fact]
     public async Task LlmAuditor_ProducesAuditPhaseCostRow()
     {
@@ -433,8 +531,11 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         bool registerExtractor = true,
         IReadOnlyList<IAuditor>? auditors = null,
         int maxAuditIterations = 1,
-        IAgentUsageStore? usageStore = null)
+        IAgentUsageStore? usageStore = null,
+        AgentKind? agentKind = null,
+        bool extractorReturnsNull = false)
     {
+        var resolvedAgentKind = agentKind ?? AgentKind.Claude;
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
@@ -444,7 +545,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = resolvedAgentKind };
         var registry = new AgentRegistry([agent]);
 
         var auditorList = auditors ?? [];
@@ -456,7 +557,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             DisplayName = "Test Project",
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
-            DefaultAgent = AgentKind.Claude,
+            DefaultAgent = resolvedAgentKind,
             Audit = new ProjectAudit { MaxIterations = maxAuditIterations, AuditTypes = auditTypes },
         });
 
@@ -467,8 +568,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null;
         if (registerExtractor)
         {
-            var fake = new FakeCostExtractor { Kind = AgentKind.Claude };
-            extractors = new Dictionary<AgentKind, IAgentCostExtractor> { [AgentKind.Claude] = fake };
+            var fake = new FakeCostExtractor { Kind = resolvedAgentKind, ReturnNull = extractorReturnsNull };
+            extractors = new Dictionary<AgentKind, IAgentCostExtractor> { [resolvedAgentKind] = fake };
         }
 
         var pipeline = new PipelineRunner(
@@ -523,9 +624,12 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     private sealed class FakeCostExtractor : IAgentCostExtractor
     {
         public AgentKind Kind { get; init; }
+        public bool ReturnNull { get; init; }
 
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
-            => new(InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "fake-model");
+            => ReturnNull
+                ? null
+                : new(InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "fake-model");
 
         public ModelRateConfig? DefaultPricing => null;
     }

@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -92,6 +93,47 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
 
         Assert.Equal(300, agg.SumMicroCents);
         Assert.Equal(2, agg.Count);
+    }
+
+    [Fact]
+    public async Task RecordAsync_PersistsPhaseAndTimingMetadata()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var started = DateTimeOffset.Parse("2026-06-01T00:00:00Z");
+        var ended = started.AddSeconds(7);
+        await _store.RecordAsync(new AgentUsageEvent
+        {
+            Id = id,
+            TimeUtc = ended,
+            AgentKind = "cursor",
+            ModelId = "cursor-model",
+            Phase = "work",
+            StartedUtc = started,
+            EndedUtc = ended,
+            ElapsedMs = 7000,
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            CostMicroCents = 0,
+            WorkItemId = "wi-timing",
+        });
+
+        await using var conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT phase, started_utc, ended_utc, elapsed_ms
+            FROM agent_usage_events
+            WHERE id = $id
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("work", reader.GetString(0));
+        Assert.Equal(started.ToString("O"), reader.GetString(1));
+        Assert.Equal(ended.ToString("O"), reader.GetString(2));
+        Assert.Equal(7000, reader.GetInt64(3));
     }
 
     [Fact]

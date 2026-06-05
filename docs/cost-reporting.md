@@ -8,8 +8,10 @@ to run?" with per-phase and per-agent breakdowns.
 
 Every agent invocation (work, rework, audit LLM auditors, merge) attempts
 to extract token usage from the agent CLI's output and store a cost row in
-the `work_item_costs` SQLite table.  Costs are surfaced via two REST
-endpoints and an admin dashboard "Costs" tab.
+the `work_item_costs` SQLite table. When a registered extractor cannot find
+tokens, the pipeline still writes a zero-token, $0 row with the invocation
+timestamps so elapsed agent time and run count remain visible. Costs are
+surfaced via two REST endpoints and an admin dashboard "Costs" tab.
 
 Cost writes are **best-effort**: any failure during extraction or storage
 is logged at Warning level and does not abort the pipeline phase.
@@ -109,6 +111,14 @@ Rules:
 
 Each supported agent kind has a dedicated `IAgentCostExtractor`
 implementation that parses the agent CLI's stdout and stderr.
+
+If an extractor is registered for an agent kind but returns `null`, the
+pipeline records an elapsed-time fallback row: `input_tokens = 0`,
+`cached_input_tokens = 0`, `output_tokens = 0`, `estimated_usd = 0`, and
+`raw_metadata_json.source = "extractor_null_elapsed_fallback"`. The row's
+`started_at` / `ended_at` still feed `usageTotal.elapsedMs`, the cost API's
+`elapsedMs`, and invocation counts. If no extractor is registered at all, no
+cost row is written.
 
 ### Claude (`ClaudeCostExtractor`)
 

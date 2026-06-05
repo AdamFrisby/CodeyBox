@@ -58,6 +58,7 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
     {
         var item = CreateItem();
         await _factory.Store.CreateAsync(item);
+        var now = DateTimeOffset.Parse("2026-06-01T00:00:00Z");
 
         var workCost = new WorkItemCost
         {
@@ -70,8 +71,8 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
             CachedInputTokens = 0,
             OutputTokens = 500,
             EstimatedUsd = 0.1875,
-            StartedAt = DateTimeOffset.UtcNow.AddSeconds(-10),
-            EndedAt = DateTimeOffset.UtcNow,
+            StartedAt = now.AddSeconds(-10),
+            EndedAt = now,
         };
         var auditCost = new WorkItemCost
         {
@@ -85,8 +86,8 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
             CachedInputTokens = 0,
             OutputTokens = 100,
             EstimatedUsd = 0.0375,
-            StartedAt = DateTimeOffset.UtcNow.AddSeconds(-5),
-            EndedAt = DateTimeOffset.UtcNow,
+            StartedAt = now.AddSeconds(-5),
+            EndedAt = now,
         };
 
         await _factory.CostStore.RecordAsync(workCost);
@@ -99,10 +100,14 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(12000, body.GetProperty("totals").GetProperty("inputTokens").GetInt32());
         Assert.Equal(600, body.GetProperty("totals").GetProperty("outputTokens").GetInt32());
+        Assert.Equal(15000, body.GetProperty("totals").GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(2, body.GetProperty("totals").GetProperty("invocationCount").GetInt32());
 
         var byPhase = body.GetProperty("byPhase");
-        Assert.True(byPhase.TryGetProperty("work", out _));
+        Assert.True(byPhase.TryGetProperty("work", out var work));
         Assert.True(byPhase.TryGetProperty("audit", out _));
+        Assert.Equal(10000, work.GetProperty("elapsedMs").GetInt64());
+        Assert.Equal(1, work.GetProperty("invocationCount").GetInt32());
     }
 
     [Fact]
@@ -187,6 +192,8 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("proj-costs-test", body.GetProperty("projectId").GetString());
         Assert.Equal(1000, body.GetProperty("totals").GetProperty("inputTokens").GetInt32());
+        Assert.True(body.GetProperty("totals").GetProperty("elapsedMs").GetInt64() > 0);
+        Assert.Equal(1, body.GetProperty("totals").GetProperty("invocationCount").GetInt32());
     }
 
     private static WorkItem CreateItem(string projectId = "test-project") => new()

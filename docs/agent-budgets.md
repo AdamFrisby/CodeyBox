@@ -13,9 +13,13 @@ APIs too.
 
 ## How it works
 
-1. Every completed agent invocation writes one row to the `agent_usage_events`
-   SQLite table (the same site that records `work_item_costs`). Cost is stored
-   in **microcents** (`1 cent = 10000 microcents`, `1 USD = 1_000_000 microcents`).
+1. Every completed agent invocation with a registered cost extractor writes one
+   row to the `agent_usage_events` SQLite table (the same site that records
+   `work_item_costs`). Cost is stored in **microcents** (`1 cent = 10000
+   microcents`, `1 USD = 1_000_000 microcents`). The row also carries phase,
+   start/end timestamps, and elapsed milliseconds. If the extractor cannot find
+   token counts, the event still records the agent/model/work item and a zero
+   token, zero-cost run so usage windows retain run-count visibility.
 2. `AgentBudgetCalculator` sums `cost_microcents` over each configured window and
    computes `percentRemaining = 100 − (used / limit × 100)`.
 3. The per-window figures combine into one synthetic `AgentQuotaSnapshot`:

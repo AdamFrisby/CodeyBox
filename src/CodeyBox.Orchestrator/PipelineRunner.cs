@@ -10189,7 +10189,12 @@ Original merge-phase failure (for context):
                 agentKind.Value, phase);
             return;
         }
-        if (snapshot is null) return;
+        var usedElapsedFallback = snapshot is null;
+        snapshot ??= new AgentCostSnapshot(
+            InputTokens: 0,
+            CachedInputTokens: 0,
+            OutputTokens: 0,
+            ModelId: dispatchModelId);
 
         decimal usd;
         try { usd = _costCalculator.Calculate(snapshot, agentKind); }
@@ -10217,6 +10222,9 @@ Original merge-phase failure (for context):
                 EstimatedUsd = (double)usd,
                 StartedAt = startedAt,
                 EndedAt = endedAt,
+                RawMetadataJson = usedElapsedFallback
+                    ? """{"source":"extractor_null_elapsed_fallback"}"""
+                    : "{}",
             }, CancellationToken.None);
 
             // Emit the same accounting as OTel counters so dashboards align with
@@ -10244,7 +10252,7 @@ Original merge-phase failure (for context):
             try
             {
                 await _usageStore.RecordAsync(
-                    BuildUsageEvent(agentKind, agentInstanceId, dispatchModelId, snapshot, usd, workItemId, endedAt),
+                    BuildUsageEvent(agentKind, agentInstanceId, dispatchModelId, snapshot, usd, workItemId, endedAt, phase, startedAt),
                     CancellationToken.None);
             }
             catch (Exception ex)
@@ -10284,8 +10292,10 @@ Original merge-phase failure (for context):
         AgentCostSnapshot snapshot,
         decimal usd,
         WorkItemId workItemId,
-        DateTimeOffset endedAt) =>
-        BuildUsageEvent(agentKind, null, dispatchModelId, snapshot, usd, workItemId, endedAt);
+        DateTimeOffset endedAt,
+        string? phase = null,
+        DateTimeOffset? startedAt = null) =>
+        BuildUsageEvent(agentKind, null, dispatchModelId, snapshot, usd, workItemId, endedAt, phase, startedAt);
 
     internal static AgentUsageEvent BuildUsageEvent(
         AgentKind agentKind,
@@ -10294,13 +10304,21 @@ Original merge-phase failure (for context):
         AgentCostSnapshot snapshot,
         decimal usd,
         WorkItemId workItemId,
-        DateTimeOffset endedAt) => new()
+        DateTimeOffset endedAt,
+        string? phase = null,
+        DateTimeOffset? startedAt = null) => new()
         {
             Id = Guid.NewGuid().ToString(),
             TimeUtc = endedAt,
             AgentKind = agentKind.Value,
             AgentInstanceId = agentInstanceId,
             ModelId = dispatchModelId,
+            Phase = phase,
+            StartedUtc = startedAt,
+            EndedUtc = endedAt,
+            ElapsedMs = startedAt is { } start
+                ? (long)Math.Max(0, (endedAt - start).TotalMilliseconds)
+                : 0,
             InputTokens = Math.Max(0, snapshot.InputTokens),
             CachedInputTokens = Math.Max(0, snapshot.CachedInputTokens),
             OutputTokens = Math.Max(0, snapshot.OutputTokens),

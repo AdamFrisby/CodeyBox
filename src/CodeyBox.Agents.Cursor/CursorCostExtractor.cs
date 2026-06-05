@@ -8,9 +8,9 @@ namespace CodeyBox.Agents.Cursor;
 ///
 /// <para>The Cursor CLI does not currently document a final-usage line shape
 /// in its stdout. Returning <c>null</c> from <see cref="TryExtract"/> means
-/// the cost calculator falls back to <c>usageTotal.elapsedMs</c> for
-/// time-spent visibility (operator's stated preference). If/when Cursor adds
-/// a usage line, parse it here.</para>
+/// the pipeline records a zero-token, zero-cost row whose timestamps still feed
+/// <c>usageTotal.elapsedMs</c> for time-spent visibility. If/when Cursor adds a
+/// usage line, parse it here.</para>
 ///
 /// <para><see cref="DefaultPricing"/> is null because cost is unknown — the
 /// model is paid via the operator's flat-rate Cursor subscription, so a

@@ -16,6 +16,8 @@ public sealed class CostsTabTests : TestContext
         int outputTokens = 678,
         int cachedTokens = 500,
         double estimatedUsd = 0.168525,
+        long elapsedMs = 12_000,
+        int invocationCount = 1,
         string[]? phases = null,
         string[]? agentKinds = null)
     {
@@ -28,6 +30,8 @@ public sealed class CostsTabTests : TestContext
                 cachedInputTokens = cachedTokens,
                 outputTokens,
                 estimatedUsd,
+                elapsedMs,
+                invocationCount,
             });
         }
 
@@ -39,6 +43,8 @@ public sealed class CostsTabTests : TestContext
             CachedInputTokens = cachedTokens,
             OutputTokens = outputTokens,
             EstimatedUsd = estimatedUsd,
+            ElapsedMs = elapsedMs,
+            InvocationCount = invocationCount,
         }).ToList();
 
         return new WorkItemCostsDto
@@ -50,6 +56,8 @@ public sealed class CostsTabTests : TestContext
                 CachedInputTokens = cachedTokens,
                 OutputTokens = outputTokens,
                 EstimatedUsd = estimatedUsd,
+                ElapsedMs = elapsedMs,
+                InvocationCount = invocationCount,
             },
             ByPhase = byPhase,
             ByAgent = byAgent,
@@ -108,6 +116,26 @@ public sealed class CostsTabTests : TestContext
         var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("No cost data", cut.Markup);
+    }
+
+    [Fact]
+    public void WorkItemCosts_ZeroTokensWithElapsedTime_ShowsActivity()
+    {
+        var fake = new FakeApiClient([]);
+        fake.CostsOverride[ItemId] = MakeCosts(
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedTokens: 0,
+            estimatedUsd: 0,
+            elapsedMs: 15_000,
+            agentKinds: ["cursor"]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+
+        Assert.Contains("Token counts unavailable", cut.Markup);
+        Assert.Contains("15s", cut.Markup);
+        Assert.Contains("cursor", cut.Markup);
     }
 
     [Fact]
