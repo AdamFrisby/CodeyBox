@@ -125,8 +125,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(finalItem);
-        Assert.NotEqual(WorkItemState.Failed, finalItem!.State);
-        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, finalItem.State);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var swap = Assert.Single(history, h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
@@ -1580,10 +1579,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var codexProbe = new RecordingProbe(AgentKind.Codex, codexQuotaSnapshot);
         var claudeProbe = new RecordingProbe(AgentKind.Claude, claudeQuotaSnapshot);
 
+        var resolvedQuotaOptions = quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [frontier],
             [codexProbe, claudeProbe],
-            quotaOptions ?? new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            resolvedQuotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -1605,6 +1605,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe],
+            auditQuotaOptions: resolvedQuotaOptions,
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
@@ -1662,10 +1663,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var codexProbe = new RecordingProbe(AgentKind.Codex);
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
 
+        var costQuotaOptions = new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [frontier],
             [codexProbe, claudeProbe],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            costQuotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -1684,6 +1686,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe],
+            auditQuotaOptions: costQuotaOptions,
             costStore: costStore,
             costExtractors: extractors,
             costCalculator: calculator,
@@ -1768,10 +1771,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
         var geminiProbe = new RecordingProbe(AgentKind.Gemini);
 
+        var threeMemberQuotaOptions = new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [frontier],
             [codexProbe, claudeProbe, geminiProbe],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            threeMemberQuotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -1789,6 +1793,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [codexProbe, claudeProbe, geminiProbe],
+            auditQuotaOptions: threeMemberQuotaOptions,
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector(), new GeminiQuotaFailureDetector() }),

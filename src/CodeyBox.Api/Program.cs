@@ -895,7 +895,10 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
 });
 builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
     new QuotaGatePolicy(sp.GetRequiredService<QuotaRouterOptions>()));
-builder.Services.AddSingleton<IAgentQuotaGate, QuotaGateAvailability>();
+builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
+    sp.GetRequiredService<QuotaGatePolicy>(),
+    sp.GetService<IQuotaFailureStore>(),
+    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow));
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;

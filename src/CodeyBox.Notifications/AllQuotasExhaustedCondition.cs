@@ -6,7 +6,10 @@ namespace CodeyBox.Notifications;
 /// <summary>
 /// Evaluates true when every configured agent with a subscription quota probe
 /// is denied by the shared quota gate. Clears when at least one agent is
-/// routable.
+/// routable. Routes through <see cref="IAgentQuotaGate.AllowsAsync"/> so the
+/// gate's observed-failure breaker (consulted internally) gates this evaluation
+/// the same way it gates dispatch — without it the condition could report
+/// quotas available while every dispatch candidate is blocked by the breaker.
 /// </summary>
 public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 {
@@ -38,29 +41,36 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
         if (probes.Count == 0)
             return false;
 
+        var now = DateTimeOffset.UtcNow;
         foreach (var probe in probes)
         {
+            var member = new AgentMembership
+            {
+                Agent = probe.Kind,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            };
+
+            AgentQuotaSnapshot snapshot;
             try
             {
-                var member = new AgentMembership
-                {
-                    Agent = probe.Kind,
-                    Billing = AgentBilling.Subscription,
-                    QualityScore = 100,
-                };
-                var snapshot = await probe.GetAvailabilityAsync(member, ct);
-
-                if (_quotaGate.Allows(member, snapshot, DateTimeOffset.UtcNow))
-                    return false;
+                snapshot = await probe.GetAvailabilityAsync(member, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "AllQuotasExhaustedCondition: probe {AgentKind} failed; treating as below threshold", probe.Kind);
                 continue;
             }
+
+            if (await _quotaGate.AllowsAsync(member, snapshot, now, ct))
+                return false;
         }
 
-        return probes.Count > 0;
+        return true;
     }
 
     public void Dispose() { }

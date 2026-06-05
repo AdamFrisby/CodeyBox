@@ -274,7 +274,7 @@ public sealed class PipelineRunner : IPipelineRunner
             : auditQuotaProbes
                 .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
                 .ToDictionary(p => p.Kind);
-        _auditQuotaOptions = auditQuotaOptions ?? classRouter?.QuotaOptions ?? new QuotaRouterOptions();
+        _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
         _taskQueue = taskQueue;

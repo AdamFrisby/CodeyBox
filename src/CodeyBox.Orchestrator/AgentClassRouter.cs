@@ -133,8 +133,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _dispatchAvailability = dispatchAvailability;
     }
 
-    public QuotaRouterOptions QuotaOptions => _opts;
-
     /// <summary>
     /// Combines a probe-derived quota with the operator's local budget for the
     /// same (agent, model): takes MIN of the two available percentages so the

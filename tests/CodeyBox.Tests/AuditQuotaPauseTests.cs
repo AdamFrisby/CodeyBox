@@ -345,10 +345,11 @@ public sealed class AuditQuotaPauseTests : IDisposable
         var dispatchAvailability = pauses is null
             ? null
             : new AgentDispatchAvailability(pauses: pauses);
+        var sharedQuotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
             routeProbes,
-            new QuotaRouterOptions { MinQuotaPct = 10 },
+            sharedQuotaOptions,
             NullLogger<AgentClassRouter>.Instance,
             time,
             dispatchAvailability: dispatchAvailability);
@@ -406,6 +407,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: auditProbes,
+            auditQuotaOptions: sharedQuotaOptions,
             retryScheduler: scheduler,
             classRouter: router,
             fallbackHistory: fallbackHistory,

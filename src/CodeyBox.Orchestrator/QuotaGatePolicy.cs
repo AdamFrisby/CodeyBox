@@ -239,9 +239,21 @@ public sealed class QuotaGatePolicy
 public sealed class QuotaGateAvailability : IAgentQuotaGate
 {
     private readonly QuotaGatePolicy _policy;
+    private readonly IQuotaFailureStore? _failureStore;
+    private readonly TimeSpan _observedFailureWindow;
 
-    public QuotaGateAvailability(QuotaGatePolicy policy) =>
+    public QuotaGateAvailability(QuotaGatePolicy policy)
+        : this(policy, failureStore: null, observedFailureWindow: TimeSpan.Zero) { }
+
+    public QuotaGateAvailability(
+        QuotaGatePolicy policy,
+        IQuotaFailureStore? failureStore,
+        TimeSpan observedFailureWindow)
+    {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        _failureStore = failureStore;
+        _observedFailureWindow = observedFailureWindow;
+    }
 
     public bool Allows(
         AgentMembership member,
@@ -257,6 +269,28 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
             nowUtc,
             recentObservedFailure,
             observedFailureReason).Allow;
+    }
+
+    public async Task<bool> AllowsAsync(
+        AgentMembership member,
+        AgentQuotaSnapshot snapshot,
+        DateTimeOffset nowUtc,
+        CancellationToken ct = default)
+    {
+        var recentObservedFailure = false;
+        string? observedFailureReason = null;
+        if (_failureStore is not null && _observedFailureWindow > TimeSpan.Zero)
+        {
+            var observedAt = await _failureStore.GetMostRecentAsync(
+                member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct);
+            if (observedAt is { } seenAt)
+            {
+                recentObservedFailure = true;
+                observedFailureReason = $"observed quota failure at {seenAt:O}";
+            }
+        }
+
+        return Allows(member, snapshot, nowUtc, recentObservedFailure, observedFailureReason);
     }
 }
 

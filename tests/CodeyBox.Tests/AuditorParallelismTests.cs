@@ -442,10 +442,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
                 },
             ],
         };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
             [probe],
-            new QuotaRouterOptions { MinQuotaPct = 10 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var auditor = new FakeLlmAuditor(
@@ -464,7 +465,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             seed,
             auditors: [auditor],
             maxAuditIterations: 1,
-            classRouter: router);
+            classRouter: router,
+            auditQuotaOptions: quotaOptions);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
@@ -495,10 +497,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
                 },
             ],
         };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
             [new FixedQuotaProbe(AgentKind.Claude, resetAt)],
-            new QuotaRouterOptions { MinQuotaPct = 10 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var auditor = new FakeLlmAuditor(
@@ -517,7 +520,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             seed,
             auditors: [auditor],
             maxAuditIterations: 1,
-            classRouter: router);
+            classRouter: router,
+            auditQuotaOptions: quotaOptions);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
@@ -548,10 +552,11 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
                 },
             ],
         };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
             [probe],
-            new QuotaRouterOptions { MinQuotaPct = 10 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var auditor = new FakeLlmAuditor(
@@ -570,7 +575,8 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
             seed,
             auditors: [auditor],
             maxAuditIterations: 1,
-            classRouter: router);
+            classRouter: router,
+            auditQuotaOptions: quotaOptions);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
 
         var item = AuditorTestHelpers.NewItem() with { AgentClassId = "frontier" };
