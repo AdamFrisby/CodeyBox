@@ -89,10 +89,11 @@ internal static class WorkItemCostsEndpoints
 
         // byAgent breakdown
         var byAgent = rows
-            .GroupBy(r => new { r.AgentKind, r.ModelId })
+            .GroupBy(r => new { r.AgentKind, r.AgentInstanceId, r.ModelId })
             .Select(g => new
             {
                 agent = g.Key.AgentKind,
+                agentInstanceId = g.Key.AgentInstanceId,
                 modelId = g.Key.ModelId,
                 inputTokens = g.Sum(r => (long)r.InputTokens),
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
@@ -129,10 +130,11 @@ internal static class WorkItemCostsEndpoints
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
 
         var byAgent = rows
-            .GroupBy(r => new { r.AgentKind, r.ModelId })
+            .GroupBy(r => new { r.AgentKind, r.AgentInstanceId, r.ModelId })
             .Select(g => new
             {
                 agent = g.Key.AgentKind,
+                agentInstanceId = g.Key.AgentInstanceId,
                 modelId = g.Key.ModelId,
                 inputTokens = g.Sum(r => (long)r.InputTokens),
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),

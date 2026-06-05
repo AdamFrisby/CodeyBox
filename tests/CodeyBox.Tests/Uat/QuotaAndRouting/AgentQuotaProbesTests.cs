@@ -55,12 +55,22 @@ public sealed class AgentQuotaProbesTests
 
         var root = document.RootElement;
         Assert.Equal("UseObservedFailures", root.GetProperty("unknownPolicy").GetString());
-        var apiProbe = root.GetProperty("probes").EnumerateArray().Single();
+        var claudeProbes = root.GetProperty("probes")
+            .EnumerateArray()
+            .Where(p => p.GetProperty("agent").GetString() == "claude")
+            .ToList();
+        var apiProbe = Assert.Single(claudeProbes, p =>
+            p.TryGetProperty("modelId", out var modelId) &&
+            modelId.GetString() == "claude-opus-4-7");
         Assert.Equal("claude", apiProbe.GetProperty("agent").GetString());
+        Assert.Equal("claude", apiProbe.GetProperty("agentInstanceId").GetString());
         Assert.Equal(70, apiProbe.GetProperty("latestSnapshot").GetProperty("availablePct").GetDouble());
         Assert.True(apiProbe.GetProperty("wouldAllow").GetBoolean());
         Assert.True(apiProbe.GetProperty("perModelWouldAllow").GetProperty("claude-opus-4-7").GetBoolean());
-        Assert.Equal(1, probe.CallCount);
+        Assert.Contains(claudeProbes, p =>
+            p.TryGetProperty("modelId", out var modelId) &&
+            modelId.ValueKind == JsonValueKind.Null);
+        Assert.Equal(2, probe.CallCount);
     }
 
     [Fact]

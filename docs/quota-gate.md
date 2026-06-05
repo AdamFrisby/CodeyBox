@@ -57,6 +57,9 @@ also fall back to `MinQuotaPct`.
 
 All knobs are hot-reloadable via the `CodeyBox:QuotaRouter` config block —
 edits to `~/codeybox-extra.json` take effect on the next gate decision.
+`IntraKindRoutingPolicy` controls how same-kind subscription instances are
+ordered after class scoring: `MostQuotaFirst` (default), `RoundRobin`, or
+`Sticky`.
 
 ## Probe Model
 
@@ -180,7 +183,10 @@ for follow-on shapes that surface before a code release can land.
 `GET /quota` returns:
 
 - current quota router thresholds and unknown policy
-- each registered probe's latest snapshot
+- each configured subscription instance's latest snapshot, including
+  `agentInstanceId`, reset windows, and its containing class
+- kind aggregates so operators can distinguish per-instance rows from the
+  broader agent kind
 - per-model quota breakdowns
 - observed failure counters from the last 60 minutes
 - overall and per-model `wouldAllow` decisions

@@ -147,6 +147,11 @@ internal static class AgentsCommand
                 foreach (var row in rows)
                 {
                     var agent = row.GetProperty("agent").GetString();
+                    var display = row.TryGetProperty("agentInstanceId", out var instanceEl)
+                        && instanceEl.ValueKind != JsonValueKind.Null
+                        && !string.IsNullOrWhiteSpace(instanceEl.GetString())
+                        ? instanceEl.GetString()
+                        : agent;
                     var reason = row.TryGetProperty("pausedReason", out var reasonEl)
                         && reasonEl.ValueKind != JsonValueKind.Null
                         ? reasonEl.GetString()
@@ -155,7 +160,7 @@ internal static class AgentsCommand
                         && expiresEl.ValueKind != JsonValueKind.Null
                         ? $" expires={expiresEl.GetString()}"
                         : "";
-                    Console.WriteLine($"{agent}: {reason}{expires}");
+                    Console.WriteLine($"{display}: {reason}{expires}");
                 }
             }
             catch (JsonException ex)

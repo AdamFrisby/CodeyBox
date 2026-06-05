@@ -981,7 +981,7 @@ Clear a per-project queue pause. No-op if the project is not paused.
 
 ### `GET /agents/paused`
 
-List agent kinds currently paused for new dispatch.
+List agent kinds and pooled instances currently paused for new dispatch.
 
 ### `POST /agents/{kind}/pause`
 
@@ -995,6 +995,11 @@ continue to completion.
 `reason` is required, ≤ 500 chars, no control characters. Optional expiry can
 be sent as `durationSeconds`, `duration` (for example `"6h"`), or `expiresAt`.
 
+### `POST /agents/{kind}/instances/{instanceId}/pause`
+
+Pause one pooled instance route such as `claude/acct-a` while same-kind siblings
+continue dispatching. Body and validation are the same as kind-wide pause.
+
 ### `POST /agents/{kind}/resume`
 
 Resume dispatch to one agent kind. No-op if the agent is not paused.
@@ -1002,6 +1007,11 @@ Resume dispatch to one agent kind. No-op if the agent is not paused.
 ```json
 { "reason": "maintenance complete" }
 ```
+
+### `POST /agents/{kind}/instances/{instanceId}/resume`
+
+Resume one pooled instance route. No-op if that instance is not paused.
+
 ### `GET /workers`
 
 List currently-registered worker slots from the heartbeat registry. Useful for operator-grade introspection of what the process is currently doing, and for diagnosing stale rows after a crash.
@@ -1181,8 +1191,9 @@ Liveness probe. Returns `{ "status": "ok" }`.
 Returns the orchestrator's current quota view for registered subscription
 probes: latest snapshots, per-model buckets, observed quota-shaped failures in
 the last 60 minutes, `wouldAllow` decisions, and paused-agent annotations
-(`paused`, `pausedReason`, `pausedAt`, `pausedBy`, `pauseExpiresAt`,
-`dispatchStatus`). See
+(`agentInstanceId`, `paused`, `pausedReason`, `pausedAt`, `pausedBy`,
+`pauseExpiresAt`, `dispatchStatus`). Configured pooled instances are returned
+as separate rows, with `kindAggregates` summarising the broader kind. See
 [`quota-gate.md`](quota-gate.md).
 
 ### `POST /projects/{id}/release`

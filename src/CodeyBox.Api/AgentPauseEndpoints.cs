@@ -10,6 +10,8 @@ internal static class AgentPauseEndpoints
         group.MapGet("/paused", ListPausedAsync);
         group.MapPost("/{kind}/pause", PauseAsync);
         group.MapPost("/{kind}/resume", ResumeAsync);
+        group.MapPost("/{kind}/instances/{instanceId}/pause", PauseInstanceAsync);
+        group.MapPost("/{kind}/instances/{instanceId}/resume", ResumeInstanceAsync);
     }
 
     private static async Task<IResult> ListPausedAsync(
@@ -22,6 +24,26 @@ internal static class AgentPauseEndpoints
 
     private static async Task<IResult> PauseAsync(
         string kind,
+        PauseAgentRequest body,
+        IAgentPauseController pauses,
+        IAgentRegistry agents,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+        => await PauseCoreAsync(kind, instanceId: null, body, pauses, agents, webhooks, ct);
+
+    private static async Task<IResult> PauseInstanceAsync(
+        string kind,
+        string instanceId,
+        PauseAgentRequest body,
+        IAgentPauseController pauses,
+        IAgentRegistry agents,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+        => await PauseCoreAsync(kind, instanceId, body, pauses, agents, webhooks, ct);
+
+    private static async Task<IResult> PauseCoreAsync(
+        string kind,
+        string? instanceId,
         PauseAgentRequest body,
         IAgentPauseController pauses,
         IAgentRegistry agents,
@@ -45,13 +67,17 @@ internal static class AgentPauseEndpoints
             return Results.BadRequest(new { error = ex.Message });
         }
 
-        var state = await pauses.PauseAsync(agent, body.Reason!.Trim(), "api", expiresAt, ct);
+        var routeKeyResult = ResolveInstanceRouteKey(agent, instanceId);
+        if (routeKeyResult.Error is not null) return routeKeyResult.Error;
+        var routeKey = routeKeyResult.RouteKey;
+        var state = await pauses.PauseAsync(agent, body.Reason!.Trim(), "api", expiresAt, ct, routeKey);
         _ = webhooks.PublishAsync(new WebhookEvent
         {
             Event = "agent.paused",
             Details = new
             {
                 agent = state.Agent.Value,
+                agentInstanceId = state.AgentInstanceId,
                 reason = state.PausedReason,
                 pausedAt = state.PausedAt,
                 pausedBy = state.PausedBy,
@@ -69,6 +95,26 @@ internal static class AgentPauseEndpoints
         IAgentRegistry agents,
         IWebhookDispatcher webhooks,
         CancellationToken ct)
+        => await ResumeCoreAsync(kind, instanceId: null, body, pauses, agents, webhooks, ct);
+
+    private static async Task<IResult> ResumeInstanceAsync(
+        string kind,
+        string instanceId,
+        ResumeAgentRequest? body,
+        IAgentPauseController pauses,
+        IAgentRegistry agents,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+        => await ResumeCoreAsync(kind, instanceId, body, pauses, agents, webhooks, ct);
+
+    private static async Task<IResult> ResumeCoreAsync(
+        string kind,
+        string? instanceId,
+        ResumeAgentRequest? body,
+        IAgentPauseController pauses,
+        IAgentRegistry agents,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
     {
         var agent = NormaliseKind(kind);
         if (!agents.Available.Contains(agent))
@@ -77,7 +123,10 @@ internal static class AgentPauseEndpoints
         var validation = ValidateResumeReason(body?.Reason);
         if (validation is not null) return validation;
 
-        var wasPaused = await pauses.ResumeAsync(agent, "api", body?.Reason, ct);
+        var routeKeyResult = ResolveInstanceRouteKey(agent, instanceId);
+        if (routeKeyResult.Error is not null) return routeKeyResult.Error;
+        var routeKey = routeKeyResult.RouteKey;
+        var wasPaused = await pauses.ResumeAsync(agent, "api", body?.Reason, ct, routeKey);
         if (wasPaused)
         {
             _ = webhooks.PublishAsync(new WebhookEvent
@@ -86,6 +135,7 @@ internal static class AgentPauseEndpoints
                 Details = new
                 {
                     agent = agent.Value,
+                    agentInstanceId = routeKey,
                     resumedAt = DateTimeOffset.UtcNow,
                     resumedBy = "api",
                     reason = body?.Reason,
@@ -96,12 +146,31 @@ internal static class AgentPauseEndpoints
         return Results.Ok(new
         {
             agent = agent.Value,
+            agentInstanceId = routeKey,
             paused = false,
         });
     }
 
     private static AgentKind NormaliseKind(string kind) =>
         new(kind.Trim().ToLowerInvariant());
+
+    private static (string? RouteKey, IResult? Error) ResolveInstanceRouteKey(
+        AgentKind agent,
+        string? instanceId)
+    {
+        var id = AgentInstanceIds.NormalizeInstanceId(instanceId);
+        if (id is null)
+            return (null, null);
+        if (id.Contains('/', StringComparison.Ordinal) ||
+            id.Contains("%2f", StringComparison.OrdinalIgnoreCase))
+        {
+            return (null, Results.BadRequest(new
+            {
+                error = "instanceId path segment must not contain '/'; use /agents/{kind}/instances/{instanceId}/...",
+            }));
+        }
+        return (AgentInstanceIds.RouteKey(agent, id), null);
+    }
 
     private static IResult? ValidateReason(string? reason)
     {
@@ -169,6 +238,7 @@ internal static class AgentPauseEndpoints
     private static object ToDto(AgentPauseState state) => new
     {
         agent = state.Agent.Value,
+        agentInstanceId = state.AgentInstanceId,
         paused = state.Paused,
         pausedAt = state.PausedAt,
         pausedReason = state.PausedReason,

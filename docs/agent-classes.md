@@ -91,6 +91,12 @@ When `claude/acct-a` is exhausted or rate-limited, fallback can move to
 `claude/acct-b` before trying a weaker or different kind. The VM receives only
 the selected instance's credential bundle for that invocation.
 
+Same-kind siblings are ordered by `CodeyBox:QuotaRouter:IntraKindRoutingPolicy`.
+The default `MostQuotaFirst` probes sibling instances and spends the account
+with the most remaining quota first. `RoundRobin` rotates across usable
+siblings for even wear, and `Sticky` keeps a work item on its existing
+`AgentInstanceId` when that instance is still usable.
+
 For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
 and behavior is unchanged.
@@ -467,6 +473,7 @@ Configured under `CodeyBox:QuotaRouter`:
       "QuotaRecheckIntervalSeconds": 300,
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
+      "IntraKindRoutingPolicy": "MostQuotaFirst",
       "ObservedFailureWindowMinutes": 10,
       "ObservedFailureRetentionMinutes": 30,
       "ProbeMaxRetries": 2,
@@ -484,6 +491,7 @@ Configured under `CodeyBox:QuotaRouter`:
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
+| `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order usable same-kind subscription instances: `MostQuotaFirst`, `RoundRobin`, or `Sticky`. Hot-reloadable. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a quota-shaped stderr failure blocks the same agent/model. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed failures are retained in `state.db`. |
 | `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |

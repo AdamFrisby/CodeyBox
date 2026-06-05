@@ -221,6 +221,7 @@ When `event` is `agent.paused`:
 {
   "details": {
     "agent": "claude",
+    "agentInstanceId": "claude/acct-a",
     "reason": "provider outage",
     "pausedAt": "2026-06-04T02:00:00.000+00:00",
     "pausedBy": "api",
@@ -230,7 +231,8 @@ When `event` is `agent.paused`:
 ```
 
 `expiresAt` is `null` for an indefinite pause. In-flight runs are not killed;
-the event only means new dispatch to that agent kind is disabled.
+the event only means new dispatch to that agent kind or instance route is
+disabled. `agentInstanceId` is `null` for a kind-wide pause.
 
 ### `agent_resumed` details
 
@@ -240,6 +242,7 @@ When `event` is `agent.resumed`:
 {
   "details": {
     "agent": "claude",
+    "agentInstanceId": "claude/acct-a",
     "resumedAt": "2026-06-04T08:00:00.000+00:00",
     "resumedBy": "api",
     "reason": "maintenance complete"
@@ -247,7 +250,7 @@ When `event` is `agent.resumed`:
 }
 ```
 
-`reason` may be `null`.
+`reason` and `agentInstanceId` may be `null`.
 
 ### `waiting_for_agent_resume` details
 

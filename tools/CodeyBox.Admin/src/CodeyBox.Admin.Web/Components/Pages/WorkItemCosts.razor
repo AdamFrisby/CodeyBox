@@ -146,7 +146,7 @@ else
                     @foreach (var ag in _costs.ByAgent)
                     {
                         <tr>
-                            <td>@ag.Agent</td>
+                            <td>@AgentDisplay(ag)</td>
                             <td>@(ag.ModelId ?? "—")</td>
                             <td>@FormatTokens(ag.InputTokens)</td>
                             <td>@FormatTokens(ag.CachedInputTokens)</td>
@@ -209,6 +209,9 @@ else
         if (n >= 1_000) return $"{n / 1_000.0:F1}K";
         return n.ToString();
     }
+
+    private static string AgentDisplay(AgentCostBreakdownDto agent) =>
+        string.IsNullOrWhiteSpace(agent.AgentInstanceId) ? agent.Agent : agent.AgentInstanceId!;
 
     private static int? GetInt(JsonElement el, string key)
     {

@@ -4884,7 +4884,9 @@ public sealed class PipelineRunner : IPipelineRunner
             // selected for auditing). The walk runs the full quota /
             // availability gate on each candidate.
             var workMember = TryResolveSelectedMember(workRunner.Kind, project, item);
-            if ((workMember?.HasCapability(WellKnownCapabilities.Audit) ?? auditPool.Contains(workRunner.Kind))
+            if ((workMember is not null
+                    ? _classRouter?.MemberHasCapability(classId, workMember, WellKnownCapabilities.Audit) == true
+                    : auditPool.Contains(workRunner.Kind))
                 && GetAgentPausedReason(workRunner.Kind) is null)
             {
                 return new AuditAgentSelection(workRunner, workMember);
@@ -5004,7 +5006,8 @@ public sealed class PipelineRunner : IPipelineRunner
             // picked for auditing — even when it is the only one with quota.
             // Mid-iteration fallback in InvokeAgentWithQuotaFallbackAsync
             // enforces the same gate via requireAuditCapability.
-            if (auditPool is not null && !member.HasCapability(WellKnownCapabilities.Audit))
+            if (auditPool is not null
+                && _classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
             {
                 _log.LogDebug(
                     "Class '{ClassId}' member '{Member}' not tagged 'audit'; skipping for auditor '{Auditor}'",
@@ -5106,7 +5109,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var quotaRejectedCount = 0;
         foreach (var member in await _classRouter.OrderedFallbackCandidatesAsync(item, project, ct))
         {
-            if (!member.HasCapability(WellKnownCapabilities.Audit))
+            if (_classRouter?.MemberHasCapability(classId, member, WellKnownCapabilities.Audit) != true)
                 continue;
             if (!_agents.TryGet(member.Agent, out var memberRunner))
             {
@@ -5690,7 +5693,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 // matches the resolve-time gate in ResolveAuditAgentRunnerAsync
                 // so the work item never ends up on an agent the operator did
                 // not tag for this phase.
-                if (requiredCapabilityPoolActive && !candidate.HasCapability(requireCapability!))
+                if (requiredCapabilityPoolActive
+                    && _classRouter.MemberHasCapability(classId, candidate, requireCapability!) != true)
                 {
                     _log.LogDebug(
                         "Class '{ClassId}' member '{Agent}' not in '{Capability}' pool; skipping for fallback (work item {WorkItemId})",

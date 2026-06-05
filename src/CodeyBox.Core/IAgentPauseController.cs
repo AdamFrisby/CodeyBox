@@ -1,7 +1,8 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Runtime operator control for excluding one agent kind from new dispatches.
+/// Runtime operator control for excluding one agent kind or routed instance
+/// from new dispatches.
 /// Pauses are persisted by the host implementation so intent survives restart.
 /// In-flight agent runs are not cancelled by this contract.
 /// </summary>
@@ -12,20 +13,25 @@ public interface IAgentPauseController
         string reason,
         string pausedBy,
         DateTimeOffset? expiresAt = null,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? agentInstanceId = null);
 
     Task<bool> ResumeAsync(
         AgentKind agent,
         string resumedBy,
         string? reason = null,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? agentInstanceId = null);
 
     /// <summary>
     /// Returns active pause state for <paramref name="agent"/>, or null when
     /// the agent is dispatchable. Implementations may lazily clear expired
     /// pauses before answering.
     /// </summary>
-    Task<AgentPauseState?> GetAgentStateAsync(AgentKind agent, CancellationToken ct = default);
+    Task<AgentPauseState?> GetAgentStateAsync(
+        AgentKind agent,
+        CancellationToken ct = default,
+        string? agentInstanceId = null);
 
     /// <summary>
     /// Returns every currently active pause. Implementations may lazily clear
@@ -50,4 +56,5 @@ public sealed record AgentPauseState(
     string? PausedReason,
     string? PausedBy,
     DateTimeOffset? ExpiresAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? AgentInstanceId = null);

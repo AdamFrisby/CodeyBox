@@ -18,9 +18,15 @@ public sealed class AgentClassRouterTests
         IEnumerable<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
         double minQuotaPct = 10.0,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IntraKindRoutingPolicy policy = IntraKindRoutingPolicy.MostQuotaFirst)
     {
-        var opts = new QuotaRouterOptions { MinQuotaPct = minQuotaPct, QuotaRecheckInterval = TimeSpan.FromMinutes(5) };
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = minQuotaPct,
+            QuotaRecheckInterval = TimeSpan.FromMinutes(5),
+            IntraKindRoutingPolicy = policy,
+        };
         return new AgentClassRouter(
             catalog.ToList(),
             probes,
@@ -143,6 +149,68 @@ public sealed class AgentClassRouterTests
         var snapshot = router.SnapshotQuotaAvailabilityByInstance();
         Assert.Contains(snapshot, s => s.InstanceId == "claude/acct-a" && s.AvailablePct == 0.0);
         Assert.Contains(snapshot, s => s.InstanceId == "claude/acct-b" && s.AvailablePct == 75.0);
+    }
+
+    [Fact]
+    public async Task MostQuotaFirst_Default_SelectsSiblingWithMostHeadroom()
+    {
+        var acctA = Sub(Claude) with { InstanceId = "acct-a", QualityScore = 100 };
+        var acctB = Sub(Claude) with { InstanceId = "acct-b", QualityScore = 99 };
+        var probe = new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            [acctA.RouteKey] = 30.0,
+            [acctB.RouteKey] = 80.0,
+        });
+        var router = BuildRouter([FrontierClass(acctA, acctB)], [probe]);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal("claude/acct-b", decision.Chosen!.RouteKey);
+    }
+
+    [Fact]
+    public async Task RoundRobinPolicy_RotatesBetweenSameKindInstances()
+    {
+        var acctA = Sub(Claude) with { InstanceId = "acct-a", QualityScore = 100 };
+        var acctB = Sub(Claude) with { InstanceId = "acct-b", QualityScore = 100 };
+        var probe = new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            [acctA.RouteKey] = 80.0,
+            [acctB.RouteKey] = 80.0,
+        });
+        var router = BuildRouter(
+            [FrontierClass(acctA, acctB)],
+            [probe],
+            policy: IntraKindRoutingPolicy.RoundRobin);
+
+        var first = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var second = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var third = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal("claude/acct-a", first.Chosen!.RouteKey);
+        Assert.Equal("claude/acct-b", second.Chosen!.RouteKey);
+        Assert.Equal("claude/acct-a", third.Chosen!.RouteKey);
+    }
+
+    [Fact]
+    public async Task StickyPolicy_PrefersPreviouslySelectedInstance()
+    {
+        var acctA = Sub(Claude) with { InstanceId = "acct-a", QualityScore = 100 };
+        var acctB = Sub(Claude) with { InstanceId = "acct-b", QualityScore = 100 };
+        var probe = new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            [acctA.RouteKey] = 80.0,
+            [acctB.RouteKey] = 80.0,
+        });
+        var router = BuildRouter(
+            [FrontierClass(acctA, acctB)],
+            [probe],
+            policy: IntraKindRoutingPolicy.Sticky);
+        var item = MakeItem("frontier") with { Agent = Claude, AgentInstanceId = "claude/acct-b" };
+
+        var decision = await router.ResolveAsync(item, null, CancellationToken.None);
+
+        Assert.Equal("claude/acct-b", decision.Chosen!.RouteKey);
     }
 
     [Fact]

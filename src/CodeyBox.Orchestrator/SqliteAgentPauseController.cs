@@ -17,7 +17,8 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
     private readonly SqliteDatabaseWriteGate _lock;
     private readonly ILogger<SqliteAgentPauseController> _log;
     private readonly TimeProvider _time;
-    private readonly ConcurrentDictionary<AgentKind, AgentPauseState> _states = new();
+    private readonly ConcurrentDictionary<string, AgentPauseState> _states =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public event Action? AgentPauseChanged;
 
@@ -44,19 +45,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                 walCmd.ExecuteNonQuery();
             }
 
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                CREATE TABLE IF NOT EXISTS agent_pause_state (
-                    agent_kind    TEXT PRIMARY KEY,
-                    paused        INTEGER NOT NULL DEFAULT 0,
-                    paused_at     TEXT,
-                    paused_reason TEXT,
-                    paused_by     TEXT,
-                    expires_at    TEXT,
-                    updated_at    TEXT NOT NULL
-                );
-                """;
-            cmd.ExecuteNonQuery();
+            EnsureSchema();
 
             LoadState();
         }
@@ -71,16 +60,18 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         string reason,
         string pausedBy,
         DateTimeOffset? expiresAt = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? agentInstanceId = null)
     {
-        await PruneIfExpiredAsync(agent, ct).ConfigureAwait(false);
+        var key = PauseKey(agent, agentInstanceId);
+        await PruneIfExpiredAsync(key, ct).ConfigureAwait(false);
 
         AgentPauseState state;
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var now = _time.GetUtcNow();
-            var pausedAt = _states.TryGetValue(agent, out var existing)
+            var pausedAt = _states.TryGetValue(key, out var existing)
                 ? existing.PausedAt ?? now
                 : now;
             state = new AgentPauseState(
@@ -90,15 +81,18 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                 PausedReason: reason,
                 PausedBy: pausedBy,
                 ExpiresAt: expiresAt,
-                UpdatedAt: now);
+                UpdatedAt: now,
+                AgentInstanceId: InstanceStateId(agent, agentInstanceId));
 
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 INSERT INTO agent_pause_state
-                    (agent_kind, paused, paused_at, paused_reason, paused_by, expires_at, updated_at)
+                    (pause_key, agent_kind, agent_instance_id, paused, paused_at, paused_reason, paused_by, expires_at, updated_at)
                 VALUES
-                    ($agent, 1, $paused_at, $reason, $paused_by, $expires_at, $updated_at)
-                ON CONFLICT(agent_kind) DO UPDATE SET
+                    ($pause_key, $agent, $instance, 1, $paused_at, $reason, $paused_by, $expires_at, $updated_at)
+                ON CONFLICT(pause_key) DO UPDATE SET
+                    agent_kind        = $agent,
+                    agent_instance_id = $instance,
                     paused        = 1,
                     paused_at     = COALESCE(agent_pause_state.paused_at, $paused_at),
                     paused_reason = $reason,
@@ -109,7 +103,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
             BindState(cmd, state);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
 
-            _states[agent] = state;
+            _states[key] = state;
         }
         finally
         {
@@ -125,18 +119,20 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         AgentKind agent,
         string resumedBy,
         string? reason = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? agentInstanceId = null)
     {
-        await PruneIfExpiredAsync(agent, ct).ConfigureAwait(false);
+        var key = PauseKey(agent, agentInstanceId);
+        await PruneIfExpiredAsync(key, ct).ConfigureAwait(false);
 
         AgentPauseState? previous;
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (!_states.TryRemove(agent, out previous))
+            if (!_states.TryRemove(key, out previous))
                 return false;
 
-            await PersistRunningAsync(agent, _time.GetUtcNow(), ct).ConfigureAwait(false);
+            await PersistRunningAsync(key, agent, _time.GetUtcNow(), ct).ConfigureAwait(false);
         }
         finally
         {
@@ -148,14 +144,27 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         return true;
     }
 
-    public async Task<AgentPauseState?> GetAgentStateAsync(AgentKind agent, CancellationToken ct = default)
+    public async Task<AgentPauseState?> GetAgentStateAsync(
+        AgentKind agent,
+        CancellationToken ct = default,
+        string? agentInstanceId = null)
     {
-        if (!_states.TryGetValue(agent, out var state))
-            return null;
+        var key = PauseKey(agent, agentInstanceId);
+        if (!_states.TryGetValue(key, out var state))
+        {
+            if (agentInstanceId is null)
+                return null;
+
+            key = PauseKey(agent, null);
+            if (!_states.TryGetValue(key, out state))
+                return null;
+        }
 
         if (IsExpired(state, _time.GetUtcNow()))
         {
-            await ResumeExpiredAsync(agent, state, ct).ConfigureAwait(false);
+            await ResumeExpiredAsync(key, state, ct).ConfigureAwait(false);
+            if (agentInstanceId is not null)
+                return await GetAgentStateAsync(agent, ct).ConfigureAwait(false);
             return null;
         }
 
@@ -167,11 +176,11 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         foreach (var state in _states.Values)
         {
             if (IsExpired(state, _time.GetUtcNow()))
-                await ResumeExpiredAsync(state.Agent, state, ct).ConfigureAwait(false);
+                await ResumeExpiredAsync(PauseKey(state.Agent, state.AgentInstanceId), state, ct).ConfigureAwait(false);
         }
 
         return _states.Values
-            .OrderBy(s => s.Agent.Value, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(s => s.AgentInstanceId ?? s.Agent.Value, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
@@ -189,7 +198,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         using (var cmd = _conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT agent_kind, paused, paused_at, paused_reason, paused_by, expires_at, updated_at
+                SELECT pause_key, agent_kind, agent_instance_id, paused, paused_at, paused_reason, paused_by, expires_at, updated_at
                 FROM agent_pause_state
                 WHERE paused = 1;
                 """;
@@ -203,14 +212,14 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                     continue;
                 }
 
-                _states[state.Agent] = state;
+                _states[PauseKey(state.Agent, state.AgentInstanceId)] = state;
                 AuditLog.AgentStartedWhilePaused(state.Agent, state.PausedReason);
             }
         }
 
         foreach (var state in expired)
         {
-            PersistRunningAsync(state.Agent, now, CancellationToken.None)
+            PersistRunningAsync(PauseKey(state.Agent, state.AgentInstanceId), state.Agent, now, CancellationToken.None)
                 .ConfigureAwait(false)
                 .GetAwaiter()
                 .GetResult();
@@ -218,25 +227,25 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         }
     }
 
-    private async Task PruneIfExpiredAsync(AgentKind agent, CancellationToken ct)
+    private async Task PruneIfExpiredAsync(string key, CancellationToken ct)
     {
-        if (_states.TryGetValue(agent, out var state) && IsExpired(state, _time.GetUtcNow()))
-            await ResumeExpiredAsync(agent, state, ct).ConfigureAwait(false);
+        if (_states.TryGetValue(key, out var state) && IsExpired(state, _time.GetUtcNow()))
+            await ResumeExpiredAsync(key, state, ct).ConfigureAwait(false);
     }
 
-    private async Task ResumeExpiredAsync(AgentKind agent, AgentPauseState observed, CancellationToken ct)
+    private async Task ResumeExpiredAsync(string key, AgentPauseState observed, CancellationToken ct)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (!_states.TryGetValue(agent, out var current))
+            if (!_states.TryGetValue(key, out var current))
                 return;
             if (!Equals(current, observed) || !IsExpired(current, _time.GetUtcNow()))
                 return;
 
-            _states.TryRemove(agent, out _);
-            await PersistRunningAsync(agent, _time.GetUtcNow(), ct).ConfigureAwait(false);
-            AuditLog.AgentPauseExpired(agent, current.PausedReason);
+            _states.TryRemove(key, out _);
+            await PersistRunningAsync(key, current.Agent, _time.GetUtcNow(), ct).ConfigureAwait(false);
+            AuditLog.AgentPauseExpired(current.Agent, current.PausedReason);
         }
         finally
         {
@@ -246,15 +255,15 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         NotifyPauseChanged();
     }
 
-    private async Task PersistRunningAsync(AgentKind agent, DateTimeOffset now, CancellationToken ct)
+    private async Task PersistRunningAsync(string key, AgentKind agent, DateTimeOffset now, CancellationToken ct)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             INSERT INTO agent_pause_state
-                (agent_kind, paused, paused_at, paused_reason, paused_by, expires_at, updated_at)
+                (pause_key, agent_kind, agent_instance_id, paused, paused_at, paused_reason, paused_by, expires_at, updated_at)
             VALUES
-                ($agent, 0, NULL, NULL, NULL, NULL, $updated_at)
-            ON CONFLICT(agent_kind) DO UPDATE SET
+                ($pause_key, $agent, NULL, 0, NULL, NULL, NULL, NULL, $updated_at)
+            ON CONFLICT(pause_key) DO UPDATE SET
                 paused        = 0,
                 paused_at     = NULL,
                 paused_reason = NULL,
@@ -262,6 +271,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                 expires_at    = NULL,
                 updated_at    = $updated_at;
             """;
+        cmd.Parameters.AddWithValue("$pause_key", key);
         cmd.Parameters.AddWithValue("$agent", agent.Value);
         cmd.Parameters.AddWithValue("$updated_at", now.ToString("O", CultureInfo.InvariantCulture));
         await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
@@ -272,14 +282,15 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
 
     private static AgentPauseState ReadState(SqliteDataReader reader)
     {
-        var agent = new AgentKind(reader.GetString(0));
-        var paused = reader.GetInt32(1) == 1;
-        var pausedAt = ReadDateTimeOffset(reader, 2);
-        var reason = reader.IsDBNull(3) ? null : reader.GetString(3);
-        var pausedBy = reader.IsDBNull(4) ? null : reader.GetString(4);
-        var expiresAt = ReadDateTimeOffset(reader, 5);
-        var updatedAt = ReadDateTimeOffset(reader, 6) ?? DateTimeOffset.MinValue;
-        return new AgentPauseState(agent, paused, pausedAt, reason, pausedBy, expiresAt, updatedAt);
+        var agent = new AgentKind(reader.GetString(1));
+        var instance = reader.IsDBNull(2) ? null : reader.GetString(2);
+        var paused = reader.GetInt32(3) == 1;
+        var pausedAt = ReadDateTimeOffset(reader, 4);
+        var reason = reader.IsDBNull(5) ? null : reader.GetString(5);
+        var pausedBy = reader.IsDBNull(6) ? null : reader.GetString(6);
+        var expiresAt = ReadDateTimeOffset(reader, 7);
+        var updatedAt = ReadDateTimeOffset(reader, 8) ?? DateTimeOffset.MinValue;
+        return new AgentPauseState(agent, paused, pausedAt, reason, pausedBy, expiresAt, updatedAt, instance);
     }
 
     private static DateTimeOffset? ReadDateTimeOffset(SqliteDataReader reader, int ordinal) =>
@@ -289,7 +300,9 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
 
     private static void BindState(SqliteCommand cmd, AgentPauseState state)
     {
+        cmd.Parameters.AddWithValue("$pause_key", PauseKey(state.Agent, state.AgentInstanceId));
         cmd.Parameters.AddWithValue("$agent", state.Agent.Value);
+        cmd.Parameters.AddWithValue("$instance", state.AgentInstanceId ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$paused_at",
             state.PausedAt?.ToString("O", CultureInfo.InvariantCulture) ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$reason", state.PausedReason ?? (object)DBNull.Value);
@@ -297,6 +310,86 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         cmd.Parameters.AddWithValue("$expires_at",
             state.ExpiresAt?.ToString("O", CultureInfo.InvariantCulture) ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$updated_at", state.UpdatedAt.ToString("O", CultureInfo.InvariantCulture));
+    }
+
+    private void EnsureSchema()
+    {
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS agent_pause_state (
+                    pause_key         TEXT PRIMARY KEY,
+                    agent_kind        TEXT NOT NULL,
+                    agent_instance_id TEXT,
+                    paused            INTEGER NOT NULL DEFAULT 0,
+                    paused_at         TEXT,
+                    paused_reason     TEXT,
+                    paused_by         TEXT,
+                    expires_at        TEXT,
+                    updated_at        TEXT NOT NULL
+                );
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
+        if (!HasColumn("agent_pause_state", "pause_key"))
+            MigrateLegacySchema();
+
+        using var index = _conn.CreateCommand();
+        index.CommandText = """
+            CREATE INDEX IF NOT EXISTS idx_agent_pause_kind
+                ON agent_pause_state(agent_kind);
+            """;
+        index.ExecuteNonQuery();
+    }
+
+    private bool HasColumn(string table, string column)
+    {
+        using var cmd = _conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- table name is a hardcoded migration helper input
+        cmd.CommandText = $"PRAGMA table_info({table});";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private void MigrateLegacySchema()
+    {
+        using var migrate = _conn.CreateCommand();
+        migrate.CommandText = """
+            ALTER TABLE agent_pause_state RENAME TO agent_pause_state_legacy;
+            CREATE TABLE agent_pause_state (
+                pause_key         TEXT PRIMARY KEY,
+                agent_kind        TEXT NOT NULL,
+                agent_instance_id TEXT,
+                paused            INTEGER NOT NULL DEFAULT 0,
+                paused_at         TEXT,
+                paused_reason     TEXT,
+                paused_by         TEXT,
+                expires_at        TEXT,
+                updated_at        TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO agent_pause_state
+                (pause_key, agent_kind, agent_instance_id, paused, paused_at, paused_reason, paused_by, expires_at, updated_at)
+            SELECT agent_kind, agent_kind, NULL, paused, paused_at, paused_reason, paused_by, expires_at, updated_at
+            FROM agent_pause_state_legacy;
+            DROP TABLE agent_pause_state_legacy;
+            """;
+        migrate.ExecuteNonQuery();
+    }
+
+    private static string PauseKey(AgentKind agent, string? agentInstanceId)
+        => AgentInstanceIds.RouteKey(agent, agentInstanceId);
+
+    private static string? InstanceStateId(AgentKind agent, string? agentInstanceId)
+    {
+        var key = PauseKey(agent, agentInstanceId);
+        return string.Equals(key, agent.Value, StringComparison.OrdinalIgnoreCase) ? null : key;
     }
 
     private void NotifyPauseChanged()

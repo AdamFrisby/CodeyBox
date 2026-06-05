@@ -386,6 +386,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
             _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
             _quotaRouterOptions.ColdStartFitInWindow = src.ColdStartFitInWindow;
+            _quotaRouterOptions.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -829,6 +830,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.ObservedFailureRetentionMinutes,
                 opts.CapRetryIntervalSeconds,
                 opts.ColdStartFitInWindow,
+                IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);
 

@@ -122,9 +122,12 @@ The operator CLI also exposes per-agent runtime pause controls:
 
 ```bash
 codeybox agents pause claude --reason "reserve quota for oversight" --for 6h
+codeybox agents pause claude/acct-a --reason "account flagged today"
 codeybox agents resume claude
+codeybox agents resume claude/acct-a
 codeybox agents paused --json
 ```
 
 `--for` accepts `s`, `m`, `h`, or `d` suffixes. Pausing affects new dispatch
-only; in-flight runs continue.
+only; in-flight runs continue. A route key such as `claude/acct-a` pauses only
+that pooled subscription instance.

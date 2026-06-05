@@ -2063,6 +2063,64 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterIntraKindRoutingPolicyPropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                IntraKindRoutingPolicy = IntraKindRoutingPolicy.MostQuotaFirst,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = new QuotaRouterOptions
+        {
+            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
+            IntraKindRoutingPolicy = initial.QuotaRouter.IntraKindRoutingPolicy,
+        };
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        Assert.Equal(IntraKindRoutingPolicy.MostQuotaFirst, qro.IntraKindRoutingPolicy);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                IntraKindRoutingPolicy = IntraKindRoutingPolicy.RoundRobin,
+            },
+        });
+        Assert.Equal(IntraKindRoutingPolicy.RoundRobin, qro.IntraKindRoutingPolicy);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                IntraKindRoutingPolicy = IntraKindRoutingPolicy.Sticky,
+            },
+        });
+        Assert.Equal(IntraKindRoutingPolicy.Sticky, qro.IntraKindRoutingPolicy);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_PipelineTuningPushesNewFieldsToSnapshot()
     {
         var initial = new CodeyBoxOptions
