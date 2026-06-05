@@ -107,6 +107,27 @@ non-zero on findings.
 
 Capability: `None`.
 
+### `process:build-script`
+
+Runs `./build.sh` from the work-branch repository root in the credential-free
+audit-tool sandbox. The project owns the script contents and decides whether it
+compiles only or compiles plus tests.
+
+Behavior:
+
+- `build.sh` absent: skipped by default with no findings.
+- `build.sh` absent and `Audit.BuildScriptRequired=true`: blocking
+  `build.sh missing` finding.
+- `build.sh` exits `0`: pass, with stdout/stderr captured in the audit report.
+- `build.sh` exits non-zero: blocking `build failed` finding with captured
+  stdout/stderr attached.
+- `build.sh` cannot execute, exits `126`/`127`, or exceeds
+  `CodeyBox:BuildScriptAudit:TimeoutSeconds`: the work item fails as
+  infrastructure (`could-not-verify`), not as a code finding, and audit does
+  not pass by default.
+
+Capability: `None`.
+
 ### Built-in audit-type presets
 
 CodeyBox ships these audit-type presets as YAML resources (see `docs/audit-types.md`):

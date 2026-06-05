@@ -385,6 +385,12 @@ public sealed record ProjectAudit
     // Project config overrides this when set.
     public TimeSpan PerIterationTimeout { get; init; } = TimeSpan.FromMinutes(120);
     public bool StopOnFirstFailure { get; init; }
+    /// <summary>
+    /// When true, <c>process:build-script</c> treats a missing repo-root
+    /// <c>build.sh</c> as a blocking audit finding. Default false keeps the
+    /// language-agnostic build gate opt-in by script presence.
+    /// </summary>
+    public bool BuildScriptRequired { get; init; }
 
     /// <summary>
     /// Minutes of zero CPU + zero TCP-connection activity before an agent is

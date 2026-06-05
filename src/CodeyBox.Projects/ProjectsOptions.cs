@@ -133,6 +133,11 @@ public sealed class ProjectAuditConfig
     public string? FailingSeverity { get; set; }
     public int? PerIterationTimeoutMinutes { get; set; }
     public bool? StopOnFirstFailure { get; set; }
+    /// <summary>
+    /// Require a repo-root build.sh during audit. Null inherits; false keeps
+    /// the build-script auditor skip-if-absent.
+    /// </summary>
+    public bool? BuildScriptRequired { get; set; }
 
     /// <summary>
     /// Minutes of zero activity before stuck detection fires.

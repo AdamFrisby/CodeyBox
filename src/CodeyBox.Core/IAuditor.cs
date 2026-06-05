@@ -106,7 +106,13 @@ public sealed record AuditContext(
     /// Warning finding in that case so the missing row is visible to operators
     /// rather than silently disabling the check.
     /// </summary>
-    int? PromptRevisionAtDispatch = null);
+    int? PromptRevisionAtDispatch = null,
+    /// <summary>
+    /// Project-level policy for <c>process:build-script</c>. When false, a
+    /// missing repo-root <c>build.sh</c> makes that auditor skip. When true,
+    /// a missing script is a blocking audit finding.
+    /// </summary>
+    bool BuildScriptRequired = false);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(

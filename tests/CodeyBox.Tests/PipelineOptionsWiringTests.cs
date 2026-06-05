@@ -1,4 +1,5 @@
 using CodeyBox.Api;
+using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
@@ -104,6 +105,21 @@ public sealed class PipelineOptionsWiringTests
         var options = factory.Services.GetRequiredService<PipelineOptions>();
 
         Assert.Equal(TimeSpan.FromSeconds(60), options.RequiredBuildVerificationTimeout);
+    }
+
+    [Fact]
+    public void ProgramBindsBuildScriptAuditTimeoutOptions()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:BuildScriptAudit:TimeoutSeconds"] = "1200",
+        });
+
+        var options = factory.Services
+            .GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>()
+            .CurrentValue;
+
+        Assert.Equal(1200, options.TimeoutSeconds);
     }
 
     private sealed class PipelineOptionsWiringFactory : WebApplicationFactory<Program>

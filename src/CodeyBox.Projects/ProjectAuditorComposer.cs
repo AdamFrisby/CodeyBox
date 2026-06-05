@@ -101,6 +101,15 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor("gui:smoke", auditors, prepend: true);
         }
 
+        // Always include the language-agnostic build-script auditor. It is a
+        // credential-free tool auditor that no-ops unless the branch carries a
+        // repo-root build.sh or the project requires one.
+        if (!auditors.Any(a => a.Name.Equals(
+                BuildScriptAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor(BuildScriptAuditor.AuditorName, auditors, prepend: false);
+        }
+
         // Always include the deterministic prompt-revision trailer auditor.
         // It is cheap (single git log -1), requires no agent credentials, and
         // enforces the cross-iteration invariant that the agent's HEAD commit

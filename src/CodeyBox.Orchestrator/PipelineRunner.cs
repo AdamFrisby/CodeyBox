@@ -1273,6 +1273,11 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
+        catch (BuildScriptAuditUnavailableException ex)
+        {
+            _log.LogWarning(ex, "Work item {Id} could not verify build.sh audit gate", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
         catch (AuditHistoryLoadFailedException ex)
         {
             _log.LogWarning(ex, "Work item {Id} could not load persisted audit history", item.Id);
@@ -3911,7 +3916,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 var revisionForCtx = await TryLookupIterationRevisionAsync(item.Id, iteration, ct);
                 var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
                     ModelId: item.ModelId, ReasoningMode: item.ReasoningMode,
-                    PromptRevisionAtDispatch: revisionForCtx);
+                    PromptRevisionAtDispatch: revisionForCtx,
+                    BuildScriptRequired: project.Audit.BuildScriptRequired);
                 var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)

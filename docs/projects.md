@@ -274,8 +274,36 @@ For per-auditor control (e.g. security on Claude, completeness on Gemini):
   work agent — no crash, no failed work items.
 
 Tool auditors (`security:gitleaks`, `python:test-pass`, `csharp:build-WaE`,
-etc.) are never
-affected by these settings — they do not invoke an LLM.
+`process:build-script`, etc.) are never affected by these settings — they do
+not invoke an LLM.
+
+### Build-script audit gate
+
+`process:build-script` is always available as a credential-free tool auditor.
+It looks for a repo-root `build.sh` on the work branch. When the script is
+absent, the default behavior is skip-if-absent so existing projects are
+unchanged. When present, CodeyBox runs `./build.sh` in the audit-tool sandbox
+with the configured timeout; exit `0` passes and any other build exit becomes a
+blocking `build failed` finding with stdout/stderr captured.
+
+Set `Audit.BuildScriptRequired=true` for projects that must provide the script:
+
+```json
+{
+  "Projects": [
+    {
+      "Id": "my-app",
+      "Audit": {
+        "BuildScriptRequired": true
+      }
+    }
+  ]
+}
+```
+
+`build.sh` execution failures are distinct from build failures. If the script
+cannot execute, exits `126`/`127`, or times out, the item fails/defer-surfaces as
+`could-not-verify` infrastructure rather than a source-code audit finding.
 
 See [`docs/audit.md`](audit.md) for the full cross-review documentation
 including trade-offs, observability events, and quota fallthrough behaviour.
