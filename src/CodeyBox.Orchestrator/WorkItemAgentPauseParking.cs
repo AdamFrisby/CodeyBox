@@ -26,6 +26,10 @@ internal static class WorkItemAgentPauseParking
             ? AgentPauseResumeMapper.RetryFromForState(current.State)
             : AgentPauseResumeMapper.NormalizeRetryFrom(retryFrom);
         var target = pausedAgent ?? current.AgentPauseTarget;
+        // Stamp the resume entry-point on the dedicated agent_pause_retry_from
+        // column rather than overloading quota_retry_from: agent-pause parking
+        // is not quota recovery, and the WorkItemDto / scheduler boundary keeps
+        // the two deferral mechanisms cleanly separated.
         var next = current.With(
             WorkItemState.WaitingForAgentResume,
             $"waiting: agent paused: {normalizedReason}") with
@@ -33,7 +37,8 @@ internal static class WorkItemAgentPauseParking
             FailureKind = null,
             QuotaResetAt = null,
             NextQuotaRetryAt = null,
-            QuotaRetryFrom = normalizedRetryFrom,
+            QuotaRetryFrom = null,
+            AgentPauseRetryFrom = normalizedRetryFrom,
             StartedAt = null,
             AgentPauseTarget = target,
         };

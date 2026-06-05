@@ -138,6 +138,20 @@ public sealed record WorkItem
     public AgentKind? AgentPauseTarget { get; init; }
 
     /// <summary>
+    /// Pipeline entry point the agent-pause resume scheduler should use when
+    /// the paused agent is resumed (or its pause expires). Same value set as
+    /// <see cref="QuotaRetryFrom"/> ("work", "audit", "conflict_rework",
+    /// "merge", or "upstream") but tracked separately so agent-pause parking
+    /// does not have to overload quota-recovery plumbing on
+    /// <see cref="WorkItemState.WaitingForAgentResume"/> rows. Null until an
+    /// item is parked for agent resume; cleared when the item leaves
+    /// <see cref="WorkItemState.WaitingForAgentResume"/>. Legacy rows that
+    /// were parked before this field was introduced fall back to
+    /// <see cref="QuotaRetryFrom"/> on resume.
+    /// </summary>
+    public string? AgentPauseRetryFrom { get; init; }
+
+    /// <summary>
     /// Why the item was cancelled. Only populated when <see cref="State"/> is
     /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
     /// legacy rows written before this column existed.
@@ -510,6 +524,7 @@ public sealed record WorkItem
             NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
             QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
+            AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             // CancellationSource is preserved on Failed (so triage shows what cancelled the

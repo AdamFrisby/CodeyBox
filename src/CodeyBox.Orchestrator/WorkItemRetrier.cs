@@ -277,7 +277,12 @@ public sealed class WorkItemRetrier
         if (item.State != WorkItemState.WaitingForAgentResume)
             return new AgentPauseResumeOutcome(false, $"work item is in state {item.State}", null, "work");
 
-        var retryFrom = AgentPauseResumeMapper.NormalizeRetryFrom(item.QuotaRetryFrom);
+        // Prefer the dedicated agent-pause column; fall back to the legacy
+        // quota_retry_from value for rows parked before agent_pause_retry_from
+        // existed so legacy WaitingForAgentResume rows keep resuming at the
+        // correct phase boundary.
+        var retryFrom = AgentPauseResumeMapper.NormalizeRetryFrom(
+            item.AgentPauseRetryFrom ?? item.QuotaRetryFrom);
         var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
         var resumed = item.With(resumeState, error: null) with
         {
@@ -285,6 +290,7 @@ public sealed class WorkItemRetrier
             QuotaResetAt = null,
             NextQuotaRetryAt = null,
             QuotaRetryFrom = null,
+            AgentPauseRetryFrom = null,
             StartedAt = null,
         };
 

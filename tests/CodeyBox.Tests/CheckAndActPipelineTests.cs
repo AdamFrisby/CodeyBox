@@ -916,7 +916,8 @@ public sealed class CheckAndActPipelineTests : IDisposable
 
         var parked = await tp.Store.GetAsync(followup.Id);
         Assert.Equal(WorkItemState.WaitingForAgentResume, parked!.State);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("audit", parked.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
         Assert.Contains("paused by operator", parked.LastError);
         Assert.Equal(checkInvocationsBefore, tp.Agent.CheckInvocations.Count);
         Assert.Single(tp.Agent.CheckPlan);

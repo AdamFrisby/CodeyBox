@@ -136,8 +136,13 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
-    public async Task Router_MixedPausedAndQuotaBlockedMembers_WaitsForAgentResume()
+    public async Task Router_MixedPausedAndQuotaBlockedMembers_ParksOnQuotaNotPausedAgent()
     {
+        // Paused codex + quota-blocked claude: park on the quota-recovery
+        // channel so QuotaRetryScheduler wakes the item when claude's quota
+        // refills, instead of stranding it behind the paused codex until the
+        // operator resumes. Paused agents stay visible in the decision so
+        // dashboards/logs still surface the pause.
         using var pauses = MakeController();
         await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
         var router = BuildRouter(pauses,
@@ -159,8 +164,9 @@ public sealed class AgentPauseTests : IDisposable
         var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
 
         Assert.True(decision.ShouldWait);
-        Assert.True(decision.WaitingForPausedAgent);
-        Assert.Contains("paused by operator", decision.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.False(decision.WaitingForPausedAgent);
+        Assert.Contains("below the effective quota floor", decision.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("paused", decision.Reason, StringComparison.OrdinalIgnoreCase);
         Assert.Equal([AgentKind.Codex], decision.PausedAgents);
     }
 
@@ -245,7 +251,8 @@ public sealed class AgentPauseTests : IDisposable
         var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
         Assert.NotNull(parked);
         Assert.False(pipeline.Entered);
-        Assert.Equal("work", parked!.QuotaRetryFrom);
+        Assert.Equal("work", parked!.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
 
         await svc.StopAsync(CancellationToken.None);
         await pauses.ResumeAsync(AgentKind.Claude, "test");
@@ -256,6 +263,7 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(1, retried);
         var resumed = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, resumed!.State);
+        Assert.Null(resumed.AgentPauseRetryFrom);
         Assert.Null(resumed.QuotaRetryFrom);
         Assert.True(queue.Count >= 1);
     }
@@ -378,7 +386,8 @@ public sealed class AgentPauseTests : IDisposable
         var parked = await WaitForStateAsync(store, item.Id, WorkItemState.WaitingForAgentResume);
         Assert.NotNull(parked);
         Assert.False(pipeline.Entered);
-        Assert.Equal("work", parked!.QuotaRetryFrom);
+        Assert.Equal("work", parked!.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
         await svc.StopAsync(CancellationToken.None);
     }
 
@@ -621,6 +630,244 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(WorkItemState.Failed, failed!.State);
         Assert.Equal("configuration", failed.FailureKind);
         Assert.Contains("unsupported agentControl action", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_BlankPersistedAgent_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = "   ",
+                Reason = "reserve quota",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agentControl.agent is required", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlResumeItem_PersistedControlCharacterReason_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Resume,
+                Agent = AgentKind.Claude.Value,
+                Reason = "bad\x01reason",
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agentControl.reason", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_NonPositivePersistedDuration_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+                DurationSeconds = -3600,
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("durationSeconds must be positive", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_DurationAndExpiresAtBothSet_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+                DurationSeconds = 3600,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(2),
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("provide either durationSeconds or expiresAt", failed.LastError);
+    }
+
+    [Fact]
+    public async Task Worker_AgentControlPauseItem_PastExpiresAt_FailsConfiguration()
+    {
+        using var pauses = MakeController();
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var webhooks = new CapturingWebhookDispatcher();
+        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(-1),
+            },
+        };
+        await store.CreateAsync(item);
+
+        await pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("configuration", failed.FailureKind);
+        Assert.Contains("agentControl.expiresAt must be in the future", failed.LastError);
+    }
+
+    [Fact]
+    public async Task SqliteStore_MalformedAgentControlJson_HydratesAsNullSpec()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var item = Item(classId: null) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+            },
+        };
+        await store.CreateAsync(item);
+
+        // Simulate corruption — overwrite the agent_control_json column with
+        // invalid JSON. ReadAgentControlSpec must swallow the JsonException and
+        // return null rather than stranding the row.
+        await CorruptAgentControlJsonAsync(_dbPath, item.Id, "{not json");
+
+        var hydrated = await store.GetAsync(item.Id);
+        Assert.NotNull(hydrated);
+        Assert.Null(hydrated!.AgentControl);
+    }
+
+    private static async Task CorruptAgentControlJsonAsync(
+        string dbPath, WorkItemId id, string raw)
+    {
+        await using var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+            $"Data Source={dbPath}");
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE work_items SET agent_control_json = $j WHERE id = $i;";
+        cmd.Parameters.AddWithValue("$j", raw);
+        cmd.Parameters.AddWithValue("$i", id.ToString());
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task AgentClassRouter_CheckReadinessAsync_PausedOnly_ReturnsUnavailable()
+    {
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Claude, "operator reserve", "test");
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members = [Member(AgentKind.Claude)],
+            });
+
+        var capacity = new AlwaysHasCapacitySnapshot();
+        var readiness = await router.CheckReadinessAsync(
+            Item("frontier"), null, capacity, CancellationToken.None);
+
+        Assert.Equal(AgentRoutingReadinessState.Unavailable, readiness.State);
+        Assert.NotNull(readiness.Reason);
+        Assert.Contains("paused by operator", readiness.Reason!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class AlwaysHasCapacitySnapshot : IAgentCapacitySnapshot
+    {
+        public bool HasCapacity(AgentKind agent) => true;
+    }
+
+    [Fact]
+    public async Task Router_MixedPausedAndQuotaBlocked_DoesNotWaitForPausedAgent_AndPauseStillSurfaces()
+    {
+        // Acceptance: when one member is paused and another is quota-blocked,
+        // the router must NOT park as WaitingForAgentResume — that would
+        // strand the item behind the operator pause when the unpaused peer
+        // could recover via the standard quota retry path. The paused agent
+        // still surfaces in PausedAgents/Reason for dashboard visibility.
+        using var pauses = MakeController();
+        await pauses.PauseAsync(AgentKind.Codex, "operator reserve", "test");
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members =
+                [
+                    Member(AgentKind.Codex),
+                    Member(AgentKind.Claude),
+                ],
+            },
+            [
+                new FakeProbe(AgentKind.Codex, 100.0),
+                new FakeProbe(AgentKind.Claude, 0.0),
+            ]);
+
+        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+
+        Assert.True(decision.ShouldWait);
+        Assert.False(decision.WaitingForPausedAgent);
+        Assert.Equal([AgentKind.Codex], decision.PausedAgents);
     }
 
     [Fact]

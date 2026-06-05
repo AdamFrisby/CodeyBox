@@ -298,8 +298,24 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 ct).ConfigureAwait(false);
         }
 
+        var ownership = current.ToDictionary(s => s.Agent, s => s.PausedBy);
         foreach (var (agent, (reason, expiresAt)) in desired)
         {
+            if (ownership.TryGetValue(agent, out var pausedBy)
+                && !string.Equals(pausedBy, ConfigPausedBy, StringComparison.OrdinalIgnoreCase))
+            {
+                // A runtime owner (API / work-item / operator CLI) already holds
+                // this agent's pause row. The config block is "config-owned-only"
+                // and must NOT take over the row — otherwise removing the config
+                // entry later would resume an agent the runtime never asked to
+                // unpause. The runtime pause remains authoritative; the config
+                // intent is ignored for as long as the runtime pause stands.
+                _log.LogInformation(
+                    "Skipping configured pause for {Agent}: runtime pause already owned by '{Owner}'",
+                    agent.Value, pausedBy ?? "(unknown)");
+                continue;
+            }
+
             await _pauses.PauseAsync(
                 agent,
                 reason,

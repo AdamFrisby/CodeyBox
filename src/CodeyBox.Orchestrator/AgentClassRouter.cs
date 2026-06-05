@@ -635,11 +635,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
                 ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
-            var allPaused = pausedRejected.Count == sorted.Count;
-            var reason = allPaused
-                ? $"all eligible members of class '{classId}' are paused by operator: "
-                : $"at least one eligible member of class '{classId}' is paused by operator while all others are blocked: ";
-            reason += string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"));
+            var reason = $"all eligible members of class '{classId}' are paused by operator: "
+                + string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"));
             return new AgentRoutingDecision
             {
                 ShouldWait = true,
@@ -653,6 +650,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             };
         }
 
+        // Only park on agent-resume when EVERY eligible member is paused. When
+        // at least one non-paused member has a recoverable blocker (quota,
+        // cap, budget, smoke), the item must park on that recovery channel
+        // instead — AgentPauseRetryScheduler only wakes WaitingForAgentResume
+        // rows, so parking on the paused agent would strand the item until
+        // the operator unpauses even when the unpaused peer recovers first.
         if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
             return BuildPausedWaitDecision();
 
@@ -669,8 +672,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         //  - smoke-excluded: cleared by the in-VM smoke sweep / operator
         //    reset, NOT by quota recovery — don't misreport it as quota.
         //  - quota-below-floor: clears when the quota window resets.
-        if (pausedRejected.Count > 0 && hasSubscription)
-            return BuildPausedWaitDecision();
+        //  - mixed (paused + recoverable): park on the recoverable blocker;
+        //    the operator pause is logged in the reason but does not change
+        //    the wake channel — see BuildPausedWaitDecision's invariant.
+        string? pausedSuffix = pausedRejected.Count > 0
+            ? "; paused (not the wake channel): "
+                + string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"))
+            : null;
 
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
@@ -713,6 +721,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                          $"(ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%)";
                 suggested = _opts.QuotaRecheckInterval;
             }
+            if (pausedSuffix is not null)
+                reason += pausedSuffix;
             if (commitDispatchSideEffects)
                 AuditLog.QuotaRouterWaiting(classId, item.Id, suggested);
             return new AgentRoutingDecision
@@ -722,6 +732,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 AnyMemberAtCap = capBlocked,
                 AtCapAgents = atCapAgents,
                 Reason = reason,
+                PausedAgents = pausedRejected
+                    .Select(p => p.Agent)
+                    .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
             };
         }
 
@@ -767,9 +781,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             };
         }
 
-        if (pausedRejected.Count > 0)
-            return BuildPausedWaitDecision();
-
         // Build the park interval from whichever blocker is the soonest to clear.
         // budget-reset is typically minutes-to-hours; cap-retry is seconds. Both
         // can be active simultaneously (some PayPerApi members budget-exhausted,
@@ -798,6 +809,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
         else
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted";
+        if (pausedSuffix is not null)
+            parkReason += pausedSuffix;
         if (commitDispatchSideEffects)
         {
             _log.LogInformation(
@@ -813,6 +826,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             AnyMemberAtCap = fallbackCapBlocked,
             AtCapAgents = atCapAgents,
             Reason = parkReason,
+            PausedAgents = pausedRejected
+                .Select(p => p.Agent)
+                .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
         };
     }
 

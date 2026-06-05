@@ -352,7 +352,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         var parked = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.WaitingForAgentResume, parked!.State);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("audit", parked.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
         Assert.Contains("waiting: agent paused", parked.LastError);
     }
 

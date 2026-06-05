@@ -160,6 +160,150 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task AgentPausesStartup_AppliesConfiguredPauses()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            AgentPauses = new Dictionary<string, AgentPauseConfig>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = new() { Paused = true, Reason = "reserve quota at boot" },
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-startup-pauses-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            dbPath,
+            NullLogger<SqliteAgentPauseController>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pauses: pauses);
+        try
+        {
+            await coordinator.StartAsync(CancellationToken.None);
+
+            var state = await pauses.GetAgentStateAsync(Claude);
+            Assert.NotNull(state);
+            Assert.Equal("reserve quota at boot", state!.PausedReason);
+            Assert.Equal("config", state.PausedBy);
+        }
+        finally
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AgentPausesHotReload_PausedFalseEntry_DoesNotPauseAgent()
+    {
+        var initial = new CodeyBoxOptions();
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-off-entry-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            dbPath,
+            NullLogger<SqliteAgentPauseController>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pauses: pauses);
+        try
+        {
+            await coordinator.StartAsync(CancellationToken.None);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                AgentPauses = new Dictionary<string, AgentPauseConfig>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["claude"] = new() { Paused = false },
+                },
+            });
+
+            Assert.Null(await pauses.GetAgentStateAsync(Claude));
+        }
+        finally
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AgentPausesHotReload_DoesNotOverwriteExistingRuntimePause()
+    {
+        var initial = new CodeyBoxOptions();
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-runtime-takeover-{Guid.NewGuid():N}.db");
+        using var pauses = new SqliteAgentPauseController(
+            dbPath,
+            NullLogger<SqliteAgentPauseController>.Instance);
+
+        await pauses.PauseAsync(Claude, "api pause", "api");
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            pauses: pauses);
+        try
+        {
+            await coordinator.StartAsync(CancellationToken.None);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                AgentPauses = new Dictionary<string, AgentPauseConfig>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["claude"] = new() { Paused = true, Reason = "config wants to pause too" },
+                },
+            });
+
+            var state = await pauses.GetAgentStateAsync(Claude);
+            Assert.NotNull(state);
+            Assert.Equal("api", state!.PausedBy);
+            Assert.Equal("api pause", state.PausedReason);
+
+            // Removing the config entry must NOT resume the still-active runtime pause.
+            monitor.Fire(new CodeyBoxOptions());
+            var after = await pauses.GetAgentStateAsync(Claude);
+            Assert.NotNull(after);
+            Assert.Equal("api", after!.PausedBy);
+        }
+        finally
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SmokeHotReload_ReEnableRunsMissingProbeCoverage()
     {
         var initial = new CodeyBoxOptions
