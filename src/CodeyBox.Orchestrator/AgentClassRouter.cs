@@ -61,7 +61,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // Keyed by (agent kind, model id ?? ""); value is the UTC instant at which
     // the suppression expires. Survives only the current process lifetime —
     // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), DateTimeOffset> _exhausted
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), ExhaustionEntry> _exhausted
         = new();
 
     // Last quota-availability percentage observed per (agent, model) during
@@ -71,12 +71,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // determine availability). Updated on every ProbeAsync result.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
         = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), EffectiveQuota> _lastEffectiveQuota
+        = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), bool> _lastQuotaUsable
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
         = new();
 
     private sealed record QuotaRetryAdmission(AgentKind Agent, string ModelId, DateTimeOffset ExpiresAt);
+    private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
 
     /// <summary>
     /// Raised when a routing probe observes an eligible member move from below
@@ -399,6 +402,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // claim a quota threshold.
         var subscriptionTotal = sorted.Count(x => x.Member.Billing == AgentBilling.Subscription);
         var subscriptionSmokeExcluded = 0;
+        var subscriptionExhaustionCacheExcluded = 0;
+        DateTimeOffset? earliestExhaustionCacheExpiry = null;
         // Every member the availability gate benched (in-VM smoke / fast-fail /
         // missing-probe), regardless of billing. The PayPerApi-only fallback below
         // must never fire one of these: a smoke bench means the binary is broken,
@@ -454,9 +459,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // from an older in-process exhaustion cache entry.
             if (!bypassInProcessExhaustion
                 && !quotaRetryAdmissionMatches
-                && IsExhausted(member, nowUtc))
+                && TryGetExhaustedUntil(member, nowUtc, out var exhaustedUntil))
             {
-                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, "in-process exhaustion cache"));
+                var reason = $"in-process exhaustion cache until {exhaustedUntil:O}";
+                if (commitDispatchSideEffects)
+                    LogMemberExcluded(item.Id, member, reason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
+                if (member.Billing == AgentBilling.Subscription)
+                {
+                    subscriptionExhaustionCacheExcluded++;
+                    if (earliestExhaustionCacheExpiry is null || exhaustedUntil < earliestExhaustionCacheExpiry.Value)
+                        earliestExhaustionCacheExpiry = exhaustedUntil;
+                }
                 continue;
             }
             // Smoke gate / fast-fail circuit breaker excluded this agent? Skip
@@ -565,6 +579,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (commitDispatchSideEffects)
                 AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
+            var knownQuotaUsable = KnownQuotaMeetsFloor(member, quota, nowUtc);
+            RefreshExhaustionFromProbe(member, quota, knownQuotaUsable, nowUtc);
+
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
             if (commitDispatchSideEffects)
                 RecordAvailabilityAndMaybeNotify(member, quota, gate);
@@ -627,6 +644,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             if (quotaRetryAdmissionMatches)
                 quotaRetryAdmissionDeniedAfterProbe = true;
+            if (commitDispatchSideEffects)
+                LogMemberExcluded(item.Id, member, gate.Reason);
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
@@ -697,6 +716,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 && r.RejectReason != "ranked lower"
                 && !r.RejectReason.StartsWith("per-agent cap:", StringComparison.Ordinal));
             var allSmokeExcluded = subscriptionTotal > 0 && subscriptionSmokeExcluded == subscriptionTotal;
+            var allExhaustionCacheExcluded = subscriptionTotal > 0 && subscriptionExhaustionCacheExcluded == subscriptionTotal;
             string reason;
             TimeSpan suggested;
             if (capBlocked && hasNonCapRejection)
@@ -713,6 +733,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             {
                 reason = $"all subscription members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
                          + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+                suggested = _opts.QuotaRecheckInterval;
+            }
+            else if (allExhaustionCacheExcluded)
+            {
+                var expiry = earliestExhaustionCacheExpiry is { } e ? $" earliest cache expiry {e:O};" : "";
+                reason = $"all subscription members of class '{classId}' are suppressed by the in-process exhaustion cache;{expiry} "
+                         + "quota retry recheck will probe current availability";
                 suggested = _opts.QuotaRecheckInterval;
             }
             else
@@ -974,15 +1001,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var target = smokeTarget ?? ResolveWorkSmokeTarget(project, item.BaselineImageRef);
 
         var nowUtc = _time.GetUtcNow();
-        // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
-        // across long-running processes. TryRemove(KeyValuePair) only removes when
-        // the value still matches what we observed — a concurrent MarkExhausted that
-        // refreshed the expiry between the read and the remove is preserved.
-        foreach (var key in _exhausted.Keys.ToList())
-        {
-            if (_exhausted.TryGetValue(key, out var expiry) && expiry <= nowUtc)
-                _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), DateTimeOffset>(key, expiry));
-        }
+        PruneExpiredExhaustion(nowUtc);
 
         // Score + order the eligible, non-exhausted members first. Availability
         // (and the in-VM gate) is applied last, in score order, so we only probe
@@ -1079,19 +1098,114 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (ttl <= TimeSpan.Zero) return;
         var nowUtc = _time.GetUtcNow();
         var until = nowUtc + ttl;
-        // Cap by resetAt when known — including a past resetAt, which means
+        var key = ExhaustionKey(member);
+        var earliestKnownReset = resetAt;
+        if (_lastEffectiveQuota.TryGetValue(key, out var lastQuota)
+            && EarliestKnownWindowReset(lastQuota, nowUtc, futureOnly: true) is { } windowReset
+            && (earliestKnownReset is null || windowReset < earliestKnownReset.Value))
+        {
+            earliestKnownReset = windowReset;
+        }
+
+        // Cap by the earliest known reset — including a past resetAt, which means
         // the agent's own reset hint says we're already through the window.
-        if (resetAt is { } reset && reset < until)
+        if (earliestKnownReset is { } reset && reset < until)
             until = reset;
-        if (until <= nowUtc) return; // expired already; nothing to suppress
-        var key = (member.Agent, member.ModelId ?? string.Empty);
-        _exhausted.AddOrUpdate(key, until, (_, existing) => existing > until ? existing : until);
+        if (until <= nowUtc)
+        {
+            _exhausted.TryRemove(key, out _);
+            return;
+        }
+
+        var next = new ExhaustionEntry(until);
+        _exhausted.AddOrUpdate(key, next, (_, existing) =>
+            existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
+                ? next
+                : existing);
     }
 
     private bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
     {
-        var key = (member.Agent, member.ModelId ?? string.Empty);
-        return _exhausted.TryGetValue(key, out var expiry) && expiry > nowUtc;
+        return TryGetExhaustedUntil(member, nowUtc, out _);
+    }
+
+    private static (AgentKind Agent, string ModelId) ExhaustionKey(AgentMembership member) =>
+        (member.Agent, member.ModelId ?? string.Empty);
+
+    private bool TryGetExhaustedUntil(AgentMembership member, DateTimeOffset nowUtc, out DateTimeOffset expiresAt)
+    {
+        var key = ExhaustionKey(member);
+        if (!_exhausted.TryGetValue(key, out var entry))
+        {
+            expiresAt = default;
+            return false;
+        }
+
+        if (entry.ExpiresAt <= nowUtc)
+        {
+            _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), ExhaustionEntry>(key, entry));
+            expiresAt = default;
+            return false;
+        }
+
+        expiresAt = entry.ExpiresAt;
+        return true;
+    }
+
+    private void PruneExpiredExhaustion(DateTimeOffset nowUtc)
+    {
+        // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
+        // across long-running processes. TryRemove(KeyValuePair) only removes when
+        // the value still matches what we observed — a concurrent MarkExhausted that
+        // refreshed the expiry between the read and the remove is preserved.
+        foreach (var entry in _exhausted)
+        {
+            if (entry.Value.ExpiresAt <= nowUtc)
+                _exhausted.TryRemove(entry);
+        }
+    }
+
+    private void RefreshExhaustionFromProbe(
+        AgentMembership member,
+        EffectiveQuota quota,
+        bool knownQuotaUsable,
+        DateTimeOffset nowUtc)
+    {
+        var key = ExhaustionKey(member);
+        if (knownQuotaUsable)
+        {
+            if (_exhausted.TryRemove(key, out var removed))
+            {
+                _log.LogInformation(
+                    "Quota probe cleared in-process exhaustion for {Agent}/{Model}; previousExpiry={PreviousExpiry:O} available={Available:F1}%",
+                    member.Agent.Value,
+                    member.ModelId ?? "(default)",
+                    removed.ExpiresAt,
+                    quota.AvailablePct);
+            }
+            return;
+        }
+
+        if (!_exhausted.TryGetValue(key, out var existing))
+            return;
+
+        if (EarliestKnownWindowReset(quota, nowUtc, futureOnly: true) is not { } earliestReset)
+            return;
+
+        if (earliestReset >= existing.ExpiresAt)
+            return;
+
+        var shortened = new ExhaustionEntry(earliestReset);
+        if (_exhausted.TryUpdate(key, shortened, existing))
+        {
+            _log.LogInformation(
+                "Quota probe shortened in-process exhaustion for {Agent}/{Model}: previousExpiry={PreviousExpiry:O} nextExpiry={NextExpiry:O} available={Available:F1}%",
+                member.Agent.Value,
+                member.ModelId ?? "(default)",
+                existing.ExpiresAt,
+                shortened.ExpiresAt,
+                quota.AvailablePct);
+        }
     }
 
     private void RecordQuotaRetryAdmission(WorkItem item, AgentMembership member)
@@ -1176,6 +1290,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (classId is null) return null;
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
 
+        var nowUtc = _time.GetUtcNow();
         DateTimeOffset? earliest = null;
         foreach (var member in agentClass.Members)
         {
@@ -1210,10 +1325,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // independent of where in the ramp the member happens to be.
             if (quota.AvailablePct < 0) continue;
             if (quota.AvailablePct >= _opts.MinQuotaPct) continue;
-            if (quota.ResetAt is not { } resetAt) continue;
+            var resetAt = EarliestKnownWindowReset(quota, nowUtc, futureOnly: false);
+            if (resetAt is null) continue;
 
-            if (earliest is null || resetAt < earliest.Value)
-                earliest = resetAt;
+            if (earliest is null || resetAt.Value < earliest.Value)
+                earliest = resetAt.Value;
         }
         return earliest;
     }
@@ -1292,9 +1408,73 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         AgentMembership member,
         EffectiveQuota quota)
     {
-        var key = (member.Agent, member.ModelId ?? string.Empty);
+        var key = ExhaustionKey(member);
         _lastAvailablePct[key] = quota.AvailablePct;
+        _lastEffectiveQuota[key] = quota;
         return key;
+    }
+
+    private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)
+    {
+        var availablePct = quota.AvailablePct;
+        if (availablePct < 0)
+            return false;
+
+        var floor = member.Billing == AgentBilling.Subscription
+            ? ComputeEffectiveFloorPct(member.Agent, quota.ResetAt, nowUtc)
+            : _opts.MinQuotaPct;
+        if (availablePct < floor)
+            return false;
+
+        if (member.Billing == AgentBilling.Subscription
+            && quota.Windows is { Count: > 0 } windows)
+        {
+            foreach (var w in windows)
+            {
+                if (w.AvailablePct < 0) continue;
+                if (w.AvailablePct < ResolveWindowFloorPct(w.Name))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static DateTimeOffset? EarliestKnownWindowReset(
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        bool futureOnly)
+    {
+        DateTimeOffset? earliest = null;
+
+        void Consider(DateTimeOffset? resetAt)
+        {
+            if (resetAt is not { } reset)
+                return;
+            if (futureOnly && reset <= nowUtc)
+                return;
+            if (earliest is null || reset < earliest.Value)
+                earliest = reset;
+        }
+
+        Consider(quota.ResetAt);
+        if (quota.Windows is { Count: > 0 } windows)
+        {
+            foreach (var window in windows)
+                Consider(window.ResetAt);
+        }
+
+        return earliest;
+    }
+
+    private void LogMemberExcluded(WorkItemId itemId, AgentMembership member, string reason)
+    {
+        _log.LogInformation(
+            "Work item {Id}: excluded {Agent}/{Model}: {Reason}",
+            itemId,
+            member.Agent.Value,
+            member.ModelId ?? "(default)",
+            reason);
     }
 
     private void NotifyQuotaUsableThresholdCrossed()

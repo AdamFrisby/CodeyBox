@@ -24,6 +24,18 @@ public sealed class AgentClassRouterFallbackTests
             new QuotaRouterOptions { MinQuotaPct = 10.0 },
             NullLogger<AgentClassRouter>.Instance);
 
+    private static AgentClassRouter BuildWithOptions(
+        AgentClass cls,
+        QuotaRouterOptions options,
+        TimeProvider timeProvider,
+        params IAgentQuotaProbe[] probes) =>
+        new(
+            [cls],
+            probes,
+            options,
+            NullLogger<AgentClassRouter>.Instance,
+            timeProvider);
+
     private static AgentClass Frontier(params AgentMembership[] members) => new()
     {
         Id = "frontier",
@@ -137,5 +149,82 @@ public sealed class AgentClassRouterFallbackTests
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task ResolveQuotaRetry_RecoveredProbe_ClearsStaleInProcessExhaustion()
+    {
+        var member = Sub(Codex);
+        var cls = Frontier(member);
+        var router = Build(cls, new FakeProbe(Codex, 80.0));
+
+        router.MarkExhausted(member, TimeSpan.FromDays(10), resetAt: DateTimeOffset.UtcNow.AddDays(6));
+
+        var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Null(blocked.Chosen);
+        Assert.True(blocked.ShouldWait);
+
+        var retryDecision = await router.ResolveQuotaRetryAsync(Item(), project: null, CancellationToken.None);
+        Assert.False(retryDecision.ShouldWait);
+
+        // Use a fresh work item id so this cannot pass merely because
+        // ResolveQuotaRetryAsync recorded a one-item admission.
+        var nextRoute = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Equal(Codex, nextRoute.Chosen!.Agent);
+        Assert.False(nextRoute.ShouldWait);
+    }
+
+    [Fact]
+    public async Task MarkExhausted_UsesEarliestKnownWindowReset_WhenSoonerThanReportedReset()
+    {
+        var time = new ManualTimeProvider();
+        var now = time.GetUtcNow();
+        var shortReset = now.AddHours(5);
+        var longReset = now.AddDays(6);
+        var member = Sub(Codex);
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot
+        {
+            AvailablePct = 80.0,
+            ResetAt = longReset,
+            Windows =
+            [
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 80.0, ResetAt = shortReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 80.0, ResetAt = longReset },
+            ],
+        });
+        var router = BuildWithOptions(
+            Frontier(member),
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            time,
+            probe);
+
+        var initial = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Equal(Codex, initial.Chosen!.Agent);
+
+        router.MarkExhausted(member, TimeSpan.FromDays(10), resetAt: longReset);
+        var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Null(blocked.Chosen);
+        Assert.True(blocked.ShouldWait);
+
+        time.Advance(shortReset - now + TimeSpan.FromTicks(1));
+
+        var recovered = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.Equal(Codex, recovered.Chosen!.Agent);
+        Assert.False(recovered.ShouldWait);
+    }
+
+    private sealed class MutableSnapshotProbe : IAgentQuotaProbe
+    {
+        public MutableSnapshotProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
+        {
+            Kind = kind;
+            Snapshot = snapshot;
+        }
+
+        public AgentKind Kind { get; }
+        public AgentQuotaSnapshot Snapshot { get; set; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(Snapshot);
     }
 }
