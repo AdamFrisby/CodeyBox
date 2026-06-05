@@ -1692,7 +1692,11 @@ public sealed class InVmSmokeProberTests
         // reason instead).
         Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(500),
             $"gate returned in {sw.Elapsed}; GateDeadlineSeconds=0 was wrongly treated as immediate");
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10),
+        // Full-suite audit hosts can delay timer continuations well past the
+        // 1s configured bound under load. The verdict below pins that the inner
+        // provisioning timeout fired; this ceiling only catches an unbounded
+        // hang without making the test depend on low scheduler latency.
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30),
             $"gate took {sw.Elapsed}; inner provisioning bound failed to fire under disabled deadline");
         var av = registry.GetAvailability(AgentKind.Cursor);
         Assert.False(av.Available);

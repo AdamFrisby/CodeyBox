@@ -12,6 +12,10 @@ namespace CodeyBox.Agents.Codex;
 /// 1. JSON output (codex exec --json): looks for {"usage":{"input_tokens":N,"cached_input_tokens":C,"output_tokens":M}}
 ///    and the OpenAI usage shape {"usage":{"prompt_tokens":N,"prompt_tokens_details":{"cached_tokens":C},"completion_tokens":M}}.
 /// 2. Human-readable patterns: "Usage: N input, M output tokens".
+///
+/// <see cref="AgentCostSnapshot.InputTokens"/> is the total input bucket; cached
+/// input is recorded separately so the shared calculator can derive fresh input
+/// uniformly across providers.
 /// </summary>
 public sealed class CodexCostExtractor : IAgentCostExtractor
 {
@@ -62,6 +66,8 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
 
         if (text.IndexOf("usage", StringComparison.OrdinalIgnoreCase) < 0) return null;
 
+        AgentCostSnapshot? lastLineSnapshot = null;
+
         foreach (var line in text.Split('\n',
             StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
@@ -71,10 +77,13 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             {
                 using var doc = JsonDocument.Parse(line);
                 var snapshot = ExtractFromDoc(doc.RootElement);
-                if (snapshot is not null) return snapshot;
+                if (snapshot is not null) lastLineSnapshot = snapshot;
             }
             catch (JsonException) { }
+            catch (InvalidOperationException) { }
         }
+
+        if (lastLineSnapshot is not null) return lastLineSnapshot;
 
         try
         {
@@ -82,6 +91,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             return ExtractFromDoc(doc.RootElement);
         }
         catch (JsonException) { }
+        catch (InvalidOperationException) { }
 
         return null;
     }
@@ -100,7 +110,6 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         else if (usage.TryGetProperty("output_tokens", out var ot) && TryGetNonNegativeInt32(ot, out var otv)) output = otv;
 
         var cached = TryReadCachedInputTokens(usage);
-        var freshInput = Math.Max(0, totalInput - cached);
 
         if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
@@ -109,7 +118,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         }
 
         if (totalInput == 0 && cached == 0 && output == 0) return null;
-        return new AgentCostSnapshot(freshInput, cached, output, modelId);
+        return new AgentCostSnapshot(totalInput, cached, output, modelId);
     }
 
     private static bool TryGetUsage(JsonElement root, out JsonElement usage, int depth)
@@ -122,9 +131,9 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
 
         if (root.ValueKind == JsonValueKind.Object)
         {
-            if (root.TryGetProperty("usage", out usage)) return true;
-            if (root.TryGetProperty("token_usage", out usage)) return true;
-            if (root.TryGetProperty("total_token_usage", out usage)) return true;
+            if (TryGetUsageObject(root, "usage", out usage)) return true;
+            if (TryGetUsageObject(root, "token_usage", out usage)) return true;
+            if (TryGetUsageObject(root, "total_token_usage", out usage)) return true;
 
             if (root.TryGetProperty("payload", out var payload) && TryGetUsage(payload, out usage, depth + 1)) return true;
             if (root.TryGetProperty("item", out var item) && TryGetUsage(item, out usage, depth + 1)) return true;
@@ -135,9 +144,18 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         return false;
     }
 
+    private static bool TryGetUsageObject(JsonElement root, string propertyName, out JsonElement usage)
+    {
+        if (root.TryGetProperty(propertyName, out usage) && usage.ValueKind == JsonValueKind.Object)
+            return true;
+
+        usage = default;
+        return false;
+    }
+
     private static bool TryGetNonNegativeInt32(JsonElement element, out int value)
     {
-        if (element.TryGetInt32(out value) && value >= 0)
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out value) && value >= 0)
             return true;
 
         value = 0;
@@ -151,11 +169,13 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             return cachedInputValue;
 
         if (usage.TryGetProperty("prompt_tokens_details", out var promptDetails)
+            && promptDetails.ValueKind == JsonValueKind.Object
             && promptDetails.TryGetProperty("cached_tokens", out var promptCached)
             && TryGetNonNegativeInt32(promptCached, out var promptCachedValue))
             return promptCachedValue;
 
         if (usage.TryGetProperty("input_tokens_details", out var inputDetails)
+            && inputDetails.ValueKind == JsonValueKind.Object
             && inputDetails.TryGetProperty("cached_tokens", out var inputCached)
             && TryGetNonNegativeInt32(inputCached, out var inputCachedValue))
             return inputCachedValue;
@@ -180,7 +200,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (promptM.Success && completionM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = Math.Max(0, ParseTokenCount(promptM.Groups[1].Value) - cached);
+            var input = ParseTokenCount(promptM.Groups[1].Value);
             var output = ParseTokenCount(completionM.Groups[1].Value);
             return new AgentCostSnapshot(input, cached, output, null);
         }
@@ -190,7 +210,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (inputM.Success && outputM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = Math.Max(0, ParseTokenCount(inputM.Groups[1].Value) - cached);
+            var input = ParseTokenCount(inputM.Groups[1].Value);
             var output = ParseTokenCount(outputM.Groups[1].Value);
             if (input > 0 || cached > 0 || output > 0)
                 return new AgentCostSnapshot(input, cached, output, null);

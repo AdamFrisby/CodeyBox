@@ -29,6 +29,10 @@ public interface IAgentCostExtractor
 /// <summary>
 /// Token snapshot extracted from a single agent CLI invocation.
 /// </summary>
+/// <param name="InputTokens">Total input tokens, including cached input when the provider reports cached tokens as a subset.</param>
+/// <param name="CachedInputTokens">Cached input tokens included in <paramref name="InputTokens"/>.</param>
+/// <param name="OutputTokens">Output tokens.</param>
+/// <param name="ModelId">Provider model identifier, when available.</param>
 public sealed record AgentCostSnapshot(
     int InputTokens,
     int CachedInputTokens,

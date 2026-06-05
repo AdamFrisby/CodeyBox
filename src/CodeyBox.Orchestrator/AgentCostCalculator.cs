@@ -140,23 +140,13 @@ public sealed class AgentCostCalculator
         var rate = ResolveRate(opts, kind, snapshot.ModelId);
         if (rate is null) return 0m;
 
-        var billableInput = BillableInputTokens(snapshot, kind);
+        var billableInput = Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
         var cost =
             (decimal)billableInput * (decimal)rate.InputPerMillion / 1_000_000m
             + (decimal)snapshot.CachedInputTokens * (decimal)rate.CachedInputPerMillion / 1_000_000m
             + (decimal)snapshot.OutputTokens * (decimal)rate.OutputPerMillion / 1_000_000m;
 
         return decimal.Round(cost, 6);
-    }
-
-    private static int BillableInputTokens(AgentCostSnapshot snapshot, AgentKind kind)
-    {
-        // CodexCostExtractor stores prompt/input tokens as the fresh remainder
-        // because Codex/OpenAI totals include cached tokens in the same field.
-        if (kind == AgentKind.Codex)
-            return Math.Max(0, snapshot.InputTokens);
-
-        return Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
     }
 
     private ModelRateConfig? ResolveRate(AgentPricingOptions opts, AgentKind kind, string? modelId)
