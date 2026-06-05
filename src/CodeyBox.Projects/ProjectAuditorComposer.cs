@@ -118,9 +118,9 @@ public sealed class ProjectAuditorComposer
         // requires one, and PipelineRunner gives isolated auditors a fresh
         // sandbox so branch-controlled scripts cannot mutate later checks.
         if (!auditors.Any(a => a.Name.Equals(
-                BuildScriptAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
+                WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)))
         {
-            IncludeRegisteredAuditor(BuildScriptAuditor.AuditorName, auditors, prepend: false);
+            IncludeRegisteredAuditor(WellKnownAuditorNames.BuildScript, auditors, prepend: false);
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)

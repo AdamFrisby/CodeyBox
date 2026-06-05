@@ -3128,7 +3128,7 @@ internal static class MultipassDaemonRetry
             ? $"multipass transient daemon error after {retries} retries ({errorClass}) during {description}: {stderr}"
             : $"multipass daemon unreachable after {retries} retries ({errorClass}) during {description}; health probe failed: {finalProbe.Error}; last stderr: {stderr}";
         log.LogError("{Message}", message);
-        return result with { Stderr = message };
+        return result with { Stderr = message, ExecutionUnavailable = true };
     }
 
     internal static string? ClassifyTransient(IReadOnlyList<string> argv, ProcessRunResult result)
@@ -3351,7 +3351,7 @@ internal static class MultipassRetry
         log.LogWarning(
             "{Description}: SSH still refusing after {Max} attempts; surfacing failure. stderr: {Stderr}",
             description, maxAttempts, result.Stderr.Trim());
-        return result;
+        return result with { ExecutionUnavailable = true };
     }
 }
 
@@ -3696,7 +3696,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             result.Stdout,
             result.Stderr,
             result.StdoutLimitExceeded,
-            result.StderrLimitExceeded);
+            result.StderrLimitExceeded,
+            result.StartFailed || result.ExecutionUnavailable);
     }
 
     private async Task<ProcessRunResult> ExecRunAsync(

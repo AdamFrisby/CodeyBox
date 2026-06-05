@@ -283,8 +283,8 @@ not invoke an LLM.
 It looks for a repo-root `build.sh` on the work branch. When the script is
 absent, the default behavior is skip-if-absent so existing projects are
 unchanged. When present, CodeyBox runs `./build.sh` in the audit-tool sandbox
-with the configured timeout; exit `0` passes and any other build exit becomes a
-blocking `build failed` finding with stdout/stderr captured.
+with the configured timeout; exit `0` passes and ordinary non-zero build exits
+become blocking `build failed` findings with stdout/stderr captured.
 
 Set `Audit.BuildScriptRequired=true` for projects that must provide the script:
 

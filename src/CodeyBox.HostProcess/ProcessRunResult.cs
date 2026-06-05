@@ -7,7 +7,8 @@ public readonly record struct ProcessRunResult(
     string Stderr,
     bool StdoutLimitExceeded = false,
     bool StderrLimitExceeded = false,
-    bool StartFailed = false)
+    bool StartFailed = false,
+    bool ExecutionUnavailable = false)
 {
-    public bool Success => ExitCode == 0 && !StartFailed;
+    public bool Success => ExitCode == 0 && !StartFailed && !ExecutionUnavailable;
 }

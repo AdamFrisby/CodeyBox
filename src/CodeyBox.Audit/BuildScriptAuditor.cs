@@ -9,7 +9,7 @@ namespace CodeyBox.Audit;
 /// </summary>
 public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
 {
-    public const string AuditorName = "process:build-script";
+    public const string AuditorName = WellKnownAuditorNames.BuildScript;
     public const int OutputCaptureMaxBytes = 1024 * 1024;
 
     private const int CommandCannotExecuteExitCode = 126;
@@ -53,14 +53,11 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
 
         if (presence.ExitCode != 0)
         {
-            if (presence.ExitCode != 1 || IsCouldNotExecute(presence) || IsProviderExecutionFailure(presence))
+            if (presence.ExitCode != 1 || IsCouldNotExecute(presence) || presence.ExecutionUnavailable)
                 throw UnavailableFromResult("could-not-verify: build.sh presence check could not run", presence);
 
             if (context.BuildScriptRequired)
                 return MissingRequiredResult("This project requires a repo-root build.sh for the build-script audit gate, but none was present on the work branch.");
-
-            if (await BaseBranchHasBuildScriptAsync(sandbox, workingDirectory, context.BaseBranch, ct))
-                return MissingRequiredResult("The base branch contains a repo-root build.sh, but it was missing on the work branch. Restore the script or intentionally disable the build-script auditor in project configuration.");
 
             return MissingOptionalResult();
         }
@@ -100,7 +97,7 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         if (result.Success)
             return new AuditResult(true, [], RawOutput: output);
 
-        if (IsProviderExecutionFailure(result))
+        if (result.ExecutionUnavailable || IsCouldNotExecute(result))
             throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
 
         var description = result.OutputLimitExceeded
@@ -131,40 +128,6 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
             "build.sh missing",
             description);
         return new AuditResult(false, [finding], RawOutput: "required build.sh missing");
-    }
-
-    private async Task<bool> BaseBranchHasBuildScriptAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        string baseBranch,
-        CancellationToken ct)
-    {
-        var baseRef = BaseBranchRef(baseBranch);
-        var verifyRef = await ExecOrUnavailableAsync(
-            sandbox,
-            new SandboxExec
-            {
-                Argv = ["git", "-C", workingDirectory, "rev-parse", "--verify", "--quiet", $"{baseRef}^{{commit}}"],
-            },
-            $"resolve base branch {baseRef}",
-            ct);
-        if (!verifyRef.Success)
-            throw UnavailableFromResult($"could-not-verify: base branch {baseRef} could not be resolved", verifyRef);
-
-        var basePresence = await ExecOrUnavailableAsync(
-            sandbox,
-            new SandboxExec
-            {
-                Argv = ["git", "-C", workingDirectory, "cat-file", "-e", $"{baseRef}:build.sh"],
-            },
-            $"check base branch {baseRef} for build.sh",
-            ct);
-        if (basePresence.ExitCode == 0)
-            return true;
-        if (basePresence.ExitCode == 128 && !IsProviderExecutionFailure(basePresence))
-            return false;
-
-        throw UnavailableFromResult($"could-not-verify: base branch {baseRef} build.sh presence check could not run", basePresence);
     }
 
     private async Task<SandboxExecResult> ExecOrUnavailableAsync(
@@ -201,16 +164,6 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
     private static bool IsCouldNotExecute(SandboxExecResult result)
         => result.ExitCode is CommandCannotExecuteExitCode or CommandNotFoundExitCode;
 
-    private static bool IsProviderExecutionFailure(SandboxExecResult result)
-    {
-        if (result.ExitCode == 0)
-            return false;
-
-        var stderr = result.Stderr ?? string.Empty;
-        return stderr.StartsWith("multipass transient daemon error after ", StringComparison.Ordinal)
-            || stderr.StartsWith("multipass daemon unreachable after ", StringComparison.Ordinal);
-    }
-
     private static AuditUnavailableException UnavailableFromResult(
         string reason,
         SandboxExecResult result)
@@ -237,18 +190,6 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
         if (string.IsNullOrEmpty(stderr)) return stdout;
         if (string.IsNullOrEmpty(stdout)) return stderr;
         return stdout + "\n" + stderr;
-    }
-
-    private static string BaseBranchRef(string baseBranch)
-    {
-        var branch = baseBranch.Trim();
-        if (branch.StartsWith("refs/remotes/", StringComparison.Ordinal))
-            return branch;
-        if (branch.StartsWith("refs/heads/", StringComparison.Ordinal))
-            branch = branch["refs/heads/".Length..];
-        if (branch.StartsWith("origin/", StringComparison.Ordinal))
-            return $"refs/remotes/{branch}";
-        return $"refs/remotes/origin/{branch}";
     }
 
     private static string Tail(string text, int maxChars)

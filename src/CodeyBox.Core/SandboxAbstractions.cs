@@ -934,8 +934,9 @@ public sealed record SandboxExecResult(
     string Stdout,
     string Stderr,
     bool StdoutLimitExceeded = false,
-    bool StderrLimitExceeded = false)
+    bool StderrLimitExceeded = false,
+    bool ExecutionUnavailable = false)
 {
     public bool OutputLimitExceeded => StdoutLimitExceeded || StderrLimitExceeded;
-    public bool Success => ExitCode == 0 && !OutputLimitExceeded;
+    public bool Success => ExitCode == 0 && !OutputLimitExceeded && !ExecutionUnavailable;
 }

@@ -73,10 +73,6 @@ public sealed class BuildScriptAuditorTests : IDisposable
         {
             if (IsPresenceCheck(exec))
                 return new SandboxExecResult(1, "", "");
-            if (IsBaseRefProbe(exec))
-                return new SandboxExecResult(0, "", "");
-            if (IsBaseBuildScriptProbe(exec))
-                return new SandboxExecResult(128, "", "fatal: path 'build.sh' does not exist");
             return new SandboxExecResult(99, "should not run", "");
         });
 
@@ -89,6 +85,8 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.Empty(result.Findings);
         Assert.Equal("build.sh absent; auditor skipped", result.RawOutput);
         Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
+        var onlyExec = Assert.Single(sandbox.Executed);
+        Assert.True(IsPresenceCheck(onlyExec));
     }
 
     [Fact]
@@ -107,20 +105,16 @@ public sealed class BuildScriptAuditorTests : IDisposable
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Equal("build.sh missing", finding.Title);
-        Assert.DoesNotContain(sandbox.Executed, IsBaseBuildScriptProbe);
+        Assert.DoesNotContain(sandbox.Executed, exec => exec.Argv.FirstOrDefault() == "git");
     }
 
     [Fact]
-    public async Task AbsentOnWorkBranchButPresentOnBase_IsBlockingMissingScriptFinding()
+    public async Task AbsentOnWorkBranchAndOptional_DoesNotProbeBaseBranch()
     {
         var sandbox = new StubSandbox(exec =>
         {
             if (IsPresenceCheck(exec))
                 return new SandboxExecResult(1, "", "");
-            if (IsBaseRefProbe(exec))
-                return new SandboxExecResult(0, "", "");
-            if (IsBaseBuildScriptProbe(exec))
-                return new SandboxExecResult(0, "", "");
             return new SandboxExecResult(99, "should not run", "");
         });
 
@@ -129,31 +123,31 @@ public sealed class BuildScriptAuditorTests : IDisposable
             "/work/repo",
             Ctx(required: false));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Equal("build.sh missing", finding.Title);
-        Assert.Contains("base branch contains", finding.Description);
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
         Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
+        Assert.DoesNotContain(sandbox.Executed, exec => exec.Argv.FirstOrDefault() == "git");
     }
 
-    [Fact]
-    public async Task Exit127FromScript_IsBlockingBuildFailedFinding()
+    [Theory]
+    [InlineData(126)]
+    [InlineData(127)]
+    public async Task BuildScriptCannotExecute_ThrowsCouldNotVerifyInsteadOfFinding(int exitCode)
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
-            : new SandboxExecResult(127, "", "command not found\n"));
+            : new SandboxExecResult(exitCode, "", "command not found\n"));
 
-        var result = await new BuildScriptAuditor().RunAsync(
-            sandbox,
-            "/work/repo",
-            Ctx());
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal("build failed", finding.Title);
-        Assert.Contains("build.sh exited with code 127", finding.Description);
-        Assert.Contains("command not found", finding.Description);
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("build.sh could not execute", ex.Message);
+        Assert.Contains($"exit {exitCode}", ex.Message);
+        Assert.Equal(exitCode, ex.ExitCode);
     }
 
     [Fact]
@@ -221,14 +215,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.Contains("check for ./build.sh", ex.Message);
     }
 
-    [Theory]
-    [InlineData("multipass transient daemon error after 2 retries (multipass-socket-error) during exec on vm: socket failed")]
-    [InlineData("multipass daemon unreachable after 2 retries (multipass-socket-unreachable) during exec on vm; health probe failed: down; last stderr: socket failed")]
-    public async Task ProviderExecFailureResult_ThrowsCouldNotVerifyInsteadOfBuildFinding(string stderr)
+    [Fact]
+    public async Task ProviderExecUnavailableResult_ThrowsCouldNotVerifyInsteadOfBuildFinding()
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
-            : new SandboxExecResult(1, "", stderr));
+            : new SandboxExecResult(1, "", "sandbox provider unavailable", ExecutionUnavailable: true));
 
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
             new BuildScriptAuditor().RunAsync(
@@ -260,6 +252,33 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.Contains("stdout truncated", result.RawOutput);
     }
 
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task OutputLimitExceededWithExitZero_IsBlockingFinding(bool stdoutLimitExceeded, bool stderrLimitExceeded)
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(0, "", "")
+            : new SandboxExecResult(
+                0,
+                stdoutLimitExceeded ? "partial stdout" : "",
+                stderrLimitExceeded ? "partial stderr" : "",
+                StdoutLimitExceeded: stdoutLimitExceeded,
+                StderrLimitExceeded: stderrLimitExceeded));
+
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains("output exceeded the per-stream capture limit", finding.Description);
+        Assert.Contains("Last observed exit code: 0", finding.Description);
+        Assert.Contains(stdoutLimitExceeded ? "stdout truncated" : "stderr truncated", result.RawOutput);
+    }
+
     [Fact]
     public async Task TimeoutOptionsAccessor_EvaluatedPerRun()
     {
@@ -289,7 +308,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_Exit127_PersistsBuildFindingAndFailsAudit()
+    public async Task Pipeline_Exit127_FailsInfrastructureWithoutPersistingCodeFinding()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -316,12 +335,10 @@ public sealed class BuildScriptAuditorTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Contains("build failed", final.LastError);
-        var report = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
-        var finding = Assert.Single(report.Findings);
-        Assert.Equal("build failed", finding.Title);
-        Assert.Contains("missing tool", report.RawOutput);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could-not-verify", final.LastError);
+        Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
     }
 
     [Fact]
@@ -478,12 +495,6 @@ public sealed class BuildScriptAuditorTests : IDisposable
 
     private static bool IsBuildExecution(SandboxExec exec)
         => exec.Argv.SequenceEqual(["sh", "-c", "./build.sh"]);
-
-    private static bool IsBaseRefProbe(SandboxExec exec)
-        => exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"]);
-
-    private static bool IsBaseBuildScriptProbe(SandboxExec exec)
-        => exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "cat-file", "-e", "refs/remotes/origin/main:build.sh"]);
 
     private static async Task CommitBuildScriptToBareBranchAsync(
         string barePath,
