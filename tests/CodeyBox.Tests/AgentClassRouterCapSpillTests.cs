@@ -60,6 +60,14 @@ public sealed class AgentClassRouterCapSpillTests
         return new AgentConcurrencySnapshot(opts);
     }
 
+    private static AgentConcurrencySnapshot CapsForRoutes(params (string RouteKey, int Max)[] caps)
+    {
+        var opts = new AgentConcurrencyOptions();
+        foreach (var (routeKey, max) in caps)
+            opts.Members[routeKey] = new AgentConcurrencyEntry { MaxConcurrent = max };
+        return new AgentConcurrencySnapshot(opts);
+    }
+
     private static AgentClassRouter BuildRouter(
         IReadOnlyList<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
@@ -108,6 +116,28 @@ public sealed class AgentClassRouterCapSpillTests
 
         Assert.NotNull(decision.Chosen);
         Assert.Equal(Codex, decision.Chosen!.Agent);
+        Assert.False(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task SameKindTopInstanceAtCap_SpillsToSiblingInstance()
+    {
+        var acctA = Sub(Claude, score: 100) with { InstanceId = "acct-a" };
+        var acctB = Sub(Claude, score: 99) with { InstanceId = "acct-b" };
+        var cls = FrontierClass(acctA, acctB);
+        var counters = new RouteCounters();
+        counters.Increment(acctA.RouteKey);
+        var caps = CapsForRoutes((acctA.RouteKey, 1), (acctB.RouteKey, 1));
+        var router = BuildRouter(
+            [cls],
+            [new FakeProbe(Claude, 100.0)],
+            counters, caps);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.Equal(acctB.RouteKey, decision.Chosen.RouteKey);
         Assert.False(decision.ShouldWait);
     }
 
@@ -607,5 +637,28 @@ public sealed class AgentClassRouterCapSpillTests
 
         public Task<IReadOnlyList<AgentBudgetUsageView>> SummariseAllAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<AgentBudgetUsageView>>(Array.Empty<AgentBudgetUsageView>());
+    }
+
+    private sealed class RouteCounters : IAgentRunningCounters
+    {
+        private readonly Dictionary<string, int> _runningByRoute = new(StringComparer.OrdinalIgnoreCase);
+
+        public void Increment(string routeKey) =>
+            _runningByRoute[routeKey] = GetRunning(routeKey) + 1;
+
+        public int GetRunning(AgentKind agent) =>
+            _runningByRoute
+                .Where(kv => string.Equals(AgentInstanceIds.KindFromRouteKey(kv.Key), agent.Value, StringComparison.OrdinalIgnoreCase))
+                .Sum(kv => kv.Value);
+
+        public int GetRunning(AgentMembership member) => GetRunning(member.RouteKey);
+
+        public IReadOnlyDictionary<AgentKind, int> Snapshot() =>
+            _runningByRoute
+                .GroupBy(kv => AgentInstanceIds.KindFromRouteKey(kv.Key), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => new AgentKind(g.Key), g => g.Sum(kv => kv.Value));
+
+        private int GetRunning(string routeKey) =>
+            _runningByRoute.TryGetValue(routeKey, out var n) ? n : 0;
     }
 }

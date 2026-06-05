@@ -41,8 +41,10 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
                     phase TEXT NOT NULL,
                     iteration INTEGER,
                     from_agent TEXT NOT NULL,
+                    from_instance_id TEXT,
                     from_model TEXT,
                     to_agent TEXT,
+                    to_instance_id TEXT,
                     to_model TEXT,
                     reason TEXT NOT NULL,
                     occurred_at TEXT NOT NULL
@@ -51,6 +53,8 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
                     ON agent_fallback_history(work_item_id, occurred_at);
                 """;
             create.ExecuteNonQuery();
+            RunMigration("ALTER TABLE agent_fallback_history ADD COLUMN from_instance_id TEXT;");
+            RunMigration("ALTER TABLE agent_fallback_history ADD COLUMN to_instance_id TEXT;");
         }
         finally
         {
@@ -69,17 +73,19 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
                 using var cmd = _conn.CreateCommand();
                 cmd.CommandText = """
                     INSERT INTO agent_fallback_history
-                        (id, work_item_id, phase, iteration, from_agent, from_model, to_agent, to_model, reason, occurred_at)
+                        (id, work_item_id, phase, iteration, from_agent, from_instance_id, from_model, to_agent, to_instance_id, to_model, reason, occurred_at)
                     VALUES
-                        ($id, $wid, $phase, $iter, $fa, $fm, $ta, $tm, $reason, $at);
+                        ($id, $wid, $phase, $iter, $fa, $fi, $fm, $ta, $ti, $tm, $reason, $at);
                     """;
                 cmd.Parameters.AddWithValue("$id", record.Id.ToString());
                 cmd.Parameters.AddWithValue("$wid", record.WorkItemId.ToString());
                 cmd.Parameters.AddWithValue("$phase", record.Phase);
                 cmd.Parameters.AddWithValue("$iter", (object?)record.Iteration ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$fa", record.FromAgent.Value);
+                cmd.Parameters.AddWithValue("$fi", (object?)record.FromInstanceId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$fm", (object?)record.FromModel ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$ta", record.ToAgent is { } toa ? toa.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("$ti", (object?)record.ToInstanceId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$tm", (object?)record.ToModel ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$reason", record.Reason);
                 cmd.Parameters.AddWithValue("$at", record.OccurredAt.ToUniversalTime().ToString("O"));
@@ -96,6 +102,20 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
         }
     }
 
+    private void RunMigration(string sql)
+    {
+        try
+        {
+            using var m = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals
+            m.CommandText = sql;
+            m.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
+        }
+    }
+
     public async Task<IReadOnlyList<AgentFallbackRecord>> ListByWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
     {
         await _connectionLock.WaitAsync(ct);
@@ -103,7 +123,7 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                SELECT id, work_item_id, phase, iteration, from_agent, from_model, to_agent, to_model, reason, occurred_at
+                SELECT id, work_item_id, phase, iteration, from_agent, from_instance_id, from_model, to_agent, to_instance_id, to_model, reason, occurred_at
                 FROM agent_fallback_history
                 WHERE work_item_id = $wid
                 ORDER BY occurred_at ASC;
@@ -120,11 +140,13 @@ public sealed class SqliteAgentFallbackHistoryStore : IAgentFallbackHistoryStore
                     Phase: reader.GetString(2),
                     Iteration: reader.IsDBNull(3) ? null : reader.GetInt32(3),
                     FromAgent: new AgentKind(reader.GetString(4)),
-                    FromModel: reader.IsDBNull(5) ? null : reader.GetString(5),
-                    ToAgent: reader.IsDBNull(6) ? null : new AgentKind(reader.GetString(6)),
-                    ToModel: reader.IsDBNull(7) ? null : reader.GetString(7),
-                    Reason: reader.GetString(8),
-                    OccurredAt: DateTimeOffset.Parse(reader.GetString(9))));
+                    FromInstanceId: reader.IsDBNull(5) ? null : reader.GetString(5),
+                    FromModel: reader.IsDBNull(6) ? null : reader.GetString(6),
+                    ToAgent: reader.IsDBNull(7) ? null : new AgentKind(reader.GetString(7)),
+                    ToInstanceId: reader.IsDBNull(8) ? null : reader.GetString(8),
+                    ToModel: reader.IsDBNull(9) ? null : reader.GetString(9),
+                    Reason: reader.GetString(10),
+                    OccurredAt: DateTimeOffset.Parse(reader.GetString(11))));
             }
             return rows;
         }

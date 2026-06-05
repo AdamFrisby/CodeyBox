@@ -111,7 +111,8 @@ public sealed record AgenticConflictResolverCandidate(
     IAgentRunner Runner,
     AgentCredential? Credential,
     string? ModelId = null,
-    string? ReasoningMode = null);
+    string? ReasoningMode = null,
+    string? AgentInstanceId = null);
 
 /// <summary>
 /// Resolves an in-sandbox mid-rebase/merge conflict by invoking the

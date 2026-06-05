@@ -39,6 +39,7 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
                     id TEXT PRIMARY KEY,
                     work_item_id TEXT NOT NULL,
                     agent_kind TEXT NOT NULL,
+                    agent_instance_id TEXT,
                     model_id TEXT,
                     phase TEXT NOT NULL,
                     started_at TEXT NOT NULL,
@@ -50,6 +51,7 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
                     ON agent_involvement(work_item_id, started_at);
                 """;
             create.ExecuteNonQuery();
+            RunMigration("ALTER TABLE agent_involvement ADD COLUMN agent_instance_id TEXT;");
         }
         finally
         {
@@ -68,13 +70,14 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
                 using var cmd = _conn.CreateCommand();
                 cmd.CommandText = """
                     INSERT INTO agent_involvement
-                        (id, work_item_id, agent_kind, model_id, phase, started_at, ended_at, iteration, outcome)
+                        (id, work_item_id, agent_kind, agent_instance_id, model_id, phase, started_at, ended_at, iteration, outcome)
                     VALUES
-                        ($id, $wid, $agent, $model, $phase, $started, $ended, $iter, $outcome);
+                        ($id, $wid, $agent, $instance, $model, $phase, $started, $ended, $iter, $outcome);
                     """;
                 cmd.Parameters.AddWithValue("$id", entry.Id.ToString());
                 cmd.Parameters.AddWithValue("$wid", entry.WorkItemId.ToString());
                 cmd.Parameters.AddWithValue("$agent", entry.AgentKind.Value);
+                cmd.Parameters.AddWithValue("$instance", (object?)entry.AgentInstanceId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$model", (object?)entry.ModelId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$phase", entry.Phase);
                 cmd.Parameters.AddWithValue("$started", entry.StartedAt.ToUniversalTime().ToString("O"));
@@ -91,6 +94,20 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         finally
         {
             _connectionLock.Release();
+        }
+    }
+
+    private void RunMigration(string sql)
+    {
+        try
+        {
+            using var m = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals
+            m.CommandText = sql;
+            m.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
         }
     }
 
@@ -134,7 +151,7 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                SELECT id, work_item_id, agent_kind, model_id, phase, started_at, ended_at, iteration, outcome
+                SELECT id, work_item_id, agent_kind, agent_instance_id, model_id, phase, started_at, ended_at, iteration, outcome
                 FROM agent_involvement
                 WHERE work_item_id = $wid
                 ORDER BY started_at ASC, rowid ASC;
@@ -149,12 +166,13 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
                     Id: Guid.Parse(reader.GetString(0)),
                     WorkItemId: new WorkItemId(Guid.Parse(reader.GetString(1))),
                     AgentKind: new AgentKind(reader.GetString(2)),
-                    ModelId: reader.IsDBNull(3) ? null : reader.GetString(3),
-                    Phase: reader.GetString(4),
-                    StartedAt: DateTimeOffset.Parse(reader.GetString(5)),
-                    EndedAt: reader.IsDBNull(6) ? null : DateTimeOffset.Parse(reader.GetString(6)),
-                    Iteration: reader.IsDBNull(7) ? null : reader.GetInt32(7),
-                    Outcome: reader.IsDBNull(8) ? null : reader.GetString(8)));
+                    AgentInstanceId: reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ModelId: reader.IsDBNull(4) ? null : reader.GetString(4),
+                    Phase: reader.GetString(5),
+                    StartedAt: DateTimeOffset.Parse(reader.GetString(6)),
+                    EndedAt: reader.IsDBNull(7) ? null : DateTimeOffset.Parse(reader.GetString(7)),
+                    Iteration: reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                    Outcome: reader.IsDBNull(9) ? null : reader.GetString(9)));
             }
             return rows;
         }

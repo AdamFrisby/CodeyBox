@@ -107,11 +107,12 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private IEnumerable<Measurement<double>> ObserveQuotaAvailability()
     {
         if (_quotaSnapshot is null) yield break;
-        foreach (var (agent, model, pct) in _quotaSnapshot.SnapshotQuotaAvailability())
+        foreach (var (instanceId, agent, model, pct) in _quotaSnapshot.SnapshotQuotaAvailabilityByInstance())
         {
             yield return new Measurement<double>(
                 pct,
                 new KeyValuePair<string, object?>("agent.kind", agent.Value),
+                new KeyValuePair<string, object?>("agent.instance", instanceId),
                 new KeyValuePair<string, object?>("model", model ?? "(default)"));
         }
     }

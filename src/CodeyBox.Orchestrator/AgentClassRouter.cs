@@ -58,10 +58,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // so /concurrency surface and tests reference the same value.
     public const double DefaultColdStartFitInWindow = 2.0;
     // In-process short-lived exhaustion cache populated by mid-iteration fallback.
-    // Keyed by (agent kind, model id ?? ""); value is the UTC instant at which
+    // Keyed by (route key, model id ?? ""); value is the UTC instant at which
     // the suppression expires. Survives only the current process lifetime —
     // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), ExhaustionEntry> _exhausted
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, ExhaustionEntry> _exhausted
         = new();
 
     // Last quota-availability percentage observed per (agent, model) during
@@ -69,16 +69,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     // chart subscription headroom without issuing fresh probe round-trips on
     // the metrics-collection thread. -1 means "unknown" (the probe could not
     // determine availability). Updated on every ProbeAsync result.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), double> _lastAvailablePct
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, double> _lastAvailablePct
         = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), EffectiveQuota> _lastEffectiveQuota
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, EffectiveQuota> _lastEffectiveQuota
         = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(AgentKind Agent, string ModelId), bool> _lastQuotaUsable
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, bool> _lastQuotaUsable
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
         = new();
 
-    private sealed record QuotaRetryAdmission(AgentKind Agent, string ModelId, DateTimeOffset ExpiresAt);
+    private readonly record struct MemberQuotaKey(string RouteKey, AgentKind Agent, string ModelId);
+    private sealed record QuotaRetryAdmission(string RouteKey, string ModelId, DateTimeOffset ExpiresAt);
     private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
 
     /// <summary>
@@ -274,8 +275,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         public ReadOnlyCapacitySlotGate(IAgentCapacitySnapshot capacity) => _capacity = capacity;
 
         public bool TryReserve(AgentKind agent) => _capacity.HasCapacity(agent);
+        public bool TryReserve(AgentMembership member) => _capacity.HasCapacity(member);
 
         public void Release(AgentKind agent) { }
+        public void Release(AgentMembership member) { }
     }
 
     public async Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
@@ -434,6 +437,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // members were blocked, and used together with capSaturatedMembers to
         // drive AnyMemberAtCap.
         var atCapAgents = new List<AgentKind>();
+        var atCapMembers = new List<AgentMembership>();
 
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in sorted)
@@ -530,8 +534,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // existing cap-defer (rare, and correctly bounded).
             if (IsAtAgentCap(member))
             {
-                var cap = GetAgentCap(member.Agent);
-                var running = _runningCounters?.GetRunning(member.Agent) ?? 0;
+                var cap = GetAgentCap(member);
+                var running = _runningCounters?.GetRunning(member) ?? 0;
                 var capReason = $"per-agent cap: running={running} cap={cap}";
                 if (commitDispatchSideEffects)
                     _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
@@ -577,7 +581,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
 
             if (commitDispatchSideEffects)
-                AuditLog.QuotaProbed(member.Agent, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
+                AuditLog.QuotaProbed(member.Agent, member.RouteKey, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
             var knownQuotaUsable = KnownQuotaMeetsFloor(member, quota, nowUtc);
             RefreshExhaustionFromProbe(member, quota, knownQuotaUsable, nowUtc);
@@ -595,7 +599,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 // succeeds, so the caller skips its own redundant reserve and
                 // the race between check and commit is closed by the gate's
                 // atomic increment.
-                if (slotGate is not null && !slotGate.TryReserve(member.Agent))
+                if (slotGate is not null && !slotGate.TryReserve(member))
                 {
                     var capReason = "per-agent cap reached";
                     if (commitDispatchSideEffects)
@@ -605,6 +609,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     }
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                     atCapAgents.Add(member.Agent);
+                    atCapMembers.Add(member);
                     continue;
                 }
 
@@ -758,6 +763,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 SuggestedRecheckIn = suggested,
                 AnyMemberAtCap = capBlocked,
                 AtCapAgents = atCapAgents,
+                AtCapMembers = atCapMembers,
                 Reason = reason,
                 PausedAgents = pausedRejected
                     .Select(p => p.Agent)
@@ -786,9 +792,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
             if (pausedMembers.Contains(candidate.Member)) continue;
             var fallback = candidate.Member;
-            if (slotGate is not null && !slotGate.TryReserve(fallback.Agent))
+            if (slotGate is not null && !slotGate.TryReserve(fallback))
             {
                 atCapAgents.Add(fallback.Agent);
+                atCapMembers.Add(fallback);
                 continue;
             }
 
@@ -852,6 +859,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             SuggestedRecheckIn = budgetRecheck,
             AnyMemberAtCap = fallbackCapBlocked,
             AtCapAgents = atCapAgents,
+            AtCapMembers = atCapMembers,
             Reason = parkReason,
             PausedAgents = pausedRejected
                 .Select(p => p.Agent)
@@ -870,9 +878,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private bool IsAtAgentCap(AgentMembership member)
     {
         if (_runningCounters is null) return false;
-        var cap = GetAgentCap(member.Agent);
+        var cap = GetAgentCap(member);
         if (cap <= 0) return false;
-        return _runningCounters.GetRunning(member.Agent) >= cap;
+        return _runningCounters.GetRunning(member) >= cap;
     }
 
     /// <summary>
@@ -893,6 +901,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             : 0;
     }
 
+    private int GetAgentCap(AgentMembership member)
+    {
+        var opts = _concurrencySnapshot?.Current;
+        if (opts is null)
+            return 0;
+
+        if (opts.Members.TryGetValue(member.RouteKey, out var exact)
+            && exact is { MaxConcurrent: > 0 })
+            return exact.MaxConcurrent;
+
+        if (opts.Members.TryGetValue(member.Agent.Value, out var byKind)
+            && byKind is { MaxConcurrent: > 0 })
+            return byKind.MaxConcurrent;
+
+        return 0;
+    }
+
     /// <summary>
     /// Looks up the canonical <see cref="AgentMembership"/> for a class member.
     /// Returns null if the class is unknown or no member matches the (agent, model)
@@ -905,7 +930,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// ReasoningMode) instead of fabricating a placeholder.
     /// </para>
     /// </summary>
-    public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId)
+    public AgentMembership? FindMember(string classId, AgentKind agent, string? modelId, string? instanceId = null)
     {
         var cfg = Volatile.Read(ref _routingConfig);
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
@@ -913,6 +938,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         foreach (var m in agentClass.Members)
         {
             if (m.Agent != agent) continue;
+            if (!string.IsNullOrWhiteSpace(instanceId)
+                && !AgentInstanceIds.Matches(m, instanceId))
+                continue;
             var memberModel = m.ModelId ?? string.Empty;
             if (string.Equals(memberModel, normalisedModel, StringComparison.Ordinal))
                 return m;
@@ -957,6 +985,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var snap = new List<(AgentKind, string?, double)>(_lastAvailablePct.Count);
         foreach (var kv in _lastAvailablePct)
             snap.Add((kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
+        return snap;
+    }
+
+    public IReadOnlyList<(string InstanceId, AgentKind Agent, string? ModelId, double AvailablePct)> SnapshotQuotaAvailabilityByInstance()
+    {
+        var snap = new List<(string, AgentKind, string?, double)>(_lastAvailablePct.Count);
+        foreach (var kv in _lastAvailablePct)
+            snap.Add((kv.Key.RouteKey, kv.Key.Agent, kv.Key.ModelId.Length == 0 ? null : kv.Key.ModelId, kv.Value));
         return snap;
     }
 
@@ -1129,8 +1165,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return TryGetExhaustedUntil(member, nowUtc, out _);
     }
 
-    private static (AgentKind Agent, string ModelId) ExhaustionKey(AgentMembership member) =>
-        (member.Agent, member.ModelId ?? string.Empty);
+    private static MemberQuotaKey ExhaustionKey(AgentMembership member) =>
+        new(member.RouteKey, member.Agent, member.ModelId ?? string.Empty);
 
     private bool TryGetExhaustedUntil(AgentMembership member, DateTimeOffset nowUtc, out DateTimeOffset expiresAt)
     {
@@ -1143,7 +1179,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         if (entry.ExpiresAt <= nowUtc)
         {
-            _exhausted.TryRemove(new KeyValuePair<(AgentKind Agent, string ModelId), ExhaustionEntry>(key, entry));
+            _exhausted.TryRemove(new KeyValuePair<MemberQuotaKey, ExhaustionEntry>(key, entry));
             expiresAt = default;
             return false;
         }
@@ -1216,7 +1252,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             ? _opts.ObservedFailureWindow
             : TimeSpan.FromMinutes(1);
         var admission = new QuotaRetryAdmission(
-            member.Agent,
+            member.RouteKey,
             member.ModelId ?? string.Empty,
             nowUtc + ttl);
         _quotaRetryAdmissions[item.Id] = admission;
@@ -1246,7 +1282,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private static bool QuotaRetryAdmissionMatches(QuotaRetryAdmission? admission, AgentMembership member)
         => admission is not null
-           && admission.Agent == member.Agent
+           && string.Equals(admission.RouteKey, member.RouteKey, StringComparison.OrdinalIgnoreCase)
            && string.Equals(admission.ModelId, member.ModelId ?? string.Empty, StringComparison.Ordinal);
 
     private void ConsumeQuotaRetryAdmission(WorkItemId itemId, QuotaRetryAdmission? admission)
@@ -1404,7 +1440,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             NotifyQuotaUsableThresholdCrossed();
     }
 
-    private (AgentKind Agent, string ModelId) RecordObservedAvailability(
+    private MemberQuotaKey RecordObservedAvailability(
         AgentMembership member,
         EffectiveQuota quota)
     {
@@ -1496,7 +1532,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
-    private bool RecordQuotaUsableTransition((AgentKind Agent, string ModelId) key, bool isUsable)
+    private bool RecordQuotaUsableTransition(MemberQuotaKey key, bool isUsable)
     {
         while (true)
         {
@@ -1635,7 +1671,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             fit = availablePct / estimate.AvgBurnPctPerItem;
         }
 
-        var running = _runningCounters.GetRunning(member.Agent);
+        var running = _runningCounters.GetRunning(member);
         if (running < fit) return null;
 
         var reason =
@@ -1697,7 +1733,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 SampleCount: est.SampleCount,
                 BurnEstimateStatus: est.Status,
                 FitInWindow: fit,
-                RunningOnAgent: _runningCounters?.GetRunning(member.Agent) ?? 0));
+                RunningOnAgent: _runningCounters?.GetRunning(member) ?? 0));
         }
         return results;
     }
@@ -1998,6 +2034,12 @@ public sealed record AgentRoutingDecision
     /// without re-deriving which members were blocked.
     /// </summary>
     public IReadOnlyList<AgentKind> AtCapAgents { get; init; } = [];
+
+    /// <summary>
+    /// Instance-aware companion to <see cref="AtCapAgents"/>. Empty for legacy
+    /// callers that only use per-kind gates.
+    /// </summary>
+    public IReadOnlyList<AgentMembership> AtCapMembers { get; init; } = [];
 
     /// <summary>
     /// True when every otherwise-eligible member was excluded because an

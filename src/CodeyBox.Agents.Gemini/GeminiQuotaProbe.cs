@@ -58,15 +58,15 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
     internal const int AutoFanOutConcurrency = 2;
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
+    private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<GeminiQuotaProbe> _log;
 
-    // Cache keyed by (token, modelKey). modelKey = the configured model id, or
+    // Cache keyed by (route key, token, modelKey). modelKey = the configured model id, or
     // GeminiKnownModels.AutoSentinel for the auto fan-out result, or "" for the
     // no-ModelId legacy fallback that hits retrieveUserQuota. Two members on
     // the same account using different models don't clobber each other.
-    private readonly Dictionary<(string Token, string ModelKey), CacheEntry> _cache = new();
+    private readonly Dictionary<(string RouteKey, string Token, string ModelKey), CacheEntry> _cache = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Gemini;
@@ -74,6 +74,15 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
     public GeminiQuotaProbe(
         IHttpClientFactory httpClientFactory,
         Func<AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<GeminiQuotaProbe> log)
+        : this(httpClientFactory, _ => credentialsProvider(), cacheTtl, log)
+    {
+    }
+
+    public GeminiQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<GeminiQuotaProbe> log)
     {
@@ -85,10 +94,11 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        var credentials = _credentialsProvider();
+        var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
+        var routeKey = member.RouteKey;
 
         bool isAuto = GeminiKnownModels.IsAuto(member.ModelId);
         bool hasFixedModel = !isAuto && !string.IsNullOrWhiteSpace(member.ModelId);
@@ -100,7 +110,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         await _lock.WaitAsync(ct);
         try
         {
-            if (_cache.TryGetValue((token, modelKey), out var entry)
+            if (_cache.TryGetValue((routeKey, token, modelKey), out var entry)
                 && DateTimeOffset.UtcNow < entry.ExpiresAt)
             {
                 snapshot = entry.Snapshot;
@@ -112,7 +122,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
                     : hasFixedModel
                         ? await FetchSingleAsync(token, member.ModelId!, ct)
                         : await FetchTierSignalAsync(token, ct);
-                _cache[(token, modelKey)] = new CacheEntry(snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+                _cache[(routeKey, token, modelKey)] = new CacheEntry(snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             }
         }
         finally

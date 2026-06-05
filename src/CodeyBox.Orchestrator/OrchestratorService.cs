@@ -94,13 +94,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // dispatch time.
     private readonly AgentConcurrencySnapshot _concurrencySnapshot;
 
-    // Live in-flight count keyed by routed agent kind. For class-routed items
+    // Live in-flight count keyed by routed agent instance. For class-routed items
     // the count is incremented atomically inside AgentClassRouter via the
     // IAgentSlotGate (this service); for direct-agent items the orchestrator
     // reserves the slot itself after routing. In both cases the outer finally
     // block releases the slot. Surfaced via /concurrency and consumed by the
     // rate-aware gate.
-    private readonly ConcurrentDictionary<AgentKind, int> _runningPerAgent = new();
+    private readonly ConcurrentDictionary<string, int> _runningPerRoute = new(StringComparer.OrdinalIgnoreCase);
 
     // Re-pickup delay applied when a direct-agent item hits its per-agent
     // cap. Class-routed items use QuotaRouterOptions.CapRetryRecheckInterval
@@ -243,16 +243,32 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     /// <inheritdoc />
-    public int GetRunning(AgentKind agent) =>
-        _runningPerAgent.TryGetValue(agent, out var n) ? n : 0;
+    public int GetRunning(AgentKind agent)
+    {
+        var total = 0;
+        foreach (var kv in _runningPerRoute)
+        {
+            if (string.Equals(AgentInstanceIds.KindFromRouteKey(kv.Key), agent.Value, StringComparison.OrdinalIgnoreCase))
+                total += kv.Value;
+        }
+        return total;
+    }
+
+    /// <inheritdoc />
+    public int GetRunning(AgentMembership member) =>
+        _runningPerRoute.TryGetValue(member.RouteKey, out var n) ? n : 0;
 
     /// <inheritdoc />
     public IReadOnlyDictionary<AgentKind, int> Snapshot()
     {
         // Materialise so callers can iterate safely while the dispatcher mutates.
-        var snap = new Dictionary<AgentKind, int>(_runningPerAgent.Count);
-        foreach (var kv in _runningPerAgent)
-            if (kv.Value > 0) snap[kv.Key] = kv.Value;
+        var snap = new Dictionary<AgentKind, int>();
+        foreach (var kv in _runningPerRoute)
+        {
+            if (kv.Value <= 0) continue;
+            var kind = new AgentKind(AgentInstanceIds.KindFromRouteKey(kv.Key));
+            snap[kind] = snap.TryGetValue(kind, out var existing) ? existing + kv.Value : kv.Value;
+        }
         return snap;
     }
 
@@ -273,10 +289,46 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             : 0;
     }
 
+    internal int GetAgentCap(AgentMembership member)
+    {
+        var opts = _concurrencySnapshot.Current;
+        if (opts.Members.TryGetValue(member.RouteKey, out var exact) && exact is { MaxConcurrent: > 0 })
+            return exact.MaxConcurrent;
+        return opts.Members.TryGetValue(member.Agent.Value, out var entry) && entry is { MaxConcurrent: > 0 }
+            ? entry.MaxConcurrent
+            : 0;
+    }
+
     public bool HasCapacity(AgentKind agent)
     {
         var cap = GetAgentCap(agent);
         return cap <= 0 || GetRunning(agent) < cap;
+    }
+
+    public bool HasCapacity(AgentMembership member)
+    {
+        var cap = GetAgentCap(member);
+        return cap <= 0 || GetRunning(member) < cap;
+    }
+
+    private int GetRunningForRoute(string routeKey) =>
+        _runningPerRoute.TryGetValue(routeKey, out var n) ? n : 0;
+
+    private int GetAgentCapForRoute(AgentKind agent, string routeKey)
+    {
+        var opts = _concurrencySnapshot.Current;
+        if (opts.Members.TryGetValue(routeKey, out var exact) && exact is { MaxConcurrent: > 0 })
+            return exact.MaxConcurrent;
+        return opts.Members.TryGetValue(agent.Value, out var byKind) && byKind is { MaxConcurrent: > 0 }
+            ? byKind.MaxConcurrent
+            : 0;
+    }
+
+    private static string ResolveDirectRouteKey(AgentKind agent, string? routeKeyOrInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(routeKeyOrInstanceId))
+            return agent.Value;
+        return AgentInstanceIds.RouteKey(agent, routeKeyOrInstanceId);
     }
 
     /// <summary>
@@ -340,8 +392,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 caps[kv.Key] = kv.Value.MaxConcurrent;
         }
         var running = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in _runningPerAgent)
-            if (kv.Value > 0) running[kv.Key.Value] = kv.Value;
+        foreach (var kv in _runningPerRoute)
+            if (kv.Value > 0) running[kv.Key] = kv.Value;
 
         return new ConcurrencyStateSnapshot(
             GlobalMaxConcurrent: _opts.MaxConcurrentWorkers,
@@ -365,26 +417,36 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     public bool TryReserve(AgentKind agent)
     {
-        var cap = GetAgentCap(agent);
+        return TryReserveRoute(agent.Value, GetAgentCap(agent));
+    }
+
+    /// <inheritdoc />
+    public bool TryReserve(AgentMembership member)
+    {
+        return TryReserveRoute(member.RouteKey, GetAgentCap(member));
+    }
+
+    private bool TryReserveRoute(string routeKey, int cap)
+    {
         if (cap <= 0)
         {
             // No per-agent cap configured — still increment so /concurrency reflects reality.
-            _runningPerAgent.AddOrUpdate(agent, 1, static (_, v) => v + 1);
+            _runningPerRoute.AddOrUpdate(routeKey, 1, static (_, v) => v + 1);
             return true;
         }
 
         while (true)
         {
-            if (_runningPerAgent.TryGetValue(agent, out var current))
+            if (_runningPerRoute.TryGetValue(routeKey, out var current))
             {
                 if (current >= cap) return false;
-                if (_runningPerAgent.TryUpdate(agent, current + 1, current)) return true;
+                if (_runningPerRoute.TryUpdate(routeKey, current + 1, current)) return true;
                 // Lost a race; retry the read and re-evaluate the cap.
             }
             else
             {
-                // First reservation for this agent kind in this process.
-                if (_runningPerAgent.TryAdd(agent, 1)) return true;
+                // First reservation for this route key in this process.
+                if (_runningPerRoute.TryAdd(routeKey, 1)) return true;
                 // Lost the add race against another reserver; fall through to the
                 // TryGetValue branch which will TryUpdate against the observed value.
             }
@@ -397,6 +459,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     public void Release(AgentKind agent)
     {
+        ReleaseRoute(agent.Value);
+    }
+
+    /// <inheritdoc />
+    public void Release(AgentMembership member)
+    {
+        ReleaseRoute(member.RouteKey);
+    }
+
+    private void ReleaseRoute(string routeKey)
+    {
         // Decrement-or-remove: drop the key when it hits 0 so the next
         // TryReserveAgentSlot takes the TryAdd branch cleanly. Holding the key
         // at 0 would cause TryUpdate(..., 1, 0) to be the only valid path —
@@ -404,14 +477,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // the dictionary and turns Snapshot/GetConcurrencyState into a fuller scan.
         while (true)
         {
-            if (!_runningPerAgent.TryGetValue(agent, out var current)) return;
+            if (!_runningPerRoute.TryGetValue(routeKey, out var current)) return;
             if (current <= 1)
             {
-                if (_runningPerAgent.TryRemove(new KeyValuePair<AgentKind, int>(agent, current))) return;
+                if (_runningPerRoute.TryRemove(new KeyValuePair<string, int>(routeKey, current))) return;
             }
             else
             {
-                if (_runningPerAgent.TryUpdate(agent, current - 1, current)) return;
+                if (_runningPerRoute.TryUpdate(routeKey, current - 1, current)) return;
             }
             // Lost a race; retry.
         }
@@ -1420,7 +1493,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // Per-agent slot tracking: set when the router pins the item to an agent
         // and the reservation succeeds. Cleared in the outer finally so a deferral
         // or crash cannot leak the slot.
-        AgentKind? agentForRelease = null;
+        string? agentRouteForRelease = null;
         bool agentSlotReserved = false;
 
         try
@@ -1565,10 +1638,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         var deferDelay = decision.SuggestedRecheckIn;
                         if (decision.AnyMemberAtCap)
                         {
-                            foreach (var atCapAgent in decision.AtCapAgents)
+                            if (decision.AtCapMembers.Count > 0)
                             {
-                                AuditLog.ConcurrencyGated(item.Id, atCapAgent,
-                                    GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                                foreach (var atCapMember in decision.AtCapMembers)
+                                {
+                                    AuditLog.ConcurrencyGated(item.Id, atCapMember.Agent,
+                                        GetRunning(atCapMember), GetAgentCap(atCapMember));
+                                }
+                            }
+                            else
+                            {
+                                foreach (var atCapAgent in decision.AtCapAgents)
+                                {
+                                    AuditLog.ConcurrencyGated(item.Id, atCapAgent,
+                                        GetRunning(atCapAgent), GetAgentCap(atCapAgent));
+                                }
                             }
                         }
                         AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
@@ -1578,12 +1662,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
                 if (decision.Chosen is { } chosen)
                 {
-                    item = item with { Agent = chosen.Agent, ModelId = chosen.ModelId, ReasoningMode = chosen.ReasoningMode };
+                    item = item with
+                    {
+                        Agent = chosen.Agent,
+                        AgentInstanceId = chosen.RouteKey,
+                        ModelId = chosen.ModelId,
+                        ReasoningMode = chosen.ReasoningMode,
+                    };
                     if (decision.SlotReserved)
                     {
                         // Router already reserved the slot through our gate —
                         // outer finally releases on every exit path.
-                        agentForRelease = chosen.Agent;
+                        agentRouteForRelease = chosen.RouteKey;
                         agentSlotReserved = true;
                     }
                 }
@@ -1623,21 +1713,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     return;
                 }
 
-                agentForRelease = item.Agent;
                 if (item.Agent is { } routedAgent)
                 {
-                    if (!TryReserve(routedAgent))
+                    var routeKey = ResolveDirectRouteKey(routedAgent, item.AgentInstanceId);
+                    var cap = GetAgentCapForRoute(routedAgent, routeKey);
+                    if (!TryReserveRoute(routeKey, cap))
                     {
-                        var cap = GetAgentCap(routedAgent);
-                        var running = GetRunning(routedAgent);
+                        var running = GetRunningForRoute(routeKey);
                         _log.LogInformation(
-                            "Worker {WorkerId} deferring {Id}: per-agent cap reached for {Agent} (running={Running} cap={Cap})",
-                            workerIndex, id, routedAgent.Value, running, cap);
+                            "Worker {WorkerId} deferring {Id}: per-agent cap reached for {RouteKey} (running={Running} cap={Cap})",
+                            workerIndex, id, routeKey, running, cap);
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
                         ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
+                    agentRouteForRelease = routeKey;
                     agentSlotReserved = true;
                 }
             }
@@ -1831,9 +1922,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // which it was incremented). Doing this here — rather than at the
             // call site — guarantees we never leak a slot on the disk-deferred /
             // budget-deferred / pipeline-exception code paths.
-            if (agentSlotReserved && agentForRelease is { } releaseAgent)
+            if (agentSlotReserved && agentRouteForRelease is { } releaseRoute)
             {
-                Release(releaseAgent);
+                ReleaseRoute(releaseRoute);
             }
 
             // Stop the heartbeat and remove the registry row on any exit path

@@ -46,6 +46,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                     phase               TEXT NOT NULL,
                     iteration           INTEGER,
                     agent_kind          TEXT NOT NULL,
+                    agent_instance_id   TEXT,
                     model_id            TEXT,
                     input_tokens        INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -61,15 +62,16 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                     ON work_item_costs(work_item_id, started_at);
                 """;
             createCmd.ExecuteNonQuery();
+            RunMigration("ALTER TABLE work_item_costs ADD COLUMN agent_instance_id TEXT;");
 
             _insertCmd = _conn.CreateCommand();
             _insertCmd.CommandText = """
                 INSERT INTO work_item_costs
-                    (id, work_item_id, phase, iteration, agent_kind, model_id,
+                    (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
                      estimated_usd, started_at, ended_at, raw_metadata_json)
                 VALUES
-                    ($id, $wi, $phase, $iter, $kind, $model,
+                    ($id, $wi, $phase, $iter, $kind, $instance, $model,
                      $input, $cached, $output,
                      $usd, $started, $ended, $meta)
                 """;
@@ -78,6 +80,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             _insertCmd.Parameters.Add("$phase", SqliteType.Text);
             _insertCmd.Parameters.Add("$iter", SqliteType.Integer);
             _insertCmd.Parameters.Add("$kind", SqliteType.Text);
+            _insertCmd.Parameters.Add("$instance", SqliteType.Text);
             _insertCmd.Parameters.Add("$model", SqliteType.Text);
             _insertCmd.Parameters.Add("$input", SqliteType.Integer);
             _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
@@ -104,6 +107,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             _insertCmd.Parameters["$phase"].Value = cost.Phase;
             _insertCmd.Parameters["$iter"].Value = cost.Iteration.HasValue ? (object)cost.Iteration.Value : DBNull.Value;
             _insertCmd.Parameters["$kind"].Value = cost.AgentKind;
+            _insertCmd.Parameters["$instance"].Value = cost.AgentInstanceId is not null ? cost.AgentInstanceId : DBNull.Value;
             _insertCmd.Parameters["$model"].Value = cost.ModelId is not null ? (object)cost.ModelId : DBNull.Value;
             _insertCmd.Parameters["$input"].Value = cost.InputTokens;
             _insertCmd.Parameters["$cached"].Value = cost.CachedInputTokens;
@@ -120,6 +124,20 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         }
     }
 
+    private void RunMigration(string sql)
+    {
+        try
+        {
+            using var m = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals
+            m.CommandText = sql;
+            m.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
+        }
+    }
+
     public async Task<IReadOnlyList<WorkItemCost>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
     {
         // Read-only query: open a separate read connection to avoid holding the write lock
@@ -129,7 +147,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
 
         using var cmd = readConn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
+            SELECT id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                    input_tokens, cached_input_tokens, output_tokens,
                    estimated_usd, started_at, ended_at, raw_metadata_json
             FROM work_item_costs
@@ -174,7 +192,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             var placeholders = string.Join(",", chunk.Select((_, i) => $"$wi{i}"));
             // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- placeholders are $-prefixed indices, all values bound via parameters
             cmd.CommandText = $"""
-                SELECT id, work_item_id, phase, iteration, agent_kind, model_id,
+                SELECT id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                        input_tokens, cached_input_tokens, output_tokens,
                        estimated_usd, started_at, ended_at, raw_metadata_json
                 FROM work_item_costs
@@ -216,7 +234,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
 
         using var cmd = readConn.CreateCommand();
         cmd.CommandText = """
-            SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.model_id,
+            SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.agent_instance_id, c.model_id,
                    c.input_tokens, c.cached_input_tokens, c.output_tokens,
                    c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json
             FROM work_item_costs c
@@ -369,11 +387,11 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             using var insert = _conn.CreateCommand();
             insert.CommandText = """
                 INSERT INTO work_item_costs
-                    (id, work_item_id, phase, iteration, agent_kind, model_id,
+                    (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
                      estimated_usd, started_at, ended_at, raw_metadata_json)
                 VALUES
-                    ($id, $wi, $phase, $iter, $kind, NULL,
+                    ($id, $wi, $phase, $iter, $kind, NULL, NULL,
                      $input, $cached, $output, $usd, $started, $ended, $meta)
                 """;
             BindReconcile(insert, row);
@@ -422,14 +440,15 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         Phase = r.GetString(2),
         Iteration = r.IsDBNull(3) ? null : r.GetInt32(3),
         AgentKind = r.GetString(4),
-        ModelId = r.IsDBNull(5) ? null : r.GetString(5),
-        InputTokens = r.GetInt32(6),
-        CachedInputTokens = r.GetInt32(7),
-        OutputTokens = r.GetInt32(8),
-        EstimatedUsd = r.GetDouble(9),
-        StartedAt = DateTimeOffset.Parse(r.GetString(10)),
-        EndedAt = DateTimeOffset.Parse(r.GetString(11)),
-        RawMetadataJson = r.GetString(12),
+        AgentInstanceId = r.IsDBNull(5) ? null : r.GetString(5),
+        ModelId = r.IsDBNull(6) ? null : r.GetString(6),
+        InputTokens = r.GetInt32(7),
+        CachedInputTokens = r.GetInt32(8),
+        OutputTokens = r.GetInt32(9),
+        EstimatedUsd = r.GetDouble(10),
+        StartedAt = DateTimeOffset.Parse(r.GetString(11)),
+        EndedAt = DateTimeOffset.Parse(r.GetString(12)),
+        RawMetadataJson = r.GetString(13),
     };
 
     private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row)

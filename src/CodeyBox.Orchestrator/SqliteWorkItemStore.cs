@@ -52,6 +52,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     base_branch TEXT,
                     work_branch TEXT,
                     agent TEXT,
+                    agent_instance_id TEXT,
                     work_timeout_ticks INTEGER NOT NULL,
                     merge_timeout_ticks INTEGER NOT NULL,
                     push_upstream INTEGER NOT NULL,
@@ -97,6 +98,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             // Additive migration: add agent_class_id column for quota-aware routing.
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
+            // Additive migration: selected agent instance route key for per-account credentials.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_instance_id TEXT;");
 
             // Additive migration: add queue_position for admin-dashboard reorder support.
             // Default 0 = "no explicit position" → store treats as sort-last (behind timestamp-based positions).
@@ -389,7 +392,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             {
                 cmd.Transaction = tx;
                 cmd.CommandText = """
-                    INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent,
+                    INSERT INTO work_items (id, project_id, title, prompt, base_branch, work_branch, agent, agent_instance_id,
                         work_timeout_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
@@ -402,7 +405,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup)
-                    VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
+                    VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
@@ -500,6 +503,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
+                    agent_instance_id = $agent_instance_id,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
@@ -564,6 +568,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 UPDATE work_items SET
                     project_id = $project_id, title = $title,
                     base_branch = $base, work_branch = $work, agent = $agent,
+                    agent_instance_id = $agent_instance_id,
                     work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
                     state = $state, updated_at = $ua, last_error = $err,
                     upstream_push_attempts = $att, depends_on_json = $deps,
@@ -1661,6 +1666,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$base", (object?)item.BaseBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$work", (object?)item.WorkBranch ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent", (object?)item.Agent?.Value ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$agent_instance_id", (object?)item.AgentInstanceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$wt", item.WorkTimeout.Ticks);
         cmd.Parameters.AddWithValue("$mt", item.MergeTimeout.Ticks);
         cmd.Parameters.AddWithValue("$pu", item.PushUpstream ? 1 : 0);
@@ -1737,6 +1743,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         BaseBranch = r.IsDBNull(r.GetOrdinal("base_branch")) ? null : r.GetString(r.GetOrdinal("base_branch")),
         WorkBranch = r.IsDBNull(r.GetOrdinal("work_branch")) ? null : r.GetString(r.GetOrdinal("work_branch")),
         Agent = r.IsDBNull(r.GetOrdinal("agent")) ? null : new AgentKind(r.GetString(r.GetOrdinal("agent"))),
+        AgentInstanceId = ReadNullableString(r, "agent_instance_id"),
         WorkTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("work_timeout_ticks"))),
         MergeTimeout = new TimeSpan(r.GetInt64(r.GetOrdinal("merge_timeout_ticks"))),
         PushUpstream = r.GetInt32(r.GetOrdinal("push_upstream")) != 0,

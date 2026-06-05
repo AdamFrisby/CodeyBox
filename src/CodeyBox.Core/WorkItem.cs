@@ -73,6 +73,15 @@ public sealed record WorkItem
     public AgentKind? Agent { get; init; }
 
     /// <summary>
+    /// Stable route key for the currently selected agent instance, e.g.
+    /// <c>claude/acct-a</c>. Null means the legacy default instance for
+    /// <see cref="Agent"/>. Class routing stamps this alongside
+    /// <see cref="Agent"/> so the pipeline can inject the selected instance's
+    /// credential and attribute cost/quota/fallback rows to that instance.
+    /// </summary>
+    public string? AgentInstanceId { get; init; }
+
+    /// <summary>
     /// Optional audit profile override for this work item. Null means use the
     /// project's configured default audit profile.
     /// </summary>

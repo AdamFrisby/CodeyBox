@@ -15,7 +15,9 @@ public sealed record AgentFallbackRecord(
     AgentKind? ToAgent,
     string? ToModel,
     string Reason,
-    DateTimeOffset OccurredAt);
+    DateTimeOffset OccurredAt,
+    string? FromInstanceId = null,
+    string? ToInstanceId = null);
 
 /// <summary>
 /// Durable store of mid-iteration agent fallback events. Exposed on the

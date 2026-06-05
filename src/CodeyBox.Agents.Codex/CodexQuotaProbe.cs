@@ -32,12 +32,12 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         };
 
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly Func<AgentQuotaCredentials> _credentialsProvider;
+    private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<CodexQuotaProbe> _log;
 
-    // Single-entry cache: (token, account, snapshot, expiry). Protected by _lock.
-    private (string AccessToken, string? AccountId, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
+    // Single-entry cache: (route key, token, account, snapshot, expiry). Protected by _lock.
+    private (string RouteKey, string AccessToken, string? AccountId, AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt)? _cache;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     // Dedupes the Information log line that fires when a configured model is
@@ -62,6 +62,15 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         Func<AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<CodexQuotaProbe> log)
+        : this(httpClientFactory, _ => credentialsProvider(), cacheTtl, log)
+    {
+    }
+
+    public CodexQuotaProbe(
+        IHttpClientFactory httpClientFactory,
+        Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
+        TimeSpan cacheTtl,
+        ILogger<CodexQuotaProbe> log)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
@@ -71,16 +80,18 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
-        var credentials = _credentialsProvider();
+        var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
             return Unknown("no token configured");
+        var routeKey = member.RouteKey;
 
         AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct);
         try
         {
             if (_cache is { } entry
+                && string.Equals(entry.RouteKey, routeKey, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(entry.AccessToken, token, StringComparison.Ordinal)
                 && string.Equals(entry.AccountId, credentials.AccountId, StringComparison.Ordinal)
                 && DateTimeOffset.UtcNow < entry.ExpiresAt)
@@ -90,7 +101,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             else
             {
                 snapshot = await FetchAsync(token, credentials.AccountId, ct);
-                _cache = (token, credentials.AccountId, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
+                _cache = (routeKey, token, credentials.AccountId, snapshot, DateTimeOffset.UtcNow + _cacheTtl);
             }
         }
         finally

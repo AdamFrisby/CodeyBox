@@ -46,6 +46,7 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                     id                  TEXT PRIMARY KEY,
                     time_utc            TEXT NOT NULL,
                     agent_kind          TEXT NOT NULL,
+                    agent_instance_id   TEXT,
                     model_id            TEXT,
                     input_tokens        INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -55,25 +56,31 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_agent_model_time
                     ON agent_usage_events(agent_kind, model_id, time_utc);
+                CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time
+                    ON agent_usage_events(agent_instance_id, model_id, time_utc)
+                    WHERE agent_instance_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_usage_time
                     ON agent_usage_events(time_utc);
                 """;
             createCmd.ExecuteNonQuery();
+            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;");
 
             _insertCmd = _conn.CreateCommand();
             _insertCmd.CommandText = """
                 INSERT INTO agent_usage_events
-                    (id, time_utc, agent_kind, model_id,
+                    (id, time_utc, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
                      cost_microcents, work_item_id)
                 VALUES
-                    ($id, $time, $kind, $model,
+                    ($id, $time, $kind, $instance, $model,
                      $input, $cached, $output,
                      $cost, $wi)
                 """;
             _insertCmd.Parameters.Add("$id", SqliteType.Text);
             _insertCmd.Parameters.Add("$time", SqliteType.Text);
             _insertCmd.Parameters.Add("$kind", SqliteType.Text);
+            _insertCmd.Parameters.Add("$instance", SqliteType.Text);
             _insertCmd.Parameters.Add("$model", SqliteType.Text);
             _insertCmd.Parameters.Add("$input", SqliteType.Integer);
             _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
@@ -96,6 +103,7 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
             _insertCmd.Parameters["$id"].Value = usage.Id;
             _insertCmd.Parameters["$time"].Value = usage.TimeUtc.ToUniversalTime().ToString("O");
             _insertCmd.Parameters["$kind"].Value = usage.AgentKind;
+            _insertCmd.Parameters["$instance"].Value = usage.AgentInstanceId is not null ? usage.AgentInstanceId : DBNull.Value;
             _insertCmd.Parameters["$model"].Value = usage.ModelId is not null ? usage.ModelId : DBNull.Value;
             _insertCmd.Parameters["$input"].Value = usage.InputTokens;
             _insertCmd.Parameters["$cached"].Value = usage.CachedInputTokens;
@@ -107,6 +115,20 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         finally
         {
             _writeLock.Release();
+        }
+    }
+
+    private void RunMigration(string sql)
+    {
+        try
+        {
+            using var m = _conn.CreateCommand();
+            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals
+            m.CommandText = sql;
+            m.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
         }
     }
 

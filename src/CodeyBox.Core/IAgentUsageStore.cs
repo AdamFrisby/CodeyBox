@@ -14,6 +14,7 @@ public sealed record AgentUsageEvent
     public required string Id { get; init; }
     public required DateTimeOffset TimeUtc { get; init; }
     public required string AgentKind { get; init; }
+    public string? AgentInstanceId { get; init; }
     public string? ModelId { get; init; }
     public required int InputTokens { get; init; }
     public int CachedInputTokens { get; init; }

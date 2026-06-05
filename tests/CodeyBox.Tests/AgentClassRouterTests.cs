@@ -121,6 +121,31 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task SameKindInstanceExhausted_FallsBackToFreshSibling()
+    {
+        var acctA = Sub(Claude) with { InstanceId = "acct-a", QualityScore = 100 };
+        var acctB = Sub(Claude) with { InstanceId = "acct-b", QualityScore = 99 };
+        var probe = new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            [acctA.RouteKey] = 0.0,
+            [acctB.RouteKey] = 75.0,
+        });
+        var cls = FrontierClass(acctA, acctB);
+        var router = BuildRouter([cls], [probe]);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+        Assert.Equal("claude/acct-b", decision.Chosen.RouteKey);
+        Assert.Equal(new[] { "claude/acct-a", "claude/acct-b" }, probe.RouteKeys);
+
+        var snapshot = router.SnapshotQuotaAvailabilityByInstance();
+        Assert.Contains(snapshot, s => s.InstanceId == "claude/acct-a" && s.AvailablePct == 0.0);
+        Assert.Contains(snapshot, s => s.InstanceId == "claude/acct-b" && s.AvailablePct == 75.0);
+    }
+
+    [Fact]
     public async Task UnknownAvailablePct_TreatedAsAvailable_FailOpen()
     {
         var cls = FrontierClass(Sub(Claude));
@@ -369,5 +394,31 @@ internal sealed class FakeProbe : IAgentQuotaProbe
     {
         CallCount++;
         return Task.FromResult(_snapshot);
+    }
+}
+
+internal sealed class InstanceRouteProbe : IAgentQuotaProbe
+{
+    private readonly IReadOnlyDictionary<string, AgentQuotaSnapshot> _snapshotsByRoute;
+
+    public InstanceRouteProbe(AgentKind kind, IReadOnlyDictionary<string, double> availabilityByRoute)
+    {
+        Kind = kind;
+        _snapshotsByRoute = availabilityByRoute.ToDictionary(
+            kv => kv.Key,
+            kv => new AgentQuotaSnapshot { AvailablePct = kv.Value },
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    public AgentKind Kind { get; }
+
+    public List<string> RouteKeys { get; } = [];
+
+    public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+    {
+        RouteKeys.Add(member.RouteKey);
+        return Task.FromResult(_snapshotsByRoute.TryGetValue(member.RouteKey, out var snapshot)
+            ? snapshot
+            : new AgentQuotaSnapshot { AvailablePct = 100.0 });
     }
 }

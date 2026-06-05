@@ -23,9 +23,16 @@ public static class AgentClassesConfigBuilder
     /// </summary>
     public static IReadOnlyList<AgentClass> Build(
         List<AgentClassOptions> options, ILogger log)
+        => Build(options, [], log);
+
+    public static IReadOnlyList<AgentClass> Build(
+        List<AgentClassOptions> options,
+        List<AgentInstanceOptions> instances,
+        ILogger log)
     {
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<AgentClass>();
+        var instancesByRouteKey = BuildInstanceCatalog(instances);
 
         foreach (var classOpts in options)
         {
@@ -37,6 +44,7 @@ public static class AgentClassesConfigBuilder
                 throw new InvalidOperationException($"AgentClass '{classOpts.Id}' must have at least one member");
 
             var members = new List<AgentMembership>();
+            var seenMemberKeys = new HashSet<(string RouteKey, string ModelId)>();
             foreach (var m in classOpts.Members)
             {
                 if (string.IsNullOrWhiteSpace(m.Agent))
@@ -55,6 +63,21 @@ public static class AgentClassesConfigBuilder
                 // Gemini at frontier-adjacent tier REQUIRES ReasoningMode="high" — running
                 // standard-reasoning Gemini in a >=90 slot misrepresents its capability.
                 var agentKind = new AgentKind(m.Agent);
+                var instanceId = AgentInstanceIds.NormalizeInstanceId(m.InstanceId);
+                AgentInstanceOptions? configuredInstance = null;
+                if (instanceId is not null)
+                {
+                    ValidateInstanceId(instanceId, $"AgentClass '{classOpts.Id}': member '{m.Agent}' InstanceId", agentKind);
+                    var routeKey = AgentInstanceIds.RouteKey(agentKind, instanceId);
+                    if (instancesByRouteKey.TryGetValue(routeKey, out configuredInstance))
+                    {
+                        var configuredAgent = new AgentKind(configuredInstance.Agent.Trim());
+                        if (configuredAgent != agentKind)
+                            throw new InvalidOperationException(
+                                $"AgentClass '{classOpts.Id}': member '{m.Agent}' references InstanceId '{instanceId}' " +
+                                $"configured for agent '{configuredAgent.Value}'.");
+                    }
+                }
                 if (agentKind == AgentKind.Gemini && score >= 90 &&
                     !string.Equals(m.ReasoningMode, "high", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException(
@@ -75,15 +98,25 @@ public static class AgentClassesConfigBuilder
                     if (seenCapabilities.Add(tag))
                         capabilities.Add(tag);
                 }
-                members.Add(new AgentMembership
+                var credentialReference = BuildCredentialReference(m, configuredInstance);
+                var member = new AgentMembership
                 {
                     Agent = agentKind,
                     Billing = billing,
+                    InstanceId = instanceId,
+                    CredentialReference = credentialReference,
                     ModelId = m.ModelId,
                     QualityScore = score,
                     ReasoningMode = m.ReasoningMode,
                     Capabilities = capabilities,
-                });
+                };
+                var memberKey = (member.RouteKey, m.ModelId ?? string.Empty);
+                if (!seenMemberKeys.Add(memberKey))
+                    throw new InvalidOperationException(
+                        $"AgentClass '{classOpts.Id}': duplicate member route '{member.RouteKey}'" +
+                        (string.IsNullOrEmpty(m.ModelId) ? "" : $" model '{m.ModelId}'") +
+                        ". Give same-kind subscriptions distinct InstanceId values.");
+                members.Add(member);
             }
 
             var hasOnlySubscription = members.All(m => m.Billing == AgentBilling.Subscription);
@@ -101,8 +134,8 @@ public static class AgentClassesConfigBuilder
                 classOpts.Id,
                 string.Join(", ", members.Select(m =>
                     string.IsNullOrEmpty(m.ModelId)
-                        ? $"{m.Agent.Value}({m.Billing})"
-                        : $"{m.Agent.Value}/{m.ModelId}({m.Billing})")));
+                        ? $"{m.RouteKey}({m.Billing})"
+                        : $"{m.RouteKey}/{m.ModelId}({m.Billing})")));
 
             result.Add(new AgentClass
             {
@@ -115,6 +148,57 @@ public static class AgentClassesConfigBuilder
         }
 
         return result;
+    }
+
+    private static IReadOnlyDictionary<string, AgentInstanceOptions> BuildInstanceCatalog(
+        List<AgentInstanceOptions> instances)
+    {
+        var result = new Dictionary<string, AgentInstanceOptions>(StringComparer.OrdinalIgnoreCase);
+        foreach (var instance in instances)
+        {
+            if (string.IsNullOrWhiteSpace(instance.Id))
+                throw new InvalidOperationException("Each AgentInstance must have a non-empty Id");
+            if (string.IsNullOrWhiteSpace(instance.Agent))
+                throw new InvalidOperationException($"AgentInstance '{instance.Id}' must have a non-empty Agent");
+
+            var agent = new AgentKind(instance.Agent.Trim());
+            var id = AgentInstanceIds.NormalizeInstanceId(instance.Id)!;
+            ValidateInstanceId(id, $"AgentInstance '{instance.Id}' Id", agent);
+            var routeKey = AgentInstanceIds.RouteKey(agent, id);
+            if (!result.TryAdd(routeKey, instance))
+                throw new InvalidOperationException($"AgentInstance route '{routeKey}' is not unique");
+        }
+        return result;
+    }
+
+    private static AgentCredentialReference? BuildCredentialReference(
+        AgentMembershipOptions member,
+        AgentInstanceOptions? configuredInstance)
+    {
+        var reference = new AgentCredentialReference
+        {
+            FilePath = TrimToNull(member.CredentialFilePath) ?? TrimToNull(configuredInstance?.CredentialFilePath),
+            TokenEnvironmentVariable = TrimToNull(member.TokenEnvironmentVariable) ?? TrimToNull(configuredInstance?.TokenEnvironmentVariable),
+            AuthJsonEnvironmentVariable = TrimToNull(member.AuthJsonEnvironmentVariable) ?? TrimToNull(configuredInstance?.AuthJsonEnvironmentVariable),
+            SettingsFilePath = TrimToNull(member.SettingsFilePath) ?? TrimToNull(configuredInstance?.SettingsFilePath),
+            DestinationPath = TrimToNull(member.DestinationPath) ?? TrimToNull(configuredInstance?.DestinationPath),
+            SandboxEnvironmentVariable = TrimToNull(member.SandboxEnvironmentVariable) ?? TrimToNull(configuredInstance?.SandboxEnvironmentVariable),
+        };
+        return reference.HasAnyReference ? reference : null;
+    }
+
+    private static string? TrimToNull(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static void ValidateInstanceId(string id, string label, AgentKind agent)
+    {
+        if (id.IndexOf('\0') >= 0)
+            throw new InvalidOperationException($"{label} must not contain a null character");
+        if (id.Any(char.IsWhiteSpace))
+            throw new InvalidOperationException($"{label} must not contain whitespace");
+        if (id.Contains('/', StringComparison.Ordinal)
+            && !string.Equals(AgentInstanceIds.KindFromRouteKey(id), agent.Value, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"{label} route prefix must match agent '{agent.Value}'");
     }
 
     /// <summary>
