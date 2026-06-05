@@ -78,7 +78,6 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
                 if (snapshot is not null) lastLineSnapshot = snapshot;
             }
             catch (JsonException) { }
-            catch (InvalidOperationException) { }
         }
 
         if (lastLineSnapshot is not null) return lastLineSnapshot;
@@ -89,7 +88,6 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             return ExtractFromDoc(doc.RootElement);
         }
         catch (JsonException) { }
-        catch (InvalidOperationException) { }
 
         return null;
     }
@@ -101,7 +99,9 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
 
         string? modelId = null;
 
-        if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
+        if (root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("model", out var m)
+            && m.ValueKind == JsonValueKind.String)
         {
             var raw = m.GetString();
             modelId = raw is { Length: > 128 } ? raw[..128] : raw;

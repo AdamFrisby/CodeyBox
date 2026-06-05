@@ -73,6 +73,23 @@ public sealed class ClaudeCostExtractorTests
     }
 
     [Fact]
+    public void HumanReadable_ParsesTotalTokenFooterWithCachedTokens()
+    {
+        var stdout = """
+            Total input tokens: 12,345
+            Cache input tokens: 5,000
+            Total output tokens: 678
+            """;
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(7345, result.InputTokens);
+        Assert.Equal(678, result.OutputTokens);
+        Assert.Equal(5000, result.CachedInputTokens);
+    }
+
+    [Fact]
     public void NullAndEmpty_ReturnsNull()
     {
         Assert.Null(Extractor.TryExtract(null, null));

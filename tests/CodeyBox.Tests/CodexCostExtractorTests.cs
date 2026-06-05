@@ -110,6 +110,32 @@ public sealed class CodexCostExtractorTests
     }
 
     [Fact]
+    public void Json_StringifiedUsagePayload_RecordsCachedTokens()
+    {
+        var stdout = """{"token_usage_json":"{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":7}"}""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(600, result.InputTokens);
+        Assert.Equal(400, result.CachedInputTokens);
+        Assert.Equal(7, result.OutputTokens);
+    }
+
+    [Fact]
+    public void Json_ArrayRootUsage_RecordsCachedTokens()
+    {
+        var stdout = """[{"usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}]""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(600, result.InputTokens);
+        Assert.Equal(400, result.CachedInputTokens);
+        Assert.Equal(7, result.OutputTokens);
+    }
+
+    [Fact]
     public void Json_MalformedUsageDetailObjects_TreatsDetailsAsAbsent()
     {
         var stdout = """{"usage":{"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":0,"input_tokens_details":null}}""";
@@ -138,14 +164,14 @@ public sealed class CodexCostExtractorTests
     [Fact]
     public void Json_CachedTokensEqualInputTotal_RecordsCachedOnlyInput()
     {
-        var stdout = """{"usage":{"prompt_tokens":1000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":1000}}}""";
+        var stdout = """{"usage":{"prompt_tokens":1000,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":1000}}}""";
 
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
         Assert.Equal(0, result.InputTokens);
         Assert.Equal(1000, result.CachedInputTokens);
-        Assert.Equal(7, result.OutputTokens);
+        Assert.Equal(0, result.OutputTokens);
     }
 
     [Fact]
