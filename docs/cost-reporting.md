@@ -116,8 +116,17 @@ Primary: scans the agent's NDJSON stdout for a `result` event with a
 `usage` field:
 
 ```json
-{"type":"result","subtype":"success","usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":890},"model":"claude-sonnet-4-6"}
+{"type":"result","subtype":"success","usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":890,"cache_creation_input_tokens":250},"model":"claude-sonnet-4-6"}
 ```
+
+Anthropic splits prompt input into three buckets: `input_tokens` (truly
+novel content), `cache_creation_input_tokens` (tokens written to cache
+this turn — priced higher than fresh on the API), and
+`cache_read_input_tokens` (read from cache — cheap). The extractor sums
+all three into `input_tokens` (the column / `AgentCostSnapshot.InputTokens`)
+so the calculator's `billable_input = input_tokens - cached_input_tokens`
+formula bills both the fresh portion and `cache_creation` at the fresh
+input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
 
 Fallback: scans stderr/stdout for the human-readable footer line emitted
 when `--output-format stream-json` is not used:
