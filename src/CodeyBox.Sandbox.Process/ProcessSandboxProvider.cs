@@ -191,24 +191,45 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
-        proc.OutputDataReceived += (_, e) =>
+        var limitOutput = exec.MaxStdoutBytes.HasValue || exec.MaxStderrBytes.HasValue;
+        if (!limitOutput)
         {
-            if (e.Data is null) return;
-            var line = e.Data + "\n";
-            stdout.Append(line);
-            exec.StdoutChunkCallback?.Invoke(line);
-        };
-        proc.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is null) return;
-            var line = e.Data + "\n";
-            stderr.Append(line);
-            exec.StderrChunkCallback?.Invoke(line);
-        };
+            proc.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stdout.Append(line);
+                exec.StdoutChunkCallback?.Invoke(line);
+            };
+            proc.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stderr.Append(line);
+                exec.StderrChunkCallback?.Invoke(line);
+            };
+        }
 
         proc.Start();
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
+        Task<LimitedReadResult>? limitedStdoutTask = null;
+        Task<LimitedReadResult>? limitedStderrTask = null;
+        if (limitOutput)
+        {
+            void KillForLimit()
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            }
+
+            limitedStdoutTask = ReadLimitedAsync(
+                proc.StandardOutput, exec.MaxStdoutBytes, exec.StdoutChunkCallback, KillForLimit, ct);
+            limitedStderrTask = ReadLimitedAsync(
+                proc.StandardError, exec.MaxStderrBytes, exec.StderrChunkCallback, KillForLimit, ct);
+        }
+        else
+        {
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+        }
         if (exec.Stdin is not null)
         {
             await proc.StandardInput.WriteAsync(exec.Stdin);
@@ -225,8 +246,79 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox
             throw;
         }
 
+        if (limitedStdoutTask is not null && limitedStderrTask is not null)
+        {
+            var stdoutResult = await limitedStdoutTask;
+            var stderrResult = await limitedStderrTask;
+            return new SandboxExecResult(
+                proc.ExitCode,
+                stdoutResult.Text,
+                stderrResult.Text,
+                stdoutResult.LimitExceeded,
+                stderrResult.LimitExceeded);
+        }
+
         return new SandboxExecResult(proc.ExitCode, stdout.ToString(), stderr.ToString());
     }
+
+    private static async Task<LimitedReadResult> ReadLimitedAsync(
+        StreamReader reader,
+        int? maxBytes,
+        Action<string>? chunkCallback,
+        Action onLimitExceeded,
+        CancellationToken ct)
+    {
+        const int readBufferChars = 4096;
+        var output = new StringBuilder();
+        var buffer = new char[readBufferChars];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+            if (read == 0)
+                return new LimitedReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            if (maxBytes is { } limit)
+            {
+                var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+                if (totalBytes + chunkBytes > limit)
+                {
+                    var remaining = Math.Max(0, limit - totalBytes);
+                    if (remaining > 0)
+                    {
+                        var truncated = TakeUtf8Prefix(chunk, remaining);
+                        output.Append(truncated);
+                        chunkCallback?.Invoke(truncated);
+                    }
+
+                    onLimitExceeded();
+                    return new LimitedReadResult(output.ToString(), LimitExceeded: true);
+                }
+
+                totalBytes += chunkBytes;
+            }
+
+            output.Append(chunk);
+            chunkCallback?.Invoke(chunk);
+        }
+    }
+
+    private static string TakeUtf8Prefix(string input, int maxBytes)
+    {
+        var bytes = 0;
+        for (var i = 0; i < input.Length; i++)
+        {
+            var charBytes = Encoding.UTF8.GetByteCount(input.AsSpan(i, 1));
+            if (bytes + charBytes > maxBytes)
+                return input[..i];
+            bytes += charBytes;
+        }
+        return input;
+    }
+
+    private sealed record LimitedReadResult(string Text, bool LimitExceeded);
 
     /// <summary>
     /// Maps a sandbox-absolute path under a known mount point to its host-fs

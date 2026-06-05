@@ -35,7 +35,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
         Assert.Equal("build ok\n", result.RawOutput);
-        Assert.Contains(sandbox.Executed, argv => argv.SequenceEqual(["sh", "-c", "./build.sh"]));
+        var presence = Assert.Single(sandbox.Executed, IsPresenceCheck);
+        Assert.Equal("/work/repo", presence.WorkingDirectory);
+        var build = Assert.Single(sandbox.Executed, IsBuildExecution);
+        Assert.Equal("/work/repo", build.WorkingDirectory);
+        Assert.Equal(BuildScriptAuditor.OutputCaptureMaxBytes, build.MaxStdoutBytes);
+        Assert.Equal(BuildScriptAuditor.OutputCaptureMaxBytes, build.MaxStderrBytes);
     }
 
     [Fact]
@@ -64,9 +69,16 @@ public sealed class BuildScriptAuditorTests : IDisposable
     [Fact]
     public async Task AbsentAndOptional_SkipsWithoutBlocking()
     {
-        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
-            ? new SandboxExecResult(1, "", "")
-            : new SandboxExecResult(99, "should not run", ""));
+        var sandbox = new StubSandbox(exec =>
+        {
+            if (IsPresenceCheck(exec))
+                return new SandboxExecResult(1, "", "");
+            if (IsBaseRefProbe(exec))
+                return new SandboxExecResult(0, "", "");
+            if (IsBaseBuildScriptProbe(exec))
+                return new SandboxExecResult(128, "", "fatal: path 'build.sh' does not exist");
+            return new SandboxExecResult(99, "should not run", "");
+        });
 
         var result = await new BuildScriptAuditor().RunAsync(
             sandbox,
@@ -76,7 +88,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
         Assert.Equal("build.sh absent; auditor skipped", result.RawOutput);
-        Assert.DoesNotContain(sandbox.Executed, argv => argv.SequenceEqual(["sh", "-c", "./build.sh"]));
+        Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
     }
 
     [Fact]
@@ -95,25 +107,53 @@ public sealed class BuildScriptAuditorTests : IDisposable
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
         Assert.Equal("build.sh missing", finding.Title);
+        Assert.DoesNotContain(sandbox.Executed, IsBaseBuildScriptProbe);
     }
 
     [Fact]
-    public async Task Exit127_ThrowsCouldNotVerifyInsteadOfFinding()
+    public async Task AbsentOnWorkBranchButPresentOnBase_IsBlockingMissingScriptFinding()
+    {
+        var sandbox = new StubSandbox(exec =>
+        {
+            if (IsPresenceCheck(exec))
+                return new SandboxExecResult(1, "", "");
+            if (IsBaseRefProbe(exec))
+                return new SandboxExecResult(0, "", "");
+            if (IsBaseBuildScriptProbe(exec))
+                return new SandboxExecResult(0, "", "");
+            return new SandboxExecResult(99, "should not run", "");
+        });
+
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx(required: false));
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal("build.sh missing", finding.Title);
+        Assert.Contains("base branch contains", finding.Description);
+        Assert.DoesNotContain(sandbox.Executed, IsBuildExecution);
+    }
+
+    [Fact]
+    public async Task Exit127FromScript_IsBlockingBuildFailedFinding()
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(127, "", "command not found\n"));
 
-        var ex = await Assert.ThrowsAsync<BuildScriptAuditUnavailableException>(() =>
-            new BuildScriptAuditor().RunAsync(
-                sandbox,
-                "/work/repo",
-                Ctx()));
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
 
-        Assert.Contains("could-not-verify", ex.Message);
-        Assert.Contains("exit 127", ex.Message);
-        Assert.Equal(127, ex.ExitCode);
-        Assert.Contains("command not found", ex.Output);
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains("build.sh exited with code 127", finding.Description);
+        Assert.Contains("command not found", finding.Description);
     }
 
     [Fact]
@@ -121,7 +161,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
     {
         var sandbox = new TimeoutSandbox();
 
-        var ex = await Assert.ThrowsAsync<BuildScriptAuditUnavailableException>(() =>
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
             new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 1 }).RunAsync(
                 sandbox,
                 "/work/repo",
@@ -133,7 +173,123 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_Exit127_FailsInfrastructureAndDoesNotPersistCodeFinding()
+    public async Task BuildExecThrows_ThrowsCouldNotVerifyInsteadOfFinding()
+    {
+        var sandbox = new ThrowOnBuildSandbox();
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("could not execute", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(126)]
+    [InlineData(127)]
+    public async Task PresenceProbeCannotExecute_ThrowsCouldNotVerifyInsteadOfSkip(int exitCode)
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(exitCode, "", "shell unavailable")
+            : new SandboxExecResult(99, "should not run", ""));
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx(required: false)));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains($"exit {exitCode}", ex.Message);
+    }
+
+    [Fact]
+    public async Task PresenceProbeThrows_ThrowsCouldNotVerifyInsteadOfSkip()
+    {
+        var sandbox = new ThrowOnPresenceSandbox();
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx(required: false)));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("check for ./build.sh", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("multipass transient daemon error after 2 retries (multipass-socket-error) during exec on vm: socket failed")]
+    [InlineData("multipass daemon unreachable after 2 retries (multipass-socket-unreachable) during exec on vm; health probe failed: down; last stderr: socket failed")]
+    public async Task ProviderExecFailureResult_ThrowsCouldNotVerifyInsteadOfBuildFinding(string stderr)
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(0, "", "")
+            : new SandboxExecResult(1, "", stderr));
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
+
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("build.sh could not execute", ex.Message);
+    }
+
+    [Fact]
+    public async Task OutputLimitExceeded_IsBlockingFindingWithTruncationNotice()
+    {
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(0, "", "")
+            : new SandboxExecResult(137, "partial stdout", "", StdoutLimitExceeded: true));
+
+        var result = await new BuildScriptAuditor().RunAsync(
+            sandbox,
+            "/work/repo",
+            Ctx());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains("output exceeded the per-stream capture limit", finding.Description);
+        Assert.Contains("stdout truncated", finding.Description);
+        Assert.Contains("stdout truncated", result.RawOutput);
+    }
+
+    [Fact]
+    public async Task TimeoutOptionsAccessor_EvaluatedPerRun()
+    {
+        var calls = 0;
+        var auditor = new BuildScriptAuditor(() =>
+        {
+            calls++;
+            return new BuildScriptAuditorOptions { TimeoutSeconds = 30 + calls };
+        });
+        var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
+            ? new SandboxExecResult(0, "", "")
+            : new SandboxExecResult(0, "ok", ""));
+
+        await auditor.RunAsync(sandbox, "/work/repo", Ctx());
+        await auditor.RunAsync(sandbox, "/work/repo", Ctx());
+
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
+    public void BuildScriptAuditor_IsCredentialFreeAndIsolated()
+    {
+        var auditor = new BuildScriptAuditor();
+
+        Assert.Equal(AuditCapabilities.None, auditor.Required);
+        Assert.True(((IAuditSandboxIsolation)auditor).RequiresFreshSandbox);
+    }
+
+    [Fact]
+    public async Task Pipeline_Exit127_PersistsBuildFindingAndFailsAudit()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -160,11 +316,97 @@ public sealed class BuildScriptAuditorTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("could-not-verify", final.LastError);
-        Assert.Contains("exit 127", final.LastError);
-        Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build failed", final.LastError);
+        var report = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        var finding = Assert.Single(report.Findings);
+        Assert.Equal("build failed", finding.Title);
+        Assert.Contains("missing tool", report.RawOutput);
+    }
+
+    [Fact]
+    public async Task Pipeline_RequiredMissingBuildScript_FailsAuditEndToEnd()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var projectAudit = new ProjectAudit
+        {
+            MaxIterations = 1,
+            AuditTypes = ["scripted"],
+            BuildScriptRequired = true,
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 })],
+            maxAuditIterations: 1,
+            projectAudit: projectAudit,
+            auditReportStore: reports,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/build-script-required-missing") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitFileToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "work.txt",
+            "work complete\n");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("build.sh missing", final.LastError);
+        var report = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.Contains(report.Findings, f => f.Title == "build.sh missing");
+    }
+
+    [Fact]
+    public async Task Pipeline_BuildScriptCannotTamperWithLaterPromptRevisionAuditor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors:
+            [
+                new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 }),
+                new PromptRevisionTrailerAuditor(),
+            ],
+            maxAuditIterations: 1,
+            auditReportStore: reports,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        var item = NewItem("feature/build-script-tamper") with { State = WorkItemState.WorkComplete };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitBuildScriptToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            """
+            #!/bin/sh
+            git config user.email audit@example.invalid
+            git config user.name Audit
+            git commit --allow-empty -m "tampered audit clone
+
+            CodeyBox-Prompt-Revision: 1"
+            echo tampered audit clone
+            """);
+
+        await tp.Store.CreateAsync(item);
+        await tp.Store.RecordIterationDispatchAsync(item.Id, 1, 1, DateTimeOffset.UtcNow, CancellationToken.None);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains($"missing {CodeyBoxTrailers.PromptRevisionTrailerKey}", final.LastError);
+        Assert.Contains(reports.Reports, r =>
+            r.AuditorName == BuildScriptAuditor.AuditorName &&
+            r.WorstSeverity == "none" &&
+            r.RawOutput!.Contains("tampered audit clone"));
+        var trailerReport = Assert.Single(reports.Reports, r => r.AuditorName == PromptRevisionTrailerAuditor.AuditorName);
+        Assert.Contains(trailerReport.Findings, f => f.Title.Contains($"missing {CodeyBoxTrailers.PromptRevisionTrailerKey}"));
     }
 
     [Fact]
@@ -234,6 +476,15 @@ public sealed class BuildScriptAuditorTests : IDisposable
     private static bool IsPresenceCheck(SandboxExec exec)
         => exec.Argv.SequenceEqual(["sh", "-c", "test -f ./build.sh"]);
 
+    private static bool IsBuildExecution(SandboxExec exec)
+        => exec.Argv.SequenceEqual(["sh", "-c", "./build.sh"]);
+
+    private static bool IsBaseRefProbe(SandboxExec exec)
+        => exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"]);
+
+    private static bool IsBaseBuildScriptProbe(SandboxExec exec)
+        => exec.Argv.SequenceEqual(["git", "-C", "/work/repo", "cat-file", "-e", "refs/remotes/origin/main:build.sh"]);
+
     private static async Task CommitBuildScriptToBareBranchAsync(
         string barePath,
         string branch,
@@ -267,10 +518,38 @@ public sealed class BuildScriptAuditorTests : IDisposable
         }
     }
 
+    private static async Task CommitFileToBareBranchAsync(
+        string barePath,
+        string branch,
+        string relativePath,
+        string contents)
+    {
+        var clone = Directory.CreateTempSubdirectory("codeybox-build-script-branch-").FullName;
+        try
+        {
+            await TestSupport.RunGit(clone, "clone", barePath, ".");
+            await TestSupport.RunGit(clone, "config", "user.email", "test@example.invalid");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+
+            var path = Path.Combine(clone, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, contents);
+
+            await TestSupport.RunGit(clone, "add", relativePath);
+            await TestSupport.RunGit(clone, "commit", "-m", "work complete");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
+        }
+        finally
+        {
+            try { Directory.Delete(clone, recursive: true); } catch { }
+        }
+    }
+
     private sealed class StubSandbox : ISandbox
     {
         private readonly Func<SandboxExec, SandboxExecResult> _handler;
-        public List<IReadOnlyList<string>> Executed { get; } = [];
+        public List<SandboxExec> Executed { get; } = [];
 
         public StubSandbox(Func<SandboxExec, SandboxExecResult> handler)
             => _handler = handler;
@@ -279,7 +558,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            Executed.Add(exec.Argv.ToArray());
+            Executed.Add(exec);
             return Task.FromResult(_handler(exec));
         }
 
@@ -300,6 +579,30 @@ public sealed class BuildScriptAuditorTests : IDisposable
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new SandboxExecResult(0, "should not run", "");
         }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ThrowOnBuildSandbox : ISandbox
+    {
+        public string Id => "throw-build";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (IsPresenceCheck(exec))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            throw new InvalidOperationException("sandbox exec failed");
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ThrowOnPresenceSandbox : ISandbox
+    {
+        public string Id => "throw-presence";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            => throw new InvalidOperationException("presence probe failed");
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }

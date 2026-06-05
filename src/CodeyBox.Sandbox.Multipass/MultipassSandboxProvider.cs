@@ -3686,8 +3686,17 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        var result = await ExecRunAsync(exec, ct);
-        return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+        var result = await ExecRunAsync(
+            exec,
+            ct,
+            exec.MaxStdoutBytes,
+            exec.MaxStderrBytes);
+        return new SandboxExecResult(
+            result.ExitCode,
+            result.Stdout,
+            result.Stderr,
+            result.StdoutLimitExceeded,
+            result.StderrLimitExceeded);
     }
 
     private async Task<ProcessRunResult> ExecRunAsync(

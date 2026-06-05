@@ -1273,9 +1273,9 @@ public sealed class PipelineRunner : IPipelineRunner
             _log.LogWarning(ex, "Work item {Id} could not verify required build", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
-        catch (BuildScriptAuditUnavailableException ex)
+        catch (AuditUnavailableException ex)
         {
-            _log.LogWarning(ex, "Work item {Id} could not verify build.sh audit gate", item.Id);
+            _log.LogWarning(ex, "Work item {Id} could not verify audit gate", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (AuditHistoryLoadFailedException ex)
@@ -4586,30 +4586,71 @@ public sealed class PipelineRunner : IPipelineRunner
             // Tool auditors: one shared sandbox, sequential.
             if (toolPairs.Count > 0)
             {
-                await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-                if (credential is not null && credential.Files.Count > 0)
-                    await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
-                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
-
-                foreach (var (auditor, runner, member) in toolPairs)
+                async Task<ISandbox> CreatePreparedToolSandboxAsync()
                 {
-                    var run = await ExecAuditorAsync(
-                        sandbox,
-                        auditor,
-                        runner,
-                        workRunner,
-                        credential,
-                        member?.RouteKey,
-                        project,
-                        ctx,
-                        ct);
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
-                    if (needsCreds && runner.Kind != workRunner.Kind)
-                        activeAuditAgentKind ??= runner.Kind;
-                    findings.AddRange(run.Result.Findings);
-                    if (project.Audit.StopOnFirstFailure && run.Result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                        return (findings, activeAuditAgentKind);
+                    var prepared = await _sandboxes.CreateAsync(spec, ct);
+                    try
+                    {
+                        if (credential is not null && credential.Files.Count > 0)
+                            await MaterialiseCredentialFilesAsync(prepared, credential, ct);
+                        await Run(prepared, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                        await Run(prepared, "git", "-C", SandboxConventions.WorkDir, "checkout", ctx.WorkBranch);
+                        return prepared;
+                    }
+                    catch
+                    {
+                        await prepared.DisposeAsync();
+                        throw;
+                    }
+                }
+
+                ISandbox? sharedToolSandbox = null;
+                try
+                {
+                    foreach (var (auditor, runner, member) in toolPairs)
+                    {
+                        AuditorRunRecord run;
+                        if (auditor is IAuditSandboxIsolation { RequiresFreshSandbox: true })
+                        {
+                            await using var isolatedSandbox = await CreatePreparedToolSandboxAsync();
+                            run = await ExecAuditorAsync(
+                                isolatedSandbox,
+                                auditor,
+                                runner,
+                                workRunner,
+                                credential,
+                                member?.RouteKey,
+                                project,
+                                ctx,
+                                ct);
+                        }
+                        else
+                        {
+                            sharedToolSandbox ??= await CreatePreparedToolSandboxAsync();
+                            run = await ExecAuditorAsync(
+                                sharedToolSandbox,
+                                auditor,
+                                runner,
+                                workRunner,
+                                credential,
+                                member?.RouteKey,
+                                project,
+                                ctx,
+                                ct);
+                        }
+
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        if (needsCreds && runner.Kind != workRunner.Kind)
+                            activeAuditAgentKind ??= runner.Kind;
+                        findings.AddRange(run.Result.Findings);
+                        if (project.Audit.StopOnFirstFailure && run.Result.Findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                            return (findings, activeAuditAgentKind);
+                    }
+                }
+                finally
+                {
+                    if (sharedToolSandbox is not null)
+                        await sharedToolSandbox.DisposeAsync();
                 }
             }
 

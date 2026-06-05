@@ -32,13 +32,40 @@ public sealed class GraphicalSmokeWiringTests
         Assert.Contains(registeredAuditors, a => a is BuildScriptAuditor && a.Name == BuildScriptAuditor.AuditorName);
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        // gui:smoke is composed FIRST (prepended for graphical projects); the
-        // always-on build-script and prompt-revision auditors are appended
-        // after preset auditors. With no language/auditType presets this
-        // project ends up with all three registered auditors composed.
+        // gui:smoke is composed FIRST (prepended for graphical projects);
+        // prompt-revision runs before the branch-controlled build script.
+        // With no language/auditType presets this project ends up with all
+        // three registered auditors composed.
         Assert.Equal(3, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
+        Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
+        Assert.IsType<BuildScriptAuditor>(composed[2]);
+    }
+
+    [Fact]
+    public void ProgramComposesBuildScriptAuditorForDefaultHeadlessProject()
+    {
+        var project = new Project
+        {
+            Id = new ProjectId("headless"),
+            DisplayName = "Headless",
+            RepositoryUrl = "https://example.com/headless.git",
+            Audit = new ProjectAudit
+            {
+                Languages = [],
+                AuditTypes = [],
+            },
+        };
+
+        using var factory = new WorkItemApiFactory(null, project);
+        var composer = factory.Services.GetRequiredService<ProjectAuditorComposer>();
+
+        var composed = composer.Compose(project, new ScriptedAgent([]));
+
+        Assert.Equal(2, composed.Count);
+        Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
-        Assert.IsType<PromptRevisionTrailerAuditor>(composed[2]);
+        Assert.Contains(composed, a => a.Name == BuildScriptAuditor.AuditorName);
+        Assert.DoesNotContain(composed, a => a.Name == "gui:smoke");
     }
 }

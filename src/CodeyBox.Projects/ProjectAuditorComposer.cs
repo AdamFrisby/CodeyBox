@@ -101,15 +101,6 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor("gui:smoke", auditors, prepend: true);
         }
 
-        // Always include the language-agnostic build-script auditor. It is a
-        // credential-free tool auditor that no-ops unless the branch carries a
-        // repo-root build.sh or the project requires one.
-        if (!auditors.Any(a => a.Name.Equals(
-                BuildScriptAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
-        {
-            IncludeRegisteredAuditor(BuildScriptAuditor.AuditorName, auditors, prepend: false);
-        }
-
         // Always include the deterministic prompt-revision trailer auditor.
         // It is cheap (single git log -1), requires no agent credentials, and
         // enforces the cross-iteration invariant that the agent's HEAD commit
@@ -117,9 +108,19 @@ public sealed class ProjectAuditorComposer
         // snapshotted at dispatch time. A missing or stale trailer means the
         // agent finished against an old prompt — a blocking finding.
         if (!auditors.Any(a => a.Name.Equals(
-                "process:prompt-revision-trailer", StringComparison.OrdinalIgnoreCase)))
+                PromptRevisionTrailerAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
         {
-            IncludeRegisteredAuditor("process:prompt-revision-trailer", auditors, prepend: false);
+            IncludeRegisteredAuditor(PromptRevisionTrailerAuditor.AuditorName, auditors, prepend: false);
+        }
+
+        // Always include the language-agnostic build-script auditor last. It
+        // no-ops unless the branch carries a repo-root build.sh or the project
+        // requires one, and PipelineRunner gives isolated auditors a fresh
+        // sandbox so branch-controlled scripts cannot mutate later checks.
+        if (!auditors.Any(a => a.Name.Equals(
+                BuildScriptAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor(BuildScriptAuditor.AuditorName, auditors, prepend: false);
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
