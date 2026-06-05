@@ -136,11 +136,12 @@ is load-bearing: session resume must reattach to the same stopped/resumed VM,
 not create a fresh clone, because the working tree and any runner-local state
 belong to that VM.
 
-The handle is safe to serialize for orchestrator restart recovery. Runtime-only
-properties such as the live `ISandbox` object and `AgentCredential` are marked
-`JsonIgnore`; credentials must be reacquired through the normal credential
-provider after a restart. A persistent Claude implementation can therefore
-store a handle containing `{ sessionId: "<claude resume id>", sandbox:
+The handle is safe to serialize for orchestrator restart recovery because it
+contains only durable identifiers and non-secret metadata; it never stores the
+live `ISandbox` object or `AgentCredential`. Credentials must be reacquired
+through the normal credential provider after a restart. A persistent Claude
+implementation can therefore store a handle containing `{ sessionId:
+"<claude resume id>", sandbox:
 "<multipass vm name>" }`, stop the VM between phases, and later run the next
 turn by resuming that VM and invoking Claude with its resume ID. The Anthropic
 prompt cache is server-side, so a live process is not required between turns;

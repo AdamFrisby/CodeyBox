@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace CodeyBox.Core;
 
@@ -71,7 +72,7 @@ public interface ISessionAgentRunner : IAgentRunner
 /// provider-side cache benefit but lets non-session runners participate in the
 /// session contract. Handles opened in the current process resolve through
 /// adapter-private state. Hosts that need restart recovery must provide a
-/// sandbox reattacher and, when needed, a credential resolver; the persisted
+/// sandbox reattacher and, when needed, a credential provider; the persisted
 /// handle itself never stores live objects or secret material.
 /// </summary>
 public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
@@ -79,7 +80,7 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
     private readonly IAgentRunner _inner;
     private readonly Func<ISandbox, AgentSessionSandboxRef> _sandboxRefFactory;
     private readonly Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? _sandboxReattacher;
-    private readonly Func<AgentKind, CancellationToken, Task<AgentCredential?>>? _credentialResolver;
+    private readonly ICredentialProvider? _credentialProvider;
     private readonly ConcurrentDictionary<string, StatelessSessionState> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _closedSessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _reattachLocks = new(StringComparer.Ordinal);
@@ -93,8 +94,8 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
     /// back to a live sandbox object. Without it, inactive/deserialized handles
     /// are rejected explicitly.
     /// </param>
-    /// <param name="credentialResolver">
-    /// Optional hook for reacquiring credentials after restart. When omitted,
+    /// <param name="credentialProvider">
+    /// Optional provider for reacquiring credentials after restart. When omitted,
     /// reattached turns run with a null credential, matching image-baked auth
     /// scenarios.
     /// </param>
@@ -105,12 +106,12 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
     public StatelessSessionAgentRunner(
         IAgentRunner inner,
         Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? sandboxReattacher = null,
-        Func<AgentKind, CancellationToken, Task<AgentCredential?>>? credentialResolver = null,
+        ICredentialProvider? credentialProvider = null,
         Func<ISandbox, AgentSessionSandboxRef>? sandboxRefFactory = null)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _sandboxReattacher = sandboxReattacher;
-        _credentialResolver = credentialResolver;
+        _credentialProvider = credentialProvider;
         _sandboxRefFactory = sandboxRefFactory ?? (static sandbox => new AgentSessionSandboxRef(sandbox.Id));
     }
 
@@ -185,22 +186,28 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         ct.ThrowIfCancellationRequested();
 
         var state = await ResolveStateAsync(sessionHandle, ct);
-        lock (state.Gate)
+        await state.Gate.WaitAsync(ct);
+        try
         {
+            ThrowIfClosed(state);
             if (state.Suspended)
                 throw new InvalidOperationException("Cannot send an agent turn while the session is suspended.");
-        }
 
-        return await _inner.RunAsync(
-            state.Sandbox,
-            sessionHandle.WorkingDirectory,
-            prompt,
-            state.Credential,
-            sessionHandle.ModelId,
-            sessionHandle.ReasoningMode,
-            ct,
-            stdoutChunkCallback,
-            captureStructuredStream);
+            return await _inner.RunAsync(
+                state.Sandbox,
+                sessionHandle.WorkingDirectory,
+                prompt,
+                state.Credential,
+                sessionHandle.ModelId,
+                sessionHandle.ReasoningMode,
+                ct,
+                stdoutChunkCallback,
+                captureStructuredStream);
+        }
+        finally
+        {
+            state.Gate.Release();
+        }
     }
 
     public async Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
@@ -209,9 +216,15 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         EnsureKind(sessionHandle);
         ct.ThrowIfCancellationRequested();
         var state = await ResolveStateAsync(sessionHandle, ct);
-        lock (state.Gate)
+        await state.Gate.WaitAsync(ct);
+        try
         {
+            ThrowIfClosed(state);
             state.Suspended = true;
+        }
+        finally
+        {
+            state.Gate.Release();
         }
     }
 
@@ -221,9 +234,15 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         EnsureKind(sessionHandle);
         ct.ThrowIfCancellationRequested();
         var state = await ResolveStateAsync(sessionHandle, ct);
-        lock (state.Gate)
+        await state.Gate.WaitAsync(ct);
+        try
         {
+            ThrowIfClosed(state);
             state.Suspended = false;
+        }
+        finally
+        {
+            state.Gate.Release();
         }
     }
 
@@ -233,16 +252,22 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         ct.ThrowIfCancellationRequested();
 
         EnsureKind(sessionHandle);
-        ThrowIfClosed(sessionHandle);
-        if (!_sessions.TryRemove(sessionHandle.SessionId, out var state))
+        var state = await ResolveStateAsync(sessionHandle, ct);
+        await state.Gate.WaitAsync(ct);
+        try
         {
-            state = await ResolveStateAsync(sessionHandle, ct);
-            _sessions.TryRemove(sessionHandle.SessionId, out _);
-        }
+            ThrowIfClosed(state);
+            await state.Sandbox.DisposeAsync();
 
-        _closedSessions[sessionHandle.SessionId] = 0;
-        _reattachLocks.TryRemove(sessionHandle.SessionId, out _);
-        await state.Sandbox.DisposeAsync();
+            state.Closed = true;
+            _sessions.TryRemove(sessionHandle.SessionId, out _);
+            _closedSessions[sessionHandle.SessionId] = 0;
+            _reattachLocks.TryRemove(sessionHandle.SessionId, out _);
+        }
+        finally
+        {
+            state.Gate.Release();
+        }
     }
 
     private async Task<StatelessSessionState> ResolveStateAsync(
@@ -277,12 +302,12 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
                 if (sandbox is null)
                     throw new InvalidOperationException("The configured sandbox reattacher returned null.");
 
-                var credential = _credentialResolver is null
+                var credential = _credentialProvider is null
                     ? null
-                    : await _credentialResolver(sessionHandle.RunnerKind, ct);
+                    : await _credentialProvider.GetAsync(sessionHandle.RunnerKind, ct);
                 if (credential is not null && credential.Agent != sessionHandle.RunnerKind)
                     throw new InvalidOperationException(
-                        $"Credential resolver returned credentials for '{credential.Agent}', not '{sessionHandle.RunnerKind}'.");
+                        $"Credential provider returned credentials for '{credential.Agent}', not '{sessionHandle.RunnerKind}'.");
 
                 state = new StatelessSessionState(sandbox, credential);
                 _sessions[sessionHandle.SessionId] = state;
@@ -317,20 +342,30 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
             throw new InvalidOperationException("This agent session has already been closed.");
     }
 
+    private static void ThrowIfClosed(StatelessSessionState state)
+    {
+        if (state.Closed)
+            throw new InvalidOperationException("This agent session has already been closed.");
+    }
+
     private sealed class StatelessSessionState(ISandbox sandbox, AgentCredential? credential)
     {
-        public object Gate { get; } = new();
+        public SemaphoreSlim Gate { get; } = new(1, 1);
         public ISandbox Sandbox { get; } = sandbox;
         public AgentCredential? Credential { get; } = credential;
         public bool Suspended { get; set; }
+        public bool Closed { get; set; }
     }
 }
 
 public static class AgentSessionRunnerExtensions
 {
+    private static readonly ConditionalWeakTable<IAgentRunner, ISessionAgentRunner> StatelessAdapters = new();
+
     public static ISessionAgentRunner AsSessionRunner(this IAgentRunner runner)
     {
         ArgumentNullException.ThrowIfNull(runner);
-        return runner as ISessionAgentRunner ?? new StatelessSessionAgentRunner(runner);
+        return runner as ISessionAgentRunner
+            ?? StatelessAdapters.GetValue(runner, static inner => new StatelessSessionAgentRunner(inner));
     }
 }

@@ -198,6 +198,67 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
+    public async Task StatelessAdapter_SendTurn_ReturnsInnerResultUnchanged()
+    {
+        var expected = new AgentResult(false, "scripted failure", "scripted stdout", "scripted stderr");
+        var inner = new RecordingAgentRunner();
+        inner.ScriptedResults.Enqueue(expected);
+        var runner = new StatelessSessionAgentRunner(inner);
+        var handle = await runner.OpenSessionAsync(new RecordingSandbox("vm-result"), "/work", credential: null);
+
+        var result = await runner.SendTurnAsync(handle, "failed turn");
+
+        Assert.Same(expected, result);
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_Close_WaitsForInFlightTurnBeforeDisposingSandbox()
+    {
+        var inner = new RecordingAgentRunner
+        {
+            RunStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            ReleaseRun = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var runner = new StatelessSessionAgentRunner(inner);
+        var sandbox = new RecordingSandbox("vm-close-active-turn");
+        var handle = await runner.OpenSessionAsync(sandbox, "/work", credential: null);
+
+        var sendTask = runner.SendTurnAsync(handle, "slow turn");
+        await inner.RunStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var closeTask = runner.CloseSessionAsync(handle);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        Assert.False(closeTask.IsCompleted);
+        Assert.Equal(0, sandbox.DisposeCount);
+
+        inner.ReleaseRun.SetResult();
+        await sendTask;
+        await closeTask;
+
+        Assert.Equal(1, sandbox.DisposeCount);
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_CloseFailure_CanBeRetried()
+    {
+        var runner = new StatelessSessionAgentRunner(new RecordingAgentRunner());
+        var sandbox = new ThrowingDisposeSandbox("vm-close-retry", failuresBeforeSuccess: 1);
+        var handle = await runner.OpenSessionAsync(sandbox, "/work", credential: null);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => runner.CloseSessionAsync(handle));
+
+        Assert.Contains("dispose failed", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, sandbox.DisposeCount);
+
+        await runner.CloseSessionAsync(handle);
+
+        Assert.Equal(2, sandbox.DisposeCount);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => runner.CloseSessionAsync(handle));
+    }
+
+    [Fact]
     public async Task StatelessAdapter_DeserializedHandle_ReattachesSandboxAndCredential()
     {
         var original = new StatelessSessionAgentRunner(
@@ -229,12 +290,12 @@ public sealed class AgentSessionRunnerTests
                 reattachedRefs.Add(sandboxRef);
                 return Task.FromResult<ISandbox>(reattachedSandbox);
             },
-            credentialResolver: (kind, ct) =>
+            credentialProvider: new DelegateCredentialProvider((kind, ct) =>
             {
                 ct.ThrowIfCancellationRequested();
                 credentialKinds.Add(kind);
                 return Task.FromResult<AgentCredential?>(resolvedCredential);
-            });
+            }));
 
         await restarted.ResumeSessionAsync(persisted);
         var result = await restarted.SendTurnAsync(persisted, "after restart");
@@ -252,7 +313,45 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
-    public async Task StatelessAdapter_ReattachWithThrowingCredentialResolver_DisposesSandbox()
+    public async Task StatelessAdapter_ConcurrentPersistedHandleOperations_ReattachOnceAndShareState()
+    {
+        var inner = new RecordingAgentRunner();
+        var reattachedSandbox = new RecordingSandbox("vm-concurrent-reattach");
+        var reattacherStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseReattacher = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reattachCount = 0;
+        var runner = new StatelessSessionAgentRunner(
+            inner,
+            sandboxReattacher: async (sandboxRef, ct) =>
+            {
+                Assert.Equal("vm-concurrent-reattach", sandboxRef.Id);
+                Interlocked.Increment(ref reattachCount);
+                reattacherStarted.TrySetResult();
+                await releaseReattacher.Task.WaitAsync(ct);
+                return reattachedSandbox;
+            });
+        var handle = new AgentSessionHandle(
+            AgentKind.Claude,
+            "stateless-claude-concurrent-reattach",
+            new AgentSessionSandboxRef("vm-concurrent-reattach"),
+            "/work");
+
+        var first = runner.SendTurnAsync(handle, "first after restart");
+        await reattacherStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var second = runner.SendTurnAsync(handle, "second after restart");
+
+        await Task.Delay(TimeSpan.FromMilliseconds(50));
+        releaseReattacher.SetResult();
+
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(1, reattachCount);
+        Assert.Equal(2, inner.Calls.Count);
+        Assert.All(inner.Calls, call => Assert.Same(reattachedSandbox, call.Sandbox));
+    }
+
+    [Fact]
+    public async Task StatelessAdapter_ReattachWithThrowingCredentialProvider_DisposesSandbox()
     {
         var sandbox = new RecordingSandbox("vm-credential-throws");
         var runner = new StatelessSessionAgentRunner(
@@ -262,11 +361,11 @@ public sealed class AgentSessionRunnerTests
                 ct.ThrowIfCancellationRequested();
                 return Task.FromResult<ISandbox>(sandbox);
             },
-            credentialResolver: static (_, ct) =>
+            credentialProvider: new DelegateCredentialProvider(static (_, ct) =>
             {
                 ct.ThrowIfCancellationRequested();
                 throw new InvalidOperationException("credential unavailable");
-            });
+            }));
         var handle = new AgentSessionHandle(
             AgentKind.Claude,
             "stateless-claude-credential-throws",
@@ -291,11 +390,11 @@ public sealed class AgentSessionRunnerTests
                 ct.ThrowIfCancellationRequested();
                 return Task.FromResult<ISandbox>(sandbox);
             },
-            credentialResolver: static (_, ct) =>
+            credentialProvider: new DelegateCredentialProvider(static (_, ct) =>
             {
                 ct.ThrowIfCancellationRequested();
                 return Task.FromResult<AgentCredential?>(MakeCredential("wrong-agent", AgentKind.Codex));
-            });
+            }));
         var handle = new AgentSessionHandle(
             AgentKind.Claude,
             "stateless-claude-wrong-credential",
@@ -305,7 +404,7 @@ public sealed class AgentSessionRunnerTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => runner.ResumeSessionAsync(handle));
 
-        Assert.Contains("Credential resolver returned credentials", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Credential provider returned credentials", ex.Message, StringComparison.Ordinal);
         Assert.Equal(1, sandbox.DisposeCount);
     }
 
@@ -402,10 +501,12 @@ public sealed class AgentSessionRunnerTests
     [Fact]
     public async Task StatelessAdapter_RunAsyncAndClassifyFailure_PassThroughToInnerRunner()
     {
+        var runResult = new AgentResult(false, "one-shot failed", "one-shot stdout", "one-shot stderr");
         var inner = new RecordingAgentRunner
         {
             Classification = new AgentFailureClassification(AgentFailureKind.QuotaExhausted, Reason: "from-inner"),
         };
+        inner.ScriptedResults.Enqueue(runResult);
         var runner = new StatelessSessionAgentRunner(inner);
         var sandbox = new RecordingSandbox("vm-passthrough");
 
@@ -420,7 +521,7 @@ public sealed class AgentSessionRunnerTests
         var failure = new AgentResult(false, "failed", Stdout: null, Stderr: "stderr");
         var classification = runner.ClassifyFailure(failure);
 
-        Assert.True(run.Success);
+        Assert.Same(runResult, run);
         var call = Assert.Single(inner.Calls);
         Assert.Same(sandbox, call.Sandbox);
         Assert.Equal("one shot", call.Prompt);
@@ -433,14 +534,25 @@ public sealed class AgentSessionRunnerTests
     }
 
     [Fact]
-    public void AsSessionRunner_WrapsStatelessRunnerAndPreservesNativeSessionRunner()
+    public async Task AsSessionRunner_WrapsStatelessRunnerAndPreservesNativeSessionRunner()
     {
-        IAgentRunner stateless = new RecordingAgentRunner();
-        var wrapped = stateless.AsSessionRunner();
+        var stateless = new RecordingAgentRunner();
+        var wrapped = ((IAgentRunner)stateless).AsSessionRunner();
         var native = new NativeSessionAgentRunner();
 
         Assert.IsType<StatelessSessionAgentRunner>(wrapped);
+        Assert.Same(wrapped, ((IAgentRunner)stateless).AsSessionRunner());
         Assert.Same(native, ((IAgentRunner)native).AsSessionRunner());
+
+        var sandbox = new RecordingSandbox("vm-as-session-runner");
+        var handle = await wrapped.OpenSessionAsync(sandbox, "/work", credential: null);
+        var result = await wrapped.SendTurnAsync(handle, "through wrapper");
+        await wrapped.CloseSessionAsync(handle);
+
+        Assert.True(result.Success);
+        var call = Assert.Single(stateless.Calls);
+        Assert.Same(sandbox, call.Sandbox);
+        Assert.Equal("through wrapper", call.Prompt);
     }
 
     [Fact]
@@ -464,10 +576,13 @@ public sealed class AgentSessionRunnerTests
     {
         public AgentKind Kind => AgentKind.Claude;
         public List<AgentCall> Calls { get; } = [];
+        public Queue<AgentResult> ScriptedResults { get; } = new();
+        public TaskCompletionSource? RunStarted { get; init; }
+        public TaskCompletionSource? ReleaseRun { get; init; }
         public AgentFailureClassification Classification { get; set; } = new(AgentFailureKind.Normal);
         public AgentResult? ClassifiedResult { get; private set; }
 
-        public Task<AgentResult> RunAsync(
+        public async Task<AgentResult> RunAsync(
             ISandbox sandbox,
             string workingDirectory,
             string prompt,
@@ -488,7 +603,13 @@ public sealed class AgentSessionRunnerTests
                 reasoningMode,
                 captureStructuredStream));
             stdoutChunkCallback?.Invoke($"chunk:{prompt}");
-            return Task.FromResult(new AgentResult(true, "ok", prompt, null));
+            RunStarted?.TrySetResult();
+            if (ReleaseRun is not null)
+                await ReleaseRun.Task.WaitAsync(ct);
+
+            return ScriptedResults.Count > 0
+                ? ScriptedResults.Dequeue()
+                : new AgentResult(true, "ok", prompt, null);
         }
 
         public AgentFailureClassification ClassifyFailure(AgentResult result)
@@ -496,6 +617,13 @@ public sealed class AgentSessionRunnerTests
             ClassifiedResult = result;
             return Classification;
         }
+    }
+
+    private sealed class DelegateCredentialProvider(
+        Func<AgentKind, CancellationToken, Task<AgentCredential?>> getCredential) : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+            => getCredential(agent, ct);
     }
 
     private sealed record AgentCall(
@@ -522,6 +650,30 @@ public sealed class AgentSessionRunnerTests
         public ValueTask DisposeAsync()
         {
             DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingDisposeSandbox(string id, int failuresBeforeSuccess) : ISandbox
+    {
+        private int _remainingFailures = failuresBeforeSuccess;
+
+        public string Id { get; } = id;
+        public int DisposeCount { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            _ = exec;
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            if (_remainingFailures-- > 0)
+                throw new InvalidOperationException("dispose failed");
+
             return ValueTask.CompletedTask;
         }
     }
