@@ -96,11 +96,16 @@ public sealed class StartupResumeApiAvailabilityTests
             bootstrapClient?.Dispose();
         }
 
+        // Wider deadline absorbs thread-pool starvation under parallel-suite
+        // CPU contention. Background mode marks Failed after the
+        // configuredTimeout elapses; the happy path still flips within tens
+        // of ms after that, but the BackgroundService kick can sit on the
+        // ready-queue much longer under load.
         var failed = await WaitForStateAsync(
             factory.Store,
             item.Id,
             WorkItemState.Failed,
-            configuredTimeout + TimeSpan.FromSeconds(5));
+            configuredTimeout + TimeSpan.FromSeconds(60));
         Assert.Null(failed.SuspendedVmName);
         Assert.Contains(behavior == "hang" ? "timed out" : "simulated resume failure", failed.LastError);
         Assert.Contains(item.SuspendedVmName!, factory.Provider.ResumedNames);

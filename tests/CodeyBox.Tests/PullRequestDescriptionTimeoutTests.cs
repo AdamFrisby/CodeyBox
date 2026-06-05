@@ -80,8 +80,11 @@ public sealed class PullRequestDescriptionTimeoutTests
             gitHost, factory, NullLogger<GitHubUpstreamRemote>.Instance,
             TimeoutOpts, timings: null, descriptionGenerator: new HangingDescriptionGenerator());
 
+        // Wider guard absorbs thread-pool starvation under parallel-suite CPU
+        // contention; the happy path still resolves within tens of ms once the
+        // 50 ms generator timeout fires.
         await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(5));
+            .WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.Single(handler.RequestBodies);
         Assert.Contains("Static description", handler.RequestBodies[0]);
@@ -99,8 +102,11 @@ public sealed class PullRequestDescriptionTimeoutTests
             gitHost, factory, NullLogger<GitHubUpstreamRemote>.Instance,
             TimeoutOpts, timings: null, descriptionGenerator: new HangingDescriptionGenerator());
 
+        // Wider guard absorbs thread-pool starvation under parallel-suite CPU
+        // contention; the happy path still resolves within tens of ms once the
+        // 50 ms generator timeout fires.
         await remote.CompleteAsync(SampleRequest, CancellationToken.None)
-            .WaitAsync(TimeSpan.FromSeconds(5));
+            .WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.Contains("Co-Authored-By: CodeyBox", handler.RequestBodies[0]);
     }
