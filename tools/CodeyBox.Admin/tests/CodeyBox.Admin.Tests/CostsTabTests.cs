@@ -68,13 +68,13 @@ public sealed class CostsTabTests : TestContext
     public void WorkItemCosts_ShowsSummaryWithUsd()
     {
         var fake = new FakeApiClient([]);
-        fake.CostsOverride[ItemId] = MakeCosts(estimatedUsd: 0.168525);
+        fake.CostsOverride[ItemId] = MakeCosts(estimatedUsd: 0.168525, elapsedMs: 0);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("$", cut.Markup);
-        Assert.Contains("12", cut.Markup);
+        Assert.Contains("12.3K input", cut.Markup);
     }
 
     [Fact]

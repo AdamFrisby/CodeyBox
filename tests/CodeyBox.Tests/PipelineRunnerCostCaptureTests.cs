@@ -15,8 +15,8 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies that PipelineRunner writes cost rows via IWorkItemCostStore when
-/// an IAgentCostExtractor returns a snapshot or is registered but cannot extract
-/// tokens, and does not throw or write rows when no extractor is registered.
+/// an IAgentCostExtractor returns a snapshot, cannot extract tokens, or no
+/// extractor is registered for the completed agent invocation.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class PipelineRunnerCostCaptureTests : IDisposable
@@ -70,19 +70,43 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
-    public async Task MissingExtractor_NoCostRow()
+    public async Task MissingExtractor_WritesElapsedFallbackCostAndUsageRows()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var costStore = new RecordingCostStore();
-        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, registerExtractor: false);
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            registerExtractor: false,
+            usageStore: usageStore,
+            agentKind: AgentKind.Opencode);
 
         tp.Agent.WorkPlan.Enqueue(new FileWrite("no-extractor.txt", "x\n"));
 
-        var item = NewItem("feature/no-extractor");
+        var item = NewItem("feature/no-extractor") with
+        {
+            Agent = AgentKind.Opencode,
+            ModelId = "opencode-default-model",
+        };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        Assert.Empty(costStore.Recorded);
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("opencode", workRow.AgentKind);
+        Assert.Equal("opencode-default-model", workRow.ModelId);
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.False(workRow.HasExtractedTokenUsage);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("opencode", usage.AgentKind);
+        Assert.Equal("opencode-default-model", usage.ModelId);
+        Assert.Equal(workRow.StartedAt, usage.StartedUtc);
+        Assert.Equal(workRow.EndedAt, usage.EndedUtc);
+        Assert.Equal((long)(workRow.EndedAt - workRow.StartedAt).TotalMilliseconds, usage.ElapsedMs);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.OutputTokens);
     }
 
     [Fact]
@@ -201,6 +225,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(1000, workRow.InputTokens);
         Assert.Equal(100, workRow.CachedInputTokens);
         Assert.Equal(200, workRow.OutputTokens);
+        Assert.True(workRow.HasExtractedTokenUsage);
+        Assert.DoesNotContain("elapsed_fallback", workRow.RawMetadataJson);
+        Assert.DoesNotContain("extractor_null_elapsed_fallback", workRow.RawMetadataJson);
 
         Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
         Assert.Contains(usageStore.Recorded, e =>
@@ -244,7 +271,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(0, workRow.OutputTokens);
         Assert.Equal(0.0, workRow.EstimatedUsd);
         Assert.True(workRow.EndedAt > workRow.StartedAt);
-        Assert.Contains("extractor_null_elapsed_fallback", workRow.RawMetadataJson);
+        Assert.False(workRow.HasExtractedTokenUsage);
 
         Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
         var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
@@ -253,7 +280,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal("work", usage.Phase);
         Assert.Equal(workRow.StartedAt, usage.StartedUtc);
         Assert.Equal(workRow.EndedAt, usage.EndedUtc);
-        Assert.True(usage.ElapsedMs > 0);
+        Assert.Equal((long)(workRow.EndedAt - workRow.StartedAt).TotalMilliseconds, usage.ElapsedMs);
         Assert.Equal(0, usage.InputTokens);
         Assert.Equal(0, usage.CachedInputTokens);
         Assert.Equal(0, usage.OutputTokens);
@@ -324,6 +351,21 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(0, ev.CachedInputTokens);
         Assert.Equal(0, ev.OutputTokens);
         Assert.Equal(0L, ev.CostMicroCents);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_ClampsNegativeElapsed_ToZero()
+    {
+        var ended = DateTimeOffset.Parse("2026-06-01T00:00:00Z");
+        var started = ended.AddSeconds(5);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 0, CachedInputTokens: 0, OutputTokens: 0, ModelId: null);
+
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Cursor, "cursor-model", snapshot,
+            usd: 0m, new WorkItemId(Guid.NewGuid()), ended, phase: "work", startedAt: started);
+
+        Assert.Equal(0, ev.ElapsedMs);
     }
 
     [Fact]

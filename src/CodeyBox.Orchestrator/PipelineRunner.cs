@@ -39,6 +39,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private const int AuditEscalationHistoryLimit = 25;
     private const int AuditEscalationFindingsPerIterationLimit = 20;
     private const int AuditEscalationFindingDescriptionLimit = 2000;
+    private const string ElapsedFallbackMetadataSource = "elapsed_fallback";
 
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
@@ -10178,17 +10179,24 @@ Original merge-phase failure (for context):
         DateTimeOffset endedAt,
         string? dispatchModelId)
     {
-        if (_costStore is null || _costExtractors is null || _costCalculator is null) return;
-        if (!_costExtractors.TryGetValue(agentKind, out var extractor)) return;
+        if (_costStore is null) return;
 
         AgentCostSnapshot? snapshot;
-        try { snapshot = extractor.TryExtract(stdout, stderr); }
-        catch (Exception ex)
+        if (_costExtractors is not null && _costExtractors.TryGetValue(agentKind, out var extractor))
         {
-            _log.LogWarning(ex, "Cost: extractor threw for agent '{Agent}' phase '{Phase}'",
-                agentKind.Value, phase);
-            return;
+            try { snapshot = extractor.TryExtract(stdout, stderr); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Cost: extractor threw for agent '{Agent}' phase '{Phase}'; recording elapsed fallback",
+                    agentKind.Value, phase);
+                snapshot = null;
+            }
         }
+        else
+        {
+            snapshot = null;
+        }
+
         var usedElapsedFallback = snapshot is null;
         snapshot ??= new AgentCostSnapshot(
             InputTokens: 0,
@@ -10196,13 +10204,15 @@ Original merge-phase failure (for context):
             OutputTokens: 0,
             ModelId: dispatchModelId);
 
-        decimal usd;
-        try { usd = _costCalculator.Calculate(snapshot, agentKind); }
-        catch (Exception ex)
+        var usd = 0m;
+        if (!usedElapsedFallback && _costCalculator is not null)
         {
-            _log.LogWarning(ex, "Cost: calculator threw for agent '{Agent}' phase '{Phase}'",
-                agentKind.Value, phase);
-            return;
+            try { usd = _costCalculator.Calculate(snapshot, agentKind); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Cost: calculator threw for agent '{Agent}' phase '{Phase}'; recording tokens with zero estimated cost",
+                    agentKind.Value, phase);
+            }
         }
 
         try
@@ -10223,8 +10233,9 @@ Original merge-phase failure (for context):
                 StartedAt = startedAt,
                 EndedAt = endedAt,
                 RawMetadataJson = usedElapsedFallback
-                    ? """{"source":"extractor_null_elapsed_fallback"}"""
+                    ? JsonSerializer.Serialize(new { source = ElapsedFallbackMetadataSource })
                     : "{}",
+                HasExtractedTokenUsage = !usedElapsedFallback,
             }, CancellationToken.None);
 
             // Emit the same accounting as OTel counters so dashboards align with

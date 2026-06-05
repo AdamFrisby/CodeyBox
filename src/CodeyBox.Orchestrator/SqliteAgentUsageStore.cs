@@ -71,10 +71,10 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
             RunMigration("ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
             RunMigration("CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;");
 
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN phase TEXT;");
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN started_utc TEXT;");
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN ended_utc TEXT;");
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0;");
+            AddUsageColumnIfMissing("phase", "ALTER TABLE agent_usage_events ADD COLUMN phase TEXT;");
+            AddUsageColumnIfMissing("started_utc", "ALTER TABLE agent_usage_events ADD COLUMN started_utc TEXT;");
+            AddUsageColumnIfMissing("ended_utc", "ALTER TABLE agent_usage_events ADD COLUMN ended_utc TEXT;");
+            AddUsageColumnIfMissing("elapsed_ms", "ALTER TABLE agent_usage_events ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0;");
 
             _insertCmd = _conn.CreateCommand();
             _insertCmd.CommandText = """
@@ -142,19 +142,29 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         }
     }
 
-    private void RunMigration(string sql)
+    private void AddUsageColumnIfMissing(string columnName, string sql)
     {
-        try
+        if (UsageColumnExists(columnName))
+            return;
+
+        using var cmd = _conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private bool UsageColumnExists(string columnName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(agent_usage_events);";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
         {
-            using var cmd = _conn.CreateCommand();
-            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
-            cmd.CommandText = sql;
-            cmd.ExecuteNonQuery();
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
-        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
-        {
-            // Column already exists from a previous startup.
-        }
+
+        return false;
     }
 
     public async Task<AgentUsageWindowAggregate> SumWindowAsync(
