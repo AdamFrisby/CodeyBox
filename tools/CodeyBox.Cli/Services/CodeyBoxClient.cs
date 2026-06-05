@@ -132,6 +132,31 @@ internal sealed class CodeyBoxClient
         return await GetRawAsync("/queue/status", ct);
     }
 
+    internal async Task PauseAgentAsync(
+        string kind,
+        string reason,
+        double? durationSeconds = null,
+        CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/agents/{Uri.EscapeDataString(kind)}/pause",
+            new PauseAgentRequest { Reason = reason, DurationSeconds = durationSeconds },
+            CliJsonContext.Default.PauseAgentRequest,
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    internal async Task ResumeAgentAsync(string kind, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsync($"/agents/{Uri.EscapeDataString(kind)}/resume", content: null, ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    internal async Task<string> GetPausedAgentsAsync(CancellationToken ct = default)
+    {
+        return await GetRawAsync("/agents/paused", ct);
+    }
+
     internal async Task<string> GetWorkersAsync(CancellationToken ct = default)
     {
         return await GetRawAsync("/workers", ct);

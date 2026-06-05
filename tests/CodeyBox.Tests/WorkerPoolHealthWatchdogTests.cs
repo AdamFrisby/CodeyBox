@@ -573,6 +573,34 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task HealthCandidates_AgentControlItemBypassesAgentAvailabilityGate()
+    {
+        var normal = Item() with { Agent = AgentKind.Claude, Priority = 100 };
+        var control = Item() with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "maintenance",
+            },
+            Agent = AgentKind.Claude,
+            Priority = 50,
+        };
+        await _store.CreateAsync(normal);
+        await _store.CreateAsync(control);
+
+        var health = BuildHealthSource(availability: new FakeAvailabilityRegistry(available: false));
+        var candidates = await health.ListRunnableCandidatesAsync(
+            10,
+            CancellationToken.None);
+
+        Assert.Contains(candidates, i => i.Id == control.Id);
+        Assert.DoesNotContain(candidates, i => i.Id == normal.Id);
+    }
+
+    [Fact]
     public async Task AuditPassedCandidate_IsTreatedAsRunnableWork()
     {
         var item = Item() with { State = WorkItemState.AuditPassed };

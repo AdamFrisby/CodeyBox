@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -73,6 +74,174 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task PauseAndResumeAgent_UpdatesPausedAgentsList()
+    {
+        var pause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "reserve quota", durationSeconds = 3600 });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        var claude = Assert.Single(paused!);
+        Assert.Equal("claude", claude.Agent);
+        Assert.True(claude.Paused);
+        Assert.Equal("reserve quota", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+
+        var resume = await _client.PostAsJsonAsync("/agents/claude/resume", new { });
+        Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
+        paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        Assert.Empty(paused!);
+    }
+
+    [Fact]
+    public async Task AgentPauseEndpoint_UpdatesProductionDispatchAvailabilityUsedByRouter()
+    {
+        var pause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "reserve quota" });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var availability = _factory.Services
+            .GetRequiredService<IAgentDispatchAvailability>()
+            .GetAvailability(AgentKind.Claude);
+        Assert.True(AgentDispatchAvailability.IsPausedVerdict(availability));
+
+        var project = await _factory.Services
+            .GetRequiredService<IProjectRepository>()
+            .GetAsync(new ProjectId("proj"));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "dispatch integration",
+            Prompt = "do work",
+            AgentClassId = "frontier",
+        };
+
+        var decision = await _factory.Services
+            .GetRequiredService<AgentClassRouter>()
+            .ResolveAsync(item, project, CancellationToken.None);
+
+        Assert.False(decision.ShouldWait);
+        Assert.Equal(AgentKind.Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task AgentPauseEndpoints_AcceptDurationStringAndFutureExpiresAt()
+    {
+        var durationPause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "outage", duration = "6h" });
+        Assert.Equal(HttpStatusCode.OK, durationPause.StatusCode);
+
+        var paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        var claude = Assert.Single(paused!);
+        Assert.Equal("claude", claude.Agent);
+        Assert.Equal("outage", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+
+        var resume = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = "switch to absolute" });
+        Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
+
+        var future = DateTimeOffset.UtcNow.AddHours(2);
+        var expiresAtPause = await _client.PostAsJsonAsync(
+            "/agents/claude/pause",
+            new { reason = "maintenance", expiresAt = future });
+        Assert.Equal(HttpStatusCode.OK, expiresAtPause.StatusCode);
+
+        paused = await _client.GetFromJsonAsync<List<AgentPauseResponse>>("/agents/paused");
+        claude = Assert.Single(paused!);
+        Assert.Equal("maintenance", claude.PausedReason);
+        Assert.NotNull(claude.ExpiresAt);
+        Assert.True(claude.ExpiresAt >= future.AddSeconds(-5));
+    }
+
+    [Fact]
+    public async Task AgentPauseEndpoints_RejectUnknownAgentAndInvalidBodies()
+    {
+        var unknown = await _client.PostAsJsonAsync("/agents/not-real/pause", new { reason = "test" });
+        Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+
+        var unknownResume = await _client.PostAsJsonAsync("/agents/not-real/resume", new { });
+        Assert.Equal(HttpStatusCode.NotFound, unknownResume.StatusCode);
+
+        var missingReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { });
+        Assert.Equal(HttpStatusCode.BadRequest, missingReason.StatusCode);
+
+        var controlReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = "bad\nreason" });
+        Assert.Equal(HttpStatusCode.BadRequest, controlReason.StatusCode);
+
+        var longReason = new string('x', 501);
+        var tooLongReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = longReason });
+        Assert.Equal(HttpStatusCode.BadRequest, tooLongReason.StatusCode);
+
+        var conflictingExpiry = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            durationSeconds = 60,
+            expiresAt = DateTimeOffset.UtcNow.AddHours(1),
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, conflictingExpiry.StatusCode);
+
+        var nonPositiveDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            durationSeconds = 0,
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, nonPositiveDuration.StatusCode);
+
+        var badDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            duration = "12w",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, badDuration.StatusCode);
+
+        var overflowDuration = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            duration = "1e100d",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, overflowDuration.StatusCode);
+
+        var pastExpiry = await _client.PostAsJsonAsync("/agents/claude/pause", new
+        {
+            reason = "test",
+            expiresAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, pastExpiry.StatusCode);
+
+        var badResumeReason = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = "bad\nreason" });
+        Assert.Equal(HttpStatusCode.BadRequest, badResumeReason.StatusCode);
+
+        var longResumeReason = await _client.PostAsJsonAsync("/agents/claude/resume", new { reason = longReason });
+        Assert.Equal(HttpStatusCode.BadRequest, longResumeReason.StatusCode);
+    }
+
+    [Fact]
+    public async Task QuotaEndpoint_ReportsPausedAgentAsPausedAndNotAllowed()
+    {
+        var pause = await _client.PostAsJsonAsync("/agents/claude/pause", new { reason = "reserve quota" });
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var quota = await _client.GetAsync("/quota");
+        Assert.Equal(HttpStatusCode.OK, quota.StatusCode);
+        using var doc = JsonDocument.Parse(await quota.Content.ReadAsStringAsync());
+        var claude = doc.RootElement.GetProperty("probes").EnumerateArray()
+            .First(e => e.GetProperty("agent").GetString() == "claude");
+        var pausedClaude = doc.RootElement.GetProperty("pausedAgents").EnumerateArray()
+            .First(e => e.GetProperty("agent").GetString() == "claude");
+
+        Assert.True(claude.GetProperty("paused").GetBoolean());
+        Assert.True(pausedClaude.GetProperty("paused").GetBoolean());
+        Assert.Equal("paused", claude.GetProperty("dispatchStatus").GetString());
+        Assert.Contains("paused by operator", claude.GetProperty("dispatchReason").GetString());
+        Assert.False(claude.GetProperty("wouldAllow").GetBoolean());
+        Assert.False(claude.GetProperty("defaultModelWouldAllow").GetBoolean());
+    }
+
+    [Fact]
     public async Task PauseQueue_EmptyReason_Returns400()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "" });
@@ -118,6 +287,14 @@ public sealed class QueueStatusHttpTests : IDisposable
         DateTimeOffset? PausedAt,
         string? PausedReason);
 
+    private sealed record AgentPauseResponse(
+        string Agent,
+        bool Paused,
+        DateTimeOffset? PausedAt,
+        string? PausedReason,
+        string? PausedBy,
+        DateTimeOffset? ExpiresAt);
+
     private sealed record BudgetLimitsResponse(int PerHour, int PerDay, int Concurrent);
 
     private sealed record BudgetUsageResponse(
@@ -158,6 +335,15 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:Smoke:Enabled"] = "false",
+                ["CodeyBox:AgentClasses:0:Id"] = "frontier",
+                ["CodeyBox:AgentClasses:0:DisplayName"] = "Frontier",
+                ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "claude",
+                ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                ["CodeyBox:AgentClasses:0:Members:1:Agent"] = "codex",
+                ["CodeyBox:AgentClasses:0:Members:1:Billing"] = "Subscription",
+                ["CodeyBox:AgentClasses:0:Members:1:QualityScore"] = "90",
             });
         });
         builder.ConfigureTestServices(services =>
@@ -167,6 +353,9 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
             services.AddSingleton<IWorkItemStore>(Store);
             services.RemoveAll<IQueueController>();
             services.AddSingleton<IQueueController>(QueueController);
+            services.RemoveAll<IAgentQuotaProbe>();
+            services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, 100));
+            services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Codex, 100));
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project
@@ -174,6 +363,7 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
                     Id = new ProjectId("proj"),
                     DisplayName = "Test Project",
                     RepositoryUrl = "https://github.com/test/repo",
+                    DefaultAgentClass = "frontier",
                 }));
         });
     }

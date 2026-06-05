@@ -12,4 +12,17 @@ namespace CodeyBox.Core;
 /// <see cref="IInVmSmokeGate.EnsureAvailableAsync"/> call rather than binding
 /// to both the gate and the concrete availability registry.</para>
 /// </summary>
-public sealed record AgentAvailability(bool Available, string? Reason, DateTimeOffset? LastSmokePassedAt);
+public sealed record AgentAvailability(
+    bool Available,
+    string? Reason,
+    DateTimeOffset? LastSmokePassedAt,
+    AgentAvailabilityCause Cause = AgentAvailabilityCause.None);
+
+public enum AgentAvailabilityCause
+{
+    None = 0,
+    SmokeGate = 1,
+    FastFail = 2,
+    MissingProbe = 3,
+    OperatorPaused = 4,
+}

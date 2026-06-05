@@ -76,4 +76,55 @@ public sealed class FleetPagePauseButtonTests : TestContext
         Assert.Contains("Queue", cut.Markup);
         Assert.Contains("global queue pause", cut.Markup);
     }
+
+    [Fact]
+    public void Fleet_AgentPause_CallsApiWithKindReasonAndDuration()
+    {
+        var fake = new FakeApiClient([]);
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<FleetPage>();
+        cut.FindAll("input")[0].Change("claude");
+        cut.FindAll("input")[1].Change("reserve quota");
+        cut.FindAll("input")[2].Change("6");
+        cut.Find(".btn-agent-pause").Click();
+
+        Assert.Equal("claude", fake.AgentPauseKindCaptured);
+        Assert.Equal("reserve quota", fake.AgentPauseReasonCaptured);
+        Assert.Equal(21600, fake.AgentPauseDurationCaptured);
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Contains("<code>claude</code>", cut.Markup);
+            Assert.Contains("reserve quota", cut.Markup);
+            Assert.DoesNotContain("No paused agents.", cut.Markup);
+        });
+    }
+
+    [Fact]
+    public void Fleet_PausedAgentResume_CallsApi()
+    {
+        var fake = new FakeApiClient([]);
+        fake.PausedAgentsOverride =
+        [
+            new AgentPauseStateDto
+            {
+                Agent = "gemini",
+                Paused = true,
+                PausedReason = "outage",
+                PausedAt = DateTimeOffset.UtcNow,
+            },
+        ];
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<FleetPage>();
+        cut.Find(".btn-agent-resume").Click();
+
+        Assert.Equal("gemini", fake.AgentResumeKindCaptured);
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Contains("No paused agents.", cut.Markup);
+            Assert.DoesNotContain("<code>gemini</code>", cut.Markup);
+            Assert.DoesNotContain("outage", cut.Markup);
+        });
+    }
 }

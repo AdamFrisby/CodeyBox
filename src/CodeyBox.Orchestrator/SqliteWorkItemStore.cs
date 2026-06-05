@@ -137,6 +137,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_from TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_pause_target TEXT;");
+            // Resume entry-point for WaitingForAgentResume rows. Separate from
+            // quota_retry_from so agent-pause parking does not have to overload
+            // the quota-recovery column on rows that aren't quota-shaped at all.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_pause_retry_from TEXT;");
 
             // Composite indexes for fleet summary aggregation queries.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_project_state ON work_items(project_id, state);");
@@ -236,6 +241,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN job_type TEXT NOT NULL DEFAULT 'Normal';");
             // CheckAndActSpec (question + actionable condition + on-yes action). JSON.
             RunMigration("ALTER TABLE work_items ADD COLUMN check_spec_json TEXT;");
+            // AgentControlSpec (pause/resume agent control-plane action). JSON.
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_control_json TEXT;");
             // CheckVerdict (answer + evidence + confidence). JSON; populated after check completes.
             RunMigration("ALTER TABLE work_items ADD COLUMN check_verdict_json TEXT;");
             // Back-pointer from a follow-up Normal item to the CheckAndAct item that enqueued it.
@@ -388,22 +395,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         min_model_score, cancellation_reason, recovery_attempts, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
-                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, auditor_profile, priority,
+                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from, agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
                         required_capabilities_json,
-                        job_type, check_spec_json, check_verdict_json, origin_check_work_item_id,
+                        job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
-                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $auditor_profile, $priority,
+                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from, $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
                         $required_capabilities,
-                        $job_type, $check_spec, $check_verdict, $origin_check,
+                        $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup);
                     """;
@@ -513,6 +520,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
+                    agent_pause_target = $agent_pause_target,
+                    agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
@@ -521,6 +530,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
                     check_verdict_json = $check_verdict,
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
@@ -574,6 +584,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
+                    agent_pause_target = $agent_pause_target,
+                    agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
                     cancellation_source = $cancellation_source,
                     transient_cancel_retries = $transient_cancel_retries,
@@ -582,6 +594,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
                     check_verdict_json = $check_verdict,
                     origin_check_work_item_id = $origin_check,
                     re_check_verdicts_json = $re_check_verdicts,
@@ -913,7 +926,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     {(int)WorkItemState.MergeConflictResolutionFailed},
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
                     {(int)WorkItemState.NeedsOperatorInput},
-                    {(int)WorkItemState.WaitingForQuotaReset}
+                    {(int)WorkItemState.WaitingForQuotaReset},
+                    {(int)WorkItemState.WaitingForAgentResume}
                 )
                 ORDER BY
                     CASE
@@ -1002,7 +1016,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.WaitingForAgentResume}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -1685,6 +1699,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$agent_pause_target", (object?)item.AgentPauseTarget?.Value ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$agent_pause_retry_from", (object?)item.AgentPauseRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$priority", item.Priority);
         cmd.Parameters.AddWithValue("$audit_max_iterations", (object?)item.AuditMaxIterations ?? DBNull.Value);
@@ -1699,6 +1715,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$job_type", item.JobType.ToString());
         cmd.Parameters.AddWithValue("$check_spec",
             item.Check is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Check));
+        cmd.Parameters.AddWithValue("$agent_control",
+            item.AgentControl is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.AgentControl));
         cmd.Parameters.AddWithValue("$check_verdict",
             item.Verdict is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Verdict));
         cmd.Parameters.AddWithValue("$origin_check",
@@ -1753,6 +1771,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
+        AgentPauseTarget = ReadNullableAgentKind(r, "agent_pause_target"),
+        AgentPauseRetryFrom = ReadNullableString(r, "agent_pause_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
         Priority = ReadInt32OrDefault(r, "priority", defaultValue: 0),
         AuditMaxIterations = ReadNullableInt32(r, "audit_max_iterations"),
@@ -1765,6 +1785,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         RequiredCapabilities = ReadRequiredCapabilities(r),
         JobType = ReadJobType(r),
         Check = ReadCheckSpec(r),
+        AgentControl = ReadAgentControlSpec(r),
         Verdict = ReadCheckVerdict(r),
         OriginCheckWorkItemId = ReadNullableWorkItemId(r, "origin_check_work_item_id"),
         ReCheckVerdicts = ReadReCheckVerdicts(r),
@@ -1809,6 +1830,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         var json = r.GetString(ord);
         if (string.IsNullOrEmpty(json)) return null;
         try { return JsonSerializer.Deserialize<CheckAndActSpec>(json); }
+        catch (JsonException) { return null; }
+    }
+
+    private static AgentControlSpec? ReadAgentControlSpec(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("agent_control_json");
+        if (r.IsDBNull(ord)) return null;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json)) return null;
+        try { return JsonSerializer.Deserialize<AgentControlSpec>(json); }
         catch (JsonException) { return null; }
     }
 
@@ -1874,6 +1905,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         var ord = r.GetOrdinal(column);
         return r.IsDBNull(ord) ? null : r.GetString(ord);
+    }
+
+    private static AgentKind? ReadNullableAgentKind(SqliteDataReader r, string column)
+    {
+        var raw = ReadNullableString(r, column);
+        return string.IsNullOrWhiteSpace(raw) ? null : new AgentKind(raw);
     }
 
     private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader r, string column)

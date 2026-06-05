@@ -115,3 +115,16 @@ the codebase:
 ```bash
 dotnet build CodeyBox.slnx
 ```
+
+## Agent Pause Commands
+
+The operator CLI also exposes per-agent runtime pause controls:
+
+```bash
+codeybox agents pause claude --reason "reserve quota for oversight" --for 6h
+codeybox agents resume claude
+codeybox agents paused --json
+```
+
+`--for` accepts `s`, `m`, `h`, or `d` suffixes. Pausing affects new dispatch
+only; in-flight runs continue.

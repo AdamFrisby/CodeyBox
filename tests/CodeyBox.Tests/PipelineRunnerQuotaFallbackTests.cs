@@ -152,6 +152,44 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task ReworkFirstAttemptPaused_FallsBackBeforeInvokingPausedRunner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Codex, "rework-profile");
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Rework = "rework-profile",
+                Merge = "merge-profile",
+            },
+            inVmSmokeGate: pauseGate);
+
+        var codexPhases = new List<string>();
+        var claudePhases = new List<string>();
+        fix.Codex.PhaseInvocationStarted += (_, phase) => codexPhases.Add(phase);
+        fix.Claude.PhaseInvocationStarted += (_, phase) => claudePhases.Add(phase);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Contains("work", codexPhases);
+        Assert.DoesNotContain("rework", codexPhases);
+        Assert.Contains("rework", claudePhases);
+        Assert.Contains(pauseGate.Calls, c =>
+            c.Kind == AgentKind.Codex && c.Target.NetworkProfile == "rework-profile");
+    }
+
+    [Fact]
     public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
     {
         // The exact regression that prompted the mid-rework Claude 5h-window
@@ -2169,13 +2207,19 @@ internal sealed class FlakyInvolvementStore : IAgentInvolvementStore
 /// </summary>
 internal sealed class RecordingProbe : IAgentQuotaProbe
 {
+    private readonly double _availablePct;
+
     public AgentKind Kind { get; }
     public List<AgentKind> MarkedExhausted { get; } = new();
 
-    public RecordingProbe(AgentKind kind) { Kind = kind; }
+    public RecordingProbe(AgentKind kind, double availablePct = 80.0)
+    {
+        Kind = kind;
+        _availablePct = availablePct;
+    }
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = 80.0 });
+        => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = _availablePct });
 
     public Task MarkExhaustedAsync(
         AgentMembership member,

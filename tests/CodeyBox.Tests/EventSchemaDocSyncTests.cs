@@ -66,11 +66,11 @@ public sealed class EventSchemaDocSyncTests
     public void Doc_DeclaresCurrentSchemaVersion()
     {
         var doc = ReadDoc();
-        Assert.Equal("1.2", EventSchema.CurrentVersion);
+        Assert.Equal("1.3", EventSchema.CurrentVersion);
 
         var declaration = Regex.Match(doc, @"^eventSchemaVersion\s*=\s*""(?<version>\d+\.\d+)""\s*$", RegexOptions.Multiline);
         Assert.True(declaration.Success, "docs/EVENT_SCHEMA.md must declare the current eventSchemaVersion");
-        Assert.Equal("1.2", declaration.Groups["version"].Value);
+        Assert.Equal("1.3", declaration.Groups["version"].Value);
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public sealed class EventSchemaDocSyncTests
         using var parsed = JsonDocument.Parse(json);
         var root = parsed.RootElement;
 
-        Assert.Equal("1.2", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("1.3", root.GetProperty("eventSchemaVersion").GetString());
         Assert.True(root.TryGetProperty("evolutionRules", out _));
         Assert.True(root.TryGetProperty("envelope", out var envelope));
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));
@@ -99,7 +99,7 @@ public sealed class EventSchemaDocSyncTests
     [Fact]
     public void Schema_PinsExistingEnvelopeFieldsAndEventTypesToInitialVersion()
     {
-        // Current schema is 1.2, but these fields and event names existed in
+        // Current schema is 1.3, but these fields and event names existed in
         // 1.0. This guards the compatibility metadata trackers use to decide
         // whether a payload is safe for their minimum supported schema.
         var schema = EventSchema.GetSchema();
@@ -107,9 +107,14 @@ public sealed class EventSchemaDocSyncTests
         Assert.All(schema.Envelope.Values, field =>
             Assert.Equal("1.0", field.IntroducedIn));
         Assert.All(
-            schema.EventTypes.Where(kv => !kv.Key.StartsWith("worker_pool.", StringComparison.Ordinal)),
+            schema.EventTypes.Where(kv =>
+                !kv.Key.StartsWith("worker_pool.", StringComparison.Ordinal) &&
+                kv.Key is not "agent.paused" and not "agent.resumed" and not "work_item.waiting_for_agent_resume"),
             kv => Assert.Equal("1.0", kv.Value.IntroducedIn));
         Assert.Equal("1.2", schema.EventTypes["worker_pool.stalled"].IntroducedIn);
         Assert.Equal("1.2", schema.EventTypes["worker_pool.restart_required"].IntroducedIn);
+        Assert.Equal("1.3", schema.EventTypes["agent.paused"].IntroducedIn);
+        Assert.Equal("1.3", schema.EventTypes["agent.resumed"].IntroducedIn);
+        Assert.Equal("1.3", schema.EventTypes["work_item.waiting_for_agent_resume"].IntroducedIn);
     }
 }

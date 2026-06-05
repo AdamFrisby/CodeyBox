@@ -23,6 +23,27 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxTemplateChecks must be between 1 and {CodeyBoxOptions.MaximumMaxTemplateChecks}");
         }
 
+        foreach (var (agent, pause) in options.AgentPauses)
+        {
+            if (string.IsNullOrWhiteSpace(agent))
+            {
+                failures.Add("CodeyBox:AgentPauses keys must not be empty");
+                continue;
+            }
+
+            if (pause.Paused
+                && AgentPauseValidation.ValidateRequiredReason(pause.Reason, $"CodeyBox:AgentPauses:{agent}:Reason") is { } reasonError)
+                failures.Add(reasonError);
+            else if (!pause.Paused
+                && AgentPauseValidation.ValidateOptionalReason(pause.Reason, $"CodeyBox:AgentPauses:{agent}:Reason") is { } optionalReasonError)
+                failures.Add(optionalReasonError);
+
+            if (pause.DurationSeconds is { } seconds && seconds <= 0)
+                failures.Add($"CodeyBox:AgentPauses:{agent}:DurationSeconds must be positive");
+            if (pause.DurationSeconds is not null && pause.ExpiresAt is not null)
+                failures.Add($"CodeyBox:AgentPauses:{agent} must provide either DurationSeconds or ExpiresAt, not both");
+        }
+
         if (!Enum.IsDefined(options.Shutdown.SandboxResumeMode))
         {
             failures.Add("CodeyBox:Shutdown:SandboxResumeMode must be Background or Blocking");

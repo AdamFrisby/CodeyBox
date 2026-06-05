@@ -399,6 +399,44 @@ public sealed class MergeConflictReworkTests : IDisposable
             c.Target.NetworkProfile == "rework-profile");
     }
 
+    [Fact]
+    public async Task ConflictRework_PausedReworkAgent_ParksForAgentResume()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var pauseGate = new PausingTargetInVmSmokeGate(AgentKind.Claude, "rework-profile");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            networkProfiles: new ProjectNetworkProfiles
+            {
+                Work = "work-profile",
+                Merge = "merge-profile",
+                Rework = "rework-profile",
+            },
+            inVmSmokeGate: pauseGate);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        var workBranch = "codeybox/" + WorkItemId.New().ToString()[..8];
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, final!.State);
+        Assert.Equal("conflict_rework", final.AgentPauseRetryFrom);
+        Assert.Null(final.QuotaRetryFrom);
+        Assert.Equal(0, final.ConflictReworkAttempts);
+        Assert.Contains("waiting: agent paused", final.LastError);
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+        Assert.Contains(pauseGate.Calls, c =>
+            c.Kind == AgentKind.Claude &&
+            c.Target.NetworkProfile == "rework-profile");
+    }
+
     /// <summary>
     /// Anti-abandonment guard: when the rework agent runs
     /// <c>git reset --hard origin/main</c> mid-iteration (discarding prior

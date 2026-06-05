@@ -15,7 +15,7 @@ without the other, CI fails.
 ## Current version
 
 ```
-eventSchemaVersion = "1.2"
+eventSchemaVersion = "1.3"
 ```
 
 The `eventSchemaVersion` string is semver (`major.minor`). Trackers should
@@ -37,7 +37,7 @@ Every webhook + SSE payload is a JSON object with this shape:
 ```jsonc
 {
   // ── Required (since 1.0) ─────────────────────────────────────
-  "eventSchemaVersion": "1.2",                  // semver string
+  "eventSchemaVersion": "1.3",                  // semver string
   "eventType":          "work_item.done",       // stable identifier
   "emittedAt":          "2026-05-18T12:34:56.789+00:00",
 
@@ -94,6 +94,8 @@ subscribe to.
 | `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
 | `agent.smoke_recovered` | 1.0 | Previously-excluded agent recovered: a subsequent smoke probe passed. |
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
+| `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind. |
+| `agent.resumed` | 1.3 | Operator resumed dispatch to one agent kind. |
 | `sandbox.leak_detected` | 1.0 | Leaked `codeybox-*` sandbox detected by reaper. |
 | `sandbox.leak_disposed` | 1.0 | Reaper successfully disposed a leaked sandbox. |
 | `sandbox.leak_dispose_failed` | 1.0 | Reaper failed to dispose a leaked sandbox. |
@@ -120,6 +122,7 @@ subscribe to.
 | `work_item.resumed` | 1.0 | Operator-cancelled work item resumed via `POST /workitems/{id}/resume`. |
 | `work_item.needs_operator_input` | 1.0 | Work item parked awaiting operator answers. |
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
+| `work_item.waiting_for_agent_resume` | 1.3 | Work item parked because its only eligible agent is paused. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
 | `work_item.auto_retry` | 1.0 | Quota auto-retry re-queued a failed item. |
 | `work_item.recovered` | 1.0 | Dead-worker reaper recovered an item with a state-changing transition. |
@@ -144,7 +147,9 @@ subscribe to.
 
 See [`webhooks.md`](webhooks.md) for the per-event `details` payload shapes.
 Schema 1.1 adds the sandbox leak `reason` details field. Schema 1.2 adds
-worker-pool health watchdog events for dispatcher stalls and restart escalation.
+worker-pool health watchdog events for dispatcher stalls and restart
+escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
+events.
 
 ---
 

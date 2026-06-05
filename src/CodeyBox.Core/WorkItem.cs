@@ -127,6 +127,31 @@ public sealed record WorkItem
     public string? QuotaRetryFrom { get; init; }
 
     /// <summary>
+    /// Agent kind whose operator pause parked this item in
+    /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
+    /// <see cref="Agent"/> because later phases can be blocked by an audit,
+    /// merge, or conflict-rework agent that is not the original work owner.
+    /// Null means the paused blocker set had multiple agents or predates this
+    /// field; the resume scheduler requeues those rows on pause-state changes
+    /// and lets routing decide again.
+    /// </summary>
+    public AgentKind? AgentPauseTarget { get; init; }
+
+    /// <summary>
+    /// Pipeline entry point the agent-pause resume scheduler should use when
+    /// the paused agent is resumed (or its pause expires). Same value set as
+    /// <see cref="QuotaRetryFrom"/> ("work", "audit", "conflict_rework",
+    /// "merge", or "upstream") but tracked separately so agent-pause parking
+    /// does not have to overload quota-recovery plumbing on
+    /// <see cref="WorkItemState.WaitingForAgentResume"/> rows. Null until an
+    /// item is parked for agent resume; cleared when the item leaves
+    /// <see cref="WorkItemState.WaitingForAgentResume"/>. Legacy rows that
+    /// were parked before this field was introduced fall back to
+    /// <see cref="QuotaRetryFrom"/> on resume.
+    /// </summary>
+    public string? AgentPauseRetryFrom { get; init; }
+
+    /// <summary>
     /// Why the item was cancelled. Only populated when <see cref="State"/> is
     /// <see cref="WorkItemState.Cancelled"/>; null for all other states and for
     /// legacy rows written before this column existed.
@@ -387,6 +412,8 @@ public sealed record WorkItem
     /// runs a single agent invocation in a sandbox that evaluates a yes/no
     /// question against the project repo, persists a structured verdict, and
     /// optionally enqueues a follow-up <see cref="JobType.Normal"/> item.
+    /// <see cref="JobType.AgentControl"/> runs an operator control-plane pause
+    /// or resume action without launching an agent sandbox.
     /// </summary>
     public JobType JobType { get; init; } = JobType.Normal;
 
@@ -397,6 +424,12 @@ public sealed record WorkItem
     /// <see cref="JobType"/> is <see cref="JobType.CheckAndAct"/>; null otherwise.
     /// </summary>
     public CheckAndActSpec? Check { get; init; }
+
+    /// <summary>
+    /// Configuration for a <see cref="JobType.AgentControl"/> item. Null for
+    /// ordinary and check-and-act work items.
+    /// </summary>
+    public AgentControlSpec? AgentControl { get; init; }
 
     /// <summary>
     /// Verdict the agent returned for a <see cref="JobType.CheckAndAct"/> item.
@@ -490,6 +523,8 @@ public sealed record WorkItem
             QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
             QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
+            AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
+            AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
             CancellationReason = state == WorkItemState.Cancelled ? cancellationReason : null,
             // CancellationSource is preserved on Failed (so triage shows what cancelled the

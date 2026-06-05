@@ -123,6 +123,39 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_AgentControlWorkingItem_NoWorker_NoCheckpoint_Requeues()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "reserve quota",
+            },
+        };
+        await _store.CreateAsync(item);
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Null(after.StartedAt);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.LastError);
+        Assert.Equal(item.AgentControl, after.AgentControl);
+        Assert.Equal(1, _queue.Count);
+
+        var evt = Assert.Single(_webhooks.Events);
+        Assert.Equal("work_item.recovered", evt.Event);
+        Assert.NotNull(evt.WorkItem);
+        Assert.Equal(item.Id, evt.WorkItem!.Id);
+    }
+
+    [Fact]
     public async Task Sweep_WorkingItem_NoWorker_WithCheckpoint_ReenqueuesForResume()
     {
         var item = MakeItem(

@@ -294,7 +294,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return new QuotaRetryRoutingDecision(
             decision.ShouldWait,
             decision.NoEligibleMembers,
-            decision.Reason);
+            decision.Reason,
+            decision.WaitingForPausedAgent);
     }
 
     private async Task<AgentRoutingDecision> ResolveCoreAsync(
@@ -386,6 +387,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             rejected.Add((m.Agent, m.ModelId, eff, DescribeIneligibility(m, item)));
         }
 
+        var pausedRejected = new List<(AgentKind Agent, string Reason)>();
+        var pausedMembers = new HashSet<AgentMembership>();
+
         var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
         // Track subscription members benched purely by the availability gate
         // (in-VM smoke / fast-fail breaker / missing-probe). If every
@@ -431,9 +435,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         {
             var member = entry.Member;
             var quotaRetryAdmissionMatches = QuotaRetryAdmissionMatches(quotaRetryAdmission, member);
+            var cachedAvailability = _dispatchAvailability?.GetAvailability(member.Agent);
+            if (IsOperatorPaused(cachedAvailability))
+            {
+                var pausedReason = cachedAvailability!.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                pausedRejected.Add((member.Agent, pausedReason));
+                pausedMembers.Add(member);
+                if (commitDispatchSideEffects)
+                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
+                continue;
+            }
+
             // Mid-iteration fallback may have marked this member exhausted in the
             // current process. Skip it immediately so we don't burn a probe round-trip
-            // re-discovering what we just learned from a live failure.
+            // re-discovering what we just learned from a live failure. Operator
+            // pause is checked first so a paused agent remains visibly distinct
+            // from an older in-process exhaustion cache entry.
             if (!bypassInProcessExhaustion
                 && !quotaRetryAdmissionMatches
                 && IsExhausted(member, nowUtc))
@@ -450,6 +468,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             var availability = await GetGatedAvailabilityAsync(member.Agent, smokeTarget, ct);
             if (availability is { Available: false })
             {
+                if (IsOperatorPaused(availability))
+                {
+                    var pausedReason = availability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
+                    pausedRejected.Add((member.Agent, pausedReason));
+                    pausedMembers.Add(member);
+                    if (commitDispatchSideEffects)
+                        _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
+                    continue;
+                }
+
                 var smokeReason = $"smoke gate: {availability.Reason}";
                 if (commitDispatchSideEffects)
                     _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
@@ -601,6 +630,35 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, gate.Reason));
         }
 
+        AgentRoutingDecision BuildPausedWaitDecision()
+        {
+            if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
+                ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
+
+            var reason = $"all eligible members of class '{classId}' are paused by operator: "
+                + string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"));
+            return new AgentRoutingDecision
+            {
+                ShouldWait = true,
+                WaitingForPausedAgent = true,
+                SuggestedRecheckIn = _opts.QuotaRecheckInterval,
+                Reason = reason,
+                PausedAgents = pausedRejected
+                    .Select(p => p.Agent)
+                    .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
+            };
+        }
+
+        // Only park on agent-resume when EVERY eligible member is paused. When
+        // at least one non-paused member has a recoverable blocker (quota,
+        // cap, budget, smoke), the item must park on that recovery channel
+        // instead — AgentPauseRetryScheduler only wakes WaitingForAgentResume
+        // rows, so parking on the paused agent would strand the item until
+        // the operator unpauses even when the unpaused peer recovers first.
+        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
+            return BuildPausedWaitDecision();
+
         if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
             ConsumeQuotaRetryAdmission(item.Id, quotaRetryAdmission);
 
@@ -614,6 +672,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         //  - smoke-excluded: cleared by the in-VM smoke sweep / operator
         //    reset, NOT by quota recovery — don't misreport it as quota.
         //  - quota-below-floor: clears when the quota window resets.
+        //  - mixed (paused + recoverable): park on the recoverable blocker;
+        //    the operator pause is logged in the reason but does not change
+        //    the wake channel — see BuildPausedWaitDecision's invariant.
+        string? pausedSuffix = pausedRejected.Count > 0
+            ? "; paused (not the wake channel): "
+                + string.Join("; ", pausedRejected.Select(p => $"{p.Agent.Value} ({p.Reason})"))
+            : null;
+
         var anyAtCap = atCapAgents.Count > 0;
         if (hasSubscription || anyAtCap)
         {
@@ -655,6 +721,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                          $"(ramp {_opts.StartFloorPct:F1}%→{_opts.EndFloorPct:F1}%, fallback {_opts.MinQuotaPct:F1}%)";
                 suggested = _opts.QuotaRecheckInterval;
             }
+            if (pausedSuffix is not null)
+                reason += pausedSuffix;
             if (commitDispatchSideEffects)
                 AuditLog.QuotaRouterWaiting(classId, item.Id, suggested);
             return new AgentRoutingDecision
@@ -664,6 +732,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 AnyMemberAtCap = capBlocked,
                 AtCapAgents = atCapAgents,
                 Reason = reason,
+                PausedAgents = pausedRejected
+                    .Select(p => p.Agent)
+                    .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
             };
         }
 
@@ -685,6 +757,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
             if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
+            if (pausedMembers.Contains(candidate.Member)) continue;
             var fallback = candidate.Member;
             if (slotGate is not null && !slotGate.TryReserve(fallback.Agent))
             {
@@ -736,6 +809,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             parkReason = $"all PayPerApi members of class '{classId}' are at their per-agent concurrency cap";
         else
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted";
+        if (pausedSuffix is not null)
+            parkReason += pausedSuffix;
         if (commitDispatchSideEffects)
         {
             _log.LogInformation(
@@ -751,6 +826,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             AnyMemberAtCap = fallbackCapBlocked,
             AtCapAgents = atCapAgents,
             Reason = parkReason,
+            PausedAgents = pausedRejected
+                .Select(p => p.Agent)
+                .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
         };
     }
 
@@ -1107,6 +1186,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // rejected at routing time.
             if (member.QualityScore < item.MinModelScore) continue;
             if (!MemberCoversRequiredCapabilities(member, item.RequiredCapabilities)) continue;
+            var availability = _dispatchAvailability?.GetAvailability(member.Agent);
+            if (IsOperatorPaused(availability))
+                continue;
 
             AgentQuotaSnapshot snapshot;
             try
@@ -1553,6 +1635,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return true;
     }
 
+    private static bool IsOperatorPaused(AgentAvailability? availability) =>
+        availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
+
     private static string DescribeIneligibility(AgentMembership member, WorkItem item)
     {
         var failsScore = member.QualityScore < item.MinModelScore;
@@ -1733,6 +1818,17 @@ public sealed record AgentRoutingDecision
     /// without re-deriving which members were blocked.
     /// </summary>
     public IReadOnlyList<AgentKind> AtCapAgents { get; init; } = [];
+
+    /// <summary>
+    /// True when every otherwise-eligible member was excluded because an
+    /// operator paused its agent kind. The caller should park the item in
+    /// <see cref="WorkItemState.WaitingForAgentResume"/> rather than using
+    /// quota retry scheduling.
+    /// </summary>
+    public bool WaitingForPausedAgent { get; init; }
+
+    /// <summary>Paused agents that blocked this dispatch attempt.</summary>
+    public IReadOnlyList<AgentKind> PausedAgents { get; init; } = [];
 }
 
 /// <summary>

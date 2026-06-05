@@ -272,8 +272,12 @@ internal sealed class WorkItemCreationService
 
         var jobType = JobType.Normal;
         CheckAndActSpec? checkSpec = null;
+        AgentControlSpec? agentControlSpec = null;
         if (req.Check is not null)
         {
+            if (req.AgentControl is not null)
+                return Error("check and agentControl cannot both be provided");
+
             var check = req.Check;
             if (string.IsNullOrWhiteSpace(check.Question))
                 return Error("check.question is required");
@@ -333,6 +337,51 @@ internal sealed class WorkItemCreationService
             };
             jobType = JobType.CheckAndAct;
         }
+        else if (req.AgentControl is not null)
+        {
+            var control = req.AgentControl;
+            if (string.IsNullOrWhiteSpace(control.Agent))
+                return Error("agentControl.agent is required");
+            var controlAgent = new AgentKind(control.Agent.Trim().ToLowerInvariant());
+            if (!_agents.TryGet(controlAgent, out _))
+                return new PreparedWorkItemCreationResult(
+                    null,
+                    Results.BadRequest(new { error = $"unknown agent '{control.Agent}'", available = _agents.Available.Select(a => a.Value) }));
+
+            var actionText = control.Action?.Trim();
+            AgentControlAction action;
+            if (string.Equals(actionText, "pause", StringComparison.OrdinalIgnoreCase))
+                action = AgentControlAction.Pause;
+            else if (string.Equals(actionText, "resume", StringComparison.OrdinalIgnoreCase))
+                action = AgentControlAction.Resume;
+            else
+                return Error("agentControl.action must be 'pause' or 'resume'");
+
+            var reason = string.IsNullOrWhiteSpace(control.Reason) ? null : control.Reason.Trim();
+            if (action == AgentControlAction.Pause && reason is null)
+                return Error("agentControl.reason is required for pause");
+
+            var reasonValidation = AgentPauseValidation.ValidateOptionalReason(reason, "agentControl.reason");
+            if (reasonValidation is not null)
+                return Error(reasonValidation);
+
+            if (control.DurationSeconds is { } seconds && seconds <= 0)
+                return Error("agentControl.durationSeconds must be positive");
+            if (control.DurationSeconds is not null && control.ExpiresAt is not null)
+                return Error("agentControl: provide either durationSeconds or expiresAt, not both");
+            if (control.ExpiresAt is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow)
+                return Error("agentControl.expiresAt must be in the future");
+
+            agentControlSpec = new AgentControlSpec
+            {
+                Action = action,
+                Agent = controlAgent.Value,
+                Reason = reason,
+                DurationSeconds = control.DurationSeconds,
+                ExpiresAt = control.ExpiresAt,
+            };
+            jobType = JobType.AgentControl;
+        }
 
         var item = new WorkItem
         {
@@ -356,6 +405,7 @@ internal sealed class WorkItemCreationService
             RequiredCapabilities = requiredCapabilities,
             JobType = jobType,
             Check = checkSpec,
+            AgentControl = agentControlSpec,
             TemplateName = provenance?.TemplateName,
             TemplateEntryIndex = provenance?.TemplateEntryIndex,
         };

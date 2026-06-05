@@ -55,6 +55,7 @@ internal static class CliApp
         root.AddCommand(QuotaCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(ConcurrencyCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(FleetCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        root.AddCommand(AgentsCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(ConfigureCommand.Build());
         root.AddCommand(VersionCommand.Build());
 

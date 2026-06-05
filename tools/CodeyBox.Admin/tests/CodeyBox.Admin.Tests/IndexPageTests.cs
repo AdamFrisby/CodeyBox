@@ -408,6 +408,39 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         return Task.FromResult<QueueStatusDto?>(QueueStatusOverride);
     }
 
+    public List<AgentPauseStateDto> PausedAgentsOverride { get; set; } = [];
+    public string? AgentPauseKindCaptured { get; private set; }
+    public string? AgentPauseReasonCaptured { get; private set; }
+    public double? AgentPauseDurationCaptured { get; private set; }
+    public string? AgentResumeKindCaptured { get; private set; }
+
+    public Task<List<AgentPauseStateDto>> GetPausedAgentsAsync(CancellationToken ct = default)
+        => Task.FromResult(PausedAgentsOverride);
+
+    public Task<AgentPauseStateDto?> PauseAgentAsync(string agent, string reason, double? durationSeconds = null, CancellationToken ct = default)
+    {
+        AgentPauseKindCaptured = agent;
+        AgentPauseReasonCaptured = reason;
+        AgentPauseDurationCaptured = durationSeconds;
+        var state = new AgentPauseStateDto
+        {
+            Agent = agent,
+            Paused = true,
+            PausedAt = DateTimeOffset.UtcNow,
+            PausedReason = reason,
+            ExpiresAt = durationSeconds is null ? null : DateTimeOffset.UtcNow.AddSeconds(durationSeconds.Value),
+        };
+        PausedAgentsOverride.Add(state);
+        return Task.FromResult<AgentPauseStateDto?>(state);
+    }
+
+    public Task<bool> ResumeAgentAsync(string agent, CancellationToken ct = default)
+    {
+        AgentResumeKindCaptured = agent;
+        PausedAgentsOverride.RemoveAll(p => string.Equals(p.Agent, agent, StringComparison.OrdinalIgnoreCase));
+        return Task.FromResult(true);
+    }
+
     public Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
         => Task.FromResult(BudgetUsageOverrides.TryGetValue(projectId, out var u) ? (BudgetUsageDto?)u : null);
 

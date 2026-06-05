@@ -18,6 +18,7 @@ public static class EventSchema
     public const string CurrentVersion = WebhookEvent.CurrentSchemaVersion;
     private const string InitialVersion = "1.0";
     private const string WorkerPoolHealthVersion = "1.2";
+    private const string AgentPauseVersion = "1.3";
 
     /// <summary>
     /// Returns the schema document. Plain value type so it serialises cleanly
@@ -55,9 +56,12 @@ public static class EventSchema
             .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
 
     private static string EventTypeIntroducedIn(string name)
-        => name.StartsWith("worker_pool.", StringComparison.Ordinal)
-            ? WorkerPoolHealthVersion
-            : InitialVersion;
+        => name switch
+        {
+            "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
+            _ when name.StartsWith("worker_pool.", StringComparison.Ordinal) => WorkerPoolHealthVersion,
+            _ => InitialVersion,
+        };
 
     /// <summary>
     /// Authoritative list of every event the pipeline can emit at this schema
@@ -76,6 +80,8 @@ public static class EventSchema
         "agent.smoke_failed",
         "agent.smoke_recovered",
         "agent.fallback",
+        "agent.paused",
+        "agent.resumed",
         // Sandbox lifecycle (leak reaper only — provisioning is audit-log not webhook)
         "sandbox.leak_detected",
         "sandbox.leak_disposed",
@@ -105,6 +111,7 @@ public static class EventSchema
         "work_item.resumed",
         "work_item.needs_operator_input",
         "work_item.waiting_for_quota_reset",
+        "work_item.waiting_for_agent_resume",
         // Work-item lifecycle / operator interaction
         "work_item.agent_stuck",
         "work_item.auto_retry",

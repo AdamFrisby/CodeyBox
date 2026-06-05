@@ -220,11 +220,11 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             {
                 var backgroundCts = new CancellationTokenSource();
                 _backgroundCts = backgroundCts;
-                _resumeTask = ResumeAllAndSignalAsync(backgroundCts.Token);
+                _resumeTask = RunLongRunningAsync(() => ResumeAllAndSignalAsync(backgroundCts.Token));
                 return Task.CompletedTask;
             }
 
-            _resumeTask = ResumeAllAndSignalAsync(ct);
+            _resumeTask = RunLongRunningAsync(() => ResumeAllAndSignalAsync(ct));
             return _resumeTask;
         }
     }
@@ -420,14 +420,21 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
     {
         var timeout = CurrentOptions().ResumeTimeout;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeout);
 
         Task? resumeTask = null;
         try
         {
             resumeTask = RunLongRunningAsync(
                 () => suspending.ResumeSandboxAsync(vmName, timeoutCts.Token));
-            await resumeTask.WaitAsync(timeout, ct);
+            if (UseBlockingResumeTimeoutWait(timeout))
+            {
+                await WaitForTaskOrTimeoutAsync(resumeTask, timeout, ct);
+            }
+            else
+            {
+                timeoutCts.CancelAfter(timeout);
+                await resumeTask.WaitAsync(timeout, ct);
+            }
             return (true, null, null);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -441,7 +448,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (resumeTask is not null)
-                ObserveProviderTaskException(resumeTask);
+                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -451,7 +458,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (resumeTask is not null)
-                ObserveProviderTaskException(resumeTask);
+                await ObserveProviderTaskAfterCancellationAsync(resumeTask);
             var error = $"timed out after {timeout}";
             _log.LogWarning(
                 "Startup resume timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; clearing suspend bookkeeping so the item can recover via the stranded-item path",
@@ -632,14 +639,12 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Task<bool>? promoteTask = null;
         try
         {
-            promoteTask = RunLongRunningAsync(
-                () => suspending.PushSuspendedVmCheckpointRefAsync(
-                    vmName,
-                    SandboxConventions.WorkDir,
-                    refName,
-                    $"codeybox: suspend-resume checkpoint {itemId}",
-                    timeoutCts.Token));
-
+            promoteTask = suspending.PushSuspendedVmCheckpointRefAsync(
+                vmName,
+                SandboxConventions.WorkDir,
+                refName,
+                $"codeybox: suspend-resume checkpoint {itemId}",
+                timeoutCts.Token);
             var pushed = await promoteTask.WaitAsync(timeout, ct);
             if (pushed)
                 return true;
@@ -660,7 +665,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         {
             timeoutCts.Cancel();
             if (promoteTask is not null)
-                ObserveProviderTaskException(promoteTask);
+                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -670,7 +675,7 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             if (promoteTask is not null)
-                ObserveProviderTaskException(promoteTask);
+                await ObserveProviderTaskAfterCancellationAsync(promoteTask);
 
             _log.LogWarning(
                 "Startup checkpoint promotion timed out for sandbox {VmName} (work item {WorkItemId}) after {Timeout}; falling through to stranded-item recovery",
@@ -700,6 +705,67 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             CancellationToken.None,
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+    }
+
+    private async Task ObserveProviderTaskAfterCancellationAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromMilliseconds(250));
+        }
+        catch (TimeoutException)
+        {
+            ObserveProviderTaskException(task);
+        }
+        catch (OperationCanceledException)
+        {
+            _log.LogDebug("Provider task observed cancellation after startup resume timeout/cancellation");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Provider task faulted after startup resume timeout/cancellation");
+        }
+    }
+
+    private static bool UseBlockingResumeTimeoutWait(TimeSpan timeout) =>
+        timeout <= TimeSpan.FromSeconds(5);
+
+    private static async Task WaitForTaskOrTimeoutAsync(Task task, TimeSpan timeout, CancellationToken ct)
+    {
+        if (task.IsCompleted)
+        {
+            await task.ConfigureAwait(false);
+            return;
+        }
+
+        using var completed = new ManualResetEventSlim(false);
+        using var cancellationRegistration = ct.Register(
+            static state => ((ManualResetEventSlim)state!).Set(),
+            completed);
+        _ = task.ContinueWith(
+            static (_, state) =>
+            {
+                try
+                {
+                    ((ManualResetEventSlim)state!).Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // The timeout path already moved on; the provider task is
+                    // observed separately so late completion is harmless.
+                }
+            },
+            completed,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        if (!completed.Wait(timeout))
+            throw new TimeoutException();
+        if (ct.IsCancellationRequested)
+            throw new OperationCanceledException(ct);
+
+        await task.ConfigureAwait(false);
     }
 
     private static Task RunLongRunningAsync(Func<Task> work) =>

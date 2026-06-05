@@ -30,6 +30,8 @@ namespace CodeyBox.Api;
 ///   snapshot cache — it recomputes from the live usage store on every call —
 ///   so the new windows take effect on the next gate/visibility read).</item>
 /// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
+/// <item><c>CodeyBox:AgentPauses</c> → <see cref="IAgentPauseController"/> config-owned
+///   pause/resume reconciliation.</item>
 /// <item><c>CodeyBox:Smoke</c> → <see cref="SmokeOptionsSnapshot.Replace"/>
 ///   so the master smoke switch applies to pickup, router, and in-VM gates
 ///   without restart.</item>
@@ -53,6 +55,8 @@ namespace CodeyBox.Api;
 /// </summary>
 public sealed class AgentConfigHotReload : IHostedService, IDisposable
 {
+    private const string ConfigPausedBy = "config";
+
     private readonly IOptionsMonitor<CodeyBoxOptions> _monitor;
     private readonly OrchestratorService _orchestrator;
     private readonly AgentClassRouter _router;
@@ -68,6 +72,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly IAgentPauseController? _pauses;
+    private readonly IAgentRegistry? _agents;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -86,6 +92,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastPipelineTuning = "";
     private string _lastBudgetDeferralRecheck = "";
     private string _lastSmoke = "";
+    private string _lastAgentPauses = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -105,7 +112,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
         QuotaRouterOptions? quotaRouterOptions = null,
         IInVmSmokeCoveragePolicy? coverage = null,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentPauseController? pauses = null,
+        IAgentRegistry? agents = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -129,10 +138,12 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
         _smokeOptions = smokeOptions;
+        _pauses = pauses;
+        _agents = agents;
         _log = log;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
         // Capture initial serialised state so the first OnChange after startup
         // only fires audit entries for fields that actually changed against
@@ -150,14 +161,15 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
         _lastSmoke = SerializeSmoke(initial.Smoke);
+        _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
+        await ApplyConfiguredAgentPausesAtStartupAsync(initial, cancellationToken);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
             "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen}",
             _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length, _lastSanitizer.Length);
-        return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -183,12 +195,152 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyPricingIfChanged(opts);
             ApplyBudgetsIfChanged(opts);
             ApplyDefaultsIfChanged(opts);
+            ApplyAgentPausesIfChanged(opts);
             ApplyIncrementalRebaseIfChanged(opts);
             ApplySanitizerIfChanged(opts);
             ApplyQuotaRouterIfChanged(opts);
             ApplyPipelineTuningIfChanged(opts);
             ApplyBudgetDeferralRecheckIfChanged(opts);
         }
+    }
+
+    private async Task ApplyConfiguredAgentPausesAtStartupAsync(
+        CodeyBoxOptions opts,
+        CancellationToken ct)
+    {
+        if (_pauses is null)
+            return;
+
+        try
+        {
+            await ReconcileConfiguredAgentPausesAsync(opts.AgentPauses, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Could not apply startup AgentPauses config; runtime pause API remains available");
+        }
+    }
+
+    private void ApplyAgentPausesIfChanged(CodeyBoxOptions opts)
+    {
+        if (_pauses is null) return;
+
+        var next = SerializeAgentPauses(opts.AgentPauses);
+        if (string.Equals(_lastAgentPauses, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastAgentPauses;
+        try
+        {
+            ReconcileConfiguredAgentPausesAsync(opts.AgentPauses, CancellationToken.None)
+                .ConfigureAwait(false)
+                .GetAwaiter()
+                .GetResult();
+            _lastAgentPauses = next;
+            AuditLog.ConfigReloaded("AgentPauses", prev, next);
+            _log.LogInformation("Hot-reloaded AgentPauses: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Hot-reload of AgentPauses rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private async Task ReconcileConfiguredAgentPausesAsync(
+        IReadOnlyDictionary<string, AgentPauseConfig> configured,
+        CancellationToken ct)
+    {
+        var desired = new Dictionary<AgentKind, (string Reason, DateTimeOffset? ExpiresAt)>();
+        foreach (var (rawAgent, pause) in configured)
+        {
+            var agent = new AgentKind(rawAgent.Trim().ToLowerInvariant());
+            if (_agents is not null && !_agents.Available.Contains(agent))
+            {
+                _log.LogWarning(
+                    "Ignoring configured pause for unknown agent '{Agent}'",
+                    rawAgent);
+                continue;
+            }
+
+            if (!pause.Paused)
+                continue;
+
+            if (AgentPauseValidation.ValidateRequiredReason(
+                    pause.Reason,
+                    $"CodeyBox:AgentPauses:{rawAgent}:Reason") is { } reasonError)
+                throw new InvalidOperationException(reasonError);
+
+            var expiresAt = ResolveConfiguredPauseExpiresAt(rawAgent, pause);
+            if (expiresAt is { } expiry && expiry <= DateTimeOffset.UtcNow)
+                continue;
+
+            desired[agent] = (pause.Reason!.Trim(), expiresAt);
+        }
+
+        var current = await _pauses!.ListPausedAsync(ct).ConfigureAwait(false);
+        foreach (var state in current)
+        {
+            if (!string.Equals(state.PausedBy, ConfigPausedBy, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (desired.ContainsKey(state.Agent))
+                continue;
+
+            await _pauses.ResumeAsync(
+                state.Agent,
+                ConfigPausedBy,
+                "removed from config",
+                ct).ConfigureAwait(false);
+        }
+
+        var ownership = current.ToDictionary(s => s.Agent, s => s.PausedBy);
+        foreach (var (agent, (reason, expiresAt)) in desired)
+        {
+            if (ownership.TryGetValue(agent, out var pausedBy)
+                && !string.Equals(pausedBy, ConfigPausedBy, StringComparison.OrdinalIgnoreCase))
+            {
+                // A runtime owner (API / work-item / operator CLI) already holds
+                // this agent's pause row. The config block is "config-owned-only"
+                // and must NOT take over the row — otherwise removing the config
+                // entry later would resume an agent the runtime never asked to
+                // unpause. The runtime pause remains authoritative; the config
+                // intent is ignored for as long as the runtime pause stands.
+                _log.LogInformation(
+                    "Skipping configured pause for {Agent}: runtime pause already owned by '{Owner}'",
+                    agent.Value, pausedBy ?? "(unknown)");
+                continue;
+            }
+
+            await _pauses.PauseAsync(
+                agent,
+                reason,
+                ConfigPausedBy,
+                expiresAt,
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    private static DateTimeOffset? ResolveConfiguredPauseExpiresAt(
+        string agent,
+        AgentPauseConfig pause)
+    {
+        if (pause.DurationSeconds is { } seconds && seconds <= 0)
+            throw new InvalidOperationException($"CodeyBox:AgentPauses:{agent}:DurationSeconds must be positive");
+        if (pause.DurationSeconds is not null && pause.ExpiresAt is not null)
+            throw new InvalidOperationException(
+                $"CodeyBox:AgentPauses:{agent} must provide either DurationSeconds or ExpiresAt, not both");
+
+        if (pause.ExpiresAt is { } expiresAt)
+            return expiresAt;
+
+        return pause.DurationSeconds is { } durationSeconds
+            ? DateTimeOffset.UtcNow.AddSeconds(durationSeconds)
+            : null;
     }
 
     private void ApplyQuotaRouterIfChanged(CodeyBoxOptions opts)
@@ -611,6 +763,21 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         JsonSerializer.Serialize(
             defaults.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
+            JsonOpts);
+
+    private static string SerializeAgentPauses(Dictionary<string, AgentPauseConfig> pauses) =>
+        JsonSerializer.Serialize(
+            pauses.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    kv => kv.Key,
+                    kv => new
+                    {
+                        kv.Value.Paused,
+                        Reason = kv.Value.Reason,
+                        kv.Value.ExpiresAt,
+                        kv.Value.DurationSeconds,
+                    },
+                    StringComparer.OrdinalIgnoreCase),
             JsonOpts);
 
     private static string SerializeIncrementalRebase(IncrementalRebaseOptions opts) =>

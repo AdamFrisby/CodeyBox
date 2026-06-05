@@ -263,6 +263,101 @@ public sealed class WorkItemRetrier
         return await _gitHost.GetDefaultBranchAsync(repoId, ct);
     }
 
+    public readonly record struct AgentPauseResumeOutcome(
+        bool Success,
+        string? Error,
+        WorkItem? Resumed,
+        string RetryFrom);
+
+    public async Task<AgentPauseResumeOutcome> ResumeAfterAgentPauseAsync(
+        WorkItem item,
+        string source,
+        CancellationToken ct = default)
+    {
+        if (item.State != WorkItemState.WaitingForAgentResume)
+            return new AgentPauseResumeOutcome(false, $"work item is in state {item.State}", null, "work");
+
+        // Prefer the dedicated agent-pause column; fall back to the legacy
+        // quota_retry_from value for rows parked before agent_pause_retry_from
+        // existed so legacy WaitingForAgentResume rows keep resuming at the
+        // correct phase boundary.
+        var retryFrom = AgentPauseResumeMapper.NormalizeRetryFrom(
+            item.AgentPauseRetryFrom ?? item.QuotaRetryFrom);
+        var resumeState = AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom);
+        var resumed = item.With(resumeState, error: null) with
+        {
+            FailureKind = null,
+            QuotaResetAt = null,
+            NextQuotaRetryAt = null,
+            QuotaRetryFrom = null,
+            AgentPauseRetryFrom = null,
+            StartedAt = null,
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(
+                resumed,
+                WorkItemState.WaitingForAgentResume,
+                ct)
+            .ConfigureAwait(false);
+        if (!updated)
+        {
+            return new AgentPauseResumeOutcome(
+                false,
+                "work item state changed before agent-pause resume",
+                null,
+                retryFrom);
+        }
+
+        try
+        {
+            await _queue.EnqueueAsync(resumed.Id, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var reverted = false;
+            try
+            {
+                reverted = await _store.TryUpdateIfStateAsync(
+                        item,
+                        resumeState,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception rollbackEx)
+            {
+                _log.LogError(rollbackEx,
+                    "Failed to roll back work item {Id} after agent-pause resume queue kick failed",
+                    item.Id);
+            }
+
+            if (reverted)
+            {
+                _log.LogWarning(ex,
+                    "Agent-pause resume of work item {Id} updated state to {State} but queue kick failed; rolled back to WaitingForAgentResume",
+                    item.Id,
+                    resumeState);
+                return new AgentPauseResumeOutcome(
+                    false,
+                    $"queue enqueue failed after state update; rolled back to WaitingForAgentResume: {ex.Message}",
+                    null,
+                    retryFrom);
+            }
+
+            _log.LogError(ex,
+                "Agent-pause resume of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
+                item.Id,
+                resumeState);
+            return new AgentPauseResumeOutcome(
+                false,
+                $"queue enqueue failed after state update and rollback did not apply: {ex.Message}",
+                null,
+                retryFrom);
+        }
+
+        AuditLog.AgentPauseWaitingItemResumed(item.Id, source, retryFrom);
+        return new AgentPauseResumeOutcome(true, null, resumed, retryFrom);
+    }
+
     /// <summary>
     /// Outcome of a resume attempt. <see cref="ResumeStatus"/> maps 1:1 to HTTP
     /// status codes so the API endpoint can be a thin adapter.

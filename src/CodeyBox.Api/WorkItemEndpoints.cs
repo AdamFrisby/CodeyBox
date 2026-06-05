@@ -361,14 +361,16 @@ internal static class WorkItemEndpoints
 
         // Only resume from terminal-failed states or parked states
         // (NeedsOperatorInput for operator triage, WaitingForQuotaReset for
-        // operator override of the scheduler).
+        // operator override of the scheduler, WaitingForAgentResume for
+        // operator override of per-agent runtime pause controls).
         // Done items have nothing to retry; other non-terminal states would
         // race the pipeline.
         if (item!.State is not (WorkItemState.Failed or WorkItemState.AuditFailed
             or WorkItemState.MergeConflictResolutionFailed or WorkItemState.Cancelled
             or WorkItemState.AbandonedAfterRecoveryAttempts
             or WorkItemState.NeedsOperatorInput
-            or WorkItemState.WaitingForQuotaReset))
+            or WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume))
             return Results.Conflict(new { error = $"cannot retry item in state {item.State}; only terminal-failed or operator-parked items can be retried" });
 
         // Pass body.From through verbatim (including null) so the retrier can
@@ -1863,6 +1865,8 @@ internal static class WorkItemEndpoints
             NextQuotaRetryAt: item.NextQuotaRetryAt,
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             QuotaRetryFrom: item.QuotaRetryFrom,
+            AgentPauseTarget: item.AgentPauseTarget?.Value,
+            AgentPauseRetryFrom: item.AgentPauseRetryFrom,
             Usage: usage?.Iteration,
             UsageTotal: usage?.Total,
             Priority: item.Priority,
@@ -1879,6 +1883,7 @@ internal static class WorkItemEndpoints
                 : item.RequiredCapabilities.ToList(),
             JobType: item.JobType.ToString(),
             Check: item.Check,
+            AgentControl: ToAgentControlDto(item.AgentControl),
             Verdict: item.Verdict,
             OriginCheckWorkItemId: item.OriginCheckWorkItemId?.ToString(),
             ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
@@ -1940,6 +1945,21 @@ internal static class WorkItemEndpoints
         }
         return (result, null);
     }
+
+    private static AgentControlDto? ToAgentControlDto(AgentControlSpec? spec) =>
+        spec is null
+            ? null
+            : new AgentControlDto(
+                spec.Action switch
+                {
+                    AgentControlAction.Pause => "pause",
+                    AgentControlAction.Resume => "resume",
+                    _ => spec.Action.ToString(),
+                },
+                spec.Agent,
+                spec.Reason,
+                spec.DurationSeconds,
+                spec.ExpiresAt);
 
     /// <summary>
     /// Validates a requested priority against the global cap and the project's
@@ -2098,7 +2118,10 @@ public sealed record CreateWorkItemRequest(
     // the supplied yes/no question against the project repo and returns a
     // structured verdict. On a matching verdict, the orchestrator enqueues
     // the OnYes follow-up as a normal work item parented to the check.
-    CheckAndActRequest? Check = null);
+    CheckAndActRequest? Check = null,
+    // When present, creates a JobType.AgentControl item that performs a
+    // control-plane pause/resume for one agent kind without launching an agent.
+    AgentControlRequest? AgentControl = null);
 
 /// <summary>
 /// Request payload for the optional <c>check</c> block on
@@ -2125,6 +2148,20 @@ public sealed record OnYesActionRequest(
     string? Agent = null,
     string? AgentClassId = null,
     string[]? DependsOn = null);
+
+public sealed record AgentControlRequest(
+    string Action,
+    string Agent,
+    string? Reason = null,
+    int? DurationSeconds = null,
+    DateTimeOffset? ExpiresAt = null);
+
+public sealed record AgentControlDto(
+    string Action,
+    string Agent,
+    string? Reason = null,
+    int? DurationSeconds = null,
+    DateTimeOffset? ExpiresAt = null);
 
 public sealed record RetryWorkItemRequest(string? From);
 
@@ -2214,6 +2251,8 @@ public sealed record WorkItemDto(
     DateTimeOffset? NextQuotaRetryAt = null,
     int QuotaRetryAttempts = 0,
     string? QuotaRetryFrom = null,
+    string? AgentPauseTarget = null,
+    string? AgentPauseRetryFrom = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     WorkItemIterationUsage? Usage = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -2230,6 +2269,8 @@ public sealed record WorkItemDto(
     string JobType = "Normal",
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     CheckAndActSpec? Check = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    AgentControlDto? AgentControl = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     CheckVerdict? Verdict = null,
     string? OriginCheckWorkItemId = null,

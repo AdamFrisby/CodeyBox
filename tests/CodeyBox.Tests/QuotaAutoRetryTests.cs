@@ -270,6 +270,94 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task PeriodicSweep_MovesRecoveredButPausedQuotaItemToWaitingForAgentResume()
+    {
+        var stateDb = Path.Combine(_workspace, $"quota-paused-{Guid.NewGuid():N}.db");
+        var pauseDb = Path.Combine(_workspace, $"quota-pauses-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        using var pauses = new SqliteAgentPauseController(
+            pauseDb,
+            NullLogger<SqliteAgentPauseController>.Instance,
+            _time);
+        await pauses.PauseAsync(AgentKind.Claude, "maintenance", "test");
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "test-class",
+        });
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "test-class",
+                    DisplayName = "Test Class",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Claude,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+            [new FakeProbe(AgentKind.Claude, 100)],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            timeProvider: _time);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "quota paused",
+            Prompt = "p",
+            AgentClassId = "test-class",
+            State = WorkItemState.WaitingForQuotaReset,
+            QuotaRetryFrom = "audit",
+            NextQuotaRetryAt = _time.Now.AddMinutes(-1),
+        };
+        await store.CreateAsync(item);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)sweepMethod.Invoke(scheduler, [CancellationToken.None])!;
+
+        var parked = await store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, parked!.State);
+        Assert.Equal("audit", parked.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
+        Assert.Contains("waiting: agent paused", parked.LastError);
+    }
+
+    [Fact]
     public async Task Scheduler_PeriodicSweep_RetriesEligibleItems()
     {
         var agent = new QuotaFailingAgent();

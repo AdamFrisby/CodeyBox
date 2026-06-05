@@ -115,6 +115,46 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<QueueStatusDto>(JsonOptions, ct);
     }
 
+    public async Task<List<AgentPauseStateDto>> GetPausedAgentsAsync(CancellationToken ct = default)
+    {
+        var result = await _http.GetFromJsonAsync<List<AgentPauseStateDto>>("/agents/paused", JsonOptions, ct);
+        return result ?? [];
+    }
+
+    public async Task<AgentPauseStateDto?> PauseAgentAsync(
+        string agent,
+        string reason,
+        double? durationSeconds = null,
+        CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/agents/{Uri.EscapeDataString(agent)}/pause",
+            new { reason, durationSeconds },
+            JsonOptions,
+            ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"Pause agent failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
+        }
+        return await resp.Content.ReadFromJsonAsync<AgentPauseStateDto>(JsonOptions, ct);
+    }
+
+    public async Task<bool> ResumeAgentAsync(string agent, CancellationToken ct = default)
+    {
+        var resp = await _http.PostAsJsonAsync(
+            $"/agents/{Uri.EscapeDataString(agent)}/resume",
+            new { },
+            JsonOptions,
+            ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException($"Resume agent failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
+        }
+        return true;
+    }
+
     public async Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)
     {
         var resp = await _http.GetAsync($"/projects/{Uri.EscapeDataString(projectId)}/budget/usage", ct);

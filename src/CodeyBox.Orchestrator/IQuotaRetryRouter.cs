@@ -23,4 +23,5 @@ public interface IQuotaRetryRouter
 public sealed record QuotaRetryRoutingDecision(
     bool ShouldWait,
     bool NoEligibleMembers,
-    string? Reason);
+    string? Reason,
+    bool WaitingForPausedAgent = false);

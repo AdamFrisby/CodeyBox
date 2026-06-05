@@ -1287,7 +1287,8 @@ builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
-    sp.GetRequiredService<SmokeOptionsSnapshot>()));
+    sp.GetRequiredService<SmokeOptionsSnapshot>(),
+    sp.GetRequiredService<IAgentPauseController>()));
 builder.Services.AddSingleton<IAgentSmokeCache>(sp =>
 {
     var opts = sp.GetRequiredService<SmokeOptions>();
@@ -1653,6 +1654,18 @@ builder.Services.AddSingleton<IQueueController>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteQueueController(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteQueueController>>());
 });
+builder.Services.AddSingleton<SqliteAgentPauseController>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAgentPauseController(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteAgentPauseController>>(),
+        TimeProvider.System);
+});
+builder.Services.AddSingleton<IAgentPauseController>(sp =>
+    sp.GetRequiredService<SqliteAgentPauseController>());
+builder.Services.AddSingleton<IAgentPauseSignal>(sp =>
+    sp.GetRequiredService<SqliteAgentPauseController>());
 builder.Services.AddSingleton<InMemoryTaskQueue>();
 builder.Services.AddSingleton<ITaskQueue>(sp => sp.GetRequiredService<InMemoryTaskQueue>());
 builder.Services.AddSingleton<WorkItemCreationService>();
@@ -1952,7 +1965,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     watchdogOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.WorkerProgressWatchdog,
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
-    auditProgress: sp.GetRequiredService<IAuditProgressStore>()));
+    auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
+    agentPauseController: sp.GetRequiredService<IAgentPauseController>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -1979,6 +1993,13 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<IAgentPauseController>(),
+    sp.GetRequiredService<ILogger<AgentPauseRetryScheduler>>(),
+    sp.GetRequiredService<IAgentPauseSignal>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentPauseRetryScheduler>());
 
 builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
@@ -2057,7 +2078,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<QuotaRouterOptions>(),
     sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
-    sp.GetRequiredService<IStartupInitialRecoverySink>()));
+    sp.GetRequiredService<IStartupInitialRecoverySink>(),
+    dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<WorkerPoolHealthCoordinator>(sp => new WorkerPoolHealthCoordinator(
@@ -2176,7 +2198,9 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
-        smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>());
+        smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
+        pauses: sp.GetRequiredService<IAgentPauseController>(),
+        agents: sp.GetRequiredService<IAgentRegistry>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -2348,6 +2372,7 @@ SandboxEndpoints.Map(app);
 BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
+AgentPauseEndpoints.Map(app);
 
 app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 
@@ -2356,6 +2381,7 @@ app.MapGet("/quota", async (
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
     IAgentBudgetProvider? budgetProvider,
+    IAgentPauseController? agentPauses,
     ILoggerFactory loggerFactory,
     CancellationToken ct) =>
 {
@@ -2363,6 +2389,10 @@ app.MapGet("/quota", async (
     IReadOnlyList<QuotaFailureObservation> failures = failureStore is null
         ? Array.Empty<QuotaFailureObservation>()
         : await failureStore.ListRecentAsync(TimeSpan.FromMinutes(60), now, ct);
+    var pausedStates = agentPauses is null
+        ? Array.Empty<AgentPauseState>()
+        : await agentPauses.ListPausedAsync(ct);
+    var pausedByAgent = pausedStates.ToDictionary(s => s.Agent, s => s);
 
     var snapshots = new List<object>();
     foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
@@ -2379,6 +2409,9 @@ app.MapGet("/quota", async (
             .ToList();
         var recentDefaultFailure = recentFailuresForProbe.Any(f => f.ModelId is null);
         var recentFailure = recentFailuresForProbe.Count > 0;
+        var paused = pausedByAgent.TryGetValue(probe.Kind, out var pause);
+        var quotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options);
+        var defaultQuotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options);
         var modelKeys = snapshot.PerModel.Keys
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -2399,16 +2432,23 @@ app.MapGet("/quota", async (
                     latestObservedAt = g.Max(x => x.ObservedAt),
                 })
                 .ToList(),
-            wouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options),
-            defaultModelWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options),
+            paused,
+            pausedReason = pause?.PausedReason,
+            pausedAt = pause?.PausedAt,
+            pausedBy = pause?.PausedBy,
+            pauseExpiresAt = pause?.ExpiresAt,
+            dispatchStatus = paused ? "paused" : "quota",
+            dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
+            wouldAllow = !paused && quotaWouldAllow,
+            defaultModelWouldAllow = !paused && defaultQuotaWouldAllow,
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
-                modelId => QuotaRouter.WouldAllow(
-                    snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
-                    recentFailuresForProbe.Any(f =>
-                    f.Agent == probe.Kind &&
-                    string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
-                    options),
+                modelId => !paused && QuotaRouter.WouldAllow(
+                        snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
+                        recentFailuresForProbe.Any(f =>
+                            f.Agent == probe.Kind &&
+                            string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
+                        options),
                 StringComparer.OrdinalIgnoreCase),
         });
     }
@@ -2457,6 +2497,16 @@ app.MapGet("/quota", async (
         unknownPolicy = options.UnknownPolicy.ToString(),
         observedFailureWindowMinutes = options.ObservedFailureWindow.TotalMinutes,
         probes = snapshots,
+        pausedAgents = pausedStates.Select(s => new
+        {
+            agent = s.Agent.Value,
+            paused = s.Paused,
+            pausedAt = s.PausedAt,
+            pausedReason = s.PausedReason,
+            pausedBy = s.PausedBy,
+            expiresAt = s.ExpiresAt,
+            updatedAt = s.UpdatedAt,
+        }).ToList(),
         budgets,
         budgetsError,
         observedFailuresLast60m = failures,
@@ -2726,7 +2776,7 @@ namespace CodeyBox.Api
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
-    ///   <c>AgentBurnEstimator</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
@@ -2806,6 +2856,15 @@ namespace CodeyBox.Api
         /// next dispatched agent run.
         /// </summary>
         public Dictionary<string, string?> AgentDefaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Operator-configured per-agent pauses. Keyed by agent kind value.
+        /// Applied at startup and hot-reloaded by <see cref="AgentConfigHotReload"/>.
+        /// Runtime API/work-item pauses remain persisted in SQLite separately;
+        /// removing an entry here resumes only pauses owned by config.
+        /// </summary>
+        public Dictionary<string, AgentPauseConfig> AgentPauses { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
@@ -3090,6 +3149,31 @@ namespace CodeyBox.Api
         /// dev/UAT hosts still come up.
         /// </summary>
         public bool FailOnUnknownModel { get; set; } = false;
+    }
+
+    /// <summary>
+    /// Per-agent operator pause config. Bound from
+    /// <c>CodeyBox:AgentPauses:{agent}</c>.
+    /// </summary>
+    public sealed class AgentPauseConfig
+    {
+        /// <summary>
+        /// Whether this config entry should pause the agent. Default true so
+        /// a present entry is a pause declaration.
+        /// </summary>
+        public bool Paused { get; set; } = true;
+
+        /// <summary>Operator-visible pause reason.</summary>
+        public string? Reason { get; set; }
+
+        /// <summary>Optional absolute auto-resume time.</summary>
+        public DateTimeOffset? ExpiresAt { get; set; }
+
+        /// <summary>
+        /// Optional relative auto-resume duration in seconds, measured from the
+        /// reload that applies a changed config value.
+        /// </summary>
+        public int? DurationSeconds { get; set; }
     }
 
     /// <summary>

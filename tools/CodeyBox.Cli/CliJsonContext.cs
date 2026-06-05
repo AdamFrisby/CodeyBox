@@ -11,6 +11,7 @@ namespace CodeyBox.Cli;
 [JsonSerializable(typeof(QueueTemplateResponse))]
 [JsonSerializable(typeof(RetryRequest))]
 [JsonSerializable(typeof(PauseQueueRequest))]
+[JsonSerializable(typeof(PauseAgentRequest))]
 [JsonSerializable(typeof(ReorderRequest))]
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,

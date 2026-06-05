@@ -576,6 +576,9 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         var decision = await _router.ResolveQuotaRetryAsync(item, project, ct);
         if (decision.ShouldWait)
         {
+            if (decision.WaitingForPausedAgent)
+                return await TransitionWaitingItemForAgentResumeAsync(item, decision.Reason, ct);
+
             _log.LogDebug("Work item {Id} still gated by quota; decision: {Reason}", item.Id, decision.Reason);
             return new QuotaRetryAttemptResult("skipped:quota-still-gated", decision.Reason);
         }
@@ -602,6 +605,48 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         // 5. Trigger retry.
         return await PerformRetryAsync(item, trigger, ct);
+    }
+
+    private async Task<QuotaRetryAttemptResult> TransitionWaitingItemForAgentResumeAsync(
+        WorkItem item,
+        string? reason,
+        CancellationToken ct)
+    {
+        var pausedReason = string.IsNullOrWhiteSpace(reason)
+            ? "agent paused by operator"
+            : reason.Trim();
+        Project? project = null;
+        if (_projects is not null)
+        {
+            try
+            {
+                project = await _projects.GetAsync(item.ProjectId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Could not load project for agent-pause transition of quota retry item {Id}",
+                    item.Id);
+            }
+        }
+
+        var result = await WorkItemAgentPauseParking.ParkAsync(
+            _store,
+            _webhooks,
+            _log,
+            item,
+            pausedReason,
+            project,
+            pausedAgent: null,
+            ct,
+            retryFrom: NormalizeRetryFrom(item.QuotaRetryFrom));
+        if (!result.Updated)
+        {
+            return new QuotaRetryAttemptResult("skipped:state-changed", result.Reason);
+        }
+
+        return new QuotaRetryAttemptResult("moved:waiting-for-agent-resume", result.Reason);
     }
 
     private async Task<QuotaRetryAttemptResult> TransitionWaitingItemAtRetryCapAsync(

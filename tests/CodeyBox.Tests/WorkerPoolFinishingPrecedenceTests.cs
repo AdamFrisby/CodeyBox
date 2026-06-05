@@ -41,6 +41,26 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         Assert.Equal(ready.Id, picked);
     }
 
+    [Fact]
+    public async Task PickNextEligible_SkipsWaitingForAgentResumeRows()
+    {
+        var parked = Item(WorkItemState.WaitingForAgentResume, priority: 100);
+        var ready = Item(WorkItemState.Queued, priority: 0);
+        await _store.CreateAsync(parked);
+        await _store.CreateAsync(ready);
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            new InMemoryTaskQueue(), _store, new FinishingPrecedencePipeline(_store),
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Equal(ready.Id, picked);
+    }
+
     [Theory]
     [InlineData(WorkItemState.AuditPassed, WorkItemState.Merging)]
     [InlineData(WorkItemState.Merging, WorkItemState.Merging)]

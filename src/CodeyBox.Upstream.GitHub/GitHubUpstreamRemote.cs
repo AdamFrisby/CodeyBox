@@ -446,11 +446,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 AgentReasoningTail = agentTail,
             };
 
-            var generated = await _descriptionGenerator.GenerateAsync(genRequest, genCts.Token);
+            var generationTask = _descriptionGenerator.GenerateAsync(genRequest, genCts.Token);
+            var generated = await generationTask.WaitAsync(_opts.PrDescription.Timeout, ct);
             // Redact the generated body — the LLM may echo secrets from the diff.
             generated = RawOutputRedactor.Redact(generated);
             _log.LogInformation("LLM-generated PR description produced ({Chars} chars)", generated.Length);
             return generated + PrFooter;
+        }
+        catch (TimeoutException)
+        {
+            _log.LogWarning("PR description generation timed out after {Timeout}; using static template",
+                _opts.PrDescription.Timeout);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

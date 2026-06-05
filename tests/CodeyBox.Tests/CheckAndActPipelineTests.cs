@@ -872,6 +872,58 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PostActReValidation_AgentPausedAfterWork_ParksWithoutDispatchingRecheck()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new TogglePauseInVmSmokeGate();
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, inVmSmokeGate: gate);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "issue remains", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for issue",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-pause-recheck",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is remediation required?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "parameterised"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "clean", "high"));
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            gate.Paused = true;
+            return Task.CompletedTask;
+        };
+        var checkInvocationsBefore = tp.Agent.CheckInvocations.Count;
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.WaitingForAgentResume, parked!.State);
+        Assert.Equal("audit", parked.AgentPauseRetryFrom);
+        Assert.Null(parked.QuotaRetryFrom);
+        Assert.Contains("paused by operator", parked.LastError);
+        Assert.Equal(checkInvocationsBefore, tp.Agent.CheckInvocations.Count);
+        Assert.Single(tp.Agent.CheckPlan);
+    }
+
+    [Fact]
     public async Task PostActReValidation_StillActionableAfterCap_FailsWithRemediationDidNotSatisfy()
     {
         // Acceptance path (2): check==yes → act does NOT close the gap →
@@ -1186,6 +1238,35 @@ public sealed class CheckAndActPipelineTests : IDisposable
         {
             Targets.Add(target);
             return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+    }
+
+    private sealed class TogglePauseInVmSmokeGate : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+        public bool Paused { get; set; }
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            _ = kind;
+            _ = target;
+            _ = ct;
+            return Task.FromResult(Paused
+                ? new AgentAvailability(
+                    false,
+                    "paused by operator: maintenance",
+                    null,
+                    AgentAvailabilityCause.OperatorPaused)
+                : new AgentAvailability(true, null, null));
         }
 
         public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;

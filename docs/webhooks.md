@@ -26,6 +26,8 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.cancelled` | Work item was cancelled via the API |
 | `work_item.agent_stuck` | Stuck-agent probe detected a hang and killed the agent (see [Details](#agent_stuck-details)) |
 | `agent.smoke_failed` | Credential smoke test failed at startup or work-item pickup (see [Details](#agent_smoke_failed-details)) |
+| `agent.paused` | Operator paused new dispatch to one agent kind (see [Details](#agent_paused-details)) |
+| `agent.resumed` | Operator resumed dispatch to one agent kind (see [Details](#agent_resumed-details)) |
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
@@ -39,6 +41,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.auto_retry` | Quota auto-retry scheduler re-queued a Failed work item once its quota window reopened (see [Details](#auto_retry-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
+| `work_item.waiting_for_agent_resume` | Work item parked because its only eligible agent is paused |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
 | `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
 | `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
@@ -116,9 +119,9 @@ registered cost extractor) — receivers should treat absent as "unknown".
 
 `eventSchemaVersion` is stamped on every payload and identifies the envelope
 contract version (top-level fields, identifier semantics, signing). New event
-types or new optional `details` fields are additive and do **not** bump this
-version. Receivers should treat unknown event names as a no-op and ignore any
-unknown fields inside `details`.
+types or new optional `details` fields are additive minor-version bumps.
+Receivers should treat unknown event names as a no-op and ignore any unknown
+fields inside `details`.
 
 ### `audit_iteration` details
 
@@ -209,6 +212,59 @@ When `event` is `queue.resumed`:
   }
 }
 ```
+
+### `agent_paused` details
+
+When `event` is `agent.paused`:
+
+```json
+{
+  "details": {
+    "agent": "claude",
+    "reason": "provider outage",
+    "pausedAt": "2026-06-04T02:00:00.000+00:00",
+    "pausedBy": "api",
+    "expiresAt": "2026-06-04T08:00:00.000+00:00"
+  }
+}
+```
+
+`expiresAt` is `null` for an indefinite pause. In-flight runs are not killed;
+the event only means new dispatch to that agent kind is disabled.
+
+### `agent_resumed` details
+
+When `event` is `agent.resumed`:
+
+```json
+{
+  "details": {
+    "agent": "claude",
+    "resumedAt": "2026-06-04T08:00:00.000+00:00",
+    "resumedBy": "api",
+    "reason": "maintenance complete"
+  }
+}
+```
+
+`reason` may be `null`.
+
+### `waiting_for_agent_resume` details
+
+When `event` is `work_item.waiting_for_agent_resume`, `workItem` and `project`
+carry the affected item and its project:
+
+```json
+{
+  "details": {
+    "reason": "paused by operator: provider outage",
+    "retryFrom": "work"
+  }
+}
+```
+
+`retryFrom` identifies the phase the item should re-enter after the agent is
+resumed, such as `"work"`, `"audit"`, `"merge"`, or `"upstream"`.
 
 ### `budget_deferred` details
 

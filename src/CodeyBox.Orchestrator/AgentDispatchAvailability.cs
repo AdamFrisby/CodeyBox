@@ -4,8 +4,9 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Dispatch-facing availability policy. It is the single place that combines
-/// the master smoke switch, the in-VM smoke gate, and the availability registry
-/// read semantics used by routing, pickup, and worker-health checks.
+/// operator pause state, the master smoke switch, the in-VM smoke gate, and
+/// the availability registry read semantics used by routing, pickup, and
+/// worker-health checks.
 /// </summary>
 public interface IAgentDispatchAvailability
 {
@@ -41,18 +42,23 @@ public interface IAgentEffectiveAvailabilityReader
 
 public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
 {
+    public const string PausedReasonPrefix = "paused by operator";
+
     private readonly IAgentEffectiveAvailabilityReader? _availability;
     private readonly IInVmSmokeGate? _inVmSmokeGate;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly IAgentPauseController? _pauses;
 
     public AgentDispatchAvailability(
         IAgentEffectiveAvailabilityReader? availability = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        SmokeOptionsSnapshot? smokeOptions = null,
+        IAgentPauseController? pauses = null)
     {
         _availability = availability;
         _inVmSmokeGate = inVmSmokeGate;
         _smokeOptions = smokeOptions;
+        _pauses = pauses;
     }
 
     public async Task<AgentAvailability?> EnsureAvailableAsync(
@@ -60,6 +66,9 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
         InVmSmokeSandboxTarget target,
         CancellationToken ct)
     {
+        if (await GetPausedAvailabilityAsync(kind, ct) is { } paused)
+            return paused;
+
         if (SmokeDisabled)
             return GetAvailability(kind);
 
@@ -71,6 +80,9 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
 
     public AgentAvailability? GetAvailability(AgentKind kind)
     {
+        if (GetPausedAvailability(kind) is { } paused)
+            return paused;
+
         if (_availability is null)
             return null;
 
@@ -81,4 +93,43 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
     }
 
     private bool SmokeDisabled => _smokeOptions?.Enabled == false;
+
+    public static bool IsPausedVerdict(AgentAvailability? availability) =>
+        availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
+
+    private async Task<AgentAvailability?> GetPausedAvailabilityAsync(
+        AgentKind kind,
+        CancellationToken ct)
+    {
+        if (_pauses is null)
+            return null;
+
+        var pause = await _pauses.GetAgentStateAsync(kind, ct);
+        return pause is null ? null : ToPausedAvailability(pause);
+    }
+
+    private AgentAvailability? GetPausedAvailability(AgentKind kind)
+    {
+        if (_pauses is null)
+            return null;
+
+        var pause = _pauses.GetAgentStateAsync(kind, CancellationToken.None)
+            .ConfigureAwait(false)
+            .GetAwaiter()
+            .GetResult();
+        return pause is null ? null : ToPausedAvailability(pause);
+    }
+
+    private static AgentAvailability ToPausedAvailability(AgentPauseState pause) =>
+        new(false, FormatPausedReason(pause), null, AgentAvailabilityCause.OperatorPaused);
+
+    private static string FormatPausedReason(AgentPauseState pause)
+    {
+        var reason = string.IsNullOrWhiteSpace(pause.PausedReason)
+            ? PausedReasonPrefix
+            : $"{PausedReasonPrefix}: {pause.PausedReason}";
+        return pause.ExpiresAt is { } expiresAt
+            ? $"{reason} until {expiresAt:O}"
+            : reason;
+    }
 }

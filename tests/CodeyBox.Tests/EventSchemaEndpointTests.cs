@@ -33,7 +33,7 @@ public sealed class EventSchemaEndpointTests : IDisposable
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        Assert.Equal("1.2", root.GetProperty("eventSchemaVersion").GetString());
+        Assert.Equal("1.3", root.GetProperty("eventSchemaVersion").GetString());
 
         var eventTypes = root.GetProperty("eventTypes");
         // Every event type the code knows about must appear in the endpoint payload.

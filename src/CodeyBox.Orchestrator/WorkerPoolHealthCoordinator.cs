@@ -152,6 +152,9 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         if (project is not null && await IsBudgetBlockedAsync(candidate, project.Budget, ct))
             return false;
 
+        if (candidate.JobType == JobType.AgentControl)
+            return true;
+
         return await HasEligibleAvailableAgentAsync(candidate, project, ct);
     }
 
@@ -227,10 +230,11 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         }
 
         var directAgent = item.Agent ?? project?.DefaultAgent;
-        return directAgent is { } agent && IsDirectAgentAvailable(agent);
+        return directAgent is { } agent
+               && await IsDirectAgentAvailableAsync(agent, ct);
     }
 
-    private bool IsDirectAgentAvailable(AgentKind agent)
+    private async Task<bool> IsDirectAgentAvailableAsync(AgentKind agent, CancellationToken ct)
     {
         if (_agents is not null && !_agents.Available.Contains(agent))
             return false;
