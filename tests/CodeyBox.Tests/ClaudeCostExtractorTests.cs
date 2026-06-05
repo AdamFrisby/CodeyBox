@@ -20,9 +20,38 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(NdJsonFixture, null);
 
         Assert.NotNull(result);
-        Assert.Equal(12345, result.InputTokens);
+        // InputTokens is the TOTAL input bucket per the AgentCostSnapshot contract
+        // (the calculator derives billable fresh as InputTokens - CachedInputTokens).
+        // For Anthropic that means fresh + cache_creation + cache_read.
+        Assert.Equal(12345 + 5000, result.InputTokens);
         Assert.Equal(678, result.OutputTokens);
         Assert.Equal(5000, result.CachedInputTokens);
+    }
+
+    [Fact]
+    public void NdJson_IncludesCacheCreationInInputTotal()
+    {
+        // Representative real-world shape: most input is cache_creation (tokens
+        // written to cache this turn — the most expensive prompt-input bucket),
+        // a tiny fresh input_tokens, and a large cache_read_input_tokens.
+        // Regression: ClaudeCostExtractor used to drop cache_creation_input_tokens
+        // entirely, so the recorded input was ~0 relative to cached and the
+        // cache-creation cost component was zeroed out.
+        const string fixture = """
+            {"type":"assistant","message":{"id":"msg_02","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":43,"output_tokens":120,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+            {"type":"result","subtype":"success","duration_ms":5000,"num_turns":1,"result":"Done","is_error":false,"session_id":"abc","total_cost_usd":0.12,"usage":{"input_tokens":43,"output_tokens":120,"cache_read_input_tokens":900000,"cache_creation_input_tokens":10000}}
+            """;
+
+        var result = Extractor.TryExtract(fixture, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(43 + 10000 + 900000, result.InputTokens);
+        Assert.Equal(900000, result.CachedInputTokens);
+        Assert.Equal(120, result.OutputTokens);
+        // Sanity: billable fresh per the calculator's formula = InputTokens - CachedInputTokens.
+        // It must include cache_creation (10000) on top of fresh input_tokens (43),
+        // not just one or the other.
+        Assert.Equal(10043, result.InputTokens - result.CachedInputTokens);
     }
 
     [Fact]
