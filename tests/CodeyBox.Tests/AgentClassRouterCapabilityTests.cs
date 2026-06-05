@@ -118,6 +118,30 @@ public sealed class AgentClassRouterCapabilityTests
     }
 
     [Fact]
+    public async Task RequiredCapability_InheritsAcrossSameKindInstances()
+    {
+        var tagged = Member(Claude, 100, "audit") with { InstanceId = "acct-a" };
+        var sibling = Member(Claude, 99) with { InstanceId = "acct-b" };
+        var cls = Class(tagged, sibling);
+        var router = BuildRouter([cls], [new InstanceRouteProbe(Claude, new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            [tagged.RouteKey] = 0.0,
+            [sibling.RouteKey] = 50.0,
+        })]);
+
+        var decision = await router.ResolveAsync(
+            Item(required: "audit") with { AgentInstanceId = sibling.RouteKey },
+            null,
+            CancellationToken.None);
+        var pool = router.GetCapabilityPool("cls", "audit");
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(sibling.RouteKey, decision.Chosen!.RouteKey);
+        Assert.NotNull(pool);
+        Assert.Contains(Claude, pool!);
+    }
+
+    [Fact]
     public async Task RequiredCapability_MemberMustCoverEveryTag()
     {
         // Claude declares "sensitive" only; item requires both — Claude rejected.

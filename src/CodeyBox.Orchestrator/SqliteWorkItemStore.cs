@@ -18,6 +18,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         Converters = { new JsonStringEnumConverter() },
     };
     private readonly SqliteConnection _conn;
+    private readonly string _connectionString;
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
@@ -26,7 +27,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        _conn = new SqliteConnection($"Data Source={path}");
+        _connectionString = $"Data Source={path}";
+        _conn = new SqliteConnection(_connectionString);
         _writeLock = SqliteDatabaseWriteGate.ForPath(path);
         _writeLock.Wait();
         try
@@ -1975,7 +1977,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         SqliteTransaction? tx,
         CancellationToken ct)
     {
-        using var cmd = _conn.CreateCommand();
+        // The store has one long-lived connection for writes and legacy reads.
+        // External-id enrichment happens after those readers are disposed and
+        // can be triggered concurrently by polling/dispatch paths, so use a
+        // short-lived read connection unless the caller needs same-transaction
+        // visibility.
+        using var readConn = tx is null ? await OpenReadConnectionAsync(ct) : null;
+        using var cmd = tx is null ? readConn!.CreateCommand() : _conn.CreateCommand();
         if (tx is not null) cmd.Transaction = tx;
         cmd.CommandText = "SELECT namespace, external_id FROM work_item_external_ids WHERE work_item_id = $id;";
         cmd.Parameters.AddWithValue("$id", id.ToString());
@@ -1999,7 +2007,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (ids.Count == 0) return result;
 
         var idSet = ids as HashSet<WorkItemId> ?? new HashSet<WorkItemId>(ids);
-        using var cmd = _conn.CreateCommand();
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var cmd = readConn.CreateCommand();
         if (ids.Count > 256)
         {
             cmd.CommandText = "SELECT work_item_id, namespace, external_id FROM work_item_external_ids;";
@@ -2032,6 +2041,17 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         foreach (var kv in accum)
             result[kv.Key] = kv.Value;
         return result;
+    }
+
+    private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
+    {
+        var conn = new SqliteConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+        await pragma.ExecuteNonQueryAsync(ct);
+        return conn;
     }
 
     /// <summary>

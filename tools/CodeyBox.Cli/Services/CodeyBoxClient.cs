@@ -139,7 +139,7 @@ internal sealed class CodeyBoxClient
         CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
-            $"/agents/{Uri.EscapeDataString(kind)}/pause",
+            AgentPausePath(kind, "pause"),
             new PauseAgentRequest { Reason = reason, DurationSeconds = durationSeconds },
             CliJsonContext.Default.PauseAgentRequest,
             ct);
@@ -148,8 +148,20 @@ internal sealed class CodeyBoxClient
 
     internal async Task ResumeAgentAsync(string kind, CancellationToken ct = default)
     {
-        var resp = await _http.PostAsync($"/agents/{Uri.EscapeDataString(kind)}/resume", content: null, ct);
+        var resp = await _http.PostAsync(AgentPausePath(kind, "resume"), content: null, ct);
         await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+    }
+
+    private static string AgentPausePath(string routeKeyOrKind, string action)
+    {
+        var value = routeKeyOrKind.Trim();
+        var slash = value.IndexOf('/');
+        if (slash <= 0 || slash == value.Length - 1)
+            return $"/agents/{Uri.EscapeDataString(value)}/{action}";
+
+        var kind = value[..slash];
+        var instanceId = value[(slash + 1)..];
+        return $"/agents/{Uri.EscapeDataString(kind)}/instances/{Uri.EscapeDataString(instanceId)}/{action}";
     }
 
     internal async Task<string> GetPausedAgentsAsync(CancellationToken ct = default)

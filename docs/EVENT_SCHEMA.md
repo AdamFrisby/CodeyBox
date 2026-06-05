@@ -94,8 +94,8 @@ subscribe to.
 | `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
 | `agent.smoke_recovered` | 1.0 | Previously-excluded agent recovered: a subsequent smoke probe passed. |
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
-| `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind. |
-| `agent.resumed` | 1.3 | Operator resumed dispatch to one agent kind. |
+| `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind or pooled instance route. |
+| `agent.resumed` | 1.3 | Operator resumed dispatch to one agent kind or pooled instance route. |
 | `sandbox.leak_detected` | 1.0 | Leaked `codeybox-*` sandbox detected by reaper. |
 | `sandbox.leak_disposed` | 1.0 | Reaper successfully disposed a leaked sandbox. |
 | `sandbox.leak_dispose_failed` | 1.0 | Reaper failed to dispose a leaked sandbox. |

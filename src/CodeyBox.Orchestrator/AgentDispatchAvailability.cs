@@ -21,11 +21,19 @@ public interface IAgentDispatchAvailability
         InVmSmokeSandboxTarget target,
         CancellationToken ct);
 
+    Task<AgentAvailability?> EnsureAvailableAsync(
+        AgentMembership member,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+        => EnsureAvailableAsync(member.Agent, target, ct);
+
     /// <summary>
     /// Returns the current effective availability without running a probe. Used
     /// by readiness/health checks that only need the cached verdict.
     /// </summary>
     AgentAvailability? GetAvailability(AgentKind kind);
+
+    AgentAvailability? GetAvailability(AgentMembership member) => GetAvailability(member.Agent);
 }
 
 /// <summary>
@@ -78,6 +86,23 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
         return _availability?.GetAvailability(kind);
     }
 
+    public async Task<AgentAvailability?> EnsureAvailableAsync(
+        AgentMembership member,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        if (await GetPausedAvailabilityAsync(member.Agent, ct, member.RouteKey) is { } paused)
+            return paused;
+
+        if (SmokeDisabled)
+            return GetAvailability(member);
+
+        if (_inVmSmokeGate is not null)
+            return await _inVmSmokeGate.EnsureAvailableAsync(member.Agent, target, ct);
+
+        return _availability?.GetAvailability(member.Agent);
+    }
+
     public AgentAvailability? GetAvailability(AgentKind kind)
     {
         if (GetPausedAvailability(kind) is { } paused)
@@ -92,6 +117,20 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
         return _availability.GetAvailability(kind);
     }
 
+    public AgentAvailability? GetAvailability(AgentMembership member)
+    {
+        if (GetPausedAvailability(member.Agent, member.RouteKey) is { } paused)
+            return paused;
+
+        if (_availability is null)
+            return null;
+
+        if (SmokeDisabled)
+            return _availability.GetAvailabilityWithoutSmokeGateExclusions(member.Agent);
+
+        return _availability.GetAvailability(member.Agent);
+    }
+
     private bool SmokeDisabled => _smokeOptions?.Enabled == false;
 
     public static bool IsPausedVerdict(AgentAvailability? availability) =>
@@ -99,21 +138,22 @@ public sealed class AgentDispatchAvailability : IAgentDispatchAvailability
 
     private async Task<AgentAvailability?> GetPausedAvailabilityAsync(
         AgentKind kind,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? agentInstanceId = null)
     {
         if (_pauses is null)
             return null;
 
-        var pause = await _pauses.GetAgentStateAsync(kind, ct);
+        var pause = await _pauses.GetAgentStateAsync(kind, ct, agentInstanceId);
         return pause is null ? null : ToPausedAvailability(pause);
     }
 
-    private AgentAvailability? GetPausedAvailability(AgentKind kind)
+    private AgentAvailability? GetPausedAvailability(AgentKind kind, string? agentInstanceId = null)
     {
         if (_pauses is null)
             return null;
 
-        var pause = _pauses.GetAgentStateAsync(kind, CancellationToken.None)
+        var pause = _pauses.GetAgentStateAsync(kind, CancellationToken.None, agentInstanceId)
             .ConfigureAwait(false)
             .GetAwaiter()
             .GetResult();

@@ -821,6 +821,7 @@ builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
         ColdStartFitInWindow = qr.ColdStartFitInWindow,
+        IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
     };
 
     static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)
@@ -2389,6 +2390,7 @@ app.MapHub<AgentStdoutHub>("/hubs/agent-stdout");
 
 app.MapGet("/quota", async (
     IEnumerable<IAgentQuotaProbe> probes,
+    AgentClassRouter? router,
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
     IAgentBudgetProvider? budgetProvider,
@@ -2403,24 +2405,34 @@ app.MapGet("/quota", async (
     var pausedStates = agentPauses is null
         ? Array.Empty<AgentPauseState>()
         : await agentPauses.ListPausedAsync(ct);
-    var pausedByAgent = pausedStates.ToDictionary(s => s.Agent, s => s);
+    var pausedByKey = pausedStates.ToDictionary(
+        s => s.AgentInstanceId ?? s.Agent.Value,
+        s => s,
+        StringComparer.OrdinalIgnoreCase);
+    var pausedByAgent = pausedStates
+        .Where(s => s.AgentInstanceId is null)
+        .ToDictionary(s => s.Agent, s => s);
+    var probeByKind = probes
+        .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
+        .ToDictionary(p => p.Kind);
+    var representedProbeKeys = new HashSet<(AgentKind Agent, string? ModelId)>();
 
     var snapshots = new List<object>();
-    foreach (var probe in probes.Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe))
+    var kindAggregateCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    async Task AddSnapshotAsync(AgentMembership member, string? classId, string? classDisplayName)
     {
-        var member = new AgentMembership
-        {
-            Agent = probe.Kind,
-            Billing = AgentBilling.Subscription,
-            QualityScore = 100,
-        };
+        if (!probeByKind.TryGetValue(member.Agent, out var probe))
+            return;
+
+        representedProbeKeys.Add((member.Agent, member.ModelId));
         var snapshot = await probe.GetAvailabilityAsync(member, ct);
         var recentFailuresForProbe = failures
-            .Where(f => f.Agent == probe.Kind && f.ObservedAt >= now - options.ObservedFailureWindow)
+            .Where(f => f.Agent == member.Agent && f.ObservedAt >= now - options.ObservedFailureWindow)
             .ToList();
         var recentDefaultFailure = recentFailuresForProbe.Any(f => f.ModelId is null);
         var recentFailure = recentFailuresForProbe.Count > 0;
-        var paused = pausedByAgent.TryGetValue(probe.Kind, out var pause);
+        var paused = pausedByKey.TryGetValue(member.RouteKey, out var pause)
+            || pausedByAgent.TryGetValue(member.Agent, out pause);
         var quotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options);
         var defaultQuotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options);
         var modelKeys = snapshot.PerModel.Keys
@@ -2429,10 +2441,16 @@ app.MapGet("/quota", async (
             .ToList();
         snapshots.Add(new
         {
-            agent = probe.Kind.Value,
+            agent = member.Agent.Value,
+            agentInstanceId = member.RouteKey,
+            instanceId = member.InstanceId,
+            classId,
+            classDisplayName,
+            billing = member.Billing.ToString(),
+            modelId = member.ModelId,
             latestSnapshot = snapshot,
             observedFailuresLast60m = failures
-                .Where(f => f.Agent == probe.Kind)
+                .Where(f => f.Agent == member.Agent)
                 .GroupBy(f => new { f.ProjectId, f.ModelId, f.FailureKind })
                 .Select(g => new
                 {
@@ -2457,11 +2475,39 @@ app.MapGet("/quota", async (
                 modelId => !paused && QuotaRouter.WouldAllow(
                         snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
                         recentFailuresForProbe.Any(f =>
-                            f.Agent == probe.Kind &&
+                            f.Agent == member.Agent &&
                             string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
                         options),
                 StringComparer.OrdinalIgnoreCase),
         });
+        kindAggregateCounts[member.Agent.Value] =
+            kindAggregateCounts.TryGetValue(member.Agent.Value, out var count) ? count + 1 : 1;
+    }
+
+    if (router is not null)
+    {
+        var seenMemberRows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in router.SnapshotConfiguredMembers())
+        {
+            if (entry.Member.Billing != AgentBilling.Subscription)
+                continue;
+            if (!seenMemberRows.Add($"{entry.Member.RouteKey}\0{entry.Member.ModelId ?? string.Empty}"))
+                continue;
+            await AddSnapshotAsync(entry.Member, entry.ClassId, entry.DisplayName);
+        }
+    }
+
+    foreach (var probe in probeByKind.Values)
+    {
+        if (representedProbeKeys.Any(k => k.Agent == probe.Kind && k.ModelId is null))
+            continue;
+
+        await AddSnapshotAsync(new AgentMembership
+        {
+            Agent = probe.Kind,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        }, classId: null, classDisplayName: null);
     }
 
     var budgets = new List<object>();
@@ -2507,10 +2553,20 @@ app.MapGet("/quota", async (
         minQuotaPct = options.MinQuotaPct,
         unknownPolicy = options.UnknownPolicy.ToString(),
         observedFailureWindowMinutes = options.ObservedFailureWindow.TotalMinutes,
+        intraKindRoutingPolicy = options.IntraKindRoutingPolicy.ToString(),
         probes = snapshots,
+        kindAggregates = kindAggregateCounts
+            .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => new
+            {
+                agent = kv.Key,
+                instances = kv.Value,
+            })
+            .ToList(),
         pausedAgents = pausedStates.Select(s => new
         {
             agent = s.Agent.Value,
+            agentInstanceId = s.AgentInstanceId,
             paused = s.Paused,
             pausedAt = s.PausedAt,
             pausedReason = s.PausedReason,
@@ -3710,6 +3766,14 @@ namespace CodeyBox.Api
         /// dispatch queue from stalling on cold start. Default 2.0.
         /// </summary>
         public double ColdStartFitInWindow { get; set; } = 2.0;
+        /// <summary>
+        /// How pooled instances of the same agent kind are ordered. Default
+        /// MostQuotaFirst maximizes runway; RoundRobin spreads wear; Sticky
+        /// keeps later phases on the selected instance when available.
+        /// Hot-reloadable.
+        /// </summary>
+        public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
+            IntraKindRoutingPolicy.MostQuotaFirst;
         /// <summary>
         /// Additional retries on a transient probe failure (network error / timeout / 5xx)
         /// before recording the failure. Total attempts = 1 + this value. Default 2.

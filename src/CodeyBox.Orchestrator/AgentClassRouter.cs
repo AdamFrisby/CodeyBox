@@ -77,10 +77,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
         = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _roundRobinCursors
+        = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly record struct MemberQuotaKey(string RouteKey, AgentKind Agent, string ModelId);
     private sealed record QuotaRetryAdmission(string RouteKey, string ModelId, DateTimeOffset ExpiresAt);
     private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
+    private sealed record PrecomputedQuota(AgentQuotaSnapshot Snapshot, BudgetAdjustedQuota Budgeted);
 
     /// <summary>
     /// Raised when a routing probe observes an eligible member move from below
@@ -324,6 +327,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 item.Id, classId);
             return new AgentRoutingDecision { Reason = $"unknown agent class '{classId}'" };
         }
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
 
         // Step 1: filter by eligibility — both the legacy QualityScore floor and
         // the new capability gate must pass during the transition window.
@@ -331,7 +335,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var eligible = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
-            .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
+            .Where(x => MemberCoversRequiredCapabilities(
+                x.Member,
+                item.RequiredCapabilities,
+                effectiveCapabilities))
             .ToList();
 
         if (eligible.Count == 0)
@@ -350,7 +357,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     Agent: m.Agent,
                     ModelId: m.ModelId,
                     EffectiveScore: m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtcFloor),
-                    RejectReason: DescribeIneligibility(m, item)))
+                    RejectReason: DescribeIneligibility(m, item, effectiveCapabilities)))
                 .ToList();
             if (commitDispatchSideEffects)
                 AuditLog.QuotaRouterNoEligible(item.Id, classId, item.MinModelScore, below);
@@ -373,6 +380,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
             .ThenBy(x => x.ConfigIndex)
             .ToList();
+        var precomputedQuotas = new Dictionary<MemberQuotaKey, PrecomputedQuota>();
+        var ordered = await ApplyIntraKindPolicyAsync(
+            classId,
+            item,
+            sorted,
+            precomputedQuotas,
+            commitDispatchSideEffects,
+            ct);
         var quotaRetryAdmission = bypassRecentFailurePrecheck && bypassInProcessExhaustion
             ? null
             : GetQuotaRetryAdmission(item.Id, nowUtc);
@@ -387,23 +402,23 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         foreach (var m in agentClass.Members)
         {
             var failsScore = m.QualityScore < item.MinModelScore;
-            var failsCaps = !MemberCoversRequiredCapabilities(m, item.RequiredCapabilities);
+            var failsCaps = !MemberCoversRequiredCapabilities(m, item.RequiredCapabilities, effectiveCapabilities);
             if (!failsScore && !failsCaps) continue;
             var eff = m.QualityScore + ComputeTodModifier(cfg.TodModifiers, m.Agent, nowUtc);
-            rejected.Add((m.Agent, m.ModelId, eff, DescribeIneligibility(m, item)));
+            rejected.Add((m.Agent, m.ModelId, eff, DescribeIneligibility(m, item, effectiveCapabilities)));
         }
 
         var pausedRejected = new List<(AgentKind Agent, string Reason)>();
         var pausedMembers = new HashSet<AgentMembership>();
 
-        var hasSubscription = sorted.Any(x => x.Member.Billing == AgentBilling.Subscription);
+        var hasSubscription = ordered.Any(x => x.Member.Billing == AgentBilling.Subscription);
         // Track subscription members benched purely by the availability gate
         // (in-VM smoke / fast-fail breaker / missing-probe). If every
         // subscription member fell out for that reason — and none for quota —
         // the "wait" we return below is unblocked by the smoke sweep / operator
         // reset, NOT a quota recheck, so the reason text must say so rather than
         // claim a quota threshold.
-        var subscriptionTotal = sorted.Count(x => x.Member.Billing == AgentBilling.Subscription);
+        var subscriptionTotal = ordered.Count(x => x.Member.Billing == AgentBilling.Subscription);
         var subscriptionSmokeExcluded = 0;
         var subscriptionExhaustionCacheExcluded = 0;
         DateTimeOffset? earliestExhaustionCacheExpiry = null;
@@ -440,11 +455,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var atCapMembers = new List<AgentMembership>();
 
         // Step 4: probe quota in sorted order; pick the first viable member.
-        foreach (var entry in sorted)
+        foreach (var entry in ordered)
         {
             var member = entry.Member;
             var quotaRetryAdmissionMatches = QuotaRetryAdmissionMatches(quotaRetryAdmission, member);
-            var cachedAvailability = _dispatchAvailability?.GetAvailability(member.Agent);
+            var cachedAvailability = _dispatchAvailability?.GetAvailability(member);
             if (IsOperatorPaused(cachedAvailability))
             {
                 var pausedReason = cachedAvailability!.Reason ?? AgentDispatchAvailability.PausedReasonPrefix;
@@ -483,7 +498,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // (when wired) also probes an apparently-Available-but-never-probed
             // agent here so the exit-127 / auth cascade is caught on the FIRST
             // dispatch, not on first run; a cache hit is free.
-            var availability = await GetGatedAvailabilityAsync(member.Agent, smokeTarget, ct);
+            var availability = await GetGatedAvailabilityAsync(member, smokeTarget, ct);
             if (availability is { Available: false })
             {
                 if (IsOperatorPaused(availability))
@@ -546,32 +561,21 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 continue;
             }
 
+            var quotaKey = ExhaustionKey(member);
             AgentQuotaSnapshot snapshot;
-            try
+            BudgetAdjustedQuota budgeted;
+            if (precomputedQuotas.TryGetValue(quotaKey, out var precomputed))
             {
-                snapshot = await ProbeAsync(member, ct);
+                snapshot = precomputed.Snapshot;
+                budgeted = precomputed.Budgeted;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            else
             {
-                // Probe threw (transient API error). Treat it as unknown (-1) and
-                // still apply the local-budget MIN below rather than aborting the
-                // whole routing pass: a healthy configured budget must still be
-                // able to gate or admit the member when the subscription probe API
-                // blips. Bypassing the budget here would fail-open the operator
-                // spend cap on a probe error. OperationCanceledException
-                // (shutdown/abort) is allowed to propagate.
-                _log.LogDebug(ex,
-                    "Quota probe for {Agent}/{Model} threw; treating as unknown",
-                    member.Agent.Value, member.ModelId ?? "(default)");
-                snapshot = new AgentQuotaSnapshot
-                {
-                    AvailablePct = -1,
-                    Notes = $"probe threw: {ex.GetType().Name}",
-                };
+                snapshot = await ProbeOrUnknownAsync(member, ct);
+                var resolved = ResolveMemberQuota(snapshot, member);
+                budgeted = await ApplyBudgetAsync(member, resolved, ct);
             }
-            var quota = ResolveMemberQuota(snapshot, member);
-            var budgeted = await ApplyBudgetAsync(member, quota, ct);
-            quota = budgeted.Quota;
+            var quota = budgeted.Quota;
 
             if (member.Billing == AgentBilling.PayPerApi && budgeted.BudgetExhausted)
             {
@@ -614,7 +618,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 }
 
                 // Mark all remaining sorted entries as "ranked lower" for the audit event.
-                foreach (var other in sorted.Where(x => x != entry))
+                foreach (var other in ordered.Where(x => x != entry))
                     rejected.Add((other.Member.Agent, other.Member.ModelId, other.EffectiveScore, "ranked lower"));
 
                 var modDesc = DescribeModifiers(cfg.TodModifiers, member.Agent, nowUtc);
@@ -680,7 +684,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // instead — AgentPauseRetryScheduler only wakes WaitingForAgentResume
         // rows, so parking on the paused agent would strand the item until
         // the operator unpauses even when the unpaused peer recovers first.
-        if (pausedRejected.Count > 0 && pausedRejected.Count == sorted.Count)
+        if (pausedRejected.Count > 0 && pausedRejected.Count == ordered.Count)
             return BuildPausedWaitDecision();
 
         if (commitDispatchSideEffects && quotaRetryAdmissionDeniedAfterProbe)
@@ -785,7 +789,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // Spill through eligible candidates in score order, honouring the caller's
         // slot gate so the per-agent cap remains an authoritative gate for
         // PayPerApi members too.
-        foreach (var candidate in sorted)
+        foreach (var candidate in ordered)
         {
             if (budgetExhaustedMembers.Contains(candidate.Member)) continue;
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
@@ -831,8 +835,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var fallbackCapBlocked = capSaturatedMembers.Count > 0 || atCapAgents.Count > 0;
         if (fallbackCapBlocked && budgetRecheck > _opts.CapRetryRecheckInterval)
             budgetRecheck = _opts.CapRetryRecheckInterval;
-        var allFallbackSmokeExcluded = sorted.Count > 0
-            && sorted.All(x => smokeExcluded.Contains((x.Member.Agent, x.Member.ModelId)));
+        var allFallbackSmokeExcluded = ordered.Count > 0
+            && ordered.All(x => smokeExcluded.Contains((x.Member.Agent, x.Member.ModelId)));
         string parkReason;
         if (allFallbackSmokeExcluded)
             parkReason = $"all PayPerApi members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
@@ -970,13 +974,40 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (string.IsNullOrEmpty(classId) || string.IsNullOrEmpty(capability)) return null;
         var cfg = Volatile.Read(ref _routingConfig);
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
         var pool = new HashSet<AgentKind>();
         foreach (var member in agentClass.Members)
         {
-            if (member.HasCapability(capability))
+            if (EffectiveCapabilities(member, effectiveCapabilities)
+                .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase)))
                 pool.Add(member.Agent);
         }
         return pool.Count == 0 ? null : pool;
+    }
+
+    public bool MemberHasCapability(string? classId, AgentMembership member, string capability)
+    {
+        if (string.IsNullOrEmpty(capability))
+            return false;
+        if (string.IsNullOrEmpty(classId))
+            return member.HasCapability(capability);
+
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return member.HasCapability(capability);
+
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        return EffectiveCapabilities(member, effectiveCapabilities)
+            .Any(tag => string.Equals(tag, capability, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public IReadOnlyList<(string ClassId, string DisplayName, AgentMembership Member)> SnapshotConfiguredMembers()
+    {
+        var cfg = Volatile.Read(ref _routingConfig);
+        return cfg.Catalog.Values
+            .OrderBy(c => c.Id, StringComparer.OrdinalIgnoreCase)
+            .SelectMany(c => c.Members.Select(m => (c.Id, c.DisplayName, m)))
+            .ToList();
     }
 
     /// <inheritdoc />
@@ -1038,6 +1069,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var nowUtc = _time.GetUtcNow();
         PruneExpiredExhaustion(nowUtc);
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
 
         // Score + order the eligible, non-exhausted members first. Availability
         // (and the in-VM gate) is applied last, in score order, so we only probe
@@ -1046,7 +1078,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var ordered = agentClass.Members
             .Select((m, idx) => (Member: m, ConfigIndex: idx))
             .Where(x => x.Member.QualityScore >= item.MinModelScore)
-            .Where(x => MemberCoversRequiredCapabilities(x.Member, item.RequiredCapabilities))
+            .Where(x => MemberCoversRequiredCapabilities(
+                x.Member,
+                item.RequiredCapabilities,
+                effectiveCapabilities))
             .Where(x => !IsExhausted(x.Member, nowUtc))
             .Select(x => new
             {
@@ -1069,7 +1104,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var result = new List<AgentMembership>(ordered.Count);
         foreach (var member in ordered)
         {
-            var av = await GetGatedAvailabilityAsync(member.Agent, target, ct);
+            var av = await GetGatedAvailabilityAsync(member, target, ct);
             if (av is null || av.Available)
                 result.Add(member);
         }
@@ -1119,6 +1154,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return _dispatchAvailability is null
             ? null
             : await _dispatchAvailability.EnsureAvailableAsync(kind, target, ct);
+    }
+
+    private async Task<AgentAvailability?> GetGatedAvailabilityAsync(
+        AgentMembership member,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        return _dispatchAvailability is null
+            ? null
+            : await _dispatchAvailability.EnsureAvailableAsync(member, target, ct);
     }
 
     /// <summary>
@@ -1303,6 +1348,160 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return _nullProbe.GetAvailabilityAsync(member, ct);
     }
 
+    private async Task<AgentQuotaSnapshot> ProbeOrUnknownAsync(AgentMembership member, CancellationToken ct)
+    {
+        try
+        {
+            return await ProbeAsync(member, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Probe threw (transient API error). Treat it as unknown (-1) and
+            // still apply the local-budget MIN rather than aborting routing.
+            _log.LogDebug(ex,
+                "Quota probe for {Agent}/{Model} threw; treating as unknown",
+                member.Agent.Value, member.ModelId ?? "(default)");
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = -1,
+                Notes = $"probe threw: {ex.GetType().Name}",
+            };
+        }
+    }
+
+    private async Task<List<ScoredMember>> ApplyIntraKindPolicyAsync(
+        string classId,
+        WorkItem item,
+        List<ScoredMember> sorted,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        bool commitDispatchSideEffects,
+        CancellationToken ct)
+    {
+        if (sorted.Count <= 1)
+            return sorted;
+
+        var policy = _opts.IntraKindRoutingPolicy;
+        if (policy == IntraKindRoutingPolicy.MostQuotaFirst)
+            await PrecomputeQuotaForSameKindGroupsAsync(sorted, precomputedQuotas, ct);
+
+        var buckets = sorted
+            .GroupBy(x => x.Member.Agent)
+            .Select(g => new
+            {
+                Agent = g.Key,
+                Members = OrderIntraKindGroup(
+                    classId,
+                    item,
+                    g.Key,
+                    g.ToList(),
+                    precomputedQuotas,
+                    policy,
+                    commitDispatchSideEffects),
+                BestScore = g.Max(x => x.EffectiveScore),
+                BestBillingRank = g.Min(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1),
+                FirstConfigIndex = g.Min(x => x.ConfigIndex),
+            })
+            .OrderByDescending(g => g.BestScore)
+            .ThenBy(g => g.BestBillingRank)
+            .ThenBy(g => g.FirstConfigIndex)
+            .ToList();
+
+        return buckets.SelectMany(g => g.Members).ToList();
+    }
+
+    private async Task PrecomputeQuotaForSameKindGroupsAsync(
+        List<ScoredMember> sorted,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        CancellationToken ct)
+    {
+        foreach (var group in sorted.GroupBy(x => x.Member.Agent).Where(g => g.Count() > 1))
+        {
+            foreach (var entry in group)
+            {
+                var member = entry.Member;
+                var key = ExhaustionKey(member);
+                if (precomputedQuotas.ContainsKey(key))
+                    continue;
+
+                var snapshot = await ProbeOrUnknownAsync(member, ct);
+                var resolved = ResolveMemberQuota(snapshot, member);
+                var budgeted = await ApplyBudgetAsync(member, resolved, ct);
+                precomputedQuotas[key] = new PrecomputedQuota(snapshot, budgeted);
+                RecordObservedAvailability(member, budgeted.Quota);
+            }
+        }
+    }
+
+    private List<ScoredMember> OrderIntraKindGroup(
+        string classId,
+        WorkItem item,
+        AgentKind agent,
+        List<ScoredMember> group,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        IntraKindRoutingPolicy policy,
+        bool commitDispatchSideEffects)
+    {
+        if (group.Count <= 1)
+            return group;
+
+        var baseline = group
+            .OrderByDescending(x => x.EffectiveScore)
+            .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+            .ThenBy(x => x.ConfigIndex)
+            .ToList();
+
+        return policy switch
+        {
+            IntraKindRoutingPolicy.RoundRobin => RotateRoundRobin(classId, agent, baseline, commitDispatchSideEffects),
+            IntraKindRoutingPolicy.Sticky => OrderSticky(item, baseline),
+            _ => baseline
+                .OrderByDescending(x => QuotaRank(x.Member, precomputedQuotas))
+                .ThenByDescending(x => x.EffectiveScore)
+                .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
+                .ThenBy(x => x.ConfigIndex)
+                .ToList(),
+        };
+    }
+
+    private List<ScoredMember> RotateRoundRobin(
+        string classId,
+        AgentKind agent,
+        List<ScoredMember> group,
+        bool commitDispatchSideEffects)
+    {
+        if (group.Count <= 1 || !commitDispatchSideEffects)
+            return group;
+
+        var key = $"{classId}\0{agent.Value}";
+        var cursor = _roundRobinCursors.AddOrUpdate(
+            key,
+            1,
+            (_, current) => unchecked(current + 1)) - 1;
+        var offset = Math.Abs(cursor % group.Count);
+        return group.Skip(offset).Concat(group.Take(offset)).ToList();
+    }
+
+    private static List<ScoredMember> OrderSticky(WorkItem item, List<ScoredMember> group)
+    {
+        if (string.IsNullOrWhiteSpace(item.AgentInstanceId))
+            return group;
+
+        var sticky = group.FirstOrDefault(x => AgentInstanceIds.Matches(x.Member, item.AgentInstanceId));
+        if (sticky is null)
+            return group;
+
+        return [sticky, .. group.Where(x => !ReferenceEquals(x, sticky))];
+    }
+
+    private static double QuotaRank(
+        AgentMembership member,
+        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas)
+    {
+        if (!precomputedQuotas.TryGetValue(ExhaustionKey(member), out var precomputed))
+            return member.Billing == AgentBilling.PayPerApi ? 100.0 : double.NegativeInfinity;
+        return precomputed.Budgeted.Quota.AvailablePct;
+    }
+
     /// <summary>
     /// Returns the earliest known reset time across all currently-exhausted
     /// subscription members of the class that <paramref name="item"/> would route
@@ -1327,6 +1526,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (!cfg.Catalog.TryGetValue(classId, out var agentClass)) return null;
 
         var nowUtc = _time.GetUtcNow();
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
         DateTimeOffset? earliest = null;
         foreach (var member in agentClass.Members)
         {
@@ -1336,8 +1536,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // point waiting for their quota to reset when they would still be
             // rejected at routing time.
             if (member.QualityScore < item.MinModelScore) continue;
-            if (!MemberCoversRequiredCapabilities(member, item.RequiredCapabilities)) continue;
-            var availability = _dispatchAvailability?.GetAvailability(member.Agent);
+            if (!MemberCoversRequiredCapabilities(
+                    member,
+                    item.RequiredCapabilities,
+                    effectiveCapabilities)) continue;
+            var availability = _dispatchAvailability?.GetAvailability(member);
             if (IsOperatorPaused(availability))
                 continue;
 
@@ -1831,9 +2034,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// </summary>
     internal static bool MemberCoversRequiredCapabilities(
         AgentMembership member, IReadOnlyList<string> required)
+        => MemberCoversRequiredCapabilities(member, required, null);
+
+    internal static bool MemberCoversRequiredCapabilities(
+        AgentMembership member,
+        IReadOnlyList<string> required,
+        IReadOnlyDictionary<AgentKind, IReadOnlySet<string>>? effectiveCapabilities)
     {
         if (required.Count == 0) return true;
-        var declared = member.Capabilities;
+        var declared = EffectiveCapabilities(member, effectiveCapabilities);
         if (declared.Count == 0) return false;
         foreach (var tag in required)
         {
@@ -1851,21 +2060,62 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return true;
     }
 
+    private static IReadOnlySet<string> EffectiveCapabilities(
+        AgentMembership member,
+        IReadOnlyDictionary<AgentKind, IReadOnlySet<string>>? effectiveCapabilities)
+    {
+        if (effectiveCapabilities is not null
+            && effectiveCapabilities.TryGetValue(member.Agent, out var inherited))
+            return inherited;
+
+        return member.Capabilities.Count == 0
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(member.Capabilities, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyDictionary<AgentKind, IReadOnlySet<string>> BuildEffectiveCapabilities(AgentClass agentClass)
+    {
+        var byKind = new Dictionary<AgentKind, HashSet<string>>();
+        foreach (var member in agentClass.Members)
+        {
+            if (!byKind.TryGetValue(member.Agent, out var set))
+            {
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                byKind[member.Agent] = set;
+            }
+
+            foreach (var capability in member.Capabilities)
+            {
+                if (!string.IsNullOrWhiteSpace(capability))
+                    set.Add(capability.Trim());
+            }
+        }
+
+        return byKind.ToDictionary(
+            kv => kv.Key,
+            kv => (IReadOnlySet<string>)kv.Value,
+            EqualityComparer<AgentKind>.Default);
+    }
+
     private static bool IsOperatorPaused(AgentAvailability? availability) =>
         availability is { Available: false, Cause: AgentAvailabilityCause.OperatorPaused };
 
-    private static string DescribeIneligibility(AgentMembership member, WorkItem item)
+    private static string DescribeIneligibility(
+        AgentMembership member,
+        WorkItem item,
+        IReadOnlyDictionary<AgentKind, IReadOnlySet<string>>? effectiveCapabilities = null)
     {
         var failsScore = member.QualityScore < item.MinModelScore;
-        var failsCaps = !MemberCoversRequiredCapabilities(member, item.RequiredCapabilities);
+        var declared = EffectiveCapabilities(member, effectiveCapabilities);
+        var failsCaps = !MemberCoversRequiredCapabilities(member, item.RequiredCapabilities, effectiveCapabilities);
         if (failsScore && failsCaps)
             return $"below floor ({member.QualityScore} < {item.MinModelScore}); " +
                    $"missing capabilities (required=[{string.Join(",", item.RequiredCapabilities)}], " +
-                   $"declared=[{string.Join(",", member.Capabilities)}])";
+                   $"declared=[{string.Join(",", declared)}])";
         if (failsScore)
             return $"below floor ({member.QualityScore} < {item.MinModelScore})";
         return $"missing capabilities (required=[{string.Join(",", item.RequiredCapabilities)}], " +
-               $"declared=[{string.Join(",", member.Capabilities)}])";
+               $"declared=[{string.Join(",", declared)}])";
     }
 
     private static int ComputeTodModifier(IReadOnlyList<ParsedTodModifier> modifiers, AgentKind agent, DateTimeOffset nowUtc)
@@ -2162,6 +2412,20 @@ public sealed class QuotaRouterOptions
     /// dispatch queue from stalling on cold start. Default 2.0.
     /// </summary>
     public double ColdStartFitInWindow { get; set; } = 2.0;
+
+    /// <summary>
+    /// How the router orders multiple eligible instances of the same agent kind.
+    /// Hot-reloadable through the shared options instance.
+    /// </summary>
+    public IntraKindRoutingPolicy IntraKindRoutingPolicy { get; set; } =
+        IntraKindRoutingPolicy.MostQuotaFirst;
+}
+
+public enum IntraKindRoutingPolicy
+{
+    MostQuotaFirst,
+    RoundRobin,
+    Sticky,
 }
 
 public enum QuotaUnknownPolicy

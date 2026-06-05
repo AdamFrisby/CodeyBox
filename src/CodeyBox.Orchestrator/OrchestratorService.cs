@@ -1699,7 +1699,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             {
                 var effectiveDirectAgent = item.Agent ?? project?.DefaultAgent;
                 var directAvailability = shouldRouteWorkAgentAtPickup && effectiveDirectAgent is { } directAgent
-                    ? _dispatchAvailability?.GetAvailability(directAgent)
+                    ? _dispatchAvailability?.GetAvailability(new AgentMembership
+                    {
+                        Agent = directAgent,
+                        InstanceId = item.AgentInstanceId,
+                        Billing = AgentBilling.Subscription,
+                        QualityScore = 100,
+                    })
                     : null;
                 if (effectiveDirectAgent is { } pausedCandidate
                     && IsOperatorPaused(directAvailability))

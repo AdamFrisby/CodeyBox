@@ -166,6 +166,11 @@ public sealed class QueueStatusHttpTests : IDisposable
         var unknownResume = await _client.PostAsJsonAsync("/agents/not-real/resume", new { });
         Assert.Equal(HttpStatusCode.NotFound, unknownResume.StatusCode);
 
+        var slashInInstance = await _client.PostAsJsonAsync(
+            "/agents/claude/instances/codex%2Facct/pause",
+            new { reason = "test" });
+        Assert.Equal(HttpStatusCode.BadRequest, slashInInstance.StatusCode);
+
         var missingReason = await _client.PostAsJsonAsync("/agents/claude/pause", new { });
         Assert.Equal(HttpStatusCode.BadRequest, missingReason.StatusCode);
 

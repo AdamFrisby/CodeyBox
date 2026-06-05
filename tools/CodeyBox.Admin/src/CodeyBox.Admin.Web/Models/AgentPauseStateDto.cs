@@ -3,6 +3,7 @@ namespace CodeyBox.Admin.Web.Models;
 public sealed class AgentPauseStateDto
 {
     public string Agent { get; set; } = "";
+    public string? AgentInstanceId { get; set; }
     public bool Paused { get; set; }
     public DateTimeOffset? PausedAt { get; set; }
     public string? PausedReason { get; set; }

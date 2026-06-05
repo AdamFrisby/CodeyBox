@@ -236,6 +236,8 @@ The queue index page shows a coloured banner at the top:
 Operators can pause and resume one agent kind without stopping the whole
 queue. The pause is a pickup gate only: in-flight runs are not killed, and all
 other agents continue dispatching normally.
+When an agent class pools multiple subscriptions for one kind, pause the
+specific route key (`claude/acct-a`) to leave its siblings dispatching.
 
 ### API And CLI
 
@@ -243,8 +245,11 @@ other agents continue dispatching normally.
 GET  /agents/paused
 POST /agents/{kind}/pause   body: { "reason": "...", "durationSeconds": 21600 }
 POST /agents/{kind}/resume  body: { "reason": "..." }
+POST /agents/{kind}/instances/{instanceId}/pause
+POST /agents/{kind}/instances/{instanceId}/resume
 
 codeybox agents pause claude --reason "reserve quota" --for 6h
+codeybox agents pause claude/acct-a --reason "account flagged today"
 codeybox agents resume claude
 codeybox agents paused
 ```
@@ -258,6 +263,7 @@ next pause-state read.
 | What | Behaviour |
 |---|---|
 | New work/rework/audit/merge dispatch | Paused agent is excluded from eligible candidates |
+| One pooled instance is paused | That route key is excluded; same-kind siblings remain eligible |
 | Only eligible agent is paused | Item parks at `WaitingForAgentResume` and resumes automatically on unpause |
 | In-flight run on paused agent | Continues normally |
 | `/quota` and dashboard | Show paused status separately from quota exhaustion |

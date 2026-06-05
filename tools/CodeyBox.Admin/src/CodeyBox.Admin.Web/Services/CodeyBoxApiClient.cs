@@ -128,7 +128,7 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
-            $"/agents/{Uri.EscapeDataString(agent)}/pause",
+            AgentPausePath(agent, "pause"),
             new { reason, durationSeconds },
             JsonOptions,
             ct);
@@ -143,7 +143,7 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     public async Task<bool> ResumeAgentAsync(string agent, CancellationToken ct = default)
     {
         var resp = await _http.PostAsJsonAsync(
-            $"/agents/{Uri.EscapeDataString(agent)}/resume",
+            AgentPausePath(agent, "resume"),
             new { },
             JsonOptions,
             ct);
@@ -153,6 +153,18 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
             throw new HttpRequestException($"Resume agent failed ({(int)resp.StatusCode}): {body}", null, resp.StatusCode);
         }
         return true;
+    }
+
+    private static string AgentPausePath(string routeKeyOrKind, string action)
+    {
+        var value = routeKeyOrKind.Trim();
+        var slash = value.IndexOf('/');
+        if (slash <= 0 || slash == value.Length - 1)
+            return $"/agents/{Uri.EscapeDataString(value)}/{action}";
+
+        var kind = value[..slash];
+        var instanceId = value[(slash + 1)..];
+        return $"/agents/{Uri.EscapeDataString(kind)}/instances/{Uri.EscapeDataString(instanceId)}/{action}";
     }
 
     public async Task<BudgetUsageDto?> GetBudgetUsageAsync(string projectId, CancellationToken ct = default)

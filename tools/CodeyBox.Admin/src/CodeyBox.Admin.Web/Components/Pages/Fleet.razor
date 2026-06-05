@@ -51,12 +51,12 @@
                 @foreach (var p in _pausedAgents)
                 {
                     <tr>
-                        <td><code>@p.Agent</code></td>
+                        <td><code>@PauseDisplay(p)</code></td>
                         <td>@(p.PausedReason ?? "—")</td>
                         <td>@FormatDate(p.PausedAt)</td>
                         <td>@FormatDate(p.ExpiresAt)</td>
                         <td>
-                            <button class="btn btn-agent-resume" @onclick="() => ResumeAgentAsync(p.Agent)">Resume</button>
+                            <button class="btn btn-agent-resume" @onclick="() => ResumeAgentAsync(PauseDisplay(p))">Resume</button>
                         </td>
                     </tr>
                 }
@@ -277,6 +277,9 @@ else
             _error = "Failed to resume agent. Check server logs for details.";
         }
     }
+
+    private static string PauseDisplay(AgentPauseStateDto state) =>
+        string.IsNullOrWhiteSpace(state.AgentInstanceId) ? state.Agent : state.AgentInstanceId!;
 
     private async Task PauseProjectAsync(string projectId)
     {

@@ -40,6 +40,11 @@ Hot-reloadable today:
 - `AgentClasses` + `AgentInstances` + `AgentScoreModifiers` — re-applied via
   `AgentConfigHotReload` to the live `AgentClassRouter` catalog. In-flight
   routing calls finish against the snapshot they started with.
+- `QuotaRouter` gate fields — re-applied via `AgentConfigHotReload` to the
+  shared `QuotaRouterOptions` object read by the live router. This includes
+  quota floors, unknown-policy handling, observed-failure windows, cap retry
+  delay, cold-start fit, and `IntraKindRoutingPolicy`. Probe cache TTL remains
+  startup-captured; see the not-hot-reloadable list below.
 - `AgentBurnEstimator` — re-applied via `AgentConfigHotReload` to the live
   burn-estimator (per-window token budgets, default burn percentages). Agents
   with samples but no positive `WindowTokenBudget` fail open until a budget is
@@ -105,8 +110,8 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   shutdown-service constructors.
 - `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
   `OrchestratorOptions` and the worker-pool plumbing at startup.
-- `QuotaRouter.*` — `QuotaRouterOptions` and the per-probe `QuotaCacheTtl` are
-  captured by the router and the per-provider quota probes at construction.
+- `QuotaRouter.QuotaCacheTtlSeconds` — per-provider quota probe caches are sized
+  at construction. Other router gate fields are hot-reloaded.
 - `Smoke.CacheTtlMinutes` / `Smoke.Availability.*` — cache and availability
   registry singletons are sized at startup.
 - `BudgetAlerts.CheckInterval` — sized into the `BudgetAlertService`'s
@@ -335,6 +340,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   "QuotaRecheckIntervalSeconds": 300,
   "QuotaCacheTtlSeconds": 60,
   "UnknownPolicy": "UseObservedFailures",
+  "IntraKindRoutingPolicy": "MostQuotaFirst",
   "ObservedFailureWindowMinutes": 10,
   "ObservedFailureRetentionMinutes": 30,
   "ProbeMaxRetries": 2,
@@ -350,6 +356,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
+| `IntraKindRoutingPolicy` | `MostQuotaFirst` | Same-kind instance ordering policy: `MostQuotaFirst` maximizes runway, `RoundRobin` spreads wear evenly, and `Sticky` keeps a work item on its existing instance when usable. Hot-reloadable. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same agent/model across all projects. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
 | `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |

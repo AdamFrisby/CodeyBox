@@ -22,6 +22,7 @@ public sealed class CostTotalsDto
 public sealed class AgentCostBreakdownDto
 {
     public string Agent { get; set; } = "";
+    public string? AgentInstanceId { get; set; }
     public string? ModelId { get; set; }
     public int InputTokens { get; set; }
     public int CachedInputTokens { get; set; }

@@ -69,6 +69,31 @@ public sealed class AgentPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task ExpiredInstancePause_FallsBackToKindWidePause()
+    {
+        var now = new DateTimeOffset(2026, 6, 4, 0, 0, 0, TimeSpan.Zero);
+        var time = new FakeTimeProvider(now);
+        using var ctrl = MakeController(time);
+
+        await ctrl.PauseAsync(AgentKind.Claude, "provider outage", "test");
+        await ctrl.PauseAsync(
+            AgentKind.Claude,
+            "account flagged",
+            "test",
+            now.AddMinutes(1),
+            agentInstanceId: "claude/acct-a");
+
+        time.Advance(TimeSpan.FromMinutes(2));
+        var state = await ctrl.GetAgentStateAsync(AgentKind.Claude, agentInstanceId: "claude/acct-a");
+
+        Assert.NotNull(state);
+        Assert.Null(state!.AgentInstanceId);
+        Assert.Equal("provider outage", state.PausedReason);
+        var paused = Assert.Single(await ctrl.ListPausedAsync());
+        Assert.Null(paused.AgentInstanceId);
+    }
+
+    [Fact]
     public async Task Router_ExcludesPausedAgent_AndDispatchesOtherEligibleAgent()
     {
         using var pauses = MakeController();
@@ -89,6 +114,30 @@ public sealed class AgentPauseTests : IDisposable
 
         Assert.False(decision.ShouldWait);
         Assert.Equal(AgentKind.Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task Router_ExcludesPausedInstance_AndDispatchesSameKindSibling()
+    {
+        using var pauses = MakeController();
+        var acctA = Member(AgentKind.Claude) with { InstanceId = "acct-a", QualityScore = 100 };
+        var acctB = Member(AgentKind.Claude) with { InstanceId = "acct-b", QualityScore = 99 };
+        await pauses.PauseAsync(AgentKind.Claude, "account flagged", "test", agentInstanceId: acctA.RouteKey);
+        var router = BuildRouter(pauses,
+            new AgentClass
+            {
+                Id = "frontier",
+                DisplayName = "Frontier",
+                Members = [acctA, acctB],
+            });
+
+        var decision = await router.ResolveAsync(Item("frontier"), null, CancellationToken.None);
+
+        Assert.False(decision.ShouldWait);
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(acctB.RouteKey, decision.Chosen!.RouteKey);
+        var paused = Assert.Single(await pauses.ListPausedAsync());
+        Assert.Equal(acctA.RouteKey, paused.AgentInstanceId);
     }
 
     [Fact]

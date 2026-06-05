@@ -220,10 +220,10 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
-    public async Task PauseAgentAsync_PostsEscapedAgentAndBody()
+    public async Task PauseAgentAsync_PostsInstanceRouteAndBody()
     {
         var (client, handler) = Build("""
-            {"agent":"claude/pro","paused":true,"pausedAt":"2026-06-04T12:00:00Z",
+            {"agent":"claude","agentInstanceId":"claude/pro","paused":true,"pausedAt":"2026-06-04T12:00:00Z",
              "pausedReason":"reserve quota","pausedBy":"api","expiresAt":"2026-06-04T13:00:00Z",
              "updatedAt":"2026-06-04T12:00:00Z"}
             """);
@@ -231,12 +231,13 @@ public sealed class CodeyBoxApiClientTests
         var state = await client.PauseAgentAsync("claude/pro", "reserve quota", 3600);
 
         Assert.Equal(HttpMethod.Post, handler.LastMethod);
-        Assert.Equal("/agents/claude%2Fpro/pause", handler.LastPath);
+        Assert.Equal("/agents/claude/instances/pro/pause", handler.LastPath);
         var body = JsonSerializer.Deserialize<JsonElement>(handler.LastBody ?? "{}");
         Assert.Equal("reserve quota", body.GetProperty("reason").GetString());
         Assert.Equal(3600, body.GetProperty("durationSeconds").GetDouble());
         Assert.NotNull(state);
-        Assert.Equal("claude/pro", state!.Agent);
+        Assert.Equal("claude", state!.Agent);
+        Assert.Equal("claude/pro", state.AgentInstanceId);
         Assert.Equal("reserve quota", state.PausedReason);
     }
 
@@ -254,15 +255,15 @@ public sealed class CodeyBoxApiClientTests
     }
 
     [Fact]
-    public async Task ResumeAgentAsync_PostsEscapedAgent()
+    public async Task ResumeAgentAsync_PostsInstanceRoute()
     {
-        var (client, handler) = Build("""{"agent":"claude/pro","paused":false}""");
+        var (client, handler) = Build("""{"agent":"claude","agentInstanceId":"claude/pro","paused":false}""");
 
         var resumed = await client.ResumeAgentAsync("claude/pro");
 
         Assert.True(resumed);
         Assert.Equal(HttpMethod.Post, handler.LastMethod);
-        Assert.Equal("/agents/claude%2Fpro/resume", handler.LastPath);
+        Assert.Equal("/agents/claude/instances/pro/resume", handler.LastPath);
         Assert.NotNull(handler.LastBody);
     }
 

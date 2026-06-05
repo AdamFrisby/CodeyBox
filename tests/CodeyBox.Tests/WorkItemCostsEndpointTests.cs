@@ -106,6 +106,58 @@ public sealed class WorkItemCostsEndpointTests : IClassFixture<CostsApiFactory>
     }
 
     [Fact]
+    public async Task GetCosts_ByAgentSplitsSameKindSameModelByInstance()
+    {
+        var item = CreateItem();
+        await _factory.Store.CreateAsync(item);
+
+        await _factory.CostStore.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = item.Id.ToString(),
+            Phase = "work",
+            AgentKind = "claude",
+            AgentInstanceId = "claude/acct-a",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 1000,
+            OutputTokens = 100,
+            EstimatedUsd = 0.10,
+            StartedAt = DateTimeOffset.UtcNow.AddSeconds(-10),
+            EndedAt = DateTimeOffset.UtcNow.AddSeconds(-5),
+        });
+        await _factory.CostStore.RecordAsync(new WorkItemCost
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = item.Id.ToString(),
+            Phase = "audit",
+            AgentKind = "claude",
+            AgentInstanceId = "claude/acct-b",
+            ModelId = "claude-opus-4-7",
+            InputTokens = 2000,
+            OutputTokens = 200,
+            EstimatedUsd = 0.20,
+            StartedAt = DateTimeOffset.UtcNow.AddSeconds(-4),
+            EndedAt = DateTimeOffset.UtcNow,
+        });
+
+        var client = _factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/costs");
+        resp.EnsureSuccessStatusCode();
+
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        var byAgent = body.GetProperty("byAgent").EnumerateArray().ToList();
+        Assert.Equal(2, byAgent.Count);
+        Assert.Contains(byAgent, a =>
+            a.GetProperty("agent").GetString() == "claude" &&
+            a.GetProperty("agentInstanceId").GetString() == "claude/acct-a" &&
+            a.GetProperty("estimatedUsd").GetDouble() == 0.10);
+        Assert.Contains(byAgent, a =>
+            a.GetProperty("agent").GetString() == "claude" &&
+            a.GetProperty("agentInstanceId").GetString() == "claude/acct-b" &&
+            a.GetProperty("estimatedUsd").GetDouble() == 0.20);
+    }
+
+    [Fact]
     public async Task GetProjectCosts_ReturnsTotalsForDateRange()
     {
         var item = CreateItem(projectId: "proj-costs-test");

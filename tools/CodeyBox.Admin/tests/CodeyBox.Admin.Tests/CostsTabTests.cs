@@ -122,4 +122,19 @@ public sealed class CostsTabTests : TestContext
         Assert.Contains("claude", cut.Markup);
         Assert.Contains("costs-agent-table", cut.Markup);
     }
+
+    [Fact]
+    public void WorkItemCosts_ShowsAgentInstanceBreakdown()
+    {
+        var fake = new FakeApiClient([]);
+        var costs = MakeCosts(agentKinds: ["claude"]);
+        costs.ByAgent[0].AgentInstanceId = "claude/acct-a";
+        fake.CostsOverride[ItemId] = costs;
+        Services.AddSingleton<ICodeyBoxApiClient>(fake);
+
+        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+
+        Assert.Contains("claude/acct-a", cut.Markup);
+        Assert.Contains("costs-agent-table", cut.Markup);
+    }
 }
