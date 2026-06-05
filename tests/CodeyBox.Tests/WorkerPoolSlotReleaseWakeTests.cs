@@ -313,6 +313,10 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
         using var registry = new CancellationRegistry(CancellationToken.None);
+        // Force a pacing window and pause from the reservation hook so the
+        // second item exercises the post-pacing queue-pause branch
+        // deterministically. Reset the timestamp before resume so the
+        // carried-over first spawn does not block the post-resume dispatch.
         WorkItemId? pauseOnReserve = null;
         var pauseApplied = false;
         var reservedSecond = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -366,6 +370,130 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         pipeline.Release(second.Id);
         Assert.True(await pipeline.WaitForDoneAsync(second.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task QueuePauseBetweenSpawnReservationAndPipelineStart_SkipsPipelineAndPreservesItem()
+    {
+        // Covers the IsQueuePaused branch inside the worker's Task.Run body:
+        // when the queue pauses after spawn pacing completed but before the
+        // pipeline starts, the worker must log+return without running the
+        // item, leaving the work item Queued so a later resume can dispatch
+        // it.
+        using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+
+        // OnWorkerSpawned runs synchronously between the spawn timestamp
+        // write and Task.Run. Pausing the queue once on the first spawn
+        // guarantees the Task.Run body sees IsQueuePaused == true while
+        // leaving later spawns (post-resume) untouched.
+        SqliteQueueController? capturedController = null;
+        var pausesIssued = 0;
+        var pauseIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pauseOnSpawn = new Action(() =>
+        {
+            if (Interlocked.Increment(ref pausesIssued) != 1) return;
+            capturedController?.PauseAsync("test: pause between spawn and pipeline").GetAwaiter().GetResult();
+            pauseIssued.TrySetResult();
+        });
+        capturedController = controller;
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                OnWorkerSpawned = pauseOnSpawn,
+            },
+            NullLogger<OrchestratorService>.Instance,
+            queueController: controller);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var item = MakeItem(createdAt: DateTimeOffset.UtcNow);
+        await _store.CreateAsync(item);
+        await queue.EnqueueAsync(item.Id);
+
+        await pauseIssued.Task.WaitAsync(DispatchWaitTimeout);
+        Assert.Equal(QueueState.Paused, controller.State);
+        Assert.False(
+            await pipeline.WaitForEnteredAsync(item.Id, NoDispatchQuietPeriod),
+            "The worker must not enter the pipeline when the queue paused between spawn and pipeline start.");
+        Assert.True(
+            await WaitUntilAsync(() => !svc.IsActiveForTest(item.Id), DispatchWaitTimeout),
+            "The skipped worker's finally block must release the slot and reservation.");
+
+        var stored = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+
+        await controller.ResumeAsync();
+        Assert.True(
+            await pipeline.WaitForEnteredAsync(item.Id, DispatchWaitTimeout),
+            "After resume the item must dispatch normally.");
+        pipeline.Release(item.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(item.Id, DispatchWaitTimeout));
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task SpawnPacingDelay_BreaksPromptlyOnQueuePauseDuringWait()
+    {
+        // Asserts the pause-detection latency of WaitForSpawnPacingDelayAsync:
+        // when the queue pauses while the worker is mid-wait, the wait must
+        // exit well before the configured MinSpawnInterval would otherwise
+        // elapse. A regression that lost the IsQueuePaused check inside the
+        // polling loop would block for the full MinSpawnInterval.
+        using var controller = new SqliteQueueController(_dbPath, NullLogger<SqliteQueueController>.Instance);
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var minSpawnInterval = TimeSpan.FromSeconds(5);
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = 1,
+                MinSpawnInterval = minSpawnInterval,
+            },
+            NullLogger<OrchestratorService>.Instance,
+            queueController: controller);
+
+        await svc.StartAsync(CancellationToken.None);
+        await queue.WaitForFirstDequeueAsync(DispatchWaitTimeout);
+
+        var now = DateTimeOffset.UtcNow;
+        var first = MakeItem(createdAt: now);
+        var second = MakeItem(createdAt: now.AddMilliseconds(1));
+        await _store.CreateAsync(first);
+        await _store.CreateAsync(second);
+        await queue.EnqueueAsync(first.Id);
+
+        Assert.True(await pipeline.WaitForEnteredAsync(first.Id, DispatchWaitTimeout));
+        pipeline.Release(first.Id);
+        Assert.True(await pipeline.WaitForDoneAsync(first.Id, DispatchWaitTimeout));
+
+        Assert.True(
+            await WaitUntilAsync(() => svc.IsActiveForTest(second.Id), DispatchWaitTimeout),
+            "The second item should be reserved before the spawn-pacing delay completes.");
+
+        // The pacing wait should be at least a few seconds at this point
+        // (MinSpawnInterval=5s less first-item processing). Pausing the
+        // queue must break the wait far faster than that residual interval,
+        // proving the polling loop observes IsQueuePaused mid-wait. A
+        // regression that lost the check would block until the full pacing
+        // window elapsed.
+        var pauseStart = DateTimeOffset.UtcNow;
+        await controller.PauseAsync("pause during spawn pacing wait");
+        Assert.True(
+            await WaitUntilAsync(() => !svc.IsActiveForTest(second.Id), TimeSpan.FromSeconds(2)),
+            "The polling loop in WaitForSpawnPacingDelayAsync must observe IsQueuePaused and exit promptly.");
+        var detectionLatency = DateTimeOffset.UtcNow - pauseStart;
+        Assert.True(
+            detectionLatency < TimeSpan.FromMilliseconds(1500),
+            $"Pause detection in the spawn-pacing wait took {detectionLatency} which is far longer than the polling interval; the wait did not observe the pause.");
         await svc.StopAsync(CancellationToken.None);
     }
 

@@ -25,6 +25,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private readonly ActiveSandboxTracker? _active;
     private readonly NamedAdmissionTracker? _resumeAdmissions;
     private readonly NamedAdmissionTracker _disposedSandboxAdmissions = new();
+    private readonly NamedAdmissionTracker _disposedBaselineAdmissions = new();
     private readonly ISuspendingSandboxProvider? _suspendingProvider;
     private readonly IDiskGuardedSandboxProvider? _diskGuardedProvider;
     private readonly IBaselineImageResolver? _baselineResolver;
@@ -226,18 +227,21 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         return baselineResolver.ResolveBaselineRef(profileName, flavor);
     }
 
-    public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
     {
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
-        return baselineResolver.ListBaselineImagesAsync(ct);
+        var baselines = await baselineResolver.ListBaselineImagesAsync(ct).ConfigureAwait(false);
+        _disposedBaselineAdmissions.ReleaseMissing(baselines.Select(static info => info.Name));
+        return baselines;
     }
 
-    public Task DisposeBaselineImageAsync(string name, CancellationToken ct)
+    public async Task DisposeBaselineImageAsync(string name, CancellationToken ct)
     {
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
-        return baselineResolver.DisposeBaselineImageAsync(name, ct);
+        await baselineResolver.DisposeBaselineImageAsync(name, ct).ConfigureAwait(false);
+        _disposedBaselineAdmissions.Release(name);
     }
 
     public async Task<string?> EnsureBaselineImageAsync(
@@ -248,12 +252,33 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     {
         var baselineProvisioner = _baselineProvisioner
             ?? throw new NotSupportedException("The wrapped sandbox provider does not provision baseline images.");
-        using var lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
-        return await baselineProvisioner.EnsureBaselineImageAsync(
-            profileName,
-            flavor,
-            pinnedBaselineRef,
-            ct).ConfigureAwait(false);
+        var lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
+        var releaseLease = true;
+        try
+        {
+            var result = await baselineProvisioner.EnsureBaselineImageAsync(
+                profileName,
+                flavor,
+                pinnedBaselineRef,
+                ct).ConfigureAwait(false);
+            return result;
+        }
+        catch (SandboxProvisioningDeferredException ex)
+            when (!string.IsNullOrWhiteSpace(ex.RetainedSandboxName))
+        {
+            _log.LogWarning(
+                ex,
+                "Retaining sandbox admission token after baseline bake failure because baseline {BaselineName} may still exist",
+                ex.RetainedSandboxName);
+            _disposedBaselineAdmissions.Retain(ex.RetainedSandboxName!, lease);
+            releaseLease = false;
+            throw;
+        }
+        finally
+        {
+            if (releaseLease)
+                lease.Dispose();
+        }
     }
 
     private ISandbox WrapSandbox(ISandbox sandbox, SandboxAdmissionLease lease)

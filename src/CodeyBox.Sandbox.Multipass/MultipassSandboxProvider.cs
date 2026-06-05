@@ -1534,24 +1534,44 @@ git push origin HEAD:{refName}";
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
         }
-        catch
+        catch (Exception bakeEx)
         {
             // A failed bake may have already launched a VM. Purge it before the
             // admission decorator releases its baseline-provisioning token; a
             // half-created running baseline must not escape the global VM cap.
-            if (await TryDeleteVmAsync(opts, baselineName))
+            var deleted = await TryDeleteVmAsync(opts, baselineName);
+            if (deleted)
             {
                 _log.LogWarning(
                     "Baseline bake for {Name} failed; purged partial baseline VM before retry",
                     baselineName);
+                throw;
             }
-            else
+
+            // delete --purge failed: surface the retained baseline name so the
+            // admission decorator keeps the token reserved until
+            // ListBaselineImagesAsync / DisposeBaselineImageAsync proves the
+            // partial baseline VM is actually gone. Without this, a stuck
+            // baseline VM would escape MaxConcurrentSandboxes.
+            if (await SandboxMayStillExistAfterFailedDeleteAsync(opts, baselineName))
             {
                 _log.LogError(
-                    "Baseline bake for {Name} failed and automatic purge did not complete; operator may need to `multipass delete --purge {PurgeTarget}` before retry",
+                    "Baseline bake for {Name} failed and automatic purge did not complete; retaining sandbox admission until baseline is proven gone (operator may need to `multipass delete --purge {PurgeTarget}`)",
                     baselineName,
                     baselineName);
+                throw new SandboxProvisioningDeferredException(
+                    Name,
+                    "baseline-bake-cleanup",
+                    "multipass-delete-purge-failed",
+                    $"baseline bake failed and best-effort delete --purge did not prove baseline {baselineName} was removed: {bakeEx.Message}",
+                    _daemonRetryPolicy.ExhaustedRequeueDelay,
+                    retainedSandboxName: baselineName,
+                    innerException: bakeEx);
             }
+
+            _log.LogWarning(
+                "Baseline bake for {Name} failed; delete --purge reported failure but inventory confirms the baseline is absent",
+                baselineName);
             throw;
         }
     }

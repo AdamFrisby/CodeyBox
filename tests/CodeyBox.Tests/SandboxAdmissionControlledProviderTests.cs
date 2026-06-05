@@ -233,6 +233,66 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task BaselineProvisioningFailureWithRetainedBaseline_RetainsAdmissionUntilBaselineDisposed()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            FailNextEnsureBaselineRetainedName = "cb-baseline-retained",
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(provider);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provisioner.EnsureBaselineImageAsync(
+            "default",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None));
+
+        // The retained admission must block further creates until the baseline
+        // is disposed (or proven absent by ListBaselineImagesAsync).
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var queued = provider.CreateAsync(Spec(), CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queued.IsCompleted);
+
+        await resolver.DisposeBaselineImageAsync("cb-baseline-retained", CancellationToken.None);
+        await using var sandbox = await queued.WaitAsync(TestDeadline);
+
+        Assert.Equal(1, inner.DisposeBaselineCalls);
+    }
+
+    [Fact]
+    public async Task ListBaselineImagesAsync_ReleasesRetainedAdmissionForBaselinesNoLongerInInventory()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            FailNextEnsureBaselineRetainedName = "cb-baseline-vanished",
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(provider);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provisioner.EnsureBaselineImageAsync(
+            "default",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None));
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+
+        // Inner ListBaselineImagesAsync returns an empty list, so the retained
+        // admission for the absent baseline must be released.
+        var listed = await resolver.ListBaselineImagesAsync(CancellationToken.None);
+        Assert.Empty(listed);
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var sandbox = await provider.CreateAsync(Spec(), CancellationToken.None).WaitAsync(TestDeadline);
+    }
+
+    [Fact]
     public async Task DisposeLeakedAsync_ReleasesRetainedResumeLease()
     {
         var inner = new CountingSandboxProvider();
@@ -1026,6 +1086,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public int MarkOwnedCalls => Volatile.Read(ref _markOwnedCalls);
         public bool BlockEnsureBaseline { get; init; }
         public bool ThrowOnEnsureBaseline { get; init; }
+        public string? FailNextEnsureBaselineRetainedName { get; set; }
         public bool BlockResume { get; init; }
         public TaskCompletionSource ResumeStarted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1124,6 +1185,17 @@ public sealed class SandboxAdmissionControlledProviderTests
             {
                 EnsureBaselineStarted.SetResult();
                 await AllowEnsureBaseline.Task.WaitAsync(ct);
+            }
+            if (FailNextEnsureBaselineRetainedName is { } retainedBaselineName)
+            {
+                FailNextEnsureBaselineRetainedName = null;
+                throw new SandboxProvisioningDeferredException(
+                    "counting",
+                    "baseline-bake-cleanup",
+                    "multipass-delete-purge-failed",
+                    "baseline bake failed and cleanup did not prove removal",
+                    TimeSpan.FromSeconds(1),
+                    retainedSandboxName: retainedBaselineName);
             }
             if (ThrowOnEnsureBaseline)
                 throw new InvalidOperationException("ensure baseline failed");

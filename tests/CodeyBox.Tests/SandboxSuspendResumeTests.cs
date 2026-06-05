@@ -982,6 +982,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
+        // The provider task runs on a separate thread and may set
+        // ResumeCancellationObserved after TryResumeSandboxAsync returns, so
+        // poll rather than assert immediately to keep the test deterministic
+        // under load.
+        await WaitUntilAsync(() => provider.ResumeCancellationObserved);
+
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
         Assert.Null(after.SuspendedVmName);
