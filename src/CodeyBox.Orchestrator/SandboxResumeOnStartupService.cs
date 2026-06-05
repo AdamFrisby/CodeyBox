@@ -639,13 +639,12 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
         Task<bool>? promoteTask = null;
         try
         {
-            promoteTask = RunLongRunningAsync(
-                () => suspending.PushSuspendedVmCheckpointRefAsync(
-                    vmName,
-                    SandboxConventions.WorkDir,
-                    refName,
-                    $"codeybox: suspend-resume checkpoint {itemId}",
-                    timeoutCts.Token));
+            promoteTask = suspending.PushSuspendedVmCheckpointRefAsync(
+                vmName,
+                SandboxConventions.WorkDir,
+                refName,
+                $"codeybox: suspend-resume checkpoint {itemId}",
+                timeoutCts.Token);
             var pushed = await promoteTask.WaitAsync(timeout, ct);
             if (pushed)
                 return true;
