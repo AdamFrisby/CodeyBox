@@ -477,7 +477,6 @@ public sealed record ProjectAudit
         {
             Profile = selected,
             Profiles = Profiles,
-            BuildScriptRequired = BuildScriptRequired || profile.BuildScriptRequired,
         };
     }
 }

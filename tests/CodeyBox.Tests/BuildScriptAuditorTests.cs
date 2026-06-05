@@ -1,4 +1,5 @@
 using CodeyBox.Audit;
+using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
@@ -132,22 +133,24 @@ public sealed class BuildScriptAuditorTests : IDisposable
     [Theory]
     [InlineData(126)]
     [InlineData(127)]
-    public async Task BuildScriptExit126Or127_EmitsBlockingBuildFailedFinding(int exitCode)
+    public async Task BuildScriptExit126Or127_ThrowsCouldNotVerifyInsteadOfFinding(int exitCode)
     {
         var sandbox = new StubSandbox(exec => IsPresenceCheck(exec)
             ? new SandboxExecResult(0, "", "")
             : new SandboxExecResult(exitCode, "", "command not found\n"));
 
-        var result = await new BuildScriptAuditor().RunAsync(
-            sandbox,
-            "/work/repo",
-            Ctx());
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            new BuildScriptAuditor().RunAsync(
+                sandbox,
+                "/work/repo",
+                Ctx()));
 
-        Assert.False(result.Passed);
-        var finding = Assert.Single(result.Findings);
-        Assert.Equal("build failed", finding.Title);
-        Assert.Contains($"build.sh exited with code {exitCode}", finding.Description);
-        Assert.Contains("command not found", finding.Description);
+        Assert.Contains("could-not-verify", ex.Message);
+        Assert.Contains("build.sh could not execute", ex.Message);
+        Assert.Contains($"exit {exitCode}", ex.Message);
+        Assert.Equal(exitCode, ex.ExitCode);
+        Assert.NotNull(ex.Output);
+        Assert.Contains("command not found", ex.Output);
     }
 
     [Fact]
@@ -343,7 +346,33 @@ public sealed class BuildScriptAuditorTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_Exit127_PersistsBlockingBuildFinding()
+    public void ProjectAuditorComposer_RequiredBuildScriptCannotBeExcluded()
+    {
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            new IAuditor[] { new BuildScriptAuditor() },
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = new Project
+        {
+            Id = new ProjectId("required-build-script"),
+            DisplayName = "Required Build Script",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                Languages = [],
+                AuditTypes = [],
+                BuildScriptRequired = true,
+                ExcludedAuditors = [BuildScriptAuditor.AuditorName],
+            },
+        };
+
+        var auditors = composer.Compose(project, new StubAgent());
+
+        Assert.Contains(auditors, a => a.Name == BuildScriptAuditor.AuditorName);
+    }
+
+    [Fact]
+    public async Task Pipeline_Exit127_FailsAsInfrastructureWithoutPersistedFinding()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var reports = new CapturingAuditReportStore();
@@ -370,12 +399,12 @@ public sealed class BuildScriptAuditorTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Contains("build failed", final.LastError);
-        var report = Assert.Single(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
-        Assert.Contains(report.Findings, f => f.Title == "build failed");
-        Assert.NotNull(report.RawOutput);
-        Assert.Contains("missing tool", report.RawOutput!);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could-not-verify", final.LastError);
+        Assert.Contains("build.sh could not execute", final.LastError);
+        Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
+        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
     }
 
     [Fact]
@@ -559,6 +588,53 @@ public sealed class BuildScriptAuditorTests : IDisposable
         Assert.False(overrides!.Audit.BuildScriptRequired);
     }
 
+    [Fact]
+    public async Task ProjectRepository_ProfileCanDisableInheritedBuildScriptRequirement()
+    {
+        var options = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Audit = new ProjectAuditConfig
+                {
+                    BuildScriptRequired = true,
+                    Languages = [],
+                    AuditTypes = [],
+                },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "profiled",
+                    RepositoryUrl = "https://example.com/profiled.git",
+                    Audit = new ProjectAuditConfig
+                    {
+                        Profile = "legacy",
+                        Profiles = new Dictionary<string, ProjectAuditConfig>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["legacy"] = new()
+                            {
+                                BuildScriptRequired = false,
+                                Languages = [],
+                                AuditTypes = [],
+                            },
+                        },
+                    },
+                },
+            ],
+        };
+        using var repo = new ProjectRepository(
+            new StaticOptionsMonitor<ProjectsOptions>(options),
+            NullLogger<ProjectRepository>.Instance);
+
+        var project = await repo.GetAsync(new ProjectId("profiled"));
+        var resolved = project!.Audit.ResolveProfile();
+
+        Assert.True(project.Audit.BuildScriptRequired);
+        Assert.False(resolved.BuildScriptRequired);
+    }
+
     private static AuditContext Ctx(bool required = false) => new(
         WorkItemId.New(),
         WorkBranch: "work",
@@ -704,6 +780,23 @@ public sealed class BuildScriptAuditorTests : IDisposable
             => throw new InvalidOperationException("presence probe failed");
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class StubAgent : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Claude;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+            => Task.FromResult(new AgentResult(true, "ok", "", null));
     }
 
     private sealed class CapturingAuditReportStore : IAuditReportStore

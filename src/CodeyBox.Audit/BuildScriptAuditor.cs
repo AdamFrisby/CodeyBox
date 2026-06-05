@@ -98,6 +98,8 @@ public sealed class BuildScriptAuditor : IAuditor, IAuditSandboxIsolation
             throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
         if (result.OutputLimitExceeded)
             throw UnavailableFromResult("could-not-verify: build.sh output exceeded the capture limit", result);
+        if (IsCouldNotExecute(result))
+            throw UnavailableFromResult("could-not-verify: build.sh could not execute", result);
         if (result.Success)
             return new AuditResult(true, [], RawOutput: output);
 

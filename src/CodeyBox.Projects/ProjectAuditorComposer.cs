@@ -126,7 +126,10 @@ public sealed class ProjectAuditorComposer
         if (project.Audit.ExcludedAuditors.Count > 0)
         {
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);
-            auditors.RemoveAll(a => excluded.Contains(a.Name));
+            auditors.RemoveAll(a =>
+                excluded.Contains(a.Name) &&
+                !(project.Audit.BuildScriptRequired &&
+                  a.Name.Equals(WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)));
         }
 
         return auditors;
