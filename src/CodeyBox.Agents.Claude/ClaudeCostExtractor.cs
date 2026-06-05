@@ -84,12 +84,11 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
                     // Anthropic splits prompt input into three buckets: input_tokens
                     // (fresh), cache_creation_input_tokens (tokens written to cache
                     // this turn — priced higher than fresh), and cache_read_input_tokens
-                    // (read from cache — cheap). AgentCostSnapshot.InputTokens is the
-                    // TOTAL input bucket; the calculator derives the billable fresh
-                    // portion as InputTokens - CachedInputTokens. Dropping
-                    // cache_creation_input_tokens (as the extractor used to) made the
-                    // recorded input ~0 relative to cached and zeroed out the
-                    // cache-creation cost component.
+                    // (read from cache — cheap). Claude stores the total input bucket
+                    // so the calculator derives the billable fresh portion as
+                    // InputTokens - CachedInputTokens. Dropping cache_creation_input_tokens
+                    // (as the extractor used to) made the recorded input ~0 relative to
+                    // cached and zeroed out the cache-creation cost component.
                     var freshInput = usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv) ? itv : 0;
                     var cacheCreation = usage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.TryGetInt32(out var cctv) ? cctv : 0;
                     var cacheRead = usage.TryGetProperty("cache_read_input_tokens", out var ct) && ct.TryGetInt32(out var ctv) ? ctv : 0;

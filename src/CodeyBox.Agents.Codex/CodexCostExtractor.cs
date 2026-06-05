@@ -13,9 +13,9 @@ namespace CodeyBox.Agents.Codex;
 ///    and the OpenAI usage shape {"usage":{"prompt_tokens":N,"prompt_tokens_details":{"cached_tokens":C},"completion_tokens":M}}.
 /// 2. Human-readable patterns: "Usage: N input, M output tokens".
 ///
-/// <see cref="AgentCostSnapshot.InputTokens"/> is the total input bucket; cached
-/// input is recorded separately so the shared calculator can derive fresh input
-/// uniformly across providers.
+/// Codex/OpenAI prompt/input totals include cached tokens, so this extractor
+/// stores <see cref="AgentCostSnapshot.InputTokens"/> as the fresh remainder
+/// and records the cached subset separately.
 /// </summary>
 public sealed class CodexCostExtractor : IAgentCostExtractor
 {
@@ -117,8 +117,10 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
             modelId = raw is { Length: > 128 } ? raw[..128] : raw;
         }
 
-        if (totalInput == 0 && cached == 0 && output == 0) return null;
-        return new AgentCostSnapshot(totalInput, cached, output, modelId);
+        var input = FreshInputTokens(totalInput, cached);
+
+        if (input == 0 && cached == 0 && output == 0) return null;
+        return new AgentCostSnapshot(input, cached, output, modelId);
     }
 
     private static bool TryGetUsage(JsonElement root, out JsonElement usage, int depth)
@@ -200,7 +202,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (promptM.Success && completionM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = ParseTokenCount(promptM.Groups[1].Value);
+            var input = FreshInputTokens(ParseTokenCount(promptM.Groups[1].Value), cached);
             var output = ParseTokenCount(completionM.Groups[1].Value);
             return new AgentCostSnapshot(input, cached, output, null);
         }
@@ -210,7 +212,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         if (inputM.Success && outputM.Success)
         {
             var cached = TryParseCachedTokens(text);
-            var input = ParseTokenCount(inputM.Groups[1].Value);
+            var input = FreshInputTokens(ParseTokenCount(inputM.Groups[1].Value), cached);
             var output = ParseTokenCount(outputM.Groups[1].Value);
             if (input > 0 || cached > 0 || output > 0)
                 return new AgentCostSnapshot(input, cached, output, null);
@@ -228,6 +230,9 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
         var compact = CachedPattern.Match(text);
         return compact.Success ? ParseTokenCount(compact.Groups[1].Value) : 0;
     }
+
+    private static int FreshInputTokens(int totalInput, int cached)
+        => Math.Max(0, totalInput - cached);
 
     private static int ParseTokenCount(string s)
     {

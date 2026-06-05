@@ -20,9 +20,9 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(NdJsonFixture, null);
 
         Assert.NotNull(result);
-        // InputTokens is the TOTAL input bucket per the AgentCostSnapshot contract
-        // (the calculator derives billable fresh as InputTokens - CachedInputTokens).
-        // For Anthropic that means fresh + cache_creation + cache_read.
+        // Claude stores the total input bucket so the calculator derives billable
+        // fresh as InputTokens - CachedInputTokens. For Anthropic that means
+        // fresh + cache_creation + cache_read.
         Assert.Equal(12345 + 5000, result.InputTokens);
         Assert.Equal(678, result.OutputTokens);
         Assert.Equal(5000, result.CachedInputTokens);

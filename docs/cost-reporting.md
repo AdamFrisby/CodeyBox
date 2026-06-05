@@ -39,7 +39,8 @@ plan — even when the agent is run under a subscription plan.  This makes
 costs comparable across agents and over time, and ensures that a "free"
 cached token still shows as a fraction of its list-price value.
 
-The formula is:
+For providers that store cached tokens as a subset of `input_tokens`, the
+formula is:
 
 ```
 billable_input  = input_tokens - cached_input_tokens
@@ -48,11 +49,10 @@ estimated_usd   = (billable_input / 1_000_000) × input_rate_per_m
                 + (output_tokens / 1_000_000) × output_rate_per_m
 ```
 
-Codex is normalized before this general formula is applied: Codex/OpenAI
-prompt totals include cached tokens, so `CodexCostExtractor` stores only
-the fresh remainder in `input_tokens` and the cached subset in
-`cached_input_tokens`. The calculator bills Codex `input_tokens` directly
-as the fresh input bucket.
+Codex is normalized before pricing: Codex/OpenAI prompt totals include
+cached tokens, so `CodexCostExtractor` stores only the fresh remainder in
+`input_tokens` and the cached subset in `cached_input_tokens`. The
+calculator bills Codex `input_tokens` directly as the fresh input bucket.
 
 ## Database schema
 
