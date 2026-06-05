@@ -382,6 +382,43 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
+    public async Task CalculatorFailure_WritesExtractedTokenRowsWithZeroEstimatedCost()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            calculatorDefaultPricingThrows: true);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("calculator-fallback.txt", "x\n"));
+
+        var item = NewItem("feature/calculator-fallback");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("claude", workRow.AgentKind);
+        Assert.Equal(1000, workRow.InputTokens);
+        Assert.Equal(100, workRow.CachedInputTokens);
+        Assert.Equal(200, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.True(workRow.HasExtractedTokenUsage);
+        Assert.Equal("{}", workRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("claude", usage.AgentKind);
+        Assert.Equal(1000, usage.InputTokens);
+        Assert.Equal(100, usage.CachedInputTokens);
+        Assert.Equal(200, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+    }
+
+    [Fact]
     public async Task CheckAndActCheckPhase_WritesElapsedFallbackCostAndUsageRows()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -791,7 +828,8 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         bool extractorReturnsNull = false,
         bool extractorThrows = false,
         AgentCostSnapshot? extractorSnapshot = null,
-        AgentPricingOptions? pricingOptions = null)
+        AgentPricingOptions? pricingOptions = null,
+        bool calculatorDefaultPricingThrows = false)
     {
         var resolvedAgentKind = agentKind ?? AgentKind.Claude;
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -821,7 +859,6 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
-        var calculator = new AgentCostCalculator(pricingOptions ?? new AgentPricingOptions());
 
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null;
         if (registerExtractor)
@@ -832,9 +869,11 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
                 ReturnNull = extractorReturnsNull,
                 Throw = extractorThrows,
                 Snapshot = extractorSnapshot,
+                DefaultPricingThrows = calculatorDefaultPricingThrows,
             };
             extractors = new Dictionary<AgentKind, IAgentCostExtractor> { [resolvedAgentKind] = fake };
         }
+        var calculator = new AgentCostCalculator(pricingOptions ?? new AgentPricingOptions(), extractors);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -890,6 +929,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         public AgentKind Kind { get; init; }
         public bool ReturnNull { get; init; }
         public bool Throw { get; init; }
+        public bool DefaultPricingThrows { get; init; }
         public AgentCostSnapshot? Snapshot { get; init; }
 
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
@@ -905,7 +945,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
                 ModelId: "fake-model");
         }
 
-        public ModelRateConfig? DefaultPricing => null;
+        public ModelRateConfig? DefaultPricing => DefaultPricingThrows
+            ? throw new InvalidOperationException("injected calculator pricing failure")
+            : null;
     }
 
     // ── Recording cost store ──────────────────────────────────────────────────

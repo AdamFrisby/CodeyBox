@@ -188,11 +188,11 @@ Total tokens: input=1234 output=567
   a model string; `model_id` will be `null` for those rows, and rate
   lookup falls back to the agent's `DefaultRate`.
 - **Copilot**: GitHub Copilot does not emit token counts in its CLI output.
-  No extractor is registered for Copilot; cost rows will not be written for
-  Copilot-backed work items.
-- **Unknown agents**: any agent kind without a registered extractor is
-  silently skipped.  A Warning is logged at startup listing agent kinds
-  without extractors.
+  `CopilotCostExtractor` returns `null`, so completed Copilot-backed phases
+  write the standard elapsed-time fallback rows.
+- **Unknown agents**: any agent kind without a registered extractor still
+  writes elapsed-time fallback rows for completed invocations. A Warning is
+  logged at startup listing agent kinds without extractors.
 
 ## REST API
 

@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using System.Text.Json;
 
@@ -364,7 +365,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
 
     public async Task ReconcileFromAgentStreamSummaryAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
     {
-        if (row.Summary.EstimatedUsd is null)
+        if (row.Summary.EstimatedUsd is null && !HasExtractedTokens(row.Summary))
             return;
 
         await _writeLock.WaitAsync(ct);
@@ -526,6 +527,11 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase)
             ? "audit"
             : phase;
+
+    private static bool HasExtractedTokens(AgentStreamSummary summary) =>
+        summary.InputTokens > 0
+        || summary.CachedInputTokens > 0
+        || summary.OutputTokens > 0;
 
     public void Dispose()
     {

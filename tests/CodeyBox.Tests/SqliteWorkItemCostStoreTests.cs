@@ -183,6 +183,57 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(10, row.CachedInputTokens);
         Assert.Equal(20, row.OutputTokens);
         Assert.Equal(0.42, row.EstimatedUsd, precision: 5);
+        Assert.True(row.HasExtractedTokenUsage);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlySummaryUpdatesElapsedFallbackFlag()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "audit") with
+        {
+            AgentKind = "gemini",
+            ModelId = "gemini-2.5-pro",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "audit-llm-quality:llm-review-1-abcdef.jsonl",
+            "audit-llm-quality:llm-review",
+            1,
+            AgentKind.Gemini,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                300,
+                50,
+                25,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        var row = Assert.Single(rows);
+        Assert.Equal("audit", row.Phase);
+        Assert.Equal(300, row.InputTokens);
+        Assert.Equal(25, row.CachedInputTokens);
+        Assert.Equal(50, row.OutputTokens);
+        Assert.Equal(0.0, row.EstimatedUsd);
+        Assert.True(row.HasExtractedTokenUsage);
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("gemini", 10);
+        Assert.Equal(1, samples);
+        Assert.Equal(375, avg);
     }
 
     [Fact]
