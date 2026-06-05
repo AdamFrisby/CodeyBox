@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Text.Json.Serialization;
 
 namespace CodeyBox.Core;
 
@@ -14,6 +13,10 @@ public sealed record AgentSessionSandboxRef(
 
 /// <summary>
 /// Persistable handle for a logical multi-turn agent session.
+/// The handle intentionally carries only durable identifiers and non-secret
+/// metadata. Live sandbox objects and credentials are owned by the runner
+/// process and must be reattached/reacquired from these identifiers after an
+/// orchestrator restart.
 /// </summary>
 /// <param name="RunnerKind">Agent runner kind that owns the handle.</param>
 /// <param name="SessionId">Runner/provider session identifier, e.g. a Claude CLI resume ID.</param>
@@ -29,22 +32,7 @@ public sealed record AgentSessionHandle(
     string WorkingDirectory,
     string? ModelId = null,
     string? ReasoningMode = null,
-    IReadOnlyDictionary<string, string>? Metadata = null)
-{
-    /// <summary>
-    /// Live sandbox object for in-process adapters. This is deliberately not
-    /// serialized; restart recovery must reattach from <see cref="Sandbox"/>.
-    /// </summary>
-    [JsonIgnore]
-    public ISandbox? RuntimeSandbox { get; init; }
-
-    /// <summary>
-    /// Live credential for in-process adapters. Credentials must be reacquired
-    /// after restart rather than serialized into a persisted handle.
-    /// </summary>
-    [JsonIgnore]
-    public AgentCredential? RuntimeCredential { get; init; }
-}
+    IReadOnlyDictionary<string, string>? Metadata = null);
 
 /// <summary>
 /// Optional runner capability for logical sessions that span multiple turns.
@@ -81,16 +69,49 @@ public interface ISessionAgentRunner : IAgentRunner
 /// <see cref="IAgentRunner"/>. Each session turn is an ordinary one-shot
 /// <see cref="IAgentRunner.RunAsync"/> invocation, so this provides no
 /// provider-side cache benefit but lets non-session runners participate in the
-/// session contract.
+/// session contract. Handles opened in the current process resolve through
+/// adapter-private state. Hosts that need restart recovery must provide a
+/// sandbox reattacher and, when needed, a credential resolver; the persisted
+/// handle itself never stores live objects or secret material.
 /// </summary>
 public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
 {
     private readonly IAgentRunner _inner;
+    private readonly Func<ISandbox, AgentSessionSandboxRef> _sandboxRefFactory;
+    private readonly Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? _sandboxReattacher;
+    private readonly Func<AgentKind, CancellationToken, Task<AgentCredential?>>? _credentialResolver;
     private readonly ConcurrentDictionary<string, StatelessSessionState> _sessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _closedSessions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _reattachLocks = new(StringComparer.Ordinal);
 
-    public StatelessSessionAgentRunner(IAgentRunner inner)
+    /// <summary>
+    /// Creates a session adapter over a stateless runner.
+    /// </summary>
+    /// <param name="inner">The one-shot runner to invoke for each session turn.</param>
+    /// <param name="sandboxReattacher">
+    /// Optional restart-recovery hook that maps the durable sandbox reference
+    /// back to a live sandbox object. Without it, inactive/deserialized handles
+    /// are rejected explicitly.
+    /// </param>
+    /// <param name="credentialResolver">
+    /// Optional hook for reacquiring credentials after restart. When omitted,
+    /// reattached turns run with a null credential, matching image-baked auth
+    /// scenarios.
+    /// </param>
+    /// <param name="sandboxRefFactory">
+    /// Optional hook for producing provider-specific durable sandbox references
+    /// from the live sandbox supplied to <see cref="OpenSessionAsync"/>.
+    /// </param>
+    public StatelessSessionAgentRunner(
+        IAgentRunner inner,
+        Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? sandboxReattacher = null,
+        Func<AgentKind, CancellationToken, Task<AgentCredential?>>? credentialResolver = null,
+        Func<ISandbox, AgentSessionSandboxRef>? sandboxRefFactory = null)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        _sandboxReattacher = sandboxReattacher;
+        _credentialResolver = credentialResolver;
+        _sandboxRefFactory = sandboxRefFactory ?? (static sandbox => new AgentSessionSandboxRef(sandbox.Id));
     }
 
     public AgentKind Kind => _inner.Kind;
@@ -132,27 +153,27 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         ct.ThrowIfCancellationRequested();
 
         var sessionId = $"stateless-{Kind.Value}-{Guid.NewGuid():N}";
+        var sandboxRef = _sandboxRefFactory(sandbox);
+        if (string.IsNullOrWhiteSpace(sandboxRef.Id))
+            throw new InvalidOperationException("Session sandbox references must include a non-blank id.");
+
         var handle = new AgentSessionHandle(
             Kind,
             sessionId,
-            new AgentSessionSandboxRef(sandbox.Id),
+            sandboxRef,
             workingDirectory,
             modelId,
             reasoningMode,
             new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["mode"] = "stateless",
-            })
-        {
-            RuntimeSandbox = sandbox,
-            RuntimeCredential = credential,
-        };
+            });
 
         _sessions[sessionId] = new StatelessSessionState(sandbox, credential);
         return Task.FromResult(handle);
     }
 
-    public Task<AgentResult> SendTurnAsync(
+    public async Task<AgentResult> SendTurnAsync(
         AgentSessionHandle sessionHandle,
         string prompt,
         CancellationToken ct = default,
@@ -163,14 +184,14 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         ArgumentNullException.ThrowIfNull(prompt);
         ct.ThrowIfCancellationRequested();
 
-        var state = ResolveState(sessionHandle);
+        var state = await ResolveStateAsync(sessionHandle, ct);
         lock (state.Gate)
         {
             if (state.Suspended)
                 throw new InvalidOperationException("Cannot send an agent turn while the session is suspended.");
         }
 
-        return _inner.RunAsync(
+        return await _inner.RunAsync(
             state.Sandbox,
             sessionHandle.WorkingDirectory,
             prompt,
@@ -182,28 +203,28 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
             captureStructuredStream);
     }
 
-    public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+    public async Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(sessionHandle);
+        EnsureKind(sessionHandle);
         ct.ThrowIfCancellationRequested();
-        var state = ResolveState(sessionHandle);
+        var state = await ResolveStateAsync(sessionHandle, ct);
         lock (state.Gate)
         {
             state.Suspended = true;
         }
-
-        return Task.CompletedTask;
     }
 
-    public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
+    public async Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(sessionHandle);
+        EnsureKind(sessionHandle);
         ct.ThrowIfCancellationRequested();
-        var state = ResolveState(sessionHandle);
+        var state = await ResolveStateAsync(sessionHandle, ct);
         lock (state.Gate)
         {
             state.Suspended = false;
         }
-
-        return Task.CompletedTask;
     }
 
     public async Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
@@ -212,33 +233,62 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
         ct.ThrowIfCancellationRequested();
 
         EnsureKind(sessionHandle);
+        ThrowIfClosed(sessionHandle);
         if (!_sessions.TryRemove(sessionHandle.SessionId, out var state))
         {
-            if (sessionHandle.RuntimeSandbox is null)
-                return;
-            state = new StatelessSessionState(sessionHandle.RuntimeSandbox, sessionHandle.RuntimeCredential);
+            state = await ResolveStateAsync(sessionHandle, ct);
+            _sessions.TryRemove(sessionHandle.SessionId, out _);
         }
 
+        _closedSessions[sessionHandle.SessionId] = 0;
+        _reattachLocks.TryRemove(sessionHandle.SessionId, out _);
         await state.Sandbox.DisposeAsync();
     }
 
-    private StatelessSessionState ResolveState(AgentSessionHandle sessionHandle)
+    private async Task<StatelessSessionState> ResolveStateAsync(
+        AgentSessionHandle sessionHandle,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(sessionHandle);
         EnsureKind(sessionHandle);
+        ThrowIfClosed(sessionHandle);
 
         if (_sessions.TryGetValue(sessionHandle.SessionId, out var state))
             return state;
 
-        if (sessionHandle.RuntimeSandbox is not null)
+        if (_sandboxReattacher is null)
         {
-            state = new StatelessSessionState(sessionHandle.RuntimeSandbox, sessionHandle.RuntimeCredential);
-            _sessions.TryAdd(sessionHandle.SessionId, state);
-            return state;
+            throw new InvalidOperationException(
+                "This stateless session is not active in the current process and no sandbox reattacher was configured. Reopen a session or configure a runner that can reattach from the persisted session handle.");
         }
 
-        throw new InvalidOperationException(
-            "This stateless session is not active in the current process. Reopen a session or use a runner that can reattach from the persisted session handle.");
+        var gate = _reattachLocks.GetOrAdd(sessionHandle.SessionId, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            ThrowIfClosed(sessionHandle);
+            if (_sessions.TryGetValue(sessionHandle.SessionId, out state))
+                return state;
+
+            var sandbox = await _sandboxReattacher(sessionHandle.Sandbox, ct);
+            if (sandbox is null)
+                throw new InvalidOperationException("The configured sandbox reattacher returned null.");
+
+            var credential = _credentialResolver is null
+                ? null
+                : await _credentialResolver(sessionHandle.RunnerKind, ct);
+            if (credential is not null && credential.Agent != sessionHandle.RunnerKind)
+                throw new InvalidOperationException(
+                    $"Credential resolver returned credentials for '{credential.Agent}', not '{sessionHandle.RunnerKind}'.");
+
+            state = new StatelessSessionState(sandbox, credential);
+            _sessions[sessionHandle.SessionId] = state;
+            return state;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private void EnsureKind(AgentSessionHandle sessionHandle)
@@ -249,6 +299,12 @@ public sealed class StatelessSessionAgentRunner : ISessionAgentRunner
                 $"Session handle belongs to runner '{sessionHandle.RunnerKind}', not '{Kind}'.",
                 nameof(sessionHandle));
         }
+    }
+
+    private void ThrowIfClosed(AgentSessionHandle sessionHandle)
+    {
+        if (_closedSessions.ContainsKey(sessionHandle.SessionId))
+            throw new InvalidOperationException("This agent session has already been closed.");
     }
 
     private sealed class StatelessSessionState(ISandbox sandbox, AgentCredential? credential)
