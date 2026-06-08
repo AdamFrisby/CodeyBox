@@ -2218,7 +2218,13 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
     checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>(),
-    agentSupervision: sp.GetService<IAgentSupervisionService>()));
+    agentSupervision: sp.GetService<IAgentSupervisionService>(),
+    // Resumable Claude session worker (item 3 of the rollout). Composed
+    // with Project.ClaudeSession.Enabled and the global Enabled flag — the
+    // pipeline keeps the legacy independent-phase path for any item that
+    // doesn't opt in to all three.
+    claudeSessionWorker: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>(),
+    claudeSessionOptions: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

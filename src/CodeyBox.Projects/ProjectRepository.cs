@@ -313,6 +313,10 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             SkipCredentialSmokeTest = pc.SkipCredentialSmokeTest ?? false,
             MaxPriority = pc.MaxPriority,
             GraphicalSandbox = pc.GraphicalSandbox ?? defaults.GraphicalSandbox ?? false,
+            ClaudeSession = new ProjectClaudeSessionConfig
+            {
+                Enabled = pc.ClaudeSession?.Enabled ?? false,
+            },
         };
     }
 

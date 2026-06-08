@@ -169,12 +169,24 @@ VM's disk so conversation context is preserved regardless.
 
 The worker is OFF by default — the existing one-shot `ClaudeAgentRunner`
 remains the registered `IAgentRunner` for Claude until config opts an item
-in. Config keys (bound from `CodeyBox:ClaudeSession`):
+in. **All three** of the following gates must be true before a work item
+takes the session path; any one of them off keeps the legacy
+independent-phase pipeline (fresh sandbox per work / rework call, no
+`--resume`, no shared VM across phases):
+
+| Gate | Where | Default | Description |
+|------|-------|---------|-------------|
+| Global flag | `CodeyBox:ClaudeSession:Enabled` | `false` | Master switch. When false, Claude work items always use the one-shot path. |
+| Per-project flag | `CodeyBox:Projects:<id>:ClaudeSession:Enabled` | `false` | Per-project opt-in. Unset projects keep the legacy pipeline even with the global flag on. |
+| Agent kind | item's effective `Agent` | — | Must resolve to `claude`. The session worker is Claude-only. |
+| Metrics knob | `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Emit per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
+
+**Transport configuration keys** (independent of the gate set above —
+these select how each turn is delivered once the session path is in
+play):
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `CodeyBox:ClaudeSession:Enabled` | `false` | Master switch. When false, Claude work items always use the one-shot path. |
-| `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Emit per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
 | `CodeyBox:ClaudeSession:Transport` | `print` | Command-delivery + billing channel. `print` = today's `claude --print --resume`. `acp` = Agent Client Protocol via `claude --ide` (OFF the metered `-p` pool). Case-insensitive, hot-reloadable. Invalid values fall back to `print`. |
 | `CodeyBox:ClaudeSession:TransportOverridesByAgentClassMember:<member>` | (none) | Per-agent-class-member transport override. Wins over the per-project override and the global default. |
 | `CodeyBox:ClaudeSession:TransportOverridesByProject:<projectId>` | (none) | Per-project transport override. Loses to the per-class-member override. |
@@ -207,6 +219,45 @@ Per-turn metrics (`ClaudeSessionTurnMetrics`) carry the `Transport` tag
 (`"print"` / `"acp"`) so dashboards can confirm traffic moved off the
 metered pool.
 
+**Compose example** — enabling the session worker for one project:
+
+```jsonc
+// appsettings.json (or local override)
+{
+  "CodeyBox": {
+    "ClaudeSession": { "Enabled": true },
+    "Projects": [
+      {
+        "Id": "my-project",
+        "RepositoryUrl": "https://github.com/me/repo.git",
+        "Agent": "claude",
+        "ClaudeSession": { "Enabled": true }
+      },
+      {
+        "Id": "other-project",
+        "RepositoryUrl": "https://github.com/me/other.git",
+        "Agent": "claude"
+        // ClaudeSession omitted → this project keeps the legacy path even
+        // though the global flag is on.
+      }
+    ]
+  }
+}
+```
+
+CheckAndAct items always take the legacy path even when the gates are on —
+the single-shot read-only audit has no rework loop, so session reuse has
+no value. The session worker is also Claude-only; items whose effective
+agent is Codex / Gemini / Copilot / Cursor / Opencode keep the legacy
+path regardless of the project flag.
+
+**Auditor isolation (non-negotiable):** the auditor NEVER shares the
+worker's session or VM. Each audit iteration spins up its own fresh
+sandbox via the existing `CollectFindingsAsync` path. A session-shared
+auditor would rubber-stamp the worker's own changes and silently merge
+broken code. This is a hard architectural invariant; the brief explicitly
+forbids a persistent-auditor option in this rollout step.
+
 Lifecycle inside the worker:
 
 - `OpenSessionAsync` allocates local state; the Claude CLI session id is
@@ -237,12 +288,25 @@ returns a handle augmented with the captured CLI session id under
 `Metadata["claude.cliSessionId"]`, and a fallback flag under
 `Metadata["claude.fallbackToOneShot"]` once the worker has degraded to
 fresh-one-shot mode (so a restart inherits that degraded state instead of
-re-attempting the failed resume). Reviving the handle in a fresh process
-requires a sandbox-reattacher callback wired into the worker; the current
-rollout step (item 2 of 3) leaves the production reattacher unwired and
-the worker surfaces a clear `InvalidOperationException` on any reattach
-attempt. The dispatch wiring that persists and replays the handle across
-a restart lands in item 3.
+re-attempting the failed resume).
+
+**Pipeline-level restart behavior (item 3):** when a session-enabled item
+is interrupted by an orchestrator restart, the pipeline does NOT attempt
+to reattach to the orphaned worker VM from the prior process. Instead the
+recovered item degrades to the legacy one-shot path for the remainder:
+
+- An item picked up at `WorkComplete` or later (`skipWork=true`) doesn't
+  open a new session lifecycle; the existing audit / rework / merge loop
+  uses fresh sandboxes via the legacy code path.
+- An item picked up at `Queued` after a crash mid-work opens a NEW session
+  against a new VM. The prior VM is treated as a leak and reaped by
+  `SandboxLeakReaper`.
+
+Either way the item never strands — the brief's "resumes-or-degrades"
+contract is satisfied by the degrade path. Reviving a session against an
+existing VM would require an `IAttachableSandboxProvider` hook the
+provider API does not yet expose; adding that is left for a later
+rollout.
 
 Per-turn metrics are emitted as `ClaudeSessionTurnMetrics` snapshots to the
 registered `IClaudeSessionMetricsSink`. Each snapshot carries the total

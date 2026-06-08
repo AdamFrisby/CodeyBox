@@ -151,6 +151,20 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly string _disabledHostHooksPath;
+    // Resumable Claude session worker. Null when not registered in DI (the
+    // default for tests / minimal compositions). Composed with the global
+    // CodeyBox:ClaudeSession:Enabled flag and per-project opt-in
+    // (Project.ClaudeSession.Enabled) by ShouldEnterClaudeSessionMode — items
+    // that opt out of all three keep the legacy independent-phase pipeline.
+    private readonly CodeyBox.Agents.Claude.ClaudeSessionWorker? _claudeSessionWorker;
+    private readonly CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions _claudeSessionOptions;
+    // AsyncLocal flows through the deep work/audit/rework call chain without
+    // having to thread an explicit parameter through every helper. Scoped at
+    // the top of RunAsync (set when session-mode applies) and read by
+    // RunAgentPhaseAsync to swap in the persistent worker VM + worker turn.
+    // Per-pipeline-execution by construction, so two concurrent work items
+    // never see each other's lifecycle.
+    private readonly AsyncLocal<ClaudeSessionLifecycle?> _ambientSessionLifecycle = new();
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
     // CancellationTokenSource timers use a uint millisecond due-time internally;
@@ -226,7 +240,9 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentPauseController? agentPauseController = null,
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
-        IAgentSupervisionService? agentSupervision = null)
+        IAgentSupervisionService? agentSupervision = null,
+        CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
+        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -327,6 +343,8 @@ public sealed class PipelineRunner : IPipelineRunner
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
+        _claudeSessionWorker = claudeSessionWorker;
+        _claudeSessionOptions = claudeSessionOptions ?? new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _opts.RequiredBuildVerificationTimeout,
@@ -334,6 +352,107 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
+
+    /// <summary>
+    /// Whether the resumable Claude session worker should drive the work +
+    /// every rework iteration for this item. All three conditions must hold:
+    /// <list type="bullet">
+    ///   <item>The worker is registered in DI (<see cref="_claudeSessionWorker"/> non-null).</item>
+    ///   <item>The global flag <c>CodeyBox:ClaudeSession:Enabled</c> is true.</item>
+    ///   <item>The per-project flag <c>Project.ClaudeSession.Enabled</c> is true.</item>
+    ///   <item>The work item's effective agent is Claude (the worker is Claude-only).</item>
+    /// </list>
+    /// <para>Items that fail any one of these conditions take the legacy
+    /// independent-phase pipeline (fresh sandbox per work / rework call,
+    /// no <c>--resume</c>, no shared VM across phases) unchanged. The brief
+    /// is non-negotiable here: a session-shared auditor would self-review.</para>
+    /// </summary>
+    internal bool ShouldEnterClaudeSessionMode(WorkItem item, Project project, IAgentRunner runner)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(project);
+        ArgumentNullException.ThrowIfNull(runner);
+        if (_claudeSessionWorker is null) return false;
+        if (!_claudeSessionOptions.Enabled) return false;
+        if (!project.ClaudeSession.Enabled) return false;
+        if (runner.Kind != AgentKind.Claude) return false;
+        // CheckAndAct is a read-only single-shot probe; it doesn't have a
+        // rework loop, so the session-share benefit doesn't apply.
+        if (item.JobType == JobType.CheckAndAct) return false;
+        if (item.JobType == JobType.AgentControl) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Opens a fresh <see cref="ClaudeSessionLifecycle"/> against a newly
+    /// provisioned worker sandbox. The lifecycle is published on
+    /// <see cref="_ambientSessionLifecycle"/> so the work / rework agent-phase
+    /// path can pick it up without an explicit parameter, and returned for
+    /// the caller's <c>await using</c> so it disposes (closes the session,
+    /// disposing the VM) on the way out of <see cref="RunAsync"/> regardless
+    /// of how the pipeline exits.
+    /// </summary>
+    private async Task<ClaudeSessionLifecycle?> TryOpenClaudeSessionLifecycleAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        string repoId,
+        CancellationToken ct)
+    {
+        if (!ShouldEnterClaudeSessionMode(item, project, runner))
+            return null;
+        if (_claudeSessionWorker is null)
+            return null;
+
+        // Use the work-phase sandbox target for the worker VM. Subsequent
+        // rework turns reuse the same VM via session resume, so the network
+        // profile / flavor / baseline pin established here applies to every
+        // worker turn for this item.
+        var access = _gitHost.GetSandboxAccess(repoId);
+        var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
+        var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct).ConfigureAwait(false);
+        var spec = BuildSandboxSpec(
+            access,
+            includeAgentCredential: credential,
+            allowAgentNetwork: true,
+            hostNetworkProfile: sandboxTarget.NetworkProfile,
+            timingWorkItemId: item.Id,
+            timingPhase: "work",
+            flavor: sandboxTarget.Flavor,
+            extraEnvironment: null,
+            baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
+                project,
+                new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
+                item.BaselineImageRef));
+
+        var sandbox = await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+        try
+        {
+            if (credential is not null && credential.Files.Count > 0)
+                await MaterialiseCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+
+            var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+                _claudeSessionWorker,
+                sandbox,
+                SandboxConventions.WorkDir,
+                credential,
+                item.ModelId,
+                item.ReasoningMode,
+                ct).ConfigureAwait(false);
+            // sandbox ownership transferred to the lifecycle
+            sandbox = null!;
+            _ambientSessionLifecycle.Value = lifecycle;
+            return lifecycle;
+        }
+        catch
+        {
+            // OpenAsync didn't adopt the sandbox; ensure we don't leak the VM.
+            if (sandbox is not null)
+                await sandbox.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
 
     private Task<string> ProcessAgentPromptAsync(
         WorkItemId itemId,
@@ -750,6 +869,7 @@ public sealed class PipelineRunner : IPipelineRunner
             return;
         }
 
+        ClaudeSessionLifecycle? claudeSessionLifecycle = null;
         try
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
@@ -761,6 +881,19 @@ public sealed class PipelineRunner : IPipelineRunner
             if (string.Equals(workBranch, baseBranch, StringComparison.Ordinal))
                 throw new InvalidOperationException(
                     $"workBranch must differ from baseBranch (both '{baseBranch}'); refusing to bypass merge-phase containment");
+
+            // Session-mode dispatch: when the work item, its project, and the
+            // global flag all opt in for the Claude resumable worker, open one
+            // worker session+VM up-front. The lifecycle is published via the
+            // AsyncLocal so the work / rework agent-phase path picks it up
+            // without any explicit threading; the outer try/finally closes it
+            // (disposes the VM) on every exit path. Items that don't opt in
+            // see no behaviour change: claudeSessionLifecycle stays null and
+            // RunAgentPhaseAsync takes the legacy independent-phase branch.
+            if (!skipWork && !skipAudit)
+            {
+                claudeSessionLifecycle = await TryOpenClaudeSessionLifecycleAsync(item, project, agentRunner, repoId, ct);
+            }
             if (!string.Equals(item.WorkBranch, workBranch, StringComparison.Ordinal))
             {
                 item = item with { WorkBranch = workBranch };
@@ -1358,6 +1491,26 @@ public sealed class PipelineRunner : IPipelineRunner
         }
         finally
         {
+            // Tear down the resumable Claude worker VM on every exit path
+            // (success, terminal failure, host shutdown). The lifecycle's
+            // CloseSessionAsync disposes the VM regardless of suspend state,
+            // so a session that completed cleanly + got suspended after the
+            // last rework turn still has its VM destroyed here — no idle VMs
+            // leak past terminal transitions.
+            if (claudeSessionLifecycle is not null)
+            {
+                try
+                {
+                    await claudeSessionLifecycle.DisposeAsync();
+                }
+                catch
+                {
+                    // Disposal is best-effort; SandboxLeakReaper sweeps any
+                    // orphaned VM the close path couldn't reach.
+                }
+                _ambientSessionLifecycle.Value = null;
+            }
+
             if (_stdoutBroadcaster is not null)
             {
                 try { await _stdoutBroadcaster.CompleteAsync(item.Id); }
@@ -2643,23 +2796,76 @@ public sealed class PipelineRunner : IPipelineRunner
                 new SandboxTarget(networkProfile, sandboxFlavor),
                 item.BaselineImageRef));
 
-        var sandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = WorkSandboxContext.Current != null
-            ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
-            : await _sandboxes.CreateAsync(spec, ct);
-        sandboxStartSw.Stop();
-        CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+        // Session-mode (Claude resumable worker) reuses ONE sandbox across the
+        // work phase + every rework iteration: the VM is stopped during each
+        // (long) audit and resumed for the next worker turn. The lifecycle
+        // owns disposal (it disposes the VM via CloseSessionAsync at the end
+        // of RunAsync), so this method must NOT dispose the sandbox in the
+        // session branch — suspending it after a successful turn is what
+        // preserves the prompt cache + transcript across the upcoming audit.
+        var sessionLifecycle = _ambientSessionLifecycle.Value;
+        var useClaudeSession = sessionLifecycle is not null
+            && runner.Kind == AgentKind.Claude
+            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+
+        ISandbox sandbox;
+        bool sandboxOwnedByPhase;
+        bool skipClone;
+        if (useClaudeSession)
+        {
+            // GetSandboxAsync resumes the VM via the worker's resume hook
+            // (multipass start) when the lifecycle is currently suspended;
+            // on the very first call it is already running.
+            sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
+            sandboxOwnedByPhase = false;
+            // On subsequent worker turns (rework) the previous turn already
+            // cloned into /work; re-cloning would fail and would also throw
+            // away the agent's mid-tree scratch state. We refresh against
+            // origin via fetch + checkout below instead of cloning.
+            skipClone = sessionLifecycle.FirstTurnComplete;
+        }
+        else
+        {
+            // Legacy independent-phase path. WorkSandboxContext, when present
+            // on the ambient AsyncLocal, lets the orchestrator reuse a warm
+            // sandbox across the work + audit phases of the same item; the
+            // wrapper it returns has a cheap DisposeAsync so the
+            // sandboxOwnedByPhase finally below stays safe.
+            var sandboxStartSw = Stopwatch.StartNew();
+            sandbox = WorkSandboxContext.Current != null
+                ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
+                : await _sandboxes.CreateAsync(spec, ct);
+            sandboxStartSw.Stop();
+            CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+            sandboxOwnedByPhase = true;
+            skipClone = false;
+        }
+
+        var phaseSucceeded = false;
+        try
+        {
 
         if (credential is not null && credential.Files.Count > 0)
             await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
-        TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
-            activitySource: CodeyBoxActivities.Sandbox, log: _log);
-        await using (cloneScope)
+        if (!skipClone)
         {
-            await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
+                activitySource: CodeyBoxActivities.Sandbox, log: _log);
+            await using (cloneScope)
+            {
+                await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+            }
+            CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
         }
-        CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
+        else
+        {
+            // Session-mode rework turn: the clone from the prior turn is
+            // still on disk. Refresh against origin so any incremental
+            // rebase that ran between iterations lands in the work tree
+            // before the agent looks at it.
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+        }
         var resumingPreempt = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
         var checkedOutExistingBranch = false;
         if (resumingPreempt)
@@ -2762,27 +2968,36 @@ public sealed class PipelineRunner : IPipelineRunner
                 {
                     var phaseForPreprocessor = isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework;
                     var iterationForPreprocessor = iteration ?? 1;
-                    var runTask = AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
-                        runner,
+                    Func<string, CancellationToken, Task<string>> promptPreprocessor = (raw, pct) => ProcessAgentPromptAsync(
+                        item.Id,
+                        runner.Kind,
+                        phaseForPreprocessor,
+                        iterationForPreprocessor,
+                        project,
                         sandbox,
-                        SandboxConventions.WorkDir,
-                        prompt,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        supervision!,
-                        stdoutCallback,
-                        captureStructuredStream,
-                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
-                            item.Id,
-                            runner.Kind,
-                            phaseForPreprocessor,
-                            iterationForPreprocessor,
-                            project,
+                        raw,
+                        pct);
+                    var runTask = useClaudeSession
+                        ? RunClaudeSessionSupervisedTurnsAsync(
+                            sessionLifecycle!,
+                            supervision!,
+                            prompt,
+                            stdoutCallback,
+                            promptPreprocessor,
+                            runnerCts.Token)
+                        : AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                            runner,
                             sandbox,
-                            raw,
-                            pct),
-                        runnerCts.Token);
+                            SandboxConventions.WorkDir,
+                            prompt,
+                            credential,
+                            item.ModelId,
+                            item.ReasoningMode,
+                            supervision!,
+                            stdoutCallback,
+                            captureStructuredStream,
+                            promptPreprocessor,
+                            runnerCts.Token);
                     var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                     if (completed != runTask)
                     {
@@ -2803,16 +3018,23 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (supervision is not null)
                         await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, runnerCts.Token);
 
-                    var runTask = resumingPreempt
-                    && runner is IResumableAgentRunner resumable
-                    ? resumable.RunResumedAsync(
-                        sandbox, SandboxConventions.WorkDir, prompt, credential,
-                        new AgentResumeContext(item.PreemptCheckpoint!),
-                        item.ModelId, item.ReasoningMode, runnerCts.Token,
-                        stdoutChunkCallback: stdoutCallback)
-                    : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: captureStructuredStream);
+                    // Session-mode work / rework turn: route the agent invocation
+                    // through the lifecycle so the captured CLI session id flows
+                    // across turns (--resume on turn 2+) and the per-turn cache_read
+                    // metrics get emitted. The lifecycle forces stream-json on so
+                    // the worker can observe the session id; the captureStructuredStream
+                    // value we pass into RunAsync is irrelevant when useClaudeSession.
+                    var runTask = useClaudeSession && !resumingPreempt
+                        ? sessionLifecycle!.SendTurnAsync(prompt, runnerCts.Token, stdoutCallback)
+                        : (resumingPreempt && runner is IResumableAgentRunner resumable
+                            ? resumable.RunResumedAsync(
+                                sandbox, SandboxConventions.WorkDir, prompt, credential,
+                                new AgentResumeContext(item.PreemptCheckpoint!),
+                                item.ModelId, item.ReasoningMode, runnerCts.Token,
+                                stdoutChunkCallback: stdoutCallback)
+                            : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
+                                stdoutChunkCallback: stdoutCallback,
+                                captureStructuredStream: captureStructuredStream));
                     var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                     if (completed != runTask)
                     {
@@ -3143,7 +3365,73 @@ public sealed class PipelineRunner : IPipelineRunner
 
         await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
 
+        phaseSucceeded = true;
         return agentResult.Stdout;
+        }
+        finally
+        {
+            if (sandboxOwnedByPhase)
+            {
+                // Legacy independent-phase pipeline: the sandbox is per-phase,
+                // dispose it now (matches the original `await using var sandbox`
+                // behaviour).
+                try
+                {
+                    await sandbox.DisposeAsync();
+                }
+                catch
+                {
+                    // Best-effort disposal — the outer exception (if any) is
+                    // the meaningful failure.
+                }
+            }
+            else if (useClaudeSession && phaseSucceeded)
+            {
+                // Session-mode success path: suspend the worker VM so the
+                // (long) audit phase doesn't burn host resources holding an
+                // idle worker, while preserving the in-VM transcript and the
+                // server-side prompt cache (within its TTL) for the next
+                // rework turn. On failure we leave the lifecycle live —
+                // RunAsync's outer try/finally disposes it (close = dispose VM).
+                try
+                {
+                    await sessionLifecycle!.SuspendAsync(CancellationToken.None);
+                }
+                catch
+                {
+                    // Suspend failure is non-fatal at the per-turn boundary;
+                    // the next turn's GetSandboxAsync will resume the VM
+                    // (multipass start is idempotent against a running VM).
+                }
+            }
+        }
+    }
+
+    private static async Task<AgentResult> RunClaudeSessionSupervisedTurnsAsync(
+        ClaudeSessionLifecycle sessionLifecycle,
+        IAgentSupervisionSession supervision,
+        string prompt,
+        Action<string>? stdoutCallback,
+        Func<string, CancellationToken, Task<string>> promptPreprocessor,
+        CancellationToken ct)
+    {
+        var supervisedStdout = supervision.WrapStdoutCallback(stdoutCallback);
+        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, ct)
+            .ConfigureAwait(false);
+
+        var agentResult = await sessionLifecycle.SendTurnAsync(prompt, ct, supervisedStdout)
+            .ConfigureAwait(false);
+
+        return await supervision.RunPendingInjectionsAsync(
+                agentResult,
+                async (turn, turnCt) =>
+                {
+                    var turnPrompt = await promptPreprocessor(turn.Prompt, turnCt).ConfigureAwait(false);
+                    return await sessionLifecycle.SendTurnAsync(turnPrompt, turnCt, supervisedStdout)
+                        .ConfigureAwait(false);
+                },
+                ct)
+            .ConfigureAwait(false);
     }
 
     private static string PreemptRefFor(WorkItemId id) => $"refs/heads/codeybox/preempt/{id}";

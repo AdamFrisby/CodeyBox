@@ -112,7 +112,9 @@ internal static class TestSupport
         IAuditProgressStore? auditProgressOverride = null,
         bool cliSessionResumableAgent = false,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
-        IAgentSupervisionService? agentSupervision = null)
+        IAgentSupervisionService? agentSupervision = null,
+        CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
+        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -205,7 +207,9 @@ internal static class TestSupport
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
             auditProgress: auditProgressOverride ?? store,
             checkCompletionRunner: checkCompletionRunner,
-            agentSupervision: agentSupervision);
+            agentSupervision: agentSupervision,
+            claudeSessionWorker: claudeSessionWorker,
+            claudeSessionOptions: claudeSessionOptions);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

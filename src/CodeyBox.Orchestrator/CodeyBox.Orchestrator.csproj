@@ -6,6 +6,7 @@
     <ProjectReference Include="..\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />

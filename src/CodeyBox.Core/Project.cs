@@ -182,6 +182,39 @@ public sealed record Project
     /// this cap (lowering priority is always allowed).
     /// </summary>
     public int? MaxPriority { get; init; }
+
+    /// <summary>
+    /// Per-project opt-in for the resumable Claude session worker. When true
+    /// AND the global <c>CodeyBox:ClaudeSession:Enabled</c> flag is set AND
+    /// the work item's effective agent kind is Claude, the orchestrator keeps
+    /// ONE worker session across the work phase and every audit-driven rework
+    /// iteration: the worker VM is stopped during each (long) audit and
+    /// resumed for the next rework turn (which carries <c>--resume</c> against
+    /// the captured CLI session id, so the server-side prompt cache and the
+    /// in-VM transcript both survive). The auditor always runs in its own
+    /// fresh sandbox with no shared session — self-review would rubber-stamp
+    /// its own work.
+    ///
+    /// <para>Default <c>false</c>: every project keeps the legacy independent-
+    /// phase pipeline (fresh sandbox per work/rework call) until an operator
+    /// opts in here.</para>
+    /// </summary>
+    public ProjectClaudeSessionConfig ClaudeSession { get; init; } = new();
+}
+
+/// <summary>
+/// Per-project Claude resumable-session worker opt-in. Composes with the
+/// global <c>CodeyBox:ClaudeSession:Enabled</c> flag and per-item agent kind:
+/// all three (global + project + Claude) must be true before a work item
+/// takes the session path. See <see cref="Project.ClaudeSession"/>.
+/// </summary>
+public sealed record ProjectClaudeSessionConfig
+{
+    /// <summary>
+    /// Per-project opt-in. Default <c>false</c> — the project uses the legacy
+    /// per-phase fresh-sandbox pipeline.
+    /// </summary>
+    public bool Enabled { get; init; }
 }
 
 /// <summary>
