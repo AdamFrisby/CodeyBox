@@ -5,23 +5,21 @@ namespace CodeyBox.Core;
 /// <summary>
 /// Applies the same secret-value patterns as <see cref="SensitiveDataRedactionEnricher"/>
 /// to arbitrary strings. Used to scrub auditor raw output before persisting it.
+/// Reuses <see cref="SensitiveDataRedactionEnricher.SecretValuePatternSource"/> so
+/// the auditor path and SignalR/log paths stay in lockstep on what counts as a secret.
 /// </summary>
-public static partial class RawOutputRedactor
+public static class RawOutputRedactor
 {
-    // Matches the same patterns as SensitiveDataRedactionEnricher.SecretValuePattern,
-    // plus additional families: AWS IAM, Stripe, generic OpenAI, PEM private-key headers,
-    // and Slack bot/user tokens.
-    [GeneratedRegex(
-        @"(?:gho_[A-Za-z0-9]+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|AIza[A-Za-z0-9_-]{35,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]+|sk_test_[A-Za-z0-9]+|sk-[A-Za-z0-9]{32,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xoxb-[A-Za-z0-9_-]+|xoxp-[A-Za-z0-9_-]+)",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex SecretPattern();
+    private static readonly Regex SecretPattern = new(
+        SensitiveDataRedactionEnricher.SecretValuePatternSource,
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Replaces any detected secret token in <paramref name="text"/> with <c>***</c>.
     /// Returns the original string unchanged when no secrets are found.
     /// </summary>
     public static string Redact(string text) =>
-        SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(SecretPattern().Replace(text, "***"));
+        SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(SecretPattern.Replace(text, "***"));
 
     /// <summary>
     /// Truncates <paramref name="text"/> to at most <paramref name="maxBytes"/> UTF-8 bytes,

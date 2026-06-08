@@ -79,6 +79,36 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_PemPrivateKey_HeaderBodyAndFooterReplaced()
+    {
+        const string Pem =
+            "-----BEGIN RSA PRIVATE KEY-----\n" +
+            "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n" +
+            "KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwIDAQABAkEArZkfPGZSv7Tnp7c3pwSt\n" +
+            "-----END RSA PRIVATE KEY-----";
+        var result = RawOutputRedactor.Redact($"crash dump:\n{Pem}\ntrailing");
+
+        Assert.DoesNotContain("BEGIN", result);
+        Assert.DoesNotContain("END", result);
+        Assert.DoesNotContain("MIIBOgIB", result);
+        Assert.Contains("***", result);
+        Assert.Contains("trailing", result);
+    }
+
+    [Fact]
+    public void Redact_SlackBotAppAndRefreshTokens_AreReplaced()
+    {
+        var result = RawOutputRedactor.Redact(
+            "bot=xoxb-1234567890-aaaa app=xoxa-2-1234567890-bbbb refresh=xoxr-1234567890-cccc session=xoxs-1234567890-dddd");
+
+        Assert.DoesNotContain("xoxb-", result);
+        Assert.DoesNotContain("xoxa-", result);
+        Assert.DoesNotContain("xoxr-", result);
+        Assert.DoesNotContain("xoxs-", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
     public void Redact_NoSecrets_ReturnsOriginal()
     {
         var input = "Build successful. 0 errors, 2 warnings.";
