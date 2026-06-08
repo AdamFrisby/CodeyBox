@@ -541,6 +541,14 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
 builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
+// Attachment-manifest injection: routed through the preprocessor chain so the
+// pipeline never grew a bespoke "inject ATTACHMENTS section" branch. No-op
+// until IWorkItemAttachmentSource is wired by the attachments foundation.
+builder.Services.AddSingleton<IAgentPromptPreprocessor, AttachmentManifestPromptPreprocessor>();
+// Cross-agent handoff brief injection: fires only when the involvement store
+// shows a prior phase ran under a different AgentKind. No-op until both
+// IAgentInvolvementStore and ICrossAgentHandoffBriefBuilder are wired.
+builder.Services.AddSingleton<IAgentPromptPreprocessor, CrossAgentHandoffPromptPreprocessor>();
 builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
 
 // ClaudeSessionWorker — resumable Claude runner. Registered alongside (NOT

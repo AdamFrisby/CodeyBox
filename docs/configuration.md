@@ -510,11 +510,27 @@ Rolling file log configuration.
 
 ## `PromptPreprocessing`
 
-Agent prompt preprocessing configuration. CodeyBox ships a built-in
-preprocessor that prepends the project rules file to every agent prompt. This
-is the reliable delivery path for house rules across Codex, Claude, Cursor,
-opencode, and any future runner; root-level agent file discovery is a
-compatibility aid, not the enforcement mechanism.
+Agent prompt preprocessing configuration. CodeyBox ships three built-in
+preprocessors that run in order before every agent invocation:
+
+1. **`ProjectRulesPromptPreprocessor`** — prepends the project rules file
+   (`ProjectRulesPath`, default `AGENTS.md`). This is the reliable delivery
+   path for house rules across Codex, Claude, Cursor, opencode, and any
+   future runner; root-level agent file discovery is a compatibility aid,
+   not the enforcement mechanism.
+2. **`AttachmentManifestPromptPreprocessor`** — injects an `## Attachments`
+   manifest listing every blob the attachments foundation has staged into
+   the sandbox for the work item (in-VM path, filename, MIME type, caption).
+   No-op until `IWorkItemAttachmentSource` is wired and the work item carries
+   attachments. The preprocessor never reads files — blob staging is the
+   foundation's responsibility.
+3. **`CrossAgentHandoffPromptPreprocessor`** — injects a `## Cross-agent
+   handoff` brief whenever the current invocation runs under a different
+   `AgentKind` than the most recent agent-involvement entry (the orchestrator
+   spilled from one agent to another mid-work-item). The brief itself is
+   built by `ICrossAgentHandoffBriefBuilder`; the preprocessor only detects
+   the cross-agent transition and injects whatever text the builder returns.
+   No-op until both `IAgentInvolvementStore` and the brief builder are wired.
 
 ```json
 "PromptPreprocessing": {
