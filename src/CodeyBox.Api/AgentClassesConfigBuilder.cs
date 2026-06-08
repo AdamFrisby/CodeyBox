@@ -115,7 +115,9 @@ public static class AgentClassesConfigBuilder
                     throw new InvalidOperationException(
                         $"AgentClass '{classOpts.Id}': duplicate member route '{member.RouteKey}'" +
                         (string.IsNullOrEmpty(m.ModelId) ? "" : $" model '{m.ModelId}'") +
-                        ". Give same-kind subscriptions distinct InstanceId values.");
+                        ". Give same-kind subscriptions distinct InstanceId values " +
+                        "(legacy shadowing duplicates are rejected since #226 multi-subscription pooling). " +
+                        "See docs/agent-classes.md \"Migrating pre-pooling configs\".");
                 members.Add(member);
             }
 
