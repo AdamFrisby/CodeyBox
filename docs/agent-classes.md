@@ -101,6 +101,32 @@ For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
 and behavior is unchanged.
 
+### Migrating pre-pooling configs
+
+Multi-subscription pooling (#226 / #227) tightened config validation so two
+class members can no longer resolve to the same `(agent, model)` route key
+without distinct `InstanceId` values. Legacy configs that listed the same
+subscription twice as a shadowing hack — e.g. two `codex/gpt-5.5` rows in the
+same class — now fail startup with:
+
+```
+AgentClass 'codex-xhigh': duplicate member route 'codex' model 'gpt-5.5'.
+Give same-kind subscriptions distinct InstanceId values
+(legacy shadowing duplicates are rejected since #226 multi-subscription pooling).
+```
+
+To migrate:
+
+- If the duplicate was a copy-paste accident, drop the extra member.
+- If it represented two real accounts you want to pool, give each one a
+  stable `InstanceId` (e.g. `acct-a` / `acct-b`) and add the corresponding
+  `AgentInstances` block with the per-account credential pointer. Once each
+  member has a distinct route key, the router treats them as siblings and
+  applies `CodeyBox:QuotaRouter:IntraKindRoutingPolicy` between them.
+
+Hot-reload edits to `CodeyBox:AgentClasses` that fail this rule are rejected
+and the prior catalog is kept; startup-time edits hard-fail the host.
+
 Credential fields can also be declared inline on a member when you do not need
 a reusable top-level instance:
 

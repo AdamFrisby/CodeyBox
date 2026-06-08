@@ -41,6 +41,10 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
 
             using var createCmd = _conn.CreateCommand();
             // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- hardcoded DDL only
+            // The agent_instance_id-bearing index lives in the post-ALTER block below;
+            // creating it here would crash startup against a pre-pooling DB whose
+            // agent_usage_events table is missing the column (SQLite resolves index
+            // expressions at CREATE INDEX time, ignoring IF NOT EXISTS).
             createCmd.CommandText = """
                 CREATE TABLE IF NOT EXISTS agent_usage_events (
                     id                  TEXT PRIMARY KEY,
@@ -56,9 +60,6 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_agent_model_time
                     ON agent_usage_events(agent_kind, model_id, time_utc);
-                CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time
-                    ON agent_usage_events(agent_instance_id, model_id, time_utc)
-                    WHERE agent_instance_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_usage_time
                     ON agent_usage_events(time_utc);
                 """;
