@@ -499,19 +499,26 @@ builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
 // unchanged; config-gated opt-in callers resolve the concrete type to drive
 // multi-turn sessions across a stop/resume-able VM. The options snapshot is a
 // singleton so a hot reload can flip Enabled mid-process without restart.
+// Mutable singleton so the IOptionsMonitor.OnChange handler below can flip
+// Transport / Enabled / EmitTurnMetrics in place; the worker reads the live
+// value on every turn so the flip applies to the NEXT dispatch.
 builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(sp =>
 {
-    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.ClaudeSession;
-    return new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions
-    {
-        Enabled = opts.Enabled,
-        EmitTurnMetrics = opts.EmitTurnMetrics,
-    };
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var live = new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions();
+    ClaudeSessionOptionsBinder.Apply(live, monitor.CurrentValue.ClaudeSession);
+    monitor.OnChange(opts => ClaudeSessionOptionsBinder.Apply(live, opts.ClaudeSession));
+    return live;
 });
 // Default metrics sink is the no-op; operators wire a logging/metrics-backed
 // sink by registering their own IClaudeSessionMetricsSink before this line.
 builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(
     CodeyBox.Agents.Claude.NullClaudeSessionMetricsSink.Instance);
+// ACP transport. Always registered so the operator can flip
+// CodeyBox:ClaudeSession:Transport=acp at runtime; the worker only opens an
+// ACP transport when the resolved config asks for it.
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.AcpClaudeTransport>(_ =>
+    new CodeyBox.Agents.Claude.AcpClaudeTransport());
 builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
 {
     var runner = sp.GetServices<IAgentRunner>()
@@ -530,13 +537,6 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
     if (provider is ISuspendingSandboxProvider suspending)
         resumeHook = (sandboxRef, ct) => suspending.ResumeSandboxAsync(sandboxRef.Id, ct);
 
-    // sandboxReattacher (revive an ISandbox bound to an existing VM after an
-    // orchestrator restart) is intentionally null in this rollout step. The
-    // dispatch wiring that persists / replays AgentSessionHandle across a
-    // restart lands in item 3 of the rollout; until then, ResolveStateAsync
-    // throws InvalidOperationException with a clear message rather than
-    // silently failing. The worker is OFF by default, so this gap is only
-    // reachable for an operator who has opted in via CodeyBox:ClaudeSession:Enabled.
     return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
         runner,
         sandboxReattacher: null,
@@ -544,7 +544,11 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
         credentialProvider: sp.GetService<ICredentialProvider>(),
         sandboxRefFactory: null,
         metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
-        options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>());
+        options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(),
+        acpTransport: sp.GetRequiredService<CodeyBox.Agents.Claude.AcpClaudeTransport>(),
+        printTransport: null,
+        onTransportDegraded: (sessionId, reason) =>
+            AuditLog.ClaudeAcpTransportDegraded(sessionId, reason));
 });
 
 // Plugin discovery result captured before builder.Build() so the credential
@@ -3343,11 +3347,7 @@ namespace CodeyBox.Api
     {
         /// <summary>
         /// Master switch. Default <c>false</c> — Claude dispatches keep using
-        /// the legacy one-shot runner unless an operator opts in here. The
-        /// per-agent-class-member and per-project opt-in switches land in the
-        /// next rollout step (item 3); once those ship the global flag will
-        /// compose with them to route specific work items to the session
-        /// worker.
+        /// the legacy one-shot runner unless an operator opts in here.
         /// </summary>
         public bool Enabled { get; set; } = false;
 
@@ -3358,6 +3358,32 @@ namespace CodeyBox.Api
         /// observable. Disable for A/B comparisons against the one-shot path.
         /// </summary>
         public bool EmitTurnMetrics { get; set; } = true;
+
+        /// <summary>
+        /// Command-delivery + billing channel for new Claude session turns.
+        /// Accepts <c>"print"</c> (default — today's <c>claude --print --resume</c>
+        /// path) or <c>"acp"</c> (Agent Client Protocol, drives
+        /// <c>claude --ide</c> off the metered <c>-p</c> pool). Case-insensitive,
+        /// hot-reloadable: subsequent turns observe the new value on the next
+        /// dispatch. Invalid values fall back to <c>"print"</c>.
+        /// </summary>
+        public string Transport { get; set; } = "print";
+
+        /// <summary>
+        /// Optional per-agent-class-member transport overrides. Map key is
+        /// the agent-class-member name (case-insensitive); value is
+        /// <c>"print"</c> or <c>"acp"</c>. Edit via
+        /// <c>CodeyBox:ClaudeSession:TransportOverridesByAgentClassMember:&lt;member&gt;</c>.
+        /// </summary>
+        public Dictionary<string, string> TransportOverridesByAgentClassMember { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Optional per-project transport overrides. Map key is the project id
+        /// (case-insensitive); value is <c>"print"</c> or <c>"acp"</c>.
+        /// </summary>
+        public Dictionary<string, string> TransportOverridesByProject { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig

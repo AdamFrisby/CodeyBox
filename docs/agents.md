@@ -173,6 +173,37 @@ in. Config keys (bound from `CodeyBox:ClaudeSession`):
 |-----|---------|-------------|
 | `CodeyBox:ClaudeSession:Enabled` | `false` | Master switch. When false, Claude work items always use the one-shot path. |
 | `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Emit per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
+| `CodeyBox:ClaudeSession:Transport` | `print` | Command-delivery + billing channel. `print` = today's `claude --print --resume`. `acp` = Agent Client Protocol via `claude --ide` (OFF the metered `-p` pool). Case-insensitive, hot-reloadable. Invalid values fall back to `print`. |
+| `CodeyBox:ClaudeSession:TransportOverridesByAgentClassMember:<member>` | (none) | Per-agent-class-member transport override. Wins over the per-project override and the global default. |
+| `CodeyBox:ClaudeSession:TransportOverridesByProject:<projectId>` | (none) | Per-project transport override. Loses to the per-class-member override. |
+
+#### Selecting a transport
+
+`print` is the existing path: `claude --print --dangerously-skip-permissions
+[--resume <id>]` per turn. Continuity comes from the captured Claude CLI
+session id (passed back via `--resume`); cache warmth follows the server-side
+prompt cache TTL.
+
+`acp` runs the in-sandbox `ClaudeSessionWorker.AcpClaudeTransport` bridge:
+CodeyBox materialises a tiny Node.js bridge inside the sandbox, the bridge
+hosts a WebSocket on a random local port, writes an IDE lockfile at
+`~/.claude/ide/<port>.lock` carrying `{transport:"ws", url, authToken,
+workspaceFolders, ...}`, and spawns `claude --ide` so the agent connects to
+the bridge. ACP JSON-RPC traffic (`initialize`, `session/new` or
+`session/load`, `session/prompt`, streamed `session/update`s, `stopReason`)
+flows host ↔ bridge stdio ↔ in-VM WebSocket ↔ claude. Permission requests
+(`session/request_permission`) and input requests (`session/request_input`)
+auto-grant / answer with a `<codeybox-question>` default so a headless ACP
+turn never waits on a human. Session continuity uses the assigned ACP
+session id, passed back via `session/load` on the next turn.
+
+If the ACP transport fails to open or any turn raises
+`AcpTransportUnavailableException`, the worker logs
+`agent.claude_acp_transport_degraded` and falls back to the `print`
+transport for the rest of that session — the work item is never stranded.
+Per-turn metrics (`ClaudeSessionTurnMetrics`) carry the `Transport` tag
+(`"print"` / `"acp"`) so dashboards can confirm traffic moved off the
+metered pool.
 
 Lifecycle inside the worker:
 
