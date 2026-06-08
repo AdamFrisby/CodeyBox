@@ -1556,16 +1556,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        // Microsoft.Data.Sqlite can throw an internal NullReferenceException from
-        // SqliteConnection.Close() during a teardown race (observed on host
-        // graceful shutdown). Swallow it so the noise doesn't surface as an
-        // "Unhandled exception" AND so _writeLock is always disposed.
+        // Microsoft.Data.Sqlite.SqliteConnection.Close() has been observed to throw
+        // NullReferenceException intermittently when a still-in-flight async command
+        // (from a not-yet-fully-drained background worker) races against connection
+        // teardown (observed on host graceful shutdown). The connection is being
+        // discarded either way; swallow so the write-gate release below always runs,
+        // the noise doesn't surface as an unhandled exception, and the test/host
+        // tear-down stays clean. The try/finally also enforces the standard dispose
+        // contract that every owned resource is released even if an earlier disposal throws.
         try
         {
             _conn.Dispose();
         }
         catch (NullReferenceException)
         {
+            // Internal Sqlite teardown race; safe to ignore — we own no further state.
         }
         finally
         {
