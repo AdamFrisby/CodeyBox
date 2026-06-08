@@ -101,9 +101,15 @@ This gate is independent of `StopOnFirstFailure`: even when the option is
 LLM panel. Tool auditors without the role (e.g. format-check) do not gate
 the panel, because the panel's CI claim only covers build and tests.
 
-Built-in language presets mark `<lang>:build-*` and `<lang>:test-*`
-auditors as BuildTestGate. Repository-supplied YAML may also mark its own
-shell auditors with `role: build-test-gate`.
+Built-in language presets mark the `<lang>:build-*` (where the preset
+ships a separate build step — currently only `csharp:build-WaE`) and the
+`<lang>:test-*` auditor as BuildTestGate. The other shipped languages
+(Go, Node, Python, Rust) fold the build into the same command as the
+test suite, so only their `<lang>:test-*` auditor carries the role.
+Repository-supplied YAML may also mark its own shell auditors with
+`role: build-test-gate` — do so for any custom step (e.g. a separate
+`tsc`/`cargo check`/cross-compile) whose failure should also short-circuit
+the LLM panel.
 
 ## Built-in auditors
 

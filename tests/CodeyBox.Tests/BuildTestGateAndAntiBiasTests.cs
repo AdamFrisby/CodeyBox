@@ -173,15 +173,23 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
         "does NOT mean the code is correct, complete, or well-designed";
     private const string CiAlreadyRanMarker =
         "Automated CI has already built the project and run the full test suite";
+    // The operative anti-rerun instruction. Asserted separately from the
+    // surrounding CI-claim/anti-bias clauses so removing JUST this sentence
+    // (leaving the context that hints at it) still fails the test.
+    private const string DoNotRunBuildOrTestsMarker =
+        "Do NOT run any build or test commands yourself";
 
     [Fact]
     public async Task LowQualityDiff_ThatBuildsAndPassesTests_StillProducesFindings()
     {
         // Frame is the SHIPPED one loaded from the embedded preset catalog —
-        // any regression that removes the disclaimer or weakens the CI-note
-        // will fail this test rather than silently un-gating the bias.
+        // any regression that removes the disclaimer, the CI-note, or the
+        // operative "Do NOT run any build or test commands" instruction will
+        // fail this test rather than silently un-gating the bias or letting
+        // panel auditors re-run the deterministic suite.
         var frameTemplate = new PresetCatalog().LlmPromptFrameTemplate;
         Assert.Contains(CiAlreadyRanMarker, frameTemplate, StringComparison.Ordinal);
+        Assert.Contains(DoNotRunBuildOrTestsMarker, frameTemplate, StringComparison.Ordinal);
         Assert.Contains(AntiBiasMarker, frameTemplate, StringComparison.Ordinal);
 
         var runner = new LowQualityDiffReviewRunner();
@@ -203,8 +211,10 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
 
         var result = await auditor.RunAsync(sandbox, "/work", ctx);
 
-        // The disclaimer reached the agent.
+        // The CI note, the anti-rerun directive, and the anti-bias disclaimer
+        // all reached the agent prompt.
         Assert.Contains(CiAlreadyRanMarker, runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains(DoNotRunBuildOrTestsMarker, runner.ObservedPrompt, StringComparison.Ordinal);
         Assert.Contains(AntiBiasMarker, runner.ObservedPrompt, StringComparison.Ordinal);
 
         // And the simulated reviewer still surfaces blocking findings on the

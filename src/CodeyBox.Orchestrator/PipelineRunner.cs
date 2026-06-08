@@ -6417,25 +6417,15 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
 
-        // Re-order so:
-        //   1. BuildTestGate-role auditors run first (deterministic build+test
-        //      must provably pass before any LLM panel runs, because the LLM
-        //      prompt frame asserts "CI built and ran tests with no failures"
-        //      and that claim must always be TRUE).
-        //   2. Other tool/local auditors next.
-        //   3. Credential-requiring (LLM) auditors last.
-        // List.Sort with a stable-feeling key keeps the original registration
-        // order within each tier. The byCaps GroupBy below preserves
-        // first-seen-key order, so tool groups (and BuildTestGate within them)
-        // iterate before any LLM group.
-        resolved.Sort((a, b) =>
-        {
-            static int Tier(IAuditor auditor)
-                => auditor.Role == AuditorRole.BuildTestGate ? 0
-                    : auditor.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 2
-                    : 1;
-            return Tier(a.Auditor) - Tier(b.Auditor);
-        });
+        // Re-order so BuildTestGate-role auditors run first, then other
+        // tool/local auditors, then credential-requiring (LLM) auditors. The
+        // tier function lives in AuditorOrdering.TierOf so the invariant has
+        // one source of truth (AuditorRegistry uses the same helper). OrderBy
+        // is stable, so within each tier the original registration order is
+        // preserved; the byCaps GroupBy below preserves first-seen-key order,
+        // so tool groups (and BuildTestGate within them) iterate before any
+        // LLM group.
+        resolved = resolved.OrderBy(x => AuditorOrdering.TierOf(x.Auditor)).ToList();
 
         // Group by (capabilities, resolved-runner-kind) so auditors that need
         // different agent credentials get separate sandboxes — each sandbox is

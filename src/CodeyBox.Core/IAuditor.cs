@@ -240,3 +240,22 @@ public interface IAuditorRegistry
 {
     IReadOnlyList<IAuditor> All { get; }
 }
+
+/// <summary>
+/// Single source of truth for the per-iteration audit-panel ordering tier:
+/// BuildTestGate auditors first (tier 0), declared short-circuit gates next
+/// (tier 1), other tool/local auditors next (tier 2), credential-requiring
+/// (LLM) auditors last (tier 3). The pipeline uses this to guarantee the LLM
+/// panel's "CI ran with no failures" prompt claim is always true. Both
+/// <see cref="IAuditorRegistry"/> and the pipeline's per-iteration sort go
+/// through this helper so a new tier or a gate-semantics change only ever
+/// needs to be made in one place.
+/// </summary>
+public static class AuditorOrdering
+{
+    public static int TierOf(IAuditor auditor)
+        => auditor.Role == AuditorRole.BuildTestGate ? 0
+            : auditor.CanShortCircuitOnBlockingFinding ? 1
+            : auditor.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 3
+            : 2;
+}

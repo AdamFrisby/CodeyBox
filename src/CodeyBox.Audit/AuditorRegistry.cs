@@ -10,20 +10,13 @@ public sealed class AuditorRegistry : IAuditorRegistry
 {
     public AuditorRegistry(IEnumerable<IAuditor> auditors)
     {
-        // Stable order:
-        //   1. BuildTestGate auditors first (deterministic build+test must
-        //      provably pass before any LLM panel asserts CI did so).
-        //   2. Other declared short-circuit gates.
-        //   3. Other tool/local auditors.
-        //   4. LLM/network auditors last.
+        // Tier 0 (BuildTestGate) -> Tier 1 (declared short-circuit gates) ->
+        // Tier 2 (other tool/local) -> Tier 3 (credentialed LLM/network). The
+        // pipeline applies the same tier function per iteration; the ordering
+        // invariant lives in AuditorOrdering.TierOf so one site owns it.
         // OrderBy is stable, so within each tier the original registration
         // order is preserved.
-        All = auditors
-            .OrderBy(a => a.Role == AuditorRole.BuildTestGate ? 0
-                : a.CanShortCircuitOnBlockingFinding ? 1
-                : a.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 3
-                : 2)
-            .ToList();
+        All = auditors.OrderBy(AuditorOrdering.TierOf).ToList();
     }
 
     public IReadOnlyList<IAuditor> All { get; }
