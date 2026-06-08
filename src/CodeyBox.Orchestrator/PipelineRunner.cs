@@ -141,6 +141,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
+    private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly string _disabledHostHooksPath;
     private static readonly object PickupRebaseLocksGate = new();
     private static readonly Dictionary<string, PickupRebaseLock> PickupRebaseLocks = new(StringComparer.Ordinal);
@@ -214,7 +215,8 @@ public sealed class PipelineRunner : IPipelineRunner
         IRequiredBuildVerifier? requiredBuildVerifier = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
         IAuditProgressStore? auditProgress = null,
-        IAgentPauseController? agentPauseController = null)
+        IAgentPauseController? agentPauseController = null,
+        AgentPromptPreprocessorChain? promptPreprocessors = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -274,6 +276,7 @@ public sealed class PipelineRunner : IPipelineRunner
         _questionStore = questionStore;
         _taskQueue = taskQueue;
         _orchestratorOptions = orchestratorOptions ?? new OrchestratorOptions();
+        _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
@@ -310,6 +313,72 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
+
+    private Task<string> ProcessAgentPromptAsync(
+        WorkItemId itemId,
+        AgentKind agentKind,
+        AgentPromptPhase phase,
+        int iteration,
+        Project project,
+        ISandbox sandbox,
+        string prompt,
+        CancellationToken ct)
+    {
+        if (!_promptPreprocessors.HasPreprocessors)
+            return Task.FromResult(prompt);
+
+        // Every pipeline-phase agent in this file runs against the
+        // SandboxConventions.WorkDir clone (work, rework, check-and-act,
+        // post-act-recheck, merge, conflict-rework, merge-security-review),
+        // so we pass that as the preprocessor's working directory. The
+        // deep-audit path uses /work/repo and goes through the
+        // wrapper-based plumbing in PromptPreprocessingAgentRunner.RunAsync,
+        // which forwards the runner's actual workingDirectory.
+        var ctx = new PromptContext(itemId, agentKind, phase, iteration, project, sandbox, SandboxConventions.WorkDir);
+        return _promptPreprocessors.ProcessAsync(ctx, prompt, ct);
+    }
+
+    private IAgentRunner WrapPromptPreprocessedRunner(
+        IAgentRunner runner,
+        WorkItemId itemId,
+        AgentPromptPhase phase,
+        int iteration,
+        Project project)
+    {
+        if (!_promptPreprocessors.HasPreprocessors)
+            return runner;
+
+        return PromptPreprocessingAgentRunner.Wrap(
+            runner,
+            _promptPreprocessors,
+            itemId,
+            phase,
+            iteration,
+            project);
+    }
+
+    private IReadOnlyList<AgenticConflictResolverCandidate> WrapPromptPreprocessedCandidates(
+        IReadOnlyList<AgenticConflictResolverCandidate> candidates,
+        WorkItemId itemId,
+        AgentPromptPhase phase,
+        int iteration,
+        Project project)
+    {
+        if (!_promptPreprocessors.HasPreprocessors)
+            return candidates;
+
+        return candidates
+            .Select(candidate => candidate with
+            {
+                Runner = WrapPromptPreprocessedRunner(
+                    candidate.Runner,
+                    itemId,
+                    phase,
+                    iteration,
+                    project),
+            })
+            .ToList();
+    }
 
     private async Task RunAgentControlAsync(WorkItem item, Project project, CancellationToken ct)
     {
@@ -1949,7 +2018,12 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                candidates ??= await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                candidates ??= WrapPromptPreprocessedCandidates(
+                    await BuildAgenticConflictCandidatesAsync(item, project, runner, ct),
+                    item.Id,
+                    AgentPromptPhase.Merge,
+                    iteration: 1,
+                    project);
 
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
@@ -2549,6 +2623,15 @@ public sealed class PipelineRunner : IPipelineRunner
             ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
             : null;
         var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
+        prompt = await ProcessAgentPromptAsync(
+            item.Id,
+            runner.Kind,
+            isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+            iteration ?? 1,
+            project,
+            sandbox,
+            prompt,
+            ct);
 
         AgentResult agentResult;
         using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -3065,6 +3148,15 @@ public sealed class PipelineRunner : IPipelineRunner
         });
 
         AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "check");
+        prompt = await ProcessAgentPromptAsync(
+            item.Id,
+            agentRunner.Kind,
+            AgentPromptPhase.CheckAndAct,
+            1,
+            project,
+            sandbox,
+            prompt,
+            ct);
         var result = await agentRunner.RunAsync(
             sandbox, SandboxConventions.WorkDir, prompt, credential,
             item.ModelId, item.ReasoningMode, ct,
@@ -3438,6 +3530,15 @@ public sealed class PipelineRunner : IPipelineRunner
         });
 
         AuditLog.AgentStarted(agentRunner.Kind, sandbox.Id, "post-act-recheck");
+        prompt = await ProcessAgentPromptAsync(
+            item.Id,
+            agentRunner.Kind,
+            AgentPromptPhase.CheckAndAct,
+            1,
+            project,
+            sandbox,
+            prompt,
+            ct);
         var result = await agentRunner.RunAsync(
             sandbox, SandboxConventions.WorkDir, prompt, credential,
             item.ModelId, item.ReasoningMode, ct,
@@ -4478,6 +4579,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         workRunner,
                         credential,
                         member?.RouteKey,
+                        project,
                         ctx,
                         ct);
                     await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
@@ -4544,6 +4646,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         workRunner,
                         candidateCredential,
                         trialItem.AgentInstanceId,
+                        project,
                         candidateCtx,
                         attemptCt);
                 }
@@ -4659,6 +4762,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IAgentRunner workRunner,
         AgentCredential? credential,
         string? agentInstanceId,
+        Project project,
         AuditContext ctx,
         CancellationToken ct)
     {
@@ -4683,9 +4787,15 @@ public sealed class PipelineRunner : IPipelineRunner
         var crossKind = runner.Kind != workRunner.Kind;
         // Thread the resolved runner into the context so LlmReviewAuditor
         // can use the cross-review agent instead of its baked-in default.
+        var promptRunner = WrapPromptPreprocessedRunner(
+            runner,
+            ctx.WorkItemId,
+            AgentPromptPhase.Audit,
+            ctx.Iteration,
+            project);
         var auditorCtx = ctx with
         {
-            AuditRunner = runner,
+            AuditRunner = promptRunner,
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
             CaptureStructuredStream = streamCapture is not null,
@@ -6502,8 +6612,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                    var candidates = await BuildAgenticConflictCandidatesAsync(
-                        item, project, runner, ct, AgenticConflictResolverOperation.Merge);
+                    var candidates = WrapPromptPreprocessedCandidates(
+                        await BuildAgenticConflictCandidatesAsync(
+                            item, project, runner, ct, AgenticConflictResolverOperation.Merge),
+                        item.Id,
+                        AgentPromptPhase.Merge,
+                        iteration: 1,
+                        project);
                     var resolverResult = await _agenticConflictResolver.ResolveAsync(
                         sandbox,
                         SandboxConventions.WorkDir,
@@ -6529,6 +6644,15 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
                 var mergePrompt = BuildMergePrompt(baseBranch, workBranch, hostMerge, project.Audit.MergeScopeBufferLines);
+                mergePrompt = await ProcessAgentPromptAsync(
+                    item.Id,
+                    runner.Kind,
+                    AgentPromptPhase.Merge,
+                    1,
+                    project,
+                    sandbox,
+                    mergePrompt,
+                    ct);
                 var mergeExecScope = await TimingScope.BeginAsync(
                     _timings, item.Id, "merge", "agent.exec",
                     metadata: new Dictionary<string, object> { ["agent"] = runner.Kind.Value },
@@ -7174,9 +7298,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox? sandbox,
         CancellationToken ct)
     {
-        _ = workItemId;
-        _ = project;
-        if (runner is not ITextOnlyAgentRunner)
+        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
         {
             _log.LogWarning(
                 "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
@@ -7185,7 +7307,21 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
-        var textOnlyRunner = (ITextOnlyAgentRunner)runner;
+        // PromptPreprocessingAgentRunner's RunTextOnlyAsync re-runs the chain
+        // on a non-null sandbox, so skip the explicit pass here when the
+        // runner is already wrapped to avoid injecting the rules block twice.
+        if (sandbox is not null && runner is not PromptPreprocessingAgentRunner)
+        {
+            prompt = await ProcessAgentPromptAsync(
+                workItemId,
+                runner.Kind,
+                AgentPromptPhase.Merge,
+                1,
+                project,
+                sandbox,
+                prompt,
+                ct);
+        }
         var result = await textOnlyRunner.RunTextOnlyAsync(
             prompt,
             credential,
@@ -8270,6 +8406,15 @@ public sealed class PipelineRunner : IPipelineRunner
 
             var prompt = BuildConflictReworkPrompt(
                 item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message);
+            prompt = await ProcessAgentPromptAsync(
+                item.Id,
+                runner.Kind,
+                AgentPromptPhase.Rework,
+                item.ConflictReworkAttempts,
+                project,
+                sandbox,
+                prompt,
+                ct);
 
             // Run the agent. We use the same agent identity/class as the
             // original work agent (this method's `runner` parameter); the

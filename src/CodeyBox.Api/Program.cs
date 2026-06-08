@@ -488,6 +488,10 @@ builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
+builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
+builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
+builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
 
 // Plugin discovery result captured before builder.Build() so the credential
 // provider factory below can reference the list directly without any async
@@ -1978,7 +1982,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     requiredBuildVerifier: sp.GetRequiredService<IRequiredBuildVerifier>(),
     dispatchAvailability: sp.GetService<IAgentDispatchAvailability>(),
     auditProgress: sp.GetRequiredService<IAuditProgressStore>(),
-    agentPauseController: sp.GetRequiredService<IAgentPauseController>()));
+    agentPauseController: sp.GetRequiredService<IAgentPauseController>(),
+    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2050,7 +2055,8 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     sp.GetRequiredService<ILogger<ReleaseService>>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditMaxConcurrency,
     () => TimeSpan.FromSeconds(sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.DeepAuditRemediationItemTimeoutSeconds),
-    agentStreams: sp.GetService<IAgentStreamStore>()));
+    agentStreams: sp.GetService<IAgentStreamStore>(),
+    promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>()));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
