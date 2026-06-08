@@ -1556,25 +1556,37 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        // Microsoft.Data.Sqlite.SqliteConnection.Close() has been observed to throw
-        // NullReferenceException intermittently when a still-in-flight async command
-        // (from a not-yet-fully-drained background worker) races against connection
-        // teardown (observed on host graceful shutdown). The connection is being
-        // discarded either way; swallow so the write-gate release below always runs,
-        // the noise doesn't surface as an unhandled exception, and the test/host
-        // tear-down stays clean. The try/finally also enforces the standard dispose
-        // contract that every owned resource is released even if an earlier disposal throws.
         try
         {
-            _conn.Dispose();
-        }
-        catch (NullReferenceException)
-        {
-            // Internal Sqlite teardown race; safe to ignore — we own no further state.
+            DisposeSqliteConnectionTolerantOfTeardownNre(_conn);
         }
         finally
         {
             _writeLock.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Disposes a connection, tolerating the
+    /// <see cref="NullReferenceException"/> that
+    /// <c>Microsoft.Data.Sqlite.SqliteConnection.Close()</c> has been observed
+    /// to throw intermittently when a still-in-flight async command (from a
+    /// not-yet-fully-drained background worker) races against connection
+    /// teardown. The connection is being discarded either way, so swallowing
+    /// the NRE keeps the dispose contract clean — the caller's
+    /// <c>try/finally</c> still releases every other owned resource. Any other
+    /// exception bubbles. Exposed <c>internal</c> so the tolerance branch is
+    /// directly exercisable from unit tests.
+    /// </summary>
+    internal static void DisposeSqliteConnectionTolerantOfTeardownNre(IDisposable connection)
+    {
+        try
+        {
+            connection.Dispose();
+        }
+        catch (NullReferenceException)
+        {
+            // Internal Sqlite teardown race; safe to ignore — no further state to release.
         }
     }
 

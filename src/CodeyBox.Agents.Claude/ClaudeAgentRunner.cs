@@ -30,8 +30,11 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
     internal const string MessagesEndpoint = "https://api.anthropic.com/v1/messages";
-    internal const string ModelsEndpoint = "https://api.anthropic.com/v1/models";
-    internal const string AnthropicVersion = "2023-06-01";
+    // /v1/models endpoint and anthropic-version pin live in ClaudeModelListProbe;
+    // re-export so the text-only path (which fetches /v1/models for alias→canonical
+    // resolution) shares a single source of truth with the startup probe.
+    internal const string ModelsEndpoint = ClaudeModelListProbe.ModelsEndpoint;
+    internal const string AnthropicVersion = ClaudeModelListProbe.AnthropicVersion;
     internal const int TextOnlyMaxTokens = 8192;
     internal const string MissingApiKeyReason =
         "ANTHROPIC_API_KEY is required for Claude text-only calls (subscription OAuth declined for account-safety)";
@@ -644,32 +647,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     /// <summary>
     /// Parses <c>{"data":[{"id":"..."}, ...]}</c> into the list of ids; returns
-    /// an empty list on any parse failure.
+    /// an empty list on any parse failure. Delegates to
+    /// <see cref="ClaudeModelListProbe.ParseResponse"/> — the startup model-list
+    /// probe and this text-only alias resolver speak the same wire format and
+    /// must not drift.
     /// </summary>
-    internal static IReadOnlyList<string> ParseModelIds(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
-                return Array.Empty<string>();
-            var ids = new List<string>();
-            foreach (var item in data.EnumerateArray())
-            {
-                if (item.ValueKind != JsonValueKind.Object) continue;
-                if (!item.TryGetProperty("id", out var idEl) || idEl.ValueKind != JsonValueKind.String) continue;
-                var id = idEl.GetString();
-                if (!string.IsNullOrWhiteSpace(id))
-                    ids.Add(id);
-            }
-            return ids;
-        }
-        catch (JsonException)
-        {
-            return Array.Empty<string>();
-        }
-    }
+    internal static IReadOnlyList<string> ParseModelIds(string json) =>
+        ClaudeModelListProbe.ParseResponse(json).ModelIds;
 
     /// <summary>
     /// Extracts the concatenated text payload from a <c>/v1/messages</c>

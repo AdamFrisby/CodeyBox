@@ -42,7 +42,7 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
             new Dictionary<string, string> { ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat01-x" },
             new Dictionary<string, string>());
 
-    private static ClaudeAgentRunner BuildRunner(FakeAnthropicHandler handler, string? defaultModel = "claude-opus-4-7")
+    private static ClaudeAgentRunner BuildRunner(HttpMessageHandler handler, string? defaultModel = "claude-opus-4-7")
     {
         var defaults = new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -346,6 +346,95 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
         Assert.Equal("haiku", result.Output);
     }
 
+    [Fact]
+    public async Task RunTextOnlyAsync_AliasResolved_ButMessagesFails_SummaryShowsBothIds()
+    {
+        // When alias resolution rewrote the id and the POST still fails, the
+        // diagnostic must surface BOTH ids so operators see the rewrite as
+        // separate from a pure-model-typo failure.
+        var handler = new FakeAnthropicHandler(
+            modelsResponse: (HttpStatusCode.OK, ModelsJson),
+            messagesResponder: _ => (HttpStatusCode.InternalServerError, """{"error":{"message":"upstream blew up"}}"""));
+        var runner = BuildRunner(handler);
+
+        var result = await runner.RunTextOnlyAsync(
+            "hi", ApiKeyCredential(), modelId: "claude-opus-4-7");
+
+        Assert.False(result.Success);
+        Assert.Contains("HTTP 500", result.Summary);
+        Assert.Contains("model=claude-opus-4-7-20260315", result.Summary);
+        Assert.Contains("requested=claude-opus-4-7", result.Summary);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_Cancelled_PropagatesOperationCanceled()
+    {
+        // The OCE re-throw branch in TryResolveCanonicalModelIdAsync (and
+        // the outer catch-filter that excludes OCE) must let cancellation
+        // propagate to the caller rather than swallowing it as a generic
+        // failure result.
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var handler = new CancellingHandler(cts.Token);
+        var runner = BuildRunner(handler);
+
+        // TaskCanceledException is the concrete subclass HttpClient surfaces;
+        // both inherit OperationCanceledException, and the test pins the
+        // contract that OCE propagates (rather than being swallowed into a
+        // generic failure result).
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            runner.RunTextOnlyAsync("hi", ApiKeyCredential(),
+                modelId: "claude-opus-4-7", ct: cts.Token));
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_ModelListThrowsNetworkException_FallsBackToRequestedId()
+    {
+        // Exercises the generic (non-OCE) catch in TryResolveCanonicalModelIdAsync —
+        // a thrown HttpRequestException during /v1/models must NOT degrade the
+        // call; resolution returns the requested id and the POST proceeds.
+        var handler = new ScriptedAnthropicHandler(
+            modelsResponder: _ => throw new HttpRequestException("dns failed"),
+            messagesResponder: req =>
+            {
+                var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(body);
+                // Fell back to the requested id verbatim.
+                Assert.Equal("claude-opus-4-7", doc.RootElement.GetProperty("model").GetString());
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"content":[{"type":"text","text":"ok"}]}""", Encoding.UTF8, "application/json"),
+                };
+            });
+        var runner = BuildRunner(handler);
+
+        var result = await runner.RunTextOnlyAsync(
+            "hi", ApiKeyCredential(), modelId: "claude-opus-4-7");
+        Assert.True(result.Success);
+        Assert.Equal("ok", result.Output);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_MessagesThrowsNetworkException_SurfacedAsFailureNotRethrown()
+    {
+        // Exercises the outer general-exception catch in RunTextOnlyAsync.
+        // A transport failure during /v1/messages becomes a non-success
+        // result; the caller is never asked to unwind a network blip.
+        var handler = new ScriptedAnthropicHandler(
+            modelsResponder: _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ModelsJson, Encoding.UTF8, "application/json"),
+            },
+            messagesResponder: _ => throw new HttpRequestException("transport blew up"));
+        var runner = BuildRunner(handler);
+
+        var result = await runner.RunTextOnlyAsync(
+            "hi", ApiKeyCredential(), modelId: "claude-opus-4-7");
+        Assert.False(result.Success);
+        Assert.Equal("Claude text-only call failed", result.Summary);
+        Assert.Contains("transport blew up", result.Error);
+    }
+
     // ── Live opt-in (compiles unconditionally; runs only with the env flag) ───
 
     /// <summary>
@@ -439,6 +528,61 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
         IReadOnlyDictionary<string, string> Headers,
         string? ContentType,
         string? Body);
+
+    /// <summary>
+    /// Yields control via <see cref="Task.Delay(TimeSpan, CancellationToken)"/>
+    /// so an already-cancelled token surfaces an
+    /// <see cref="OperationCanceledException"/> from inside
+    /// <c>SendAsync</c> — exactly the shape <c>HttpClient.SendAsync</c>
+    /// produces under real cancellation.
+    /// </summary>
+    private sealed class CancellingHandler : HttpMessageHandler
+    {
+        private readonly CancellationToken _externalCt;
+
+        public CancellingHandler(CancellationToken externalCt) { _externalCt = externalCt; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(_externalCt, cancellationToken);
+            await Task.Delay(TimeSpan.FromSeconds(30), linked.Token);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    /// <summary>
+    /// Per-endpoint responder; the callback may throw to simulate a transport
+    /// fault (used to exercise the runner's general-exception handlers).
+    /// </summary>
+    private sealed class ScriptedAnthropicHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _modelsResponder;
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _messagesResponder;
+
+        public ScriptedAnthropicHandler(
+            Func<HttpRequestMessage, HttpResponseMessage> modelsResponder,
+            Func<HttpRequestMessage, HttpResponseMessage> messagesResponder)
+        {
+            _modelsResponder = modelsResponder;
+            _messagesResponder = messagesResponder;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var url = request.RequestUri?.ToString() ?? string.Empty;
+            return Task.FromResult(url switch
+            {
+                ClaudeAgentRunner.ModelsEndpoint => _modelsResponder(request),
+                ClaudeAgentRunner.MessagesEndpoint => _messagesResponder(request),
+                _ => new HttpResponseMessage(HttpStatusCode.NotFound)
+                {
+                    Content = new StringContent($"unhandled url: {url}", Encoding.UTF8, "application/json"),
+                },
+            });
+        }
+    }
 }
 
 /// <summary>
