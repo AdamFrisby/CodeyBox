@@ -327,7 +327,14 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!_promptPreprocessors.HasPreprocessors)
             return Task.FromResult(prompt);
 
-        var ctx = new PromptContext(itemId, agentKind, phase, iteration, project, sandbox);
+        // Every pipeline-phase agent in this file runs against the
+        // SandboxConventions.WorkDir clone (work, rework, check-and-act,
+        // post-act-recheck, merge, conflict-rework, merge-security-review),
+        // so we pass that as the preprocessor's working directory. The
+        // deep-audit path uses /work/repo and goes through the
+        // wrapper-based plumbing in PromptPreprocessingAgentRunner.RunAsync,
+        // which forwards the runner's actual workingDirectory.
+        var ctx = new PromptContext(itemId, agentKind, phase, iteration, project, sandbox, SandboxConventions.WorkDir);
         return _promptPreprocessors.ProcessAsync(ctx, prompt, ct);
     }
 

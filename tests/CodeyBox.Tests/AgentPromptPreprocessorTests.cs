@@ -83,6 +83,32 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task ProjectRulesPreprocessor_ReadsRulesUnderPromptContextWorkingDirectory()
+    {
+        // Regression: the preprocessor used to hardcode `/work` as the
+        // sandbox working directory, so the deep-audit path (which runs the
+        // agent against `/work/repo`) silently failed to inject AGENTS.md.
+        // Verify the SandboxExec.WorkingDirectory now matches whatever
+        // PromptContext.WorkingDirectory the wrapper supplies.
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = "deep-audit rule\n",
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(sandbox, workingDirectory: "/work/repo"),
+            "deep-audit prompt");
+
+        Assert.Contains("deep-audit rule", result);
+        Assert.Equal("/work/repo", Assert.Single(sandbox.ExecWorkingDirectories));
+    }
+
+    [Fact]
     public async Task ProjectRulesPreprocessor_MissingOrInvalidPathLeavesPromptUnchanged()
     {
         var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
@@ -136,6 +162,38 @@ public sealed class AgentPromptPreprocessorTests
 
         Assert.Equal(phases, recorder.Contexts.Select(ctx => ctx.Phase).ToArray());
         Assert.Equal(["prompt-0|processed", "prompt-1|processed", "prompt-2|processed", "prompt-3|processed", "prompt-4|processed"], inner.RunPrompts);
+    }
+
+    [Fact]
+    public async Task PromptPreprocessingAgentRunner_ForwardsWorkingDirectoryFromRunAsyncIntoContext()
+    {
+        // Regression: a previous version of PromptContext omitted the
+        // working directory and ProjectRulesPromptPreprocessor hardcoded
+        // /work, so the deep-audit path (which runs the agent against
+        // /work/repo) silently dropped the AGENTS.md injection. The wrapper
+        // must surface the caller's workingDirectory through PromptContext.
+        var recorder = new RecordingPreprocessor();
+        var chain = new AgentPromptPreprocessorChain([recorder]);
+        var inner = new RecordingTextOnlyRunner();
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>());
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
+            inner,
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Audit,
+            1,
+            NewProject());
+
+        await wrapper.RunAsync(sandbox, "/work/repo", "deep-audit prompt", credential: null);
+        var textOnly = Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        await textOnly.RunTextOnlyAsync(
+            "merge-security prompt", credential: null, sandbox: sandbox, workingDirectory: "/work");
+        await textOnly.RunTextOnlyAsync(
+            "fallback prompt", credential: null, sandbox: sandbox, workingDirectory: null);
+
+        Assert.Equal(
+            ["/work/repo", "/work", "/work"],
+            recorder.Contexts.Select(ctx => ctx.WorkingDirectory).ToArray());
     }
 
     [Fact]
@@ -420,14 +478,15 @@ public sealed class AgentPromptPreprocessorTests
         Assert.Equal("prompt|built-in-first|plugin-early|plugin-late|built-in-last", result);
     }
 
-    private static PromptContext NewContext(ISandbox? sandbox = null) =>
+    private static PromptContext NewContext(ISandbox? sandbox = null, string workingDirectory = "/work") =>
         new(
             WorkItemId.New(),
             AgentKind.Codex,
             AgentPromptPhase.Work,
             1,
             NewProject(),
-            sandbox ?? new FileBackedSandbox(new Dictionary<string, string>()));
+            sandbox ?? new FileBackedSandbox(new Dictionary<string, string>()),
+            workingDirectory);
 
     private static Project NewProject() => new()
     {
@@ -607,11 +666,14 @@ public sealed class AgentPromptPreprocessorTests
 
         public string Id => "sandbox-test";
 
+        public List<string?> ExecWorkingDirectories { get; } = [];
+
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             _ = ct;
+            ExecWorkingDirectories.Add(exec.WorkingDirectory);
             string? path = null;
             int? byteLimit = null;
             if (exec.Argv is ["cat", "--", var catPath])

@@ -28,6 +28,15 @@ public static class AgentPromptPreprocessorOrder
 
 /// <summary>
 /// Context supplied to prompt preprocessors before an agent invocation.
+/// <para>
+/// <see cref="WorkingDirectory"/> is the absolute sandbox path the agent's
+/// <c>RunAsync</c> will execute against — for pipeline phases this is the
+/// repo working tree (e.g. <c>/work</c>); the deep-audit path clones the
+/// repo into a subdirectory and runs the auditor there (e.g. <c>/work/repo</c>),
+/// so preprocessors that read repo files (such as <c>AGENTS.md</c>) MUST
+/// resolve paths relative to this directory rather than hardcoding the
+/// pipeline default.
+/// </para>
 /// </summary>
 public sealed record PromptContext(
     WorkItemId ItemId,
@@ -35,7 +44,8 @@ public sealed record PromptContext(
     AgentPromptPhase Phase,
     int Iteration,
     Project Project,
-    ISandbox Sandbox);
+    ISandbox Sandbox,
+    string WorkingDirectory);
 
 /// <summary>
 /// Transforms an agent prompt immediately before CodeyBox invokes an agent.

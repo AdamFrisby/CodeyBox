@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Orchestrator;
 
@@ -70,7 +71,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         bool captureStructuredStream = false)
     {
         var processed = await Chain.ProcessAsync(
-            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox),
+            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, workingDirectory),
             prompt,
             ct).ConfigureAwait(false);
 
@@ -114,8 +115,16 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         {
             if (sandbox is not null)
             {
+                // RunTextOnlyAsync's workingDirectory is nullable on the
+                // interface; preprocessors that read repo files need a real
+                // path, so fall back to the sandbox convention when callers
+                // pass null. Real text-only callers in the orchestrator
+                // (e.g. RunMergeSecurityReviewAsync) already pass /work.
+                var resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
+                    ? SandboxConventions.WorkDir
+                    : workingDirectory;
                 prompt = await Chain.ProcessAsync(
-                    new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox),
+                    new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory),
                     prompt,
                     ct).ConfigureAwait(false);
             }

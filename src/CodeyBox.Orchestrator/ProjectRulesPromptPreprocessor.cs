@@ -41,13 +41,22 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
             return prompt;
         }
 
+        // Resolve the rules file relative to the agent's working directory in
+        // the sandbox, not a hardcoded `/work`. The deep-audit path clones the
+        // repo into `/work/repo`, so hardcoding `/work` made `head` exit
+        // non-zero and silently dropped the rules block for every deep-audit
+        // invocation.
+        //
         // head -c bounds the read at the sandbox level: even if a work agent
         // writes a multi-GB AGENTS.md, the orchestrator only buffers ~256 KiB
         // (+ one byte) into stdout, preventing a DoS via oversized rules file.
+        var workingDir = string.IsNullOrWhiteSpace(ctx.WorkingDirectory)
+            ? SandboxConventions.WorkDir
+            : ctx.WorkingDirectory;
         var read = await ctx.Sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["head", "-c", (MaxRulesBytes + 1).ToString(CultureInfo.InvariantCulture), "--", path],
-            WorkingDirectory = SandboxConventions.WorkDir,
+            WorkingDirectory = workingDir,
         }, ct).ConfigureAwait(false);
 
         if (!read.Success)
