@@ -13,23 +13,23 @@ internal static class DotnetTestOutputParser
     private static readonly Regex FailedTestHeaderRegex = new(
         @"^\s*Failed\s+(?<name>.+?)\s+\[(?<duration>[^\]\r\n]+)\]\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
-        TimeSpan.FromSeconds(1));
+        TimeSpan.FromSeconds(5));
     private static readonly Regex PostFailureBodyRegex = new(
         @"^\s*(?:Failed!|Passed!|Skipped!|Test Run |Total tests:|Results File:)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
-        TimeSpan.FromSeconds(1));
+        TimeSpan.FromSeconds(5));
     private static readonly Regex CommandFailureSignalRegex = new(
         @"^\s*(?:.+(?:\)|:)\s*)?error\s+(?:CS|MSB|NETSDK|NU)\d+\b|^\s*Build FAILED\.|^\s*The argument .+ is invalid\.|^\s*The active test run was aborted\b|^\s*Testhost process\b.*\b(?:crashed|failed|error)\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline,
-        TimeSpan.FromSeconds(1));
+        TimeSpan.FromSeconds(5));
     private static readonly Regex UnrunnableFailureSignalRegex = new(
         @"\b(?:Microsoft\.Playwright\.PlaywrightException|Browser executable (?:was )?not found|Playwright\b.*\b(?:install|driver|browser)|unable to launch|failed to launch|connection refused|no connection could be made|ECONNREFUSED|missing (?:host|dependency|dependencies)|required (?:host|dependency|dependencies)\b.*\bnot (?:found|available))\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
-        TimeSpan.FromSeconds(1));
+        TimeSpan.FromSeconds(5));
     private static readonly Regex AssertionFailureSignalRegex = new(
         @"\b(?:Assert\.[A-Za-z0-9_]+\(\) Failure|Assert\.[A-Za-z0-9_]+ failed|Xunit\.Sdk\.[A-Za-z0-9_]+Exception|NUnit\.Framework\.AssertionException|Microsoft\.VisualStudio\.TestTools\.UnitTesting\.AssertFailedException|FluentAssertions\.Execution\.AssertionFailedException|Shouldly\.ShouldAssertException)\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
-        TimeSpan.FromSeconds(1));
+        TimeSpan.FromSeconds(5));
     private static readonly Regex DurationRegex = new(
         @"^(?<value>\d+(?:[.]\d+)?)\s*(?<unit>ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase,
