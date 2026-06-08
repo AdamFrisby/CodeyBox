@@ -30,6 +30,10 @@ internal static class DotnetTestOutputParser
         @"\b(?:Assert\.[A-Za-z0-9_]+\(\) Failure|Assert\.[A-Za-z0-9_]+ failed|Xunit\.Sdk\.[A-Za-z0-9_]+Exception|NUnit\.Framework\.AssertionException|Microsoft\.VisualStudio\.TestTools\.UnitTesting\.AssertFailedException|FluentAssertions\.Execution\.AssertionFailedException|Shouldly\.ShouldAssertException)\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline,
         TimeSpan.FromSeconds(1));
+    private static readonly Regex DurationRegex = new(
+        @"^(?<value>\d+(?:[.]\d+)?)\s*(?<unit>ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(5));
 
     public static DotnetTestOutputParseResult Parse(string auditorName, string output)
     {
@@ -212,11 +216,7 @@ internal static class DotnetTestOutputParser
         if (text.StartsWith('<'))
             text = text[1..].TrimStart();
 
-        var match = Regex.Match(
-            text,
-            @"^(?<value>\d+(?:[.]\d+)?)\s*(?<unit>ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes)$",
-            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase,
-            TimeSpan.FromSeconds(1));
+        var match = DurationRegex.Match(text);
         if (match.Success
             && double.TryParse(match.Groups["value"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
         {
