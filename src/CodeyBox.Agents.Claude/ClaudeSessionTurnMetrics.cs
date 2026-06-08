@@ -12,15 +12,24 @@ namespace CodeyBox.Agents.Claude;
 /// <c>CachedInputTokens</c> is the cache_read portion (the cheap one);
 /// <c>FreshInputTokens</c> is the derived non-cached remainder, which is what
 /// the operator wants to see drop turn-over-turn as the session warms.</para>
+///
+/// <para><see cref="Transport"/> distinguishes the command-delivery + billing
+/// channel that produced this turn (<c>"print"</c> vs <c>"acp"</c>), so
+/// dashboards can confirm Claude work is actually being routed off the
+/// <c>--print</c> metered pool when the operator has flipped
+/// <see cref="ClaudeSessionWorkerOptions.Transport"/> to
+/// <see cref="ClaudeSessionTransport.Acp"/>. Empty string means the
+/// transport tag was not recorded (legacy callers).</para>
 /// </summary>
-/// <param name="CliSessionId">Claude CLI session id used by <c>--resume</c>.</param>
+/// <param name="CliSessionId">Runner-assigned session id used by the transport's continuation flag (Claude CLI id for print; ACP session id for acp).</param>
 /// <param name="TurnIndex">Zero-based turn index within this session.</param>
 /// <param name="InputTokens">Total prompt-input tokens reported by the CLI.</param>
 /// <param name="CachedInputTokens">Prompt-input tokens served from the provider cache (cheap).</param>
 /// <param name="FreshInputTokens">Prompt-input tokens that were not cached (billed at fresh-input rates).</param>
 /// <param name="OutputTokens">Output tokens reported by the CLI.</param>
 /// <param name="ModelId">Model id reported by the CLI assistant event, if any.</param>
-/// <param name="UsedResume">True when this turn invoked <c>claude --resume</c> rather than a fresh session start.</param>
+/// <param name="UsedResume">True when this turn passed a continuation id (CLI <c>--resume</c> for print, ACP <c>session/load</c> for acp).</param>
+/// <param name="Transport">Transport tag — <c>"print"</c>, <c>"acp"</c>, or empty for legacy callers.</param>
 public sealed record ClaudeSessionTurnMetrics(
     string CliSessionId,
     int TurnIndex,
@@ -29,7 +38,8 @@ public sealed record ClaudeSessionTurnMetrics(
     int FreshInputTokens,
     int OutputTokens,
     string? ModelId,
-    bool UsedResume);
+    bool UsedResume,
+    string Transport = "");
 
 /// <summary>
 /// Receives <see cref="ClaudeSessionTurnMetrics"/> snapshots so the host can

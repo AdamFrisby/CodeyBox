@@ -1107,6 +1107,22 @@ public static class AuditLog
                 "the run will continue but thinking-block 400s may follow. stderr={Stderr}",
                 summary, stderr ?? "none");
 
+    /// <summary>
+    /// Emitted by <c>CodeyBox.Agents.Claude.ClaudeSessionWorker</c> when it
+    /// degrades the active transport for a session from ACP to print at
+    /// runtime — either because the ACP transport could not open at session
+    /// start or because a turn surfaced an
+    /// <c>AcpTransportUnavailableException</c>. The work item is NOT
+    /// stranded — the next turn proceeds on print — but the operator should
+    /// investigate the ACP path so the metered <c>-p</c> pool stops absorbing
+    /// the traffic.
+    /// </summary>
+    public static void ClaudeAcpTransportDegraded(string sessionId, string reason) =>
+        Audit("agent.claude_acp_transport_degraded")
+            .Warning(
+                "Claude ACP transport degraded to print for session {SessionId}: {Reason}",
+                sessionId, reason);
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
