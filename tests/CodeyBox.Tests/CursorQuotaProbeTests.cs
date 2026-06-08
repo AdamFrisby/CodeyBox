@@ -8,6 +8,9 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Tests for <see cref="CursorQuotaProbe"/> using a fake HTTP message handler.
+/// Shape source: live <c>DashboardService.GetCurrentPeriodUsage</c> capture
+/// 2026-06-04 — percent-used fields are the headline, NOT a non-existent
+/// <c>planUsage.remaining</c>. See <see cref="CursorQuotaProbe"/> remarks.
 /// </summary>
 public sealed class CursorQuotaProbeTests
 {
@@ -23,12 +26,15 @@ public sealed class CursorQuotaProbeTests
     {
       "billingCycleEnd": "1782444007000",
       "planUsage": {
-        "remaining": 70,
-        "limit": 100,
+        "totalSpend": 600,
+        "includedSpend": 600,
+        "limit": 2000,
+        "remainingBonus": true,
         "autoPercentUsed": 25,
         "apiPercentUsed": 10,
         "totalPercentUsed": 30
       },
+      "enabled": true,
       "autoBucketModels": ["composer-2.5"]
     }
     """;
@@ -126,30 +132,195 @@ public sealed class CursorQuotaProbeTests
     }
 
     [Fact]
-    public void ParseResponse_FullyUsed_Returns0Pct()
+    public void ParseResponse_FullyUsedAllDimensions_Returns0Pct()
     {
-        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"remaining":0,"limit":100}}""");
+        var snap = CursorQuotaProbe.ParseResponse(
+            """{"planUsage":{"totalPercentUsed":100,"autoPercentUsed":100,"apiPercentUsed":100}}""");
         Assert.Equal(0.0, snap.AvailablePct);
     }
 
     [Fact]
-    public void ParseResponse_PartiallyUsed_ReturnsRemainingPct()
+    public void ParseResponse_PartiallyUsed_ReturnsMostConstrainedDimension()
     {
-        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"remaining":93.27,"limit":100}}""");
-        Assert.Equal(93.27, snap.AvailablePct, precision: 2);
+        // max(7,12,3) = 12 -> 88% available.
+        var snap = CursorQuotaProbe.ParseResponse(
+            """{"planUsage":{"totalPercentUsed":7,"autoPercentUsed":12,"apiPercentUsed":3}}""");
+        Assert.Equal(88.0, snap.AvailablePct, precision: 5);
     }
 
     [Fact]
     public void ParseResponse_NeverNegative_WhenOverQuota()
     {
-        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"remaining":-50,"limit":100}}""");
+        // Stray over-100 percent (e.g. small floating-point overshoot from
+        // includedSpend == limit + bonus) clamps to 0% rather than going negative.
+        var snap = CursorQuotaProbe.ParseResponse(
+            """{"planUsage":{"totalPercentUsed":150,"autoPercentUsed":150,"apiPercentUsed":150}}""");
         Assert.Equal(0.0, snap.AvailablePct);
+    }
+
+    [Fact]
+    public void ParseResponse_OnlyTotalPercentUsed_IsSufficient()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"totalPercentUsed":40}}""");
+        Assert.Equal(60.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_OnlyAutoPercentUsed_IsSufficient()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"autoPercentUsed":30}}""");
+        Assert.Equal(70.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_OnlyApiPercentUsed_IsSufficient()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""{"planUsage":{"apiPercentUsed":25}}""");
+        Assert.Equal(75.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_PlanUsageAbsent_ReturnsUnknown()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""{"billingCycleEnd":"1782444007000"}""");
+        Assert.Equal(-1, snap.AvailablePct);
+        Assert.Equal("unexpected response shape", snap.Notes);
+    }
+
+    [Fact]
+    public void ParseResponse_PlanUsagePresentWithoutPercentFields_ReturnsUnknown()
+    {
+        var snap = CursorQuotaProbe.ParseResponse(
+            """{"planUsage":{"totalSpend":100,"limit":2000}}""");
+        Assert.Equal(-1, snap.AvailablePct);
+        Assert.Equal("unexpected response shape", snap.Notes);
+    }
+
+    [Fact]
+    public void ParseResponse_DisplayMessageOutOfUsage_Forces0Pct_EvenIfPercentMissing()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalPercentUsed": 80,
+            "remainingBonus": true
+          },
+          "displayMessage": "You've hit your usage limit"
+        }
+        """);
+        Assert.Equal(0.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_DisplayMessageOutOfUsage_MatchesCaseInsensitively()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": { "totalPercentUsed": 50 },
+          "displayMessage": "YOU'VE HIT YOUR INCLUDED USAGE LIMIT"
+        }
+        """);
+        Assert.Equal(0.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_NonOutOfUsageDisplayMessage_DoesNotForce0Pct()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": { "totalPercentUsed": 40 },
+          "displayMessage": "You've used 40% of your included usage"
+        }
+        """);
+        Assert.Equal(60.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_BonusExhaustedAndSpendOverLimit_Forces0Pct()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalSpend": 19903,
+            "limit": 2000,
+            "remainingBonus": false,
+            "totalPercentUsed": 90
+          }
+        }
+        """);
+        Assert.Equal(0.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_BonusExhaustedButSpendBelowLimit_DoesNotForce0Pct()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalSpend": 800,
+            "limit": 2000,
+            "remainingBonus": false,
+            "totalPercentUsed": 30
+          }
+        }
+        """);
+        Assert.Equal(70.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_EnabledFalse_Forces0Pct()
+    {
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": { "totalPercentUsed": 20 },
+          "enabled": false
+        }
+        """);
+        Assert.Equal(0.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_StringNumberPercents_ParsedDefensively()
+    {
+        // Defensive parsing: even if upstream emits a percent as a numeric string,
+        // we should still read it rather than punting to Unknown.
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalPercentUsed": "55",
+            "autoPercentUsed": "75",
+            "apiPercentUsed": "10"
+          }
+        }
+        """);
+        Assert.Equal(25.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_MalformedPercentFields_DoNotThrow()
+    {
+        // Garbage in -> Unknown rather than an unhandled exception leaking out
+        // of ParseResponse and being swallowed by FetchAsync's catch-all.
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalPercentUsed": "not-a-number",
+            "autoPercentUsed": null,
+            "apiPercentUsed": []
+          }
+        }
+        """);
+        Assert.Equal(-1, snap.AvailablePct);
+        Assert.Equal("unexpected response shape", snap.Notes);
     }
 
     [Fact]
     public async Task PartiallyUsed_WithoutPerModelBuckets_ConfiguredModel_ReturnsUnknown()
     {
-        var handler = UsageHandler("""{"planUsage":{"remaining":93.27,"limit":100}}""");
+        // Only totalPercentUsed -> overall is computed, but no autoPercentUsed
+        // means no perModel entries; the configured ModelId falls through to
+        // the unknown path so the router applies its unknown policy.
+        var handler = UsageHandler("""{"planUsage":{"totalPercentUsed":7}}""");
         var probe = BuildProbe(handler);
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
         Assert.Equal(-1, snap.AvailablePct);
@@ -160,11 +331,11 @@ public sealed class CursorQuotaProbeTests
     [Fact]
     public async Task PartiallyUsed_WithoutPerModelBuckets_NoModelId_PreservesOverall()
     {
-        var handler = UsageHandler("""{"planUsage":{"remaining":93.27,"limit":100}}""");
+        var handler = UsageHandler("""{"planUsage":{"totalPercentUsed":7}}""");
         var probe = BuildProbe(handler);
         var member = AnyMember with { ModelId = null };
         var snap = await probe.GetAvailabilityAsync(member, CancellationToken.None);
-        Assert.Equal(93.27, snap.AvailablePct, precision: 2);
+        Assert.Equal(93.0, snap.AvailablePct, precision: 5);
         Assert.Null(snap.Notes);
     }
 
@@ -227,7 +398,7 @@ public sealed class CursorQuotaProbeTests
     [Fact]
     public async Task ResponseTooLarge_ReturnsUnknown()
     {
-        var oversized = "{\"planUsage\":{\"remaining\":0,\"limit\":100}}" + new string(' ', 70 * 1024);
+        var oversized = "{\"planUsage\":{\"totalPercentUsed\":0}}" + new string(' ', 70 * 1024);
         var probe = BuildProbe(UsageHandler(oversized));
         var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
         Assert.True(snap.AvailablePct < 0);
@@ -237,11 +408,12 @@ public sealed class CursorQuotaProbeTests
     [Fact]
     public void ParseResponse_CapsPerModelByOverall()
     {
+        // total=90 -> overall 10% available. auto=25 -> bucket 75% available,
+        // but capped to overall 10%.
         var snap = CursorQuotaProbe.ParseResponse("""
         {
           "planUsage": {
-            "remaining": 10,
-            "limit": 100,
+            "totalPercentUsed": 90,
             "autoPercentUsed": 25,
             "apiPercentUsed": 10
           },
@@ -273,7 +445,7 @@ public sealed class CursorQuotaProbeTests
     {
         var handler = UsageHandler("""
         {
-          "planUsage": { "remaining": 90, "limit": 100, "autoPercentUsed": 10, "apiPercentUsed": 0 },
+          "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2"]
         }
         """);
@@ -288,6 +460,7 @@ public sealed class CursorQuotaProbeTests
     public void ParseResponse_PopulatesAutoBucketModels()
     {
         var snap = CursorQuotaProbe.ParseResponse(DefaultUsageBody);
+        // max(total=30, auto=25, api=10) = 30 -> 70% available.
         Assert.Equal(70, snap.AvailablePct, precision: 5);
         Assert.Equal(70, snap.PerModel["composer-2.5"].AvailablePct, precision: 5);
         Assert.False(snap.PerModel.ContainsKey("cursor-auto"));
@@ -300,15 +473,35 @@ public sealed class CursorQuotaProbeTests
         var snap = CursorQuotaProbe.ParseResponse("""
         {
           "planUsage": {
-            "remaining": 50,
-            "limit": 100,
+            "totalPercentUsed": 50,
             "autoPercentUsed": 20
           }
         }
         """);
+        // max(total=50, auto=20) = 50 -> 50% available.
         Assert.Equal(50, snap.AvailablePct, precision: 5);
         Assert.True(snap.PerModel.ContainsKey(CursorQuotaProbe.DefaultRoutedModelId));
         Assert.Equal(50, snap.PerModel[CursorQuotaProbe.DefaultRoutedModelId].AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void RedactAndCap_StripsTokenLikeFieldValues()
+    {
+        var input = """{"accessToken":"abc.def","sessionId":"xyz","totalPercentUsed":50}""";
+        var redacted = CursorQuotaProbe.RedactAndCap(input, 1024);
+        Assert.DoesNotContain("abc.def", redacted);
+        Assert.DoesNotContain("xyz", redacted);
+        Assert.Contains("<redacted>", redacted);
+        Assert.Contains("50", redacted);
+    }
+
+    [Fact]
+    public void RedactAndCap_TruncatesOversizedBodies()
+    {
+        var body = new string('x', 5000);
+        var redacted = CursorQuotaProbe.RedactAndCap(body, 100);
+        Assert.True(redacted.Length <= 100 + 16);
+        Assert.EndsWith("[truncated]", redacted);
     }
 
     [Fact]

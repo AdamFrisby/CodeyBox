@@ -189,13 +189,14 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
     {
-        // remaining/limit drive the headline (see CursorQuotaProbe HEADLINE-METRIC):
-        // 1800/2000 -> 90% available. autoBucketModels populates perModel with
-        // composer-2, so the configured ModelId "composer-99-unknown" doesn't
-        // match and ApplyMemberGate emits the diagnostic Notes string.
+        // percent-used dimensions drive the headline (see CursorQuotaProbe
+        // HEADLINE-METRIC): max(10,10,0)=10 -> 90% available. autoBucketModels
+        // populates perModel with composer-2, so the configured ModelId
+        // "composer-99-unknown" doesn't match and ApplyMemberGate emits the
+        // diagnostic Notes string.
         var body = """
         {
-          "planUsage": { "remaining": 1800, "limit": 2000, "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
+          "planUsage": { "totalPercentUsed": 10, "autoPercentUsed": 10, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2"]
         }
         """;
@@ -218,13 +219,14 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_ConfiguredModelPresentInPerModel_UsesParsedQuota()
     {
-        // 1400/2000 -> 70% overall available. autoBucketModels lists composer-2.5
-        // (DefaultRoutedModelId), and autoPercentUsed=25 -> auto bucket at 75%
-        // which is then capped by overall to 70%. Configured ModelId matches a
-        // populated perModel key, so ApplyMemberGate leaves the snapshot intact.
+        // max(total=30, auto=25, api=0) = 30 -> 70% overall available.
+        // autoBucketModels lists composer-2.5 (DefaultRoutedModelId), and
+        // autoPercentUsed=25 -> auto bucket at 75% which is then capped by
+        // overall to 70%. Configured ModelId matches a populated perModel key,
+        // so ApplyMemberGate leaves the snapshot intact.
         var body = """
         {
-          "planUsage": { "remaining": 1400, "limit": 2000, "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
+          "planUsage": { "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
           "autoBucketModels": ["composer-2.5"]
         }
         """;
@@ -247,7 +249,7 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     [Fact]
     public async Task Cursor_NoConfiguredModelId_PreservesOverallAvailability()
     {
-        var body = """{"planUsage":{"remaining":1400,"limit":2000,"totalPercentUsed":30}}""";
+        var body = """{"planUsage":{"totalPercentUsed":30}}""";
         var probe = BuildCursorProbe(body);
 
         var member = new AgentMembership
