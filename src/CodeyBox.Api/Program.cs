@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
@@ -492,6 +493,59 @@ builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
 builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
 builder.Services.AddSingleton<AgentPromptPreprocessorChain>();
+
+// ClaudeSessionWorker — resumable Claude runner. Registered alongside (NOT
+// instead of) the one-shot ClaudeAgentRunner so the default dispatch path is
+// unchanged; config-gated opt-in callers resolve the concrete type to drive
+// multi-turn sessions across a stop/resume-able VM. The options snapshot is a
+// singleton so a hot reload can flip Enabled mid-process without restart.
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.ClaudeSession;
+    return new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions
+    {
+        Enabled = opts.Enabled,
+        EmitTurnMetrics = opts.EmitTurnMetrics,
+    };
+});
+// Default metrics sink is the no-op; operators wire a logging/metrics-backed
+// sink by registering their own IClaudeSessionMetricsSink before this line.
+builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(
+    CodeyBox.Agents.Claude.NullClaudeSessionMetricsSink.Instance);
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
+{
+    var runner = sp.GetServices<IAgentRunner>()
+        .OfType<ClaudeAgentRunner>()
+        .First();
+
+    // Resume hook: when the registered provider exposes the suspend/resume
+    // contract (multipass; not process / bubblewrap), bring the VM back up by
+    // delegating to its ResumeSandboxAsync. The AgentSessionSandboxRef.Id IS
+    // the multipass VM name (default sandboxRefFactory derives it from
+    // ISandbox.Id, which MultipassSandbox sets to the VM name). Non-suspending
+    // providers leave the hook unwired so a stop/resume cycle isn't attempted
+    // against them — ResumeSessionAsync then short-circuits the resume step.
+    var provider = sp.GetService<ISandboxProvider>();
+    Func<AgentSessionSandboxRef, CancellationToken, Task>? resumeHook = null;
+    if (provider is ISuspendingSandboxProvider suspending)
+        resumeHook = (sandboxRef, ct) => suspending.ResumeSandboxAsync(sandboxRef.Id, ct);
+
+    // sandboxReattacher (revive an ISandbox bound to an existing VM after an
+    // orchestrator restart) is intentionally null in this rollout step. The
+    // dispatch wiring that persists / replays AgentSessionHandle across a
+    // restart lands in item 3 of the rollout; until then, ResolveStateAsync
+    // throws InvalidOperationException with a clear message rather than
+    // silently failing. The worker is OFF by default, so this gap is only
+    // reachable for an operator who has opted in via CodeyBox:ClaudeSession:Enabled.
+    return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
+        runner,
+        sandboxReattacher: null,
+        sandboxResumeHook: resumeHook,
+        credentialProvider: sp.GetService<ICredentialProvider>(),
+        sandboxRefFactory: null,
+        metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
+        options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>());
+});
 
 // Plugin discovery result captured before builder.Build() so the credential
 // provider factory below can reference the list directly without any async
@@ -3215,6 +3269,16 @@ namespace CodeyBox.Api
         /// ships a fix.
         /// </summary>
         public ClaudeThinkingBlockSanitizerOptions ClaudeThinkingBlockSanitizer { get; set; } = new();
+
+        /// <summary>
+        /// Claude resumable-session worker configuration. Bound from
+        /// <c>CodeyBox:ClaudeSession</c>. The session worker is OFF by default;
+        /// every Claude dispatch keeps using the existing one-shot
+        /// <c>ClaudeAgentRunner</c> until an operator opts in here. See
+        /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions"/> for
+        /// behaviour.
+        /// </summary>
+        public ClaudeSessionOptions ClaudeSession { get; set; } = new();
     }
 
     /// <summary>
@@ -3268,6 +3332,32 @@ namespace CodeyBox.Api
         /// Anthropic ships a fix.
         /// </summary>
         public bool Enabled { get; set; } = true;
+    }
+
+    /// <summary>
+    /// Claude resumable-session worker configuration. Bound from
+    /// <c>CodeyBox:ClaudeSession</c>. See
+    /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionWorker"/>.
+    /// </summary>
+    public sealed class ClaudeSessionOptions
+    {
+        /// <summary>
+        /// Master switch. Default <c>false</c> — Claude dispatches keep using
+        /// the legacy one-shot runner unless an operator opts in here. The
+        /// per-agent-class-member and per-project opt-in switches land in the
+        /// next rollout step (item 3); once those ship the global flag will
+        /// compose with them to route specific work items to the session
+        /// worker.
+        /// </summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>
+        /// When true (default), each <c>SendTurnAsync</c> emits a
+        /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionTurnMetrics"/>
+        /// snapshot to the registered metrics sink so the cache_read share is
+        /// observable. Disable for A/B comparisons against the one-shot path.
+        /// </summary>
+        public bool EmitTurnMetrics { get; set; } = true;
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig

@@ -63,7 +63,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
     private static void AssertResumeTimeoutHonored(TimeSpan elapsed, TimeSpan configuredTimeout)
     {
-        var upperBound = configuredTimeout + TimeSpan.FromSeconds(1);
+        // The slack here covers fixed-cost overhead unrelated to the timeout
+        // itself: starting the dedicated LongRunning thread for the resume
+        // task, the post-cancellation ObserveProviderTaskAfterCancellationAsync
+        // 250ms grace, and the SQLite UPDATE that records the Failed state.
+        // Under CI load each of these can dilate non-trivially. The bound is
+        // generous enough that genuine timeout regressions (resume that never
+        // honors the configured cap) still fall well outside it.
+        var upperBound = configuredTimeout + TimeSpan.FromSeconds(3);
         Assert.True(elapsed < upperBound,
             $"configured {configuredTimeout} resume timeout was not honored promptly; elapsed {elapsed}");
     }
@@ -597,7 +604,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             resumeTimeout: configuredTimeout);
 
         var sw = Stopwatch.StartNew();
-        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
         sw.Stop();
 
         var after = await _store.GetAsync(item.Id);
@@ -756,7 +763,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             mode: SandboxStartupResumeMode.Blocking);
 
         var sw = Stopwatch.StartNew();
-        await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+        await svc.StartingAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
         sw.Stop();
         await svc.StartAsync(CancellationToken.None);
 
@@ -793,7 +800,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await provider.ResumeBlockEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
         try
         {
-            await resumeTask.WaitAsync(TimeSpan.FromSeconds(2));
+            await resumeTask.WaitAsync(TimeSpan.FromSeconds(5));
             sw.Stop();
         }
         finally

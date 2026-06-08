@@ -154,6 +154,78 @@ each turn. This has no prompt-cache or conversation-context benefit, but lets
 session-aware pipeline code treat non-session runners uniformly without
 changing existing one-shot behavior.
 
+### Claude session worker (`ClaudeSessionWorker`)
+
+`ClaudeSessionWorker` is the resumable counterpart to the default one-shot
+`ClaudeAgentRunner`. It keeps ONE logical Claude CLI session across turns
+using `claude --resume <session-id>` so the Anthropic server-side prompt
+cache and the on-disk conversation transcript both carry over from one turn
+to the next. The cache is server-side (~5min default TTL, 1h extended), so
+stopping the worker VM between turns does **not** lose it as long as the
+next turn lands inside the TTL; the session JSONL persists on the stopped
+VM's disk so conversation context is preserved regardless.
+
+The worker is OFF by default — the existing one-shot `ClaudeAgentRunner`
+remains the registered `IAgentRunner` for Claude until config opts an item
+in. Config keys (bound from `CodeyBox:ClaudeSession`):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `CodeyBox:ClaudeSession:Enabled` | `false` | Master switch. When false, Claude work items always use the one-shot path. |
+| `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Emit per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
+
+Lifecycle inside the worker:
+
+- `OpenSessionAsync` allocates local state; the Claude CLI session id is
+  captured from the first turn's `stream-json` `system/init` event.
+- `SendTurnAsync` runs with `claude --print --output-format stream-json --verbose`
+  (so the CLI session id and per-turn usage are captured). The first turn
+  runs fresh; subsequent turns add `--resume <session-id>`. The same
+  `ClaudeSessionSanitizer` the one-shot runner uses scrubs partial/unsigned
+  thinking blocks from the stored transcript before each resume, and a
+  thinking-block 400 triggers one sanitise-and-retry pass before surfacing
+  the failure.
+- `SuspendSessionAsync` calls `IPreemptibleSandbox.StopAndPreserveAsync`
+  on the sandbox (`multipass stop`, **not** `delete --purge`) so the VM's
+  disk — including `~/.claude/projects/<slug>/<session>.jsonl` — is
+  preserved.
+- `ResumeSessionAsync` calls the configured sandbox-resume hook to bring
+  the VM back. The hook is wired in production to
+  `ISuspendingSandboxProvider.ResumeSandboxAsync` (i.e. `multipass start`)
+  when the registered provider supports the suspend contract; non-suspending
+  providers (process / bubblewrap) leave it null. Any failure of the hook
+  flips the worker into fresh-one-shot mode for the remainder of the
+  session rather than stranding the work item.
+- `CloseSessionAsync` disposes the sandbox and ends the logical session.
+
+Restart recovery: `AgentSessionHandle` is safe to persist (no live objects,
+no credential material). `ClaudeSessionWorker.SnapshotPersistedHandle`
+returns a handle augmented with the captured CLI session id under
+`Metadata["claude.cliSessionId"]`, and a fallback flag under
+`Metadata["claude.fallbackToOneShot"]` once the worker has degraded to
+fresh-one-shot mode (so a restart inherits that degraded state instead of
+re-attempting the failed resume). Reviving the handle in a fresh process
+requires a sandbox-reattacher callback wired into the worker; the current
+rollout step (item 2 of 3) leaves the production reattacher unwired and
+the worker surfaces a clear `InvalidOperationException` on any reattach
+attempt. The dispatch wiring that persists and replays the handle across
+a restart lands in item 3.
+
+Per-turn metrics are emitted as `ClaudeSessionTurnMetrics` snapshots to the
+registered `IClaudeSessionMetricsSink`. Each snapshot carries the total
+input tokens, cached (cache_read) tokens, derived fresh-input tokens, output
+tokens, model id, and a `UsedResume` flag so the operator can confirm the
+turn actually ran with `--resume` and the cache is paying off. The default
+sink registration is `NullClaudeSessionMetricsSink`; hosts wire a logging /
+metrics-backed sink by registering their own `IClaudeSessionMetricsSink`
+before service-provider build.
+
+The fleet stays pinned to `claude-opus-4-7`; the session worker does not
+hot-swap models mid-session. Long resumable sessions are the exact trigger
+surface for the thinking-block immutability 400 cluster, so the sanitiser
+is wired in unconditionally (gated only by
+`CodeyBox:ClaudeThinkingBlockSanitizer:Enabled`).
+
 ## Per-agent quirks
 
 ### Claude Code
