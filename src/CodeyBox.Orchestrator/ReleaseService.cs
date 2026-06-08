@@ -695,7 +695,7 @@ public sealed class ReleaseService
         if (!_promptPreprocessors.HasPreprocessors)
             return runner;
 
-        return new PromptPreprocessingAgentRunner(
+        return PromptPreprocessingAgentRunner.Wrap(
             runner,
             _promptPreprocessors,
             itemId,

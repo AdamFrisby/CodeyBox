@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -40,9 +41,12 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
             return prompt;
         }
 
+        // head -c bounds the read at the sandbox level: even if a work agent
+        // writes a multi-GB AGENTS.md, the orchestrator only buffers ~256 KiB
+        // (+ one byte) into stdout, preventing a DoS via oversized rules file.
         var read = await ctx.Sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["cat", "--", path],
+            Argv = ["head", "-c", (MaxRulesBytes + 1).ToString(CultureInfo.InvariantCulture), "--", path],
             WorkingDirectory = SandboxConventions.WorkDir,
         }, ct).ConfigureAwait(false);
 
@@ -101,6 +105,12 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
         while (maxChars < text.Length && Encoding.UTF8.GetByteCount(text.AsSpan(0, maxChars + 1)) <= MaxRulesBytes)
             maxChars++;
 
-        return text[..maxChars] + "\n\n[Project rules truncated by CodeyBox at 256 KiB.]";
+        // Never split a UTF-16 surrogate pair: if the cut lands between a high
+        // and low surrogate, step back one char so the truncated prefix is a
+        // valid UTF-16 string and downstream re-encoding cannot emit U+FFFD.
+        if (maxChars > 0 && maxChars < text.Length && char.IsHighSurrogate(text[maxChars - 1]))
+            maxChars--;
+
+        return text[..maxChars] + $"\n\n[Project rules truncated by CodeyBox at {MaxRulesBytes / 1024} KiB.]";
     }
 }

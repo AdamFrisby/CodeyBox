@@ -2,16 +2,25 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-internal sealed class PromptPreprocessingAgentRunner : ITextOnlyAgentRunner, IAgentDefaultModelProvider
+/// <summary>
+/// Wraps an inner <see cref="IAgentRunner"/> so the
+/// <see cref="AgentPromptPreprocessorChain"/> runs against every prompt
+/// immediately before the agent is invoked. Use <see cref="Wrap"/> to
+/// construct one — the factory returns a text-only-capable subclass when
+/// the inner runner implements <see cref="ITextOnlyAgentRunner"/>, so an
+/// <c>is ITextOnlyAgentRunner</c> check on the returned instance reflects
+/// the inner runner's true capability instead of the wrapper's claim.
+/// </summary>
+internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider
 {
-    private readonly IAgentRunner _inner;
-    private readonly AgentPromptPreprocessorChain _chain;
-    private readonly WorkItemId _itemId;
-    private readonly AgentPromptPhase _phase;
-    private readonly int _iteration;
-    private readonly Project _project;
+    protected readonly IAgentRunner Inner;
+    protected readonly AgentPromptPreprocessorChain Chain;
+    protected readonly WorkItemId ItemId;
+    protected readonly AgentPromptPhase Phase;
+    protected readonly int Iteration;
+    protected readonly Project Project;
 
-    public PromptPreprocessingAgentRunner(
+    protected PromptPreprocessingAgentRunner(
         IAgentRunner inner,
         AgentPromptPreprocessorChain chain,
         WorkItemId itemId,
@@ -19,28 +28,35 @@ internal sealed class PromptPreprocessingAgentRunner : ITextOnlyAgentRunner, IAg
         int iteration,
         Project project)
     {
-        _inner = inner;
-        _chain = chain;
-        _itemId = itemId;
-        _phase = phase;
-        _iteration = iteration;
-        _project = project;
+        Inner = inner;
+        Chain = chain;
+        ItemId = itemId;
+        Phase = phase;
+        Iteration = iteration;
+        Project = project;
     }
 
-    public AgentKind Kind => _inner.Kind;
+    public static PromptPreprocessingAgentRunner Wrap(
+        IAgentRunner inner,
+        AgentPromptPreprocessorChain chain,
+        WorkItemId itemId,
+        AgentPromptPhase phase,
+        int iteration,
+        Project project)
+    {
+        if (inner is ITextOnlyAgentRunner)
+            return new TextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
 
-    internal bool SupportsTextOnly => _inner is ITextOnlyAgentRunner;
+        return new PromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+    }
+
+    public AgentKind Kind => Inner.Kind;
 
     string? IAgentDefaultModelProvider.DefaultModelId =>
-        (_inner as IAgentDefaultModelProvider)?.DefaultModelId;
+        (Inner as IAgentDefaultModelProvider)?.DefaultModelId;
 
     public AgentFailureClassification ClassifyFailure(AgentResult result) =>
-        _inner.ClassifyFailure(result);
-
-    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
-        _inner is ITextOnlyAgentRunner textOnly
-            ? textOnly.GetTextOnlyUnavailabilityReason(credential)
-            : $"{_inner.Kind.Value} runner is not text-only capable";
+        Inner.ClassifyFailure(result);
 
     public async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -53,12 +69,12 @@ internal sealed class PromptPreprocessingAgentRunner : ITextOnlyAgentRunner, IAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        var processed = await _chain.ProcessAsync(
-            new PromptContext(_itemId, _inner.Kind, _phase, _iteration, _project, sandbox),
+        var processed = await Chain.ProcessAsync(
+            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox),
             prompt,
             ct).ConfigureAwait(false);
 
-        return await _inner.RunAsync(
+        return await Inner.RunAsync(
             sandbox,
             workingDirectory,
             processed,
@@ -70,37 +86,48 @@ internal sealed class PromptPreprocessingAgentRunner : ITextOnlyAgentRunner, IAg
             captureStructuredStream).ConfigureAwait(false);
     }
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
-        string prompt,
-        AgentCredential? credential,
-        string? modelId = null,
-        string? reasoningMode = null,
-        CancellationToken ct = default,
-        ISandbox? sandbox = null,
-        string? workingDirectory = null)
+    private sealed class TextOnlyPromptPreprocessingAgentRunner
+        : PromptPreprocessingAgentRunner, ITextOnlyAgentRunner
     {
-        if (_inner is not ITextOnlyAgentRunner textOnly)
-            return new TextOnlyAgentResult(
-                false,
-                $"{_inner.Kind.Value} runner is not text-only capable",
-                null,
-                null);
-
-        if (sandbox is not null)
+        public TextOnlyPromptPreprocessingAgentRunner(
+            IAgentRunner inner,
+            AgentPromptPreprocessorChain chain,
+            WorkItemId itemId,
+            AgentPromptPhase phase,
+            int iteration,
+            Project project)
+            : base(inner, chain, itemId, phase, iteration, project)
         {
-            prompt = await _chain.ProcessAsync(
-                new PromptContext(_itemId, _inner.Kind, _phase, _iteration, _project, sandbox),
-                prompt,
-                ct).ConfigureAwait(false);
         }
 
-        return await textOnly.RunTextOnlyAsync(
-            prompt,
-            credential,
-            modelId,
-            reasoningMode,
-            ct,
-            sandbox,
-            workingDirectory).ConfigureAwait(false);
+        public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
+            ((ITextOnlyAgentRunner)Inner).GetTextOnlyUnavailabilityReason(credential);
+
+        public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+        {
+            if (sandbox is not null)
+            {
+                prompt = await Chain.ProcessAsync(
+                    new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox),
+                    prompt,
+                    ct).ConfigureAwait(false);
+            }
+
+            return await ((ITextOnlyAgentRunner)Inner).RunTextOnlyAsync(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                sandbox,
+                workingDirectory).ConfigureAwait(false);
+        }
     }
 }

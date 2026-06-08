@@ -341,7 +341,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!_promptPreprocessors.HasPreprocessors)
             return runner;
 
-        return new PromptPreprocessingAgentRunner(
+        return PromptPreprocessingAgentRunner.Wrap(
             runner,
             _promptPreprocessors,
             itemId,
@@ -7180,16 +7180,7 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox? sandbox,
         CancellationToken ct)
     {
-        var wrappedRunner = runner as PromptPreprocessingAgentRunner;
-        if (wrappedRunner is { SupportsTextOnly: false })
-        {
-            _log.LogWarning(
-                "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
-                runner.Kind.Value);
-            return (null, "Advisory merge security review skipped: configured agent is not text-only capable.");
-        }
-
-        if (runner is not ITextOnlyAgentRunner)
+        if (runner is not ITextOnlyAgentRunner textOnlyRunner)
         {
             _log.LogWarning(
                 "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
@@ -7198,10 +7189,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
-        // When the runner is already a PromptPreprocessingAgentRunner, its
-        // RunTextOnlyAsync re-runs the chain on a non-null sandbox, so skip
-        // the explicit pass here to avoid injecting the rules block twice.
-        if (sandbox is not null && wrappedRunner is null)
+        // PromptPreprocessingAgentRunner's RunTextOnlyAsync re-runs the chain
+        // on a non-null sandbox, so skip the explicit pass here when the
+        // runner is already wrapped to avoid injecting the rules block twice.
+        if (sandbox is not null && runner is not PromptPreprocessingAgentRunner)
         {
             prompt = await ProcessAgentPromptAsync(
                 workItemId,
@@ -7213,7 +7204,6 @@ public sealed class PipelineRunner : IPipelineRunner
                 prompt,
                 ct);
         }
-        var textOnlyRunner = (ITextOnlyAgentRunner)runner;
         var result = await textOnlyRunner.RunTextOnlyAsync(
             prompt,
             credential,

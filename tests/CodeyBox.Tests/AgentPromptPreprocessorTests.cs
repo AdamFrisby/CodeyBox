@@ -123,7 +123,7 @@ public sealed class AgentPromptPreprocessorTests
 
         for (var i = 0; i < phases.Length; i++)
         {
-            var wrapper = new PromptPreprocessingAgentRunner(
+            var wrapper = PromptPreprocessingAgentRunner.Wrap(
                 inner,
                 chain,
                 WorkItemId.New(),
@@ -145,7 +145,7 @@ public sealed class AgentPromptPreprocessorTests
         var chain = new AgentPromptPreprocessorChain([recorder]);
         var inner = new RecordingTextOnlyRunner();
         var sandbox = new FileBackedSandbox(new Dictionary<string, string>());
-        var wrapper = new PromptPreprocessingAgentRunner(
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
             inner,
             chain,
             WorkItemId.New(),
@@ -153,7 +153,8 @@ public sealed class AgentPromptPreprocessorTests
             7,
             NewProject());
 
-        await wrapper.RunTextOnlyAsync("review prompt", credential: null, sandbox: sandbox, workingDirectory: "/work");
+        var textOnly = Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        await textOnly.RunTextOnlyAsync("review prompt", credential: null, sandbox: sandbox, workingDirectory: "/work");
 
         var ctx = Assert.Single(recorder.Contexts);
         Assert.Equal(AgentPromptPhase.Merge, ctx.Phase);
@@ -167,7 +168,7 @@ public sealed class AgentPromptPreprocessorTests
         var recorder = new RecordingPreprocessor();
         var chain = new AgentPromptPreprocessorChain([recorder]);
         var inner = new RecordingTextOnlyRunner();
-        var wrapper = new PromptPreprocessingAgentRunner(
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
             inner,
             chain,
             WorkItemId.New(),
@@ -175,7 +176,8 @@ public sealed class AgentPromptPreprocessorTests
             3,
             NewProject());
 
-        var result = await wrapper.RunTextOnlyAsync("untouched prompt", credential: null, sandbox: null);
+        var textOnly = Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        var result = await textOnly.RunTextOnlyAsync("untouched prompt", credential: null, sandbox: null);
 
         Assert.True(result.Success);
         Assert.Empty(recorder.Contexts);
@@ -183,30 +185,31 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task PromptPreprocessingAgentRunner_ReturnsUnavailabilityWhenInnerIsNotTextOnly()
+    public void PromptPreprocessingAgentRunner_DoesNotImplementTextOnlyWhenInnerIsPlain()
     {
-        var recorder = new RecordingPreprocessor();
-        var chain = new AgentPromptPreprocessorChain([recorder]);
-        var inner = new RecordingPlainRunner();
-        var sandbox = new FileBackedSandbox(new Dictionary<string, string>());
-        var wrapper = new PromptPreprocessingAgentRunner(
-            inner,
+        // The wrapper used to unconditionally implement ITextOnlyAgentRunner and
+        // surface a synthetic failure at call time. Now Wrap(...) returns a base
+        // wrapper for plain runners so `is ITextOnlyAgentRunner` reflects the
+        // inner runner's true capability and callers like
+        // RunMergeSecurityReviewAsync need only a single guard.
+        var chain = new AgentPromptPreprocessorChain([new RecordingPreprocessor()]);
+        var plainWrapper = PromptPreprocessingAgentRunner.Wrap(
+            new RecordingPlainRunner(),
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Merge,
+            1,
+            NewProject());
+        var textOnlyWrapper = PromptPreprocessingAgentRunner.Wrap(
+            new RecordingTextOnlyRunner(),
             chain,
             WorkItemId.New(),
             AgentPromptPhase.Merge,
             1,
             NewProject());
 
-        Assert.False(wrapper.SupportsTextOnly);
-
-        var result = await wrapper.RunTextOnlyAsync("prompt", credential: null, sandbox: sandbox);
-
-        Assert.False(result.Success);
-        Assert.Contains("not text-only capable", result.Summary);
-        Assert.Empty(recorder.Contexts);
-        var reason = wrapper.GetTextOnlyUnavailabilityReason(credential: null);
-        Assert.NotNull(reason);
-        Assert.Contains("not text-only capable", reason);
+        Assert.IsNotAssignableFrom<ITextOnlyAgentRunner>(plainWrapper);
+        Assert.IsAssignableFrom<ITextOnlyAgentRunner>(textOnlyWrapper);
     }
 
     [Fact]
@@ -284,6 +287,43 @@ public sealed class AgentPromptPreprocessorTests
 
         Assert.Contains("[Project rules truncated by CodeyBox at 256 KiB.]", result);
         // Resulting string round-trips through UTF-8 without invalid sequences.
+        var roundTripped = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(result));
+        Assert.Equal(result, roundTripped);
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_TruncatesContentSafelyAroundSurrogatePairs()
+    {
+        // Fill content with non-BMP characters whose UTF-16 representation is a
+        // surrogate pair (😀 = U+1F600 = 4 UTF-8 bytes, two UTF-16 code units).
+        // A naive char-index truncation can land between the high and low
+        // surrogate; assert the truncated prefix never contains an orphan
+        // surrogate so downstream re-encoding does not emit U+FFFD.
+        var sb = new StringBuilder();
+        while (Encoding.UTF8.GetByteCount(sb.ToString()) < (256 * 1024) + 1024)
+            sb.Append("😀");
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = sb.ToString(),
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
+
+        Assert.Contains("[Project rules truncated by CodeyBox at 256 KiB.]", result);
+        // No orphan surrogates: every high surrogate must be followed by a low surrogate.
+        for (var i = 0; i < result.Length; i++)
+        {
+            if (char.IsHighSurrogate(result[i]))
+            {
+                Assert.True(i + 1 < result.Length && char.IsLowSurrogate(result[i + 1]),
+                    "high surrogate at index " + i + " has no matching low surrogate");
+            }
+        }
         var roundTripped = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(result));
         Assert.Equal(result, roundTripped);
     }
@@ -572,8 +612,29 @@ public sealed class AgentPromptPreprocessorTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             _ = ct;
-            if (exec.Argv is ["cat", "--", var path] && _files.TryGetValue(path, out var content))
+            string? path = null;
+            int? byteLimit = null;
+            if (exec.Argv is ["cat", "--", var catPath])
+            {
+                path = catPath;
+            }
+            else if (exec.Argv is ["head", "-c", var limit, "--", var headPath]
+                && int.TryParse(limit, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+            {
+                path = headPath;
+                byteLimit = parsed;
+            }
+
+            if (path is not null && _files.TryGetValue(path, out var content))
+            {
+                if (byteLimit is { } cap)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(content);
+                    if (bytes.Length > cap)
+                        content = Encoding.UTF8.GetString(bytes, 0, cap);
+                }
                 return Task.FromResult(new SandboxExecResult(0, content, ""));
+            }
 
             return Task.FromResult(new SandboxExecResult(1, "", "not found"));
         }
