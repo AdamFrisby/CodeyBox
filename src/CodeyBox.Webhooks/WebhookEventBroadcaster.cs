@@ -208,9 +208,14 @@ public sealed class Subscription : IAsyncDisposable
     public async IAsyncEnumerable<BroadcastedEvent> ReadAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
+        // Drain the in-memory replay slice without checking cancellation between
+        // yields: it's a bounded snapshot the client explicitly asked for, and a
+        // mid-replay cancellation leaves the caller with a partial slice plus a
+        // confused Last-Event-ID. Cancellation kicks in below at the channel
+        // wait. (Without this, a slow CI scheduler could race a short test
+        // timeout against the foreach resumption between yields.)
         foreach (var evt in _replay)
         {
-            ct.ThrowIfCancellationRequested();
             yield return evt;
         }
 
