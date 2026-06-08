@@ -121,7 +121,15 @@ public sealed record AuditContext(
     /// missing repo-root <c>build.sh</c> makes that auditor skip. When true,
     /// a missing script is a blocking audit finding.
     /// </summary>
-    bool BuildScriptRequired = false);
+    bool BuildScriptRequired = false,
+    /// <summary>
+    /// Stable project identifier the work item belongs to. Used by auditors
+    /// whose per-project persistence is keyed (e.g. the mutation-rigor
+    /// auditor's ratchet baseline). Null when the call site is the legacy
+    /// shape from before this field existed; auditors that consume it must
+    /// fall back gracefully (typically to a base-branch-only key).
+    /// </summary>
+    string? ProjectId = null);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(

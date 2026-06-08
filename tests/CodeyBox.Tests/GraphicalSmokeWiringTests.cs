@@ -32,14 +32,16 @@ public sealed class GraphicalSmokeWiringTests
         Assert.Contains(registeredAuditors, a => a is BuildScriptAuditor && a.Name == BuildScriptAuditor.AuditorName);
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        // gui:smoke is composed FIRST (prepended for graphical projects);
-        // prompt-revision runs before the branch-controlled build script.
-        // With no language/auditType presets this project ends up with all
-        // three registered auditors composed.
-        Assert.Equal(3, composed.Count);
+        // gui:smoke is composed FIRST (prepended for graphical projects); the
+        // always-on prompt-revision trailer, build-script, and mutation-rigor
+        // auditors are appended after preset auditors (all auto-included when
+        // registered). With no language/auditType presets this project ends up
+        // with all four registered always-on auditors composed.
+        Assert.Equal(4, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
         Assert.IsType<BuildScriptAuditor>(composed[2]);
+        Assert.Equal("tests:mutation-rigor", composed[3].Name);
     }
 
     [Fact]
@@ -62,9 +64,10 @@ public sealed class GraphicalSmokeWiringTests
 
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        Assert.Equal(2, composed.Count);
+        Assert.Equal(3, composed.Count);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
+        Assert.Equal("tests:mutation-rigor", composed[2].Name);
         Assert.Contains(composed, a => a.Name == BuildScriptAuditor.AuditorName);
         Assert.DoesNotContain(composed, a => a.Name == "gui:smoke");
     }

@@ -61,7 +61,7 @@ For each item the auditor:
 | `RatchetTolerancePercent` | `0.5` | Absolute % points of noise allowed before a regression is reported. |
 | `FileExtensions` | `[".cs"]` | Extensions kept in the changed-file scope. |
 | `ExcludePathPrefixes` | `["tests/", "test/", ".codeybox/"]` | Prefixes dropped from the scope. |
-| `RatchetKey` | derived from `BaseBranch` | Override the per-baseline ratchet lookup key. |
+| `RatchetKey` | derived from `<ProjectId>:<BaseBranch>` | Override the per-baseline ratchet lookup key. Multi-project hosts must rely on the project-id prefix to keep baselines distinct (or set this explicitly per project). |
 
 ## Wiring a runner
 

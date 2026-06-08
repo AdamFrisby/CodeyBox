@@ -33,19 +33,41 @@ namespace CodeyBox.Audit;
 /// </summary>
 public sealed class MutationTestingAuditor : IAuditor
 {
-    private readonly MutationTestingAuditorOptions _opts;
+    private readonly Func<MutationTestingAuditorOptions> _optsProvider;
     private readonly IMutationRunner _runner;
     private readonly IMutationRatchetStore _ratchet;
 
+    /// <summary>
+    /// Production constructor. The <paramref name="optsProvider"/> is called
+    /// once per audit, so config reloads of <c>CodeyBox:Mutation</c>
+    /// (threshold, budget, tolerance, …) take effect on the next audit
+    /// without a process restart — matching the rest of the host's
+    /// hot-reloadable options wiring. The composition root typically wires
+    /// this to <c>IOptionsMonitor&lt;…&gt;.CurrentValue</c>.
+    /// </summary>
+    public MutationTestingAuditor(
+        Func<MutationTestingAuditorOptions> optsProvider,
+        IMutationRunner runner,
+        IMutationRatchetStore ratchet)
+    {
+        _optsProvider = optsProvider;
+        _runner = runner;
+        _ratchet = ratchet;
+    }
+
+    /// <summary>
+    /// Test constructor — accepts a fixed snapshot so unit tests don't have
+    /// to wire an IOptionsMonitor.
+    /// </summary>
     public MutationTestingAuditor(
         MutationTestingAuditorOptions opts,
         IMutationRunner runner,
         IMutationRatchetStore ratchet)
+        : this(() => opts, runner, ratchet)
     {
-        _opts = opts;
-        _runner = runner;
-        _ratchet = ratchet;
     }
+
+    private MutationTestingAuditorOptions _opts => _optsProvider();
 
     public string Name => _opts.Name;
     public string Kind => "tool";
@@ -57,7 +79,11 @@ public sealed class MutationTestingAuditor : IAuditor
         AuditContext context,
         CancellationToken ct = default)
     {
-        if (!_opts.Enabled)
+        // Snapshot once so the audit is internally consistent even if config
+        // reloads mid-run (CurrentValue would otherwise change underneath us).
+        var opts = _opts;
+
+        if (!opts.Enabled)
             return new AuditResult(true, [], RawOutput: "mutation-testing auditor disabled");
 
         if (_runner is NullMutationRunner)
@@ -73,15 +99,31 @@ public sealed class MutationTestingAuditor : IAuditor
             RawOutput: "no runner wired");
         }
 
-        var changed = await ListChangedFilesAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
-        var scoped = ScopeToTrackedSource(changed);
+        var listing = await ListChangedFilesAsync(sandbox, workingDirectory, context, ct).ConfigureAwait(false);
+        if (listing.Error is { } enumerationError)
+        {
+            // Fail-closed on git-diff failure. Treating "cannot enumerate changed
+            // files" as "no changed files" would let a misconfigured base ref,
+            // missing remote, or shallow clone silently green-light the gate
+            // this whole feature is built to make un-gameable.
+            return new AuditResult(false,
+            [
+                new AuditFinding(
+                    Name, AuditSeverity.Error,
+                    "could not enumerate changed files",
+                    "git diff failed twice (with and without the 'origin/' prefix) so the mutation-testing " +
+                    $"auditor cannot determine which files are in scope. Stderr: {enumerationError}"),
+            ],
+            RawOutput: enumerationError);
+        }
+        var scoped = FilterToInScopeFiles(opts, listing.Files);
         if (scoped.Count == 0)
             return new AuditResult(true, [], RawOutput: "no changed files in scope");
 
         MutationRunReport report;
         try
         {
-            report = await _runner.RunAsync(sandbox, workingDirectory, scoped, _opts.Budget, ct).ConfigureAwait(false);
+            report = await _runner.RunAsync(sandbox, workingDirectory, scoped, opts.Budget, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -102,9 +144,13 @@ public sealed class MutationTestingAuditor : IAuditor
 
         // Un-gameable conformance: every surviving mutant in changed code is a
         // missing test branch. One Error per mutant so the rework prompt cites
-        // each with file:line and mutator kind.
+        // each with file:line and mutator kind. Defence-in-depth against a
+        // misbehaving runner: drop survivors whose file is not in the scoped
+        // set so out-of-scope reports cannot flood the rework loop.
+        var scopedSet = new HashSet<string>(scoped, StringComparer.OrdinalIgnoreCase);
         foreach (var mutant in report.SurvivingMutantsInChangedCode)
         {
+            if (!scopedSet.Contains(mutant.FilePath)) continue;
             findings.Add(new AuditFinding(
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
@@ -117,7 +163,7 @@ public sealed class MutationTestingAuditor : IAuditor
                 Location: $"{mutant.FilePath}:{mutant.Line}"));
         }
 
-        if (report.ChangedCodeMutationScorePercent < _opts.ChangedCodeThresholdPercent - Epsilon)
+        if (report.ChangedCodeMutationScorePercent < opts.ChangedCodeThresholdPercent - Epsilon)
         {
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -126,15 +172,15 @@ public sealed class MutationTestingAuditor : IAuditor
                 Description:
                     $"Mutation score on the changed code is " +
                     $"{Fmt(report.ChangedCodeMutationScorePercent)}%, below the configured threshold of " +
-                    $"{Fmt(_opts.ChangedCodeThresholdPercent)}%. Add or strengthen tests on the affected " +
+                    $"{Fmt(opts.ChangedCodeThresholdPercent)}%. Add or strengthen tests on the affected " +
                     "functions so plausible bugs would fail at least one test.",
                 Location: null));
         }
 
-        var ratchetKey = ResolveRatchetKey(context);
+        var ratchetKey = ResolveRatchetKey(opts, context);
         var previous = await _ratchet.TryGetAsync(ratchetKey, ct).ConfigureAwait(false);
         if (previous is double baseline
-            && report.OverallMutationScorePercent < baseline - _opts.RatchetTolerancePercent - Epsilon)
+            && report.OverallMutationScorePercent < baseline - opts.RatchetTolerancePercent - Epsilon)
         {
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -143,7 +189,7 @@ public sealed class MutationTestingAuditor : IAuditor
                 Description:
                     $"Overall mutation score dropped from {Fmt(baseline)}% to " +
                     $"{Fmt(report.OverallMutationScorePercent)}% (tolerance " +
-                    $"{Fmt(_opts.RatchetTolerancePercent)}%). The ratchet does not permit regressions — " +
+                    $"{Fmt(opts.RatchetTolerancePercent)}%). The ratchet does not permit regressions — " +
                     "either restore the lost coverage or escalate to the operator to reset the baseline.",
                 Location: null));
         }
@@ -159,10 +205,11 @@ public sealed class MutationTestingAuditor : IAuditor
         return new AuditResult(passed, findings, RawOutput: report.RawOutput);
     }
 
-    private IReadOnlyList<string> ScopeToTrackedSource(IReadOnlyList<string> files)
+    private static IReadOnlyList<string> FilterToInScopeFiles(
+        MutationTestingAuditorOptions opts, IReadOnlyList<string> files)
     {
-        var exts = _opts.FileExtensions;
-        var excludes = _opts.ExcludePathPrefixes;
+        var exts = opts.FileExtensions;
+        var excludes = opts.ExcludePathPrefixes;
         var output = new List<string>(files.Count);
         foreach (var file in files)
         {
@@ -177,37 +224,67 @@ public sealed class MutationTestingAuditor : IAuditor
         return output;
     }
 
-    private static async Task<IReadOnlyList<string>> ListChangedFilesAsync(
+    /// <summary>
+    /// Result of trying to enumerate changed files via git. <see cref="Error"/>
+    /// non-null means BOTH diff invocations failed — the caller MUST fail
+    /// closed, since "cannot determine changes" is not the same as "no
+    /// changes" and silently treating it as the latter green-lights the gate.
+    /// <c>-z</c> is used so paths containing newlines, quotes, or non-ASCII
+    /// bytes do not get quoted or split incorrectly.
+    /// </summary>
+    private readonly record struct ChangedFileListing(IReadOnlyList<string> Files, string? Error);
+
+    private static async Task<ChangedFileListing> ListChangedFilesAsync(
         ISandbox sandbox,
         string workingDirectory,
         AuditContext context,
         CancellationToken ct)
     {
+        var baseBranch = context.BaseBranch ?? string.Empty;
         var diff = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", workingDirectory, "diff", "--name-only",
-                    $"origin/{context.BaseBranch}...HEAD"],
+            Argv = ["git", "-C", workingDirectory, "diff", "--name-only", "-z",
+                    "--end-of-options", $"origin/{baseBranch}...HEAD"],
         }, ct).ConfigureAwait(false);
         if (!diff.Success)
         {
             diff = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["git", "-C", workingDirectory, "diff", "--name-only",
-                        $"{context.BaseBranch}...HEAD"],
+                Argv = ["git", "-C", workingDirectory, "diff", "--name-only", "-z",
+                        "--end-of-options", $"{baseBranch}...HEAD"],
             }, ct).ConfigureAwait(false);
         }
         if (!diff.Success)
-            return [];
+        {
+            var stderr = string.IsNullOrWhiteSpace(diff.Stderr)
+                ? "git diff exited non-zero with no stderr output"
+                : diff.Stderr.Trim();
+            return new ChangedFileListing([], stderr);
+        }
 
-        return diff.Stdout
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        var files = diff.Stdout
+            .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => s.Trim())
+            .Where(s => s.Length > 0)
             .ToList();
+        return new ChangedFileListing(files, Error: null);
     }
 
-    private string ResolveRatchetKey(AuditContext context)
-        => string.IsNullOrWhiteSpace(_opts.RatchetKey)
-            ? $"{context.BaseBranch}"
-            : _opts.RatchetKey!;
+    private static string ResolveRatchetKey(MutationTestingAuditorOptions opts, AuditContext context)
+    {
+        if (!string.IsNullOrWhiteSpace(opts.RatchetKey))
+            return opts.RatchetKey!;
+        // Default key prefixes the base branch with the work item's project id
+        // when the orchestrator has plumbed one through. Multi-project hosts
+        // commonly share a singleton auditor + ratchet store; without this
+        // prefix, every project targeting 'main' would read and write the
+        // same baseline and one project's pass would become another's
+        // regression floor.
+        var projectPrefix = string.IsNullOrWhiteSpace(context.ProjectId)
+            ? ""
+            : $"{context.ProjectId}:";
+        return $"{projectPrefix}{context.BaseBranch}";
+    }
 
     private static string Fmt(double percent)
         => percent.ToString("F1", CultureInfo.InvariantCulture);
@@ -239,12 +316,22 @@ public sealed record MutationTestingAuditorOptions
     public double ChangedCodeThresholdPercent { get; init; } = 80.0;
 
     /// <summary>
-    /// Wall-clock budget handed to the runner. Mutation testing is expensive,
-    /// so the runner is expected to parallelise per-mutant across cores and
-    /// abort straggling mutants once this budget is exhausted. The auditor
-    /// does not itself enforce a hard kill — the runner does.
+    /// Wall-clock budget (whole minutes) handed to the runner. Mutation
+    /// testing is expensive, so the runner is expected to parallelise
+    /// per-mutant across cores and abort straggling mutants once this budget
+    /// is exhausted. The auditor does not itself enforce a hard kill — the
+    /// runner does. Int rather than TimeSpan so config can use a plain
+    /// integer ("BudgetMinutes": 15) consistent with the rest of the host
+    /// (e.g. PerIterationTimeoutMinutes).
     /// </summary>
-    public TimeSpan Budget { get; init; } = TimeSpan.FromMinutes(15);
+    public int BudgetMinutes { get; init; } = 15;
+
+    /// <summary>
+    /// Convenience accessor: <see cref="BudgetMinutes"/> as a <see cref="TimeSpan"/>.
+    /// Clamped to a minimum of 1 minute so a misconfigured 0 or negative
+    /// value cannot cause the runner to be handed a zero/negative budget.
+    /// </summary>
+    public TimeSpan Budget => TimeSpan.FromMinutes(Math.Max(1, BudgetMinutes));
 
     /// <summary>
     /// Tolerance applied when comparing the new overall score against the

@@ -123,6 +123,18 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor(WellKnownAuditorNames.BuildScript, auditors, prepend: false);
         }
 
+        // Always include the mutation-rigor auditor when it has been
+        // registered. It is config-gated: the auditor itself short-circuits
+        // to a passing no-op when CodeyBox:Mutation:Enabled=false, so
+        // auto-inclusion is cheap when the gate is off. Operators that want
+        // the gate skipped on a specific project list it under ExcludedAuditors.
+        if (_registeredAuditorsByName.ContainsKey("tests:mutation-rigor")
+            && !auditors.Any(a => a.Name.Equals(
+                "tests:mutation-rigor", StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor("tests:mutation-rigor", auditors, prepend: false);
+        }
+
         if (project.Audit.ExcludedAuditors.Count > 0)
         {
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);

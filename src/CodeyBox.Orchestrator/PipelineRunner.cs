@@ -3917,7 +3917,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
                     ModelId: item.ModelId, ReasoningMode: item.ReasoningMode,
                     PromptRevisionAtDispatch: revisionForCtx,
-                    BuildScriptRequired: project.Audit.BuildScriptRequired);
+                    BuildScriptRequired: project.Audit.BuildScriptRequired,
+                    ProjectId: project.Id.Value);
                 var collectTask = CollectFindingsAsync(item, project, runner, auditors, repoId, ctx, auditPhase.Token);
                 var completedAuditTask = await Task.WhenAny(collectTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completedAuditTask != collectTask)
