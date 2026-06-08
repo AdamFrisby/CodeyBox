@@ -337,10 +337,13 @@ public sealed class AuditQuotaPauseTests : IDisposable
         var auditProbes = classMembers
             .Select(kind => new RecordingProbe(
                 kind,
-                auditProbeAvailablePct is not null
-                    && auditProbeAvailablePct.TryGetValue(kind, out var pct)
-                    ? pct
-                    : 80.0))
+                new AgentQuotaSnapshot
+                {
+                    AvailablePct = auditProbeAvailablePct is not null
+                        && auditProbeAvailablePct.TryGetValue(kind, out var pct)
+                        ? pct
+                        : 80.0,
+                }))
             .ToList();
         var dispatchAvailability = pauses is null
             ? null
