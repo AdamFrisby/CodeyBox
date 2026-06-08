@@ -194,12 +194,34 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         => ((IAgentRunner)_runner).ClassifyFailure(result);
 
     /// <inheritdoc/>
-    public async Task<AgentSessionHandle> OpenSessionAsync(
+    public Task<AgentSessionHandle> OpenSessionAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
+        CancellationToken ct = default)
+        => OpenSessionAsync(sandbox, workingDirectory, credential, modelId, reasoningMode,
+            projectId: null, agentClassMember: null, ct: ct);
+
+    /// <summary>
+    /// Override for callers that know the dispatch context. <paramref name="projectId"/> and
+    /// <paramref name="agentClassMember"/> are matched against
+    /// <see cref="ClaudeSessionWorkerOptions.TransportOverridesByProject"/> and
+    /// <see cref="ClaudeSessionWorkerOptions.TransportOverridesByAgentClassMember"/> respectively;
+    /// the resolved transport is the per-member override (if any), then per-project, then the
+    /// global default. Both values are stamped into the returned handle's metadata so a
+    /// post-restart reattach replays the same scoped resolution rather than falling back to the
+    /// global default.
+    /// </summary>
+    public async Task<AgentSessionHandle> OpenSessionAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        string? projectId,
+        string? agentClassMember,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
@@ -211,7 +233,8 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         if (string.IsNullOrWhiteSpace(sandboxRef.Id))
             throw new InvalidOperationException("Session sandbox references must include a non-blank id.");
 
-        var requestedTransport = _options.ResolveTransport(handleMetadata: null);
+        var scopeMetadata = BuildScopeMetadata(projectId, agentClassMember);
+        var requestedTransport = _options.ResolveTransport(scopeMetadata);
         var effectiveTransport = await OpenTransportAsync(
             requestedTransport,
             sandbox,
@@ -227,6 +250,10 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             ["mode"] = "claude-session",
             [TransportMetadataKey] = effectiveTransport.Transport.Name,
         };
+        if (!string.IsNullOrWhiteSpace(projectId))
+            metadata[ProjectIdMetadataKey] = projectId!;
+        if (!string.IsNullOrWhiteSpace(agentClassMember))
+            metadata[AgentClassMemberMetadataKey] = agentClassMember!;
         if (effectiveTransport.Degraded)
             metadata[AcpFallbackToPrintMetadataKey] = "true";
         var handle = new AgentSessionHandle(
@@ -241,6 +268,19 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         _sessions[localSessionId] = new SessionState(
             sandbox, credential, effectiveTransport.Transport, effectiveTransport.Session, effectiveTransport.Degraded);
         return handle;
+    }
+
+    private static IReadOnlyDictionary<string, string>? BuildScopeMetadata(
+        string? projectId, string? agentClassMember)
+    {
+        if (string.IsNullOrWhiteSpace(projectId) && string.IsNullOrWhiteSpace(agentClassMember))
+            return null;
+        var d = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(projectId))
+            d[ProjectIdMetadataKey] = projectId!;
+        if (!string.IsNullOrWhiteSpace(agentClassMember))
+            d[AgentClassMemberMetadataKey] = agentClassMember!;
+        return d;
     }
 
     /// <inheritdoc/>

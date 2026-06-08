@@ -333,6 +333,353 @@ public sealed class ClaudeAcpTransportTests
         Assert.NotEqual(fakeAcp.Sessions[0], fakeAcp.Sessions[1]);
     }
 
+    // ── OpenSessionAsync overload — overrides actually fire at open time ─────
+
+    [Fact]
+    public async Task OpenSessionAsync_WithProjectAndMember_StampsScopeMetadata_AndAppliesMemberOverride()
+    {
+        // Per-class-member override flips the resolved transport when the
+        // operator supplied the scope at open time. The new overload also
+        // stamps both keys onto the handle so reattach observes the same
+        // scope after restart.
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-scope"));
+        var fakeAcp = new FakeAcpTransport(new FakeAcpResult("acp-scope", "ok"));
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Print };
+        opts.TransportOverridesByAgentClassMember["claude-fast"] = ClaudeSessionTransport.Acp;
+        opts.TransportOverridesByProject["proj-A"] = ClaudeSessionTransport.Print;
+        var worker = new ClaudeSessionWorker(BuildRunner(), options: opts, acpTransport: fakeAcp);
+
+        var handle = await worker.OpenSessionAsync(
+            sandbox,
+            workingDirectory: "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            projectId: "proj-A",
+            agentClassMember: "claude-fast");
+
+        // Member override wins → ACP opens for this session.
+        Assert.Equal(1, fakeAcp.OpenCount);
+        Assert.Equal("acp", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+        Assert.Equal("proj-A", handle.Metadata[ClaudeSessionWorker.ProjectIdMetadataKey]);
+        Assert.Equal("claude-fast", handle.Metadata[ClaudeSessionWorker.AgentClassMemberMetadataKey]);
+    }
+
+    [Fact]
+    public async Task OpenSessionAsync_PerProjectOverride_AppliesWithoutMemberHint()
+    {
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-proj"));
+        var fakeAcp = new FakeAcpTransport(new FakeAcpResult("acp-proj", "ok"));
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Print };
+        opts.TransportOverridesByProject["proj-acp"] = ClaudeSessionTransport.Acp;
+        var worker = new ClaudeSessionWorker(BuildRunner(), options: opts, acpTransport: fakeAcp);
+
+        var handle = await worker.OpenSessionAsync(
+            sandbox,
+            workingDirectory: "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            projectId: "proj-acp",
+            agentClassMember: null);
+
+        Assert.Equal(1, fakeAcp.OpenCount);
+        Assert.Equal("acp", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+        Assert.Equal("proj-acp", handle.Metadata[ClaudeSessionWorker.ProjectIdMetadataKey]);
+        Assert.False(handle.Metadata.ContainsKey(ClaudeSessionWorker.AgentClassMemberMetadataKey));
+    }
+
+    [Fact]
+    public async Task OpenSessionAsync_NoScope_FallsThroughToGlobalDefault()
+    {
+        // No project / member supplied → global default wins (print).
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-noscope"));
+        var fakeAcp = new FakeAcpTransport();
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Print };
+        opts.TransportOverridesByAgentClassMember["claude-fast"] = ClaudeSessionTransport.Acp;
+        var worker = new ClaudeSessionWorker(BuildRunner(), options: opts, acpTransport: fakeAcp);
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+
+        Assert.Equal(0, fakeAcp.OpenCount);
+        Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+        Assert.False(handle.Metadata.ContainsKey(ClaudeSessionWorker.AgentClassMemberMetadataKey));
+        Assert.False(handle.Metadata.ContainsKey(ClaudeSessionWorker.ProjectIdMetadataKey));
+    }
+
+    // ── Real AcpClaudeTransport — bridge materialisation + turn round-trip ───
+
+    [Fact]
+    public async Task AcpClaudeTransport_OpenAsync_WritesBridgeScript_ViaBase64Pipe()
+    {
+        var sandbox = new BridgeSandbox();
+        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-1");
+
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+
+        var materialise = sandbox.AllExecs.Single();
+        Assert.Equal("bash", materialise.Argv[0]);
+        Assert.Equal("-c", materialise.Argv[1]);
+        Assert.Contains("base64 -d > \"$HOME/.codeybox/claude-acp-bridge.cjs\"", materialise.Argv[2]);
+        // The encoded payload is the bridge script verbatim.
+        var encoded = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(AcpBridgeScript.Source));
+        Assert.Contains(encoded, materialise.Argv[2]);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_OpenAsync_SandboxFailure_RaisesUnavailable()
+    {
+        var sandbox = new BridgeSandbox { FailMaterialise = true };
+        var transport = new AcpClaudeTransport();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-x");
+
+        await Assert.ThrowsAsync<AcpTransportUnavailableException>(
+            () => transport.OpenAsync(request, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurn_ShipsAcpEnvelopesAsStdin_AndCapturesSessionId()
+    {
+        // First turn: no resume → bridge sees initialize + session/new + session/prompt.
+        // Bridge replies with a session id; transport captures it.
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-real-1\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":120,\"output_tokens\":30,\"cache_read_input_tokens\":4500,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var transport = new AcpClaudeTransport { NodeBinary = "node" };
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-real");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.True(turn.Result.Success);
+        Assert.Equal("acp-real-1", turn.CapturedCliSessionId);
+
+        var bridgeExec = sandbox.BridgeExecs.Single();
+        Assert.Contains("$HOME/.codeybox/claude-acp-bridge.cjs", bridgeExec.Argv[2]);
+
+        // Stdin frames the full envelope sequence: hello → initialize → session/new → session/prompt.
+        var stdin = bridgeExec.Stdin!;
+        Assert.Contains("\"type\":\"hello\"", stdin);
+        Assert.Contains("\"autoApprovePermissions\":true", stdin);
+        Assert.Contains("\"autoAnswerQuestions\":true", stdin);
+        Assert.Contains("\"method\":\"initialize\"", stdin);
+        Assert.Contains("\"method\":\"session/new\"", stdin);
+        Assert.Contains("\"method\":\"session/prompt\"", stdin);
+        Assert.DoesNotContain("\"method\":\"session/load\"", stdin);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_SendTurn_WithResume_IssuesSessionLoad()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var transport = new AcpClaudeTransport();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-resume");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("next", CliResumeSessionId: "acp-prior", StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.True(turn.Result.Success);
+
+        // Sanitiser ran (resume turn). The discovery script fingerprint
+        // contains the session_root marker the sanitiser is the only producer of.
+        Assert.Contains(sandbox.AllExecs, e =>
+            e.Argv.Count >= 3 && e.Argv[2].Contains("session_root", StringComparison.Ordinal));
+
+        var bridgeExec = sandbox.BridgeExecs.Single();
+        var stdin = bridgeExec.Stdin!;
+        Assert.Contains("\"method\":\"session/load\"", stdin);
+        Assert.Contains("\"sessionId\":\"acp-prior\"", stdin);
+        Assert.DoesNotContain("\"method\":\"session/new\"", stdin);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_BuildsRealShim_AndMetricsExtractCacheReadFromIt()
+    {
+        // End-to-end through the worker so the real BuildStreamJsonShimForExtractor
+        // is what the metrics sink observes — a JSON property-name regression
+        // in the production shim breaks this test, unlike the FakeAcpSession path.
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-shim-1\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-shim-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":250,\"output_tokens\":70,\"cache_read_input_tokens\":9000,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var sink = new RecordingMetricsSink();
+        var realAcp = new AcpClaudeTransport();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            metricsSink: sink,
+            options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
+            acpTransport: realAcp);
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        var result = await worker.SendTurnAsync(handle, "first");
+
+        Assert.True(result.Success);
+        var rec = sink.Records.Single();
+        Assert.Equal("acp", rec.Transport);
+        // input_tokens (fresh) + cache_read_input_tokens make up the total input bucket.
+        Assert.Equal(250 + 9000, rec.InputTokens);
+        Assert.Equal(9000, rec.CachedInputTokens);
+        Assert.Equal(250, rec.FreshInputTokens);
+        Assert.Equal(70, rec.OutputTokens);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_FatalEnvelope_SurfacesAsTransportUnavailable()
+    {
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"fatal\",\"message\":\"lockfile_write_failed\",\"detail\":\"EACCES\"}",
+        });
+        sandbox.BridgeExitCode = 2;
+
+        var transport = new AcpClaudeTransport();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-fatal");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        await Assert.ThrowsAsync<AcpTransportUnavailableException>(() =>
+            session.SendTurnAsync(
+                new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+                CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_ReSanitisesAndRetries_Succeeds()
+    {
+        // Reactive recovery path (lines 164-206 of AcpClaudeTransport):
+        // turn returns a thinking-block 400 error → sanitiser runs → retry
+        // succeeds → final result is success.
+        var sandbox = new BridgeSandbox();
+        // First bridge call: turn_error carrying the thinking-block signature.
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+        // Second bridge call (after sanitiser): turn completes successfully.
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-recovered\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var transport = new AcpClaudeTransport();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-retry");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.True(turn.Result.Success);
+        Assert.Equal("acp-recovered", turn.CapturedCliSessionId);
+        Assert.Contains("post-sanitise retry", turn.Result.Summary);
+        Assert.Equal(2, sandbox.BridgeExecs.Count);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ThinkingBlock400_SanitiserFails_PropagatesFailure()
+    {
+        // Sanitiser write-back failure → result keeps the original failure
+        // with the sanitiser failure annotation in the summary; we do NOT
+        // attempt the retry exec.
+        var sandbox = new BridgeSandbox { SanitiserListsFile = "/home/test/.claude/projects/p/s.jsonl", SanitiserFailWrite = true };
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}}",
+            "{\"type\":\"turn_error\",\"error\":{\"code\":-32000,\"message\":\"messages.0.content.0: blocks in the latest assistant message cannot be modified\"}}",
+        });
+
+        var transport = new AcpClaudeTransport();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-saniterr");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hi", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.False(turn.Result.Success);
+        Assert.Contains("sanitiser failed", turn.Result.Summary);
+        Assert.Single(sandbox.BridgeExecs); // No retry was attempted.
+    }
+
+    [Fact]
+    public void AcpClaudeTransport_BuildStreamJsonShimForExtractor_RoundTripsThroughCostExtractor()
+    {
+        // Direct check of the production shim shape so a property-name drift
+        // (e.g. cache_read_input_tokens → cacheReadInputTokens) is caught
+        // even when the worker integration test isn't run.
+        var stdout = string.Join("\n", new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-extract\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":11,\"output_tokens\":22,\"cache_read_input_tokens\":7777,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+        var obs = AcpClaudeTransport.AcpSession.ObserveBridgeOutput(stdout);
+        var shim = InvokeBuildStreamJsonShim(obs);
+
+        var extractor = new ClaudeCostExtractor();
+        var snap = extractor.TryExtract(shim, agentStderr: null);
+        Assert.NotNull(snap);
+        Assert.Equal(11 + 7777, snap!.InputTokens);
+        Assert.Equal(7777, snap.CachedInputTokens);
+        Assert.Equal(22, snap.OutputTokens);
+    }
+
+    private static string InvokeBuildStreamJsonShim(AcpClaudeTransport.BridgeObservation obs)
+    {
+        var mi = typeof(AcpClaudeTransport.AcpSession).GetMethod(
+            "BuildStreamJsonShimForExtractor",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+            ?? throw new InvalidOperationException("BuildStreamJsonShimForExtractor not found");
+        return (string)mi.Invoke(null, new object[] { obs })!;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static ClaudeAgentRunner BuildRunner() =>
@@ -460,5 +807,84 @@ public sealed class ClaudeAcpTransportTests
     {
         public List<ClaudeSessionTurnMetrics> Records { get; } = new();
         public void Record(ClaudeSessionTurnMetrics metrics) => Records.Add(metrics);
+    }
+
+    /// <summary>
+    /// Sandbox stub that classifies each ExecAsync by argv shape so the real
+    /// <see cref="AcpClaudeTransport"/> can drive a full SendTurn round-trip:
+    /// the bridge invocation receives queued envelopes via StdoutChunkCallback,
+    /// the bridge-script materialise call succeeds, and the
+    /// <see cref="ClaudeSessionSanitizer"/> discovery script returns either an
+    /// empty file list (default) or a single file path (for the sanitiser
+    /// failure test).
+    /// </summary>
+    private sealed class BridgeSandbox : ISandbox
+    {
+        private readonly Queue<string[]> _bridgeOutputs = new();
+        public List<SandboxExec> AllExecs { get; } = new();
+        public List<SandboxExec> BridgeExecs { get; } = new();
+        public string Id { get; } = "vm-" + Guid.NewGuid().ToString("N")[..8];
+
+        public bool FailMaterialise { get; set; }
+        public int BridgeExitCode { get; set; }
+        public string? SanitiserListsFile { get; set; }
+        public bool SanitiserFailWrite { get; set; }
+
+        public void NextBridgeOutput(string[] envelopes) => _bridgeOutputs.Enqueue(envelopes);
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (exec.Argv.Count == 0)
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+
+            // Bridge materialise: `bash -c "set -eu\n...base64 -d > ..."`.
+            if (IsBash(exec, "-c") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal)
+                && exec.Argv[2].Contains("base64 -d", StringComparison.Ordinal))
+            {
+                if (FailMaterialise)
+                    return Task.FromResult(new SandboxExecResult(1, "", "permission denied"));
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            // Sanitiser discovery: `bash -c "...session_root..."` with no Stdin.
+            if (IsBash(exec, "-c") && exec.Argv[2].Contains("session_root", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, SanitiserListsFile ?? "", ""));
+            }
+
+            // Sanitiser read: `bash -c "cat -- \"$1\" ..." _ <path>`.
+            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat -- ", StringComparison.Ordinal) && exec.Stdin is null)
+            {
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            // Sanitiser write: `bash -c "cat > \"$1\"" _ <path>` with Stdin.
+            if (IsBash(exec, "-c") && exec.Argv[2].Contains("cat > ", StringComparison.Ordinal))
+            {
+                if (SanitiserFailWrite)
+                    return Task.FromResult(new SandboxExecResult(1, "", "no space left on device"));
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            // Bridge invocation: `bash -lc "exec '<node>' $HOME/.codeybox/...cjs"`.
+            if (IsBash(exec, "-lc") && exec.Argv[2].Contains("claude-acp-bridge.cjs", StringComparison.Ordinal))
+            {
+                BridgeExecs.Add(exec);
+                var envelopes = _bridgeOutputs.Count > 0
+                    ? _bridgeOutputs.Dequeue()
+                    : Array.Empty<string>();
+                var stdout = string.Join("\n", envelopes) + (envelopes.Length > 0 ? "\n" : "");
+                exec.StdoutChunkCallback?.Invoke(stdout);
+                return Task.FromResult(new SandboxExecResult(BridgeExitCode, stdout, ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        private static bool IsBash(SandboxExec exec, string flag)
+            => exec.Argv.Count >= 3 && exec.Argv[0] == "bash" && exec.Argv[1] == flag;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
