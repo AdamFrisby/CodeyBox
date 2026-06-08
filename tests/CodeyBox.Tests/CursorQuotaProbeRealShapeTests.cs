@@ -23,6 +23,10 @@ public sealed class CursorQuotaProbeRealShapeTests
             snapshot.ResetAt);
         Assert.True(snapshot.PerModel.ContainsKey("composer-2.5"));
         Assert.Equal(0.0, snapshot.PerModel["composer-2.5"].AvailablePct, precision: 5);
+        // Auto bucket is at 0% just like overall, so no cap is applied — the
+        // Window string stays "auto" rather than "auto (capped by overall)".
+        Assert.Contains("auto", snapshot.PerModel["composer-2.5"].Window);
+        Assert.DoesNotContain("capped", snapshot.PerModel["composer-2.5"].Window);
         Assert.False(snapshot.PerModel.ContainsKey("cursor-auto"));
         Assert.False(snapshot.PerModel.ContainsKey("cursor-api"));
     }

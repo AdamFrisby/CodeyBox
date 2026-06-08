@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
@@ -242,6 +243,24 @@ public sealed class CursorQuotaProbeTests
         {
           "planUsage": {
             "totalSpend": 19903,
+            "limit": 2000,
+            "remainingBonus": false,
+            "totalPercentUsed": 90
+          }
+        }
+        """);
+        Assert.Equal(0.0, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public void ParseResponse_BonusExhaustedAndSpendEqualsLimit_Forces0Pct()
+    {
+        // Boundary: IsExplicitlyOutOfUsage uses totalSpend >= limit. Pin the
+        // equality case so a future flip to `>` doesn't silently regress.
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalSpend": 2000,
             "limit": 2000,
             "remainingBonus": false,
             "totalPercentUsed": 90
@@ -495,6 +514,37 @@ public sealed class CursorQuotaProbeTests
         Assert.Contains("50", redacted);
     }
 
+    [Theory]
+    [InlineData("accessToken")]
+    [InlineData("apiKey")]
+    [InlineData("clientSecret")]
+    [InlineData("userPassword")]
+    [InlineData("authHeader")]
+    [InlineData("sessionId")]
+    [InlineData("setCookie")]
+    [InlineData("bearerToken")]
+    [InlineData("access-token")] // kebab-case must also be caught
+    public void RedactAndCap_RedactsEveryTokenLikeKeyword(string fieldName)
+    {
+        var input = $$"""{"{{fieldName}}":"super-secret-value"}""";
+        var redacted = CursorQuotaProbe.RedactAndCap(input, 1024);
+        Assert.DoesNotContain("super-secret-value", redacted);
+        Assert.Contains("<redacted>", redacted);
+    }
+
+    [Fact]
+    public void RedactAndCap_HandlesJsonEscapedQuotesInValue()
+    {
+        // JSON value contains an escaped quote — the regex value class must
+        // match across `\"` so the suffix after the escape doesn't leak.
+        var input = """{"sessionToken":"abc\"def","totalPercentUsed":50}""";
+        var redacted = CursorQuotaProbe.RedactAndCap(input, 1024);
+        Assert.DoesNotContain("abc", redacted);
+        Assert.DoesNotContain("def", redacted);
+        Assert.Contains("<redacted>", redacted);
+        Assert.Contains("50", redacted);
+    }
+
     [Fact]
     public void RedactAndCap_TruncatesOversizedBodies()
     {
@@ -502,6 +552,54 @@ public sealed class CursorQuotaProbeTests
         var redacted = CursorQuotaProbe.RedactAndCap(body, 100);
         Assert.True(redacted.Length <= 100 + 16);
         Assert.EndsWith("[truncated]", redacted);
+    }
+
+    [Fact]
+    public void ParseResponse_DecimalStringPercents_ParsedInvariantCulture()
+    {
+        // TryGetDouble is pinned to NumberStyles.Float + invariant culture so
+        // a decimal-point fraction parses identically regardless of the runtime
+        // locale (some locales would otherwise expect a comma separator).
+        var snap = CursorQuotaProbe.ParseResponse("""
+        {
+          "planUsage": {
+            "totalPercentUsed": "55.5",
+            "autoPercentUsed": "30.25",
+            "apiPercentUsed": "10.0"
+          }
+        }
+        """);
+        Assert.Equal(44.5, snap.AvailablePct, precision: 5);
+    }
+
+    [Fact]
+    public async Task FetchAsync_UnexpectedShape_LogsRawBodyAtDebugRedacted()
+    {
+        // Diagnosability guarantee: when ParseResponse falls through to
+        // Unknown("unexpected response shape"), FetchAsync must log the raw
+        // body at Debug so the next shape drift isn't another silent guess.
+        // Asserting at the wiring layer guards the LogDebug call itself
+        // (removing it or swapping the Notes comparison would not be caught
+        // by the ParseResponse unit tests).
+        const string unexpectedBody = """{"sessionToken":"leaked-bearer","unrelated":"keep-me"}""";
+        var handler = UsageHandler(usageBody: unexpectedBody);
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var logger = new CapturingLogger<CursorQuotaProbe>();
+        var probe = new CursorQuotaProbe(
+            factory,
+            "test-token",
+            TimeSpan.FromSeconds(60),
+            logger);
+
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+        Assert.Equal(-1, snap.AvailablePct);
+
+        var debugEntries = logger.Entries.Where(e => e.Level == LogLevel.Debug).ToArray();
+        Assert.Contains(debugEntries, e =>
+            e.Message.Contains("unexpected response shape", StringComparison.Ordinal) &&
+            e.Message.Contains("<redacted>", StringComparison.Ordinal) &&
+            e.Message.Contains("keep-me", StringComparison.Ordinal) &&
+            !e.Message.Contains("leaked-bearer", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -68,12 +68,23 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
     private const int UnexpectedShapeLogCapChars = 1024;
 
+    // Single source of truth for the "fell through to Unknown" sentinel.
+    // FetchAsync uses it to decide whether to log the raw response body for
+    // diagnosis; ParseResponse returns it. Keeping them in lockstep prevents
+    // the silent-fallthrough regression this probe was rewritten to avoid.
+    internal const string UnexpectedShapeNotes = "unexpected response shape";
+
     private static readonly Regex OutOfUsageDisplayMessagePattern = new(
         @"hit your .*usage limit",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
+    // Value class is `(?:[^"\\]|\\.)*` so JSON strings with escaped quotes
+    // (e.g. "sessionToken":"abc\"def") are matched in full instead of stopping
+    // at the first escape, which would leave the suffix exposed in the
+    // operator log. Field-name class allows hyphens too, so kebab-case keys
+    // (e.g. "access-token") don't silently bypass redaction.
     private static readonly Regex TokenLikeFieldPattern = new(
-        @"(""[A-Za-z0-9_]*(?:token|key|secret|password|auth|session|cookie|bearer)[A-Za-z0-9_]*"")\s*:\s*""[^""]*""",
+        @"(""[A-Za-z0-9_\-]*(?:token|key|secret|password|auth|session|cookie|bearer)[A-Za-z0-9_\-]*"")\s*:\s*""(?:[^""\\]|\\.)*""",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static readonly string[] FallbackAutoBucketModels =
@@ -231,7 +242,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             // is what made the prior shape-mismatch invisible for weeks. Capped
             // and token-redacted so we don't leak bearer-shaped strings into
             // operator logs.
-            if (string.Equals(snapshot.Notes, "unexpected response shape", StringComparison.Ordinal))
+            if (string.Equals(snapshot.Notes, UnexpectedShapeNotes, StringComparison.Ordinal))
             {
                 _log.LogDebug(
                     "Cursor quota probe: unexpected response shape; raw body (redacted, capped to {Cap} chars): {Body}",
@@ -272,7 +283,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             if (!root.TryGetProperty("planUsage", out var planUsage) ||
                 planUsage.ValueKind != JsonValueKind.Object)
             {
-                return Unknown("unexpected response shape");
+                return Unknown(UnexpectedShapeNotes);
             }
 
             var hasTotal = TryGetDoubleProperty(planUsage, "totalPercentUsed", out var totalUsed);
@@ -280,7 +291,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             var hasApi = TryGetDoubleProperty(planUsage, "apiPercentUsed", out var apiUsed);
 
             if (!hasTotal && !hasAuto && !hasApi)
-                return Unknown("unexpected response shape");
+                return Unknown(UnexpectedShapeNotes);
 
             // Most-constrained percent dimension wins. The real shape can carry
             // total/auto/api at different fractions (e.g. auto fully used,
