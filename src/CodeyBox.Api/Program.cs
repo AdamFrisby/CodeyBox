@@ -506,40 +506,9 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var live = new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions();
-    ApplyClaudeSessionOptions(live, monitor.CurrentValue.ClaudeSession);
-    monitor.OnChange(opts => ApplyClaudeSessionOptions(live, opts.ClaudeSession));
+    ClaudeSessionOptionsBinder.Apply(live, monitor.CurrentValue.ClaudeSession);
+    monitor.OnChange(opts => ClaudeSessionOptionsBinder.Apply(live, opts.ClaudeSession));
     return live;
-
-    static void ApplyClaudeSessionOptions(
-        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions target,
-        ClaudeSessionOptions src)
-    {
-        target.Enabled = src.Enabled;
-        target.EmitTurnMetrics = src.EmitTurnMetrics;
-        target.Transport = ParseTransport(src.Transport);
-        ReplaceOverrides(target.TransportOverridesByAgentClassMember, src.TransportOverridesByAgentClassMember);
-        ReplaceOverrides(target.TransportOverridesByProject, src.TransportOverridesByProject);
-    }
-
-    static CodeyBox.Agents.Claude.ClaudeSessionTransport ParseTransport(string? value) =>
-        string.IsNullOrWhiteSpace(value)
-            ? CodeyBox.Agents.Claude.ClaudeSessionTransport.Print
-            : Enum.TryParse<CodeyBox.Agents.Claude.ClaudeSessionTransport>(value, ignoreCase: true, out var parsed)
-                ? parsed
-                : CodeyBox.Agents.Claude.ClaudeSessionTransport.Print;
-
-    static void ReplaceOverrides(
-        System.Collections.Concurrent.ConcurrentDictionary<string, CodeyBox.Agents.Claude.ClaudeSessionTransport> target,
-        IReadOnlyDictionary<string, string>? source)
-    {
-        target.Clear();
-        if (source is null) return;
-        foreach (var (key, value) in source)
-        {
-            if (string.IsNullOrWhiteSpace(key)) continue;
-            target[key] = ParseTransport(value);
-        }
-    }
 });
 // Default metrics sink is the no-op; operators wire a logging/metrics-backed
 // sink by registering their own IClaudeSessionMetricsSink before this line.

@@ -287,6 +287,56 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpTurn_TransportUnavailableAfterSuccessfulTurn_DoesNotPassAcpIdToPrint()
+    {
+        // Regression: previously SendTurnAsync built turnRequest with the
+        // captured ACP session id BEFORE the transport call, and reused the
+        // same turnRequest in the post-degrade retry. The print transport
+        // then received the ACP UUID as --resume, which claude --print does
+        // not know — the second turn would silently fail. The fix rebuilds
+        // turnRequest after DegradeToPrintAsync clears CapturedSessionId.
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-fallback-2"));
+        var fakeAcp = new FakeAcpTransport(
+            new FakeAcpResult("acp-cont-id", "first ok"),
+            new FakeAcpResult(
+                SessionId: "ignored",
+                AssistantText: "",
+                ThrowUnavailable: new AcpTransportUnavailableException("bridge died mid-session")));
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
+            acpTransport: fakeAcp);
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        var first = await worker.SendTurnAsync(handle, "first");
+        Assert.True(first.Success);
+        // ACP id was captured.
+        Assert.Equal("acp-cont-id",
+            worker.SnapshotPersistedHandle(handle).Metadata![ClaudeSessionWorker.CliSessionIdMetadataKey]);
+
+        // Second turn: ACP throws unavailable. Worker degrades and retries via
+        // the print transport. The print invocation MUST NOT receive
+        // --resume acp-cont-id (claude --print does not know that id).
+        var second = await worker.SendTurnAsync(handle, "second");
+        Assert.True(second.Success);
+
+        Assert.Single(sandbox.AllClaudeExecs);
+        var argv = sandbox.LastClaudeExec!.Argv.ToList();
+        Assert.Contains("--print", argv);
+        Assert.DoesNotContain("--resume", argv);
+        Assert.DoesNotContain("acp-cont-id", argv);
+
+        // Persisted handle reflects the degrade. The print transport captured
+        // its own CLI session id ("cli-fallback-2") on the retry — the stale
+        // ACP id ("acp-cont-id") must not survive on the snapshot.
+        var snapshot = worker.SnapshotPersistedHandle(handle);
+        Assert.Equal("print", snapshot.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+        Assert.Equal("true", snapshot.Metadata[ClaudeSessionWorker.AcpFallbackToPrintMetadataKey]);
+        if (snapshot.Metadata.TryGetValue(ClaudeSessionWorker.CliSessionIdMetadataKey, out var persistedId))
+            Assert.NotEqual("acp-cont-id", persistedId);
+    }
+
+    [Fact]
     public async Task AcpUnregistered_AcpRequested_DegradesToPrintCleanly()
     {
         // No acpTransport supplied at all — operator config says acp but
@@ -406,6 +456,126 @@ public sealed class ClaudeAcpTransportTests
         Assert.Equal("print", handle.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
         Assert.False(handle.Metadata.ContainsKey(ClaudeSessionWorker.AgentClassMemberMetadataKey));
         Assert.False(handle.Metadata.ContainsKey(ClaudeSessionWorker.ProjectIdMetadataKey));
+    }
+
+    // ── Post-restart reattach honours persisted transport metadata ────────────
+
+    [Fact]
+    public async Task Reattach_PersistedAcpFallbackMetadata_InheritsPrintTransport()
+    {
+        // Simulates orchestrator restart: a handle whose prior run degraded
+        // ACP→print carries AcpFallbackToPrintMetadataKey=true. On reattach
+        // ResolveStateAsync must inherit the print transport rather than
+        // retrying ACP on every turn. The ACP transport stays registered to
+        // prove the worker explicitly skips it when the metadata says
+        // "degraded".
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-reattach-degraded"));
+        var fakeAcp = new FakeAcpTransport(new FakeAcpResult("acp-should-not-be-used", "nope"));
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp };
+        var degradedCalls = new List<string>();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxReattacher: (_, _) => Task.FromResult<ISandbox>(sandbox),
+            options: opts,
+            acpTransport: fakeAcp,
+            onTransportDegraded: (_, reason) => degradedCalls.Add(reason));
+
+        var persisted = new AgentSessionHandle(
+            AgentKind.Claude,
+            "claude-session-reattach-degraded",
+            new AgentSessionSandboxRef("vm-reattach-degraded"),
+            "/work",
+            Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [ClaudeSessionWorker.AcpFallbackToPrintMetadataKey] = "true",
+            });
+
+        var result = await worker.SendTurnAsync(persisted, "after restart in degraded mode");
+        Assert.True(result.Success);
+
+        // ACP transport was never opened.
+        Assert.Equal(0, fakeAcp.OpenCount);
+        Assert.Empty(degradedCalls);
+        // Print transport ran exactly once.
+        Assert.Single(sandbox.AllClaudeExecs);
+        Assert.Contains("--print", sandbox.LastClaudeExec!.Argv);
+
+        // Persisted handle continues to advertise degraded state.
+        var snapshot = worker.SnapshotPersistedHandle(persisted);
+        Assert.Equal("print", snapshot.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+        Assert.Equal("true", snapshot.Metadata[ClaudeSessionWorker.AcpFallbackToPrintMetadataKey]);
+    }
+
+    [Fact]
+    public async Task Reattach_PersistedAgentClassMemberMetadata_ReResolvesViaOverride()
+    {
+        // Reattach replays per-class-member override resolution against the
+        // persisted metadata. Global default is Print; the persisted member
+        // points at the Acp override, so the reattach opens the ACP transport.
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-should-not-be-used"));
+        var fakeAcp = new FakeAcpTransport(new FakeAcpResult("acp-reattach", "ok"));
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Print };
+        opts.TransportOverridesByAgentClassMember["claude-fast"] = ClaudeSessionTransport.Acp;
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxReattacher: (_, _) => Task.FromResult<ISandbox>(sandbox),
+            options: opts,
+            acpTransport: fakeAcp);
+
+        var persisted = new AgentSessionHandle(
+            AgentKind.Claude,
+            "claude-session-reattach-member",
+            new AgentSessionSandboxRef("vm-reattach-member"),
+            "/work",
+            Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [ClaudeSessionWorker.AgentClassMemberMetadataKey] = "claude-fast",
+            });
+
+        var result = await worker.SendTurnAsync(persisted, "after restart");
+        Assert.True(result.Success);
+
+        // ACP transport was used (per-member override won); print never ran.
+        Assert.Equal(1, fakeAcp.OpenCount);
+        Assert.Empty(sandbox.AllClaudeExecs);
+
+        var snapshot = worker.SnapshotPersistedHandle(persisted);
+        Assert.Equal("acp", snapshot.Metadata![ClaudeSessionWorker.TransportMetadataKey]);
+    }
+
+    [Fact]
+    public async Task Reattach_PersistedProjectMetadata_ReResolvesViaProjectOverride()
+    {
+        // Same as the per-member case but for ProjectIdMetadataKey. The
+        // persisted project id picks the Acp override even though the global
+        // default is Print.
+        var sandbox = new RecordingSandbox(StreamJsonOk("cli-should-not-be-used"));
+        var fakeAcp = new FakeAcpTransport(new FakeAcpResult("acp-reattach-proj", "ok"));
+        var opts = new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Print };
+        opts.TransportOverridesByProject["proj-acp"] = ClaudeSessionTransport.Acp;
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxReattacher: (_, _) => Task.FromResult<ISandbox>(sandbox),
+            options: opts,
+            acpTransport: fakeAcp);
+
+        var persisted = new AgentSessionHandle(
+            AgentKind.Claude,
+            "claude-session-reattach-proj",
+            new AgentSessionSandboxRef("vm-reattach-proj"),
+            "/work",
+            Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [ClaudeSessionWorker.ProjectIdMetadataKey] = "proj-acp",
+            });
+
+        var result = await worker.SendTurnAsync(persisted, "after restart");
+        Assert.True(result.Success);
+
+        Assert.Equal(1, fakeAcp.OpenCount);
+        Assert.Empty(sandbox.AllClaudeExecs);
+        Assert.Equal("acp",
+            worker.SnapshotPersistedHandle(persisted).Metadata![ClaudeSessionWorker.TransportMetadataKey]);
     }
 
     // ── Real AcpClaudeTransport — bridge materialisation + turn round-trip ───
@@ -727,7 +897,8 @@ public sealed class ClaudeAcpTransportTests
         string AssistantText,
         int InputTokens = 0,
         int CacheReadInputTokens = 0,
-        int OutputTokens = 0);
+        int OutputTokens = 0,
+        AcpTransportUnavailableException? ThrowUnavailable = null);
 
     private sealed class FakeAcpTransport : IClaudeTransport
     {
@@ -762,6 +933,8 @@ public sealed class ClaudeAcpTransportTests
         {
             TurnRequests.Add(request);
             var canned = _results.Count > 0 ? _results.Dequeue() : new FakeAcpResult("acp-fallthrough", "");
+            if (canned.ThrowUnavailable is not null)
+                throw canned.ThrowUnavailable;
             var streamJson = BuildShim(canned);
             var result = new AgentResult(true, "ok", streamJson, null);
             return Task.FromResult(new ClaudeTransportTurnResult(result, streamJson, canned.SessionId));

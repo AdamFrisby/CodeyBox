@@ -317,6 +317,14 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             catch (AcpTransportUnavailableException unavailable)
             {
                 await DegradeToPrintAsync(sessionHandle, state, unavailable.Message, ct).ConfigureAwait(false);
+                // DegradeToPrintAsync cleared CapturedSessionId because the
+                // prior ACP id is meaningless to the print transport. The
+                // pre-degrade turnRequest still carries that ACP UUID as the
+                // resume id, so rebuild it from the post-degrade state before
+                // the print transport sees it.
+                var fallbackResumeId = state.FallbackToFresh ? null : state.CapturedSessionId;
+                turnRequest = new ClaudeTransportTurnRequest(prompt, fallbackResumeId, stdoutChunkCallback);
+                resumeId = fallbackResumeId;
                 turn = await state.TransportSession.SendTurnAsync(turnRequest, ct).ConfigureAwait(false);
             }
 
