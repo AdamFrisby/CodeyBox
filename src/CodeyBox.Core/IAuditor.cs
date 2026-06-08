@@ -42,6 +42,15 @@ public interface IAuditor
     /// </summary>
     string? SelfReviewGuidance => null;
 
+    /// <summary>
+    /// Optional role marker used by the pipeline to gate later auditors. The
+    /// default <see cref="AuditorRole.None"/> means "no special role". Marking
+    /// the deterministic build/test commands as <see cref="AuditorRole.BuildTestGate"/>
+    /// guarantees they run and pass before any LLM auditor panel — the panel's
+    /// prompt frame asserts "CI built the project and ran tests with no failures"
+    /// and that claim must stay true.
+    /// </summary>
+    AuditorRole Role => AuditorRole.None;
 
     /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
@@ -72,6 +81,30 @@ public enum AuditCapabilities
     Network = 1 << 1,
     /// <summary>Auditor needs a sandbox with graphical desktop capabilities.</summary>
     Graphical = 1 << 2,
+}
+
+/// <summary>
+/// Coarse-grained role classification used by the pipeline to enforce
+/// cross-auditor ordering invariants. Distinct from <see cref="AuditCapabilities"/>:
+/// capabilities describe what an auditor NEEDS; <see cref="AuditorRole"/>
+/// describes what role it FILLS in the audit panel.
+/// </summary>
+public enum AuditorRole
+{
+    /// <summary>Default — no special ordering or gating semantics.</summary>
+    None,
+
+    /// <summary>
+    /// Deterministic build/test gate (e.g. <c>csharp:build-WaE</c>,
+    /// <c>csharp:test-pass</c>). The pipeline GUARANTEES every auditor with
+    /// this role runs to completion and passes before any LLM-driven auditor
+    /// runs in the same audit iteration. If any build/test gate produces a
+    /// blocking finding, the LLM panel is skipped for that iteration — the
+    /// panel's prompt frame says CI built and tested the project with no
+    /// failures, and that claim must never be a lie. Findings still flow to
+    /// rework as normal.
+    /// </summary>
+    BuildTestGate,
 }
 
 /// <summary>Information the pipeline passes to each auditor.</summary>

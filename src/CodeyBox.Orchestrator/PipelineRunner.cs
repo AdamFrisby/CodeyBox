@@ -6417,6 +6417,26 @@ public sealed class PipelineRunner : IPipelineRunner
             }
         }
 
+        // Re-order so:
+        //   1. BuildTestGate-role auditors run first (deterministic build+test
+        //      must provably pass before any LLM panel runs, because the LLM
+        //      prompt frame asserts "CI built and ran tests with no failures"
+        //      and that claim must always be TRUE).
+        //   2. Other tool/local auditors next.
+        //   3. Credential-requiring (LLM) auditors last.
+        // List.Sort with a stable-feeling key keeps the original registration
+        // order within each tier. The byCaps GroupBy below preserves
+        // first-seen-key order, so tool groups (and BuildTestGate within them)
+        // iterate before any LLM group.
+        resolved.Sort((a, b) =>
+        {
+            static int Tier(IAuditor auditor)
+                => auditor.Role == AuditorRole.BuildTestGate ? 0
+                    : auditor.Required.HasFlag(AuditCapabilities.AgentCredentials) ? 2
+                    : 1;
+            return Tier(a.Auditor) - Tier(b.Auditor);
+        });
+
         // Group by (capabilities, resolved-runner-kind) so auditors that need
         // different agent credentials get separate sandboxes — each sandbox is
         // only ever loaded with the credentials of a single agent kind.
@@ -6428,6 +6448,13 @@ public sealed class PipelineRunner : IPipelineRunner
                     ? x.Member?.RouteKey ?? x.Runner.Kind.Value
                     : string.Empty))
             .ToList();
+
+        // Once any BuildTestGate auditor produces a blocking finding, the
+        // LLM panel's prompt-frame claim ("CI built the project and ran the
+        // full test suite with no failures") would be false, so we skip LLM
+        // auditors entirely for this iteration. The build/test findings still
+        // flow to rework as normal.
+        var buildTestGateFailed = false;
 
         foreach (var group in byCaps)
         {
@@ -6586,7 +6613,10 @@ public sealed class PipelineRunner : IPipelineRunner
                         {
                             declaredShortCircuitBlocking = true;
                         }
-                        if (project.Audit.StopOnFirstFailure && HasAuditBlockingFinding(run.Result, project))
+                        var blockingForThisAuditor = HasAuditBlockingFinding(run.Result, project);
+                        if (auditor.Role == AuditorRole.BuildTestGate && blockingForThisAuditor)
+                            buildTestGateFailed = true;
+                        if (project.Audit.StopOnFirstFailure && blockingForThisAuditor)
                             return new AuditorBatchResult(
                                 findings.ToList(),
                                 activeAuditAgentKind,
@@ -6628,6 +6658,14 @@ public sealed class PipelineRunner : IPipelineRunner
             // /audit/result.json. Post-processing is sequential and stable-ordered.
             if (llmPairs.Count > 0)
             {
+                if (buildTestGateFailed)
+                {
+                    _log.LogInformation(
+                        "Audit iteration {Iter}: skipping {Count} LLM auditor(s) because a build/test gate produced a blocking finding — the LLM prompt frame asserts CI passed, so the panel must not run when that claim is false",
+                        ctx.Iteration, llmPairs.Count);
+                    AuditLog.LlmPanelSkippedBuildTestGate(item.Id, llmPairs.Count);
+                    continue;
+                }
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
                 using var sem = new SemaphoreSlim(maxPar, maxPar);
 

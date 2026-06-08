@@ -36,9 +36,11 @@ internal static class AuditTypePresets
         // 1. Add explicitly configured auditors (usually ShellCommandAuditors).
         foreach (var a in definition.Auditors)
         {
+            var role = PresetConfigLoader.ParseAuditorRole(
+                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
             if (string.IsNullOrWhiteSpace(a.Script))
             {
-                auditors.Add(Shell(a.Name, a.CanShortCircuitOnBlockingFinding, [.. a.Argv]));
+                auditors.Add(Shell(a.Name, a.CanShortCircuitOnBlockingFinding, role, [.. a.Argv]));
             }
             else
             {
@@ -52,6 +54,7 @@ internal static class AuditTypePresets
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
+                    Role = role,
                 }));
             }
         }
@@ -92,12 +95,17 @@ internal static class AuditTypePresets
             FrameTemplate = frameTemplate,
         });
 
-    private static IAuditor Shell(string name, bool canShortCircuitOnBlockingFinding, params string[] argv)
+    private static IAuditor Shell(
+        string name,
+        bool canShortCircuitOnBlockingFinding,
+        AuditorRole role,
+        params string[] argv)
         => new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
             Name = name,
             Argv = argv,
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
+            Role = role,
         });
 }
 

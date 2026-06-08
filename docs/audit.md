@@ -86,6 +86,25 @@ network (downloading CVE feeds, fetching package versions), declare
 if the auditor itself is an LLM call. Declare `AuditCapabilities.Graphical`
 when the auditor requires a desktop sandbox.
 
+### Build/test gate ordering
+
+In addition to capability flags, an auditor can declare a `Role` of
+`AuditorRole.BuildTestGate`. The pipeline GUARANTEES every BuildTestGate
+auditor runs and passes before any LLM-driven auditor runs in the same
+audit iteration. If any BuildTestGate auditor produces a blocking finding,
+the LLM panel is skipped for that iteration — the LLM prompt frame asserts
+that CI built the project and ran tests with no failures, and that claim
+must never be false. The findings still flow to rework as normal.
+
+This gate is independent of `StopOnFirstFailure`: even when the option is
+`false` (the default), a failing build/test gate still short-circuits the
+LLM panel. Tool auditors without the role (e.g. format-check) do not gate
+the panel, because the panel's CI claim only covers build and tests.
+
+Built-in language presets mark `<lang>:build-*` and `<lang>:test-*`
+auditors as BuildTestGate. Repository-supplied YAML may also mark its own
+shell auditors with `role: build-test-gate`.
+
 ## Built-in auditors
 
 ### `ShellCommandAuditor` (`CodeyBox.Audit.Shell`)

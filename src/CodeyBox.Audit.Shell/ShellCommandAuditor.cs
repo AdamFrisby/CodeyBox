@@ -44,6 +44,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         }
     }
 
+    public AuditorRole Role => _opts.Role;
 
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder
@@ -152,4 +153,5 @@ public sealed record ShellCommandAuditorOptions
     public bool? TreatExit127AsMissingTool { get; init; }
     public IShellCommandResultClassifier? ResultClassifier { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
+    public AuditorRole Role { get; init; } = AuditorRole.None;
 }
