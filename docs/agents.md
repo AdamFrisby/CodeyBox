@@ -113,6 +113,47 @@ Adding them would mean implementing a streaming variant of `ISandbox.ExecAsync`
 plus a turn-loop in the runner — both are bounded scope and can be added
 without changing the orchestrator.
 
+## Session-capable runners
+
+`IAgentRunner.RunAsync` remains the default one-shot contract. Runners that can
+preserve logical conversation context across multiple turns may additionally
+implement `ISessionAgentRunner`:
+
+- `OpenSessionAsync(...)` opens a logical session against an already-created
+  sandbox/VM.
+- `SendTurnAsync(handle, prompt, ...)` sends one turn and returns an
+  `AgentResult`; the session remains open.
+- `SuspendSessionAsync(handle)` persists enough runner state that the
+  underlying VM may be stopped to free resources.
+- `ResumeSessionAsync(handle)` starts or reattaches to the same VM and prepares
+  the stored runner session for another turn.
+- `CloseSessionAsync(handle)` ends the logical session and disposes the VM.
+
+The durable handle is `AgentSessionHandle`. It stores the runner kind, the
+runner/provider session ID, the working directory, model/reasoning settings,
+and an `AgentSessionSandboxRef` naming the exact sandbox/VM. That VM reference
+is load-bearing: session resume must reattach to the same stopped/resumed VM,
+not create a fresh clone, because the working tree and any runner-local state
+belong to that VM.
+
+The handle is safe to serialize for orchestrator restart recovery because it
+contains only durable identifiers and non-secret metadata; it never stores the
+live `ISandbox` object or `AgentCredential`. Credentials must be reacquired
+through the normal credential provider after a restart. A persistent Claude
+implementation can therefore store a handle containing `{ sessionId:
+"<claude resume id>", sandbox:
+"<multipass vm name>" }`, stop the VM between phases, and later run the next
+turn by resuming that VM and invoking Claude with its resume ID. The Anthropic
+prompt cache is server-side, so a live process is not required between turns;
+landing the next turn within the provider TTL preserves the cache benefit, and
+the session ID preserves conversation context regardless of VM stop/start.
+
+For runners that do not implement true sessions, `StatelessSessionAgentRunner`
+adapts any `IAgentRunner` into the session contract by calling `RunAsync` for
+each turn. This has no prompt-cache or conversation-context benefit, but lets
+session-aware pipeline code treat non-session runners uniformly without
+changing existing one-shot behavior.
+
 ## Per-agent quirks
 
 ### Claude Code
