@@ -1535,6 +1535,20 @@ builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
+
+// Mutation-testing rigor gate (disabled by default; per-project threshold).
+// The auditor short-circuits to pass when Enabled=false, so registering the
+// defaults is safe; operators replace IMutationRunner / IMutationRatchetStore
+// with their own implementations to turn the gate on.
+builder.Services.Configure<MutationTestingAuditorOptions>(
+    builder.Configuration.GetSection("CodeyBox:Mutation"));
+builder.Services.TryAddSingleton<IMutationRunner, NullMutationRunner>();
+builder.Services.TryAddSingleton<IMutationRatchetStore, InMemoryMutationRatchetStore>();
+builder.Services.AddSingleton<IAuditor>(sp => new MutationTestingAuditor(
+    sp.GetRequiredService<IOptions<MutationTestingAuditorOptions>>().Value,
+    sp.GetRequiredService<IMutationRunner>(),
+    sp.GetRequiredService<IMutationRatchetStore>()));
+
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------

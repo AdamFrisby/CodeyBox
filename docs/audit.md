@@ -179,6 +179,14 @@ Configured via `reviewFocus` and `llmAuditorName` in audit-type YAML.
 
 Capability: `AgentCredentials | Network`.
 
+## Per-item testing rigor gate
+
+The `tests:mutation-rigor` auditor enforces a kill-the-mutant gate on the
+code CHANGED in a work item, scoped to the diff and parallelised in the
+runner. See [`mutation-testing.md`](mutation-testing.md) for configuration,
+runtime budget, and ratchet semantics. Disabled by default — opt in per
+project.
+
 ## Rework prompt
 
 When an audit iteration fails, `ReworkPromptBuilder` assembles a prompt
