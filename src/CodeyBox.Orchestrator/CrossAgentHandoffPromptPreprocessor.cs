@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
@@ -22,6 +23,18 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class CrossAgentHandoffPromptPreprocessor : IAgentPromptPreprocessor
 {
+    private const int MaxBriefChars = 32 * 1024;
+
+    // Captures any line that looks like one of OUR fence delimiters or
+    // section headers — `---` runs and `##` markdown headings — so a
+    // builder that emits attacker-controlled text cannot break out of
+    // the BEGIN/END fences or impersonate the "## Agent prompt" header
+    // that follows. We neutralise rather than drop so a redacted brief
+    // is still informative.
+    private static readonly Regex StructuralLine = new(
+        @"^[ \t]*(---+.*|##+\s.*)$",
+        RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private readonly IAgentInvolvementStore? _involvement;
     private readonly ICrossAgentHandoffBriefBuilder? _briefBuilder;
     private readonly ILogger<CrossAgentHandoffPromptPreprocessor> _log;
@@ -80,13 +93,15 @@ public sealed class CrossAgentHandoffPromptPreprocessor : IAgentPromptPreprocess
         if (string.IsNullOrWhiteSpace(brief))
             return prompt;
 
+        var sanitisedBrief = NeutraliseStructuralDelimiters(LimitBriefText(brief.Trim()));
+
         return $$"""
             ## Cross-agent handoff
 
             This work item was previously handled by **{{priorAgent.Value.Value}}** and is now being routed to **{{ctx.AgentKind.Value}}** as a fallback. The orchestrator has condensed what the prior agent did and the state of the work branch so you can continue without redoing finished work.
 
             --- BEGIN HANDOFF BRIEF ---
-            {{brief.Trim()}}
+            {{sanitisedBrief}}
             --- END HANDOFF BRIEF ---
 
             ## Agent prompt
@@ -96,12 +111,48 @@ public sealed class CrossAgentHandoffPromptPreprocessor : IAgentPromptPreprocess
     }
 
     /// <summary>
-    /// Returns the <see cref="AgentKind"/> of the most recent involvement
-    /// entry whose agent differs from <paramref name="currentAgent"/>. The
-    /// store's <c>ListByWorkItemAsync</c> contract is oldest-first, so we
-    /// scan in reverse. A null return means there is no prior cross-agent
-    /// record — either it's the first invocation or every prior entry is the
-    /// same kind as the current invocation (a same-agent rework).
+    /// Caps the brief at <see cref="MaxBriefChars"/> UTF-16 code units. The
+    /// builder is supposed to produce a condensed brief; an oversized one
+    /// risks blowing the agent's context window. UTF-16 surrogate pairs are
+    /// kept whole so the truncated prefix is a valid string.
+    /// </summary>
+    private static string LimitBriefText(string brief)
+    {
+        if (brief.Length <= MaxBriefChars)
+            return brief;
+
+        var cut = MaxBriefChars;
+        if (cut > 0 && char.IsHighSurrogate(brief[cut - 1]))
+            cut--;
+
+        return brief[..cut] + $"\n\n[Handoff brief truncated by CodeyBox at {MaxBriefChars / 1024} KiB.]";
+    }
+
+    /// <summary>
+    /// Defuses attacker-controlled lines that would otherwise close the
+    /// <c>--- BEGIN/END HANDOFF BRIEF ---</c> fence or impersonate the
+    /// following <c>## Agent prompt</c> header. Lines that look structural
+    /// get a single zero-width-space prefix so they render visibly the same
+    /// to a human reader but no longer match the fence/header shape.
+    /// </summary>
+    private static string NeutraliseStructuralDelimiters(string text) =>
+        StructuralLine.Replace(text, "​$&");
+
+    /// <summary>
+    /// Returns the <see cref="AgentKind"/> of the immediate predecessor in
+    /// the involvement trail when it differs from <paramref name="currentAgent"/>.
+    /// PipelineRunner records the current invocation's in-progress row
+    /// (<see cref="AgentInvolvement.EndedAt"/> == null) before invoking the
+    /// agent runner — and therefore before this preprocessor reads the
+    /// trail — so we skip in-progress rows to locate the true predecessor.
+    /// <para>
+    /// The brief fires only when that immediate finalized predecessor's kind
+    /// differs from the current invocation, i.e. a genuine cross-agent
+    /// fallback. A same-agent rework / retry must not inject a brief even
+    /// if an earlier entry in the trail happens to be a different kind —
+    /// the prior cross-agent transition was already handled at its own
+    /// boundary.
+    /// </para>
     /// </summary>
     private static AgentKind? ResolvePriorAgentKind(
         IReadOnlyList<AgentInvolvement> history,
@@ -110,8 +161,10 @@ public sealed class CrossAgentHandoffPromptPreprocessor : IAgentPromptPreprocess
         for (var i = history.Count - 1; i >= 0; i--)
         {
             var entry = history[i];
-            if (!entry.AgentKind.Equals(currentAgent))
-                return entry.AgentKind;
+            if (entry.EndedAt is null)
+                continue;
+
+            return entry.AgentKind.Equals(currentAgent) ? null : entry.AgentKind;
         }
 
         return null;

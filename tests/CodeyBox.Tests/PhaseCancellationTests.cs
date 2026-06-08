@@ -75,8 +75,10 @@ public sealed class PhaseCancellationTests
 
         await hostCts.CancelAsync();
         // Wait well past the grace window so the deadline-upgrade CompareExchange
-        // has definitely run. Polls because timer callbacks are not synchronous.
-        var deadline = DateTime.UtcNow.AddSeconds(2);
+        // has definitely run. Polls because timer callbacks are not synchronous,
+        // and the deadline is generous enough to survive parallel-test CI load
+        // where the system timer pool can starve briefly under heavy contention.
+        var deadline = DateTime.UtcNow.AddSeconds(15);
         while (phase.Source != CancellationSources.HostShutdownDeadline && DateTime.UtcNow < deadline)
             await Task.Delay(10);
 

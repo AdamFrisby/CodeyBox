@@ -73,12 +73,10 @@ public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreproces
             sb.Append("- **").Append(EscapeInline(attachment.FileName)).Append("**");
             if (!string.IsNullOrWhiteSpace(attachment.ContentType))
                 sb.Append(" (").Append(EscapeInline(attachment.ContentType)).Append(')');
-            sb.Append(" — `").Append(EscapeInline(attachment.InVmPath)).Append('`');
+            sb.Append(" — `").Append(EscapeBacktickInline(attachment.InVmPath)).Append('`');
             if (!string.IsNullOrWhiteSpace(attachment.Caption))
             {
-                var caption = attachment.Caption.Length > MaxCaptionChars
-                    ? attachment.Caption[..MaxCaptionChars] + "…"
-                    : attachment.Caption;
+                var caption = TruncateCaption(attachment.Caption);
                 sb.Append("\n  Caption: ").Append(EscapeInline(caption));
             }
             sb.Append('\n');
@@ -90,6 +88,47 @@ public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreproces
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Truncates a caption at <see cref="MaxCaptionChars"/> UTF-16 code units,
+    /// stepping back one char if the cut falls between a high and low
+    /// surrogate so the result is always a valid UTF-16 string. A naive slice
+    /// would emit a replacement character on re-encoding for an attachment
+    /// whose caption happens to contain a supplementary-plane emoji at the
+    /// cap boundary.
+    /// </summary>
+    private static string TruncateCaption(string caption)
+    {
+        if (caption.Length <= MaxCaptionChars)
+            return caption;
+
+        var cut = MaxCaptionChars;
+        if (cut > 0 && char.IsHighSurrogate(caption[cut - 1]))
+            cut--;
+
+        return caption[..cut] + "…";
+    }
+
     private static string EscapeInline(string value) =>
-        value.Replace("\r", string.Empty).Replace('\n', ' ');
+        value
+            .Replace("\r", string.Empty)
+            .Replace('\n', ' ')
+            // Inline emphasis and code fences would otherwise let a filename
+            // or caption open/close formatting that bleeds into the next
+            // manifest line. Zero-width-space prefixes neutralise the marker
+            // without distorting the visible glyphs.
+            .Replace("`", "​`")
+            .Replace("**", "​**");
+
+    /// <summary>
+    /// Path values are wrapped in a single-backtick code span (`<c>`path`</c>`),
+    /// so a path containing a backtick would close the span and bleed into
+    /// the surrounding markdown. Substitute the U+02CB Modifier Letter Grave
+    /// Accent which is visually indistinguishable from a backtick in a
+    /// monospace renderer but is not a markdown code delimiter.
+    /// </summary>
+    private static string EscapeBacktickInline(string value) =>
+        value
+            .Replace("\r", string.Empty)
+            .Replace('\n', ' ')
+            .Replace('`', 'ˋ');
 }
