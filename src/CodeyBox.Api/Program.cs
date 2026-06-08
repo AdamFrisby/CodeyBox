@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
@@ -488,6 +489,38 @@ builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
+
+// ClaudeSessionWorker — resumable Claude runner. Registered alongside (NOT
+// instead of) the one-shot ClaudeAgentRunner so the default dispatch path is
+// unchanged; config-gated opt-in callers resolve the concrete type to drive
+// multi-turn sessions across a stop/resume-able VM. The options snapshot is a
+// singleton so a hot reload can flip Enabled mid-process without restart.
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.ClaudeSession;
+    return new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions
+    {
+        Enabled = opts.Enabled,
+        EmitTurnMetrics = opts.EmitTurnMetrics,
+    };
+});
+// Default metrics sink is the no-op; operators wire a logging/metrics-backed
+// sink by registering their own IClaudeSessionMetricsSink before this line.
+builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(
+    CodeyBox.Agents.Claude.NullClaudeSessionMetricsSink.Instance);
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
+{
+    var runner = sp.GetServices<IAgentRunner>()
+        .OfType<ClaudeAgentRunner>()
+        .First();
+    return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
+        runner,
+        sandboxReattacher: null,
+        sandboxResumeHook: null,
+        credentialProvider: sp.GetService<ICredentialProvider>(),
+        sandboxRefFactory: null,
+        metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>());
+});
 
 // Plugin discovery result captured before builder.Build() so the credential
 // provider factory below can reference the list directly without any async
@@ -3209,6 +3242,16 @@ namespace CodeyBox.Api
         /// ships a fix.
         /// </summary>
         public ClaudeThinkingBlockSanitizerOptions ClaudeThinkingBlockSanitizer { get; set; } = new();
+
+        /// <summary>
+        /// Claude resumable-session worker configuration. Bound from
+        /// <c>CodeyBox:ClaudeSession</c>. The session worker is OFF by default;
+        /// every Claude dispatch keeps using the existing one-shot
+        /// <c>ClaudeAgentRunner</c> until an operator opts in here. See
+        /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions"/> for
+        /// behaviour.
+        /// </summary>
+        public ClaudeSessionOptions ClaudeSession { get; set; } = new();
     }
 
     /// <summary>
@@ -3262,6 +3305,30 @@ namespace CodeyBox.Api
         /// Anthropic ships a fix.
         /// </summary>
         public bool Enabled { get; set; } = true;
+    }
+
+    /// <summary>
+    /// Claude resumable-session worker configuration. Bound from
+    /// <c>CodeyBox:ClaudeSession</c>. See
+    /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionWorker"/>.
+    /// </summary>
+    public sealed class ClaudeSessionOptions
+    {
+        /// <summary>
+        /// Master switch. Default <c>false</c> — Claude dispatches keep using
+        /// the legacy one-shot runner unless an operator opts in here.
+        /// Compose with the per-agent-class-member opt-in and per-project
+        /// allow-list to route specific work items to the session worker.
+        /// </summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>
+        /// When true (default), each <c>SendTurnAsync</c> emits a
+        /// <see cref="CodeyBox.Agents.Claude.ClaudeSessionTurnMetrics"/>
+        /// snapshot to the registered metrics sink so the cache_read share is
+        /// observable. Disable for A/B comparisons against the one-shot path.
+        /// </summary>
+        public bool EmitTurnMetrics { get; set; } = true;
     }
 
     public sealed class AutoRetryOnQuotaFailureConfig

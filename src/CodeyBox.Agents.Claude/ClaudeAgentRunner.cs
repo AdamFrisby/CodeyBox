@@ -339,6 +339,23 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
     {
+        _ = resume;
+        return BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: null, captureStructuredStream);
+    }
+
+    /// <summary>
+    /// Builds the claude CLI argv used by <see cref="ClaudeSessionWorker"/> for
+    /// one turn in a multi-turn resumable session. Same shape as the one-shot
+    /// invocation plus an optional <c>--resume &lt;session-id&gt;</c> when the
+    /// session has a captured CLI session id from a prior turn.
+    /// </summary>
+    private AgentInvocation BuildClaudeSessionInvocation(
+        string prompt,
+        string? modelId,
+        string? reasoningMode,
+        string? cliResumeSessionId,
+        bool captureStructuredStream)
+    {
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
         if (captureStructuredStream)
         {
@@ -346,7 +363,11 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add("stream-json");
             argv.Add("--verbose");
         }
-        _ = resume;
+        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
+        {
+            argv.Add("--resume");
+            argv.Add(cliResumeSessionId);
+        }
         var effectiveModel = modelId ?? DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
         {
@@ -359,6 +380,94 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add(reasoningMode);
         }
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    /// <summary>
+    /// Runs one turn of a Claude resumable session. Invoked exclusively by
+    /// <see cref="ClaudeSessionWorker"/>; the public <see cref="RunAsync"/>
+    /// remains the canonical one-shot path. Materialises credentials and (when
+    /// <paramref name="cliResumeSessionId"/> is non-null) sanitises the stored
+    /// session JSONL transcripts before invocation, then optionally retries the
+    /// turn once after a thinking-block 400 — mirroring the one-shot path's
+    /// safety nets.
+    /// </summary>
+    internal async Task<AgentResult> RunSessionTurnAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? cliResumeSessionId,
+        string? modelId,
+        string? reasoningMode,
+        bool captureStructuredStream,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback)
+    {
+        using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
+
+        // Treat a turn with a resume id like the post-checkpoint resume path:
+        // the stored session JSONL needs preventive sanitisation before the
+        // CLI replays it, otherwise interleaved/partial thinking blocks
+        // produced by a prior turn surface as 400s.
+        var fakeResume = cliResumeSessionId is null
+            ? null
+            : new AgentResumeContext(CheckpointRef: $"claude-session:{cliResumeSessionId}");
+        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, fakeResume, ct)
+            .ConfigureAwait(false);
+        if (preparation is not null)
+            return preparation;
+
+        var invocation = BuildClaudeSessionInvocation(
+            prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
+
+        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+            .ConfigureAwait(false);
+
+        if (!result.Success
+            && (_sanitizerConfig is null || _sanitizerConfig.Enabled)
+            && ClaudeSessionSanitizer.IsThinkingBlockFailure(result))
+        {
+            var sanitized = await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(sandbox, ct)
+                .ConfigureAwait(false);
+            if (sanitized is null)
+            {
+                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                result = result with
+                {
+                    Summary = $"{result.Summary}; sanitiser failed: {sanitized.Summary}",
+                    Stderr = string.Concat(result.Stderr, "\n", sanitized.Stderr),
+                };
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<AgentResult> ExecOnceAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentInvocation invocation,
+        Action<string>? stdoutChunkCallback,
+        CancellationToken ct)
+    {
+        var exec = new SandboxExec
+        {
+            Argv = invocation.Argv,
+            WorkingDirectory = workingDirectory,
+            ExtraEnvironment = invocation.ExtraEnvironment,
+            Stdin = invocation.Stdin,
+            StdoutChunkCallback = stdoutChunkCallback,
+        };
+        var execResult = await sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
+        return new AgentResult(
+            Success: execResult.Success,
+            Summary: execResult.Success ? "ok" : $"agent exited {execResult.ExitCode}",
+            Stdout: execResult.Stdout,
+            Stderr: execResult.Stderr);
     }
 
     private static bool ContainsUnsupportedFlagMessage(string output) =>
