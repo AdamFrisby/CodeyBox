@@ -222,25 +222,33 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
     {
         var handler = new FakeAnthropicHandler(
             modelsResponse: (HttpStatusCode.OK, ModelsJson),
-            messagesResponder: _ => (HttpStatusCode.OK, """{"content":[{"type":"text","text":"ok"}]}"""));
+            messagesResponder: _ => (HttpStatusCode.OK, """{"content":[{"type":"text","text":"reply-body"}]}"""));
         var runner = BuildRunner(handler);
 
-        await runner.RunTextOnlyAsync("hello prompt", ApiKeyCredential(), modelId: "claude-opus-4-7");
+        var result = await runner.RunTextOnlyAsync("hello prompt", ApiKeyCredential(), modelId: "claude-opus-4-7");
+
+        // SUT outcome assertions: a successful 2xx must be reflected in the
+        // returned record. A test that asserts only against mock invocations
+        // would pass even if RunTextOnlyAsync ignored the response and
+        // returned failure — these guards block that regression.
+        Assert.True(result.Success, $"expected success; got '{result.Summary}' / '{result.Error}'");
+        Assert.Equal("reply-body", result.Output);
+        Assert.Null(result.Error);
 
         var modelsCall = handler.Calls[0];
         Assert.Equal(HttpMethod.Get, modelsCall.Method);
         Assert.Equal(ApiKey, modelsCall.Headers["x-api-key"]);
-        Assert.Equal(ClaudeAgentRunner.AnthropicVersion, modelsCall.Headers["anthropic-version"]);
+        Assert.Equal("2023-06-01", modelsCall.Headers["anthropic-version"]);
 
         var messagesCall = handler.Calls[1];
         Assert.Equal(HttpMethod.Post, messagesCall.Method);
         Assert.Equal(ApiKey, messagesCall.Headers["x-api-key"]);
-        Assert.Equal(ClaudeAgentRunner.AnthropicVersion, messagesCall.Headers["anthropic-version"]);
+        Assert.Equal("2023-06-01", messagesCall.Headers["anthropic-version"]);
         Assert.Equal("application/json", messagesCall.ContentType);
 
         using var body = JsonDocument.Parse(messagesCall.Body!);
         Assert.Equal("claude-opus-4-7-20260315", body.RootElement.GetProperty("model").GetString());
-        Assert.Equal(ClaudeAgentRunner.TextOnlyMaxTokens, body.RootElement.GetProperty("max_tokens").GetInt32());
+        Assert.Equal(8192, body.RootElement.GetProperty("max_tokens").GetInt32());
         var messages = body.RootElement.GetProperty("messages");
         Assert.Equal(1, messages.GetArrayLength());
         Assert.Equal("user", messages[0].GetProperty("role").GetString());
