@@ -650,6 +650,210 @@ public sealed class ProjectRepositoryTests
         Assert.Equal("https://example.com/alpha.git", preserved!.RepositoryUrl);
     }
 
+    [Fact]
+    public async Task Reload_SpuriousOnChange_WithIdenticalOptions_DoesNotRebuildOrLog()
+    {
+        // ASP.NET Core's directory-level file watcher fires OnChange for any
+        // sibling-file write in the watched config dir. With reloadOnChange:true
+        // on codeybox-extra.json this routinely fans into hundreds of spurious
+        // notifications per hour even when the JSON itself never changes. The
+        // content-hash guard MUST short-circuit those duplicates: no snapshot
+        // rebuild, no log noise, no transient-swap window for readers.
+        var initial = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    DisplayName = "Alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                },
+            ],
+        };
+        var monitor = new TestProjectsOptionsMonitor(initial);
+        var logger = new CapturingLogger<ProjectRepository>();
+        using var repo = new ProjectRepository(monitor, logger);
+
+        var snapshotBefore = await repo.GetAsync(new ProjectId("alpha"));
+        var infoCountBefore = logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information);
+
+        // Push a freshly-constructed but semantically-identical ProjectsOptions
+        // (object identity differs; serialized content is the same). Repeat
+        // many times to simulate the production stampede.
+        for (var i = 0; i < 50; i++)
+        {
+            monitor.Push(new ProjectsOptions
+            {
+                Projects =
+                [
+                    new ProjectConfig
+                    {
+                        Id = "alpha",
+                        DisplayName = "Alpha",
+                        RepositoryUrl = "https://example.com/alpha.git",
+                    },
+                ],
+            });
+        }
+
+        var snapshotAfter = await repo.GetAsync(new ProjectId("alpha"));
+        // Snapshot reference is unchanged because the no-op guard skipped the
+        // Volatile.Write — readers never observe a transient-swap window.
+        Assert.Same(snapshotBefore, snapshotAfter);
+
+        // No new info-level reload log lines for the 50 spurious pushes.
+        var infoCountAfter = logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information);
+        Assert.Equal(infoCountBefore, infoCountAfter);
+    }
+
+    [Fact]
+    public async Task Reload_RealChange_TriggersExactlyOneRebuild()
+    {
+        // A real edit to the config (e.g. adding a project, changing
+        // MaxLlmAuditorParallelism) must still produce exactly one effective
+        // reload — hot-reload is relied on for operator stopgaps. Confirms
+        // the content-hash guard does NOT swallow genuine changes.
+        var initial = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                    Audit = new ProjectAuditConfig { MaxLlmAuditorParallelism = 3 },
+                },
+            ],
+        };
+        var monitor = new TestProjectsOptionsMonitor(initial);
+        var logger = new CapturingLogger<ProjectRepository>();
+        using var repo = new ProjectRepository(monitor, logger);
+
+        var infoBefore = logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information);
+
+        // Real edit: bump MaxLlmAuditorParallelism. The new candidate hashes
+        // differently from the initial, so the guard lets it through.
+        var updated = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                    Audit = new ProjectAuditConfig { MaxLlmAuditorParallelism = 7 },
+                },
+            ],
+        };
+        monitor.Push(updated);
+
+        // Exactly one reload log entry produced by the real change.
+        var reloadLines = logger.Entries
+            .Where(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Information &&
+                        e.Message.StartsWith("ProjectRepository reloaded", StringComparison.Ordinal))
+            .ToArray();
+        Assert.Single(reloadLines);
+        Assert.Equal(infoBefore + 1, logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Information));
+
+        // And the new value took effect.
+        var p = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(p);
+        Assert.Equal(7, p!.Audit.MaxLlmAuditorParallelism);
+
+        // A duplicate spurious event carrying the same (now-current) options
+        // does NOT re-trigger another rebuild.
+        monitor.Push(new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                    Audit = new ProjectAuditConfig { MaxLlmAuditorParallelism = 7 },
+                },
+            ],
+        });
+        var reloadLinesAfterDup = logger.Entries
+            .Count(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Information &&
+                        e.Message.StartsWith("ProjectRepository reloaded", StringComparison.Ordinal));
+        Assert.Equal(1, reloadLinesAfterDup);
+    }
+
+    [Fact]
+    public async Task Reload_FailedRebuild_DoesNotRetryOnDuplicateSpuriousEvent()
+    {
+        // When a real edit produces an invalid candidate (e.g. flips into the
+        // noop+local-seed combination) the Build throws and the prior snapshot
+        // is preserved. A subsequent duplicate spurious OnChange carrying the
+        // SAME bad candidate must NOT keep re-running the failing Build —
+        // log noise is the symptom this whole change is fighting.
+        var initial = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/alpha.git",
+                },
+            ],
+        };
+        var monitor = new TestProjectsOptionsMonitor(initial);
+        var logger = new CapturingLogger<ProjectRepository>();
+        using var repo = new ProjectRepository(monitor, logger);
+
+        var bad = new ProjectsOptions
+        {
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "/home/operator/.codeybox/seeds/alpha.git",
+                    Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                },
+            ],
+        };
+        monitor.Push(bad);
+
+        // First push throws inside Build → exactly one ERROR entry.
+        var errorCountAfterFirst = logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Error);
+        Assert.Equal(1, errorCountAfterFirst);
+
+        // Push the same bad options 20 more times (simulated spurious watcher
+        // fan-out from a sibling-file write). No additional ERROR entries.
+        for (var i = 0; i < 20; i++)
+        {
+            monitor.Push(new ProjectsOptions
+            {
+                Projects =
+                [
+                    new ProjectConfig
+                    {
+                        Id = "alpha",
+                        RepositoryUrl = "/home/operator/.codeybox/seeds/alpha.git",
+                        Upstream = new ProjectUpstreamConfig { Kind = "noop" },
+                    },
+                ],
+            });
+        }
+        var errorCountAfterDuplicates = logger.Entries.Count(e =>
+            e.Level == Microsoft.Extensions.Logging.LogLevel.Error);
+        Assert.Equal(1, errorCountAfterDuplicates);
+
+        // Prior snapshot is still live.
+        var preserved = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(preserved);
+        Assert.Equal("https://example.com/alpha.git", preserved!.RepositoryUrl);
+    }
+
     [Theory]
     [InlineData("https://example.com/foo.git")]
     [InlineData("http://example.com/foo.git")]

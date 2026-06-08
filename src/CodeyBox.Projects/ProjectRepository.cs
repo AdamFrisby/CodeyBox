@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using CodeyBox.Audit.Presets;
 using Microsoft.Extensions.Options;
 using CodeyBox.Core;
@@ -21,6 +24,19 @@ namespace CodeyBox.Projects;
 /// framework does not invoke this repository's change callback at all; the
 /// existing snapshot remains in place because it is held independently here.
 ///
+/// <para>
+/// ASP.NET Core's <see cref="Microsoft.Extensions.Configuration.Json.JsonConfigurationProvider"/>
+/// uses a directory-level <see cref="Microsoft.Extensions.FileProviders.PhysicalFileProvider"/>
+/// watcher, so sibling-file writes in the watched directory (token refresh
+/// tempfiles, state caches, etc.) can fan out into spurious
+/// <see cref="IOptionsMonitor{T}.OnChange"/> notifications even when
+/// <c>codeybox-extra.json</c> itself never changes. To avoid needless
+/// snapshot rebuilds (~8/min observed in production) the reload callback
+/// hashes the bound <see cref="ProjectsOptions"/> and short-circuits when
+/// the new candidate hashes identically to the last one observed — a real
+/// edit still flips the hash and triggers exactly one rebuild.
+/// </para>
+///
 /// A future SQLite-backed CRUD impl can swap behind the same interface;
 /// the orchestrator never needs to know the difference.
 /// </summary>
@@ -29,7 +45,15 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     private readonly ILogger<ProjectRepository> _logger;
     private readonly PresetCatalogOptions? _presetCatalogOptions;
     private readonly IDisposable? _changeSubscription;
+    private readonly Lock _reloadGate = new();
     private Snapshot _snapshot;
+    private string _lastObservedHash = string.Empty;
+
+    private static readonly JsonSerializerOptions HashJsonOptions = new()
+    {
+        WriteIndented = false,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never,
+    };
 
     public ProjectRepository(IOptions<ProjectsOptions> options)
         : this(options, NullLogger<ProjectRepository>.Instance) { }
@@ -45,6 +69,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _snapshot = Build(options.Value, presetCatalogOptions);
+        _lastObservedHash = ComputeContentHash(options.Value);
     }
 
     public ProjectRepository(
@@ -55,26 +80,59 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ArgumentNullException.ThrowIfNull(monitor);
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
-        _snapshot = Build(monitor.CurrentValue, presetCatalogOptions);
+        var initial = monitor.CurrentValue;
+        _snapshot = Build(initial, presetCatalogOptions);
+        _lastObservedHash = ComputeContentHash(initial);
         _changeSubscription = monitor.OnChange(Reload);
     }
 
     private void Reload(ProjectsOptions opts)
     {
-        try
+        // Hash the candidate BEFORE taking the gate so a stampede of spurious
+        // OnChange events (directory-level FS notifications from sibling writes
+        // in the watched config dir) can be short-circuited cheaply without
+        // serialising every caller on the rebuild lock.
+        var nextHash = ComputeContentHash(opts);
+
+        lock (_reloadGate)
         {
-            var next = Build(opts, _presetCatalogOptions);
-            Volatile.Write(ref _snapshot, next);
-            _logger.LogInformation(
-                "ProjectRepository reloaded: {Count} project(s) [{Ids}]",
-                next.List.Count, string.Join(",", next.List.Select(p => p.Id.Value)));
+            if (string.Equals(_lastObservedHash, nextHash, StringComparison.Ordinal))
+            {
+                // No-op: the bound options serialize identically to the last
+                // observed candidate. Do not rebuild or swap the snapshot,
+                // and do not log — this path is taken hundreds of times per
+                // hour on a host whose codeybox-extra.json never changes.
+                return;
+            }
+
+            // Stamp the hash before Build runs so a duplicate spurious event
+            // carrying the same (invalid) candidate doesn't repeat the failing
+            // Build over and over. A later real edit produces a different
+            // hash and is retried.
+            _lastObservedHash = nextHash;
+
+            try
+            {
+                var next = Build(opts, _presetCatalogOptions);
+                Volatile.Write(ref _snapshot, next);
+                _logger.LogInformation(
+                    "ProjectRepository reloaded: {Count} project(s) [{Ids}]",
+                    next.List.Count, string.Join(",", next.List.Select(p => p.Id.Value)));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "ProjectRepository reload rejected; keeping prior snapshot. " +
+                    "Fix the configuration error and re-save to retry.");
+            }
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex,
-                "ProjectRepository reload rejected; keeping prior snapshot. " +
-                "Fix the configuration error and re-save to retry.");
-        }
+    }
+
+    private static string ComputeContentHash(ProjectsOptions opts)
+    {
+        var json = JsonSerializer.SerializeToUtf8Bytes(opts, HashJsonOptions);
+        var hash = SHA256.HashData(json);
+        return Convert.ToHexString(hash);
     }
 
     public Task<Project?> GetAsync(ProjectId id, CancellationToken ct = default)
