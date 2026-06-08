@@ -1,3 +1,4 @@
+using System.Text;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.PluginSdk;
@@ -160,6 +161,225 @@ public sealed class AgentPromptPreprocessorTests
         Assert.Equal("review prompt|processed", Assert.Single(inner.TextOnlyPrompts));
     }
 
+    [Fact]
+    public async Task PromptPreprocessingAgentRunner_SkipsChainWhenSandboxIsNull()
+    {
+        var recorder = new RecordingPreprocessor();
+        var chain = new AgentPromptPreprocessorChain([recorder]);
+        var inner = new RecordingTextOnlyRunner();
+        var wrapper = new PromptPreprocessingAgentRunner(
+            inner,
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Audit,
+            3,
+            NewProject());
+
+        var result = await wrapper.RunTextOnlyAsync("untouched prompt", credential: null, sandbox: null);
+
+        Assert.True(result.Success);
+        Assert.Empty(recorder.Contexts);
+        Assert.Equal("untouched prompt", Assert.Single(inner.TextOnlyPrompts));
+    }
+
+    [Fact]
+    public async Task PromptPreprocessingAgentRunner_ReturnsUnavailabilityWhenInnerIsNotTextOnly()
+    {
+        var recorder = new RecordingPreprocessor();
+        var chain = new AgentPromptPreprocessorChain([recorder]);
+        var inner = new RecordingPlainRunner();
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>());
+        var wrapper = new PromptPreprocessingAgentRunner(
+            inner,
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Merge,
+            1,
+            NewProject());
+
+        Assert.False(wrapper.SupportsTextOnly);
+
+        var result = await wrapper.RunTextOnlyAsync("prompt", credential: null, sandbox: sandbox);
+
+        Assert.False(result.Success);
+        Assert.Contains("not text-only capable", result.Summary);
+        Assert.Empty(recorder.Contexts);
+        var reason = wrapper.GetTextOnlyUnavailabilityReason(credential: null);
+        Assert.NotNull(reason);
+        Assert.Contains("not text-only capable", reason);
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_TruncatesContentLargerThanCap()
+    {
+        var oversized = new string('a', (256 * 1024) + 10);
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = oversized,
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
+
+        Assert.Contains("[Project rules truncated by CodeyBox at 256 KiB.]", result);
+        // The injected rules section ends at the truncation marker; everything
+        // between BEGIN and the marker is the cap-sized prefix of the input.
+        var begin = result.IndexOf("--- BEGIN PROJECT RULES ---", StringComparison.Ordinal);
+        Assert.True(begin >= 0);
+        var bodyStart = begin + "--- BEGIN PROJECT RULES ---\n".Length;
+        var markerStart = result.IndexOf("\n\n[Project rules truncated", bodyStart, StringComparison.Ordinal);
+        Assert.True(markerStart > bodyStart);
+        var rulesPrefix = result[bodyStart..markerStart];
+        Assert.Equal(256 * 1024, Encoding.UTF8.GetByteCount(rulesPrefix));
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_DoesNotTruncateContentAtOrBelowCap()
+    {
+        // Pick a size that puts every byte right under the cap and includes a
+        // multi-byte UTF-8 character so we exercise the byte-vs-char distinction.
+        var prefix = new string('a', (256 * 1024) - 4);
+        var content = prefix + "€"; // euro sign = 3 UTF-8 bytes
+        Assert.Equal((256 * 1024) - 1, Encoding.UTF8.GetByteCount(content));
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = content,
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
+
+        Assert.DoesNotContain("[Project rules truncated", result);
+        Assert.Contains("€", result);
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_TruncatesContentSafelyAroundMultiByteChars()
+    {
+        // Fill content with euro signs (3 UTF-8 bytes each). The cap is not a
+        // multiple of 3, so a naive char-index truncation would land inside a
+        // surrogate-free multi-byte sequence; verify the result is still valid.
+        var sb = new StringBuilder();
+        while (Encoding.UTF8.GetByteCount(sb.ToString()) < (256 * 1024) + 1024)
+            sb.Append('€');
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = sb.ToString(),
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
+
+        Assert.Contains("[Project rules truncated by CodeyBox at 256 KiB.]", result);
+        // Resulting string round-trips through UTF-8 without invalid sequences.
+        var roundTripped = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(result));
+        Assert.Equal(result, roundTripped);
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_WhitespaceOnlyContentLeavesPromptUnchanged()
+    {
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = "   \n\t\n",
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        Assert.Equal(
+            "original",
+            await preprocessor.ProcessAsync(NewContext(sandbox), "original"));
+    }
+
+    [Theory]
+    [InlineData("/etc/passwd")]
+    [InlineData("foo\0bar.md")]
+    [InlineData("   ")]
+    [InlineData("nested/../escape.md")]
+    public async Task ProjectRulesPreprocessor_RejectsUnsafePaths(string configuredPath)
+    {
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = configuredPath });
+        // Populate the sandbox with content the preprocessor would otherwise inject,
+        // so a regression that lets the path through would show up as injected rules.
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [configuredPath] = "should never be injected",
+            ["etc/passwd"] = "should never be injected",
+            ["nested/../escape.md"] = "should never be injected",
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        Assert.Equal(
+            "original",
+            await preprocessor.ProcessAsync(NewContext(sandbox), "original"));
+    }
+
+    [Fact]
+    public async Task ProjectRulesPreprocessor_NormalizesBackslashesToForwardSlashes()
+    {
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "docs\\agents.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["docs/agents.md"] = "win-style path resolves\n",
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
+
+        Assert.Contains("Loaded from `docs/agents.md`.", result);
+        Assert.Contains("win-style path resolves", result);
+    }
+
+    [Fact]
+    public async Task Chain_ThrowsWhenPreprocessorReturnsNull()
+    {
+        var chain = new AgentPromptPreprocessorChain([new NullReturningPreprocessor()]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => chain.ProcessAsync(NewContext(), "prompt"));
+
+        Assert.Contains(nameof(NullReturningPreprocessor), ex.Message);
+    }
+
+    [Fact]
+    public async Task Chain_OrdersMultiplePluginsByOrderInPluginBand()
+    {
+        var log = new List<string>();
+        var chain = new AgentPromptPreprocessorChain(
+        [
+            new TestPluginPreprocessor("plugin-late", log, order: 50),
+            new TestPluginPreprocessor("plugin-early", log, order: -50),
+            new AppendingPreprocessor("built-in-first", log, AgentPromptPreprocessorOrder.BuiltInFirst),
+            new AppendingPreprocessor("built-in-last", log, AgentPromptPreprocessorOrder.BuiltInLast),
+        ]);
+
+        var result = await chain.ProcessAsync(NewContext(), "prompt");
+
+        Assert.Equal(["built-in-first", "plugin-early", "plugin-late", "built-in-last"], log);
+        Assert.Equal("prompt|built-in-first|plugin-early|plugin-late|built-in-last", result);
+    }
+
     private static PromptContext NewContext(ISandbox? sandbox = null) =>
         new(
             WorkItemId.New(),
@@ -290,6 +510,49 @@ public sealed class AgentPromptPreprocessorTests
             _ = workingDirectory;
             TextOnlyPrompts.Add(prompt);
             return Task.FromResult(new TextOnlyAgentResult(true, "ok", "{}", null));
+        }
+    }
+
+    private sealed class RecordingPlainRunner : IAgentRunner
+    {
+        public List<string> RunPrompts { get; } = [];
+
+        public AgentKind Kind => AgentKind.Codex;
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = ct;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+            RunPrompts.Add(prompt);
+            return Task.FromResult(new AgentResult(true, "ok", null, null));
+        }
+    }
+
+    private sealed class NullReturningPreprocessor : IAgentPromptPreprocessor
+    {
+        public int Order => 0;
+
+        public Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
+        {
+            _ = ctx;
+            _ = prompt;
+            _ = ct;
+            return Task.FromResult<string>(null!);
         }
     }
 

@@ -7180,9 +7180,8 @@ public sealed class PipelineRunner : IPipelineRunner
         ISandbox? sandbox,
         CancellationToken ct)
     {
-        _ = workItemId;
-        _ = project;
-        if (runner is PromptPreprocessingAgentRunner wrapped && !wrapped.SupportsTextOnly)
+        var wrappedRunner = runner as PromptPreprocessingAgentRunner;
+        if (wrappedRunner is { SupportsTextOnly: false })
         {
             _log.LogWarning(
                 "Advisory merge security review skipped because agent {AgentKind} does not implement text-only review",
@@ -7199,7 +7198,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         var prompt = BuildMergeSecurityReviewPrompt(diff);
-        if (sandbox is not null)
+        // When the runner is already a PromptPreprocessingAgentRunner, its
+        // RunTextOnlyAsync re-runs the chain on a non-null sandbox, so skip
+        // the explicit pass here to avoid injecting the rules block twice.
+        if (sandbox is not null && wrappedRunner is null)
         {
             prompt = await ProcessAgentPromptAsync(
                 workItemId,
