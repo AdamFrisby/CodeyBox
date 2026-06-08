@@ -40,6 +40,7 @@ public sealed class ReleaseService
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<ReleaseService> _log;
     private readonly IAgentStreamStore? _agentStreams;
+    private readonly AgentPromptPreprocessorChain _promptPreprocessors;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -65,7 +66,8 @@ public sealed class ReleaseService
         ILogger<ReleaseService> log,
         Func<int> deepAuditMaxConcurrency,
         Func<TimeSpan> deepAuditRemediationItemTimeout,
-        IAgentStreamStore? agentStreams = null)
+        IAgentStreamStore? agentStreams = null,
+        AgentPromptPreprocessorChain? promptPreprocessors = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -85,6 +87,7 @@ public sealed class ReleaseService
         _deepAuditMaxConcurrency = deepAuditMaxConcurrency;
         _deepAuditRemediationItemTimeout = deepAuditRemediationItemTimeout;
         _agentStreams = agentStreams;
+        _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -589,7 +592,13 @@ public sealed class ReleaseService
                     ProjectId: project.Id,
                     BranchName: release.BranchName,
                     Iteration: iteration,
-                    AuditRunner: runner,
+                    AuditRunner: runner is null
+                        ? null
+                        : WrapPromptPreprocessedRunner(
+                            runner,
+                            new WorkItemId(release.Id.Value),
+                            iteration,
+                            project),
                     StdoutChunkCallback: BuildStdoutCallback(streamCapture),
                     CaptureStructuredStream: streamCapture is not null,
                     Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null);
@@ -676,6 +685,24 @@ public sealed class ReleaseService
     private static bool ToolAuditNetworkAllowlistUnsupported(string providerName) =>
         providerName.Equals("bubblewrap", StringComparison.OrdinalIgnoreCase) ||
         providerName.Equals("process", StringComparison.OrdinalIgnoreCase);
+
+    private IAgentRunner WrapPromptPreprocessedRunner(
+        IAgentRunner runner,
+        WorkItemId itemId,
+        int iteration,
+        Project project)
+    {
+        if (!_promptPreprocessors.HasPreprocessors)
+            return runner;
+
+        return new PromptPreprocessingAgentRunner(
+            runner,
+            _promptPreprocessors,
+            itemId,
+            AgentPromptPhase.Audit,
+            iteration,
+            project);
+    }
 
     // ── Releasing ─────────────────────────────────────────────────────────────
 

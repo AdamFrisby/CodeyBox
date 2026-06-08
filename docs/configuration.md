@@ -83,6 +83,9 @@ Hot-reloadable today:
   stopping the process, and that shutdown uses the updated mode.
 - `Smoke.Enabled` — hot-reloaded through `SmokeOptionsSnapshot`; disables the
   pickup credential gate, router smoke exclusions, and in-VM smoke gate.
+- `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
+  invocation; changes affect the next work/rework/audit/merge/check-and-act
+  prompt.
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
@@ -445,6 +448,26 @@ Rolling file log configuration.
 | `AuditPath` | `logs/audit-.json` | Audit-only log (`Audit=true` events). |
 | `RetainedDays` | `30` | Number of rolled files to keep. Must be ≥ 1. |
 | `MaxFileSizeBytes` | `104857600` | Per-file cap before rolling (100 MiB). |
+
+---
+
+## `PromptPreprocessing`
+
+Agent prompt preprocessing configuration. CodeyBox ships a built-in
+preprocessor that prepends the project rules file to every agent prompt. This
+is the reliable delivery path for house rules across Codex, Claude, Cursor,
+opencode, and any future runner; root-level agent file discovery is a
+compatibility aid, not the enforcement mechanism.
+
+```json
+"PromptPreprocessing": {
+  "ProjectRulesPath": "AGENTS.md"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ProjectRulesPath` | `AGENTS.md` | Repo-relative rules file to prepend when present. Re-read before each agent invocation. Missing files leave the prompt unchanged. |
 
 ---
 

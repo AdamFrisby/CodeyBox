@@ -65,10 +65,16 @@ the host's own context so that type-identity checks succeed.
 ### 2. Implement a Core interface
 
 Every extension point in CodeyBox is a `CodeyBox.Core` interface:
-`IAuditor`, `IUpstreamRemote`, `ICredentialProvider`, `IAgentRunner`, etc.
+`IAuditor`, `IUpstreamRemote`, `ICredentialProvider`,
+`IAgentPromptPreprocessor`, etc.
 Implement whichever one(s) your plugin contributes. The contracts are unchanged
 from built-in implementations — your plugin is just another singleton in the
 same DI container.
+
+Prompt preprocessors implement `IAgentPromptPreprocessor` and run before every
+agent prompt is handed to a runner. The host applies them in three segments:
+built-in first, plugin preprocessors ordered by `Order`, then built-in last.
+Use a small `Order` value to run earlier within the plugin segment.
 
 ### 3. Decorate with `[CodeyBoxPlugin]`
 
@@ -233,6 +239,8 @@ Host startup
     │      Call IPluginInitializer.InitializeAsync() on each plugin type
     │
     ├─ [host processes work items]
+    │      Agent prompt preprocessing:
+    │      built-in first → plugin preprocessors by Order → built-in last
     │
     └─ Host shutdown
            DI container disposes singletons → IAsyncDisposable.DisposeAsync()

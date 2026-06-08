@@ -280,7 +280,7 @@ Agents are interchangeable. A class lists members with quality scores; the
 router prefers the highest-scoring one that's within quota and under its
 concurrency cap. Every fallback is recorded in the commit trailer. Aider,
 Goose, or anything else is just a new `IAgentRunner` —
-see [`docs/agents.md`](docs/agents.md).
+see [`AGENTS.md`](AGENTS.md).
 
 ## Sandbox providers
 

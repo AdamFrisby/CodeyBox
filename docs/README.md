@@ -15,7 +15,7 @@ Start here if you're new:
 6. [`host-firewall.md`](host-firewall.md) — host-side egress enforcement
    for the Multipass provider (operator setup, profile model, what it
    protects against).
-7. [`agents.md`](agents.md) — built-in agents and how to add new ones.
+7. [`AGENTS.md`](../AGENTS.md) — built-in agents and how to add new ones.
 8. [`audit.md`](audit.md) — opt-in audit phase between work and merge,
    capability-grouped sandboxes, rework loop.
 9. [`git-workflow.md`](git-workflow.md) — what the work, audit, rework,
