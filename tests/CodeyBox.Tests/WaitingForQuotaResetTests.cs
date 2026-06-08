@@ -283,6 +283,115 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     }
 
     [Fact]
+    public async Task QuotaRetryScheduler_PeriodicSweep_ReEnqueuesAuditParkedItem_WhenQuotaRecovers()
+    {
+        // Regression for stranded WaitingForQuotaReset rows parked at audit:
+        // when the audit-phase fallback exhausts every class member, the item
+        // parks with QuotaRetryFrom="audit". The periodic sweep must walk it
+        // and resume at WorkComplete (the audit-phase resume slot) without
+        // requiring operator intervention, once an eligible class member is
+        // available again. Six items were observed stranded for ~4 days in
+        // production because only manual /retry moved them out.
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+
+        var time = new FixedClock(DateTimeOffset.UtcNow);
+        var pid = new ProjectId("p1");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = pid,
+            DisplayName = "p1",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+            DefaultAgentClass = "test-class",
+        });
+
+        // Stub git host so the audit-phase resume path (which requires the
+        // bare repo + work branch to exist) does not auto-fall back to
+        // from=work. The point of the test is that QuotaRetryFrom="audit"
+        // round-trips through the sweep without operator action.
+        var gitHost = new StubResumeGitHost();
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+
+        var classes = new List<AgentClass>
+        {
+            new AgentClass
+            {
+                Id = "test-class",
+                DisplayName = "Test",
+                Members =
+                [
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
+            },
+        };
+        // Probe reports 100% — quota has fully recovered.
+        var router = new AgentClassRouter(classes, [new FakeProbe(AgentKind.Claude, 100)],
+            new QuotaRouterOptions { MinQuotaPct = 10 }, NullLogger<AgentClassRouter>.Instance, time);
+        // Simulate the production state: when the item parked, the work-phase
+        // call site marked the failing member exhausted in the router's
+        // in-process cache. The periodic sweep must walk past that suppression
+        // entry when an external probe now says the agent is usable; otherwise
+        // a recovered agent stays benched until the (potentially hours-long)
+        // resetAt elapses and items never resume — the production symptom.
+        router.MarkExhausted(
+            classes[0].Members[0],
+            TimeSpan.FromHours(5),
+            resetAt: time.GetUtcNow().AddHours(5));
+        var opts = new OrchestratorOptions
+        {
+            AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+            {
+                Enabled = true,
+                PeriodicCheckInterval = TimeSpan.FromMinutes(5),
+                MaxAutoRetriesPerWorkItem = 3,
+            },
+        };
+        var scheduler = new QuotaRetryScheduler(store, retrier, opts,
+            NullLogger<QuotaRetryScheduler>.Instance, router, projects, null, webhooks, time);
+
+        var workBranch = "codeybox/audit-parked";
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = pid,
+            Title = "audit parked",
+            Prompt = "p",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "test-class",
+            // Item parked at the audit phase, e.g. via TerminalQuotaError
+            // thrown while routing the LLM auditor agent. The resume slot for
+            // from="audit" is WorkComplete.
+            QuotaRetryFrom = "audit",
+            WorkBranch = workBranch,
+            QuotaResetAt = time.GetUtcNow().AddMinutes(-5), // window already elapsed
+            NextQuotaRetryAt = time.GetUtcNow().AddMinutes(-1),
+            LastError = "All 1 eligible member(s) of class 'test-class' exhausted mid-audit",
+        };
+        await store.CreateAsync(parked);
+        gitHost.MarkRepoAndBranchPresent(parked.Id, workBranch);
+
+        var sweep = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)sweep.Invoke(scheduler, [CancellationToken.None])!;
+
+        var refetched = await store.GetAsync(parked.Id);
+        Assert.NotNull(refetched);
+        // Audit-from items resume at WorkComplete so the pipeline re-enters
+        // the audit phase rather than discarding prior work-phase commits.
+        Assert.Equal(WorkItemState.WorkComplete, refetched!.State);
+        Assert.Null(refetched.FailureKind);
+        Assert.Null(refetched.QuotaResetAt);
+        Assert.Null(refetched.NextQuotaRetryAt);
+        Assert.Equal(1, refetched.QuotaRetryAttempts);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    [Fact]
     public async Task QuotaRetryScheduler_TargetedTimer_FiresForWaitingForQuotaReset()
     {
         // Sanity that the timer path (not just the periodic sweep) treats
