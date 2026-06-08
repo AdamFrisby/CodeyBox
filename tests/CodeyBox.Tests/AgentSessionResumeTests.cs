@@ -291,6 +291,11 @@ public sealed class AgentSessionResumeTests : IDisposable
         AssertFlagValue(second, "-c", "model_reasoning_effort=high");
         Assert.Contains(sessionId, second);
         Assert.Equal("-", second[^1]);
+        // Defense-in-depth: `--` immediately precedes the positional session id
+        // so a leading-'-' id cannot be parsed as a clap flag.
+        var sessionIdx = Array.IndexOf(second.ToArray(), sessionId);
+        Assert.True(sessionIdx > 0);
+        Assert.Equal("--", second[sessionIdx - 1]);
         Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
         Assert.NotEqual("prompt", sandbox.ClaudeExecs[1].Stdin);
     }

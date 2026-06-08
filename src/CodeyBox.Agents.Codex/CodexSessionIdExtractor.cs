@@ -157,6 +157,12 @@ internal static class CodexSessionIdExtractor
         if (id.Length > 200)
             return false;
 
+        // Reject ids that begin with '-' so a model-controllable JSON line
+        // cannot smuggle a clap flag through the positional session-id
+        // argument of `codex exec resume`.
+        if (id[0] == '-')
+            return false;
+
         foreach (var c in id)
         {
             if (char.IsControl(c) || char.IsWhiteSpace(c))

@@ -307,6 +307,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // non-null, via its --keep-stdin path.
         if (!string.IsNullOrEmpty(sessionIdForResume))
         {
+            // `--` halts clap's option parsing so a session id that somehow
+            // starts with '-' cannot be interpreted as a flag. The extractor
+            // also rejects leading-'-' ids; this is defense-in-depth.
+            argv.Add("--");
             argv.Add(sessionIdForResume);
             argv.Add("-");
         }
