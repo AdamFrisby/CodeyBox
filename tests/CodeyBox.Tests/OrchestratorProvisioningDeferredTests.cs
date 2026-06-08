@@ -83,7 +83,16 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                 pipeline.SecondCallAt.Value - pipeline.FirstCallAt.Value >= recheckIn - TimeSpan.FromMilliseconds(25),
                 $"deferred requeue fired too early: first={pipeline.FirstCallAt.Value:O}, second={pipeline.SecondCallAt.Value:O}, recheck={recheckIn}");
 
-            var stored = await _store.GetAsync(item.Id);
+            // Pipeline increments CallCount BEFORE awaiting the store write to Done,
+            // so observing CallCount==2 does not imply the Done update has committed.
+            // Poll the store until the write lands (or the test deadline fires).
+            WorkItem? stored = null;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                stored = await _store.GetAsync(item.Id);
+                if (stored?.State == WorkItemState.Done) break;
+                await Task.Delay(20);
+            }
             Assert.NotNull(stored);
             Assert.Equal(WorkItemState.Done, stored!.State);
             Assert.Null(stored.FailureKind);

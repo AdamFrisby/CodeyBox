@@ -39,7 +39,12 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
     {
         const int itemCount = 3;
         const int spawnIntervalMs = 200;
-        const int slackMs = 50; // allowance for scheduler jitter
+        // Allowance for scheduler jitter. Bumped from 50ms after the auditor saw a
+        // 149.x ms gap (reported as "150ms" by F0 formatting) under parallel-test
+        // load — DateTimeOffset.UtcNow precision plus Task.Delay early-wake slack
+        // can shave a handful of ms off each observed gap. 100ms still rejects the
+        // unconstrained case (sub-ms gaps; see NoSpawnInterval_ItemsFireWithoutDelay).
+        const int slackMs = 100;
 
         // Timestamps captured at the dispatch loop level (OnWorkerSpawned) rather than
         // inside RunAsync, so thread-pool scheduling latency doesn't consume the slack.

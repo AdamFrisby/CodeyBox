@@ -1629,7 +1629,14 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     [Fact]
     public async Task StartupResume_AdoptionExit0_ButPushHangs_IsBoundedByResumeTimeout()
     {
-        var configuredTimeout = TimeSpan.FromMilliseconds(50);
+        // configuredTimeout bounds BOTH the resume call and the checkpoint push.
+        // 500ms (vs the original 50ms) gives the resume-side LongRunning thread
+        // headroom to be scheduled under parallel-test load before the timeout
+        // fires; if resume itself times out, the promotion step is skipped and
+        // the assertion below sees an empty CheckpointPushCalls. 500ms is still
+        // ~30× tighter than the 15s WaitAsync safety net, so the test still
+        // demonstrates that a hung push does not leave the operation unbounded.
+        var configuredTimeout = TimeSpan.FromMilliseconds(500);
         var item = MakeItem();
         await _store.CreateAsync(item with
         {
