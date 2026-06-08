@@ -86,6 +86,7 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
     private readonly Func<AgentSessionSandboxRef, CancellationToken, Task>? _sandboxResumeHook;
     private readonly ICredentialProvider? _credentialProvider;
     private readonly IClaudeSessionMetricsSink _metricsSink;
+    private readonly bool _emitTurnMetrics;
     private readonly ConcurrentDictionary<string, SessionState> _sessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _closedSessions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _reattachLocks = new(StringComparer.Ordinal);
@@ -118,13 +119,21 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
     /// <param name="metricsSink">
     /// Receives per-turn cache-hit metrics. Null defaults to the no-op sink.
     /// </param>
+    /// <param name="options">
+    /// Bound configuration. When supplied with <c>EmitTurnMetrics=false</c>,
+    /// <see cref="SendTurnAsync"/> skips the <see cref="IClaudeSessionMetricsSink"/>
+    /// emission entirely (useful for A/B comparisons against the one-shot
+    /// baseline). Null behaves as if every option were left at its default —
+    /// metrics emission stays on.
+    /// </param>
     public ClaudeSessionWorker(
         ClaudeAgentRunner runner,
         Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? sandboxReattacher = null,
         Func<AgentSessionSandboxRef, CancellationToken, Task>? sandboxResumeHook = null,
         ICredentialProvider? credentialProvider = null,
         Func<ISandbox, AgentSessionSandboxRef>? sandboxRefFactory = null,
-        IClaudeSessionMetricsSink? metricsSink = null)
+        IClaudeSessionMetricsSink? metricsSink = null,
+        ClaudeSessionWorkerOptions? options = null)
     {
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _sandboxReattacher = sandboxReattacher;
@@ -132,6 +141,7 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         _credentialProvider = credentialProvider;
         _sandboxRefFactory = sandboxRefFactory ?? (static sandbox => new AgentSessionSandboxRef(sandbox.Id));
         _metricsSink = metricsSink ?? NullClaudeSessionMetricsSink.Instance;
+        _emitTurnMetrics = options?.EmitTurnMetrics ?? true;
     }
 
     public AgentKind Kind => AgentKind.Claude;
@@ -485,6 +495,12 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
 
     private void EmitMetrics(SessionState state, string? stdout, string? stderr, bool usedResume)
     {
+        // Honour the configured opt-out (CodeyBox:ClaudeSession:EmitTurnMetrics
+        // = false). The check sits inside EmitMetrics rather than at the call
+        // site so the no-op sink default and the explicit suppression both
+        // funnel through one obvious place.
+        if (!_emitTurnMetrics)
+            return;
         var cliSessionId = state.CliSessionId ?? "(unassigned)";
         try
         {

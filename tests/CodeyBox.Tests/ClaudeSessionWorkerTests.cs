@@ -201,6 +201,29 @@ public sealed class ClaudeSessionWorkerTests
     }
 
     [Fact]
+    public async Task SendTurn_WithEmitTurnMetricsDisabled_SuppressesMetricEmission()
+    {
+        // CodeyBox:ClaudeSession:EmitTurnMetrics=false flips the documented
+        // off-branch: the sink must receive zero records regardless of how
+        // many turns run. Operators rely on this for A/B comparisons against
+        // the one-shot path.
+        var sandbox = new ScriptedSandbox(
+            StreamJsonFirstTurn("cli-quiet"),
+            StreamJsonSecondTurn("cli-quiet"));
+        var sink = new RecordingMetricsSink();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            metricsSink: sink,
+            options: new ClaudeSessionWorkerOptions { EmitTurnMetrics = false });
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+        await worker.SendTurnAsync(handle, "second");
+
+        Assert.Empty(sink.Records);
+    }
+
+    [Fact]
     public async Task SendTurn_WithThrowingMetricsSink_DoesNotBreakTurn()
     {
         var sandbox = new ScriptedSandbox(StreamJsonFirstTurn("cli-throws"));

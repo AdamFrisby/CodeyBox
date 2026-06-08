@@ -539,7 +539,8 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
         sandboxResumeHook: resumeHook,
         credentialProvider: sp.GetService<ICredentialProvider>(),
         sandboxRefFactory: null,
-        metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>());
+        metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
+        options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>());
 });
 
 // Plugin discovery result captured before builder.Build() so the credential
