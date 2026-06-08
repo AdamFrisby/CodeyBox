@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 
@@ -19,22 +20,39 @@ namespace CodeyBox.Agents.Cursor;
 /// missing-model warnings, invalidates on file source <c>TokenUpdated</c>).</para>
 ///
 /// <para><b>HEADLINE-METRIC.</b> The headline
-/// <see cref="AgentQuotaSnapshot.AvailablePct"/> is computed from spend-vs-limit,
-/// NOT from <c>totalPercentUsed</c>:
+/// <see cref="AgentQuotaSnapshot.AvailablePct"/> is computed from the
+/// percent-used dimensions on <c>planUsage</c>:
 /// <code>
-/// availablePct = (planUsage.remaining / planUsage.limit) * 100
-///             // equivalent to: 100 - (planUsage.totalSpend / planUsage.limit * 100)
+/// availablePct = 100 - max(totalPercentUsed, autoPercentUsed, apiPercentUsed)
 /// </code>
-/// <c>planUsage.limit == 0</c> (or a response missing <c>remaining</c>/<c>limit</c>)
-/// returns the -1 "unknown" sentinel. The <c>totalPercentUsed</c> /
-/// <c>autoPercentUsed</c> / <c>apiPercentUsed</c> fields are normalised against a
-/// much larger denominator (likely including usage-based-billing headroom) and DO
-/// NOT match what the Cursor web UI shows the operator. Captured live response:
-/// <c>totalSpend=1313, limit=2000, remaining=687, totalPercentUsed=6.73</c>;
-/// the same response's <c>displayMessage</c> reads
-/// "You've used 66% of your included usage" — i.e. 1313/2000 = 65.65%, NOT
-/// 6.73%. Picking <c>totalPercentUsed</c> would disagree with the UI by ~60
-/// points and keep dispatching Cursor when it is near cap.</para>
+/// We take the MAX so the most-constrained dimension wins; the router floor
+/// then gates cursor below <c>minQuotaPct</c>. The earlier
+/// (<c>a803b459</c>) "headline must be <c>remaining/limit</c>, not
+/// <c>totalPercentUsed</c>" decision was written against an ASSUMED shape: the
+/// live response has NO <c>planUsage.remaining</c> field, so the old parser
+/// always returned the <c>Unknown("unexpected response shape")</c> sentinel
+/// and the router could never gate Cursor by quota. The probe was
+/// unauthenticated until 2026-06-04 — this is the first time the endpoint
+/// actually returned data, which is why the shape mismatch went undetected
+/// for so long. Captured live 2026-06-04 (account out of usage):
+/// <code>
+/// "planUsage": {
+///   "totalSpend": 19903, "includedSpend": 2000, "bonusSpend": 17903,
+///   "limit": 2000, "remainingBonus": false,
+///   "autoPercentUsed": 100, "apiPercentUsed": 100, "totalPercentUsed": 100
+/// }
+/// </code>
+/// — no <c>remaining</c>; the percent-used fields ARE the headline.</para>
+///
+/// <para>Explicit out-of-usage signals override the percent-derived headline
+/// to a hard 0%, so the router gates cursor even if a percent field is missing
+/// or partial: <c>remainingBonus == false &amp;&amp; totalSpend &gt;= limit</c>,
+/// <c>displayMessage</c> matching <c>/hit your .*usage limit/i</c>, or
+/// <c>enabled == false</c>. Any one of these is sufficient.</para>
+///
+/// <para><c>resetAt</c> = <c>billingCycleEnd</c>, which is an epoch
+/// MILLISECONDS string (NOT seconds, NOT a number). The cycle is ~31 days /
+/// monthly, not weekly.</para>
 ///
 /// <para>Thread-safe; results are cached for <c>cacheTtl</c> to avoid hammering
 /// the endpoint when several work items pick up close together.</para>
@@ -48,6 +66,26 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
     internal const string DefaultRoutedModelId = "composer-2.5";
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
+    private const int UnexpectedShapeLogCapChars = 1024;
+
+    // Single source of truth for the "fell through to Unknown" sentinel.
+    // FetchAsync uses it to decide whether to log the raw response body for
+    // diagnosis; ParseResponse returns it. Keeping them in lockstep prevents
+    // the silent-fallthrough regression this probe was rewritten to avoid.
+    internal const string UnexpectedShapeNotes = "unexpected response shape";
+
+    private static readonly Regex OutOfUsageDisplayMessagePattern = new(
+        @"hit your .*usage limit",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    // Value class is `(?:[^"\\]|\\.)*` so JSON strings with escaped quotes
+    // (e.g. "sessionToken":"abc\"def") are matched in full instead of stopping
+    // at the first escape, which would leave the suffix exposed in the
+    // operator log. Field-name class allows hyphens too, so kebab-case keys
+    // (e.g. "access-token") don't silently bypass redaction.
+    private static readonly Regex TokenLikeFieldPattern = new(
+        @"(""[A-Za-z0-9_\-]*(?:token|key|secret|password|auth|session|cookie|bearer)[A-Za-z0-9_\-]*"")\s*:\s*""(?:[^""\\]|\\.)*""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static readonly string[] FallbackAutoBucketModels =
     [
@@ -198,7 +236,21 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
 
             var body = await ReadCappedAsync(response.Content, ct);
             if (body is null) return Unknown("response too large");
-            return ParseResponse(body);
+            var snapshot = ParseResponse(body);
+
+            // Log raw body when the parser bailed to Unknown — silent fallthrough
+            // is what made the prior shape-mismatch invisible for weeks. Capped
+            // and token-redacted so we don't leak bearer-shaped strings into
+            // operator logs.
+            if (string.Equals(snapshot.Notes, UnexpectedShapeNotes, StringComparison.Ordinal))
+            {
+                _log.LogDebug(
+                    "Cursor quota probe: unexpected response shape; raw body (redacted, capped to {Cap} chars): {Body}",
+                    UnexpectedShapeLogCapChars,
+                    RedactAndCap(body, UnexpectedShapeLogCapChars));
+            }
+
+            return snapshot;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -229,20 +281,35 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             var root = doc.RootElement;
 
             if (!root.TryGetProperty("planUsage", out var planUsage) ||
-                planUsage.ValueKind != JsonValueKind.Object ||
-                !TryGetDoubleProperty(planUsage, "remaining", out var remaining) ||
-                !TryGetDoubleProperty(planUsage, "limit", out var limit))
+                planUsage.ValueKind != JsonValueKind.Object)
             {
-                return Unknown("unexpected response shape");
+                return Unknown(UnexpectedShapeNotes);
             }
 
-            // Headline = remaining/limit (spend-vs-limit), NOT totalPercentUsed —
-            // see class remarks for the Cursor-UI-disagreement rationale.
-            if (limit <= 0)
-                return Unknown("planUsage.limit is zero/absent");
+            var hasTotal = TryGetDoubleProperty(planUsage, "totalPercentUsed", out var totalUsed);
+            var hasAuto = TryGetDoubleProperty(planUsage, "autoPercentUsed", out var autoUsed);
+            var hasApi = TryGetDoubleProperty(planUsage, "apiPercentUsed", out var apiUsed);
+
+            if (!hasTotal && !hasAuto && !hasApi)
+                return Unknown(UnexpectedShapeNotes);
+
+            // Most-constrained percent dimension wins. The real shape can carry
+            // total/auto/api at different fractions (e.g. auto fully used,
+            // total partially used) — taking the max keeps cursor gated when
+            // any single dimension is exhausted.
+            var maxUsed = 0.0;
+            if (hasTotal) maxUsed = Math.Max(maxUsed, totalUsed);
+            if (hasAuto) maxUsed = Math.Max(maxUsed, autoUsed);
+            if (hasApi) maxUsed = Math.Max(maxUsed, apiUsed);
+            var availablePct = ClampAvailable(100.0 - maxUsed);
+
+            // Hard 0% override on explicit out-of-usage signals — guards against
+            // a partial response where the spend math says we're exhausted but
+            // a percent field is missing or out-of-date.
+            if (IsExplicitlyOutOfUsage(root, planUsage))
+                availablePct = 0.0;
 
             var resetAt = TryGetBillingCycleEnd(root);
-            var availablePct = ClampAvailable(remaining / limit * 100.0);
             var perModel = ParsePerModel(root, planUsage, resetAt);
             CapPerModelByOverall(perModel, availablePct, resetAt);
 
@@ -257,6 +324,39 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         {
             return Unknown("invalid JSON");
         }
+    }
+
+    private static bool IsExplicitlyOutOfUsage(JsonElement root, JsonElement planUsage)
+    {
+        // Bonus exhausted AND spend has eaten through the limit.
+        if (planUsage.TryGetProperty("remainingBonus", out var remainingBonus) &&
+            remainingBonus.ValueKind == JsonValueKind.False &&
+            TryGetDoubleProperty(planUsage, "totalSpend", out var totalSpend) &&
+            TryGetDoubleProperty(planUsage, "limit", out var limit) &&
+            limit > 0 && totalSpend >= limit)
+        {
+            return true;
+        }
+
+        // Dashboard surfaces "You've hit your usage limit" verbatim when the
+        // account is out — match leniently so cosmetic copy edits don't drop
+        // the signal.
+        if (root.TryGetProperty("displayMessage", out var msg) &&
+            msg.ValueKind == JsonValueKind.String)
+        {
+            var text = msg.GetString();
+            if (!string.IsNullOrEmpty(text) && OutOfUsageDisplayMessagePattern.IsMatch(text))
+                return true;
+        }
+
+        // The dashboard surfaces a paused subscription as enabled=false.
+        if (root.TryGetProperty("enabled", out var enabled) &&
+            enabled.ValueKind == JsonValueKind.False)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static Dictionary<string, ModelQuota> ParsePerModel(
@@ -363,7 +463,11 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         return el.ValueKind switch
         {
             JsonValueKind.Number => el.TryGetDouble(out value),
-            JsonValueKind.String => double.TryParse(el.GetString(), out value),
+            JsonValueKind.String => double.TryParse(
+                el.GetString(),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out value),
             _ => false,
         };
     }
@@ -382,6 +486,20 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         while (chunk > 0 && totalRead < buffer.Length);
         if (totalRead > MaxResponseChars) return null;
         return new string(buffer, 0, totalRead);
+    }
+
+    /// <summary>
+    /// Strips values for any key whose name contains a token-shaped substring
+    /// (token, key, secret, password, auth, session, cookie, bearer) and
+    /// truncates the result to <paramref name="maxLen"/> characters. Used only
+    /// for the unexpected-shape Debug log so a bearer or session id can't slip
+    /// into operator logs if the response shape ever drifts to include one.
+    /// </summary>
+    internal static string RedactAndCap(string body, int maxLen)
+    {
+        var redacted = TokenLikeFieldPattern.Replace(body, "$1:\"<redacted>\"");
+        if (redacted.Length <= maxLen) return redacted;
+        return redacted.Substring(0, maxLen) + "…[truncated]";
     }
 
     private static double ClampAvailable(double pct) => Math.Clamp(pct, 0.0, 100.0);

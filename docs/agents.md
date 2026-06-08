@@ -416,8 +416,15 @@ in `CursorAgentRunner.BuildInvocation`.
 **Quota probe:** `CursorQuotaProbe` POSTs to Cursor's Connect-RPC
 `DashboardService/GetCurrentPeriodUsage` on `api2.cursor.sh`, using the
 `accessToken` from `~/.config/cursor/auth.json` (same credential bundle as
-the runner). Overall availability is `100 - planUsage.totalPercentUsed`;
-`billingCycleEnd` becomes `ResetAt`. Per-model routing uses
+the runner). Overall availability is
+`100 - max(planUsage.totalPercentUsed, planUsage.autoPercentUsed, planUsage.apiPercentUsed)`
+— the most-constrained dimension wins, so the router floor gates cursor as
+soon as any single axis is exhausted. Explicit out-of-usage signals
+(`remainingBonus==false && totalSpend>=limit`, `displayMessage` matching
+`/hit your .*usage limit/i`, or `enabled==false`) override the percent-
+derived headline to a hard 0%, so a partial response with a missing percent
+field still gates correctly. `billingCycleEnd` (an epoch-MILLISECONDS
+string) becomes `ResetAt`; the cycle is monthly. Per-model routing uses
 `autoBucketModels` plus `autoPercentUsed` (composer-* automatic models).
 When a member has `ModelId` set but that id is absent from the parsed
 buckets, the probe reports `AvailablePct=-1` so the router applies its
