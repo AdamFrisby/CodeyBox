@@ -1329,6 +1329,107 @@ public sealed class PipelineRunner : IPipelineRunner
         return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history, promptRevisionAtDispatch);
     }
 
+    /// <summary>
+    /// Verifies the sandbox's HEAD commit carries a
+    /// <c>CodeyBox-Prompt-Revision</c> trailer that matches the iteration's
+    /// dispatched revision; if not, adds an empty stamp commit on top with
+    /// the full canonical trailer block. The orchestrator owns the dispatch
+    /// revision and the work-item id outright, so trusting the agent to echo
+    /// them back on its final commit is unreliable: a missing trailer is a
+    /// purely mechanical failure that would otherwise block the post-work
+    /// audit and burn a whole iteration on a triviality.
+    ///
+    /// <para>The stamp is intentionally skipped when the operator updated the
+    /// prompt mid-iteration (<c>dispatched != current</c>). In that case the
+    /// agent ran against an older prompt and the
+    /// <c>process:prompt-revision-trailer</c> auditor must still surface the
+    /// missing trailer so the operator can decide whether to re-dispatch —
+    /// auto-stamping it here would paper over a genuine stale-prompt signal.
+    /// </para>
+    /// </summary>
+    internal async Task EnsureHeadCarriesPromptRevisionTrailerAsync(
+        ISandbox sandbox,
+        WorkItem item,
+        AgentKind finalAgent,
+        string? finalModel,
+        int promptRevisionAtDispatch,
+        string agentPhase,
+        CancellationToken ct)
+    {
+        var trailers = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "git", "-C", SandboxConventions.WorkDir, "log", "-1",
+                $"--pretty=format:%(trailers:key={CodeyBoxTrailers.PromptRevisionTrailerKey},valueonly=true,unfold=true)",
+            ],
+        }, ct);
+
+        if (trailers.Success)
+        {
+            var raw = (trailers.Stdout ?? string.Empty).Trim();
+            if (raw.Length > 0)
+            {
+                var firstLine = raw.Split('\n', 2)[0].Trim();
+                if (int.TryParse(firstLine, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out var found)
+                    && found == promptRevisionAtDispatch)
+                    return;
+            }
+        }
+        else
+        {
+            // A failed git read is logged but does not block the stamp — the
+            // commit itself will fail loudly if the repo is in a bad state, and
+            // the audit gate downstream catches any remaining mismatch.
+            _log.LogWarning(
+                "Failed to read HEAD trailers in work item {Id} sandbox (git exit {Exit}); proceeding with conditional stamp",
+                item.Id, trailers.ExitCode);
+        }
+
+        // Re-read the work item: if the operator bumped the prompt between
+        // iteration dispatch and this point, do NOT auto-stamp — the auditor
+        // must still flag the divergence so the operator can re-dispatch
+        // against the new prompt. Falling back to the in-memory snapshot is
+        // safe (and conservative — it favours stamping) when the store read
+        // fails; the cost of a missed stamp here is just the audit iteration
+        // we are trying to avoid.
+        WorkItem? freshItem;
+        try
+        {
+            freshItem = await _store.GetAsync(item.Id, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Failed to re-read work item {Id} during pre-audit trailer stamp; using in-memory snapshot",
+                item.Id);
+            freshItem = item;
+        }
+        var currentRevision = freshItem?.PromptRevision ?? item.PromptRevision;
+        if (currentRevision != promptRevisionAtDispatch)
+        {
+            _log.LogInformation(
+                "Work item {Id}: skipping pre-audit trailer stamp — dispatched revision {Dispatched} differs from current {Current}; auditor will surface the stale-prompt signal",
+                item.Id, promptRevisionAtDispatch, currentRevision);
+            return;
+        }
+
+        var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, finalAgent, finalModel, ct,
+            promptRevisionAtDispatch: promptRevisionAtDispatch);
+        var commitMessage = $"codeybox: stamp prompt-revision trailer\n\n{trailerBlock}";
+
+        await using (var stampScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit.stamp_trailer",
+            activitySource: CodeyBoxActivities.Sandbox, log: _log))
+        {
+            await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m", commitMessage);
+        }
+
+        _log.LogInformation(
+            "Work item {Id}: stamped CodeyBox-Prompt-Revision={Revision} on HEAD ({Phase}); agent did not emit the trailer",
+            item.Id, promptRevisionAtDispatch, agentPhase);
+    }
+
     private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>
         ResolvePhaseAbsoluteTimeout(perAttemptTimeout, _opts.PhaseAbsoluteTimeoutMultiplier);
 
@@ -2772,6 +2873,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 : "Rework agent produced no changes; cannot resolve audit findings";
             throw new InvalidOperationException(msg);
         }
+
+        // Stamp the CodeyBox trailers on HEAD if the agent forgot to emit them.
+        // The dispatch revision is orchestrator-owned state — delegating it to
+        // the agent's commit-hygiene is unreliable in practice, and a missing
+        // trailer would block the post-work audit on a purely mechanical
+        // triviality. Skipped when the operator updated the prompt
+        // mid-iteration so the auditor still surfaces the stale-prompt signal.
+        await EnsureHeadCarriesPromptRevisionTrailerAsync(
+            sandbox, item, runner.Kind, observedModelId,
+            promptRevisionAtDispatch, agentPhase, ct);
 
         await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_back_to_bare_repo",
             activitySource: CodeyBoxActivities.Sandbox, log: _log))
