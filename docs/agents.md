@@ -189,20 +189,27 @@ Lifecycle inside the worker:
   on the sandbox (`multipass stop`, **not** `delete --purge`) so the VM's
   disk — including `~/.claude/projects/<slug>/<session>.jsonl` — is
   preserved.
-- `ResumeSessionAsync` calls the configured sandbox-resume hook
-  (`ISuspendingSandboxProvider.ResumeSandboxAsync`, i.e. `multipass start`)
-  to bring the VM back, then reattaches to the same `ISandbox`. Any failure
-  here flips the worker into fresh-one-shot mode for the remainder of the
+- `ResumeSessionAsync` calls the configured sandbox-resume hook to bring
+  the VM back. The hook is wired in production to
+  `ISuspendingSandboxProvider.ResumeSandboxAsync` (i.e. `multipass start`)
+  when the registered provider supports the suspend contract; non-suspending
+  providers (process / bubblewrap) leave it null. Any failure of the hook
+  flips the worker into fresh-one-shot mode for the remainder of the
   session rather than stranding the work item.
 - `CloseSessionAsync` disposes the sandbox and ends the logical session.
 
 Restart recovery: `AgentSessionHandle` is safe to persist (no live objects,
 no credential material). `ClaudeSessionWorker.SnapshotPersistedHandle`
 returns a handle augmented with the captured CLI session id under
-`Metadata["claude.cliSessionId"]`, so a fresh process can resume the same
-VM and continue the same Claude session by reading those fields back. If
-the VM or session cannot be revived, the next turn runs fresh — degraded,
-never stranded.
+`Metadata["claude.cliSessionId"]`, and a fallback flag under
+`Metadata["claude.fallbackToOneShot"]` once the worker has degraded to
+fresh-one-shot mode (so a restart inherits that degraded state instead of
+re-attempting the failed resume). Reviving the handle in a fresh process
+requires a sandbox-reattacher callback wired into the worker; the current
+rollout step (item 2 of 3) leaves the production reattacher unwired and
+the worker surfaces a clear `InvalidOperationException` on any reattach
+attempt. The dispatch wiring that persists and replays the handle across
+a restart lands in item 3.
 
 Per-turn metrics are emitted as `ClaudeSessionTurnMetrics` snapshots to the
 registered `IClaudeSessionMetricsSink`. Each snapshot carries the total

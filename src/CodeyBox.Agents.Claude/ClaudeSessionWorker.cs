@@ -39,12 +39,18 @@ namespace CodeyBox.Agents.Claude;
 ///   <see cref="IPreemptibleSandbox.StopAndPreserveAsync"/> (multipass stop,
 ///   NOT dispose) so the VM disk and Claude session JSONL are preserved.</item>
 ///   <item><c>ResumeSessionAsync</c> brings the VM back via the configured
-///   <c>sandboxResumeHook</c> (multipass start). After an orchestrator
-///   restart the persisted <see cref="AgentSessionHandle"/> alone is enough
-///   to reattach: the <c>sandboxReattacher</c> binds a fresh <see cref="ISandbox"/>
-///   to the same VM name and the worker continues. If the VM can't be
-///   resumed the next turn falls back to a fresh one-shot run rather than
-///   stranding the work item.</item>
+///   <c>sandboxResumeHook</c> (multipass start, wired to
+///   <c>ISuspendingSandboxProvider.ResumeSandboxAsync</c> in production when
+///   the registered provider supports it; null on non-suspending providers).
+///   After an orchestrator restart the persisted <see cref="AgentSessionHandle"/>
+///   alone is enough to reattach <em>provided a <c>sandboxReattacher</c> has
+///   been wired</em>: the reattacher binds a fresh <see cref="ISandbox"/>
+///   to the same VM name and the worker continues. In the current rollout
+///   step the production DI registration leaves the reattacher null — a
+///   post-restart turn surfaces a clear <see cref="InvalidOperationException"/>
+///   rather than executing against an unbound sandbox. If the VM cannot be
+///   resumed at all, the next turn falls back to a fresh one-shot run
+///   rather than stranding the work item.</item>
 ///   <item><c>CloseSessionAsync</c> disposes the sandbox and ends the
 ///   logical session.</item>
 /// </list>
@@ -87,13 +93,19 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
     /// <param name="runner">Underlying one-shot runner whose argv/credential machinery this worker reuses for every turn.</param>
     /// <param name="sandboxReattacher">
     /// Reattaches a fresh <see cref="ISandbox"/> to the same VM after an
-    /// orchestrator restart. Without it, persisted handles cannot be revived.
+    /// orchestrator restart. Without it, persisted handles cannot be revived
+    /// and <see cref="ResolveStateAsync"/> throws
+    /// <see cref="InvalidOperationException"/> for any post-restart access.
+    /// Left null in the current rollout step; the dispatch wiring that drives
+    /// restart recovery against persisted handles lands in item 3.
     /// </param>
     /// <param name="sandboxResumeHook">
-    /// Starts the underlying VM back up. Wired to
-    /// <c>ISuspendingSandboxProvider.ResumeSandboxAsync</c> in production; tests
-    /// supply a no-op. Without it, a restart that finds the VM stopped will
-    /// fall back cleanly to fresh-one-shot mode.
+    /// Starts the underlying VM back up. Wired in production to
+    /// <c>ISuspendingSandboxProvider.ResumeSandboxAsync</c> when the registered
+    /// <c>ISandboxProvider</c> implements the suspend contract (multipass);
+    /// non-suspending providers leave it null. Tests supply a no-op or stub.
+    /// On any failure here the worker degrades to fresh-one-shot mode rather
+    /// than stranding the work item.
     /// </param>
     /// <param name="credentialProvider">
     /// Optional restart-time credential provider. The persisted handle never

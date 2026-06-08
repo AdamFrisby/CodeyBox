@@ -513,10 +513,30 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
     var runner = sp.GetServices<IAgentRunner>()
         .OfType<ClaudeAgentRunner>()
         .First();
+
+    // Resume hook: when the registered provider exposes the suspend/resume
+    // contract (multipass; not process / bubblewrap), bring the VM back up by
+    // delegating to its ResumeSandboxAsync. The AgentSessionSandboxRef.Id IS
+    // the multipass VM name (default sandboxRefFactory derives it from
+    // ISandbox.Id, which MultipassSandbox sets to the VM name). Non-suspending
+    // providers leave the hook unwired so a stop/resume cycle isn't attempted
+    // against them — ResumeSessionAsync then short-circuits the resume step.
+    var provider = sp.GetService<ISandboxProvider>();
+    Func<AgentSessionSandboxRef, CancellationToken, Task>? resumeHook = null;
+    if (provider is ISuspendingSandboxProvider suspending)
+        resumeHook = (sandboxRef, ct) => suspending.ResumeSandboxAsync(sandboxRef.Id, ct);
+
+    // sandboxReattacher (revive an ISandbox bound to an existing VM after an
+    // orchestrator restart) is intentionally null in this rollout step. The
+    // dispatch wiring that persists / replays AgentSessionHandle across a
+    // restart lands in item 3 of the rollout; until then, ResolveStateAsync
+    // throws InvalidOperationException with a clear message rather than
+    // silently failing. The worker is OFF by default, so this gap is only
+    // reachable for an operator who has opted in via CodeyBox:ClaudeSession:Enabled.
     return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
         runner,
         sandboxReattacher: null,
-        sandboxResumeHook: null,
+        sandboxResumeHook: resumeHook,
         credentialProvider: sp.GetService<ICredentialProvider>(),
         sandboxRefFactory: null,
         metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>());
@@ -3316,9 +3336,11 @@ namespace CodeyBox.Api
     {
         /// <summary>
         /// Master switch. Default <c>false</c> — Claude dispatches keep using
-        /// the legacy one-shot runner unless an operator opts in here.
-        /// Compose with the per-agent-class-member opt-in and per-project
-        /// allow-list to route specific work items to the session worker.
+        /// the legacy one-shot runner unless an operator opts in here. The
+        /// per-agent-class-member and per-project opt-in switches land in the
+        /// next rollout step (item 3); once those ship the global flag will
+        /// compose with them to route specific work items to the session
+        /// worker.
         /// </summary>
         public bool Enabled { get; set; } = false;
 

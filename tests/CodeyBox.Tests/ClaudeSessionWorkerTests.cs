@@ -311,6 +311,82 @@ public sealed class ClaudeSessionWorkerTests
     }
 
     [Fact]
+    public async Task PersistedHandle_WithFallbackMetadataKey_ReattachesInDegradedMode()
+    {
+        // A worker that previously degraded to fresh-one-shot mode persists
+        // FallbackMetadataKey=true on the handle (see
+        // PersistedHandle_VmCannotResume_DegradesToFreshOneShot). After an
+        // orchestrator restart that re-attaches against a fresh worker, the
+        // restored SessionState must inherit FallbackToFresh=true so the next
+        // turn skips --resume and the worker does not try to re-execute the
+        // failed resume hook.
+        var sandbox = new ScriptedSandbox(StreamJsonFirstTurn("cli-stale-resume-target"));
+        var resumeHookCalls = 0;
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxReattacher: (_, _) => Task.FromResult<ISandbox>(sandbox),
+            sandboxResumeHook: (_, _) =>
+            {
+                resumeHookCalls++;
+                return Task.CompletedTask;
+            });
+
+        var persisted = new AgentSessionHandle(
+            AgentKind.Claude,
+            "claude-session-degraded",
+            new AgentSessionSandboxRef("vm-degraded"),
+            "/work",
+            Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [ClaudeSessionWorker.CliSessionIdMetadataKey] = "cli-stale-resume-target",
+                [ClaudeSessionWorker.FallbackMetadataKey] = "true",
+            });
+
+        var result = await worker.SendTurnAsync(persisted, "after restart in degraded mode");
+        Assert.True(result.Success);
+
+        // Fallback path: no --resume even though a CliSessionId is persisted.
+        var argv = sandbox.AgentExec!.Argv.ToList();
+        Assert.DoesNotContain("--resume", argv);
+
+        // Snapshot reflects the inherited degraded state so subsequent restarts
+        // keep honouring it.
+        var snapshot = worker.SnapshotPersistedHandle(persisted);
+        Assert.Equal("true", snapshot.Metadata![ClaudeSessionWorker.FallbackMetadataKey]);
+    }
+
+    [Fact]
+    public async Task PersistedHandle_WithMalformedCliSessionId_IgnoresPersistedIdAndRunsFresh()
+    {
+        // The reattach branch validates the persisted CliSessionId via
+        // IsValidCliSessionId before adopting it. A tampered or malformed
+        // persisted value must NOT make it into argv as --resume; the next
+        // turn falls back to fresh.
+        var sandbox = new ScriptedSandbox(StreamJsonFirstTurn("cli-fresh-rebuild"));
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxReattacher: (_, _) => Task.FromResult<ISandbox>(sandbox));
+
+        var persisted = new AgentSessionHandle(
+            AgentKind.Claude,
+            "claude-session-tampered",
+            new AgentSessionSandboxRef("vm-tampered"),
+            "/work",
+            Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                // shell-metacharacter laced value — IsValidCliSessionId rejects.
+                [ClaudeSessionWorker.CliSessionIdMetadataKey] = "; rm -rf /",
+            });
+
+        var result = await worker.SendTurnAsync(persisted, "after restart with bad id");
+        Assert.True(result.Success);
+
+        var argv = sandbox.AgentExec!.Argv.ToList();
+        Assert.DoesNotContain("--resume", argv);
+        Assert.DoesNotContain("; rm -rf /", argv);
+    }
+
+    [Fact]
     public async Task PersistedHandle_WithoutReattacher_RejectsCleanly()
     {
         var worker = new ClaudeSessionWorker(BuildRunner());

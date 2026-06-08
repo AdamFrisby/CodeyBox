@@ -4,10 +4,13 @@ namespace CodeyBox.Agents.Claude;
 /// Bound from <c>CodeyBox:ClaudeSession</c>. The session-capable worker
 /// (<see cref="ClaudeSessionWorker"/>) is OFF by default — the existing
 /// one-shot <see cref="ClaudeAgentRunner"/> is the registered runner for
-/// Claude unless an operator opts in here. The flags compose with the
-/// per-agent-class-member <c>UseSessionWorker</c> and per-project
-/// <c>UseClaudeSessionWorker</c> switches; the worker is only used when ALL
-/// three (global enable, project allow, member opt-in) agree.
+/// Claude unless an operator opts in here.
+///
+/// <para>This is item 2 of 3 in the resumable-Claude rollout: the worker
+/// itself is built but the orchestrator-side dispatch wiring lands in item 3.
+/// Once that ships, the global <see cref="Enabled"/> flag will compose with
+/// per-agent-class-member and per-project opt-in switches so an operator can
+/// route specific work items to the session worker incrementally.</para>
 /// </summary>
 public sealed class ClaudeSessionWorkerOptions
 {
