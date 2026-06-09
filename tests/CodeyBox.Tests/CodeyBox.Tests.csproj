@@ -59,6 +59,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Gemini\CodeyBox.Agents.Gemini.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Cursor\CodeyBox.Agents.Cursor.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Opencode\CodeyBox.Agents.Opencode.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Antigravity\CodeyBox.Agents.Antigravity.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents\CodeyBox.Agents.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox\CodeyBox.Sandbox.csproj" />

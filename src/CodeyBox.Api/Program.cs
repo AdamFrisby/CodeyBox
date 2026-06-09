@@ -6,6 +6,7 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
@@ -488,6 +489,7 @@ builder.Services.AddSingleton<IAgentRunner, CodexAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner, AntigravityAgentRunner>();
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
@@ -805,6 +807,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
         // for the relevant 'Don't do' rule and docs/agents.md for setup.
+        // Antigravity uses Sign-in-with-Google OAuth — the canonical path is a
+        // file-credential bundle materialised under the AntigravityConstants
+        // env var. This mapping is the env-var fallback an operator can use
+        // to inject the full OAuth credentials JSON directly without an
+        // on-host credential file. The host env var is namespaced; the
+        // sandbox-side env var name is the one AntigravityAgentRunner's
+        // PrepareSandboxAsync reads.
+        new AgentCredentialMapping(
+            AgentKind.Antigravity,
+            "CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON",
+            AntigravityConstants.OAuthCredsEnvVar),
     }));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
@@ -1060,6 +1073,31 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
 builder.Services.AddSingleton<IAgentQuotaProbe>(_ => new OpencodeQuotaProbe());
+// Antigravity: shares the cloudcode-pa endpoint family with Gemini but is
+// metered separately per-model (each gateway model has its own bucket). The
+// probe prefers :retrieveUserQuotaSummary and falls back to :retrieveUserQuota
+// or a per-model live :generateContent ping. Token sources fall back to the
+// Gemini OAuth file since both CLIs use Sign-in-with-Google; operators with
+// distinct credentials can override via CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN or
+// per-instance CredentialReference.
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var probe = new AntigravityQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+                    ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
+                    ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
+            ?? new AgentQuotaCredentials(null),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<AntigravityQuotaProbe>());
+    source.TokenUpdated += probe.InvalidateCache;
+    return probe;
+});
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -1255,6 +1293,7 @@ builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
 // at smoke time, not first dispatch). Agents with no sandbox CLI — copilot by
@@ -1317,6 +1356,21 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         loggerFactory.CreateLogger<GeminiModelListProbe>());
 });
 builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
+// Antigravity model-list probe: reads the cloudcode-pa retrieveUserQuotaSummary
+// endpoint (with retrieveUserQuota fallback) using the same Sign-in-with-Google
+// OAuth source as Gemini, since `agy` shares Google's account/credentials path
+// but stores its tokens under a separate file.
+builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    return new AntigravityModelListProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        () => CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
+        loggerFactory.CreateLogger<AntigravityModelListProbe>());
+});
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -1849,6 +1903,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Cursor] = new CursorCostExtractor(),
         [AgentKind.Opencode] = new OpencodeCostExtractor(),
         [AgentKind.Copilot] = new CopilotCostExtractor(),
+        [AgentKind.Antigravity] = new AntigravityCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -1959,6 +2014,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
     return new CursorQuotaFailureDetector(extras);
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 

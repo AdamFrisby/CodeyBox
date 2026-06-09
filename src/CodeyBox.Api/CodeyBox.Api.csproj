@@ -10,6 +10,7 @@
     <ProjectReference Include="..\CodeyBox.Agents.Gemini\CodeyBox.Agents.Gemini.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Cursor\CodeyBox.Agents.Cursor.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Opencode\CodeyBox.Agents.Opencode.csproj" />
+    <ProjectReference Include="..\CodeyBox.Agents.Antigravity\CodeyBox.Agents.Antigravity.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream.GitHub\CodeyBox.Upstream.GitHub.csproj" />
     <ProjectReference Include="..\CodeyBox.Git\CodeyBox.Git.csproj" />
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />

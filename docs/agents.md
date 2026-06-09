@@ -16,6 +16,7 @@ tooling, not in the agent runner contract.
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
 | `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_AUTH_FILE` |
+| `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth credentials JSON, file-materialised to `~/.agy/oauth_creds.json`) | `CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN` (raw access token fallback) |
 
 The sandbox-side env name is what the agent CLI reads. The host-side env
 name is what the orchestrator's `EnvironmentCredentialProvider` looks up
@@ -40,6 +41,7 @@ the most common cause of fresh-class dispatch failures.
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
 | `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
+| `antigravity` | `curl -fsSL https://antigravity.google/install \| bash` (verify against the upstream installer at bake time; the agy binary is proprietary closed-source). Installs the `agy` CLI on `$PATH`. | Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. See [Antigravity quirks](#google-antigravity-cli-agy). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. After updating
@@ -547,6 +549,101 @@ where any `401 Unauthorized` is classified by
 `Subscription` (default) or `PayPerApi`, mirroring Gemini. Cursor's
 pay-per-api surface is undocumented at the time of writing; treat
 `PayPerApi` as a forward hook.
+
+### Google Antigravity CLI (`agy`)
+
+Antigravity is Google's successor to `gemini-cli`. Gemini Code Assist (the
+subscription `gemini-cli` rides) is being sunset 2026-06-18; the `agy`
+binary is the official replacement and exposes a multi-model gateway —
+Gemini, Anthropic Claude, and OpenAI GPT-OSS models all ride a single
+Google AI subscription quota. The runner is registered as **light-duty
+overflow**, not a workhorse: AI Pro caps requests on a weekly window with
+up to a 7-day lockout on cap breach, so over-use is especially expensive.
+
+**Binary name:** `agy`. Install via the upstream installer command and
+verify the binary lands on `$PATH` after baking.
+
+**Non-interactive invocation:** `agy --print --dangerously-skip-permissions
+--model <gateway-model-id>` with the prompt on stdin (the sandbox is the
+real permission boundary; argv-via-stdin avoids the 128 KiB MAX_ARG_STRLEN
+ceiling for big rework prompts).
+
+**Resume:** the runner emits `--conversation <id>` when a checkpoint
+captured a specific conversation id (`agy-conversation:<id>` ref) and
+falls back to `--continue` (most recent conversation) otherwise — same
+shape as `claude --resume`.
+
+**Multi-model gateway — one membership per model.** Each gateway model
+(`gemini-3.5-flash-high`, `claude-opus-4-6-thinking`,
+`gpt-oss-120b-medium`, …) is its own request bucket on Google's side. The
+router already keys exhaustion as `(AgentKind, ModelId)`, so the natural
+design is one `AgentClass` member per accepted model:
+
+```json
+{
+  "Id": "google-gateway",
+  "Members": [
+    { "Agent": "antigravity", "Billing": "Subscription",
+      "ModelId": "gemini-3.5-flash-high", "QualityScore": 70 },
+    { "Agent": "antigravity", "Billing": "Subscription",
+      "ModelId": "claude-opus-4-6-thinking", "QualityScore": 85 }
+  ]
+}
+```
+
+The probe gates each member on its own quota and the router fails over
+model-by-model. **Do not** introduce a separate "sub-subscription pool"
+subsystem — the existing per-model exhaustion key already gives the pool
+semantics for free.
+
+**Auth setup:** Sign-in-with-Google. On the host, run the agy install
+flow and complete the OAuth sign-in once; the binary writes its OAuth
+JSON to a local file. Point CodeyBox at it either by (a) configuring a
+per-instance `AgentCredentialReference` with `FilePath` set to that
+path, or (b) injecting the file's contents via the
+`CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` env var. The runner materialises
+the bundle to `~/.agy/oauth_creds.json` inside the sandbox at
+prepare-time with `chmod 600`; the refresh token is **not** shipped to
+the VM (single-use; the host CLI is the sole party allowed to refresh —
+same race rationale as Claude / Gemini).
+
+**Quota probe:** `AntigravityQuotaProbe` shares the `cloudcode-pa`
+endpoint family with `GeminiQuotaProbe`. It prefers
+`:retrieveUserQuotaSummary` (cleaner per-window/tier data than the
+per-model-fragmented `:retrieveUserQuota`), falls back to
+`:retrieveUserQuota`, and finally to a per-model `:generateContent` live
+ping (same approach as Gemini — the bucket reading can report 100% while
+a live call returns 429). The probe surfaces structured
+`quota_metadata.lockout_until` timestamps when present, so a 7-day weekly
+lockout pins `ResetAt` to the exact reset moment and the work item parks
+in `WaitingForQuotaReset` until then instead of churning.
+
+**Quota failure detector:** recognises `RESOURCE_EXHAUSTED`,
+`quota exceeded`, `weekly limit reached`, `account locked until …`, and
+the structured `quota_metadata.lockout_until` envelope. Distinguishes
+hard weekly lockouts (`QuotaFailureKind.LimitReached`) from transient
+rate-limits so the orchestrator can park items long-term when the cap is
+hit, not just bench-and-retry.
+
+**Quota story is volatile.** Google has changed the AI Pro request cap
+at least four times in four months. CodeyBox does NOT hardcode quota
+sizes — the probe reads live state, the failure detector reads the
+gateway's reset time, and operators tune `QuotaRouter:MinQuotaPct` /
+`MaxConcurrent` per member as the cap evolves. Suggested seed: light
+`MaxConcurrent` (1–2 per member) and modest `QualityScore` so the router
+treats Antigravity as overflow behind paid Claude/Codex primaries.
+
+**Cost reporting:** the cost extractor accepts both NDJSON shapes the
+gateway emits (Anthropic-style `cache_creation_input_tokens` /
+`cache_read_input_tokens` for the claude-backed models;
+Gemini-style `cached_input_tokens` / `prompt_tokens` for the
+gemini-backed models) and a human-readable footer fallback. Wire
+per-gateway-model pricing via `CodeyBox:AgentPricing`.
+
+**Reasoning level:** encoded in the gateway model id (each thinking-level
+variant has its own canonical `--model` string), so
+`AgentMembership.ReasoningMode` is informational only on this runner —
+the same shape Gemini uses.
 
 ## Credential smoke test
 

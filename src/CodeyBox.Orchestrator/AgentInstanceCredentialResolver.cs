@@ -114,6 +114,18 @@ public static class AgentInstanceCredentialResolver
             return true;
         }
 
+        if (agent == AgentKind.Antigravity)
+        {
+            // The agy CLI uses Sign-in-with-Google OAuth and stores credentials
+            // under ~/.agy/oauth_creds.json. The runner materialises this env
+            // var to that path at sandbox-prepare time.
+            credential = new AgentCredential(
+                AgentKind.Antigravity,
+                new Dictionary<string, string> { [AntigravityConstants.OAuthCredsEnvVar] = raw },
+                new Dictionary<string, string>());
+            return true;
+        }
+
         return false;
     }
 
@@ -180,6 +192,17 @@ public static class AgentInstanceCredentialResolver
         if (agent == AgentKind.Cursor)
         {
             var token = CredentialFileTokenExtractor.ExtractCursorAccessToken(raw);
+            if (string.IsNullOrWhiteSpace(token)) return false;
+            credentials = new AgentQuotaCredentials(token);
+            return true;
+        }
+
+        if (agent == AgentKind.Antigravity)
+        {
+            // The agy CLI ships a Google OAuth creds JSON of the same shape as
+            // gemini-cli; reuse the Gemini extractor so a single per-instance
+            // file works for either CLI.
+            var token = CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw);
             if (string.IsNullOrWhiteSpace(token)) return false;
             credentials = new AgentQuotaCredentials(token);
             return true;
