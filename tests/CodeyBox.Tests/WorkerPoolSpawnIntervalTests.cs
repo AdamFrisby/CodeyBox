@@ -11,6 +11,7 @@ namespace CodeyBox.Tests;
 /// each worker fires independently but spawns must be separated by
 /// at least MinSpawnInterval (minus scheduler slack).
 /// </summary>
+[Collection("Background service timing")]
 public sealed class WorkerPoolSpawnIntervalTests : IDisposable
 {
     private readonly string _dbPath =

@@ -82,6 +82,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(500, row.CachedInputTokens);
         Assert.Equal(678, row.OutputTokens);
         Assert.Equal(0.168525, row.EstimatedUsd, precision: 5);
+        Assert.True(row.HasExtractedTokenUsage);
     }
 
     [Fact]
@@ -182,6 +183,57 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.Equal(10, row.CachedInputTokens);
         Assert.Equal(20, row.OutputTokens);
         Assert.Equal(0.42, row.EstimatedUsd, precision: 5);
+        Assert.True(row.HasExtractedTokenUsage);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlySummaryUpdatesElapsedFallbackFlag()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "audit") with
+        {
+            AgentKind = "gemini",
+            ModelId = "gemini-2.5-pro",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "audit-llm-quality:llm-review-1-abcdef.jsonl",
+            "audit-llm-quality:llm-review",
+            1,
+            AgentKind.Gemini,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                300,
+                50,
+                25,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var rows = await _store.GetByWorkItemAsync(itemId);
+
+        var row = Assert.Single(rows);
+        Assert.Equal("audit", row.Phase);
+        Assert.Equal(300, row.InputTokens);
+        Assert.Equal(25, row.CachedInputTokens);
+        Assert.Equal(50, row.OutputTokens);
+        Assert.Equal(0.0, row.EstimatedUsd);
+        Assert.True(row.HasExtractedTokenUsage);
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("gemini", 10);
+        Assert.Equal(1, samples);
+        Assert.Equal(375, avg);
     }
 
     [Fact]
@@ -273,6 +325,92 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         Assert.Equal(2, samples);
         Assert.Equal(388, avg);
+    }
+
+    [Fact]
+    public async Task GetAvgTokensPerItemAsync_ExcludesElapsedFallbackRows()
+    {
+        var itemId = "fallback-only";
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+
+        await _store.RecordAsync(MakeCost(itemId) with
+        {
+            AgentKind = "cursor",
+            ModelId = "cursor-model",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            HasExtractedTokenUsage = false,
+        });
+
+        var (avg, samples) = await _store.GetAvgTokensPerItemAsync("cursor", 10);
+
+        Assert.Equal(0, avg);
+        Assert.Equal(0, samples);
+    }
+
+    [Fact]
+    public async Task Constructor_MigratesLegacyElapsedFallbackRows_ToStructuredFlag()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-legacy-{Guid.NewGuid():N}.db");
+        try
+        {
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await using var setup = conn.CreateCommand();
+                setup.CommandText = $$"""
+                    CREATE TABLE work_items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        state INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO work_items (id, project_id, state, updated_at)
+                    VALUES ('legacy-fallback', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
+                    CREATE TABLE work_item_costs (
+                        id                  TEXT PRIMARY KEY,
+                        work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        phase               TEXT NOT NULL,
+                        iteration           INTEGER,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        estimated_usd       REAL NOT NULL DEFAULT 0,
+                        started_at          TEXT NOT NULL,
+                        ended_at            TEXT NOT NULL,
+                        raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                    );
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('legacy-row', 'legacy-fallback', 'work', NULL, 'cursor', 'cursor-model',
+                         0, 0, 0, 0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z',
+                         '{"source":"extractor_null_elapsed_fallback"}');
+                    """;
+                await setup.ExecuteNonQueryAsync();
+            }
+
+            using var migrated = new SqliteWorkItemCostStore(dbPath);
+
+            var rows = await migrated.GetByWorkItemAsync("legacy-fallback");
+            var row = Assert.Single(rows);
+            Assert.False(row.HasExtractedTokenUsage);
+
+            var (avg, samples) = await migrated.GetAvgTokensPerItemAsync("cursor", 10);
+            Assert.Equal(0, avg);
+            Assert.Equal(0, samples);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best-effort */ }
+        }
     }
 
     [Fact]

@@ -52,6 +52,10 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                     agent_kind          TEXT NOT NULL,
                     agent_instance_id   TEXT,
                     model_id            TEXT,
+                    phase               TEXT,
+                    started_utc         TEXT,
+                    ended_utc           TEXT,
+                    elapsed_ms          INTEGER NOT NULL DEFAULT 0,
                     input_tokens        INTEGER NOT NULL,
                     cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens       INTEGER NOT NULL,
@@ -64,17 +68,29 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                     ON agent_usage_events(time_utc);
                 """;
             createCmd.ExecuteNonQuery();
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
-            RunMigration("CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;");
+            AddUsageColumnIfMissing("agent_instance_id", "ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
+
+            using (var indexCmd = _conn.CreateCommand())
+            {
+                indexCmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;";
+                indexCmd.ExecuteNonQuery();
+            }
+
+            AddUsageColumnIfMissing("phase", "ALTER TABLE agent_usage_events ADD COLUMN phase TEXT;");
+            AddUsageColumnIfMissing("started_utc", "ALTER TABLE agent_usage_events ADD COLUMN started_utc TEXT;");
+            AddUsageColumnIfMissing("ended_utc", "ALTER TABLE agent_usage_events ADD COLUMN ended_utc TEXT;");
+            AddUsageColumnIfMissing("elapsed_ms", "ALTER TABLE agent_usage_events ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0;");
 
             _insertCmd = _conn.CreateCommand();
             _insertCmd.CommandText = """
                 INSERT INTO agent_usage_events
                     (id, time_utc, agent_kind, agent_instance_id, model_id,
+                     phase, started_utc, ended_utc, elapsed_ms,
                      input_tokens, cached_input_tokens, output_tokens,
                      cost_microcents, work_item_id)
                 VALUES
                     ($id, $time, $kind, $instance, $model,
+                     $phase, $started, $ended, $elapsed,
                      $input, $cached, $output,
                      $cost, $wi)
                 """;
@@ -83,6 +99,10 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
             _insertCmd.Parameters.Add("$kind", SqliteType.Text);
             _insertCmd.Parameters.Add("$instance", SqliteType.Text);
             _insertCmd.Parameters.Add("$model", SqliteType.Text);
+            _insertCmd.Parameters.Add("$phase", SqliteType.Text);
+            _insertCmd.Parameters.Add("$started", SqliteType.Text);
+            _insertCmd.Parameters.Add("$ended", SqliteType.Text);
+            _insertCmd.Parameters.Add("$elapsed", SqliteType.Integer);
             _insertCmd.Parameters.Add("$input", SqliteType.Integer);
             _insertCmd.Parameters.Add("$cached", SqliteType.Integer);
             _insertCmd.Parameters.Add("$output", SqliteType.Integer);
@@ -106,6 +126,14 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
             _insertCmd.Parameters["$kind"].Value = usage.AgentKind;
             _insertCmd.Parameters["$instance"].Value = usage.AgentInstanceId is not null ? usage.AgentInstanceId : DBNull.Value;
             _insertCmd.Parameters["$model"].Value = usage.ModelId is not null ? usage.ModelId : DBNull.Value;
+            _insertCmd.Parameters["$phase"].Value = usage.Phase is not null ? usage.Phase : DBNull.Value;
+            _insertCmd.Parameters["$started"].Value = usage.StartedUtc is { } started
+                ? started.ToUniversalTime().ToString("O")
+                : DBNull.Value;
+            _insertCmd.Parameters["$ended"].Value = usage.EndedUtc is { } ended
+                ? ended.ToUniversalTime().ToString("O")
+                : DBNull.Value;
+            _insertCmd.Parameters["$elapsed"].Value = Math.Max(0, usage.ElapsedMs);
             _insertCmd.Parameters["$input"].Value = usage.InputTokens;
             _insertCmd.Parameters["$cached"].Value = usage.CachedInputTokens;
             _insertCmd.Parameters["$output"].Value = usage.OutputTokens;
@@ -119,18 +147,29 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
         }
     }
 
-    private void RunMigration(string sql)
+    private void AddUsageColumnIfMissing(string columnName, string sql)
     {
-        try
+        if (UsageColumnExists(columnName))
+            return;
+
+        using var cmd = _conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private bool UsageColumnExists(string columnName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(agent_usage_events);";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
         {
-            using var m = _conn.CreateCommand();
-            // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals
-            m.CommandText = sql;
-            m.ExecuteNonQuery();
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
-        catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
-        {
-        }
+
+        return false;
     }
 
     public async Task<AgentUsageWindowAggregate> SumWindowAsync(

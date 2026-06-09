@@ -94,20 +94,17 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
     }
 
     [Fact]
-    public async Task NoCostExtractor_DoneWebhook_OmitsUsage()
+    public async Task NoCostExtractor_DoneWebhook_CarriesElapsedFallbackUsage()
     {
         // Mirrors a deployment where IAgentCostExtractor is not registered for
-        // the work agent (e.g. gemini without configuration). No cost rows are
-        // written, SummariseAsync returns null, and the WebhookEvent emitted by
-        // PipelineRunner must therefore leave Usage / UsageTotal null. This
-        // guards the negative branch of the iterUsage?.Iteration null-propagation
-        // — if a future change wired Usage to a non-null default (e.g. a zero
-        // summary), this test would catch it.
+        // the work agent. The pipeline still writes an elapsed-only row so agent
+        // activity is visible in webhooks even when token counts are unavailable.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var costStore = new PipelineRunnerCostCaptureTests.RecordingCostStore();
         var webhooks = new CapturingWebhookDispatcher();
         using var tp = BuildPipeline(_workspace, seed, costStore, webhooks, registerExtractor: false);
 
+        tp.Agent.BeforeWorkAsync = async (_, _, ct) => await Task.Delay(25, ct);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("no-extractor-emit.txt", "x\n"));
 
         var item = MakeItem("feature/no-extractor-emit");
@@ -116,8 +113,16 @@ public sealed class PipelineRunnerUsagePublishTests : IDisposable
 
         var done = webhooks.Events.LastOrDefault(e => e.Event == "work_item.done");
         Assert.NotNull(done);
-        Assert.Null(done!.Usage);
-        Assert.Null(done.UsageTotal);
+        Assert.NotNull(done!.Usage);
+        Assert.NotNull(done.UsageTotal);
+        Assert.Equal(0, done.Usage!.TokensInput);
+        Assert.Equal(0, done.Usage.TokensOutput);
+        Assert.Equal(0, done.Usage.CostUsd);
+        Assert.True(done.Usage.ElapsedMs > 0);
+        Assert.Equal(done.Usage.ElapsedMs, done.UsageTotal!.ElapsedMs);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.False(workRow.HasExtractedTokenUsage);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

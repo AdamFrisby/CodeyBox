@@ -57,6 +57,7 @@ internal static class WorkItemCostsEndpoints
         var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
         var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
+        var totalElapsedMs = rows.Sum(ElapsedMs);
 
         // byPhase breakdown
         var byPhase = rows
@@ -75,6 +76,8 @@ internal static class WorkItemCostsEndpoints
                             cachedInputTokens = ig.Sum(r => (long)r.CachedInputTokens),
                             outputTokens = ig.Sum(r => (long)r.OutputTokens),
                             estimatedUsd = ig.Sum(r => r.EstimatedUsd),
+                            elapsedMs = ig.Sum(ElapsedMs),
+                            invocationCount = ig.Count(),
                         })
                         .ToList();
                     return (object)new
@@ -83,6 +86,8 @@ internal static class WorkItemCostsEndpoints
                         cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                         outputTokens = g.Sum(r => (long)r.OutputTokens),
                         estimatedUsd = g.Sum(r => r.EstimatedUsd),
+                        elapsedMs = g.Sum(ElapsedMs),
+                        invocationCount = g.Count(),
                         byIteration = byIter,
                     };
                 });
@@ -99,6 +104,8 @@ internal static class WorkItemCostsEndpoints
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
+                elapsedMs = g.Sum(ElapsedMs),
+                invocationCount = g.Count(),
             })
             .OrderByDescending(x => x.estimatedUsd)
             .ToList();
@@ -112,6 +119,8 @@ internal static class WorkItemCostsEndpoints
                 cachedInputTokens = totalCached,
                 outputTokens = totalOutput,
                 estimatedUsd = totalUsd,
+                elapsedMs = totalElapsedMs,
+                invocationCount = rows.Count,
             },
             byPhase,
             byAgent,
@@ -128,6 +137,7 @@ internal static class WorkItemCostsEndpoints
         var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
         var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
+        var totalElapsedMs = rows.Sum(ElapsedMs);
 
         var byAgent = rows
             .GroupBy(r => new { r.AgentKind, r.AgentInstanceId, r.ModelId })
@@ -140,6 +150,8 @@ internal static class WorkItemCostsEndpoints
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
+                elapsedMs = g.Sum(ElapsedMs),
+                invocationCount = g.Count(),
             })
             .OrderByDescending(x => x.estimatedUsd)
             .ToList();
@@ -154,6 +166,8 @@ internal static class WorkItemCostsEndpoints
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
+                elapsedMs = g.Sum(ElapsedMs),
+                invocationCount = g.Count(),
             })
             .ToList();
 
@@ -168,11 +182,16 @@ internal static class WorkItemCostsEndpoints
                 cachedInputTokens = totalCached,
                 outputTokens = totalOutput,
                 estimatedUsd = totalUsd,
+                elapsedMs = totalElapsedMs,
+                invocationCount = rows.Count,
             },
             byAgent,
             byWorkItem,
         };
     }
+
+    private static long ElapsedMs(WorkItemCost row) =>
+        (long)Math.Max(0, (row.EndedAt - row.StartedAt).TotalMilliseconds);
 
     private static DateTimeOffset? TryParseIso(string? s)
     {

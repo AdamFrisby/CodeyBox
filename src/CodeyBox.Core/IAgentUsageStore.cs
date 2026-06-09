@@ -16,6 +16,10 @@ public sealed record AgentUsageEvent
     public required string AgentKind { get; init; }
     public string? AgentInstanceId { get; init; }
     public string? ModelId { get; init; }
+    public string? Phase { get; init; }
+    public DateTimeOffset? StartedUtc { get; init; }
+    public DateTimeOffset? EndedUtc { get; init; }
+    public long ElapsedMs { get; init; }
     public required int InputTokens { get; init; }
     public int CachedInputTokens { get; init; }
     public required int OutputTokens { get; init; }

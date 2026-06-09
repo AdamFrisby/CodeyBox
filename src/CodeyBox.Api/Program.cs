@@ -1848,13 +1848,14 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Gemini] = new GeminiCostExtractor(),
         [AgentKind.Cursor] = new CursorCostExtractor(),
         [AgentKind.Opencode] = new OpencodeCostExtractor(),
+        [AgentKind.Copilot] = new CopilotCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
     {
         if (!extractors.ContainsKey(kind))
             startupLog.LogWarning(
-                "No cost extractor registered for agent '{Agent}'; cost data will not be captured for this agent", kind.Value);
+                "No cost extractor registered for agent '{Agent}'; token usage will not be extracted, but completed invocations still record elapsed fallback cost rows", kind.Value);
     }
     return extractors;
 });

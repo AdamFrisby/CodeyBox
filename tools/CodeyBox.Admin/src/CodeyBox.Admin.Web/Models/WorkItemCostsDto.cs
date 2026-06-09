@@ -17,6 +17,8 @@ public sealed class CostTotalsDto
     public int CachedInputTokens { get; set; }
     public int OutputTokens { get; set; }
     public double EstimatedUsd { get; set; }
+    public long ElapsedMs { get; set; }
+    public int InvocationCount { get; set; }
 }
 
 public sealed class AgentCostBreakdownDto
@@ -28,6 +30,8 @@ public sealed class AgentCostBreakdownDto
     public int CachedInputTokens { get; set; }
     public int OutputTokens { get; set; }
     public double EstimatedUsd { get; set; }
+    public long ElapsedMs { get; set; }
+    public int InvocationCount { get; set; }
 }
 
 /// <summary>Response shape for GET /projects/{id}/costs.</summary>
@@ -48,4 +52,6 @@ public sealed class WorkItemCostSummaryDto
     public int CachedInputTokens { get; set; }
     public int OutputTokens { get; set; }
     public double EstimatedUsd { get; set; }
+    public long ElapsedMs { get; set; }
+    public int InvocationCount { get; set; }
 }

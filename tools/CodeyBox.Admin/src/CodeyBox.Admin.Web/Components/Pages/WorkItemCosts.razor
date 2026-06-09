@@ -25,6 +25,14 @@ else
     <p class="costs-summary">
         <strong>@FormatUsd(_costs.Totals.EstimatedUsd)</strong> —
         @FormatTokens(_costs.Totals.InputTokens) input, @FormatTokens(_costs.Totals.OutputTokens) output tokens
+        @if (_costs.Totals.ElapsedMs > 0)
+        {
+            <span>, @FormatDuration(_costs.Totals.ElapsedMs) agent time</span>
+        }
+        @if (_costs.Totals.InvocationCount > 0)
+        {
+            <span>, @FormatRuns(_costs.Totals.InvocationCount)</span>
+        }
         @if (_costs.Totals.CachedInputTokens > 0)
         {
             var cacheHitPct = _costs.Totals.InputTokens > 0 ? (double)_costs.Totals.CachedInputTokens / _costs.Totals.InputTokens * 100.0 : 0.0;
@@ -80,6 +88,8 @@ else
                         <th>Cached Input</th>
                         <th>Output</th>
                         <th>Est. Cost</th>
+                        <th>Agent Time</th>
+                        <th>Runs</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -90,12 +100,16 @@ else
                         var pCached = GetInt(pEl, "cachedInputTokens");
                         var pOutput = GetInt(pEl, "outputTokens");
                         var pUsd = GetDouble(pEl, "estimatedUsd");
+                        var pElapsed = GetLong(pEl, "elapsedMs");
+                        var pRuns = GetInt(pEl, "invocationCount");
                         <tr>
                             <td>@kv.Key</td>
                             <td>@FormatTokens(pInput ?? 0)</td>
                             <td>@FormatTokens(pCached ?? 0)</td>
                             <td>@FormatTokens(pOutput ?? 0)</td>
                             <td>@FormatUsd(pUsd ?? 0)</td>
+                            <td>@FormatDuration(pElapsed ?? 0)</td>
+                            <td>@(pRuns ?? 0)</td>
                         </tr>
                         @* Iteration sub-rows *@
                         @if (pEl.ValueKind == JsonValueKind.Object
@@ -109,12 +123,16 @@ else
                                 var iCached = GetInt(iter, "cachedInputTokens");
                                 var iOutput = GetInt(iter, "outputTokens");
                                 var iUsd = GetDouble(iter, "estimatedUsd");
+                                var iElapsed = GetLong(iter, "elapsedMs");
+                                var iRuns = GetInt(iter, "invocationCount");
                                 <tr class="costs-iter-row" style="color:#666;font-size:0.9em;">
                                     <td style="padding-left:1.5em;">↳ iter @iIter</td>
                                     <td>@FormatTokens(iInput ?? 0)</td>
                                     <td>@FormatTokens(iCached ?? 0)</td>
                                     <td>@FormatTokens(iOutput ?? 0)</td>
                                     <td>@FormatUsd(iUsd ?? 0)</td>
+                                    <td>@FormatDuration(iElapsed ?? 0)</td>
+                                    <td>@(iRuns ?? 0)</td>
                                 </tr>
                             }
                         }
@@ -127,6 +145,8 @@ else
                         <td>@FormatTokens(_costs.Totals.CachedInputTokens)</td>
                         <td>@FormatTokens(_costs.Totals.OutputTokens)</td>
                         <td>@FormatUsd(_costs.Totals.EstimatedUsd)</td>
+                        <td>@FormatDuration(_costs.Totals.ElapsedMs)</td>
+                        <td>@_costs.Totals.InvocationCount</td>
                     </tr>
                 </tfoot>
             </table>
@@ -140,7 +160,7 @@ else
             <h2>By agent</h2>
             <table class="detail-table">
                 <thead>
-                    <tr><th>Agent</th><th>Model</th><th>Input</th><th>Cached Input</th><th>Output</th><th>Est. Cost</th></tr>
+                    <tr><th>Agent</th><th>Model</th><th>Input</th><th>Cached Input</th><th>Output</th><th>Est. Cost</th><th>Agent Time</th><th>Runs</th></tr>
                 </thead>
                 <tbody>
                     @foreach (var ag in _costs.ByAgent)
@@ -152,6 +172,8 @@ else
                             <td>@FormatTokens(ag.CachedInputTokens)</td>
                             <td>@FormatTokens(ag.OutputTokens)</td>
                             <td>@FormatUsd(ag.EstimatedUsd)</td>
+                            <td>@FormatDuration(ag.ElapsedMs)</td>
+                            <td>@ag.InvocationCount</td>
                         </tr>
                     }
                 </tbody>
@@ -161,7 +183,14 @@ else
 
     @if (_costs.Totals.InputTokens == 0 && _costs.Totals.OutputTokens == 0)
     {
-        <p class="costs-empty">No cost data recorded yet. Cost capture requires the agent CLI to emit token counts in its output.</p>
+        @if (_costs.Totals.ElapsedMs > 0 || _costs.Totals.InvocationCount > 0)
+        {
+            <p class="costs-empty">Token counts unavailable; recorded @FormatRuns(_costs.Totals.InvocationCount) over @FormatDuration(_costs.Totals.ElapsedMs).</p>
+        }
+        else
+        {
+            <p class="costs-empty">No cost data recorded yet. Cost capture requires an agent invocation to complete.</p>
+        }
     }
 }
 
@@ -213,9 +242,27 @@ else
     private static string AgentDisplay(AgentCostBreakdownDto agent) =>
         string.IsNullOrWhiteSpace(agent.AgentInstanceId) ? agent.Agent : agent.AgentInstanceId!;
 
+    private static string FormatRuns(int count) => count == 1 ? "1 run" : $"{count} runs";
+
+    private static string FormatDuration(long elapsedMs)
+    {
+        if (elapsedMs <= 0) return "0s";
+        var ts = TimeSpan.FromMilliseconds(elapsedMs);
+        if (ts.TotalHours >= 1) return $"{(int)ts.TotalHours}h {ts.Minutes:D2}m";
+        if (ts.TotalMinutes >= 1) return $"{ts.Minutes}m {ts.Seconds:D2}s";
+        return $"{Math.Max(1, (int)Math.Round(ts.TotalSeconds))}s";
+    }
+
     private static int? GetInt(JsonElement el, string key)
     {
         if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty(key, out var v) && v.TryGetInt32(out var n))
+            return n;
+        return null;
+    }
+
+    private static long? GetLong(JsonElement el, string key)
+    {
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty(key, out var v) && v.TryGetInt64(out var n))
             return n;
         return null;
     }

@@ -15,8 +15,8 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies that PipelineRunner writes cost rows via IWorkItemCostStore when
-/// an IAgentCostExtractor returns a snapshot, and does not throw or write rows
-/// when no extractor is registered or the extractor returns null.
+/// an IAgentCostExtractor returns a snapshot, cannot extract tokens, or no
+/// extractor is registered for the completed agent invocation.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class PipelineRunnerCostCaptureTests : IDisposable
@@ -70,19 +70,43 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
-    public async Task MissingExtractor_NoCostRow()
+    public async Task MissingExtractor_WritesElapsedFallbackCostAndUsageRows()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var costStore = new RecordingCostStore();
-        using var tp = BuildPipelineWithCosts(_workspace, seed, costStore, registerExtractor: false);
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            registerExtractor: false,
+            usageStore: usageStore,
+            agentKind: AgentKind.Opencode);
 
         tp.Agent.WorkPlan.Enqueue(new FileWrite("no-extractor.txt", "x\n"));
 
-        var item = NewItem("feature/no-extractor");
+        var item = NewItem("feature/no-extractor") with
+        {
+            Agent = AgentKind.Opencode,
+            ModelId = "opencode-default-model",
+        };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        Assert.Empty(costStore.Recorded);
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("opencode", workRow.AgentKind);
+        Assert.Equal("opencode-default-model", workRow.ModelId);
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.False(workRow.HasExtractedTokenUsage);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("opencode", usage.AgentKind);
+        Assert.Equal("opencode-default-model", usage.ModelId);
+        Assert.Equal(workRow.StartedAt, usage.StartedUtc);
+        Assert.Equal(workRow.EndedAt, usage.EndedUtc);
+        Assert.Equal((long)(workRow.EndedAt - workRow.StartedAt).TotalMilliseconds, usage.ElapsedMs);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.OutputTokens);
     }
 
     [Fact]
@@ -163,6 +187,10 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(100, ev.CachedInputTokens);
         Assert.Equal(200, ev.OutputTokens);
         Assert.Equal(item.Id.ToString(), ev.WorkItemId);
+        Assert.Equal("work", ev.Phase);
+        Assert.Equal(costStore.Recorded[0].StartedAt, ev.StartedUtc);
+        Assert.Equal(costStore.Recorded[0].EndedAt, ev.EndedUtc);
+        Assert.True(ev.ElapsedMs > 0);
 
         // The microcent cost and timestamp must be derived from the same recorded
         // cost row (not a different field or scale): CostMicroCents is the cost
@@ -170,6 +198,318 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         var costRow = costStore.Recorded[0];
         Assert.Equal(AgentUsageEvent.UsdToMicroCents((decimal)costRow.EstimatedUsd), ev.CostMicroCents);
         Assert.Equal(costRow.EndedAt, ev.TimeUtc);
+    }
+
+    [Theory]
+    [MemberData(nameof(BuiltInAgentKinds))]
+    public async Task SuccessfulRun_WritesCostAndUsageRows_ForEachAgentKind(string agentKindValue)
+    {
+        var agentKind = new AgentKind(agentKindValue);
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore, usageStore: usageStore, agentKind: agentKind);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite($"{agentKindValue}-usage.txt", "usage\n"));
+
+        var item = NewItem($"feature/{agentKindValue}-usage") with { Agent = agentKind };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal(agentKindValue, workRow.AgentKind);
+        Assert.Equal(1000, workRow.InputTokens);
+        Assert.Equal(100, workRow.CachedInputTokens);
+        Assert.Equal(200, workRow.OutputTokens);
+        Assert.True(workRow.HasExtractedTokenUsage);
+        Assert.DoesNotContain("elapsed_fallback", workRow.RawMetadataJson);
+        Assert.DoesNotContain("extractor_null_elapsed_fallback", workRow.RawMetadataJson);
+
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+        Assert.Contains(usageStore.Recorded, e =>
+            e.AgentKind == agentKindValue
+            && e.WorkItemId == item.Id.ToString()
+            && e.InputTokens == 1000
+            && e.OutputTokens == 200);
+    }
+
+    [Fact]
+    public async Task RegisteredExtractorReturningNull_WritesElapsedFallbackCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Cursor,
+            extractorReturnsNull: true);
+
+        tp.Agent.BeforeWorkAsync = async (_, _, ct) => await Task.Delay(25, ct);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("cursor-fallback.txt", "fallback\n"));
+
+        var item = NewItem("feature/cursor-fallback") with
+        {
+            Agent = AgentKind.Cursor,
+            ModelId = "cursor-default-model",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("cursor", workRow.AgentKind);
+        Assert.Equal("cursor-default-model", workRow.ModelId);
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.True(workRow.EndedAt > workRow.StartedAt);
+        Assert.False(workRow.HasExtractedTokenUsage);
+
+        Assert.Equal(costStore.Recorded.Count, usageStore.Recorded.Count);
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("cursor", usage.AgentKind);
+        Assert.Equal("cursor-default-model", usage.ModelId);
+        Assert.Equal("work", usage.Phase);
+        Assert.Equal(workRow.StartedAt, usage.StartedUtc);
+        Assert.Equal(workRow.EndedAt, usage.EndedUtc);
+        Assert.Equal((long)(workRow.EndedAt - workRow.StartedAt).TotalMilliseconds, usage.ElapsedMs);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.CachedInputTokens);
+        Assert.Equal(0, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+        Assert.Equal(item.Id.ToString(), usage.WorkItemId);
+    }
+
+    [Fact]
+    public async Task RegisteredExtractorThrowing_WritesElapsedFallbackCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Gemini,
+            extractorThrows: true);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("throwing-extractor.txt", "fallback\n"));
+
+        var item = NewItem("feature/throwing-extractor") with
+        {
+            Agent = AgentKind.Gemini,
+            ModelId = "gemini-default-model",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("gemini", workRow.AgentKind);
+        Assert.Equal("gemini-default-model", workRow.ModelId);
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.False(workRow.HasExtractedTokenUsage);
+        Assert.Contains("elapsed_fallback", workRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("gemini", usage.AgentKind);
+        Assert.Equal("gemini-default-model", usage.ModelId);
+        Assert.Equal("work", usage.Phase);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.CachedInputTokens);
+        Assert.Equal(0, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+    }
+
+    [Fact]
+    public async Task ExtractedNegativeSnapshot_WritesNonNegativeCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        var pricing = new AgentPricingOptions
+        {
+            DefaultRates =
+            {
+                ["claude"] = new ModelRateConfig
+                {
+                    InputPerMillion = 1,
+                    CachedInputPerMillion = 1,
+                    OutputPerMillion = 1,
+                },
+            },
+        };
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            extractorSnapshot: new AgentCostSnapshot(
+                InputTokens: -100,
+                CachedInputTokens: -50,
+                OutputTokens: -200,
+                ModelId: "fake-model"),
+            pricingOptions: pricing);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("negative-extracted.txt", "x\n"));
+
+        var item = NewItem("feature/negative-extracted");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal(0, workRow.InputTokens);
+        Assert.Equal(0, workRow.CachedInputTokens);
+        Assert.Equal(0, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.True(workRow.HasExtractedTokenUsage);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.CachedInputTokens);
+        Assert.Equal(0, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+    }
+
+    [Fact]
+    public async Task CalculatorFailure_WritesExtractedTokenRowsWithZeroEstimatedCost()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            calculatorDefaultPricingThrows: true);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("calculator-fallback.txt", "x\n"));
+
+        var item = NewItem("feature/calculator-fallback");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("claude", workRow.AgentKind);
+        Assert.Equal(1000, workRow.InputTokens);
+        Assert.Equal(100, workRow.CachedInputTokens);
+        Assert.Equal(200, workRow.OutputTokens);
+        Assert.Equal(0.0, workRow.EstimatedUsd);
+        Assert.True(workRow.HasExtractedTokenUsage);
+        Assert.Equal("{}", workRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("claude", usage.AgentKind);
+        Assert.Equal(1000, usage.InputTokens);
+        Assert.Equal(100, usage.CachedInputTokens);
+        Assert.Equal(200, usage.OutputTokens);
+        Assert.Equal(0, usage.CostMicroCents);
+    }
+
+    [Fact]
+    public async Task CheckAndActCheckPhase_WritesElapsedFallbackCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Cursor,
+            extractorReturnsNull: true);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "nothing actionable"));
+
+        var check = NewCheckAndActItem("feature/check-cost") with
+        {
+            Agent = AgentKind.Cursor,
+            ModelId = "cursor-default-model",
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var checkRow = Assert.Single(costStore.Recorded, r => r.Phase == "check");
+        Assert.Equal("cursor", checkRow.AgentKind);
+        Assert.Equal("cursor-default-model", checkRow.ModelId);
+        Assert.Equal(0, checkRow.InputTokens);
+        Assert.Equal(0, checkRow.CachedInputTokens);
+        Assert.Equal(0, checkRow.OutputTokens);
+        Assert.False(checkRow.HasExtractedTokenUsage);
+        Assert.Contains("elapsed_fallback", checkRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.Phase == "check");
+        Assert.Equal(check.Id.ToString(), usage.WorkItemId);
+        Assert.Equal(checkRow.EndedAt, usage.TimeUtc);
+        Assert.Equal("cursor", usage.AgentKind);
+        Assert.Equal("cursor-default-model", usage.ModelId);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.OutputTokens);
+    }
+
+    [Fact]
+    public async Task PostActReCheckPhase_WritesElapsedFallbackCostAndUsageRows()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace, seed, costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Cursor,
+            extractorReturnsNull: true);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initially actionable"));
+        var check = NewCheckAndActItem("feature/post-act-check-cost") with
+        {
+            Agent = AgentKind.Cursor,
+            ModelId = "cursor-default-model",
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("remediation.txt", "fixed\n"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "remediation satisfied the check"));
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Done, finalFollowup!.State);
+
+        var recheckRow = Assert.Single(costStore.Recorded, r => r.Phase == "post-act-recheck");
+        Assert.Equal("cursor", recheckRow.AgentKind);
+        Assert.Null(recheckRow.ModelId);
+        Assert.Equal(1, recheckRow.Iteration);
+        Assert.Equal(0, recheckRow.InputTokens);
+        Assert.Equal(0, recheckRow.CachedInputTokens);
+        Assert.Equal(0, recheckRow.OutputTokens);
+        Assert.False(recheckRow.HasExtractedTokenUsage);
+        Assert.Contains("elapsed_fallback", recheckRow.RawMetadataJson);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.Phase == "post-act-recheck");
+        Assert.Equal(followup.Id.ToString(), usage.WorkItemId);
+        Assert.Equal(recheckRow.EndedAt, usage.TimeUtc);
+        Assert.Equal("cursor", usage.AgentKind);
+        Assert.Null(usage.ModelId);
+        Assert.Equal(0, usage.InputTokens);
+        Assert.Equal(0, usage.OutputTokens);
     }
 
     [Fact]
@@ -235,6 +575,21 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(0, ev.CachedInputTokens);
         Assert.Equal(0, ev.OutputTokens);
         Assert.Equal(0L, ev.CostMicroCents);
+    }
+
+    [Fact]
+    public void BuildUsageEvent_ClampsNegativeElapsed_ToZero()
+    {
+        var ended = DateTimeOffset.Parse("2026-06-01T00:00:00Z");
+        var started = ended.AddSeconds(5);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 0, CachedInputTokens: 0, OutputTokens: 0, ModelId: null);
+
+        var ev = PipelineRunner.BuildUsageEvent(
+            AgentKind.Cursor, "cursor-model", snapshot,
+            usd: 0m, new WorkItemId(Guid.NewGuid()), ended, phase: "work", startedAt: started);
+
+        Assert.Equal(0, ev.ElapsedMs);
     }
 
     [Fact]
@@ -342,6 +697,41 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         MergeTimeout = TimeSpan.FromMinutes(5),
     };
 
+    private static WorkItem NewCheckAndActItem(string branch) => NewItem(branch) with
+    {
+        Title = "Check cost capture test",
+        Prompt = "evaluate the repo",
+        BaseBranch = "main",
+        PushUpstream = false,
+        JobType = JobType.CheckAndAct,
+        Check = new CheckAndActSpec
+        {
+            Question = "Is this repository still actionable?",
+            ActionableAnswer = true,
+            OnYes = new OnYesActionSpec
+            {
+                Title = "Remediate actionable check",
+                Prompt = "make the check non-actionable",
+            },
+        },
+    };
+
+    private static string BuildVerdictStdout(bool answer, string evidence, string confidence = "high")
+    {
+        var ans = answer ? "true" : "false";
+        return $"preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\", \"confidence\": \"{confidence}\"}}\n{CheckAndActPipeline.EndSentinel}\n";
+    }
+
+    public static TheoryData<string> BuiltInAgentKinds() => new()
+    {
+        AgentKind.Claude.Value,
+        AgentKind.Codex.Value,
+        AgentKind.Gemini.Value,
+        AgentKind.Cursor.Value,
+        AgentKind.Opencode.Value,
+        AgentKind.Copilot.Value,
+    };
+
     [Fact]
     public async Task LlmAuditor_ProducesAuditPhaseCostRow()
     {
@@ -433,8 +823,15 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         bool registerExtractor = true,
         IReadOnlyList<IAuditor>? auditors = null,
         int maxAuditIterations = 1,
-        IAgentUsageStore? usageStore = null)
+        IAgentUsageStore? usageStore = null,
+        AgentKind? agentKind = null,
+        bool extractorReturnsNull = false,
+        bool extractorThrows = false,
+        AgentCostSnapshot? extractorSnapshot = null,
+        AgentPricingOptions? pricingOptions = null,
+        bool calculatorDefaultPricingThrows = false)
     {
+        var resolvedAgentKind = agentKind ?? AgentKind.Claude;
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
@@ -444,7 +841,7 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = resolvedAgentKind };
         var registry = new AgentRegistry([agent]);
 
         var auditorList = auditors ?? [];
@@ -456,20 +853,27 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
             DisplayName = "Test Project",
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
-            DefaultAgent = AgentKind.Claude,
+            DefaultAgent = resolvedAgentKind,
             Audit = new ProjectAudit { MaxIterations = maxAuditIterations, AuditTypes = auditTypes },
         });
 
         var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var upstreamFactory = new TestUpstreamFactory();
-        var calculator = new AgentCostCalculator(new AgentPricingOptions());
 
         IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null;
         if (registerExtractor)
         {
-            var fake = new FakeCostExtractor { Kind = AgentKind.Claude };
-            extractors = new Dictionary<AgentKind, IAgentCostExtractor> { [AgentKind.Claude] = fake };
+            var fake = new FakeCostExtractor
+            {
+                Kind = resolvedAgentKind,
+                ReturnNull = extractorReturnsNull,
+                Throw = extractorThrows,
+                Snapshot = extractorSnapshot,
+                DefaultPricingThrows = calculatorDefaultPricingThrows,
+            };
+            extractors = new Dictionary<AgentKind, IAgentCostExtractor> { [resolvedAgentKind] = fake };
         }
+        var calculator = new AgentCostCalculator(pricingOptions ?? new AgentPricingOptions(), extractors);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -523,11 +927,27 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     private sealed class FakeCostExtractor : IAgentCostExtractor
     {
         public AgentKind Kind { get; init; }
+        public bool ReturnNull { get; init; }
+        public bool Throw { get; init; }
+        public bool DefaultPricingThrows { get; init; }
+        public AgentCostSnapshot? Snapshot { get; init; }
 
         public AgentCostSnapshot? TryExtract(string? stdout, string? stderr)
-            => new(InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 200, ModelId: "fake-model");
+        {
+            if (Throw)
+                throw new InvalidOperationException("injected extractor failure");
+            if (ReturnNull)
+                return null;
+            return Snapshot ?? new AgentCostSnapshot(
+                InputTokens: 1000,
+                CachedInputTokens: 100,
+                OutputTokens: 200,
+                ModelId: "fake-model");
+        }
 
-        public ModelRateConfig? DefaultPricing => null;
+        public ModelRateConfig? DefaultPricing => DefaultPricingThrows
+            ? throw new InvalidOperationException("injected calculator pricing failure")
+            : null;
     }
 
     // ── Recording cost store ──────────────────────────────────────────────────

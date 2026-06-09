@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 using System.Text.Json;
 
@@ -13,6 +14,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsByAgentQueryable, IDisposable
 {
+    private const string LegacyElapsedFallbackMetadataSource = "extractor_null_elapsed_fallback";
+
     private readonly string _path;
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
@@ -54,7 +57,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                     estimated_usd       REAL NOT NULL DEFAULT 0,
                     started_at          TEXT NOT NULL,
                     ended_at            TEXT NOT NULL,
-                    raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                    raw_metadata_json   TEXT NOT NULL DEFAULT '{}',
+                    has_extracted_token_usage INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_costs_work_item
                     ON work_item_costs(work_item_id, phase, iteration);
@@ -64,16 +68,23 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             createCmd.ExecuteNonQuery();
             RunMigration("ALTER TABLE work_item_costs ADD COLUMN agent_instance_id TEXT;");
 
+            AddWorkItemCostColumnIfMissing(
+                "has_extracted_token_usage",
+                "ALTER TABLE work_item_costs ADD COLUMN has_extracted_token_usage INTEGER NOT NULL DEFAULT 1;");
+            MarkLegacyElapsedFallbackRows();
+
             _insertCmd = _conn.CreateCommand();
             _insertCmd.CommandText = """
                 INSERT INTO work_item_costs
                     (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
-                     estimated_usd, started_at, ended_at, raw_metadata_json)
+                     estimated_usd, started_at, ended_at, raw_metadata_json,
+                     has_extracted_token_usage)
                 VALUES
                     ($id, $wi, $phase, $iter, $kind, $instance, $model,
                      $input, $cached, $output,
-                     $usd, $started, $ended, $meta)
+                     $usd, $started, $ended, $meta,
+                     $hasExtracted)
                 """;
             _insertCmd.Parameters.Add("$id", SqliteType.Text);
             _insertCmd.Parameters.Add("$wi", SqliteType.Text);
@@ -89,6 +100,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             _insertCmd.Parameters.Add("$started", SqliteType.Text);
             _insertCmd.Parameters.Add("$ended", SqliteType.Text);
             _insertCmd.Parameters.Add("$meta", SqliteType.Text);
+            _insertCmd.Parameters.Add("$hasExtracted", SqliteType.Integer);
             _insertCmd.Prepare();
         }
         finally
@@ -116,6 +128,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             _insertCmd.Parameters["$started"].Value = cost.StartedAt.ToString("O");
             _insertCmd.Parameters["$ended"].Value = cost.EndedAt.ToString("O");
             _insertCmd.Parameters["$meta"].Value = cost.RawMetadataJson;
+            _insertCmd.Parameters["$hasExtracted"].Value = cost.HasExtractedTokenUsage ? 1 : 0;
             await _insertCmd.ExecuteNonQueryAsync(ct);
         }
         finally
@@ -149,7 +162,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         cmd.CommandText = """
             SELECT id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                    input_tokens, cached_input_tokens, output_tokens,
-                   estimated_usd, started_at, ended_at, raw_metadata_json
+                   estimated_usd, started_at, ended_at, raw_metadata_json,
+                   has_extracted_token_usage
             FROM work_item_costs
             WHERE work_item_id = $wi
             ORDER BY started_at
@@ -194,7 +208,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             cmd.CommandText = $"""
                 SELECT id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                        input_tokens, cached_input_tokens, output_tokens,
-                       estimated_usd, started_at, ended_at, raw_metadata_json
+                       estimated_usd, started_at, ended_at, raw_metadata_json,
+                       has_extracted_token_usage
                 FROM work_item_costs
                 WHERE work_item_id IN ({placeholders})
                 ORDER BY work_item_id, started_at
@@ -236,7 +251,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         cmd.CommandText = """
             SELECT c.id, c.work_item_id, c.phase, c.iteration, c.agent_kind, c.agent_instance_id, c.model_id,
                    c.input_tokens, c.cached_input_tokens, c.output_tokens,
-                   c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json
+                   c.estimated_usd, c.started_at, c.ended_at, c.raw_metadata_json,
+                   c.has_extracted_token_usage
             FROM work_item_costs c
             JOIN work_items w ON w.id = c.work_item_id
             WHERE w.project_id = $proj
@@ -314,6 +330,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                 JOIN work_items w ON w.id = c.work_item_id
                 WHERE c.agent_kind = $kind
                   AND w.state = $done
+                  AND c.has_extracted_token_usage = 1
                 GROUP BY c.work_item_id
                 ORDER BY latest DESC
                 LIMIT $lim
@@ -348,7 +365,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
 
     public async Task ReconcileFromAgentStreamSummaryAsync(AgentStreamSummaryRow row, CancellationToken ct = default)
     {
-        if (row.Summary.EstimatedUsd is null)
+        if (row.Summary.EstimatedUsd is null && !HasExtractedTokens(row.Summary))
             return;
 
         await _writeLock.WaitAsync(ct);
@@ -362,7 +379,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                         cached_input_tokens = $cached,
                         output_tokens = $output,
                         estimated_usd = $usd,
-                        raw_metadata_json = $meta
+                        raw_metadata_json = $meta,
+                        has_extracted_token_usage = 1
                     WHERE id = (
                         SELECT id FROM work_item_costs
                         WHERE work_item_id = $wi
@@ -389,10 +407,12 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                 INSERT INTO work_item_costs
                     (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
-                     estimated_usd, started_at, ended_at, raw_metadata_json)
+                     estimated_usd, started_at, ended_at, raw_metadata_json,
+                     has_extracted_token_usage)
                 VALUES
                     ($id, $wi, $phase, $iter, $kind, NULL, NULL,
-                     $input, $cached, $output, $usd, $started, $ended, $meta)
+                     $input, $cached, $output, $usd, $started, $ended, $meta,
+                     1)
                 """;
             BindReconcile(insert, row);
             insert.Parameters.AddWithValue("$id", $"stream-{row.WorkItemId}-{row.FileName}");
@@ -449,7 +469,45 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         StartedAt = DateTimeOffset.Parse(r.GetString(11)),
         EndedAt = DateTimeOffset.Parse(r.GetString(12)),
         RawMetadataJson = r.GetString(13),
+        HasExtractedTokenUsage = r.GetInt32(14) != 0,
     };
+
+    private void AddWorkItemCostColumnIfMissing(string columnName, string sql)
+    {
+        if (WorkItemCostColumnExists(columnName))
+            return;
+
+        using var cmd = _conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- all callers pass hardcoded DDL literals; no user-supplied input reaches this method
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private bool WorkItemCostColumnExists(string columnName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(work_item_costs);";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private void MarkLegacyElapsedFallbackRows()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE work_item_costs
+            SET has_extracted_token_usage = 0
+            WHERE raw_metadata_json LIKE $legacy
+            """;
+        cmd.Parameters.AddWithValue("$legacy", $"%\"{LegacyElapsedFallbackMetadataSource}\"%");
+        cmd.ExecuteNonQuery();
+    }
 
     private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row)
     {
@@ -469,6 +527,11 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase)
             ? "audit"
             : phase;
+
+    private static bool HasExtractedTokens(AgentStreamSummary summary) =>
+        summary.InputTokens > 0
+        || summary.CachedInputTokens > 0
+        || summary.OutputTokens > 0;
 
     public void Dispose()
     {

@@ -7,11 +7,11 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Pins the Cursor cost extractor's deliberate "always returns null" contract.
 /// The Cursor CLI does not currently emit a documented final-usage line, so the
-/// extractor is a no-op and the cost calculator falls back to
-/// <c>usageTotal.elapsedMs</c>. These tests fail if a future "helpful" refactor
-/// adds speculative parsing — that change should be a deliberate decision, not
-/// a silent one (a parser that misreads a sandbox log line as a usage line
-/// would yield bogus per-item costs with no regression detector).
+/// extractor is a no-op and the pipeline records a zero-token elapsed-time row.
+/// These tests fail if a future "helpful" refactor adds speculative parsing —
+/// that change should be a deliberate decision, not a silent one (a parser that
+/// misreads a sandbox log line as a usage line would yield bogus per-item costs
+/// with no regression detector).
 /// </summary>
 public sealed class CursorCostExtractorTests
 {

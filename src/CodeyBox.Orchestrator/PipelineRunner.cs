@@ -39,6 +39,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private const int AuditEscalationHistoryLimit = 25;
     private const int AuditEscalationFindingsPerIterationLimit = 20;
     private const int AuditEscalationFindingDescriptionLimit = 2000;
+    private const string ElapsedFallbackMetadataSource = "elapsed_fallback";
 
     private readonly ISandboxProvider _sandboxes;
     private readonly IGitHost _gitHost;
@@ -3157,11 +3158,24 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        var startedAt = DateTimeOffset.UtcNow;
         var result = await agentRunner.RunAsync(
             sandbox, SandboxConventions.WorkDir, prompt, credential,
             item.ModelId, item.ReasoningMode, ct,
             stdoutChunkCallback: chunkCallback,
             captureStructuredStream: false);
+        var endedAt = DateTimeOffset.UtcNow;
+
+        var aggregatedStdout = aggregator.ToString();
+        if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+        {
+            aggregator.Append(result.Stdout);
+            aggregatedStdout = aggregator.ToString();
+        }
+
+        await TryRecordCostAsync(aggregatedStdout, result.Stderr,
+            agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
+            startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
         if (!result.Success)
         {
@@ -3169,15 +3183,7 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
         }
 
-        // If the runner returned a final stdout payload that wasn't streamed
-        // through the callback, append it so the verdict parser sees the full
-        // tail. Double-counting a chunk that was both streamed AND echoed in
-        // the final payload only hurts the parser if the final payload omits
-        // the sentinels — which would itself be a malformed-verdict failure.
-        if (!string.IsNullOrEmpty(result.Stdout) && !aggregator.ToString().EndsWith(result.Stdout, StringComparison.Ordinal))
-            aggregator.Append(result.Stdout);
-
-        return aggregator.ToString();
+        return aggregatedStdout;
     }
 
     /// <summary>
@@ -3383,7 +3389,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 "post-act-recheck",
                 iteration,
                 (runner, trialItem, attemptCt) => RunPostActReCheckAgentAsync(
-                    trialItem, project, runner, repoId, workBranch, prompt, attemptCt),
+                    trialItem, project, runner, repoId, workBranch, prompt, iteration, attemptCt),
                 ct,
                 initialRunnerOverride: agentRunner,
                 initialMemberOverride: _classRouter?.FindMember(
@@ -3496,7 +3502,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// </summary>
     private async Task<string> RunPostActReCheckAgentAsync(
         WorkItem item, Project project, IAgentRunner agentRunner,
-        string repoId, string workBranch, string prompt, CancellationToken ct)
+        string repoId, string workBranch, string prompt, int iteration, CancellationToken ct)
     {
         var credential = await ResolveAgentCredentialAsync(agentRunner.Kind, project, item, ct);
         var access = _gitHost.GetSandboxAccess(repoId);
@@ -3539,11 +3545,24 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        var startedAt = DateTimeOffset.UtcNow;
         var result = await agentRunner.RunAsync(
             sandbox, SandboxConventions.WorkDir, prompt, credential,
             item.ModelId, item.ReasoningMode, ct,
             stdoutChunkCallback: chunkCallback,
             captureStructuredStream: false);
+        var endedAt = DateTimeOffset.UtcNow;
+
+        var aggregatedStdout = aggregator.ToString();
+        if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+        {
+            aggregator.Append(result.Stdout);
+            aggregatedStdout = aggregator.ToString();
+        }
+
+        await TryRecordCostAsync(aggregatedStdout, result.Stderr,
+            agentRunner.Kind, item.AgentInstanceId, item.Id, "post-act-recheck", iteration,
+            startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
         if (!result.Success)
         {
@@ -3551,10 +3570,7 @@ public sealed class PipelineRunner : IPipelineRunner
             throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
         }
 
-        if (!string.IsNullOrEmpty(result.Stdout) && !aggregator.ToString().EndsWith(result.Stdout, StringComparison.Ordinal))
-            aggregator.Append(result.Stdout);
-
-        return aggregator.ToString();
+        return aggregatedStdout;
     }
 
     /// <summary>
@@ -10178,65 +10194,88 @@ Original merge-phase failure (for context):
         DateTimeOffset endedAt,
         string? dispatchModelId)
     {
-        if (_costStore is null || _costExtractors is null || _costCalculator is null) return;
-        if (!_costExtractors.TryGetValue(agentKind, out var extractor)) return;
+        if (_costStore is null && _usageStore is null) return;
 
         AgentCostSnapshot? snapshot;
-        try { snapshot = extractor.TryExtract(stdout, stderr); }
-        catch (Exception ex)
+        if (_costExtractors is not null && _costExtractors.TryGetValue(agentKind, out var extractor))
         {
-            _log.LogWarning(ex, "Cost: extractor threw for agent '{Agent}' phase '{Phase}'",
-                agentKind.Value, phase);
-            return;
-        }
-        if (snapshot is null) return;
-
-        decimal usd;
-        try { usd = _costCalculator.Calculate(snapshot, agentKind); }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "Cost: calculator threw for agent '{Agent}' phase '{Phase}'",
-                agentKind.Value, phase);
-            return;
-        }
-
-        try
-        {
-            await _costStore.RecordAsync(new WorkItemCost
+            try { snapshot = extractor.TryExtract(stdout, stderr); }
+            catch (Exception ex)
             {
-                Id = Guid.NewGuid().ToString(),
-                WorkItemId = workItemId.ToString(),
-                Phase = phase,
-                Iteration = iteration,
-                AgentKind = agentKind.Value,
-                AgentInstanceId = agentInstanceId,
-                ModelId = snapshot.ModelId,
-                InputTokens = snapshot.InputTokens,
-                CachedInputTokens = snapshot.CachedInputTokens,
-                OutputTokens = snapshot.OutputTokens,
-                EstimatedUsd = (double)usd,
-                StartedAt = startedAt,
-                EndedAt = endedAt,
-            }, CancellationToken.None);
-
-            // Emit the same accounting as OTel counters so dashboards align with
-            // the per-work-item cost rows (no double-counting — one emit per row).
-            var model = snapshot.ModelId ?? "(default)";
-            var agentTag = new KeyValuePair<string, object?>("agent.kind", agentKind.Value);
-            var agentInstanceTag = new KeyValuePair<string, object?>("agent.instance", agentInstanceId ?? agentKind.Value);
-            var modelTag = new KeyValuePair<string, object?>("model", model);
-            CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, agentInstanceTag, modelTag,
-                new KeyValuePair<string, object?>("token_type", "input"));
-            CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, agentInstanceTag, modelTag,
-                new KeyValuePair<string, object?>("token_type", "cached_input"));
-            CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, agentInstanceTag, modelTag,
-                new KeyValuePair<string, object?>("token_type", "output"));
-            CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, agentInstanceTag, modelTag);
+                _log.LogWarning(ex, "Cost: extractor threw for agent '{Agent}' phase '{Phase}'; recording elapsed fallback",
+                    agentKind.Value, phase);
+                snapshot = null;
+            }
         }
-        catch (Exception ex)
+        else
         {
-            _log.LogWarning(ex, "Cost: failed to persist row for work item {Id} phase '{Phase}'",
-                workItemId, phase);
+            snapshot = null;
+        }
+
+        var usedElapsedFallback = snapshot is null;
+        snapshot ??= new AgentCostSnapshot(
+            InputTokens: 0,
+            CachedInputTokens: 0,
+            OutputTokens: 0,
+            ModelId: dispatchModelId);
+        snapshot = ClampCostSnapshot(snapshot);
+
+        var usd = 0m;
+        if (!usedElapsedFallback && _costCalculator is not null)
+        {
+            try { usd = _costCalculator.Calculate(snapshot, agentKind); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Cost: calculator threw for agent '{Agent}' phase '{Phase}'; recording tokens with zero estimated cost",
+                    agentKind.Value, phase);
+            }
+        }
+        usd = Math.Max(0m, usd);
+
+        if (_costStore is not null)
+        {
+            try
+            {
+                await _costStore.RecordAsync(new WorkItemCost
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    WorkItemId = workItemId.ToString(),
+                    Phase = phase,
+                    Iteration = iteration,
+                    AgentKind = agentKind.Value,
+                    AgentInstanceId = agentInstanceId,
+                    ModelId = snapshot.ModelId,
+                    InputTokens = snapshot.InputTokens,
+                    CachedInputTokens = snapshot.CachedInputTokens,
+                    OutputTokens = snapshot.OutputTokens,
+                    EstimatedUsd = (double)usd,
+                    StartedAt = startedAt,
+                    EndedAt = endedAt,
+                    RawMetadataJson = usedElapsedFallback
+                        ? JsonSerializer.Serialize(new { source = ElapsedFallbackMetadataSource })
+                        : "{}",
+                    HasExtractedTokenUsage = !usedElapsedFallback,
+                }, CancellationToken.None);
+
+                // Emit the same accounting as OTel counters so dashboards align with
+                // the per-work-item cost rows (no double-counting — one emit per row).
+                var model = snapshot.ModelId ?? "(default)";
+                var agentTag = new KeyValuePair<string, object?>("agent.kind", agentKind.Value);
+                var agentInstanceTag = new KeyValuePair<string, object?>("agent.instance", agentInstanceId ?? agentKind.Value);
+                var modelTag = new KeyValuePair<string, object?>("model", model);
+                CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "input"));
+                CodeyBoxMeters.AgentTokens.Add(snapshot.CachedInputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "cached_input"));
+                CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, agentInstanceTag, modelTag,
+                    new KeyValuePair<string, object?>("token_type", "output"));
+                CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, agentInstanceTag, modelTag);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Cost: failed to persist row for work item {Id} phase '{Phase}'",
+                    workItemId, phase);
+            }
         }
 
         if (_usageStore is not null)
@@ -10244,7 +10283,7 @@ Original merge-phase failure (for context):
             try
             {
                 await _usageStore.RecordAsync(
-                    BuildUsageEvent(agentKind, agentInstanceId, dispatchModelId, snapshot, usd, workItemId, endedAt),
+                    BuildUsageEvent(agentKind, agentInstanceId, dispatchModelId, snapshot, usd, workItemId, endedAt, phase, startedAt),
                     CancellationToken.None);
             }
             catch (Exception ex)
@@ -10254,6 +10293,12 @@ Original merge-phase failure (for context):
             }
         }
     }
+
+    private static AgentCostSnapshot ClampCostSnapshot(AgentCostSnapshot snapshot) => new(
+        InputTokens: Math.Max(0, snapshot.InputTokens),
+        CachedInputTokens: Math.Max(0, snapshot.CachedInputTokens),
+        OutputTokens: Math.Max(0, snapshot.OutputTokens),
+        ModelId: snapshot.ModelId);
 
     /// <summary>
     /// Builds the durable usage-accounting row for one agent invocation.
@@ -10284,8 +10329,10 @@ Original merge-phase failure (for context):
         AgentCostSnapshot snapshot,
         decimal usd,
         WorkItemId workItemId,
-        DateTimeOffset endedAt) =>
-        BuildUsageEvent(agentKind, null, dispatchModelId, snapshot, usd, workItemId, endedAt);
+        DateTimeOffset endedAt,
+        string? phase = null,
+        DateTimeOffset? startedAt = null) =>
+        BuildUsageEvent(agentKind, null, dispatchModelId, snapshot, usd, workItemId, endedAt, phase, startedAt);
 
     internal static AgentUsageEvent BuildUsageEvent(
         AgentKind agentKind,
@@ -10294,13 +10341,21 @@ Original merge-phase failure (for context):
         AgentCostSnapshot snapshot,
         decimal usd,
         WorkItemId workItemId,
-        DateTimeOffset endedAt) => new()
+        DateTimeOffset endedAt,
+        string? phase = null,
+        DateTimeOffset? startedAt = null) => new()
         {
             Id = Guid.NewGuid().ToString(),
             TimeUtc = endedAt,
             AgentKind = agentKind.Value,
             AgentInstanceId = agentInstanceId,
             ModelId = dispatchModelId,
+            Phase = phase,
+            StartedUtc = startedAt,
+            EndedUtc = endedAt,
+            ElapsedMs = startedAt is { } start
+                ? (long)Math.Max(0, (endedAt - start).TotalMilliseconds)
+                : 0,
             InputTokens = Math.Max(0, snapshot.InputTokens),
             CachedInputTokens = Math.Max(0, snapshot.CachedInputTokens),
             OutputTokens = Math.Max(0, snapshot.OutputTokens),
