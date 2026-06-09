@@ -340,9 +340,13 @@ public sealed class BudgetEnforcementTests : IDisposable
         };
         var reg = new CancellationRegistry(CancellationToken.None);
 
+        var initialRecheck = TimeSpan.FromSeconds(2);
+        var hotReloadedRecheck = TimeSpan.FromSeconds(10);
+        var oldIntervalGrace = initialRecheck + TimeSpan.FromMilliseconds(400);
+
         var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
         {
-            ConcurrentLimitRecheck = TimeSpan.FromMilliseconds(200),
+            ConcurrentLimitRecheck = initialRecheck,
         });
 
         var svc = new OrchestratorService(
@@ -379,7 +383,7 @@ public sealed class BudgetEnforcementTests : IDisposable
         var successors = ids.Skip(1).ToArray();
 
         // Poll until every successor has been deferred under the initial
-        // 200 ms snapshot value while the first item is still running.
+        // snapshot value while the first item is still running.
         var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
         while (!successors.All(svc.IsDeferredForTest)
                && DateTimeOffset.UtcNow < deferDeadline)
@@ -393,21 +397,23 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         // Hot-reload to a long recheck interval. The next deferral cycle
         // (after items are re-enqueued and hit the cap again) must read this
-        // new value from the snapshot.
+        // new value from the snapshot. The initial interval is deliberately
+        // long enough that this replacement wins the race against the first
+        // deferred requeue on loaded test hosts.
         snapshot.Replace(new BudgetDeferralRecheckOptions
         {
-            ConcurrentLimitRecheck = TimeSpan.FromSeconds(10),
+            ConcurrentLimitRecheck = hotReloadedRecheck,
         });
 
         // Unblock the first item so the deferred items can be re-enqueued
-        // when their 200 ms deferral expires.
+        // when their initial deferral expires.
         gate1.TrySetResult();
 
-        // Wait for the initial 200 ms deferral to expire and the dispatch
+        // Wait for the initial deferral to expire and the dispatch
         // loop to process the deferred items again. One will grab the freed slot
         // and block on gate2; at least one other hits the concurrent cap and is
-        // deferred again — this time reading the hot-reloaded 10 s interval.
-        await Task.Delay(600);
+        // deferred again — this time reading the hot-reloaded interval.
+        await Task.Delay(oldIntervalGrace);
 
         int? secondDeferredIdx = null;
         var secondDeferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
@@ -416,8 +422,8 @@ public sealed class BudgetEnforcementTests : IDisposable
             // Identify an item deferred in the second cycle. With several
             // successors queued, one can grab the freed slot and block on gate2
             // while another is deferred under the cap. On a loaded test
-            // host, the worker that consumes the expired 200 ms deferral can lag
-            // behind the fixed 600 ms sleep above, so poll like the first-cycle
+            // host, the worker that consumes the expired initial deferral can lag
+            // behind the fixed delay above, so poll like the first-cycle
             // assertion instead of baking in a scheduler timing assumption.
             var successorStates = new Dictionary<WorkItemId, WorkItem?>();
             foreach (var id in successors)
@@ -444,12 +450,12 @@ public sealed class BudgetEnforcementTests : IDisposable
 
         Assert.NotNull(secondDeferredIdx);
 
-        // Now the item is deferred with the hot-reloaded 10 s interval.
-        // If the old 200 ms value was cached, it would have re-enqueued the
-        // item and spawned another worker within 500 ms. Wait past the old
-        // window and verify no retry happened.
+        // Now the item is deferred with the hot-reloaded interval.
+        // If the old value was cached, it would have re-enqueued the
+        // item and spawned another worker shortly after the old interval. Wait
+        // past the old window and verify no retry happened.
         var spawnCountAfterHotReloadDeferral = Volatile.Read(ref spawnCount);
-        await Task.Delay(500);
+        await Task.Delay(oldIntervalGrace);
 
         Assert.True(
             svc.IsDeferredForTest(ids[secondDeferredIdx.Value]),

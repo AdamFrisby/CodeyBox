@@ -37,6 +37,15 @@ public interface IAuditor
         CancellationToken ct = default);
 }
 
+/// <summary>
+/// Optional auditor marker for checks that must not share a mutable audit
+/// sandbox with later auditors.
+/// </summary>
+public interface IAuditSandboxIsolation
+{
+    bool RequiresFreshSandbox => true;
+}
+
 [Flags]
 public enum AuditCapabilities
 {
@@ -106,7 +115,13 @@ public sealed record AuditContext(
     /// Warning finding in that case so the missing row is visible to operators
     /// rather than silently disabling the check.
     /// </summary>
-    int? PromptRevisionAtDispatch = null);
+    int? PromptRevisionAtDispatch = null,
+    /// <summary>
+    /// Project-level policy for <c>process:build-script</c>. When false, a
+    /// missing repo-root <c>build.sh</c> makes that auditor skip. When true,
+    /// a missing script is a blocking audit finding.
+    /// </summary>
+    bool BuildScriptRequired = false);
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult(
@@ -123,6 +138,30 @@ public sealed record AuditFinding(
     string Title,
     string Description,
     string? Location = null);
+
+/// <summary>
+/// Raised by an auditor when audit infrastructure could not verify the check.
+/// This is distinct from an <see cref="AuditFinding"/>: no source-code finding
+/// should be persisted for a command that did not successfully run.
+/// </summary>
+public class AuditUnavailableException : Exception
+{
+    public AuditUnavailableException(string message)
+        : base(message) { }
+
+    public AuditUnavailableException(string message, Exception innerException)
+        : base(message, innerException) { }
+
+    public AuditUnavailableException(string message, int exitCode, string output)
+        : base(message)
+    {
+        ExitCode = exitCode;
+        Output = output;
+    }
+
+    public int? ExitCode { get; }
+    public string? Output { get; }
+}
 
 public enum AuditSeverity { Info, Warning, Error }
 

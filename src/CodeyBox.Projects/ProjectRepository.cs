@@ -428,6 +428,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var mergedSeverity = AuditSeverityParser.Parse(project?.FailingSeverity ?? defaults?.FailingSeverity);
         var mergedTimeoutMin = project?.PerIterationTimeoutMinutes ?? defaults?.PerIterationTimeoutMinutes ?? 120;
         var mergedStopOnFirst = project?.StopOnFirstFailure ?? defaults?.StopOnFirstFailure ?? false;
+        var mergedBuildScriptRequired = project?.BuildScriptRequired ?? defaults?.BuildScriptRequired ?? false;
         var languagesConfigured = project?.Languages is not null || defaults?.Languages is not null;
         var configuredLanguages = project?.Languages ?? defaults?.Languages ?? ProjectAuditLanguages.Default;
         var mergedLanguages = FilterConfiguredLanguages(configuredLanguages);
@@ -469,6 +470,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             FailingSeverity = mergedSeverity,
             PerIterationTimeout = TimeSpan.FromMinutes(mergedTimeoutMin),
             StopOnFirstFailure = mergedStopOnFirst,
+            BuildScriptRequired = mergedBuildScriptRequired,
             StuckThresholdMinutes = mergedStuck,
             AutoRetryOnStuck = mergedAutoRetry,
             MaxStuckRetries = mergedMaxRetries,
@@ -492,9 +494,11 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ProjectAuditConfig? defaults,
         ProjectAudit baseAudit)
     {
-        var profiles = new Dictionary<string, ProjectAudit>(
-            AuditProfilePresets.CreateBuiltIns(),
-            StringComparer.OrdinalIgnoreCase);
+        var profiles = AuditProfilePresets.CreateBuiltIns()
+            .ToDictionary(
+                kvp => kvp.Key,
+                kvp => InheritGlobalProfilePolicy(kvp.Value, baseAudit),
+                StringComparer.OrdinalIgnoreCase);
 
         if (defaults?.Profiles is not null)
         {
@@ -523,6 +527,12 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         return resolved with { Profile = profileName };
     }
 
+    private static ProjectAudit InheritGlobalProfilePolicy(ProjectAudit profile, ProjectAudit fallback)
+        => profile with
+        {
+            BuildScriptRequired = fallback.BuildScriptRequired,
+        };
+
     private static ProjectAuditConfig ProjectAuditToConfig(ProjectAudit audit)
         => new()
         {
@@ -536,6 +546,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             FailingSeverity = audit.FailingSeverity.ToString(),
             PerIterationTimeoutMinutes = (int)audit.PerIterationTimeout.TotalMinutes,
             StopOnFirstFailure = audit.StopOnFirstFailure,
+            BuildScriptRequired = audit.BuildScriptRequired,
             StuckThresholdMinutes = audit.StuckThresholdMinutes,
             AutoRetryOnStuck = audit.AutoRetryOnStuck,
             MaxStuckRetries = audit.MaxStuckRetries,

@@ -329,6 +329,54 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_ForwardsOutputCapsAndMapsLimitFlags()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(
+                0,
+                "partial output",
+                "",
+                StdoutLimitExceeded: true)));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "yes output"],
+            MaxStdoutBytes = 256,
+            MaxStderrBytes = 128,
+        });
+
+        Assert.False(result.Success);
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.False(result.StderrLimitExceeded);
+        Assert.Equal("partial output", result.Stdout);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(256, call.MaxStdoutBytes);
+        Assert.Equal(128, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task ExecAsync_MapsProcessExecutionUnavailable()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(
+                1,
+                "",
+                "provider unavailable",
+                ExecutionUnavailable: true)));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Headless, runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "echo hi"],
+        });
+
+        Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Equal("provider unavailable", result.Stderr);
+    }
+
+    [Fact]
     public async Task DefaultProcessRunner_StopsReadingWhenStderrLimitIsExceeded()
     {
         if (OperatingSystem.IsWindows()) return;

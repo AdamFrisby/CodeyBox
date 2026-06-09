@@ -92,6 +92,7 @@ public sealed class MultipassRetryTests
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("Connection refused", result.Stderr);
+        Assert.True(result.ExecutionUnavailable);
         Assert.Equal(4, attempts);
         // No delay before the first attempt, none after the last → N-1 delays.
         Assert.Equal(3, delays.Count);

@@ -1,3 +1,4 @@
+using CodeyBox.Audit;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -51,6 +52,63 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Contains("error CS1061", final.LastError);
         Assert.Equal("build", final.FailureKind);
         Assert.DoesNotContain("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("clone")]
+    [InlineData("access")]
+    [InlineData("sandbox")]
+    public async Task BuildScriptAuditor_IsolatedSetupFailure_FailsInfrastructureWithoutPersistedFinding(
+        string failurePoint)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        Func<IGitHost, IGitHost>? gitHostDecorator = failurePoint switch
+        {
+            "clone" => inner => new BrokenIsolatedRepositoryCloneGitHost(inner, "simulated isolated clone failure"),
+            "access" => inner => new BrokenIsolatedRepoAccessGitHost(inner, "simulated isolated access failure"),
+            _ => null,
+        };
+        ISandboxProvider? sandboxProvider = failurePoint == "sandbox"
+            ? new SandboxFactoryFailingSandboxProvider("simulated isolated sandbox failure")
+            : null;
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new BuildScriptAuditor(new BuildScriptAuditorOptions { TimeoutSeconds = 5 })],
+            maxAuditIterations: 1,
+            projectAudit: new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+            },
+            auditReportStore: reports,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            gitHostDecorator: gitHostDecorator,
+            sandboxProvider: sandboxProvider);
+
+        var item = NewItem($"feature/build-script-isolated-{failurePoint}") with
+        {
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            tp.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "build.sh",
+            "#!/bin/sh\nexit 0\n",
+            "add build script");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("could-not-verify", final.LastError);
+        Assert.Contains("isolated audit repository setup failed", final.LastError);
+        Assert.DoesNotContain(reports.Reports, r => r.AuditorName == BuildScriptAuditor.AuditorName);
     }
 
     [Fact]
@@ -2651,6 +2709,27 @@ public sealed class RequiredBuildGateTests : IDisposable
     {
         public override Task<string> CreateIsolatedMergeCloneAsync(string repositoryId, WorkItemId workItemId, CancellationToken ct = default)
             => throw new InvalidOperationException(message);
+
+        public override Task<string> CreateIsolatedRepositoryCloneAsync(
+            string repositoryId,
+            WorkItemId lifetimeId,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException(message);
+    }
+
+    private sealed class BrokenIsolatedRepositoryCloneGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
+    {
+        public override Task<string> CreateIsolatedRepositoryCloneAsync(
+            string repositoryId,
+            WorkItemId lifetimeId,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException(message);
+    }
+
+    private sealed class BrokenIsolatedRepoAccessGitHost(IGitHost inner, string message) : DelegatingGitHost(inner)
+    {
+        public override SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
+            => throw new InvalidOperationException(message);
     }
 
     private abstract class DelegatingGitHost(IGitHost inner) : IGitHost
@@ -2668,6 +2747,11 @@ public sealed class RequiredBuildGateTests : IDisposable
             => Inner.GetIsolatedRepoSandboxAccess(isolatedRepoHostPath);
         public virtual Task<string> CreateIsolatedMergeCloneAsync(string repositoryId, WorkItemId workItemId, CancellationToken ct = default)
             => Inner.CreateIsolatedMergeCloneAsync(repositoryId, workItemId, ct);
+        public virtual Task<string> CreateIsolatedRepositoryCloneAsync(
+            string repositoryId,
+            WorkItemId lifetimeId,
+            CancellationToken ct = default)
+            => Inner.CreateIsolatedRepositoryCloneAsync(repositoryId, lifetimeId, ct);
         public virtual Task RestoreIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)
             => Inner.RestoreIsolatedMergeCloneAsync(repositoryId, targetPath, ct);
         public virtual Task DisposeIsolatedMergeCloneAsync(string repositoryId, string targetPath, CancellationToken ct = default)

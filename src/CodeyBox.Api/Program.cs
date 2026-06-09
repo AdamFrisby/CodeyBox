@@ -222,6 +222,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
+builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
@@ -1520,6 +1521,8 @@ builder.Services.AddSingleton(_ =>
 });
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
+builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
+    () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 

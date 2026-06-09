@@ -3128,7 +3128,7 @@ internal static class MultipassDaemonRetry
             ? $"multipass transient daemon error after {retries} retries ({errorClass}) during {description}: {stderr}"
             : $"multipass daemon unreachable after {retries} retries ({errorClass}) during {description}; health probe failed: {finalProbe.Error}; last stderr: {stderr}";
         log.LogError("{Message}", message);
-        return result with { Stderr = message };
+        return result with { Stderr = message, ExecutionUnavailable = true };
     }
 
     internal static string? ClassifyTransient(IReadOnlyList<string> argv, ProcessRunResult result)
@@ -3351,7 +3351,7 @@ internal static class MultipassRetry
         log.LogWarning(
             "{Description}: SSH still refusing after {Max} attempts; surfacing failure. stderr: {Stderr}",
             description, maxAttempts, result.Stderr.Trim());
-        return result;
+        return result with { ExecutionUnavailable = true };
     }
 }
 
@@ -3686,8 +3686,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        var result = await ExecRunAsync(exec, ct);
-        return new SandboxExecResult(result.ExitCode, result.Stdout, result.Stderr);
+        var result = await ExecRunAsync(
+            exec,
+            ct,
+            exec.MaxStdoutBytes,
+            exec.MaxStderrBytes);
+        return new SandboxExecResult(
+            result.ExitCode,
+            result.Stdout,
+            result.Stderr,
+            result.StdoutLimitExceeded,
+            result.StderrLimitExceeded,
+            result.StartFailed || result.ExecutionUnavailable);
     }
 
     private async Task<ProcessRunResult> ExecRunAsync(
@@ -3740,7 +3750,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                     exec.StdoutChunkCallback,
                     exec.StderrChunkCallback,
                     maxStdoutBytes,
-                    maxStderrBytes),
+                    maxStderrBytes,
+                    exec.KillOnOutputLimit),
                 log: _log,
                 description: $"exec on {_name}",
                 ct: ct);
@@ -4029,7 +4040,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         Action<string>? stdoutChunkCallback = null,
         Action<string>? stderrChunkCallback = null,
         int? maxStdoutBytes = null,
-        int? maxStderrBytes = null)
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
         var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
         return MultipassDaemonRetry.RunWithRetryAsync(
@@ -4042,7 +4054,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
                 stderrChunkCallback,
                 maxStdoutBytes,
                 maxStderrBytes,
-                environment),
+                environment,
+                killOnOutputLimit),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
                 _runner, _opts.MultipassBinary, _daemonRetryPolicy.HealthProbeTimeout, ctInner),
             _log,

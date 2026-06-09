@@ -145,6 +145,7 @@ startup); we add explicit guards as we tighten the contract.
 | `SandboxImageReference` | string | `codeybox/agent:latest` | OCI image reference for agent sandboxes. |
 | `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. |
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
+| `BuildScriptAudit.TimeoutSeconds` | int | `1800` | Hot-reloadable per-run timeout for the credential-free `process:build-script` auditor that executes repo-root `./build.sh`. |
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |

@@ -108,15 +108,28 @@ public sealed class ProjectAuditorComposer
         // snapshotted at dispatch time. A missing or stale trailer means the
         // agent finished against an old prompt — a blocking finding.
         if (!auditors.Any(a => a.Name.Equals(
-                "process:prompt-revision-trailer", StringComparison.OrdinalIgnoreCase)))
+                PromptRevisionTrailerAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
         {
-            IncludeRegisteredAuditor("process:prompt-revision-trailer", auditors, prepend: false);
+            IncludeRegisteredAuditor(PromptRevisionTrailerAuditor.AuditorName, auditors, prepend: false);
+        }
+
+        // Always include the language-agnostic build-script auditor last. It
+        // no-ops unless the branch carries a repo-root build.sh or the project
+        // requires one, and PipelineRunner gives isolated auditors a fresh
+        // sandbox so branch-controlled scripts cannot mutate later checks.
+        if (!auditors.Any(a => a.Name.Equals(
+                WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor(WellKnownAuditorNames.BuildScript, auditors, prepend: false);
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
         {
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);
-            auditors.RemoveAll(a => excluded.Contains(a.Name));
+            auditors.RemoveAll(a =>
+                excluded.Contains(a.Name) &&
+                !(project.Audit.BuildScriptRequired &&
+                  a.Name.Equals(WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)));
         }
 
         return auditors;

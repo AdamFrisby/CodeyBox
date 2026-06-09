@@ -916,6 +916,9 @@ public sealed record SandboxExec
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
     public string? Stdin { get; init; }
+    public int? MaxStdoutBytes { get; init; }
+    public int? MaxStderrBytes { get; init; }
+    public bool KillOnOutputLimit { get; init; } = true;
 
     /// <summary>
     /// Optional callback invoked per stdout chunk as the process emits it.
@@ -927,7 +930,14 @@ public sealed record SandboxExec
     public Action<string>? StderrChunkCallback { get; init; }
 }
 
-public sealed record SandboxExecResult(int ExitCode, string Stdout, string Stderr)
+public sealed record SandboxExecResult(
+    int ExitCode,
+    string Stdout,
+    string Stderr,
+    bool StdoutLimitExceeded = false,
+    bool StderrLimitExceeded = false,
+    bool ExecutionUnavailable = false)
 {
-    public bool Success => ExitCode == 0;
+    public bool OutputLimitExceeded => StdoutLimitExceeded || StderrLimitExceeded;
+    public bool Success => ExitCode == 0 && !OutputLimitExceeded && !ExecutionUnavailable;
 }

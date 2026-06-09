@@ -197,7 +197,8 @@ public sealed class DiskGuardPreflightTests : IDisposable
             Action<string>? stderrChunkCallback = null,
             int? maxStdoutBytes = null,
             int? maxStderrBytes = null,
-            IReadOnlyDictionary<string, string>? environment = null) =>
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true) =>
             throw new InvalidOperationException("preflight tests must not reach the multipass launch path");
     }
 }
