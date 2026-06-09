@@ -49,7 +49,7 @@ public sealed class AgentPricingStartupTests : IClassFixture<AgentPricingStartup
 
         // Typical mix from https://opencode.ai/docs/go: 750 input, 82k cached, 290 output.
         var snapshot = new AgentCostSnapshot(
-            InputTokens: 82_750,
+            InputTokens: 750,
             CachedInputTokens: 82_000,
             OutputTokens: 290,
             ModelId: "opencode-go/deepseek-v4-pro");

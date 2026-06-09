@@ -315,16 +315,26 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
 internal sealed class AgentTrackingPipeline : IPipelineRunner
 {
     private readonly IWorkItemStore _store;
+    private string? _lastAgent;
+    private int _receivedNullAgent;
 
-    public AgentKind? LastAgent { get; private set; }
-    public bool ReceivedNullAgent { get; private set; }
+    public AgentKind? LastAgent
+    {
+        get
+        {
+            var value = Volatile.Read(ref _lastAgent);
+            return value is null ? null : new AgentKind(value);
+        }
+    }
+    public bool ReceivedNullAgent => Volatile.Read(ref _receivedNullAgent) != 0;
 
     public AgentTrackingPipeline(IWorkItemStore store) => _store = store;
 
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
-        LastAgent = item.Agent;
-        ReceivedNullAgent = item.Agent is null;
+        Volatile.Write(ref _lastAgent, item.Agent?.Value);
+        if (item.Agent is null)
+            Volatile.Write(ref _receivedNullAgent, 1);
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 }

@@ -48,6 +48,13 @@ public sealed class GeminiStreamParser : FlexibleAgentStreamParser
             cached ??= FirstInt(usage, "cachedContentTokenCount", "cached_content_token_count", "cached_input_tokens");
         }
 
+        // Google's promptTokenCount includes cachedContentTokenCount; normalise
+        // to the non-cached billable bucket so AgentStreamSummary.InputTokens
+        // means the same thing across providers (fresh-only) — matches the
+        // codex/opencode contract.
+        if (input is { } i && cached is { } c)
+            input = TokenUsageAccounting.FreshInputTokens(i, c);
+
         var parsed = ParseScalars(root, type, timestamp, starts, results, isAssistant, finalText);
         return parsed with
         {

@@ -78,6 +78,19 @@ public sealed class OpencodeCostExtractorTests
     }
 
     [Fact]
+    public void Json_AnthropicShape_CachedOnlyUsageStillRecordsSnapshot()
+    {
+        var stdout = """{"usage":{"input_tokens":0,"cache_read_input_tokens":900,"output_tokens":0}}""";
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(0, result!.InputTokens);
+        Assert.Equal(900, result.CachedInputTokens);
+        Assert.Equal(0, result.OutputTokens);
+    }
+
+    [Fact]
     public void Json_OpenAiShape_ParsesPromptTokensDetailsCachedTokens()
     {
         var stdout = """{"usage":{"prompt_tokens":82750,"completion_tokens":290,"prompt_tokens_details":{"cached_tokens":82000}}}""";
@@ -85,7 +98,7 @@ public sealed class OpencodeCostExtractorTests
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
-        Assert.Equal(82750, result!.InputTokens);
+        Assert.Equal(750, result!.InputTokens);
         Assert.Equal(82000, result.CachedInputTokens);
         Assert.Equal(290, result.OutputTokens);
     }

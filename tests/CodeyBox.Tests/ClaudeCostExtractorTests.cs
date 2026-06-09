@@ -20,16 +20,13 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(NdJsonFixture, null);
 
         Assert.NotNull(result);
-        // InputTokens is the TOTAL input bucket per the AgentCostSnapshot contract
-        // (the calculator derives billable fresh as InputTokens - CachedInputTokens).
-        // For Anthropic that means fresh + cache_creation + cache_read.
-        Assert.Equal(12345 + 5000, result.InputTokens);
+        Assert.Equal(12345, result.InputTokens);
         Assert.Equal(678, result.OutputTokens);
         Assert.Equal(5000, result.CachedInputTokens);
     }
 
     [Fact]
-    public void NdJson_IncludesCacheCreationInInputTotal()
+    public void NdJson_IncludesCacheCreationInInputTokens()
     {
         // Representative real-world shape: most input is cache_creation (tokens
         // written to cache this turn — the most expensive prompt-input bucket),
@@ -45,13 +42,12 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(fixture, null);
 
         Assert.NotNull(result);
-        Assert.Equal(43 + 10000 + 900000, result.InputTokens);
+        Assert.Equal(43 + 10000, result.InputTokens);
         Assert.Equal(900000, result.CachedInputTokens);
         Assert.Equal(120, result.OutputTokens);
-        // Sanity: billable fresh per the calculator's formula = InputTokens - CachedInputTokens.
         // It must include cache_creation (10000) on top of fresh input_tokens (43),
         // not just one or the other.
-        Assert.Equal(10043, result.InputTokens - result.CachedInputTokens);
+        Assert.Equal(10043, result.InputTokens);
     }
 
     [Fact]
@@ -71,7 +67,24 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
-        Assert.Equal(12345, result.InputTokens);
+        Assert.Equal(7345, result.InputTokens);
+        Assert.Equal(678, result.OutputTokens);
+        Assert.Equal(5000, result.CachedInputTokens);
+    }
+
+    [Fact]
+    public void HumanReadable_ParsesTotalTokenFooterWithCachedTokens()
+    {
+        var stdout = """
+            Total input tokens: 12,345
+            Cache input tokens: 5,000
+            Total output tokens: 678
+            """;
+
+        var result = Extractor.TryExtract(stdout, null);
+
+        Assert.NotNull(result);
+        Assert.Equal(7345, result.InputTokens);
         Assert.Equal(678, result.OutputTokens);
         Assert.Equal(5000, result.CachedInputTokens);
     }
@@ -115,7 +128,7 @@ public sealed class ClaudeCostExtractorTests
         var result = Extractor.TryExtract(null, stderr);
 
         Assert.NotNull(result);
-        Assert.Equal(12345, result.InputTokens);
+        Assert.Equal(7345, result.InputTokens);
         Assert.Equal(678, result.OutputTokens);
     }
 }

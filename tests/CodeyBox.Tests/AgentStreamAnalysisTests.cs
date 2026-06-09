@@ -203,7 +203,7 @@ public sealed class CodexStreamParserTests
         Assert.Equal("unified_exec", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
         Assert.Equal(2, tool.OutputBytes);
-        Assert.Equal(50, summary.InputTokens);
+        Assert.Equal(44, summary.InputTokens);
         Assert.Equal(9, summary.OutputTokens);
         Assert.Equal(6, summary.CachedInputTokens);
         Assert.Equal("Done.", summary.FinalAssistantMessage);
@@ -230,9 +230,26 @@ public sealed class CodexStreamParserTests
         Assert.Equal("call_1", tool.ToolUseId);
         Assert.Equal("shell", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
-        Assert.Equal(30, summary.InputTokens);
+        Assert.Equal(28, summary.InputTokens);
         Assert.Equal(4, summary.OutputTokens);
         Assert.Equal(2, summary.CachedInputTokens);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RecordsUsageFromNestedItemEvents()
+    {
+        var parser = new CodexStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"thread.started","timestamp":"2026-01-01T00:00:00Z","thread_id":"thread_1"}
+            {"type":"item.completed","timestamp":"2026-01-01T00:00:01Z","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}],"usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":7}}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(600, summary.InputTokens);
+        Assert.Equal(400, summary.CachedInputTokens);
+        Assert.Equal(7, summary.OutputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);
     }
 
@@ -270,7 +287,7 @@ public sealed class CodexStreamParserTests
             Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
             Assert.True(tool.Succeeded);
             Assert.Equal(6, tool.OutputBytes);
-            Assert.Equal(29990, summary.InputTokens);
+            Assert.Equal(11814, summary.InputTokens);
             Assert.Equal(44, summary.OutputTokens);
             Assert.Equal(18176, summary.CachedInputTokens);
             Assert.Equal("Done.", summary.FinalAssistantMessage);
@@ -408,7 +425,10 @@ public sealed class GeminiStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("read_file", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
-        Assert.Equal(10, summary.InputTokens);
+        // Google's promptTokenCount (10) includes cachedContentTokenCount (1);
+        // the parser normalises InputTokens to the fresh-only billable bucket
+        // so it has the same meaning as codex/opencode's InputTokens.
+        Assert.Equal(9, summary.InputTokens);
         Assert.Equal(3, summary.OutputTokens);
         Assert.Equal(1, summary.CachedInputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);

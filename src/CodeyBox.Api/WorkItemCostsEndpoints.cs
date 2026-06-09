@@ -53,7 +53,7 @@ internal static class WorkItemCostsEndpoints
 
     private static object BuildCostsDto(string workItemId, IReadOnlyList<WorkItemCost> rows)
     {
-        var totalInput = rows.Sum(r => (long)r.InputTokens);
+        var totalInput = rows.Sum(TokenUsageAccounting.TotalInputTokens);
         var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
         var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
@@ -72,7 +72,7 @@ internal static class WorkItemCostsEndpoints
                         .Select(ig => new
                         {
                             iteration = ig.Key,
-                            inputTokens = ig.Sum(r => (long)r.InputTokens),
+                            inputTokens = ig.Sum(TokenUsageAccounting.TotalInputTokens),
                             cachedInputTokens = ig.Sum(r => (long)r.CachedInputTokens),
                             outputTokens = ig.Sum(r => (long)r.OutputTokens),
                             estimatedUsd = ig.Sum(r => r.EstimatedUsd),
@@ -82,7 +82,7 @@ internal static class WorkItemCostsEndpoints
                         .ToList();
                     return (object)new
                     {
-                        inputTokens = g.Sum(r => (long)r.InputTokens),
+                        inputTokens = g.Sum(TokenUsageAccounting.TotalInputTokens),
                         cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                         outputTokens = g.Sum(r => (long)r.OutputTokens),
                         estimatedUsd = g.Sum(r => r.EstimatedUsd),
@@ -100,7 +100,7 @@ internal static class WorkItemCostsEndpoints
                 agent = g.Key.AgentKind,
                 agentInstanceId = g.Key.AgentInstanceId,
                 modelId = g.Key.ModelId,
-                inputTokens = g.Sum(r => (long)r.InputTokens),
+                inputTokens = g.Sum(TokenUsageAccounting.TotalInputTokens),
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
@@ -133,7 +133,7 @@ internal static class WorkItemCostsEndpoints
         DateTimeOffset to,
         IReadOnlyList<WorkItemCost> rows)
     {
-        var totalInput = rows.Sum(r => (long)r.InputTokens);
+        var totalInput = rows.Sum(TokenUsageAccounting.TotalInputTokens);
         var totalCached = rows.Sum(r => (long)r.CachedInputTokens);
         var totalOutput = rows.Sum(r => (long)r.OutputTokens);
         var totalUsd = rows.Sum(r => r.EstimatedUsd);
@@ -146,7 +146,7 @@ internal static class WorkItemCostsEndpoints
                 agent = g.Key.AgentKind,
                 agentInstanceId = g.Key.AgentInstanceId,
                 modelId = g.Key.ModelId,
-                inputTokens = g.Sum(r => (long)r.InputTokens),
+                inputTokens = g.Sum(TokenUsageAccounting.TotalInputTokens),
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),
@@ -162,7 +162,7 @@ internal static class WorkItemCostsEndpoints
             .Select(g => new
             {
                 workItemId = g.Key,
-                inputTokens = g.Sum(r => (long)r.InputTokens),
+                inputTokens = g.Sum(TokenUsageAccounting.TotalInputTokens),
                 cachedInputTokens = g.Sum(r => (long)r.CachedInputTokens),
                 outputTokens = g.Sum(r => (long)r.OutputTokens),
                 estimatedUsd = g.Sum(r => r.EstimatedUsd),

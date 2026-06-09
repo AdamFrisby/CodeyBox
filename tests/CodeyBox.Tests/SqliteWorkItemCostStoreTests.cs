@@ -262,8 +262,8 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         Assert.False(summaries.ContainsKey(withoutCosts));
         Assert.False(summaries.ContainsKey(unknown));
         // Single-row work cost: iter delta == total.
-        Assert.Equal(12345, summaries[withCostsA].Iteration.TokensInput);
-        Assert.Equal(12345, summaries[withCostsA].Total.TokensInput);
+        Assert.Equal(12845, summaries[withCostsA].Iteration.TokensInput);
+        Assert.Equal(12845, summaries[withCostsA].Total.TokensInput);
     }
 
     [Fact]
@@ -507,5 +507,206 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         var rows = await _store.GetByProjectAsync("proj-beta", from, to);
 
         Assert.Empty(rows);
+    }
+
+    [Fact]
+    public async Task Constructor_MigratesLegacyInputTokens_SubtractsCachedAndIsIdempotent()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-legacy-input-{Guid.NewGuid():N}.db");
+        try
+        {
+            // Seed a pre-fix schema (no usage_contract_version column) with rows
+            // matching the old contract: input_tokens carries the TOTAL prompt
+            // bucket and cached_input_tokens carries the cached subset already
+            // included in input_tokens.
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await using var setup = conn.CreateCommand();
+                setup.CommandText = $$"""
+                    CREATE TABLE work_items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        state INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO work_items (id, project_id, state, updated_at)
+                    VALUES ('wi-typical',    'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-skip-shape', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-zero',       'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-opencode-anth-warm', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-opencode-anth-cold', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
+                    CREATE TABLE work_item_costs (
+                        id                  TEXT PRIMARY KEY,
+                        work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        phase               TEXT NOT NULL,
+                        iteration           INTEGER,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        estimated_usd       REAL NOT NULL DEFAULT 0,
+                        started_at          TEXT NOT NULL,
+                        ended_at            TEXT NOT NULL,
+                        raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                    );
+                    -- Typical legacy row: input=10000 (TOTAL), cached=3000 (subset). After
+                    -- migration input should become 7000 fresh-only; cached unchanged.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-typical', 'wi-typical', 'work', 1, 'claude', 'claude-opus-4-7',
+                         10000, 3000, 500, 0.05,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- Defensive guard: any row with cached > input violates the
+                    -- pre-fix TOTAL-includes-cached contract, so it must already
+                    -- be fresh-only. Migration must leave such rows untouched
+                    -- (no subtraction, no clamp-to-zero).
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-skip-shape', 'wi-skip-shape', 'work', 1, 'claude', 'claude-opus-4-7',
+                         100, 250, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- Codex-shape legacy row: cached=0, input untouched by the subtraction.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-zero', 'wi-zero', 'work', 1, 'codex', 'gpt-5',
+                         4242, 0, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- OpenCode Anthropic-shape "warm" legacy row: pre-fix extractor
+                    -- read input_tokens (Anthropic spec: already fresh-only) into
+                    -- input_tokens and cache_read_input_tokens into cached. Common
+                    -- shape on warm Claude sessions through OpenCode: cached >> fresh.
+                    -- Migration MUST NOT subtract — doing so destroys the fresh
+                    -- portion and silently under-reports historical tokens.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-opencode-anth-warm', 'wi-opencode-anth-warm', 'work', 1, 'opencode', 'claude-sonnet-4-5',
+                         100, 9000, 200, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- OpenCode Anthropic-shape "cold" legacy row: fresh > cache_read
+                    -- but still ambiguous shape. Migration also has to leave this
+                    -- untouched, because we can't distinguish OpenAI-shape from
+                    -- Anthropic-shape on an opencode legacy row.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-opencode-anth-cold', 'wi-opencode-anth-cold', 'work', 1, 'opencode', 'claude-sonnet-4-5',
+                         500, 200, 100, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    """;
+                await setup.ExecuteNonQueryAsync();
+            }
+
+            // First open: should add usage_contract_version, run the migration,
+            // then flip all rows to version=1.
+            using (var migrated = new SqliteWorkItemCostStore(dbPath))
+            {
+                var typical = Assert.Single(await migrated.GetByWorkItemAsync("wi-typical"));
+                Assert.Equal(7000, typical.InputTokens);
+                Assert.Equal(3000, typical.CachedInputTokens);
+
+                // cached > input row is left untouched (input < cached is impossible
+                // under the pre-fix TOTAL-includes-cached contract, so the row must
+                // already be fresh-only — subtracting would corrupt it).
+                var skipShape = Assert.Single(await migrated.GetByWorkItemAsync("wi-skip-shape"));
+                Assert.Equal(100, skipShape.InputTokens);
+                Assert.Equal(250, skipShape.CachedInputTokens);
+
+                var zero = Assert.Single(await migrated.GetByWorkItemAsync("wi-zero"));
+                Assert.Equal(4242, zero.InputTokens);
+                Assert.Equal(0, zero.CachedInputTokens);
+
+                // OpenCode rows: shape-ambiguous pre-fix (OpenAI vs Anthropic).
+                // Both branches preserve input as-is, because corrupting genuine
+                // Anthropic-shape rows (where input was fresh-only) is irreversible.
+                var warm = Assert.Single(await migrated.GetByWorkItemAsync("wi-opencode-anth-warm"));
+                Assert.Equal(100, warm.InputTokens);
+                Assert.Equal(9000, warm.CachedInputTokens);
+
+                var cold = Assert.Single(await migrated.GetByWorkItemAsync("wi-opencode-anth-cold"));
+                Assert.Equal(500, cold.InputTokens);
+                Assert.Equal(200, cold.CachedInputTokens);
+            }
+
+            await AssertAllRowsAtVersion(dbPath, expectedVersion: 1);
+
+            // Re-open the store: migration must be a no-op (idempotent). If the
+            // WHERE usage_contract_version=0 guard ever regresses, the typical
+            // row's input would silently drop from 7000 -> 4000 (or to 0 after
+            // enough restarts).
+            using (var reopened = new SqliteWorkItemCostStore(dbPath))
+            {
+                var typical = Assert.Single(await reopened.GetByWorkItemAsync("wi-typical"));
+                Assert.Equal(7000, typical.InputTokens);
+                Assert.Equal(3000, typical.CachedInputTokens);
+
+                var skipShape = Assert.Single(await reopened.GetByWorkItemAsync("wi-skip-shape"));
+                Assert.Equal(100, skipShape.InputTokens);
+                Assert.Equal(250, skipShape.CachedInputTokens);
+
+                var zero = Assert.Single(await reopened.GetByWorkItemAsync("wi-zero"));
+                Assert.Equal(4242, zero.InputTokens);
+                Assert.Equal(0, zero.CachedInputTokens);
+
+                var warm = Assert.Single(await reopened.GetByWorkItemAsync("wi-opencode-anth-warm"));
+                Assert.Equal(100, warm.InputTokens);
+                Assert.Equal(9000, warm.CachedInputTokens);
+
+                var cold = Assert.Single(await reopened.GetByWorkItemAsync("wi-opencode-anth-cold"));
+                Assert.Equal(500, cold.InputTokens);
+                Assert.Equal(200, cold.CachedInputTokens);
+            }
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_NewInsertsAreFlaggedAtCurrentContractVersion()
+    {
+        // Defends the migration's idempotency contract: every RecordAsync insert
+        // must persist usage_contract_version=1 so the legacy backfill on the
+        // next startup leaves it alone.
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId));
+
+        await AssertAllRowsAtVersion(_dbPath, expectedVersion: 1);
+    }
+
+    private static async Task AssertAllRowsAtVersion(string dbPath, int expectedVersion)
+    {
+        await using var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, usage_contract_version FROM work_item_costs";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var count = 0;
+        while (await reader.ReadAsync())
+        {
+            count++;
+            var id = reader.GetString(0);
+            var version = reader.GetInt32(1);
+            Assert.True(version == expectedVersion,
+                $"row {id} has usage_contract_version={version}, expected {expectedVersion}");
+        }
+        Assert.True(count > 0, "expected at least one row to verify");
     }
 }

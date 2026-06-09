@@ -133,14 +133,14 @@ public sealed class AgentCostCalculator
     /// </summary>
     public decimal Calculate(AgentCostSnapshot snapshot, AgentKind kind)
     {
-        if (snapshot.InputTokens == 0 && snapshot.OutputTokens == 0)
+        if (snapshot.InputTokens == 0 && snapshot.CachedInputTokens == 0 && snapshot.OutputTokens == 0)
             return 0m;
 
         var opts = _opts;
         var rate = ResolveRate(opts, kind, snapshot.ModelId);
         if (rate is null) return 0m;
 
-        var billableInput = Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
+        var billableInput = Math.Max(0, snapshot.InputTokens);
         var cost =
             (decimal)billableInput * (decimal)rate.InputPerMillion / 1_000_000m
             + (decimal)snapshot.CachedInputTokens * (decimal)rate.CachedInputPerMillion / 1_000_000m

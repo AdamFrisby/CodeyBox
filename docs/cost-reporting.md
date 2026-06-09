@@ -39,11 +39,13 @@ plan — even when the agent is run under a subscription plan.  This makes
 costs comparable across agents and over time, and ensures that a "free"
 cached token still shows as a fraction of its list-price value.
 
-The formula is:
+Extractors normalize provider usage before storage: `input_tokens` is the
+non-cached input bucket billed at the normal input rate, and
+`cached_input_tokens` is billed separately at the cached input rate. The
+formula is:
 
 ```
-billable_input  = input_tokens - cached_input_tokens
-estimated_usd   = (billable_input / 1_000_000) × input_rate_per_m
+estimated_usd   = (input_tokens / 1_000_000) × input_rate_per_m
                 + (cached_input_tokens / 1_000_000) × cached_rate_per_m
                 + (output_tokens / 1_000_000) × output_rate_per_m
 ```
@@ -134,11 +136,10 @@ Primary: scans the agent's NDJSON stdout for a `result` event with a
 Anthropic splits prompt input into three buckets: `input_tokens` (truly
 novel content), `cache_creation_input_tokens` (tokens written to cache
 this turn — priced higher than fresh on the API), and
-`cache_read_input_tokens` (read from cache — cheap). The extractor sums
-all three into `input_tokens` (the column / `AgentCostSnapshot.InputTokens`)
-so the calculator's `billable_input = input_tokens - cached_input_tokens`
-formula bills both the fresh portion and `cache_creation` at the fresh
-input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
+`cache_read_input_tokens` (read from cache — cheap). The extractor stores
+`input_tokens + cache_creation_input_tokens` in the `input_tokens` column so
+both the fresh portion and `cache_creation` are billed at the configured
+normal input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
 
 Fallback: scans stderr/stdout for the human-readable footer line emitted
 when `--output-format stream-json` is not used:
@@ -151,16 +152,26 @@ The fallback captures cached token counts when the output includes the "N cached
 
 ### Codex (`CodexCostExtractor`)
 
-Primary: scans stdout for a JSON object with a `usage` key:
+Primary: scans stdout/stderr for a JSON object with a `usage` key. Current
+`codex exec --json` emits a terminal event like:
 
 ```json
-{"usage":{"prompt_tokens":1234,"completion_tokens":567}}
+{"type":"turn.completed","usage":{"input_tokens":10546,"cached_input_tokens":2432,"output_tokens":5}}
 ```
 
-Fallback: scans stdout for a human-readable line like:
+The extractor also accepts the OpenAI usage shape:
+
+```json
+{"usage":{"prompt_tokens":82750,"completion_tokens":290,"prompt_tokens_details":{"cached_tokens":82000}}}
+```
+
+For both shapes, the prompt/input total includes cached tokens, so the
+stored `input_tokens` value is `prompt/input total - cached tokens`.
+
+Fallback: scans stdout/stderr for human-readable token lines like:
 
 ```
-Tokens used: prompt=1234 completion=567
+Prompt tokens: 12,345 / Cached input tokens: 2,000 / Completion tokens: 678
 ```
 
 ### Gemini (`GeminiCostExtractor`)

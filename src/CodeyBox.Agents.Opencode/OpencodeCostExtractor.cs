@@ -97,18 +97,21 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
 
     private static AgentCostSnapshot? ExtractFromDoc(JsonElement root)
     {
-        if (!root.TryGetProperty("usage", out var usage)) return null;
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("usage", out var usage)
+            || usage.ValueKind != JsonValueKind.Object)
+            return null;
 
-        int input = 0, cached = 0, output = 0;
+        int totalInput = 0, cached = 0, output = 0;
         string? modelId = null;
 
-        if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.TryGetInt32(out var ptv)) input = ptv;
-        else if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) input = itv;
+        if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.TryGetInt32(out var ptv)) totalInput = ptv;
+        else if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv)) totalInput = itv;
 
         if (usage.TryGetProperty("completion_tokens", out var ct) && ct.TryGetInt32(out var ctv)) output = ctv;
         else if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv)) output = otv;
 
-        cached = TryReadCachedInputTokens(usage);
+        cached = TryReadCachedInputTokens(usage, out var cachedIncludedInInputTotal);
 
         if (root.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String)
         {
@@ -116,22 +119,32 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
             modelId = raw is { Length: > MaxModelIdLength } ? raw[..MaxModelIdLength] : raw;
         }
 
-        if (input == 0 && output == 0) return null;
+        var input = cachedIncludedInInputTotal
+            ? TokenUsageAccounting.FreshInputTokens(totalInput, cached)
+            : totalInput;
+
+        if (input == 0 && cached == 0 && output == 0) return null;
         return new AgentCostSnapshot(input, cached, output, modelId);
     }
 
-    private static int TryReadCachedInputTokens(JsonElement usage)
+    private static int TryReadCachedInputTokens(JsonElement usage, out bool cachedIncludedInInputTotal)
     {
-        if (usage.TryGetProperty("cache_read_input_tokens", out var anthropic) && anthropic.TryGetInt32(out var ac))
-            return ac;
-
         if (usage.TryGetProperty("prompt_tokens_details", out var details)
+            && details.ValueKind == JsonValueKind.Object
             && details.TryGetProperty("cached_tokens", out var openAiCached)
             && openAiCached.TryGetInt32(out var oc))
         {
+            cachedIncludedInInputTotal = true;
             return oc;
         }
 
+        if (usage.TryGetProperty("cache_read_input_tokens", out var anthropic) && anthropic.TryGetInt32(out var ac))
+        {
+            cachedIncludedInInputTotal = false;
+            return ac;
+        }
+
+        cachedIncludedInInputTotal = false;
         return 0;
     }
 
@@ -168,4 +181,5 @@ public sealed class OpencodeCostExtractor : IAgentCostExtractor
         var cleaned = s.Replace(",", "", StringComparison.Ordinal);
         return int.TryParse(cleaned, out var v) ? v : 0;
     }
+
 }

@@ -136,17 +136,24 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
 
             finalText = FirstString(item, "text", "final_message") ?? finalText;
             ParseContent(item, starts, results, ref finalText);
-            ParseUsage(item, out var itemInput, out var itemOutput, out var itemCached);
+            var itemUsage = CodexUsageParser.TryExtract(root, item);
             var parsed = ParseScalars(root, type, eventTimestamp, starts, results, isAssistant, finalText);
             return parsed with
             {
-                InputTokens = parsed.InputTokens ?? itemInput,
-                OutputTokens = parsed.OutputTokens ?? itemOutput,
-                CachedInputTokens = parsed.CachedInputTokens ?? itemCached,
+                InputTokens = itemUsage?.InputTokens ?? parsed.InputTokens,
+                OutputTokens = itemUsage?.OutputTokens ?? parsed.OutputTokens,
+                CachedInputTokens = itemUsage?.CachedInputTokens ?? parsed.CachedInputTokens,
             };
         }
 
-        return base.ParseEvent(root);
+        var fallback = base.ParseEvent(root);
+        var fallbackUsage = CodexUsageParser.TryExtract(root);
+        return fallback with
+        {
+            InputTokens = fallbackUsage?.InputTokens ?? fallback.InputTokens,
+            OutputTokens = fallbackUsage?.OutputTokens ?? fallback.OutputTokens,
+            CachedInputTokens = fallbackUsage?.CachedInputTokens ?? fallback.CachedInputTokens,
+        };
     }
 
     private static ParsedEvent ParsePayloadEvent(
@@ -211,7 +218,7 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
 
         ParseContent(payload, starts, results, ref finalText);
         var parsed = ParseScalars(payload, payloadType, eventTimestamp, starts, results, isAssistant, finalText);
-        var (input, output, cached) = ParseCodexUsage(root, payload);
+        var usage = CodexUsageParser.TryExtract(root, payload);
         var totalDuration = parsed.TotalDuration;
         if (totalDuration is null
             && (string.Equals(payloadType, "turn_complete", StringComparison.OrdinalIgnoreCase)
@@ -222,9 +229,9 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
 
         return parsed with
         {
-            InputTokens = parsed.InputTokens ?? input,
-            OutputTokens = parsed.OutputTokens ?? output,
-            CachedInputTokens = parsed.CachedInputTokens ?? cached,
+            InputTokens = usage?.InputTokens ?? parsed.InputTokens,
+            OutputTokens = usage?.OutputTokens ?? parsed.OutputTokens,
+            CachedInputTokens = usage?.CachedInputTokens ?? parsed.CachedInputTokens,
             TotalDuration = totalDuration,
             TimeToFirstToken = parsed.TimeToFirstToken
                 ?? FirstDuration(payload, "time_to_first_token_ms", "ttft_ms", "ttft_duration_ms"),
@@ -240,70 +247,6 @@ public sealed class CodexStreamParser : FlexibleAgentStreamParser
             return FirstString(invocation, "call_id", "id", "tool_use_id");
 
         return null;
-    }
-
-    private static (int? Input, int? Output, int? Cached) ParseCodexUsage(params JsonElement[] roots)
-    {
-        int? input = null;
-        int? output = null;
-        int? cached = null;
-        foreach (var root in roots)
-            ParseCodexUsage(root, ref input, ref output, ref cached, depth: 0);
-        return (input, output, cached);
-    }
-
-    private static void ParseCodexUsage(JsonElement root, ref int? input, ref int? output, ref int? cached, int depth)
-    {
-        if (depth > 8)
-            return;
-
-        ParseUsage(root, out var directInput, out var directOutput, out var directCached);
-        input ??= directInput;
-        output ??= directOutput;
-        cached ??= directCached;
-
-        if (root.ValueKind == JsonValueKind.String)
-        {
-            var raw = root.GetString();
-            if (!string.IsNullOrWhiteSpace(raw) && raw.TrimStart().StartsWith('{'))
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(raw);
-                    ParseCodexUsage(doc.RootElement, ref input, ref output, ref cached, depth + 1);
-                }
-                catch (JsonException)
-                {
-                }
-            }
-
-            return;
-        }
-
-        if (root.ValueKind != JsonValueKind.Object)
-            return;
-
-        foreach (var name in new[]
-        {
-            "total_token_usage", "token_usage", "usage", "token_usage_json", "info", "last_token_usage",
-        })
-        {
-            if (TryGet(root, out var child, name))
-                ParseCodexUsage(child, ref input, ref output, ref cached, depth + 1);
-        }
-
-        if (input.HasValue && output.HasValue && cached.HasValue)
-            return;
-
-        foreach (var property in root.EnumerateObject())
-        {
-            if (property.Value.ValueKind == JsonValueKind.Object
-                && (property.Name.Contains("usage", StringComparison.OrdinalIgnoreCase)
-                    || property.Name.Contains("token", StringComparison.OrdinalIgnoreCase)))
-            {
-                ParseCodexUsage(property.Value, ref input, ref output, ref cached, depth + 1);
-            }
-        }
     }
 
     private static bool? CommandSucceeded(JsonElement item)

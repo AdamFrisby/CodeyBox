@@ -20,6 +20,7 @@ public sealed record AgentUsageEvent
     public DateTimeOffset? StartedUtc { get; init; }
     public DateTimeOffset? EndedUtc { get; init; }
     public long ElapsedMs { get; init; }
+    /// <summary>Non-cached input token bucket; add <see cref="CachedInputTokens"/> for total prompt-side tokens.</summary>
     public required int InputTokens { get; init; }
     public int CachedInputTokens { get; init; }
     public required int OutputTokens { get; init; }

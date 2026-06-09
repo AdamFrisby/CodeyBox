@@ -8,10 +8,15 @@ namespace CodeyBox.Agents.Claude;
 ///
 /// <para>The fields are derived from the CLI's stream-json <c>result</c> usage
 /// record (see <see cref="ClaudeCostExtractor"/>): <c>InputTokens</c> is the
-/// total prompt-input bucket (fresh + cache_creation + cache_read);
+/// total prompt-input bucket (fresh + cache_creation + cache_read) so the
+/// operator can chart cache_read share of total turn-over-turn;
 /// <c>CachedInputTokens</c> is the cache_read portion (the cheap one);
-/// <c>FreshInputTokens</c> is the derived non-cached remainder, which is what
-/// the operator wants to see drop turn-over-turn as the session warms.</para>
+/// <c>FreshInputTokens</c> is the non-cached billable bucket
+/// (fresh + cache_creation), which is what the operator wants to see drop
+/// turn-over-turn as the session warms. The extractor's
+/// <see cref="AgentCostSnapshot.InputTokens"/> already carries this billable
+/// bucket, and <c>InputTokens</c> here is the sum of that with
+/// <see cref="AgentCostSnapshot.CachedInputTokens"/>.</para>
 ///
 /// <para><see cref="Transport"/> distinguishes the command-delivery + billing
 /// channel that produced this turn (<c>"print"</c> vs <c>"acp"</c>), so
@@ -23,9 +28,9 @@ namespace CodeyBox.Agents.Claude;
 /// </summary>
 /// <param name="CliSessionId">Runner-assigned session id used by the transport's continuation flag (Claude CLI id for print; ACP session id for acp).</param>
 /// <param name="TurnIndex">Zero-based turn index within this session.</param>
-/// <param name="InputTokens">Total prompt-input tokens reported by the CLI.</param>
-/// <param name="CachedInputTokens">Prompt-input tokens served from the provider cache (cheap).</param>
-/// <param name="FreshInputTokens">Prompt-input tokens that were not cached (billed at fresh-input rates).</param>
+/// <param name="InputTokens">Total prompt-input tokens reported by the CLI (fresh + cache_creation + cache_read).</param>
+/// <param name="CachedInputTokens">Prompt-input tokens served from the provider cache (cache_read).</param>
+/// <param name="FreshInputTokens">Non-cached billable prompt-input tokens (fresh + cache_creation).</param>
 /// <param name="OutputTokens">Output tokens reported by the CLI.</param>
 /// <param name="ModelId">Model id reported by the CLI assistant event, if any.</param>
 /// <param name="UsedResume">True when this turn passed a continuation id (CLI <c>--resume</c> for print, ACP <c>session/load</c> for acp).</param>
