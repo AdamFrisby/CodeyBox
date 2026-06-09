@@ -115,4 +115,45 @@ public sealed class CredentialFileTokenExtractorTests
     {
         Assert.Null(CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw));
     }
+
+    [Fact]
+    public void TryBuildAntigravitySanitisedBundle_StripsRefreshTokenAndKeepsRest()
+    {
+        // The host CLI is the sole party that holds the Google OAuth
+        // refresh_token; the in-VM agy binary must not see it (otherwise an
+        // in-VM refresh would rotate the host's refresh_token out from under
+        // the host CLI / quota probes). Same isolation invariant Claude
+        // enforces via TryBuildClaudeSanitisedBundle.
+        const string raw =
+            """{"access_token":"ya29.live","refresh_token":"rt-secret","client_id":"cid","client_secret":"csec","expiry_date":1900000000000,"token_type":"Bearer","scope":"https://www.googleapis.com/auth/cloud-platform"}""";
+
+        var ok = CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var bundle);
+
+        Assert.True(ok);
+        Assert.Contains("\"access_token\":\"ya29.live\"", bundle);
+        Assert.Contains("\"expiry_date\":1900000000000", bundle);
+        // refresh_token must be gone in both the key and the secret value.
+        Assert.DoesNotContain("refresh_token", bundle, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("rt-secret", bundle);
+        // Non-secret companions (client_id, expiry, scope) survive — they are
+        // not the single-use refresh credential and the in-VM CLI may surface
+        // them for diagnostics.
+        Assert.Contains("\"token_type\":\"Bearer\"", bundle);
+        Assert.Contains("\"scope\":", bundle);
+    }
+
+    [Theory]
+    [InlineData("not-json")]
+    [InlineData("")]
+    [InlineData("""{"refresh_token":"rt-only"}""")]
+    [InlineData("""{"access_token":""}""")]
+    [InlineData("""{"access_token":123}""")]
+    [InlineData("[]")]
+    public void TryBuildAntigravitySanitisedBundle_ReturnsFalseForMalformedOrMissingAccessToken(string raw)
+    {
+        var ok = CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var bundle);
+
+        Assert.False(ok);
+        Assert.Equal(string.Empty, bundle);
+    }
 }

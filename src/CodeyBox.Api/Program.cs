@@ -807,18 +807,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
         // for the relevant 'Don't do' rule and docs/agents.md for setup.
-        // Antigravity uses Sign-in-with-Google OAuth — the canonical path is a
-        // file-credential bundle materialised under the AntigravityConstants
-        // env var. This mapping is the env-var fallback an operator can use
-        // to inject the full OAuth credentials JSON directly without an
-        // on-host credential file. The host env var is namespaced; the
-        // sandbox-side env var name is the one AntigravityAgentRunner's
-        // PrepareSandboxAsync reads.
-        new AgentCredentialMapping(
-            AgentKind.Antigravity,
-            "CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON",
-            AntigravityConstants.OAuthCredsEnvVar),
+        // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
+        // OAuth bundle must be sanitised (refresh_token stripped) before it
+        // crosses the VM boundary; AntigravityEnvironmentCredentialProvider
+        // does that and is registered separately below.
     }));
+    // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider
+    // sanitises the env-var bundle (strips refresh_token) before shipping it
+    // to the sandbox so an in-VM refresh cannot rotate the host's
+    // refresh_token. Matches the Claude isolation invariant.
+    builtInLast.Add(new AntigravityEnvironmentCredentialProvider(
+        sp.GetService<ILogger<AntigravityEnvironmentCredentialProvider>>()));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Also accept the conventional OpenAI SDK variable. This keeps Codex

@@ -128,8 +128,11 @@ public sealed class AntigravityAgentRunnerTests
     {
         // PrepareSandboxAsync must materialise the OAuth creds JSON into
         // ~/.agy/oauth_creds.json (chmod 600) when the env-var bundle is
-        // present — the canonical auth path agy reads at startup. Verifies
-        // the bash prep exec runs FIRST and the agy invocation runs after it.
+        // present — the canonical auth path agy reads at startup. The bundle
+        // is shipped to the sandbox env var by upstream credential providers
+        // already sanitised (refresh_token stripped — see
+        // AntigravityEnvironmentCredentialProvider / AgentInstanceCredentialResolver
+        // / CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle).
         var sandbox = new MultiExecCapturingSandbox();
         var runner = new AntigravityAgentRunner();
         var credential = new AgentCredential(
@@ -137,7 +140,7 @@ public sealed class AntigravityAgentRunnerTests
             new Dictionary<string, string>
             {
                 [AntigravityConstants.OAuthCredsEnvVar] =
-                    """{"access_token":"ya29.abc","refresh_token":"r-xyz","expiry":"2099-01-01T00:00:00Z"}""",
+                    """{"access_token":"ya29.abc","expiry":"2099-01-01T00:00:00Z"}""",
             },
             new Dictionary<string, string>());
 

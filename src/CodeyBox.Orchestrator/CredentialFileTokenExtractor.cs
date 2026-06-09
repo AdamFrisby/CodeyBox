@@ -124,6 +124,61 @@ public static class CredentialFileTokenExtractor
         return null;
     }
 
+    /// <summary>
+    /// Builds a sandbox-safe Antigravity OAuth bundle: the input is the Google
+    /// OAuth creds JSON (same shape as <c>~/.gemini/oauth_creds.json</c>); the
+    /// output is identical except <c>refresh_token</c> is removed. The host
+    /// remains the sole party that holds the refresh token (matching the
+    /// Claude isolation invariant), so an in-VM refresh cannot rotate the
+    /// refresh_token out from under the host CLI / quota probes.
+    /// </summary>
+    /// <returns>
+    /// True with a sanitised JSON in <paramref name="sanitisedBundle"/> when
+    /// the input parses and carries a non-empty <c>access_token</c>; false
+    /// otherwise.
+    /// </returns>
+    public static bool TryBuildAntigravitySanitisedBundle(
+        string? rawContents,
+        out string sanitisedBundle)
+    {
+        sanitisedBundle = "";
+        if (string.IsNullOrEmpty(rawContents))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawContents);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return false;
+            if (!root.TryGetProperty("access_token", out var token)
+                || token.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(token.GetString()))
+            {
+                return false;
+            }
+
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (prop.NameEquals("refresh_token"))
+                        continue;
+                    prop.WriteTo(writer);
+                }
+                writer.WriteEndObject();
+            }
+            sanitisedBundle = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static string BuildClaudeSandboxBundle(JsonElement oauth, string token)
     {
         using var stream = new MemoryStream();
