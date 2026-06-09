@@ -246,12 +246,48 @@ a restart lands in item 3.
 
 Per-turn metrics are emitted as `ClaudeSessionTurnMetrics` snapshots to the
 registered `IClaudeSessionMetricsSink`. Each snapshot carries the total
-input tokens, cached (cache_read) tokens, derived fresh-input tokens, output
-tokens, model id, and a `UsedResume` flag so the operator can confirm the
-turn actually ran with `--resume` and the cache is paying off. The default
-sink registration is `NullClaudeSessionMetricsSink`; hosts wire a logging /
-metrics-backed sink by registering their own `IClaudeSessionMetricsSink`
-before service-provider build.
+input tokens, cache_read tokens, cache_creation tokens, derived fresh-input
+tokens, output tokens, model id, and a `UsedResume` flag so the operator can
+confirm the turn actually ran with `--resume` and the cache is paying off.
+The default sink registration is `NullClaudeSessionMetricsSink`; hosts wire
+a logging / metrics-backed sink by registering their own
+`IClaudeSessionMetricsSink` before service-provider build.
+
+#### Verifying ACP cache warmth
+
+Both transports (`print` via `--resume`, `acp` via `session/load`) restart the
+`claude` process per turn — `sandbox.ExecAsync` is one-shot stdin, so the ACP
+bridge tears down `claude --ide` at the end of every turn just like the print
+path. Provider-side prompt-cache continuity is therefore claimed via the
+session id, not via process survival. **That claim is only verified for the
+print transport today.** For ACP, the assumption is `session/load` reattaches
+to the same logical session and the server-side cache rides over — but until
+the deployed ACP binary has been observed running consecutive turns, this is
+an unverified read from the protocol docs.
+
+Before scoping the larger "daemon bridge survives across turns" follow-up
+(which needs a streaming `ISandbox.ExecAsync` or host-reachable WebSocket),
+**run STEP 1: empirically verify cache warmth from the per-turn metric.** The
+metric exposes the four buckets needed: `CachedInputTokens` (cache_read),
+`CacheCreationInputTokens` (cache_write paid this turn), `FreshInputTokens`
+(billable bucket = real fresh + cache_creation), and `OutputTokens`.
+
+1. Pick one work item with at least 3 turns on the ACP transport
+   (`Transport == "acp"` on each metric record).
+2. Read `CachedInputTokens` and `CacheCreationInputTokens` per turn:
+
+   | Turn | cache_read | cache_creation | Read it as |
+   |---|---|---|---|
+   | 1 | 0 | large | Cold start — cache being written |
+   | 2+ | large | ~0 | **Warmth preserved.** `session/load` is reattaching to a warm provider cache. The daemon bridge becomes a *latency* optimisation only (saves ~hundreds of ms per turn of `claude --ide` startup). Modest priority. |
+   | 2+ | ~0 | large again | **Warmth NOT preserved.** Cache is being rebuilt every turn, paying the cache-write rate repeatedly. **Escalate.** This is a cost / 5 h-quota regression, not a latency footnote. Daemon-bridge work becomes higher-priority and must be scoped against the dollar impact, not the millisecond impact. |
+
+3. Cross-check against the print transport on the same prompt shape to confirm
+   the print path is hitting the cache too (otherwise the comparison is
+   measuring something else — e.g. a TTL miss, not a transport bug).
+
+Until the measurement runs, **do not** start the daemon-bridge work blind —
+its scope depends on which branch the data points to.
 
 The fleet stays pinned to `claude-opus-4-7`; the session worker does not
 hot-swap models mid-session. Long resumable sessions are the exact trigger

@@ -35,6 +35,24 @@ namespace CodeyBox.Agents.Claude;
 /// <param name="ModelId">Model id reported by the CLI assistant event, if any.</param>
 /// <param name="UsedResume">True when this turn passed a continuation id (CLI <c>--resume</c> for print, ACP <c>session/load</c> for acp).</param>
 /// <param name="Transport">Transport tag — <c>"print"</c>, <c>"acp"</c>, or empty for legacy callers.</param>
+/// <remarks>
+/// <para>ACP cache-warmth verification (see docs/agents.md "Verifying ACP cache
+/// warmth"). The print transport keeps one long-lived <c>claude --print --resume</c>
+/// per turn; the ACP transport currently tears down and respawns
+/// <c>claude --ide</c> each turn, with continuity supplied by <c>session/load</c>.
+/// Whether that <c>session/load</c> actually reattaches to a warm provider-side
+/// cache is the question the daemon-bridge follow-up depends on. The split here
+/// — <see cref="CachedInputTokens"/> (cache_read) vs
+/// <see cref="CacheCreationInputTokens"/> (newly-paid prompt-write tokens) —
+/// makes the answer directly readable from per-turn metrics across consecutive
+/// turns of one session:</para>
+/// <list type="bullet">
+///   <item>cache_read dominates after turn 1 and cache_creation collapses to ~0
+///   → warmth IS preserved → daemon bridge is purely a latency optimisation
+///   (modest priority).</item>
+///   <item>cache_creation stays high every turn → cache is being rebuilt each
+///   turn → cost/quota regression — escalate.</item>
+/// </list>
 public sealed record ClaudeSessionTurnMetrics(
     string CliSessionId,
     int TurnIndex,
@@ -44,7 +62,17 @@ public sealed record ClaudeSessionTurnMetrics(
     int OutputTokens,
     string? ModelId,
     bool UsedResume,
-    string Transport = "");
+    string Transport = "")
+{
+    /// <summary>
+    /// Prompt-input tokens charged at the (more expensive) cache-write rate this
+    /// turn (Anthropic <c>cache_creation_input_tokens</c>). Lives separately
+    /// from <see cref="FreshInputTokens"/> so an operator can distinguish "real"
+    /// fresh user-typed input from cache-rebuild charges. Defaults to 0 for
+    /// callers / fixtures that didn't supply it.
+    /// </summary>
+    public int CacheCreationInputTokens { get; init; }
+}
 
 /// <summary>
 /// Receives <see cref="ClaudeSessionTurnMetrics"/> snapshots so the host can

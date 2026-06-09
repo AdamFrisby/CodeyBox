@@ -682,6 +682,14 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             var fresh = Math.Max(0, snapshot.InputTokens);
             var total = (int)Math.Min(int.MaxValue,
                 (long)Math.Max(0, snapshot.InputTokens) + Math.Max(0, snapshot.CachedInputTokens));
+            // The extractor folds cache_creation into the billable InputTokens
+            // bucket so cost rows charge correctly. The metric exposes
+            // cache_creation separately so dashboards can chart cache_read vs
+            // cache_creation over consecutive turns — the signal the ACP
+            // cache-warmth verification reads to decide whether session/load is
+            // reattaching to a warm cache or rebuilding it every turn.
+            var cacheCreation = Math.Max(0,
+                ClaudeCostExtractor.ExtractCacheCreationTokens(turn.Result.Stdout ?? turn.CombinedStdout));
             var metrics = new ClaudeSessionTurnMetrics(
                 CliSessionId: cliSessionId,
                 TurnIndex: state.TurnsCompleted,
@@ -691,7 +699,10 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
                 OutputTokens: snapshot.OutputTokens,
                 ModelId: snapshot.ModelId,
                 UsedResume: usedResume,
-                Transport: state.ActiveTransport.Name);
+                Transport: state.ActiveTransport.Name)
+            {
+                CacheCreationInputTokens = cacheCreation,
+            };
             _metricsSink.Record(metrics);
         }
         catch
