@@ -112,7 +112,8 @@ Bake them at baseline time so the first dispatch can actually run.
       "apt-get update",
       "apt-get install -y curl ca-certificates nodejs npm",
       "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
-      "curl -fsSL https://cursor.com/install | bash"
+      "curl -fsSL https://cursor.com/install | bash",
+      "curl -fsSL https://antigravity.google/install | bash"
     ]
   }
 }

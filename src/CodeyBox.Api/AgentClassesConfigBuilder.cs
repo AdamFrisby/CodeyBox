@@ -1,3 +1,4 @@
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -85,6 +86,8 @@ public static class AgentClassesConfigBuilder
                         $"ReasoningMode=\"high\". Either set ReasoningMode=\"high\" (requires @google/gemini-cli ≥0.1.9 " +
                         $"with --thinking support; install via MultipassExtraRuncmd) or lower QualityScore below 90.");
                 GeminiKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, agentKind, m.ModelId, log);
+                if (agentKind == AgentKind.Antigravity)
+                    AntigravityKnownModels.ValidateModelIdAgainstProviderList(classOpts.Id, m.ModelId, log);
                 // Capabilities are operator-declared tags. Normalise (trim + drop empties)
                 // and de-duplicate case-insensitively so '"sensitive"' and '"Sensitive"'
                 // don't both end up in the list. Tag values themselves are otherwise
