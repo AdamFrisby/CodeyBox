@@ -27,13 +27,16 @@ public sealed class AntigravityCostExtractorTests
     public void NdJson_GeminiShape_ParsesCachedInputTokens()
     {
         // gemini-* gateway models emit the flat cached_input_tokens field.
+        // Google's prompt_tokens INCLUDES cached, so InputTokens (the
+        // non-cached billing bucket) must subtract them — otherwise cached
+        // tokens get charged at both the full input rate AND the cached rate.
         var stdout =
             """{"type":"result","model":"gemini-3.5-flash-high","usage":{"prompt_tokens":5000,"cached_input_tokens":1000,"completion_tokens":420}}""";
 
         var snap = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(snap);
-        Assert.Equal(5000, snap.InputTokens);
+        Assert.Equal(5000 - 1000, snap.InputTokens);
         Assert.Equal(1000, snap.CachedInputTokens);
         Assert.Equal(420, snap.OutputTokens);
         Assert.Equal("gemini-3.5-flash-high", snap.ModelId);

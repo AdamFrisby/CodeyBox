@@ -1089,6 +1089,8 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             member,
             () => new AgentQuotaCredentials(
                 CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(
+                        Environment.GetEnvironmentVariable(AntigravityConstants.OAuthCredsEnvVar))
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
             ?? new AgentQuotaCredentials(null),

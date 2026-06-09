@@ -317,6 +317,58 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         Assert.NotEmpty(handler.LiveRequests);
     }
 
+    // ── TTL cache ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetAvailability_TwiceWithinTtl_DoesNotReIssueHttp()
+    {
+        // The probe caches successful snapshots by (RouteKey, Token, ModelId)
+        // for the configured TTL. A second call inside the window must serve
+        // the cached value, not burn another live :generateContent request slot
+        // from the very quota we're trying to measure. A regression that
+        // never caches or ignores ExpiresAt would surface here as doubled
+        // request counts.
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new AntigravityProbeRouter(liveStatus: _ => HttpStatusCode.OK);
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5), time: time);
+
+        var first = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        var second = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(100.0, first.AvailablePct);
+        Assert.Equal(100.0, second.AvailablePct);
+        Assert.Single(handler.LiveRequests);
+        Assert.Equal(1, handler.SummaryRequests);
+        Assert.Equal(1, handler.LegacyRequests);
+
+        // After TTL elapses the cache entry is dropped; the next call must
+        // re-issue the probe rather than hand back a stale snapshot forever.
+        time.Advance(TimeSpan.FromMinutes(6));
+        var refreshed = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        Assert.Equal(100.0, refreshed.AvailablePct);
+        Assert.Equal(2, handler.LiveRequests.Count);
+    }
+
+    [Fact]
+    public async Task InvalidateCache_AfterPrime_ForcesFreshHttpOnNextCall()
+    {
+        // InvalidateCache is wired to GeminiOAuthCredentialFileSource.TokenUpdated
+        // (Program.cs) so a token rotation drops stale cache + exhaustion entries
+        // before the next probe. A regression that didn't actually clear _cache
+        // would re-serve the pre-rotation snapshot indefinitely.
+        var handler = new AntigravityProbeRouter(liveStatus: _ => HttpStatusCode.OK);
+        var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
+
+        _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        Assert.Single(handler.LiveRequests);
+
+        probe.InvalidateCache();
+
+        _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        Assert.Equal(2, handler.LiveRequests.Count);
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────────────
 
     private sealed class FixedClock : TimeProvider

@@ -14,7 +14,7 @@ namespace CodeyBox.Agents.Antigravity;
 /// free — see <c>AgentClassRouter</c>).
 ///
 /// <para>This list is a seed — operators can configure unknown ids and the
-/// validator only warns (matching <see cref="CodeyBox.Agents.Gemini.GeminiKnownModels"/>).
+/// validator only warns (matching <c>CodeyBox.Agents.Gemini.GeminiKnownModels</c>).
 /// The canonical strings shipped here were captured against agy v1.0.6 on
 /// 2026-06-09; refresh as Google ships new gateway models. Per the work-item
 /// note we deliberately keep numbers (quota sizes / pricing) config-driven —
@@ -60,7 +60,7 @@ public static class AntigravityKnownModels
     /// rejected — the CLI may accept newer ids this validator hasn't been taught
     /// yet — but the warning prompts operators to double-check typos before the
     /// quota probe quietly returns "unknown" at runtime. Mirrors the equivalent
-    /// hook in <see cref="CodeyBox.Agents.Gemini.GeminiKnownModels"/>.
+    /// hook in <c>CodeyBox.Agents.Gemini.GeminiKnownModels</c>.
     /// </summary>
     public static string? ValidateModelIdAgainstProviderList(
         string classId, string? modelId, ILogger log)

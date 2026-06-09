@@ -103,9 +103,13 @@ public sealed class AntigravityCostExtractor : IAgentCostExtractor
                     if (freshInput == 0 && cacheCreation == 0 && cacheRead == 0)
                     {
                         // Gemini-shape names (gemini-* gateway models): a flat
-                        // cached_input_tokens alongside input/output.
-                        freshInput = ReadInt(usage, "prompt_tokens", "promptTokenCount");
+                        // cached_input_tokens alongside input/output. Google's
+                        // convention is that promptTokenCount INCLUDES cached,
+                        // so subtract to recover the fresh-input billing bucket
+                        // (mirrors GeminiStreamParser / TokenUsageAccounting).
+                        var promptTotal = ReadInt(usage, "prompt_tokens", "promptTokenCount");
                         cacheRead = ReadInt(usage, "cached_input_tokens", "cachedInputTokenCount");
+                        freshInput = TokenUsageAccounting.FreshInputTokens(promptTotal, cacheRead);
                     }
 
                     inputTokens = freshInput + cacheCreation;

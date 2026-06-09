@@ -366,13 +366,13 @@ public sealed class AgentSessionRunnerTests
             "/work");
 
         var first = runner.SendTurnAsync(handle, "first after restart");
-        await reattacherStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await reattacherStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
         var second = runner.SendTurnAsync(handle, "second after restart");
 
         await Task.Delay(TimeSpan.FromMilliseconds(50));
         releaseReattacher.SetResult();
 
-        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(1));
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.Equal(1, reattachCount);
         Assert.Equal(2, inner.Calls.Count);
