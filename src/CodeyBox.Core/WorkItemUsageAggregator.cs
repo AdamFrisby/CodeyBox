@@ -26,8 +26,8 @@ public static class WorkItemUsageAggregator
             if (rows[i].Iteration is { } iter && iter > maxExplicit) maxExplicit = iter;
         }
 
-        int totalIn = 0, totalOut = 0, totalCached = 0;
-        int iterIn = 0, iterOut = 0, iterCached = 0;
+        long totalIn = 0, totalOut = 0, totalCached = 0;
+        long iterIn = 0, iterOut = 0, iterCached = 0;
         double totalUsd = 0.0, iterUsd = 0.0;
         long totalElapsed = 0, iterElapsed = 0;
 
@@ -36,7 +36,8 @@ public static class WorkItemUsageAggregator
             var r = rows[i];
             var elapsedMs = (long)Math.Max(0, (r.EndedAt - r.StartedAt).TotalMilliseconds);
 
-            totalIn += ClampInt(TokenUsageAccounting.TotalInputTokens(r));
+            var rowInput = TokenUsageAccounting.TotalInputTokens(r);
+            totalIn += rowInput;
             totalOut += r.OutputTokens;
             totalCached += r.CachedInputTokens;
             totalUsd += r.EstimatedUsd;
@@ -45,7 +46,7 @@ public static class WorkItemUsageAggregator
             var bucket = BucketIteration(r, maxExplicit);
             if (bucket == maxExplicit)
             {
-                iterIn += ClampInt(TokenUsageAccounting.TotalInputTokens(r));
+                iterIn += rowInput;
                 iterOut += r.OutputTokens;
                 iterCached += r.CachedInputTokens;
                 iterUsd += r.EstimatedUsd;
@@ -86,7 +87,4 @@ public static class WorkItemUsageAggregator
 
     private static double Round4(double value) =>
         Math.Round(value, 4, MidpointRounding.AwayFromZero);
-
-    private static int ClampInt(long value) =>
-        value > int.MaxValue ? int.MaxValue : (int)value;
 }

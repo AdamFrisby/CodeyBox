@@ -675,11 +675,17 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             var snapshot = extractor.TryExtract(turn.Result.Stdout ?? turn.CombinedStdout, turn.Result.Stderr);
             if (snapshot is null)
                 return;
-            var fresh = Math.Max(0, snapshot.InputTokens - snapshot.CachedInputTokens);
+            // AgentCostSnapshot.InputTokens is the non-cached billable bucket
+            // (fresh + cache_creation for Claude); CachedInputTokens is cache_read.
+            // The metric exposes the operator-facing TOTAL prompt-input bucket so
+            // dashboards can chart cache_read share of total turn-over-turn.
+            var fresh = Math.Max(0, snapshot.InputTokens);
+            var total = (int)Math.Min(int.MaxValue,
+                (long)Math.Max(0, snapshot.InputTokens) + Math.Max(0, snapshot.CachedInputTokens));
             var metrics = new ClaudeSessionTurnMetrics(
                 CliSessionId: cliSessionId,
                 TurnIndex: state.TurnsCompleted,
-                InputTokens: snapshot.InputTokens,
+                InputTokens: total,
                 CachedInputTokens: snapshot.CachedInputTokens,
                 FreshInputTokens: fresh,
                 OutputTokens: snapshot.OutputTokens,

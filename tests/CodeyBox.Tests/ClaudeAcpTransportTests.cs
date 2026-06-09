@@ -836,7 +836,9 @@ public sealed class ClaudeAcpTransportTests
         var extractor = new ClaudeCostExtractor();
         var snap = extractor.TryExtract(shim, agentStderr: null);
         Assert.NotNull(snap);
-        Assert.Equal(11 + 7777, snap!.InputTokens);
+        // AgentCostSnapshot.InputTokens carries the non-cached billable bucket
+        // (fresh + cache_creation); cache_read lives on CachedInputTokens.
+        Assert.Equal(11, snap!.InputTokens);
         Assert.Equal(7777, snap.CachedInputTokens);
         Assert.Equal(22, snap.OutputTokens);
     }

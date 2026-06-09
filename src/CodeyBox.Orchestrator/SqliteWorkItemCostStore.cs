@@ -73,18 +73,35 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                 "ALTER TABLE work_item_costs ADD COLUMN has_extracted_token_usage INTEGER NOT NULL DEFAULT 1;");
             MarkLegacyElapsedFallbackRows();
 
+            // The pre-fix Claude/OpenCode extractors stored prompt-side totals
+            // (i.e. input_tokens already included the cached subset) while
+            // cached_input_tokens carried the cache_read portion. The new
+            // contract is fresh-only in input_tokens, so the aggregator can sum
+            // input + cached without double-counting. Run a one-time UPDATE on
+            // legacy rows to subtract cached from input. usage_contract_version
+            // = 1 means the row already uses the new contract; defaulting new
+            // inserts to 1 below means the migration only ever touches rows
+            // created before this column existed (i.e. default 0 backfill).
+            AddWorkItemCostColumnIfMissing(
+                "usage_contract_version",
+                "ALTER TABLE work_item_costs ADD COLUMN usage_contract_version INTEGER NOT NULL DEFAULT 0;");
+            MigrateLegacyInputTokensToFreshOnly();
+
             _insertCmd = _conn.CreateCommand();
+            // usage_contract_version is hard-coded 1 here so the post-migration
+            // idempotency check (re-runs on startup only touch version=0 legacy
+            // rows) holds — see MigrateLegacyInputTokensToFreshOnly.
             _insertCmd.CommandText = """
                 INSERT INTO work_item_costs
                     (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
                      estimated_usd, started_at, ended_at, raw_metadata_json,
-                     has_extracted_token_usage)
+                     has_extracted_token_usage, usage_contract_version)
                 VALUES
                     ($id, $wi, $phase, $iter, $kind, $instance, $model,
                      $input, $cached, $output,
                      $usd, $started, $ended, $meta,
-                     $hasExtracted)
+                     $hasExtracted, 1)
                 """;
             _insertCmd.Parameters.Add("$id", SqliteType.Text);
             _insertCmd.Parameters.Add("$wi", SqliteType.Text);
@@ -408,11 +425,11 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                     (id, work_item_id, phase, iteration, agent_kind, agent_instance_id, model_id,
                      input_tokens, cached_input_tokens, output_tokens,
                      estimated_usd, started_at, ended_at, raw_metadata_json,
-                     has_extracted_token_usage)
+                     has_extracted_token_usage, usage_contract_version)
                 VALUES
                     ($id, $wi, $phase, $iter, $kind, NULL, NULL,
                      $input, $cached, $output, $usd, $started, $ended, $meta,
-                     1)
+                     1, 1)
                 """;
             BindReconcile(insert, row);
             insert.Parameters.AddWithValue("$id", $"stream-{row.WorkItemId}-{row.FileName}");
@@ -506,6 +523,34 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             WHERE raw_metadata_json LIKE $legacy
             """;
         cmd.Parameters.AddWithValue("$legacy", $"%\"{LegacyElapsedFallbackMetadataSource}\"%");
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// One-shot data migration: pre-fix Claude/OpenCode rows persisted
+    /// input_tokens = TOTAL (fresh + cache_creation + cache_read for Claude;
+    /// prompt_tokens with cached subset included for OpenCode) and
+    /// cached_input_tokens = the cached subset. The new aggregator does
+    /// total = input + cached; without this fix-up legacy rows would
+    /// double-count the cached subset on every public reporting surface.
+    /// Codex rows are unaffected (cached_input_tokens was always 0 pre-fix),
+    /// but we don't filter by agent_kind — subtracting 0 from input is a
+    /// no-op, and a kind-restricted WHERE would skip rows from any future
+    /// extractor that shared the old contract.
+    /// </summary>
+    private void MigrateLegacyInputTokensToFreshOnly()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE work_item_costs
+            SET input_tokens = CASE
+                    WHEN input_tokens >= cached_input_tokens
+                        THEN input_tokens - cached_input_tokens
+                    ELSE 0
+                END,
+                usage_contract_version = 1
+            WHERE usage_contract_version = 0
+            """;
         cmd.ExecuteNonQuery();
     }
 

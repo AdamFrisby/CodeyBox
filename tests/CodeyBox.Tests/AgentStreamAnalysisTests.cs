@@ -425,7 +425,10 @@ public sealed class GeminiStreamParserTests
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("read_file", tool.ToolName);
         Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
-        Assert.Equal(10, summary.InputTokens);
+        // Google's promptTokenCount (10) includes cachedContentTokenCount (1);
+        // the parser normalises InputTokens to the fresh-only billable bucket
+        // so it has the same meaning as codex/opencode's InputTokens.
+        Assert.Equal(9, summary.InputTokens);
         Assert.Equal(3, summary.OutputTokens);
         Assert.Equal(1, summary.CachedInputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);
