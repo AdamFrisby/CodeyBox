@@ -120,4 +120,95 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Contains("--continue", sandbox.CapturedExec!.Argv);
         Assert.DoesNotContain("--conversation", sandbox.CapturedExec!.Argv);
     }
+
+    // ── PrepareSandboxAsync OAuth-creds materialisation ──────────────────────
+
+    [Fact]
+    public async Task RunAsync_WithOAuthCredsBundle_WritesCredentialsFileToSandbox()
+    {
+        // PrepareSandboxAsync must materialise the OAuth creds JSON into
+        // ~/.agy/oauth_creds.json (chmod 600) when the env-var bundle is
+        // present — the canonical auth path agy reads at startup. Verifies
+        // the bash prep exec runs FIRST and the agy invocation runs after it.
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Antigravity,
+            new Dictionary<string, string>
+            {
+                [AntigravityConstants.OAuthCredsEnvVar] =
+                    """{"access_token":"ya29.abc","refresh_token":"r-xyz","expiry":"2099-01-01T00:00:00Z"}""",
+            },
+            new Dictionary<string, string>());
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.Equal(2, sandbox.AllExecs.Count);
+        var prep = sandbox.AllExecs[0];
+        Assert.Equal("bash", prep.Argv[0]);
+        Assert.Equal("-c", prep.Argv[1]);
+        var script = prep.Argv[2];
+        Assert.Contains("$HOME/.agy/oauth_creds.json", script);
+        Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
+        Assert.Contains("chmod 600", script);
+        // Second exec is the agy CLI invocation, not the prep hook.
+        Assert.Equal("agy", sandbox.AllExecs[1].Argv[0]);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithoutOAuthCredsBundle_DoesNotRunPrepHook()
+    {
+        // Credentials with no OAuth-creds env var (e.g. operators using only
+        // legacy auth paths or with creds already on the image) must skip the
+        // prep hook entirely — single exec is just the agy CLI.
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Antigravity,
+            new Dictionary<string, string> { ["UNRELATED"] = "x" },
+            new Dictionary<string, string>());
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.Single(sandbox.AllExecs);
+        Assert.Equal("agy", sandbox.AllExecs[0].Argv[0]);
+    }
+
+    [Fact]
+    public async Task RunAsync_NullCredential_DoesNotRunPrepHook()
+    {
+        // No credential at all must also skip the prep hook — the runner
+        // tolerates running without injected auth (e.g. image-baked creds).
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.Single(sandbox.AllExecs);
+        Assert.Equal("agy", sandbox.AllExecs[0].Argv[0]);
+    }
+
+    [Fact]
+    public async Task RunAsync_PrepHookFails_PropagatesAsAgentFailure()
+    {
+        // If the sandbox can't write the creds file (chmod / quota / read-only
+        // home), surface the failure rather than racing on to the agy
+        // invocation, which would 401 against the gateway with a confusing
+        // shape and chew through a request slot.
+        var sandbox = new MultiExecCapturingSandbox(prepExitCode: 1, prepStderr: "permission denied");
+        var runner = new AntigravityAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Antigravity,
+            new Dictionary<string, string>
+            {
+                [AntigravityConstants.OAuthCredsEnvVar] = """{"access_token":"ya29.abc"}""",
+            },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential);
+
+        Assert.False(result.Success);
+        Assert.Contains("antigravity auth", result.Summary);
+        Assert.Single(sandbox.AllExecs);
+    }
 }
