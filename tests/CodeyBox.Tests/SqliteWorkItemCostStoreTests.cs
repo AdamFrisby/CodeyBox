@@ -508,4 +508,152 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
 
         Assert.Empty(rows);
     }
+
+    [Fact]
+    public async Task Constructor_MigratesLegacyInputTokens_SubtractsCachedAndIsIdempotent()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-legacy-input-{Guid.NewGuid():N}.db");
+        try
+        {
+            // Seed a pre-fix schema (no usage_contract_version column) with rows
+            // matching the old contract: input_tokens carries the TOTAL prompt
+            // bucket and cached_input_tokens carries the cached subset already
+            // included in input_tokens.
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await using var setup = conn.CreateCommand();
+                setup.CommandText = $$"""
+                    CREATE TABLE work_items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        state INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO work_items (id, project_id, state, updated_at)
+                    VALUES ('wi-typical', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-clamp',   'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-zero',    'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
+                    CREATE TABLE work_item_costs (
+                        id                  TEXT PRIMARY KEY,
+                        work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        phase               TEXT NOT NULL,
+                        iteration           INTEGER,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        estimated_usd       REAL NOT NULL DEFAULT 0,
+                        started_at          TEXT NOT NULL,
+                        ended_at            TEXT NOT NULL,
+                        raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                    );
+                    -- Typical legacy row: input=10000 (TOTAL), cached=3000 (subset). After
+                    -- migration input should become 7000 fresh-only; cached unchanged.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-typical', 'wi-typical', 'work', 1, 'claude', 'claude-opus-4-7',
+                         10000, 3000, 500, 0.05,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- Pathological row: cached > input (should not produce a negative result).
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-clamp', 'wi-clamp', 'work', 1, 'claude', 'claude-opus-4-7',
+                         100, 250, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- Codex-shape legacy row: cached=0, input untouched by the subtraction.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-zero', 'wi-zero', 'work', 1, 'codex', 'gpt-5',
+                         4242, 0, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    """;
+                await setup.ExecuteNonQueryAsync();
+            }
+
+            // First open: should add usage_contract_version, run the migration,
+            // then flip all rows to version=1.
+            using (var migrated = new SqliteWorkItemCostStore(dbPath))
+            {
+                var typical = Assert.Single(await migrated.GetByWorkItemAsync("wi-typical"));
+                Assert.Equal(7000, typical.InputTokens);
+                Assert.Equal(3000, typical.CachedInputTokens);
+
+                var clamp = Assert.Single(await migrated.GetByWorkItemAsync("wi-clamp"));
+                Assert.Equal(0, clamp.InputTokens);
+                Assert.Equal(250, clamp.CachedInputTokens);
+
+                var zero = Assert.Single(await migrated.GetByWorkItemAsync("wi-zero"));
+                Assert.Equal(4242, zero.InputTokens);
+                Assert.Equal(0, zero.CachedInputTokens);
+            }
+
+            await AssertAllRowsAtVersion(dbPath, expectedVersion: 1);
+
+            // Re-open the store: migration must be a no-op (idempotent). If the
+            // WHERE usage_contract_version=0 guard ever regresses, the typical
+            // row's input would silently drop from 7000 -> 4000 (or to 0 after
+            // enough restarts).
+            using (var reopened = new SqliteWorkItemCostStore(dbPath))
+            {
+                var typical = Assert.Single(await reopened.GetByWorkItemAsync("wi-typical"));
+                Assert.Equal(7000, typical.InputTokens);
+                Assert.Equal(3000, typical.CachedInputTokens);
+
+                var clamp = Assert.Single(await reopened.GetByWorkItemAsync("wi-clamp"));
+                Assert.Equal(0, clamp.InputTokens);
+                Assert.Equal(250, clamp.CachedInputTokens);
+
+                var zero = Assert.Single(await reopened.GetByWorkItemAsync("wi-zero"));
+                Assert.Equal(4242, zero.InputTokens);
+                Assert.Equal(0, zero.CachedInputTokens);
+            }
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Constructor_NewInsertsAreFlaggedAtCurrentContractVersion()
+    {
+        // Defends the migration's idempotency contract: every RecordAsync insert
+        // must persist usage_contract_version=1 so the legacy backfill on the
+        // next startup leaves it alone.
+        var itemId = Guid.NewGuid().ToString();
+        SeedWorkItem(itemId);
+        await _store.RecordAsync(MakeCost(itemId));
+
+        await AssertAllRowsAtVersion(_dbPath, expectedVersion: 1);
+    }
+
+    private static async Task AssertAllRowsAtVersion(string dbPath, int expectedVersion)
+    {
+        await using var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, usage_contract_version FROM work_item_costs";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var count = 0;
+        while (await reader.ReadAsync())
+        {
+            count++;
+            var id = reader.GetString(0);
+            var version = reader.GetInt32(1);
+            Assert.True(version == expectedVersion,
+                $"row {id} has usage_contract_version={version}, expected {expectedVersion}");
+        }
+        Assert.True(count > 0, "expected at least one row to verify");
+    }
 }
