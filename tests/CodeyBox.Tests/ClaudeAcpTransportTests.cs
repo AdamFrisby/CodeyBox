@@ -728,6 +728,42 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_CacheCreationTokens_SurfaceOnTurnMetric()
+    {
+        // ACP cache-warmth verification needs cache_creation read separately from
+        // cache_read. Drive the real shim through a turn that reports
+        // cache_creation_input_tokens=4321 and assert the metric exposes that
+        // exact value on the new field (folded into FreshInputTokens via the
+        // billable bucket per the existing extractor contract).
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-cc-1\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-cc-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":120,\"output_tokens\":30,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":4321}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+
+        var sink = new RecordingMetricsSink();
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            metricsSink: sink,
+            options: new ClaudeSessionWorkerOptions { Transport = ClaudeSessionTransport.Acp },
+            acpTransport: new AcpClaudeTransport());
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        var result = await worker.SendTurnAsync(handle, "first");
+
+        Assert.True(result.Success);
+        var rec = sink.Records.Single();
+        Assert.Equal(4321, rec.CacheCreationInputTokens);
+        Assert.Equal(0, rec.CachedInputTokens);
+        // The billable input bucket is fresh (120) + cache_creation (4321).
+        Assert.Equal(120 + 4321, rec.FreshInputTokens);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_FatalEnvelope_SurfacesAsTransportUnavailable()
     {
         var sandbox = new BridgeSandbox();

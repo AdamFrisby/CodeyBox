@@ -109,6 +109,44 @@ public sealed class ClaudeCostExtractor : IAgentCostExtractor
         return new AgentCostSnapshot(inputTokens, cachedTokens, outputTokens, modelId);
     }
 
+    /// <summary>
+    /// Re-reads <c>cache_creation_input_tokens</c> from the same stream-json
+    /// blob <see cref="TryExtract"/> consumes. <see cref="AgentCostSnapshot"/>
+    /// (the cross-agent contract) folds cache-creation into the billable input
+    /// bucket so cost rows charge correctly; <see cref="ClaudeSessionWorker"/>
+    /// needs the breakdown separately to drive the ACP cache-warmth verification.
+    /// Returns 0 when no recognisable <c>result</c>/<c>usage</c> event surfaces
+    /// (older CLI, plain-text mode, etc.).
+    /// </summary>
+    public static int ExtractCacheCreationTokens(string? agentStdout)
+    {
+        if (string.IsNullOrWhiteSpace(agentStdout)) return 0;
+        var first = agentStdout.AsSpan().TrimStart();
+        if (first.IsEmpty || first[0] != '{') return 0;
+        var total = 0;
+        foreach (var line in agentStdout.Split('\n',
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith('{')) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("type", out var typeProp)) continue;
+                if (typeProp.GetString() != "result") continue;
+                if (!root.TryGetProperty("usage", out var usage)) continue;
+                if (usage.TryGetProperty("cache_creation_input_tokens", out var cct)
+                    && cct.TryGetInt32(out var cctv))
+                {
+                    total = cctv;
+                }
+            }
+            catch (JsonException) { }
+            catch (InvalidOperationException) { }
+        }
+        return total;
+    }
+
     private static AgentCostSnapshot? TryParseHumanReadable(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return null;
