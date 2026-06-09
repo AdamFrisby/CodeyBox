@@ -68,8 +68,13 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
                     ON agent_usage_events(time_utc);
                 """;
             createCmd.ExecuteNonQuery();
-            RunMigration("ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
-            RunMigration("CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;");
+            AddUsageColumnIfMissing("agent_instance_id", "ALTER TABLE agent_usage_events ADD COLUMN agent_instance_id TEXT;");
+
+            using (var indexCmd = _conn.CreateCommand())
+            {
+                indexCmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_instance_model_time ON agent_usage_events(agent_instance_id, model_id, time_utc) WHERE agent_instance_id IS NOT NULL;";
+                indexCmd.ExecuteNonQuery();
+            }
 
             AddUsageColumnIfMissing("phase", "ALTER TABLE agent_usage_events ADD COLUMN phase TEXT;");
             AddUsageColumnIfMissing("started_utc", "ALTER TABLE agent_usage_events ADD COLUMN started_utc TEXT;");
