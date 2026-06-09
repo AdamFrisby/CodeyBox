@@ -531,9 +531,11 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                         updated_at TEXT NOT NULL DEFAULT ''
                     );
                     INSERT INTO work_items (id, project_id, state, updated_at)
-                    VALUES ('wi-typical', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
-                           ('wi-clamp',   'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
-                           ('wi-zero',    'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
+                    VALUES ('wi-typical',    'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-skip-shape', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-zero',       'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-opencode-anth-warm', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('wi-opencode-anth-cold', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
                     CREATE TABLE work_item_costs (
                         id                  TEXT PRIMARY KEY,
                         work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
@@ -559,13 +561,16 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                         ('row-typical', 'wi-typical', 'work', 1, 'claude', 'claude-opus-4-7',
                          10000, 3000, 500, 0.05,
                          '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
-                    -- Pathological row: cached > input (should not produce a negative result).
+                    -- Defensive guard: any row with cached > input violates the
+                    -- pre-fix TOTAL-includes-cached contract, so it must already
+                    -- be fresh-only. Migration must leave such rows untouched
+                    -- (no subtraction, no clamp-to-zero).
                     INSERT INTO work_item_costs
                         (id, work_item_id, phase, iteration, agent_kind, model_id,
                          input_tokens, cached_input_tokens, output_tokens, estimated_usd,
                          started_at, ended_at, raw_metadata_json)
                     VALUES
-                        ('row-clamp', 'wi-clamp', 'work', 1, 'claude', 'claude-opus-4-7',
+                        ('row-skip-shape', 'wi-skip-shape', 'work', 1, 'claude', 'claude-opus-4-7',
                          100, 250, 0, 0.0,
                          '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
                     -- Codex-shape legacy row: cached=0, input untouched by the subtraction.
@@ -576,6 +581,32 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                     VALUES
                         ('row-zero', 'wi-zero', 'work', 1, 'codex', 'gpt-5',
                          4242, 0, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- OpenCode Anthropic-shape "warm" legacy row: pre-fix extractor
+                    -- read input_tokens (Anthropic spec: already fresh-only) into
+                    -- input_tokens and cache_read_input_tokens into cached. Common
+                    -- shape on warm Claude sessions through OpenCode: cached >> fresh.
+                    -- Migration MUST NOT subtract — doing so destroys the fresh
+                    -- portion and silently under-reports historical tokens.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-opencode-anth-warm', 'wi-opencode-anth-warm', 'work', 1, 'opencode', 'claude-sonnet-4-5',
+                         100, 9000, 200, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
+                    -- OpenCode Anthropic-shape "cold" legacy row: fresh > cache_read
+                    -- but still ambiguous shape. Migration also has to leave this
+                    -- untouched, because we can't distinguish OpenAI-shape from
+                    -- Anthropic-shape on an opencode legacy row.
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-opencode-anth-cold', 'wi-opencode-anth-cold', 'work', 1, 'opencode', 'claude-sonnet-4-5',
+                         500, 200, 100, 0.0,
                          '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}');
                     """;
                 await setup.ExecuteNonQueryAsync();
@@ -589,13 +620,27 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 Assert.Equal(7000, typical.InputTokens);
                 Assert.Equal(3000, typical.CachedInputTokens);
 
-                var clamp = Assert.Single(await migrated.GetByWorkItemAsync("wi-clamp"));
-                Assert.Equal(0, clamp.InputTokens);
-                Assert.Equal(250, clamp.CachedInputTokens);
+                // cached > input row is left untouched (input < cached is impossible
+                // under the pre-fix TOTAL-includes-cached contract, so the row must
+                // already be fresh-only — subtracting would corrupt it).
+                var skipShape = Assert.Single(await migrated.GetByWorkItemAsync("wi-skip-shape"));
+                Assert.Equal(100, skipShape.InputTokens);
+                Assert.Equal(250, skipShape.CachedInputTokens);
 
                 var zero = Assert.Single(await migrated.GetByWorkItemAsync("wi-zero"));
                 Assert.Equal(4242, zero.InputTokens);
                 Assert.Equal(0, zero.CachedInputTokens);
+
+                // OpenCode rows: shape-ambiguous pre-fix (OpenAI vs Anthropic).
+                // Both branches preserve input as-is, because corrupting genuine
+                // Anthropic-shape rows (where input was fresh-only) is irreversible.
+                var warm = Assert.Single(await migrated.GetByWorkItemAsync("wi-opencode-anth-warm"));
+                Assert.Equal(100, warm.InputTokens);
+                Assert.Equal(9000, warm.CachedInputTokens);
+
+                var cold = Assert.Single(await migrated.GetByWorkItemAsync("wi-opencode-anth-cold"));
+                Assert.Equal(500, cold.InputTokens);
+                Assert.Equal(200, cold.CachedInputTokens);
             }
 
             await AssertAllRowsAtVersion(dbPath, expectedVersion: 1);
@@ -610,13 +655,21 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 Assert.Equal(7000, typical.InputTokens);
                 Assert.Equal(3000, typical.CachedInputTokens);
 
-                var clamp = Assert.Single(await reopened.GetByWorkItemAsync("wi-clamp"));
-                Assert.Equal(0, clamp.InputTokens);
-                Assert.Equal(250, clamp.CachedInputTokens);
+                var skipShape = Assert.Single(await reopened.GetByWorkItemAsync("wi-skip-shape"));
+                Assert.Equal(100, skipShape.InputTokens);
+                Assert.Equal(250, skipShape.CachedInputTokens);
 
                 var zero = Assert.Single(await reopened.GetByWorkItemAsync("wi-zero"));
                 Assert.Equal(4242, zero.InputTokens);
                 Assert.Equal(0, zero.CachedInputTokens);
+
+                var warm = Assert.Single(await reopened.GetByWorkItemAsync("wi-opencode-anth-warm"));
+                Assert.Equal(100, warm.InputTokens);
+                Assert.Equal(9000, warm.CachedInputTokens);
+
+                var cold = Assert.Single(await reopened.GetByWorkItemAsync("wi-opencode-anth-cold"));
+                Assert.Equal(500, cold.InputTokens);
+                Assert.Equal(200, cold.CachedInputTokens);
             }
         }
         finally

@@ -397,7 +397,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                         output_tokens = $output,
                         estimated_usd = $usd,
                         raw_metadata_json = $meta,
-                        has_extracted_token_usage = 1
+                        has_extracted_token_usage = 1,
+                        usage_contract_version = 1
                     WHERE id = (
                         SELECT id FROM work_item_costs
                         WHERE work_item_id = $wi
@@ -527,16 +528,39 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
     }
 
     /// <summary>
-    /// One-shot data migration: pre-fix Claude/OpenCode rows persisted
-    /// input_tokens = TOTAL (fresh + cache_creation + cache_read for Claude;
-    /// prompt_tokens with cached subset included for OpenCode) and
-    /// cached_input_tokens = the cached subset. The new aggregator does
-    /// total = input + cached; without this fix-up legacy rows would
-    /// double-count the cached subset on every public reporting surface.
-    /// Codex rows are unaffected (cached_input_tokens was always 0 pre-fix),
-    /// but we don't filter by agent_kind — subtracting 0 from input is a
-    /// no-op, and a kind-restricted WHERE would skip rows from any future
-    /// extractor that shared the old contract.
+    /// One-shot data migration from the pre-fix usage contract to the new
+    /// fresh-only contract. The new aggregator computes
+    /// total = input + cached, so any legacy row whose input column already
+    /// included the cached subset must have cached subtracted to avoid
+    /// double-counting on every public reporting surface.
+    ///
+    /// Pre-fix shapes:
+    ///   - Claude rows: input = TOTAL prompt (fresh + cache_creation +
+    ///     cache_read), cached = cache_read. Always input >= cached.
+    ///     Subtraction is correct.
+    ///   - OpenCode rows extracted from the OpenAI shape: input =
+    ///     prompt_tokens (TOTAL, includes cached), cached =
+    ///     prompt_tokens_details.cached_tokens. Always input >= cached.
+    ///     Subtraction is correct.
+    ///   - OpenCode rows extracted from the Anthropic shape: input =
+    ///     input_tokens (ALREADY FRESH-ONLY per Anthropic's spec),
+    ///     cached = cache_read_input_tokens. May have cached > input on
+    ///     warm sessions. Subtraction would corrupt these rows.
+    ///   - Codex rows: cached was always 0 pre-fix, so subtraction is a no-op.
+    ///
+    /// We cannot distinguish OpenCode OpenAI-shape from Anthropic-shape on a
+    /// legacy row (raw_metadata_json didn't capture the shape pre-fix), so we
+    /// take the conservative route: skip ALL opencode rows from the
+    /// subtraction. Pre-fix OpenAI-shape OpenCode rows will over-report
+    /// tokens until re-extracted, but that shape was not observed in
+    /// practice; corrupting genuine Anthropic-shape rows would be
+    /// irreversible. We also skip any row where cached > input as a
+    /// belt-and-braces guard — under the pre-fix TOTAL-includes-cached
+    /// contract that is impossible, so such rows must already be fresh-only.
+    ///
+    /// Skipped rows are still stamped at usage_contract_version = 1 so the
+    /// migration is one-shot — they are now (correctly or imperfectly)
+    /// considered to be on the new contract.
     /// </summary>
     private void MigrateLegacyInputTokensToFreshOnly()
     {
@@ -544,9 +568,9 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         cmd.CommandText = """
             UPDATE work_item_costs
             SET input_tokens = CASE
-                    WHEN input_tokens >= cached_input_tokens
-                        THEN input_tokens - cached_input_tokens
-                    ELSE 0
+                    WHEN agent_kind = 'opencode' THEN input_tokens
+                    WHEN input_tokens < cached_input_tokens THEN input_tokens
+                    ELSE input_tokens - cached_input_tokens
                 END,
                 usage_contract_version = 1
             WHERE usage_contract_version = 0
