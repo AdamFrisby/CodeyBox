@@ -429,9 +429,15 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         await _store.CreateAsync(item);
         await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
 
+        // ProgressTimeout is intentionally wider than the test loop wall-clock
+        // so the second sweep (with the activity signal cleared but well inside
+        // the timeout window) is unambiguously the "still fresh" case. A tighter
+        // window (e.g. 200ms) flakes under parallel-suite CPU contention because
+        // the second RunOnceAsync's `now` capture can land outside the prior
+        // sweep's tolerance even though no real progress has elapsed.
         var opts = new WorkerProgressWatchdogOptions
         {
-            ProgressTimeout = TimeSpan.FromMilliseconds(200),
+            ProgressTimeout = TimeSpan.FromSeconds(2),
             CheckInterval = TimeSpan.FromMilliseconds(50),
             ProcessCpuProgressSignalEnabled = true,
             ActiveSandboxProgressSignalEnabled = false,
@@ -457,7 +463,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Single(await _registry.ListAsync());
         Assert.Equal(1, activity.Calls);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(250));
+        await Task.Delay(TimeSpan.FromMilliseconds(2500));
         await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
