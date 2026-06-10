@@ -1535,6 +1535,42 @@ builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
+
+// Mutation-testing rigor gate (disabled by default; per-project threshold).
+// The auditor short-circuits to pass when Enabled=false, so registering the
+// defaults is safe; operators replace IMutationRunner / IMutationRatchetStore
+// with their own implementations to turn the gate on.
+//
+// IOptionsMonitor (not IOptions snapshot) so hot-reloads of CodeyBox:Mutation
+// (threshold, budget, etc.) take effect without a process restart, consistent
+// with the rest of the host's options wiring.
+builder.Services.Configure<MutationTestingAuditorOptions>(
+    builder.Configuration.GetSection("CodeyBox:Mutation"));
+builder.Services.TryAddSingleton<IMutationRunner, NullMutationRunner>();
+builder.Services.TryAddSingleton<IMutationRatchetStore, InMemoryMutationRatchetStore>();
+builder.Services.AddSingleton<IAuditor>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<MutationTestingAuditorOptions>>();
+    var ratchet = sp.GetRequiredService<IMutationRatchetStore>();
+    // Loud startup warning when the gate is enabled but the in-memory ratchet
+    // store is the registered implementation: it is process-local and every
+    // restart wipes the baseline, so the "no-regression" invariant only holds
+    // within a single uptime window. Operators flipping Enabled=true on a
+    // long-lived host should swap in a file- or SQLite-backed store.
+    if (monitor.CurrentValue.Enabled && ratchet is InMemoryMutationRatchetStore)
+    {
+        sp.GetRequiredService<ILogger<MutationTestingAuditor>>().LogWarning(
+            "mutation-rigor gate is enabled but the registered IMutationRatchetStore is " +
+            "InMemoryMutationRatchetStore — the no-regression baseline will be reset on every " +
+            "process restart. Register a persistent IMutationRatchetStore (file/SQLite) before " +
+            "relying on the ratchet across restarts.");
+    }
+    return new MutationTestingAuditor(
+        () => monitor.CurrentValue,
+        sp.GetRequiredService<IMutationRunner>(),
+        ratchet);
+});
+
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 
 // --- Built-in deep auditors (release in_review phase) ------------------------
