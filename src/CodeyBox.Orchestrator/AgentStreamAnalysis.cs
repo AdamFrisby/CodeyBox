@@ -128,7 +128,7 @@ public static class AgentStreamParserSelection
 
     public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
     {
-        if (summary.IsUnsupported || string.Equals(kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
+        if (summary.IsUnsupported)
             return true;
 
         return false;

@@ -78,12 +78,66 @@ public sealed class AgentStreamParserOptions
     public int MaxStalls { get; set; } = 2_000;
 }
 
-public sealed class UnknownAgentStreamParser : IAgentStreamParser
+public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
 {
     public AgentKind Kind { get; } = new("unknown");
 
-    public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
-        Task.FromResult(AgentStreamSummary.Unsupported());
+    public Task<AgentStreamSummary> ParseAsync(System.IO.Stream jsonlFile, CancellationToken ct = default) =>
+        ParseAsync(jsonlFile, context: null, ct);
+
+    public async Task<AgentStreamSummary> ParseAsync(
+        System.IO.Stream jsonlFile,
+        AgentStreamParserContext? context,
+        CancellationToken ct = default)
+    {
+        var duration = context is not null && context.InvocationEndedAt >= context.InvocationStartedAt
+            ? context.InvocationEndedAt - context.InvocationStartedAt
+            : TimeSpan.Zero;
+
+        long lineCount = 0;
+        long byteCount = 0;
+        var lastLines = new System.Collections.Generic.List<string>();
+
+        try
+        {
+            using var reader = new System.IO.StreamReader(jsonlFile, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) != null)
+            {
+                lineCount++;
+                byteCount += Encoding.UTF8.GetByteCount(line) + 1;
+
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    lastLines.Add(line);
+                    if (lastLines.Count > 10)
+                        lastLines.RemoveAt(0);
+                }
+            }
+        }
+        catch
+        {
+            // Ignore stream errors during fallback reading
+        }
+
+        var finalLineCount = context?.LineCount ?? lineCount;
+        var finalByteCount = context?.SizeBytes ?? byteCount;
+        var tail = lastLines.Count > 0 ? string.Join("\n", lastLines) : string.Empty;
+
+        return new AgentStreamSummary(
+            TotalDuration: duration,
+            TimeToFirstToken: null,
+            InputTokens: 0,
+            OutputTokens: 0,
+            CachedInputTokens: 0,
+            EstimatedUsd: null,
+            ToolCalls: Array.Empty<ToolCallInvocation>(),
+            Stalls: Array.Empty<StallEvent>(),
+            FinalAssistantMessage: tail)
+        {
+            IsUnsupported = false
+        };
+    }
 }
 
 public sealed record AgentStreamJsonLine(string Text, long LineNumber, long StartOffset, long EndOffset);

@@ -55,11 +55,20 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
         var timestamp = TryTimestamp(root);
         var starts = new List<ToolBuilder>();
         var results = new List<ToolResultBuilder>();
-        var isAssistant = string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
+        var isAssistant = string.Equals(type, "assistant", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
 
-        // Parse content using base ParseContent
+        // Parse content using base ParseContent, checking if message property is present
         string? finalText = null;
-        ParseContent(root, starts, results, ref finalText);
+        if (TryGet(root, out var message, "message"))
+        {
+            isAssistant |= string.Equals(FirstString(message, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
+            ParseContent(message, starts, results, ref finalText);
+        }
+        else
+        {
+            ParseContent(root, starts, results, ref finalText);
+        }
 
         int? input = null;
         int? output = null;
@@ -86,9 +95,9 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
         var parsed = ParseScalars(root, type, timestamp, starts, results, isAssistant, finalText);
         return parsed with
         {
-            InputTokens = parsed.InputTokens ?? input,
-            OutputTokens = parsed.OutputTokens ?? output,
-            CachedInputTokens = parsed.CachedInputTokens ?? cached,
+            InputTokens = input ?? parsed.InputTokens,
+            OutputTokens = output ?? parsed.OutputTokens,
+            CachedInputTokens = cached ?? parsed.CachedInputTokens,
         };
     }
 
