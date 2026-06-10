@@ -123,10 +123,13 @@ public sealed class QuotaEndpointTests
         response.EnsureSuccessStatusCode();
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
 
-        var probes = doc.RootElement.GetProperty("probes").EnumerateArray()
-            .ToDictionary(p => p.GetProperty("agent").GetString()!, StringComparer.OrdinalIgnoreCase);
-        Assert.True(probes["codex"].GetProperty("wouldAllow").GetBoolean());
-        Assert.False(probes["claude"].GetProperty("wouldAllow").GetBoolean());
+        var probes = doc.RootElement.GetProperty("probes").EnumerateArray().ToList();
+        Assert.All(
+            probes.Where(p => string.Equals(p.GetProperty("agent").GetString(), "codex", StringComparison.OrdinalIgnoreCase)),
+            p => Assert.True(p.GetProperty("wouldAllow").GetBoolean()));
+        Assert.All(
+            probes.Where(p => string.Equals(p.GetProperty("agent").GetString(), "claude", StringComparison.OrdinalIgnoreCase)),
+            p => Assert.False(p.GetProperty("wouldAllow").GetBoolean()));
     }
 
     [Fact]

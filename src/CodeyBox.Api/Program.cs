@@ -2620,8 +2620,8 @@ app.MapGet("/quota", async (
             pauseExpiresAt = pause?.ExpiresAt,
             dispatchStatus = paused ? "paused" : "quota",
             dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
-            wouldAllow = !paused && WouldAllow(member, recentFailure),
-            defaultModelWouldAllow = !paused && WouldAllow(member, recentDefaultFailure),
+            wouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentFailure),
+            defaultModelWouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentDefaultFailure),
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
                 modelId =>

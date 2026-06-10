@@ -5628,7 +5628,10 @@ public sealed class PipelineRunner : IPipelineRunner
         }
 
         if (combinedPct >= 0 && gate.FloorPct is { } floor && string.IsNullOrEmpty(gate.WindowName))
-            return (false, $"quota exhausted ({combinedPct:F1}% < {floor:F1}%)");
+        {
+            var label = budgetOnly ? "local budget exhausted" : "quota exhausted";
+            return (false, $"{label} ({combinedPct:F1}% < {floor:F1}%)");
+        }
 
         return (false, gate.Reason);
     }
