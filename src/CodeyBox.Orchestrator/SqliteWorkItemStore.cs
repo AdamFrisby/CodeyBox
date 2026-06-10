@@ -1556,8 +1556,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        _conn.Dispose();
-        _writeLock.Dispose();
+        // Microsoft.Data.Sqlite can throw an internal NullReferenceException from
+        // SqliteConnection.Close() during a teardown race (observed on host
+        // graceful shutdown). Swallow it so the noise doesn't surface as an
+        // "Unhandled exception" AND so _writeLock is always disposed.
+        try
+        {
+            _conn.Dispose();
+        }
+        catch (NullReferenceException)
+        {
+        }
+        finally
+        {
+            _writeLock.Dispose();
+        }
     }
 
     private static string AuditProgressAttemptKey(DateTimeOffset? workAttemptStartedAt)
