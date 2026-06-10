@@ -552,6 +552,112 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_PurgesSuccessfulResumeAndReleasesAdmission()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with { SuspendedVmName = "vm-retained", SuspendedAt = DateTimeOffset.UtcNow });
+
+        var inner = new FakeSuspendingProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        Assert.Contains("vm-retained", inner.DisposedNames);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_RetainsAdmissionWhenPurgeFails()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with { SuspendedVmName = "vm-purge-fails", SuspendedAt = DateTimeOffset.UtcNow });
+
+        var inner = new FakeSuspendingProvider { DisposeThrows = true };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var queued = provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queued.IsCompleted);
+
+        inner.DisposeThrows = false;
+        await provider.DisposeLeakedAsync("vm-purge-fails", CancellationToken.None);
+        await using var sandbox = await queued.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Contains("vm-purge-fails", inner.DisposedNames);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_ReleasesFailedResumeAdmission()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item with { SuspendedVmName = "vm-failed-release", SuspendedAt = DateTimeOffset.UtcNow });
+
+        var inner = new FakeSuspendingProvider { ResumeThrows = true };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task StartupResume_WithAdmissionWrapper_ResumeTimeoutRetainsAdmissionUntilLeakDisposal()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        await _store.CreateAsync(item with
+        {
+            SuspendedVmName = "vm-timeout-retained",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        });
+
+        var resumeRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var inner = new FakeSuspendingProvider
+        {
+            ResumeReleaseSources = new Dictionary<string, TaskCompletionSource>(StringComparer.Ordinal)
+            {
+                ["vm-timeout-retained"] = resumeRelease,
+            },
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var svc = new SandboxResumeOnStartupService(
+            provider,
+            _store,
+            NullLogger<SandboxResumeOnStartupService>.Instance,
+            NoopStartupRecoveryInputSink.Instance,
+            resumeTimeout: TimeSpan.FromMilliseconds(50));
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var queued = provider.CreateAsync(new SandboxSpec { ImageReference = "test" }, CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(queued.IsCompleted);
+
+        resumeRelease.SetResult();
+        await provider.DisposeLeakedAsync("vm-timeout-retained", CancellationToken.None);
+        await using var sandbox = await queued.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
     public async Task StartupResume_ResumeFailure_StillClearsBookkeeping()
     {
         // If multipassd is unavailable or the VM was operator-deleted, we
@@ -875,6 +981,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
             resumeTimeout: TimeSpan.FromMilliseconds(50));
 
         await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        // The provider task runs on a separate thread and may set
+        // ResumeCancellationObserved after TryResumeSandboxAsync returns, so
+        // poll rather than assert immediately to keep the test deterministic
+        // under load.
+        await WaitUntilAsync(() => provider.ResumeCancellationObserved);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, after!.State);
@@ -2278,10 +2390,12 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         // one entry, which historically surfaced as a flaky "vm-1 not in
         // ResumedNames" assertion.
         private readonly ConcurrentQueue<string> _resumedNames = new();
+        private readonly ConcurrentQueue<string> _disposedNames = new();
         private readonly ConcurrentQueue<AdoptionCall> _adoptionCalls = new();
         private readonly ConcurrentQueue<CheckpointPushCall> _checkpointPushCalls = new();
         private readonly ManualResetEventSlim _resumeBlockRelease = new();
         public IReadOnlyList<string> ResumedNames => _resumedNames.ToArray();
+        public IReadOnlyList<string> DisposedNames => _disposedNames.ToArray();
         public IReadOnlyList<AdoptionCall> AdoptionCalls => _adoptionCalls.ToArray();
         public IReadOnlyList<CheckpointPushCall> CheckpointPushCalls => _checkpointPushCalls.ToArray();
         public bool ResumeThrows { get; set; }
@@ -2289,6 +2403,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         public SandboxProvisioningDeferredException? ResumeProvisioningDeferred { get; set; }
         public bool ResumeHangs { get; set; }
         public bool ResumeBlocksBeforeReturningTask { get; set; }
+        public bool DisposeThrows { get; set; }
         public TaskCompletionSource ResumeBlockEntered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public IReadOnlySet<string> ResumeNamesToHang { get; set; } = new HashSet<string>(StringComparer.Ordinal);
@@ -2311,10 +2426,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
 
         public string Name => "fake-suspending";
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
-            => throw new NotImplementedException();
+            => Task.FromResult<ISandbox>(new NoopSandbox());
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
             => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
-        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        {
+            if (DisposeThrows)
+                throw new InvalidOperationException("simulated dispose leaked failure");
+            _disposedNames.Enqueue(name);
+            return Task.CompletedTask;
+        }
         public void ReleaseBlockedResume() => _resumeBlockRelease.Set();
 
         public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
@@ -2386,6 +2507,16 @@ public sealed class SandboxSuspendResumeTests : IDisposable
                 return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
             return Task.FromResult(CheckpointPushReturns);
         }
+    }
+
+    private sealed class NoopSandbox : ISandbox
+    {
+        public string Id { get; } = $"sandbox-{Guid.NewGuid():N}";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed record AdoptionCall(string VmName, string AgentLogPath, TimeSpan? Deadline);

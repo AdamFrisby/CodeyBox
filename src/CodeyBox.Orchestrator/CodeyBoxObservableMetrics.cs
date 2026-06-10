@@ -23,6 +23,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private readonly IWorkerPoolOccupancy? _workerPool;
     private readonly IAgentQuotaAvailabilitySnapshot? _quotaSnapshot;
     private readonly int _maxWorkers;
+    private readonly int _maxSandboxes;
     private readonly ILogger<CodeyBoxObservableMetrics> _log;
     private readonly TimeSpan _refreshInterval;
 
@@ -32,6 +33,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private readonly ObservableGauge<long> _workersInUse;
     private readonly ObservableGauge<long> _workersMax;
     private readonly ObservableGauge<long> _sandboxActive;
+    private readonly ObservableGauge<long> _sandboxMax;
     private readonly ObservableGauge<double>? _quotaAvailable;
 
     // Refreshed off-thread; read by the work-item gauge callback.
@@ -52,6 +54,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         _workerPool = workerPool;
         _quotaSnapshot = quotaSnapshot;
         _maxWorkers = orchestratorOptions.MaxConcurrentWorkers;
+        _maxSandboxes = orchestratorOptions.MaxConcurrentSandboxes;
         _log = log;
         _refreshInterval = refreshInterval ?? TimeSpan.FromSeconds(15);
 
@@ -77,7 +80,13 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
             "codeybox.sandbox.active",
             ObserveActiveSandboxes,
             unit: "{sandbox}",
-            description: "Sandboxes/VMs the current process is actively tracking.");
+            description: "Currently admitted live or provisioning sandboxes/VMs.");
+
+        _sandboxMax = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
+            "codeybox.sandbox.max",
+            () => [new Measurement<long>(_maxSandboxes)],
+            unit: "{sandbox}",
+            description: "Configured MaxConcurrentSandboxes admission ceiling.");
 
         if (_quotaSnapshot is not null)
         {
@@ -93,12 +102,13 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
 
     private IEnumerable<Measurement<long>> ObserveActiveSandboxes()
     {
-        // Providers with a persistent VM lifecycle (multipass) expose a native
-        // snapshot of shutdown-active VMs. Ephemeral providers
-        // (process/bubblewrap) have no such snapshot, so they feed the
-        // process-wide created-but-not-disposed counter instead; that keeps the
-        // gauge meaningful on the default local paths rather than reporting 0.
-        var count = _sandboxes is IActiveSandboxProvider activeProvider
+        // VM providers wrapped by SandboxAdmissionControlledProvider report the
+        // admission gate directly. That includes queued/provisioning CreateAsync,
+        // baseline warm-up, and startup resume leases that are not part of the
+        // shutdown-owned active-sandbox snapshot.
+        var count = _sandboxes is ISandboxAdmissionSnapshot admission
+            ? admission.CurrentAdmittedSandboxes
+            : _sandboxes is IActiveSandboxProvider activeProvider
             ? activeProvider.SnapshotActiveSandboxes().Count
             : SandboxLiveCounter.Active;
         return [new Measurement<long>(count, new KeyValuePair<string, object?>("provider", _sandboxes.Name))];
@@ -171,6 +181,7 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         GC.KeepAlive(_workersInUse);
         GC.KeepAlive(_workersMax);
         GC.KeepAlive(_sandboxActive);
+        GC.KeepAlive(_sandboxMax);
         GC.KeepAlive(_quotaAvailable);
         _refreshTimer?.Dispose();
     }

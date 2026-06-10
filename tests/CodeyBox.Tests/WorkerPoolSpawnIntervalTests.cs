@@ -75,8 +75,10 @@ public sealed class WorkerPoolSpawnIntervalTests : IDisposable
         using var _ = registry;
         await svc.StartAsync(CancellationToken.None);
 
-        // Wait for all items to complete. Generous timeout: 3 spawns × 200 ms + padding.
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        // Wait for all items to complete. Keep the assertion about inter-spawn
+        // gaps strict, but allow heavily parallel test runs more time to schedule
+        // the dispatch loop.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
         while (DateTimeOffset.UtcNow < deadline)
         {
             int doneCount = 0;

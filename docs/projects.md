@@ -185,7 +185,7 @@ Languages.SelectMany(preset) + AuditTypes.SelectMany(preset) + Custom
 | `FailingSeverity` | string | `"Error"` | Findings at or above this severity block the merge. `"Warning"` or `"Info"` can be used to widen the gate. |
 | `PerIterationTimeoutMinutes` | int | `10` | Wall-clock cap on a single audit iteration's sandbox |
 | `StopOnFirstFailure` | bool | `false` | Stop running auditors as soon as one returns a blocking finding — useful when cheap linters precede expensive LLM auditors |
-| `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors running concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
+| `MaxLlmAuditorParallelism` | int | `3` | Max LLM auditors one item may try to run concurrently. Default `3` means `security:llm-review`, `completeness:llm-review`, and `cheating:llm-review` all run at the same time, subject to the process-wide `CodeyBox:WorkerPool:MaxConcurrentSandboxes` ceiling. Set to `1` to serialize them if you hit API 429 rate-limit errors. Tool auditors are unaffected and always run sequentially. |
 
 The built-in `uat` profile is intended for UAT/test-generation work. It keeps
 C# format/build/test checks, gitleaks, semgrep, security LLM review, and the

@@ -1,6 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using CodeyBox.Core;
-using CodeyBox.Sandbox.Process;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -56,8 +56,10 @@ public sealed class ProcessSandboxStartupGuardTests
             });
 
         var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
 
-        Assert.IsType<ProcessSandboxProvider>(provider);
+        Assert.Equal("process", provider.Name);
+        Assert.True(admission.MaxConcurrentSandboxes >= 1);
     }
 
     private static IDisposable ConfigureRequiredProductionChangelogSecret()

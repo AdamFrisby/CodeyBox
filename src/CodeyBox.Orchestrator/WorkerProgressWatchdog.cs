@@ -147,6 +147,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 var item = await _store.GetAsync(itemId, ct);
                 if (item is null) continue;
                 if (!IsWatchedState(item.State)) continue;
+                if (!string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
                 if (_recoveredWorkers.ContainsKey(worker.WorkerId)) continue;
 
                 var activityKey = new WorkerActivityKey(worker.WorkerId, itemId);

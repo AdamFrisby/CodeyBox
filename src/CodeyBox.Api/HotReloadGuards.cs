@@ -69,6 +69,7 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             Check("CodeyBox:StateDatabasePath", _snapshot.StateDatabasePath, NormalizePath(options.StateDatabasePath), failures);
             Check("CodeyBox:GitRootDirectory", _snapshot.GitRootDirectory, NormalizePath(options.GitRootDirectory), failures);
             Check("CodeyBox:AgentStreams:Path", _snapshot.AgentStreamsPath, NormalizePath(options.AgentStreams.Path), failures);
+            Check("CodeyBox:WorkerPool:MaxConcurrentSandboxes", _snapshot.MaxConcurrentSandboxes, options.WorkerPool.MaxConcurrentSandboxes, failures);
 
             return failures.Count == 0
                 ? ValidateOptionsResult.Success
@@ -80,7 +81,8 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         NormalizeString(options.SandboxProvider),
         NormalizePath(options.StateDatabasePath),
         NormalizePath(options.GitRootDirectory),
-        NormalizePath(options.AgentStreams.Path));
+        NormalizePath(options.AgentStreams.Path),
+        options.WorkerPool.MaxConcurrentSandboxes);
 
     private static void Check(string field, string startup, string candidate, List<string> failures)
     {
@@ -89,6 +91,16 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
                 $"{field} cannot be changed at runtime (startup='{startup}', requested='{candidate}'). " +
                 "Restart CodeyBox to apply this change.");
     }
+
+    private static void Check(string field, int? startup, int? candidate, List<string> failures)
+    {
+        if (startup != candidate)
+            failures.Add(
+                $"{field} cannot be changed at runtime (startup='{Format(startup)}', requested='{Format(candidate)}'). " +
+                "Restart CodeyBox to apply this change.");
+    }
+
+    private static string Format(int? value) => value?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "<unset>";
 
     private static string NormalizeString(string? value) => value?.Trim() ?? string.Empty;
 
@@ -103,7 +115,8 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         string SandboxProvider,
         string StateDatabasePath,
         string GitRootDirectory,
-        string AgentStreamsPath);
+        string AgentStreamsPath,
+        int? MaxConcurrentSandboxes);
 }
 
 /// <summary>

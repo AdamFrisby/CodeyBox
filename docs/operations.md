@@ -113,9 +113,12 @@ The pipeline phases are written to be safe to re-run:
 
 ## Capacity
 
-`Concurrency` controls the number of worker threads. Each worker holds
-one sandbox at a time. With Multipass on KVM, plan for ~1 GB host RAM
-per running sandbox plus the agent's memory needs.
+`MaxConcurrentWorkers` controls how many work items can be in the pipeline at
+once. A single item can still create additional audit, merge, smoke, and
+verification sandboxes, so host sizing should use
+`CodeyBox:WorkerPool:MaxConcurrentSandboxes` as the VM ceiling. With Multipass
+on KVM, plan for ~1 GB host RAM per admitted sandbox plus the agent's memory
+needs.
 
 ## Failure modes you'll actually see
 

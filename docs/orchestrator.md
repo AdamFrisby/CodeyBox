@@ -6,11 +6,12 @@ executions bounded by configurable limits.
 
 ## Worker pool sizing
 
-Two independent knobs control the pool:
+Three independent knobs control worker admission and sandbox pressure:
 
 | Config key | Type | Default | Purpose |
 |---|---|---|---|
 | `CodeyBox:WorkerPool:MaxConcurrentWorkers` | `int` | `1` | Hard cap on simultaneous in-flight work items |
+| `CodeyBox:WorkerPool:MaxConcurrentSandboxes` | `int` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on live sandboxes/VMs across every phase |
 | `CodeyBox:WorkerPool:MinSpawnInterval` | `string` (TimeSpan) | `"00:00:00"` (none) | Minimum wall-clock gap between consecutive spawns |
 
 ### MaxConcurrentWorkers
@@ -20,9 +21,53 @@ The orchestrator uses a `SemaphoreSlim` of this size: once the cap is reached
 the dispatch loop blocks on the semaphore until a slot is released by a
 finishing worker.
 
-Set this to match the host's available compute. Each in-flight item may hold
-one running VM (Multipass) or one sandboxed process (Bubblewrap), so RAM and
-CPU are the binding constraints.
+Set this to match how many independent pipeline items should make progress at
+once. It is not a VM ceiling: one item can create additional sandboxes during
+audit, merge/rebase, required-build verification, smoke checks, or security
+review.
+
+### MaxConcurrentSandboxes
+
+Controls the total number of live sandboxes admitted by the process. The API
+wraps the selected `ISandboxProvider` with a single admission gate, so every
+`CreateAsync` call path shares this budget. A token is acquired before provider
+provisioning starts and released on the first disposal of the returned sandbox
+handle. Multipass therefore never has more than this many concurrently-live VMs
+from this orchestrator process, even when several worker items enter audit or
+merge at the same time.
+
+When unset, the default is `ceil(MaxConcurrentWorkers * 1.5)`: enough headroom
+for routine audit/merge overlap without making `MaxConcurrentWorkers` and
+per-item audit fan-out multiply into the host VM count. Set it explicitly on
+hosts with a known VM capacity. This is a startup-captured value because the
+live admission queue is not resized in place; restart CodeyBox to apply changes.
+
+`MaxLlmAuditorParallelism` remains a per-project audit policy. It bounds how
+many LLM auditors one item may try to run concurrently, but those auditor
+sandbox creates still queue behind `MaxConcurrentSandboxes`. The effective VM
+ceiling is:
+
+```
+live sandboxes <= CodeyBox:WorkerPool:MaxConcurrentSandboxes
+```
+
+not:
+
+```
+MaxConcurrentWorkers * MaxLlmAuditorParallelism
+```
+
+#### Deadlock Safety
+
+Worker, audit, merge, smoke, and verification phases use `await using` sandbox
+handles, so a phase releases its token when that sandbox is disposed before the
+next phase fans out. Auditor creation is cancellable and queued FIFO at the
+provider boundary. If `MaxConcurrentSandboxes` is smaller than
+`MaxConcurrentWorkers * MaxLlmAuditorParallelism`, excess auditors wait without
+holding tokens; as active auditors finish and dispose their sandboxes, the gate
+admits the next queued create. No worker keeps its work-phase sandbox token
+while waiting for audit tokens, so the queue can drain rather than forming a
+permanent cycle.
 
 ### MinSpawnInterval
 
@@ -57,20 +102,33 @@ waits at least 30 s *after the previous spawn* (not after it finishes).
 
 **Single solo developer**
 ```json
-"WorkerPool": { "MaxConcurrentWorkers": 1, "MinSpawnInterval": "00:00:00" }
+"WorkerPool": {
+  "MaxConcurrentWorkers": 1,
+  "MaxConcurrentSandboxes": 2,
+  "MinSpawnInterval": "00:00:00"
+}
 ```
 One item at a time, no pacing. Simplest setup for a single-user instance.
 
 **Small team, isolated projects**
 ```json
-"WorkerPool": { "MaxConcurrentWorkers": 4, "MinSpawnInterval": "00:00:00" }
+"WorkerPool": {
+  "MaxConcurrentWorkers": 4,
+  "MaxConcurrentSandboxes": 6,
+  "MinSpawnInterval": "00:00:00"
+}
 ```
-Up to four items run concurrently. Suitable when each project uses its own
-API key and there is no shared quota.
+Up to four items run concurrently, with six total sandboxes/VMs admitted across
+work, audit, and merge. Suitable when each project uses its own API key and
+there is no shared quota.
 
 **Shared Claude Pro / Codex Plus quota**
 ```json
-"WorkerPool": { "MaxConcurrentWorkers": 4, "MinSpawnInterval": "00:00:30" }
+"WorkerPool": {
+  "MaxConcurrentWorkers": 4,
+  "MaxConcurrentSandboxes": 6,
+  "MinSpawnInterval": "00:00:30"
+}
 ```
 Up to four workers, but each new spawn is at least 30 s after the last.
 This gives each agent a head-start before the next one calls the API,

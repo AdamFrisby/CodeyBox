@@ -391,12 +391,24 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 _activeSandboxOwners[name] = new ActiveSandboxOwnerEntry(owner, sandbox);
             return sandbox;
         }
-        catch
+        catch (Exception ex)
         {
             // Best-effort cleanup if launch / mount / transfer half-succeeded.
-            try { await TryDeleteVmAsync(opts, name); }
+            var deleted = false;
+            try { deleted = await TryDeleteVmAsync(opts, name); }
             finally { MarkNoLongerActive(name); }
             try { Directory.Delete(sandboxRoot, recursive: true); } catch { }
+            if (!deleted && await SandboxMayStillExistAfterFailedDeleteAsync(opts, name))
+            {
+                throw new SandboxProvisioningDeferredException(
+                    Name,
+                    "create-cleanup",
+                    "multipass-delete-purge-failed",
+                    $"create failed and best-effort delete --purge did not prove sandbox {name} was removed: {ex.Message}",
+                    _daemonRetryPolicy.ExhaustedRequeueDelay,
+                    retainedSandboxName: name,
+                    innerException: ex);
+            }
             throw;
         }
     }
@@ -1522,12 +1534,44 @@ git push origin HEAD:{refName}";
 
             _log.LogInformation("Baseline {Name} baked and stopped, ready to clone", baselineName);
         }
-        catch
+        catch (Exception bakeEx)
         {
-            // If bake half-succeeded, leave a partial baseline that the operator
-            // can `multipass delete --purge` and we'll re-bake. Don't auto-purge
-            // — losing partial install progress on transient errors is wasteful.
-            _log.LogError("Baseline bake for {Name} failed; you may need to `multipass delete --purge {PurgeTarget}` and retry", baselineName, baselineName);
+            // A failed bake may have already launched a VM. Purge it before the
+            // admission decorator releases its baseline-provisioning token; a
+            // half-created running baseline must not escape the global VM cap.
+            var deleted = await TryDeleteVmAsync(opts, baselineName);
+            if (deleted)
+            {
+                _log.LogWarning(
+                    "Baseline bake for {Name} failed; purged partial baseline VM before retry",
+                    baselineName);
+                throw;
+            }
+
+            // delete --purge failed: surface the retained baseline name so the
+            // admission decorator keeps the token reserved until
+            // ListBaselineImagesAsync / DisposeBaselineImageAsync proves the
+            // partial baseline VM is actually gone. Without this, a stuck
+            // baseline VM would escape MaxConcurrentSandboxes.
+            if (await SandboxMayStillExistAfterFailedDeleteAsync(opts, baselineName))
+            {
+                _log.LogError(
+                    "Baseline bake for {Name} failed and automatic purge did not complete; retaining sandbox admission until baseline is proven gone (operator may need to `multipass delete --purge {PurgeTarget}`)",
+                    baselineName,
+                    baselineName);
+                throw new SandboxProvisioningDeferredException(
+                    Name,
+                    "baseline-bake-cleanup",
+                    "multipass-delete-purge-failed",
+                    $"baseline bake failed and best-effort delete --purge did not prove baseline {baselineName} was removed: {bakeEx.Message}",
+                    _daemonRetryPolicy.ExhaustedRequeueDelay,
+                    retainedSandboxName: baselineName,
+                    innerException: bakeEx);
+            }
+
+            _log.LogWarning(
+                "Baseline bake for {Name} failed; delete --purge reported failure but inventory confirms the baseline is absent",
+                baselineName);
             throw;
         }
     }
@@ -3013,13 +3057,73 @@ test "$work" = present && test "$exec_wrapper" = present
         && (result.Stderr.Contains(sandboxPath, StringComparison.Ordinal)
             || result.Stderr.Contains("is already mounted", StringComparison.OrdinalIgnoreCase));
 
-    private async Task TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
+    private async Task<bool> TryDeleteVmAsync(MultipassSandboxOptions opts, string name)
     {
         try
         {
-            await RunAsync(opts, [opts.MultipassBinary, "delete", "--purge", name], stdin: null, ct: CancellationToken.None);
+            var result = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "delete", "--purge", name],
+                stdin: null,
+                ct: CancellationToken.None);
+            if (result.ExitCode == 0)
+                return true;
+
+            _log.LogWarning(
+                "Best-effort multipass delete --purge {Name} failed (exit {ExitCode}): {Stderr}",
+                name,
+                result.ExitCode,
+                result.Stderr);
+            return false;
         }
-        catch { /* best-effort */ }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Best-effort multipass delete --purge {Name} threw", name);
+            return false;
+        }
+    }
+
+    private async Task<bool> SandboxMayStillExistAfterFailedDeleteAsync(
+        MultipassSandboxOptions opts,
+        string name)
+    {
+        try
+        {
+            var info = await RunAsync(
+                opts,
+                [opts.MultipassBinary, "info", name, "--format=json"],
+                stdin: null,
+                ct: CancellationToken.None);
+            if (info.ExitCode == 0)
+                return true;
+            if (IsInstanceNotFound(info.Stderr))
+                return false;
+
+            _log.LogWarning(
+                "Could not prove failed-create sandbox {Name} was absent after delete --purge failed (info exit {ExitCode}): {Stderr}",
+                name,
+                info.ExitCode,
+                info.Stderr);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not prove failed-create sandbox {Name} was absent after delete --purge failed",
+                name);
+            return true;
+        }
+    }
+
+    private static bool IsInstanceNotFound(string? stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr))
+            return false;
+
+        return stderr.Contains("argument not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("instance not found", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
     }
 }
 
@@ -3508,9 +3612,9 @@ public sealed record MultipassSandboxOptions
     /// bumping speeds up build / scan / install cold-starts when the
     /// underlying tools parallelise. Keep <see cref="BaselineMemoryGB"/>
     /// at roughly 2-3× this value or builds OOM under MSBuild's per-core
-    /// worker fan-out. Total host budget is
-    /// <c>WorkerPool:MaxConcurrentWorkers × BaselineCpus</c> vCPUs and
-    /// <c>... × BaselineMemoryGB</c> GiB at saturation.
+    /// worker fan-out. Total host VM budget is
+    /// <c>WorkerPool:MaxConcurrentSandboxes × BaselineCpus</c> vCPUs and
+    /// <c>... × BaselineMemoryGB</c> GiB at sandbox saturation.
     /// </summary>
     public int BaselineCpus { get; init; } = 6;
 

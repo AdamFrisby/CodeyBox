@@ -2493,6 +2493,76 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(3, startCalls);
     }
 
+    [Fact]
+    public async Task CreateAsync_LaunchFailureWithFailedDeletePurgeAndStillPresent_DefersWithRetainedSandboxName()
+    {
+        // Exercises MultipassSandboxProvider.CreateAsync's failed-create
+        // cleanup branch: launch raises an exception, the best-effort
+        // delete --purge returns non-zero, and the subsequent info probe
+        // still finds the VM. The provider must surface a
+        // SandboxProvisioningDeferredException whose RetainedSandboxName
+        // matches the launched VM so the admission decorator can retain the
+        // sandbox token until inventory proves the VM is gone.
+        var sandboxNames = new ConcurrentQueue<string>();
+        var deleteAttempts = new ConcurrentQueue<string>();
+        var infoJsonQueries = new ConcurrentQueue<string>();
+
+        var runner = new RecordingMultipassRunner((argv, _, ct) =>
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (argv is [_, "version"])
+                return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                sandboxNames.Enqueue(argv[3]);
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    "",
+                    "launch failed: invalid memory"));
+            }
+
+            if (argv is [_, "info", _, "--format=csv"])
+                return Task.FromResult(new ProcessRunResult(1, "", "not found"));
+
+            if (argv is [_, "info", var jsonName, "--format=json"])
+            {
+                infoJsonQueries.Enqueue(jsonName);
+                // VM may still exist on multipassd's side even though our
+                // launch raised — emulate by returning success.
+                return Task.FromResult(new ProcessRunResult(0, "{\"info\":{}}", ""));
+            }
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deleteAttempts.Enqueue(deleteName);
+                return Task.FromResult(new ProcessRunResult(1, "", "delete --purge failed: instance is busy"));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-failed-create-still-present"),
+            runner: runner,
+            daemonRetryPolicy: InstantDaemonRetryPolicy());
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "ignored",
+                TimingWorkItemId = WorkItemId.New(),
+            }));
+
+        var sandboxName = Assert.Single(sandboxNames);
+        Assert.Equal("multipass", ex.Provider);
+        Assert.Equal("create-cleanup", ex.Operation);
+        Assert.Equal("multipass-delete-purge-failed", ex.ErrorClass);
+        Assert.Equal(sandboxName, ex.RetainedSandboxName);
+        Assert.Contains(sandboxName, deleteAttempts);
+        Assert.Contains(sandboxName, infoJsonQueries);
+    }
+
     [Theory]
     [InlineData("stop-before-mount", "stop")]
     [InlineData("cloud-init-exec", "exec")]

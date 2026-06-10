@@ -30,6 +30,14 @@ public sealed class WorkerPoolOptionsValidationTests
     }
 
     [Fact]
+    public void DeriveDefaultMaxConcurrentSandboxes_InvalidWorkerCount_Throws()
+    {
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OrchestratorOptionsFactory.DeriveDefaultMaxConcurrentSandboxes(0));
+        Assert.Equal("maxConcurrentWorkers", ex.ParamName);
+    }
+
+    [Fact]
     public void MinSpawnInterval_Negative_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
@@ -39,6 +47,54 @@ public sealed class WorkerPoolOptionsValidationTests
                 MinSpawnInterval = TimeSpan.FromSeconds(-1),
             }));
         Assert.Contains("MinSpawnInterval", ex.Message);
+    }
+
+    [Fact]
+    public void MaxConcurrentSandboxes_Zero_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = 0,
+            }));
+        Assert.Contains("MaxConcurrentSandboxes", ex.Message);
+    }
+
+    [Fact]
+    public void MaxConcurrentSandboxes_Negative_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = -1,
+            }));
+        Assert.Contains("MaxConcurrentSandboxes", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(1, 2)]
+    [InlineData(2, 3)]
+    [InlineData(3, 5)]
+    [InlineData(4, 6)]
+    public void MaxConcurrentSandboxes_DefaultsToCeilingOfWorkerHeadroom(int workers, int expectedSandboxes)
+    {
+        var opts = Build(new WorkerPoolOptions { MaxConcurrentWorkers = workers });
+
+        Assert.Equal(expectedSandboxes, opts.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
+    public void MaxConcurrentSandboxes_ExplicitValueWins()
+    {
+        var opts = Build(new WorkerPoolOptions
+        {
+            MaxConcurrentWorkers = 4,
+            MaxConcurrentSandboxes = 3,
+        });
+
+        Assert.Equal(3, opts.MaxConcurrentSandboxes);
     }
 
     [Fact]

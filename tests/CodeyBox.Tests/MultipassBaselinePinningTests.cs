@@ -167,6 +167,123 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureBaselineImageAsync_BakeFailure_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineInstall: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(extraRuncmd: ["touch /opt/codeybox-fail"]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.StartsWith("cb-baseline-", baselineName, StringComparison.Ordinal);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_BakeFailureAndPurgeFailure_RetainsAdmissionViaDeferredException()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineInstall: true,
+            failDeletePurge: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(extraRuncmd: ["touch /opt/codeybox-fail-purge"]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        // info before delete fails (queries the existing partial baseline);
+        // info after delete must report the VM is still present to trigger
+        // the deferred-exception retention path.
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.StartsWith("cb-baseline-", baselineName, StringComparison.Ordinal);
+        Assert.Equal(baselineName, ex.RetainedSandboxName);
+        Assert.Equal("baseline-bake-cleanup", ex.Operation);
+        Assert.Contains(baselineName, deleteNames);
+        // States still has the baseline because purge failed.
+        Assert.True(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_BakeFailureAndPurgeFailureButAbsentInventory_RethrowsOriginal()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        // The runner reports "not found" via info exit 1+stderr after delete is
+        // called (states drop happens before failDeletePurge returns), so the
+        // post-delete info check (--format=json) treats the baseline as gone
+        // and we rethrow the original install failure rather than the deferred
+        // exception.
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineInstall: true,
+            failDeletePurge: true,
+            dropStateOnDeleteAttempt: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(extraRuncmd: ["touch /opt/codeybox-fail-purge-absent"]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+    }
+
+    [Fact]
     public async Task CreateAsync_WithPinnedBaselineForDifferentProfile_FailsClosedBeforeClone()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -258,7 +375,11 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         ConcurrentDictionary<string, string> states,
         ConcurrentQueue<string> infoQueries,
         ConcurrentQueue<string> launchNames,
-        ConcurrentQueue<string> cloneSources)
+        ConcurrentQueue<string> cloneSources,
+        ConcurrentQueue<string>? deleteNames = null,
+        bool failBaselineInstall = false,
+        bool failDeletePurge = false,
+        bool dropStateOnDeleteAttempt = false)
     {
         return new RecordingMultipassRunner((argv, _, _) =>
         {
@@ -268,6 +389,13 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(states.TryGetValue(name, out var s)
                     ? new ProcessRunResult(0, s, "")
                     : new ProcessRunResult(1, "", "not found"));
+            }
+            if (argv is [_, "info", var jsonName, "--format=json"])
+            {
+                infoQueries.Enqueue(jsonName);
+                return Task.FromResult(states.ContainsKey(jsonName)
+                    ? new ProcessRunResult(0, "{}", "")
+                    : new ProcessRunResult(1, "", "instance \"" + jsonName + "\" does not exist"));
             }
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
@@ -280,7 +408,11 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(states.ContainsKey(execName) ? 0 : 1, "", ""));
             if (argv is [_, "exec", var installName, "--", "sudo", "bash", "-c", ..]
                 && installName.StartsWith("cb-baseline-", StringComparison.Ordinal))
-                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            {
+                return Task.FromResult(failBaselineInstall
+                    ? new ProcessRunResult(42, "", "install failed")
+                    : new ProcessRunResult(0, "", ""));
+            }
             if (argv is [_, "stop", var stopName])
             {
                 states[stopName] = "Stopped";
@@ -304,6 +436,11 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             if (argv is [_, "delete", "--purge", var deleteName])
             {
+                deleteNames?.Enqueue(deleteName);
+                if (dropStateOnDeleteAttempt)
+                    states.TryRemove(deleteName, out _);
+                if (failDeletePurge)
+                    return Task.FromResult(new ProcessRunResult(1, "", "delete --purge failed"));
                 states.TryRemove(deleteName, out _);
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }

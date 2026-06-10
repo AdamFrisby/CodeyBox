@@ -15,6 +15,15 @@ public sealed class WorkerPoolOptions
     public int? MaxConcurrentWorkers { get; set; }
 
     /// <summary>
+    /// Maximum number of live sandbox instances this process may hold at once.
+    /// When unset, defaults to <c>ceil(MaxConcurrentWorkers * 1.5)</c> so the
+    /// worker pool has a small audit/merge headroom without letting per-item
+    /// fan-out multiply into an unbounded VM count. Captured at startup; restart
+    /// CodeyBox to resize the live admission gate.
+    /// </summary>
+    public int? MaxConcurrentSandboxes { get; set; }
+
+    /// <summary>
     /// Minimum wall-clock interval between two consecutive worker spawns.
     /// Spreads out quota usage and sandbox-launch load. Default 0 (no pacing).
     /// </summary>

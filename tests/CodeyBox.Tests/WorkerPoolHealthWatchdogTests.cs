@@ -120,6 +120,7 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
         {
             await _queue.EnqueueAsync(item.Id);
             await orchestrator.StartAsync(CancellationToken.None);
+            await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
 
             Assert.True(
                 await WaitUntilAsync(() => orchestrator.IsActiveForTest(item.Id), DispatchWaitTimeout),
@@ -142,6 +143,9 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             await watchdog.RunOnceAsync(CancellationToken.None);
 
             Assert.DoesNotContain(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+
+            blocking.Release.TrySetResult();
+            await blocking.Exited.Task.WaitAsync(DispatchWaitTimeout);
         }
         finally
         {
@@ -707,11 +711,20 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Exited { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
             Started.TrySetResult();
-            await Release.Task.WaitAsync(ct);
+            try
+            {
+                await Release.Task.WaitAsync(ct);
+            }
+            finally
+            {
+                Exited.TrySetResult();
+            }
         }
     }
 

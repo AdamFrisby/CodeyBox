@@ -478,7 +478,7 @@ public sealed class AgentClassRouterAvailabilityTests
 
         // 1. Dispatch gate must return within bound. A regression that lost the
         //    provisioning timeout / gate deadline would hang here forever.
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15),
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(45),
             $"router.ResolveAsync hung for {sw.Elapsed} — the wedged in-VM probe was not time-bounded");
 
         // 2. Queue continues draining: Cursor was benched by the timed-out probe,

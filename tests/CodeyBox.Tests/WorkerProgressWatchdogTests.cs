@@ -190,6 +190,32 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(1, _queue.Count);
     }
 
+    [Fact]
+    public async Task Watchdog_SuspendedItem_SkipsRecovery()
+    {
+        var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(90))
+            with
+        {
+            SuspendedVmName = "vm-watchdog-startup-owned",
+            SuspendedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await PlantHeartbeatingWorkerAsync(workerId, item.Id);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Working, after.State);
+        Assert.Equal("vm-watchdog-startup-owned", after.SuspendedVmName);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Equal(0, _queue.Count);
+        var worker = Assert.Single(await _registry.ListAsync());
+        Assert.Equal(workerId, worker.WorkerId);
+    }
+
     // ── Progress within window keeps slot ────────────────────────────────────
 
     [Fact]

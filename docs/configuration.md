@@ -167,6 +167,7 @@ Controls worker concurrency and spawn pacing.
 ```json
 "WorkerPool": {
   "MaxConcurrentWorkers": 2,
+  "MaxConcurrentSandboxes": 3,
   "MinSpawnIntervalMs": 0
 }
 ```
@@ -174,7 +175,16 @@ Controls worker concurrency and spawn pacing.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `MaxConcurrentWorkers` | `1` | Hard cap on simultaneously active pipelines. |
+| `MaxConcurrentSandboxes` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
+
+`MaxConcurrentWorkers` limits concurrent work items. It does not include
+additional sandboxes created inside an item for audit, merge/rebase, security
+review, smoke, or required-build verification. `MaxConcurrentSandboxes` is the
+host-capacity ceiling underneath those per-phase policies, so a burst of LLM
+auditors from several items queues at sandbox creation instead of multiplying
+into unbounded VMs. The value is captured at startup; restart CodeyBox to resize
+the live admission gate.
 
 ---
 

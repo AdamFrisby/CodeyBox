@@ -4,7 +4,6 @@ using System.Net.Http.Json;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
-using CodeyBox.Sandbox.Process;
 using CodeyBox.Tests;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -28,11 +27,13 @@ public sealed class ApiConfigurationStartupValidationUatTests
             workerPool: new WorkerPoolOptions
             {
                 MaxConcurrentWorkers = 8,
+                MaxConcurrentSandboxes = 10,
                 MinSpawnInterval = TimeSpan.FromMilliseconds(250),
             },
             log: logger);
 
         Assert.Equal(8, options.MaxConcurrentWorkers);
+        Assert.Equal(10, options.MaxConcurrentSandboxes);
         Assert.Equal(TimeSpan.FromMilliseconds(250), options.MinSpawnInterval);
         var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
         Assert.Contains("CodeyBox:Concurrency", warning.Message);
@@ -159,8 +160,31 @@ public sealed class SandboxStartupConfigurationUatTests
             projects: new InMemoryProjectRepository());
 
         var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
 
-        Assert.IsType<ProcessSandboxProvider>(provider);
+        Assert.Equal("process", provider.Name);
+        Assert.True(admission.MaxConcurrentSandboxes >= 1);
+    }
+
+    [Fact]
+    public void MultipassSandboxResolvesAdmissionControlledProvider()
+    {
+        using var factory = new ProjectsAndConfigurationApiFactory(
+            configuration: new Dictionary<string, string?>
+            {
+                ["CodeyBox:SandboxProvider"] = "multipass",
+                ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "3",
+            },
+            projects: new InMemoryProjectRepository());
+
+        var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        Assert.Equal("multipass", provider.Name);
+        Assert.Equal(3, admission.MaxConcurrentSandboxes);
+        Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
     }
 
     private static IDisposable ConfigureRequiredProductionApiSecrets()

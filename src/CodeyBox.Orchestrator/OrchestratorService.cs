@@ -798,7 +798,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (IsQueuePaused)
                 {
                     TryReleaseConcurrencyGate();
-                    await RequeueDispatchWakeAsync(stoppingToken);
+                    await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
 
@@ -900,7 +900,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 {
                     _activeItems.TryRemove(id.Value, out _);
                     TryReleaseConcurrencyGate();
-                    await _queue.EnqueueDispatchWakeAsync(stoppingToken);
+                    await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
 
@@ -928,6 +928,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
                     try
                     {
+                        if (IsQueuePaused)
+                        {
+                            _log.LogInformation(
+                                "Worker {WorkerId} skipping {Id}: queue paused after spawn reservation but before pipeline start",
+                                workerIndex,
+                                capturedId);
+                            return;
+                        }
                         await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
                     }
                     finally
@@ -2242,6 +2250,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 public sealed record OrchestratorOptions
 {
     public int MaxConcurrentWorkers { get; init; } = 1;
+    public int MaxConcurrentSandboxes { get; init; } = 2;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
     public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(60);
 
