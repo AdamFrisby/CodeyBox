@@ -463,6 +463,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
+            StderrChunkCallback = stdoutChunkCallback,
         };
 
         SandboxExecResult result;

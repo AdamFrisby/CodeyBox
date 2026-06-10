@@ -33,7 +33,7 @@ namespace CodeyBox.Agents.Cursor;
 /// script and an <c>agent status</c> check, so auth-path drift between this runner
 /// and the CLI is caught at smoke time rather than on first dispatch.</para>
 /// </summary>
-public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private readonly AgentDefaultsSnapshot? _defaults;
 
@@ -104,6 +104,21 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPr
     /// provided. Sourced live from <see cref="AgentDefaultsSnapshot"/>.
     /// </summary>
     public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
+
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        var help = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = [Binary, "--help"],
+        }, ct).ConfigureAwait(false);
+
+        if (!help.Success)
+            return false;
+
+        var output = string.Concat(help.Stdout, "\n", help.Stderr);
+        return output.Contains("--output-format", StringComparison.Ordinal)
+            && output.Contains("stream-json", StringComparison.Ordinal);
+    }
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 

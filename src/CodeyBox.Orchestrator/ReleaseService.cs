@@ -584,7 +584,7 @@ public sealed class ReleaseService
                 var canCaptureStructuredStream = runner is not null
                     && auditor.Kind == "llm"
                     && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
-                var streamCapture = canCaptureStructuredStream
+                var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(new WorkItemId(release.Id.Value), auditPhase, iteration, ct)
                     : null;
                 var ctx = new DeepAuditContext(
@@ -600,7 +600,7 @@ public sealed class ReleaseService
                             iteration,
                             project),
                     StdoutChunkCallback: BuildStdoutCallback(streamCapture),
-                    CaptureStructuredStream: streamCapture is not null,
+                    CaptureStructuredStream: canCaptureStructuredStream,
                     Languages: project.Audit.LanguagesConfigured ? project.Audit.Languages : null);
 
                 try
@@ -645,8 +645,8 @@ public sealed class ReleaseService
 
         if (runner is not IStructuredStreamAgentRunner structuredRunner)
         {
-            _log.LogWarning(
-                "Agent {AgentKind} does not support structured stream capture; skipping stream file for phase {Phase}",
+            _log.LogInformation(
+                "Agent {AgentKind} does not support structured stream capture; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
             return false;
@@ -657,16 +657,16 @@ public sealed class ReleaseService
             if (await structuredRunner.SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false))
                 return true;
 
-            _log.LogWarning(
-                "Agent {AgentKind} structured stream flag is unavailable; skipping stream file for phase {Phase}",
+            _log.LogInformation(
+                "Agent {AgentKind} structured stream flag is unavailable; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            _log.LogWarning(
+            _log.LogInformation(
                 ex,
-                "Failed to verify structured stream support for agent {AgentKind}; skipping stream file for phase {Phase}",
+                "Failed to verify structured stream support for agent {AgentKind}; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
         }

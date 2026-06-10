@@ -2635,7 +2635,7 @@ public sealed class PipelineRunner : IPipelineRunner
             log: _log,
             activitySource: CodeyBoxActivities.Pipeline);
         var canCaptureStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, agentPhase, ct);
-        var streamCapture = canCaptureStructuredStream
+        var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
             ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
             : null;
         var stdoutCallback = BuildStdoutCallback(item.Id, agentPhase, streamCapture);
@@ -2654,7 +2654,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // Force-enable the id-bearing output mode only when the runner's public
         // resume contract says its session-id extractor needs structured output.
         var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
-        var captureStructuredStream = streamCapture is not null || needsStreamForResume;
+        var captureStructuredStream = canCaptureStructuredStream || needsStreamForResume;
 
         AgentResult agentResult;
         using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -3889,8 +3889,8 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (runner is not IStructuredStreamAgentRunner structuredRunner)
         {
-            _log.LogWarning(
-                "Agent {AgentKind} does not support structured stream capture; skipping stream file for phase {Phase}",
+            _log.LogInformation(
+                "Agent {AgentKind} does not support structured stream capture; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
             return false;
@@ -3901,16 +3901,16 @@ public sealed class PipelineRunner : IPipelineRunner
             if (await structuredRunner.SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false))
                 return true;
 
-            _log.LogWarning(
-                "Agent {AgentKind} structured stream flag is unavailable; skipping stream file for phase {Phase}",
+            _log.LogInformation(
+                "Agent {AgentKind} structured stream flag is unavailable; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            _log.LogWarning(
+            _log.LogInformation(
                 ex,
-                "Failed to verify structured stream support for agent {AgentKind}; skipping stream file for phase {Phase}",
+                "Failed to verify structured stream support for agent {AgentKind}; using plaintext fallback for phase {Phase}",
                 runner.Kind.Value,
                 phase);
         }
@@ -4942,12 +4942,10 @@ public sealed class PipelineRunner : IPipelineRunner
         var auditPhase = $"audit-llm-{auditor.Name}";
         var canCaptureStructuredStream = auditor.Kind == "llm"
             && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
-        var streamCapture = canCaptureStructuredStream
+        var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
             ? await BeginAgentStreamCaptureAsync(ctx.WorkItemId, auditPhase, ctx.Iteration, ct)
             : null;
-        var stdoutCallback = auditor.Kind == "llm"
-            ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
-            : null;
+        var stdoutCallback = BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture);
         // Force id-bearing structured output for resumable LLM auditors only
         // when the runner's session-resume contract requires it (see work-phase
         // comment).
@@ -4972,7 +4970,7 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditRunner = promptRunner,
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
-            CaptureStructuredStream = streamCapture is not null || auditNeedsStreamForResume,
+            CaptureStructuredStream = canCaptureStructuredStream || auditNeedsStreamForResume,
             ModelId = crossKind ? null : ctx.ModelId,
             ReasoningMode = ctx.ReasoningMode,
         };
@@ -6963,10 +6961,10 @@ public sealed class PipelineRunner : IPipelineRunner
                     log: _log,
                     activitySource: CodeyBoxActivities.Pipeline);
                 var canCaptureMergeStructuredStream = await CanCaptureStructuredStreamAsync(runner, sandbox, "merge", ct);
-                var mergeStreamCapture = canCaptureMergeStructuredStream
+                var mergeStreamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(item.Id, "merge", 1, ct)
                     : null;
-                mergeStructuredStreamCaptured = mergeStreamCapture is not null;
+                mergeStructuredStreamCaptured = canCaptureMergeStructuredStream;
                 var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
                 // Decouple from AgentStreams when the runner's session-id
                 // extractor needs structured output (see work-phase comment).
@@ -6978,7 +6976,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                             stdoutChunkCallback: mergeStdoutCallback,
-                            captureStructuredStream: mergeStreamCapture is not null || mergeNeedsStreamForResume);
+                            captureStructuredStream: canCaptureMergeStructuredStream || mergeNeedsStreamForResume);
                         var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
                         {
