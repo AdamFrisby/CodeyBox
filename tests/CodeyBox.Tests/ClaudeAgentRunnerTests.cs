@@ -313,22 +313,18 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal(1, pusher.DisposedCount);
     }
 
-    // ── No text-only path: account-safety contract ────────────────────────────
+    // ── Text-only path: restricted to ANTHROPIC_API_KEY (account-safety) ──────
     //
-    // ClaudeAgentRunner deliberately does NOT implement ITextOnlyAgentRunner.
-    // The pre-agentic resolver had a text-only Claude path that POSTed directly
-    // to https://api.anthropic.com/v1/messages — a usage shape outside the
-    // Claude-Code client that Anthropic can flag and terminate the subscription
-    // for. The pickup-time rebase + merge conflict resolvers now run through
-    // the normal CLI shape inside the sandbox via the agentic resolver, so the
-    // text-only path is gone. This test pins the contract: the type itself
-    // does not advertise ITextOnlyAgentRunner.
+    // ClaudeAgentRunner implements ITextOnlyAgentRunner only for the raw-API
+    // credential — a subscription OAuth /v1/messages call risks account
+    // termination and is declined by GetTextOnlyUnavailabilityReason, which
+    // the rebase-resolver router consults before invoking the runner.
 
     [Fact]
-    public void ClaudeAgentRunner_DoesNotImplementITextOnlyAgentRunner()
+    public void ClaudeAgentRunner_ImplementsITextOnlyAgentRunner()
     {
         var interfaces = typeof(ClaudeAgentRunner).GetInterfaces();
-        Assert.DoesNotContain(typeof(ITextOnlyAgentRunner), interfaces);
+        Assert.Contains(typeof(ITextOnlyAgentRunner), interfaces);
     }
 
 }

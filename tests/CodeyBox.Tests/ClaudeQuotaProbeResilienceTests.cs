@@ -163,7 +163,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
 
     // ── Falling out of retention ──────────────────────────────────────────────
 
-    
+
     [Fact]
     public async Task StalenessExceeded_FallsToUnknown_EvenIfFailureCountLow()
     {
@@ -195,7 +195,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
             $"expected unknown once retained snapshot exceeds MaxStaleness, got {snap.AvailablePct}");
     }
 
-    
+
     // ── Retry behaviour ───────────────────────────────────────────────────────
 
     [Fact]

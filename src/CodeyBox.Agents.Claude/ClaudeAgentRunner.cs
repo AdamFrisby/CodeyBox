@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -9,22 +11,38 @@ namespace CodeyBox.Agents.Claude;
 /// is expected to be installed in the sandbox image; the host injects only
 /// the API token via tmpfs/env.
 ///
-/// <para>This runner deliberately does NOT implement
-/// <see cref="ITextOnlyAgentRunner"/>. The previous text-only path POSTed
-/// directly to <c>https://api.anthropic.com/v1/messages</c> with the
-/// subscription OAuth token, which Anthropic can flag as a wrong-client-shape
-/// usage of the credential and terminate the account. The pickup-time rebase
-/// and merge-phase conflict resolvers now run inside the same sandbox via
-/// <see cref="IAgentRunner.RunAsync"/> (the normal CLI shape), so no
-/// text-only Claude path is needed. The advisory merge security review
-/// gracefully skips when the chosen agent does not implement text-only
-/// review.</para>
+/// <para>The text-only path (<see cref="ITextOnlyAgentRunner"/>) is restricted
+/// to the raw-API credential (<c>ANTHROPIC_API_KEY</c>): subscription OAuth
+/// against <c>/v1/messages</c> is the wrong-client-shape usage that risks
+/// account termination, so <see cref="GetTextOnlyUnavailabilityReason"/>
+/// declines OAuth-only credentials and the rebase router walks past Claude
+/// to the next class member. The configured model id (e.g.
+/// <c>claude-opus-4-7</c>) is an undated alias that the <c>claude</c> CLI
+/// resolves internally; the Messages API only accepts the dated canonical id
+/// (e.g. <c>claude-opus-4-7-YYYYMMDD</c>) and answers an undated alias with
+/// HTTP 404. The text-only call therefore resolves the alias via
+/// <c>GET /v1/models</c> before posting to <c>/v1/messages</c>; a probe
+/// failure leaves the requested id untouched (best-effort, so we never
+/// degrade a working call).</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private static readonly HttpClient SharedTextOnlyHttp = new();
+
+    internal const string MessagesEndpoint = "https://api.anthropic.com/v1/messages";
+    // /v1/models endpoint and anthropic-version pin live in ClaudeModelListProbe;
+    // re-export so the text-only path (which fetches /v1/models for alias→canonical
+    // resolution) shares a single source of truth with the startup probe.
+    internal const string ModelsEndpoint = ClaudeModelListProbe.ModelsEndpoint;
+    internal const string AnthropicVersion = ClaudeModelListProbe.AnthropicVersion;
+    internal const int TextOnlyMaxTokens = 8192;
+    internal const string MissingApiKeyReason =
+        "ANTHROPIC_API_KEY is required for Claude text-only calls (subscription OAuth declined for account-safety)";
+
     private readonly IClaudeTokenRotationPusher? _rotationPusher;
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
+    private readonly HttpClient _textOnlyHttp;
 
     public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null) { }
 
@@ -53,10 +71,26 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentDefaultsSnapshot? defaults,
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null)
+        : this(defaults, rotationPusher, sanitizerConfig, textOnlyHttp: null)
+    {
+    }
+
+    /// <summary>
+    /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
+    /// backed by a fake <see cref="HttpMessageHandler"/> so the text-only
+    /// path can be exercised offline without reaching api.anthropic.com.
+    /// Production wiring uses the process-wide shared HttpClient.
+    /// </summary>
+    internal ClaudeAgentRunner(
+        AgentDefaultsSnapshot? defaults,
+        IClaudeTokenRotationPusher? rotationPusher,
+        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
+        HttpClient? textOnlyHttp)
     {
         _defaults = defaults;
         _rotationPusher = rotationPusher;
         _sanitizerConfig = sanitizerConfig;
+        _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
 
     public override AgentKind Kind => AgentKind.Claude;
@@ -480,4 +514,196 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private static bool ContainsMissingBinaryMessage(string output) =>
         output.Contains("not found", StringComparison.OrdinalIgnoreCase)
         || output.Contains("no such file", StringComparison.OrdinalIgnoreCase);
+
+    // ── Text-only API path ────────────────────────────────────────────────────
+
+    public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
+    {
+        if (TryGetApiKey(credential, out _)) return null;
+        return MissingApiKeyReason;
+    }
+
+    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = reasoningMode;
+
+        if (!TryGetApiKey(credential, out var apiKey))
+        {
+            return new TextOnlyAgentResult(
+                false,
+                "missing Claude text-only credential",
+                null,
+                MissingApiKeyReason);
+        }
+
+        var requestedModel = !string.IsNullOrWhiteSpace(modelId) ? modelId! : DefaultModelId;
+        if (string.IsNullOrWhiteSpace(requestedModel))
+        {
+            return new TextOnlyAgentResult(
+                false,
+                "missing model id for Claude text-only call",
+                null,
+                "No model id available (no default configured); set a default in CodeyBox:AgentDefaults or supply an explicit modelId.");
+        }
+
+        var canonicalModel = await TryResolveCanonicalModelIdAsync(requestedModel, apiKey, ct).ConfigureAwait(false);
+
+        try
+        {
+            var body = JsonSerializer.Serialize(new
+            {
+                model = canonicalModel,
+                max_tokens = TextOnlyMaxTokens,
+                messages = new[]
+                {
+                    new { role = "user", content = prompt },
+                },
+            });
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            };
+            request.Headers.Add("x-api-key", apiKey);
+            request.Headers.Add("anthropic-version", AnthropicVersion);
+
+            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var responseText = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            if (responseText is null)
+            {
+                return new TextOnlyAgentResult(
+                    false,
+                    "Claude text-only call failed: response too large",
+                    null,
+                    "Response size exceeded 256 KiB limit.");
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                var summary = canonicalModel == requestedModel
+                    ? $"Claude text-only call failed: HTTP {(int)response.StatusCode} (model={canonicalModel})"
+                    : $"Claude text-only call failed: HTTP {(int)response.StatusCode} (model={canonicalModel}, requested={requestedModel})";
+                return new TextOnlyAgentResult(false, summary, null, responseText);
+            }
+
+            return new TextOnlyAgentResult(true, "ok", ExtractResponseText(responseText), null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new TextOnlyAgentResult(false, "Claude text-only call failed", null, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort alias→canonical resolution via <c>GET /v1/models</c>. The
+    /// Messages API rejects undated aliases (e.g. <c>claude-opus-4-7</c>) with
+    /// HTTP 404 even when <c>/v1/models</c> lists them, so a dated variant is
+    /// preferred over an exact alias match. Returns the requested id unchanged
+    /// when no dated match is found or when the probe itself fails.
+    /// </summary>
+    private async Task<string> TryResolveCanonicalModelIdAsync(string requested, string apiKey, CancellationToken ct)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, ModelsEndpoint);
+            request.Headers.Add("x-api-key", apiKey);
+            request.Headers.Add("anthropic-version", AnthropicVersion);
+
+            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+                return requested;
+
+            var body = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            if (body is null)
+                return requested;
+            var ids = ParseModelIds(body);
+            return ResolveCanonicalModelId(requested, ids);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return requested;
+        }
+    }
+
+    /// <summary>
+    /// Picks the latest date-stamped variant whose id is
+    /// <c>requested + "-" + &lt;date&gt;</c> (lex-max on YYYYMMDD = newest);
+    /// otherwise returns <paramref name="requested"/> unchanged. Preferring a
+    /// dated variant over an exact alias match is deliberate: the Messages
+    /// API has answered the undated alias with HTTP 404 even when
+    /// <c>/v1/models</c> lists it.
+    /// </summary>
+    internal static string ResolveCanonicalModelId(string requested, IReadOnlyList<string> available)
+    {
+        var prefix = requested + "-";
+        var datedMatch = available
+            .Where(id => id.StartsWith(prefix, StringComparison.Ordinal))
+            .OrderByDescending(static id => id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        return datedMatch ?? requested;
+    }
+
+    /// <summary>
+    /// Parses <c>{"data":[{"id":"..."}, ...]}</c> into the list of ids; returns
+    /// an empty list on any parse failure. Delegates to
+    /// <see cref="ClaudeModelListProbe.ParseResponse"/> — the startup model-list
+    /// probe and this text-only alias resolver speak the same wire format and
+    /// must not drift.
+    /// </summary>
+    internal static IReadOnlyList<string> ParseModelIds(string json) =>
+        ClaudeModelListProbe.ParseResponse(json).ModelIds;
+
+    /// <summary>
+    /// Extracts the concatenated text payload from a <c>/v1/messages</c>
+    /// response body: <c>{"content":[{"type":"text","text":"..."}, ...]}</c>.
+    /// Returns an empty string when no text part is present.
+    /// </summary>
+    internal static string ExtractResponseText(string responseText)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(responseText);
+            if (!doc.RootElement.TryGetProperty("content", out var content)
+                || content.ValueKind != JsonValueKind.Array)
+                return string.Empty;
+            var parts = new List<string>();
+            foreach (var item in content.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                if (item.TryGetProperty("text", out var textEl)
+                    && textEl.ValueKind == JsonValueKind.String)
+                {
+                    parts.Add(textEl.GetString() ?? string.Empty);
+                }
+            }
+            return string.Concat(parts);
+        }
+        catch (JsonException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static bool TryGetApiKey(AgentCredential? credential, out string apiKey)
+    {
+        apiKey = "";
+        if (credential is null) return false;
+        if (!credential.EnvironmentVariables.TryGetValue("ANTHROPIC_API_KEY", out var v)
+            || string.IsNullOrEmpty(v))
+            return false;
+        apiKey = v;
+        return true;
+    }
 }
