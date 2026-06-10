@@ -247,15 +247,15 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
         CreatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
         UpdatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("updated_at")), System.Globalization.CultureInfo.InvariantCulture),
         IsArchived = r.GetInt32(r.GetOrdinal("is_archived")) != 0,
-        AutomationKind = r.IsDBNull(r.GetOrdinal("automation_kind")) 
-            ? null 
+        AutomationKind = r.IsDBNull(r.GetOrdinal("automation_kind"))
+            ? null
             : Enum.Parse<AutomationKind>(r.GetString(r.GetOrdinal("automation_kind"))),
         ExecutableArtifactJson = r.IsDBNull(r.GetOrdinal("executable_artifact_json")) ? null : r.GetString(r.GetOrdinal("executable_artifact_json")),
         ConformanceJson = r.IsDBNull(r.GetOrdinal("conformance_json")) ? null : r.GetString(r.GetOrdinal("conformance_json")),
         Label = r.IsDBNull(r.GetOrdinal("label")) ? null : r.GetString(r.GetOrdinal("label")),
         LastRunPassed = r.IsDBNull(r.GetOrdinal("last_run_passed")) ? null : r.GetInt32(r.GetOrdinal("last_run_passed")) != 0,
-        LastRunAt = r.IsDBNull(r.GetOrdinal("last_run_at")) 
-            ? null 
+        LastRunAt = r.IsDBNull(r.GetOrdinal("last_run_at"))
+            ? null
             : DateTimeOffset.Parse(r.GetString(r.GetOrdinal("last_run_at")), System.Globalization.CultureInfo.InvariantCulture),
         LastRunResult = r.IsDBNull(r.GetOrdinal("last_run_result")) ? null : r.GetString(r.GetOrdinal("last_run_result")),
     };
