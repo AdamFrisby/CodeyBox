@@ -97,7 +97,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
-            return Unknown("no token configured");
+            return Unknown(QuotaUnknownReason.NoCredential, "no token configured");
         var routeKey = member.RouteKey;
 
         bool isAuto = GeminiKnownModels.IsAuto(member.ModelId);
@@ -159,7 +159,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
     {
         var result = await ProbeOneAsync(token, modelId, ct);
         if (result.Status is null)
-            return Unknown($"live probe of {modelId}: transient error");
+            return Unknown(QuotaUnknownReason.Transient, $"live probe of {modelId}: transient error");
 
         if (result.Status == HttpStatusCode.OK)
         {
@@ -191,7 +191,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             };
         }
 
-        return Unknown($"live probe of {modelId}: HTTP {(int)result.Status.Value}");
+        return Unknown(QuotaUnknownReasons.FromHttpStatus(result.Status.Value), $"live probe of {modelId}: HTTP {(int)result.Status.Value}");
     }
 
     /// <summary>
@@ -215,11 +215,11 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             {
                 _log.LogDebug("Gemini quota endpoint returned {StatusCode}; treating quota as unknown",
                     (int)response.StatusCode);
-                return Unknown($"HTTP {(int)response.StatusCode}");
+                return Unknown(QuotaUnknownReasons.FromHttpStatus(response.StatusCode), $"HTTP {(int)response.StatusCode}");
             }
 
             var body = await ReadCappedAsync(response.Content, ct);
-            if (body is null) return Unknown("response too large");
+            if (body is null) return Unknown(QuotaUnknownReason.Permanent, "response too large");
             return ParseResponse(body);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -229,7 +229,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Gemini quota probe failed; treating quota as unknown");
-            return Unknown("network error");
+            return Unknown(QuotaUnknownReason.Transient, "network error");
         }
     }
 
@@ -291,7 +291,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         // Treat the run as Unknown if no model returned a definitive 200/429
         // (only those statuses populate perModel).
         if (perModel.Count == 0)
-            return Unknown("auto fan-out: no definitive responses");
+            return Unknown(QuotaUnknownReason.Transient, "auto fan-out: no definitive responses");
 
         var notes = anyOk
             ? $"auto routed via {routedVia}"
@@ -377,7 +377,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             var root = doc.RootElement;
 
             if (!root.TryGetProperty("buckets", out var buckets) || buckets.ValueKind != JsonValueKind.Array)
-                return Unknown("unexpected response shape");
+                return Unknown(QuotaUnknownReason.Permanent, "unexpected response shape");
 
             var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
             ModelQuota? mostConstrained = null;
@@ -405,7 +405,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
             }
 
             if (perModel.Count == 0)
-                return Unknown("no buckets in response");
+                return Unknown(QuotaUnknownReason.Permanent, "no buckets in response");
 
             return new AgentQuotaSnapshot
             {
@@ -417,7 +417,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         }
         catch (JsonException)
         {
-            return Unknown("invalid JSON");
+            return Unknown(QuotaUnknownReason.Permanent, "invalid JSON");
         }
     }
 
@@ -449,8 +449,8 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe
         return DateTimeOffset.TryParse(prop.GetString(), out var parsed) ? parsed : null;
     }
 
-    private static AgentQuotaSnapshot Unknown(string reason) =>
-        new() { AvailablePct = -1, Notes = reason };
+    private static AgentQuotaSnapshot Unknown(QuotaUnknownReason reason, string notes) =>
+        AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 
     private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
 }

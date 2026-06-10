@@ -50,7 +50,7 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
                         QualityScore = 100,
                     }, ct);
 
-                if (snapshot.AvailablePct < 0 || snapshot.AvailablePct >= _minQuotaPct)
+                if (!snapshot.IsKnown || snapshot.AvailablePct >= _minQuotaPct)
                     return false;
             }
             catch (Exception ex)

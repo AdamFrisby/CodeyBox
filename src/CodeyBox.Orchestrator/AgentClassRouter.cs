@@ -162,12 +162,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             _log.LogWarning(ex,
                 "Budget gate: provider threw for {Agent}/{Model}; failing closed",
                 member.Agent.Value, member.ModelId ?? "(default)");
-            return new BudgetAdjustedQuota(probeQuota with { AvailablePct = 0.0 }, true, null);
+            return new BudgetAdjustedQuota(probeQuota with { AvailablePct = 0.0, Unknown = null }, true, null);
         }
 
         if (budget is null) return new BudgetAdjustedQuota(probeQuota, false, null);
 
-        var combinedPct = probeQuota.AvailablePct < 0
+        var combinedPct = !probeQuota.IsKnown
             ? budget.AvailablePct
             : Math.Min(probeQuota.AvailablePct, budget.AvailablePct);
 
@@ -180,7 +180,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // refuse the PayPerApi fire-anyway fallthrough that otherwise fail-opens.
         var budgetExhausted = budget.AvailablePct < _opts.MinQuotaPct;
         return new BudgetAdjustedQuota(
-            probeQuota with { AvailablePct = combinedPct, ResetAt = reset },
+            probeQuota with { AvailablePct = combinedPct, ResetAt = reset, Unknown = null },
             budgetExhausted,
             budget.ResetAt);
     }
@@ -1361,11 +1361,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             _log.LogDebug(ex,
                 "Quota probe for {Agent}/{Model} threw; treating as unknown",
                 member.Agent.Value, member.ModelId ?? "(default)");
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = -1,
-                Notes = $"probe threw: {ex.GetType().Name}",
-            };
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Transient, $"probe threw: {ex.GetType().Name}");
         }
     }
 
@@ -1562,7 +1559,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // here — this path computes retry-scheduling park time, not the
             // dispatch gate, and a stable threshold keeps the retry hint
             // independent of where in the ramp the member happens to be.
-            if (quota.AvailablePct < 0) continue;
+            if (!quota.IsKnown) continue;
             if (quota.AvailablePct >= _opts.MinQuotaPct) continue;
             var resetAt = EarliestKnownWindowReset(quota, nowUtc, futureOnly: false);
             if (resetAt is null) continue;
@@ -1580,6 +1577,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         DateTimeOffset nowUtc,
         CancellationToken ct)
     {
+        // No real reading: the configured unknown policy decides (fail-open,
+        // fail-cautious, or gate on recently-observed runtime failures). The
+        // last-known-good layer has already had its chance to substitute a
+        // recent reading before we get here.
+        if (!quota.IsKnown)
+        {
+            return _opts.UnknownPolicy switch
+            {
+                QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
+                QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
+                _ => await EvaluateObservedFailuresAsync(member, ct),
+            };
+        }
+
         var availablePct = quota.AvailablePct;
         var resetAt = quota.ResetAt;
 
@@ -1622,15 +1633,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return rateAware ?? new QuotaGateDecision(true, "quota available");
         }
 
-        if (availablePct >= 0)
-            return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)");
-
-        return _opts.UnknownPolicy switch
-        {
-            QuotaUnknownPolicy.FailOpen => new QuotaGateDecision(true, "quota unknown; fail-open"),
-            QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious"),
-            _ => await EvaluateObservedFailuresAsync(member, ct),
-        };
+        // Known and below floor.
+        return new QuotaGateDecision(false, $"quota below floor ({availablePct:F1}% < {floor:F1}%)");
     }
 
     private void RecordAvailabilityAndMaybeNotify(
@@ -1656,7 +1660,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)
     {
         var availablePct = quota.AvailablePct;
-        if (availablePct < 0)
+        if (!quota.IsKnown)
             return false;
 
         var floor = member.Billing == AgentBilling.Subscription
@@ -1924,7 +1928,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             double fit;
             if (est.Status == AgentBurnEstimateStatus.NoWindowBudget) fit = double.PositiveInfinity;
             else if (est.SampleCount <= 0 || est.AvgBurnPctPerItem <= 0) fit = _opts.ColdStartFitInWindow;
-            else if (quota.AvailablePct < 0) fit = double.NaN;
+            else if (!quota.IsKnown) fit = double.NaN;
             else fit = quota.AvailablePct / est.AvgBurnPctPerItem;
 
             results.Add(new MemberFitView(
@@ -1983,7 +1987,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     internal static EffectiveQuota ResolveMemberQuota(AgentQuotaSnapshot snapshot, AgentMembership member)
     {
         if (string.IsNullOrWhiteSpace(member.ModelId))
-            return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows);
+            return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
 
         if (snapshot.PerModel.TryGetValue(member.ModelId, out var modelQuota))
             return new EffectiveQuota(
@@ -2020,11 +2024,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         // unknown so QuotaUnknownPolicy gates it, rather than silently falling back
         // to the overall account percentage.
         if (snapshot.PerModel.Count > 0)
-            return new EffectiveQuota(-1, null, null);
+            return new EffectiveQuota(-1, null, null, Unknown: QuotaUnknownReason.Permanent);
 
         // Probe returned no per-model breakdown at all (e.g. NullQuotaProbe, or a
         // provider whose API has no per-model dimension). Fall back to overall.
-        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows);
+        return new EffectiveQuota(snapshot.AvailablePct, snapshot.ResetAt, null, snapshot.Windows, snapshot.Unknown);
     }
 
     /// <summary>
@@ -2180,7 +2184,12 @@ public sealed record EffectiveQuota(
     double AvailablePct,
     DateTimeOffset? ResetAt,
     string? Window,
-    IReadOnlyList<WindowQuota>? Windows = null);
+    IReadOnlyList<WindowQuota>? Windows = null,
+    QuotaUnknownReason? Unknown = null)
+{
+    /// <summary>True when this is a real reading (mirrors AgentQuotaSnapshot.IsKnown).</summary>
+    public bool IsKnown => Unknown is null && AvailablePct >= 0;
+}
 
 /// <summary>
 /// Snapshot of the router's rate-aware view for one class member, surfaced via
@@ -2462,9 +2471,6 @@ public sealed class NullQuotaProbe : IAgentQuotaProbe
     public AgentKind Kind => new("null");
 
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
-        => Task.FromResult(new AgentQuotaSnapshot
-        {
-            AvailablePct = -1,
-            Notes = $"no probe registered for {member.Agent}",
-        });
+        => Task.FromResult(AgentQuotaSnapshot.UnknownSnapshot(
+            QuotaUnknownReason.Permanent, $"no probe registered for {member.Agent}"));
 }

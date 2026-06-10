@@ -80,10 +80,28 @@ For multi-window quota responses, the parser uses the most constrained window:
 
 Unexpected JSON fields are ignored. Missing fields make only that part unknown.
 
-## Unknown Policy
+## Unknown Reading
 
-`CodeyBox:QuotaRouter:UnknownPolicy` controls snapshots where
-`AvailablePct < 0`:
+A probe that cannot produce a real reading returns an **unknown** snapshot
+(`AgentQuotaSnapshot.IsKnown == false`) tagged with a `QuotaUnknownReason`
+(`Transient` / `Permanent` / `NoCredential`) — not a magic `AvailablePct = -1`.
+The reason drives two layers:
+
+### Last-known-good (before the policy)
+
+Every probe is wrapped in `LastKnownGoodQuotaProbe`. On a **Transient** unknown
+(network/5xx/timeout, or an inner throw) it substitutes the most recent real
+reading for that `(RouteKey, ModelId)` — bounded by `ProbeMaxStalenessSeconds`
+and the reading's own reset — so a momentary blip keeps the floor enforced
+instead of collapsing to unknown + fall-open. A **Permanent** (revoked token,
+4xx, unparseable body) or **NoCredential** unknown discards the retained reading
+(the prior value can no longer be trusted). This applies uniformly to all probes;
+there is no per-probe retention code.
+
+### Unknown Policy (when still unknown)
+
+`CodeyBox:QuotaRouter:UnknownPolicy` controls snapshots that are still unknown
+after the last-known-good layer:
 
 - `UseObservedFailures` default. Allow unknown only when this agent/model has no
   recent quota-shaped failure.

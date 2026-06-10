@@ -8,13 +8,13 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Tests for the snapshot-retention / retry behaviour added to
-/// <see cref="ClaudeQuotaProbe"/>: a one-off transient probe failure must NOT
-/// discard the previously known-good quota figure (otherwise the
-/// <c>MinQuotaPct</c> floor is silently bypassed under
-/// <c>QuotaUnknownPolicy.UseObservedFailures</c>); only after N consecutive
-/// failures OR exceeding the staleness window should the snapshot fall to
-/// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1.
+/// Integration tests for <see cref="ClaudeQuotaProbe"/> behind the
+/// <see cref="LastKnownGoodQuotaProbe"/> decorator (the production stack): the
+/// probe owns HTTP retry and transient/permanent classification; the decorator
+/// owns last-known-good retention. A one-off transient probe failure must NOT
+/// discard the previously known-good figure (otherwise the <c>MinQuotaPct</c>
+/// floor is silently bypassed); past the staleness window — or on a permanent
+/// failure — the snapshot falls to unknown.
 /// </summary>
 public sealed class ClaudeQuotaProbeResilienceTests
 {
@@ -25,23 +25,32 @@ public sealed class ClaudeQuotaProbeResilienceTests
         QualityScore = 100,
     };
 
-    private static string Rollup(double usedPercent, string resetAt = "1778091218") =>
+    // reset_at far in the future so a retained reading isn't dropped by the
+    // decorator's reset-aware expiry (the test clock is real UtcNow).
+    private static string Rollup(double usedPercent, string resetAt = "4102444800") =>
         $"{{\"rate_limit\":{{\"primary_window\":{{\"used_percent\":{usedPercent},\"reset_at\":{resetAt}}}}}}}";
 
-    private static ClaudeQuotaProbe BuildProbe(
+    private static IAgentQuotaProbe BuildProbe(
         HttpMessageHandler handler,
         ClaudeQuotaProbeResilienceOptions options,
         TestTimeProvider time,
         TimeSpan? cacheTtl = null)
     {
         var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
-        return new ClaudeQuotaProbe(
+        var probe = new ClaudeQuotaProbe(
             factory,
             () => new AgentQuotaCredentials("test-token"),
             cacheTtl ?? TimeSpan.FromSeconds(60),
             NullLogger<ClaudeQuotaProbe>.Instance,
             resilienceProvider: () => options,
             timeProvider: time);
+        // Production stack: the last-known-good retention lives in the decorator,
+        // sharing the same staleness bound the probe options carry.
+        return new LastKnownGoodQuotaProbe(
+            probe,
+            () => new LastKnownGoodQuotaOptions { MaxStaleness = options.MaxStaleness },
+            NullLogger<LastKnownGoodQuotaProbe>.Instance,
+            time);
     }
 
     // ── Retain last-known-good across a single transient failure ──────────────
@@ -82,7 +91,6 @@ public sealed class ClaudeQuotaProbeResilienceTests
         Assert.Equal(71, second.AvailablePct, precision: 5);
         Assert.NotNull(second.Notes);
         Assert.Contains("stale", second.Notes!, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("consecutiveFailures=1", second.Notes);
     }
 
     [Fact]
@@ -155,47 +163,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
 
     // ── Falling out of retention ──────────────────────────────────────────────
 
-    [Fact]
-    public async Task ConsecutiveFailures_ExceedingThreshold_FallsToUnknown()
-    {
-        // After the configured number of consecutive end-to-end probe failures,
-        // the retained snapshot is dropped and the next call returns -1.
-        var time = new TestTimeProvider(DateTimeOffset.UtcNow);
-        // First call seeds last-known-good at available=71. Three end-to-end
-        // probes follow, each MaxRetries=0 -> one attempt apiece.
-        var handler = new SequenceHandler(
-            (HttpStatusCode.OK, Rollup(29)),
-            (HttpStatusCode.InternalServerError, ""),
-            (HttpStatusCode.InternalServerError, ""),
-            (HttpStatusCode.InternalServerError, ""));
-        var probe = BuildProbe(
-            handler,
-            new ClaudeQuotaProbeResilienceOptions
-            {
-                MaxRetries = 0,
-                RetryInitialDelay = TimeSpan.Zero,
-                MaxConsecutiveFailures = 2,
-                MaxStaleness = TimeSpan.FromMinutes(5),
-            },
-            time,
-            cacheTtl: TimeSpan.FromMilliseconds(1));
-
-        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-
-        time.Advance(TimeSpan.FromSeconds(1));
-        var s1 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(71, s1.AvailablePct, precision: 5);
-        Assert.Contains("stale", s1.Notes!, StringComparison.OrdinalIgnoreCase);
-
-        time.Advance(TimeSpan.FromSeconds(1));
-        var s2 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(71, s2.AvailablePct, precision: 5);
-
-        time.Advance(TimeSpan.FromSeconds(1));
-        var s3 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.True(s3.AvailablePct < 0, $"expected unknown after 3 consecutive failures, got {s3.AvailablePct}");
-    }
-
+    
     [Fact]
     public async Task StalenessExceeded_FallsToUnknown_EvenIfFailureCountLow()
     {
@@ -227,47 +195,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
             $"expected unknown once retained snapshot exceeds MaxStaleness, got {snap.AvailablePct}");
     }
 
-    [Fact]
-    public async Task SuccessAfterTransientFailure_ResetsConsecutiveFailureCounter()
-    {
-        // A successful probe must zero the counter so the next single transient
-        // blip doesn't tip past the threshold prematurely.
-        var time = new TestTimeProvider(DateTimeOffset.UtcNow);
-        var handler = new SequenceHandler(
-            (HttpStatusCode.OK, Rollup(29)),                  // 71
-            (HttpStatusCode.InternalServerError, ""),         // fail
-            (HttpStatusCode.OK, Rollup(50)),                  // 50, resets counter
-            (HttpStatusCode.InternalServerError, ""));        // fail again
-        var probe = BuildProbe(
-            handler,
-            new ClaudeQuotaProbeResilienceOptions
-            {
-                MaxRetries = 0,
-                RetryInitialDelay = TimeSpan.Zero,
-                MaxConsecutiveFailures = 1,
-                MaxStaleness = TimeSpan.FromMinutes(5),
-            },
-            time,
-            cacheTtl: TimeSpan.FromMilliseconds(1));
-
-        // Good
-        await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        time.Advance(TimeSpan.FromSeconds(1));
-        // Transient failure 1 — still retained (counter == 1, threshold 1).
-        var s1 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(71, s1.AvailablePct, precision: 5);
-        time.Advance(TimeSpan.FromSeconds(1));
-        // Recovery — counter resets, lastKnownGood updates.
-        var s2 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(50, s2.AvailablePct, precision: 5);
-        Assert.Null(s2.Notes);
-        time.Advance(TimeSpan.FromSeconds(1));
-        // Another transient failure — counter just hit 1 again, still retained.
-        var s3 = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
-        Assert.Equal(50, s3.AvailablePct, precision: 5);
-        Assert.Contains("stale", s3.Notes!, StringComparison.OrdinalIgnoreCase);
-    }
-
+    
     // ── Retry behaviour ───────────────────────────────────────────────────────
 
     [Fact]

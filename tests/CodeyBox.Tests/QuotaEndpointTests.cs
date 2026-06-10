@@ -248,6 +248,6 @@ public sealed class QuotaEndpointTests
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
             => Task.FromResult(_snapshotsByRoute.TryGetValue(member.RouteKey, out var snapshot)
                 ? snapshot
-                : new AgentQuotaSnapshot { AvailablePct = -1 });
+                : AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient));
     }
 }

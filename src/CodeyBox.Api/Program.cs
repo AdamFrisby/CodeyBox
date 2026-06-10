@@ -969,6 +969,23 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
 
+// Every quota probe is wrapped so a transient blip serves the most recent real
+// reading (bounded by ProbeMaxStalenessSeconds + the reading's own reset) rather
+// than collapsing to unknown and letting the router fall open. Discard-on-
+// Permanent/NoCredential is driven by the probe's QuotaUnknownReason.
+static IAgentQuotaProbe WrapLastKnownGood(IAgentQuotaProbe inner, IServiceProvider sp)
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var lf = sp.GetRequiredService<ILoggerFactory>();
+    return new LastKnownGoodQuotaProbe(
+        inner,
+        () => new LastKnownGoodQuotaOptions
+        {
+            MaxStaleness = TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds),
+        },
+        lf.CreateLogger<LastKnownGoodQuotaProbe>());
+}
+
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
@@ -1006,7 +1023,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         },
         timeProvider: null);
     source.TokenUpdated += probe.InvalidateCache;
-    return probe;
+    return WrapLastKnownGood(probe, sp);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1027,7 +1044,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
-    return probe;
+    return WrapLastKnownGood(probe, sp);
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
 // API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
@@ -1049,7 +1066,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
-    return probe;
+    return WrapLastKnownGood(probe, sp);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1067,14 +1084,14 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
-    return probe;
+    return WrapLastKnownGood(probe, sp);
 });
 
 // opencode: no verified usage endpoint at integration time. The probe ships
 // as Unknown-only so the router falls onto its QuotaUnknownPolicy
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
-builder.Services.AddSingleton<IAgentQuotaProbe>(_ => new OpencodeQuotaProbe());
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new OpencodeQuotaProbe(), sp));
 // Antigravity: the agy gateway exposes NO readable per-model quota meter
 // (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
 // :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
@@ -1101,7 +1118,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<AntigravityQuotaProbe>());
     source.TokenUpdated += probe.InvalidateCache;
-    return probe;
+    return WrapLastKnownGood(probe, sp);
 });
 
 // --- Agent class router ------------------------------------------------------

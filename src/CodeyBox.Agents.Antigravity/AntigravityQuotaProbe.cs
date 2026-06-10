@@ -115,7 +115,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
-            return Unknown("no token configured");
+            return Unknown(QuotaUnknownReason.NoCredential, "no token configured");
         var routeKey = member.RouteKey;
         var modelKey = string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!;
         var cacheKey = (routeKey, token, modelKey);
@@ -235,7 +235,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
             if (!response.IsSuccessStatusCode)
             {
                 _log.LogDebug("Antigravity loadCodeAssist returned {StatusCode}", (int)response.StatusCode);
-                return Unknown($"loadCodeAssist: HTTP {(int)response.StatusCode}");
+                return Unknown(QuotaUnknownReasons.FromHttpStatus(response.StatusCode), $"loadCodeAssist: HTTP {(int)response.StatusCode}");
             }
 
             var body = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
@@ -262,7 +262,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Antigravity loadCodeAssist probe failed");
-            return Unknown("loadCodeAssist: transient error");
+            return Unknown(QuotaUnknownReason.Transient, "loadCodeAssist: transient error");
         }
     }
 
@@ -340,8 +340,8 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
             ? value.GetString()
             : null;
 
-    private static AgentQuotaSnapshot Unknown(string reason) =>
-        new() { AvailablePct = -1, Notes = reason };
+    private static AgentQuotaSnapshot Unknown(QuotaUnknownReason reason, string notes) =>
+        AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 
     private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
     private sealed record ExhaustionOverride(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);

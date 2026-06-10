@@ -145,7 +145,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
-            return Unknown("no token configured");
+            return Unknown(QuotaUnknownReason.NoCredential, "no token configured");
         var routeKey = member.RouteKey;
 
         AgentQuotaSnapshot snapshot;
@@ -197,6 +197,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         return new AgentQuotaSnapshot
         {
             AvailablePct = -1,
+            Unknown = QuotaUnknownReason.Permanent,
             ResetAt = snapshot.ResetAt,
             Notes = notes,
             PerModel = snapshot.PerModel,
@@ -231,11 +232,11 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             {
                 _log.LogDebug("Cursor usage endpoint returned {StatusCode}; treating quota as unknown",
                     (int)response.StatusCode);
-                return Unknown($"HTTP {(int)response.StatusCode}");
+                return Unknown(QuotaUnknownReasons.FromHttpStatus(response.StatusCode), $"HTTP {(int)response.StatusCode}");
             }
 
             var body = await ReadCappedAsync(response.Content, ct);
-            if (body is null) return Unknown("response too large");
+            if (body is null) return Unknown(QuotaUnknownReason.Permanent, "response too large");
             var snapshot = ParseResponse(body);
 
             // Log raw body when the parser bailed to Unknown — silent fallthrough
@@ -259,17 +260,17 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         catch (TaskCanceledException)
         {
             _log.LogDebug("Cursor quota probe timed out; treating quota as unknown");
-            return Unknown("request timeout");
+            return Unknown(QuotaUnknownReason.Transient, "request timeout");
         }
         catch (HttpRequestException ex)
         {
             _log.LogDebug(ex, "Cursor quota probe HTTP error; treating quota as unknown");
-            return Unknown("HTTP error");
+            return Unknown(QuotaUnknownReason.Transient, "HTTP error");
         }
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Cursor quota probe failed; treating quota as unknown");
-            return Unknown("unexpected error");
+            return Unknown(QuotaUnknownReason.Transient, "unexpected error");
         }
     }
 
@@ -283,7 +284,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             if (!root.TryGetProperty("planUsage", out var planUsage) ||
                 planUsage.ValueKind != JsonValueKind.Object)
             {
-                return Unknown(UnexpectedShapeNotes);
+                return Unknown(QuotaUnknownReason.Permanent, UnexpectedShapeNotes);
             }
 
             var hasTotal = TryGetDoubleProperty(planUsage, "totalPercentUsed", out var totalUsed);
@@ -291,7 +292,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
             var hasApi = TryGetDoubleProperty(planUsage, "apiPercentUsed", out var apiUsed);
 
             if (!hasTotal && !hasAuto && !hasApi)
-                return Unknown(UnexpectedShapeNotes);
+                return Unknown(QuotaUnknownReason.Permanent, UnexpectedShapeNotes);
 
             // Most-constrained percent dimension wins. The real shape can carry
             // total/auto/api at different fractions (e.g. auto fully used,
@@ -322,7 +323,7 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         }
         catch (JsonException)
         {
-            return Unknown("invalid JSON");
+            return Unknown(QuotaUnknownReason.Permanent, "invalid JSON");
         }
     }
 
@@ -504,6 +505,6 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
 
     private static double ClampAvailable(double pct) => Math.Clamp(pct, 0.0, 100.0);
 
-    private static AgentQuotaSnapshot Unknown(string reason) =>
-        new() { AvailablePct = -1, Notes = reason };
+    private static AgentQuotaSnapshot Unknown(QuotaUnknownReason reason, string notes) =>
+        AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 }

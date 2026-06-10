@@ -83,7 +83,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         var credentials = _credentialsProvider(member);
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
-            return Unknown("no token configured");
+            return Unknown(QuotaUnknownReason.NoCredential, "no token configured");
         var routeKey = member.RouteKey;
 
         AgentQuotaSnapshot snapshot;
@@ -144,6 +144,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         return new AgentQuotaSnapshot
         {
             AvailablePct = -1,
+            Unknown = QuotaUnknownReason.Permanent,
             ResetAt = snapshot.ResetAt,
             Notes = notes,
             PerModel = snapshot.PerModel,
@@ -182,12 +183,12 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
             {
                 _log.LogDebug("Codex usage endpoint returned {StatusCode}; treating quota as unknown",
                     (int)response.StatusCode);
-                return Unknown($"HTTP {(int)response.StatusCode}");
+                return Unknown(QuotaUnknownReasons.FromHttpStatus(response.StatusCode), $"HTTP {(int)response.StatusCode}");
             }
 
             // Do NOT log the response body — it may contain account identifiers.
             var body = await ReadCappedAsync(response.Content, ct);
-            if (body is null) return Unknown("response too large");
+            if (body is null) return Unknown(QuotaUnknownReason.Permanent, "response too large");
             return ParseResponse(body);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -197,7 +198,7 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         catch (Exception ex)
         {
             _log.LogDebug(ex, "Codex quota probe failed; treating quota as unknown");
-            return Unknown("network error");
+            return Unknown(QuotaUnknownReason.Transient, "network error");
         }
     }
 
@@ -244,11 +245,11 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
                     Windows = overall?.Windows ?? Array.Empty<WindowQuota>(),
                 };
 
-            return Unknown("unexpected response shape");
+            return Unknown(QuotaUnknownReason.Permanent, "unexpected response shape");
         }
         catch (JsonException)
         {
-            return Unknown("invalid JSON");
+            return Unknown(QuotaUnknownReason.Permanent, "invalid JSON");
         }
     }
 
@@ -429,6 +430,6 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe
         return new string(buffer, 0, totalRead);
     }
 
-    private static AgentQuotaSnapshot Unknown(string reason) =>
-        new() { AvailablePct = -1, Notes = reason };
+    private static AgentQuotaSnapshot Unknown(QuotaUnknownReason reason, string notes) =>
+        AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 }

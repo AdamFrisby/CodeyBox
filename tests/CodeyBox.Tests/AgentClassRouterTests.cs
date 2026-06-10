@@ -371,7 +371,7 @@ public sealed class AgentClassRouterTests
         var router = BuildRouter([cls],
         [
             new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = claudeReset }),
-            new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = -1 }), // unknown
+            new FakeProbe(Codex, AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient)), // unknown
             new FakeProbe(AgentKind.Gemini, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = null }), // exhausted but no reset
         ]);
 
@@ -444,7 +444,9 @@ internal sealed class FakeProbe : IAgentQuotaProbe
     private readonly AgentQuotaSnapshot _snapshot;
 
     public FakeProbe(AgentKind kind, double availablePct)
-        : this(kind, new AgentQuotaSnapshot { AvailablePct = availablePct })
+        : this(kind, availablePct < 0
+            ? AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient)
+            : new AgentQuotaSnapshot { AvailablePct = availablePct })
     {
     }
 

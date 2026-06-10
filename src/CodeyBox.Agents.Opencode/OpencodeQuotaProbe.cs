@@ -32,10 +32,7 @@ public sealed class OpencodeQuotaProbe : IAgentQuotaProbe
     public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
         _ = member;
-        return Task.FromResult(new AgentQuotaSnapshot
-        {
-            AvailablePct = -1,
-            Notes = "no probe endpoint",
-        });
+        return Task.FromResult(AgentQuotaSnapshot.UnknownSnapshot(
+            QuotaUnknownReason.Permanent, "no probe endpoint"));
     }
 }
