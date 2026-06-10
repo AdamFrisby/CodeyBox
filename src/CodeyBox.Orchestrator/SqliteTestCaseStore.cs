@@ -19,6 +19,7 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
 {
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
+    private int _disposed;
 
     public SqliteTestCaseStore(string path)
     {
@@ -216,8 +217,20 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
 
     public void Dispose()
     {
-        _conn.Dispose();
-        _writeLock.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        try
+        {
+            _conn.Dispose();
+        }
+        catch (NullReferenceException)
+        {
+        }
+        finally
+        {
+            _writeLock.Dispose();
+        }
     }
 
     private static void Bind(SqliteCommand cmd, TestCase tc)

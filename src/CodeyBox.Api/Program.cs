@@ -3538,6 +3538,7 @@ namespace CodeyBox.Api
         /// </summary>
         public WorkerPoolHealthWatchdogOptions WorkerPoolHealthWatchdog { get; set; } = new();
 
+        public int MaxBulkItems { get; set; } = 1000;
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;

@@ -130,6 +130,55 @@ public sealed class TestCaseApiTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateTestCase_HyphenatedWorkItemId_NormalisesAndSucceeds()
+    {
+        var wid = await SeedWorkItemAsync();
+        var g = Guid.Parse(wid);
+        var hyphenatedWid = g.ToString("D");
+
+        var req = new CreateTestCaseRequest(
+            Id: "tc-hyphen-1",
+            Name: "Sample Test Case",
+            Description: "Verifies hyphenated GUID behaviour",
+            SourceWorkItemId: hyphenatedWid
+        );
+
+        var resp = await _client.PostAsJsonAsync("/testcases", req);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+
+        var body = await resp.Content.ReadFromJsonAsync<TestCaseDto>();
+        Assert.NotNull(body);
+        Assert.Equal(wid, body.SourceWorkItemId);
+    }
+
+    [Fact]
+    public async Task BulkCreateTestCase_ExceedsMaxLimit_ReturnsBadRequest()
+    {
+        using var customFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:MaxBulkItems"] = "2"
+                });
+            });
+        });
+        using var client = customFactory.CreateClient();
+
+        var wid = await SeedWorkItemAsync();
+        var req1 = new CreateTestCaseRequest("bulk-limit-1", "Bulk Case 1", "", wid);
+        var req2 = new CreateTestCaseRequest("bulk-limit-2", "Bulk Case 2", "", wid);
+        var req3 = new CreateTestCaseRequest("bulk-limit-3", "Bulk Case 3", "", wid);
+
+        var resp = await client.PostAsJsonAsync("/testcases/bulk", new[] { req1, req2, req3 });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+
+        var err = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("exceeds maximum limit", err);
+    }
+
+    [Fact]
     public async Task GetTestCase_NonExistent_ReturnsNotFound()
     {
         var resp = await _client.GetAsync("/testcases/does-not-exist");

@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
 
@@ -41,6 +42,8 @@ internal static class TestCaseEndpoints
         if (!Guid.TryParse(req.SourceWorkItemId, out var g))
             return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
 
+        var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
+
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
             return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
@@ -52,7 +55,7 @@ internal static class TestCaseEndpoints
             Id = id,
             Name = req.Name,
             Description = req.Description ?? string.Empty,
-            SourceWorkItemId = req.SourceWorkItemId,
+            SourceWorkItemId = normalisedSourceWorkItemId,
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,
             IsArchived = req.IsArchived,
@@ -73,10 +76,15 @@ internal static class TestCaseEndpoints
         [FromBody] IReadOnlyList<CreateTestCaseRequest> reqList,
         ITestCaseStore store,
         IWorkItemStore workItemStore,
+        IOptions<CodeyBoxOptions> options,
         CancellationToken ct)
     {
         if (reqList == null || reqList.Count == 0)
             return Results.BadRequest(new { error = "List of test cases cannot be null or empty" });
+
+        var maxBulk = options.Value.MaxBulkItems;
+        if (reqList.Count > maxBulk)
+            return Results.BadRequest(new { error = $"List of test cases exceeds maximum limit of {maxBulk} items" });
 
         var testCases = new List<TestCase>();
         foreach (var req in reqList)
@@ -89,6 +97,8 @@ internal static class TestCaseEndpoints
             if (!Guid.TryParse(req.SourceWorkItemId, out var g))
                 return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
 
+            var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
+
             var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
             if (workItem is null)
                 return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
@@ -100,7 +110,7 @@ internal static class TestCaseEndpoints
                 Id = id,
                 Name = req.Name,
                 Description = req.Description ?? string.Empty,
-                SourceWorkItemId = req.SourceWorkItemId,
+                SourceWorkItemId = normalisedSourceWorkItemId,
                 CreatedAt = DateTimeOffset.UtcNow,
                 UpdatedAt = DateTimeOffset.UtcNow,
                 IsArchived = req.IsArchived,
@@ -139,12 +149,14 @@ internal static class TestCaseEndpoints
         if (!Guid.TryParse(workItemId, out var g))
             return Results.BadRequest(new { error = $"Invalid WorkItemId format: '{workItemId}'" });
 
+        var normalisedWorkItemId = new WorkItemId(g).ToString();
+
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
             return Results.NotFound(new { error = $"WorkItem '{workItemId}' not found" });
 
         var list = new List<TestCase>();
-        await foreach (var tc in store.ListByWorkItemAsync(workItemId, ct))
+        await foreach (var tc in store.ListByWorkItemAsync(normalisedWorkItemId, ct))
         {
             list.Add(tc);
         }
@@ -176,6 +188,8 @@ internal static class TestCaseEndpoints
         if (!Guid.TryParse(req.SourceWorkItemId, out var g))
             return Results.BadRequest(new { error = $"Invalid SourceWorkItemId format: '{req.SourceWorkItemId}'" });
 
+        var normalisedSourceWorkItemId = new WorkItemId(g).ToString();
+
         var workItem = await workItemStore.GetAsync(new WorkItemId(g), ct);
         if (workItem is null)
             return Results.BadRequest(new { error = $"Linked WorkItem '{req.SourceWorkItemId}' not found" });
@@ -187,7 +201,7 @@ internal static class TestCaseEndpoints
         {
             Name = req.Name,
             Description = req.Description ?? string.Empty,
-            SourceWorkItemId = req.SourceWorkItemId,
+            SourceWorkItemId = normalisedSourceWorkItemId,
             UpdatedAt = DateTimeOffset.UtcNow,
             IsArchived = req.IsArchived,
             AutomationKind = req.AutomationKind,

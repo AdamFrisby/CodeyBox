@@ -23,6 +23,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxTemplateChecks must be between 1 and {CodeyBoxOptions.MaximumMaxTemplateChecks}");
         }
 
+        if (options.MaxBulkItems <= 0)
+        {
+            failures.Add("CodeyBox:MaxBulkItems must be a positive integer");
+        }
+
         foreach (var (agent, tolerance) in options.AgentNetworkTolerance)
         {
             if (string.IsNullOrWhiteSpace(agent))
