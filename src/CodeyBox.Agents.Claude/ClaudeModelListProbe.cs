@@ -26,7 +26,7 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
     internal const string ModelsEndpoint = "https://api.anthropic.com/v1/models";
     internal const string AnthropicVersion = "2023-06-01";
     internal const string OAuthDeclinedReason = "subscription OAuth not supported for /v1/models (account-safety); configure ANTHROPIC_API_KEY to enable ModelId validation";
-    private const int MaxResponseChars = 256 * 1024;
+    internal const int MaxResponseChars = 256 * 1024;
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<(string? OAuthToken, string? ApiKey)> _credentialsProvider;
@@ -107,7 +107,7 @@ public sealed class ClaudeModelListProbe : IAgentModelListProbe
         }
     }
 
-    private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
+    internal static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
     {
         await using var stream = await content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);

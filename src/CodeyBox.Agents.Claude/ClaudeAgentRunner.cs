@@ -577,7 +577,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
             using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var responseText = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            if (responseText is null)
+            {
+                return new TextOnlyAgentResult(
+                    false,
+                    "Claude text-only call failed: response too large",
+                    null,
+                    "Response size exceeded 256 KiB limit.");
+            }
             if (!response.IsSuccessStatusCode)
             {
                 var summary = canonicalModel == requestedModel
@@ -613,7 +621,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             if (!response.IsSuccessStatusCode)
                 return requested;
 
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var body = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            if (body is null)
+                return requested;
             var ids = ParseModelIds(body);
             return ResolveCanonicalModelId(requested, ids);
         }
