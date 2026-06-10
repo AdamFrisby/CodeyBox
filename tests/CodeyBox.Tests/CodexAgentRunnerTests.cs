@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -254,21 +256,49 @@ public sealed class CodexAgentRunnerTests
             {
                 ["codex"] = "gpt-5.5",
             });
-        var runner = new CodexAgentRunner(defaults);
+        var handler = new CapturingCodexHandler(HttpStatusCode.Unauthorized,
+            """{"error":{"message":"placeholder rejected"}}""");
+        var runner = new CodexAgentRunner(defaults, new HttpClient(handler));
         var cred = new AgentCredential(AgentKind.Codex,
             new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
             new Dictionary<string, string>());
 
-        // The call will fail because the sandbox resolves to a bogus host, but
-        // we can still verify the error message signals a model-aware failure
-        // rather than a null-model reject.
         var result = await runner.RunTextOnlyAsync("hello", cred);
 
         Assert.False(result.Success);
-        // API will reject with a 4xx or DNS failure, but NOT with our new
-        // "no default configured" guard.
+        // The "no default configured" guard would have returned before any HTTP
+        // call — assert we got past it and into the request-construction path.
         Assert.DoesNotContain("no default configured", result.Summary);
         Assert.DoesNotContain("no default configured", result.Error);
+        Assert.NotNull(handler.LastRequestBody);
+        Assert.Contains("\"model\":\"gpt-5.5\"", handler.LastRequestBody);
+    }
+
+    private sealed class CapturingCodexHandler : HttpMessageHandler
+    {
+        private readonly HttpStatusCode _status;
+        private readonly string _body;
+
+        public CapturingCodexHandler(HttpStatusCode status, string body)
+        {
+            _status = status;
+            _body = body;
+        }
+
+        public HttpRequestMessage? LastRequest { get; private set; }
+        public string? LastRequestBody { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            if (request.Content is not null)
+                LastRequestBody = await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            return new HttpResponseMessage(_status)
+            {
+                Content = new StringContent(_body),
+            };
+        }
     }
 
     [Fact]

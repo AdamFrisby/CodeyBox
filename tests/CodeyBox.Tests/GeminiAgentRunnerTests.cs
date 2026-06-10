@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -571,12 +573,13 @@ public sealed class GeminiAgentRunnerTests
     {
         // With a valid OAuth-only bundle (no GEMINI_API_KEY), RunTextOnlyAsync
         // must not return the "missing credential" failure — it must instead
-        // proceed to the Code Assist HTTP call. The call itself will fail
-        // (the placeholder token is rejected upstream / no network reachable
-        // from the unit test), but the failure shape must be the HTTP path,
-        // not the early-return guard. This is what makes the conflict
-        // resolver cascade routable to gemini under subscription OAuth.
-        var runner = new GeminiAgentRunner();
+        // proceed to the Code Assist HTTP call. The fake handler proves the
+        // call reached the HTTP path; the early-return guard would never have
+        // sent a request. This is what makes the conflict resolver cascade
+        // routable to gemini under subscription OAuth.
+        var handler = new CapturingGeminiHandler(HttpStatusCode.Unauthorized,
+            """{"error":{"message":"placeholder rejected"}}""");
+        var runner = new GeminiAgentRunner(new HttpClient(handler));
         var cred = new AgentCredential(AgentKind.Gemini,
             new Dictionary<string, string>
             {
@@ -589,6 +592,39 @@ public sealed class GeminiAgentRunnerTests
         // The early-return guard would have produced this exact summary;
         // assert we got past it.
         Assert.NotEqual("missing Gemini text-only credential", result.Summary);
+        // The OAuth path is the only one a CODEYBOX_GEMINI_OAUTH_CREDS_JSON-only
+        // bundle can route through — confirm the request actually fired against
+        // the Code Assist endpoint (not the API-key endpoint).
+        Assert.NotNull(handler.LastRequest);
+        Assert.Equal(GeminiAgentRunner.OAuthGenerateContentEndpoint,
+            handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    private sealed class CapturingGeminiHandler : HttpMessageHandler
+    {
+        private readonly HttpStatusCode _status;
+        private readonly string _body;
+
+        public CapturingGeminiHandler(HttpStatusCode status, string body)
+        {
+            _status = status;
+            _body = body;
+        }
+
+        public HttpRequestMessage? LastRequest { get; private set; }
+        public string? LastRequestBody { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            if (request.Content is not null)
+                LastRequestBody = await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            return new HttpResponseMessage(_status)
+            {
+                Content = new StringContent(_body),
+            };
+        }
     }
 
     // ── ExtractResponseText shape handling ────────────────────────────────────

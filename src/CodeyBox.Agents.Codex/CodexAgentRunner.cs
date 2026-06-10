@@ -19,15 +19,25 @@ namespace CodeyBox.Agents.Codex;
 public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
-    private static readonly HttpClient TextOnlyHttp = new();
+    private static readonly HttpClient SharedTextOnlyHttp = new();
 
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly HttpClient _textOnlyHttp;
 
-    public CodexAgentRunner() : this(defaults: null) { }
+    public CodexAgentRunner() : this(defaults: null, textOnlyHttp: null) { }
 
-    public CodexAgentRunner(AgentDefaultsSnapshot? defaults)
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, textOnlyHttp: null) { }
+
+    /// <summary>
+    /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
+    /// backed by a fake <see cref="HttpMessageHandler"/> so the text-only
+    /// path can be exercised offline without reaching api.openai.com.
+    /// Production wiring uses the process-wide shared HttpClient.
+    /// </summary>
+    internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, HttpClient? textOnlyHttp)
     {
         _defaults = defaults;
+        _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
 
     public override AgentKind Kind => AgentKind.Codex;
@@ -175,7 +185,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
             var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Codex text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);

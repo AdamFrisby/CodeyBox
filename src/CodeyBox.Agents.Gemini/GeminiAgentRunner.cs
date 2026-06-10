@@ -15,7 +15,23 @@ namespace CodeyBox.Agents.Gemini;
 /// </summary>
 public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
-    private static readonly HttpClient TextOnlyHttp = new();
+    private static readonly HttpClient SharedTextOnlyHttp = new();
+
+    private readonly HttpClient _textOnlyHttp;
+
+    public GeminiAgentRunner() : this(textOnlyHttp: null) { }
+
+    /// <summary>
+    /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
+    /// backed by a fake <see cref="HttpMessageHandler"/> so the text-only
+    /// path can be exercised offline without reaching the Code Assist /
+    /// public Gemini endpoints. Production wiring uses the process-wide
+    /// shared HttpClient.
+    /// </summary>
+    internal GeminiAgentRunner(HttpClient? textOnlyHttp)
+    {
+        _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
+    }
 
     // @google/gemini-cli emits ANSI colour codes and progress spinners to
     // stderr (and occasionally stdout) even in non-TTY mode. Strip them so
@@ -182,14 +198,14 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // API-key first preference: pay-per-use callers explicitly configured
         // GEMINI_API_KEY and expect that quota to be spent, not the OAuth one.
         if (TryGetApiKey(credential, out var apiKey))
-            return await SendApiKeyAsync(prompt, apiKey, modelId, ct).ConfigureAwait(false);
+            return await SendApiKeyAsync(_textOnlyHttp, prompt, apiKey, modelId, ct).ConfigureAwait(false);
 
         // OAuth subscription fallback: authorized for Gemini specifically (the
         // operator note explicitly permits subscription-OAuth usage against
         // Gemini's API directly; this is the resolver-cascade workaround until
         // the agentic in-VM resolver lands).
         if (TryGetOAuthAccessToken(credential, out var oauthToken))
-            return await SendOAuthAsync(prompt, oauthToken, modelId, ct).ConfigureAwait(false);
+            return await SendOAuthAsync(_textOnlyHttp, prompt, oauthToken, modelId, ct).ConfigureAwait(false);
 
         return new TextOnlyAgentResult(
             false,
@@ -199,7 +215,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     }
 
     private static async Task<TextOnlyAgentResult> SendApiKeyAsync(
-        string prompt, string apiKey, string? modelId, CancellationToken ct)
+        HttpClient http, string prompt, string apiKey, string? modelId, CancellationToken ct)
     {
         try
         {
@@ -223,7 +239,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             };
             request.Headers.Add("x-goog-api-key", apiKey);
 
-            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
             var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Gemini text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
@@ -237,7 +253,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     }
 
     private static async Task<TextOnlyAgentResult> SendOAuthAsync(
-        string prompt, string accessToken, string? modelId, CancellationToken ct)
+        HttpClient http, string prompt, string accessToken, string? modelId, CancellationToken ct)
     {
         try
         {
@@ -266,7 +282,7 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            using var response = await TextOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
             var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Gemini text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
