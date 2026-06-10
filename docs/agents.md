@@ -636,9 +636,22 @@ semantics for free.
 sign-in once. agy stores the token in the system keyring (Secret Service);
 extract it (service `gemini`, username `antigravity`) into a file — its native
 shape is `{"auth_method":…,"token":{"access_token":…,"refresh_token":…,"expiry":…}}`.
-Point CodeyBox at that file's contents via the
-`CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` env var (or a per-instance
-`AgentCredentialReference` `FilePath`). The runner materialises the bundle to
+Point CodeyBox at that file's contents via one of:
+
+- `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` env var carrying the JSON inline.
+  Read **once** at process launch, so a keyring re-dump requires an
+  orchestrator restart. Convenient when the supervisor reads the keyring at
+  service start and never rotates.
+- A per-instance `AgentCredentialReference.FilePath` on the antigravity
+  `AgentMembership` (set via `CredentialFilePath` on the agent-class member
+  or agent instance in config). Read **fresh on every dispatch** by
+  `AgentInstanceCredentialResolver`, so an out-of-band re-dump of the file
+  (e.g. by a periodic keyring → file refresher) is picked up on the next
+  antigravity dispatch with no restart. Use this when the keyring token
+  rotates and the supervisor can re-dump at intervals shorter than the
+  refresh-token lifetime.
+
+The runner materialises the bundle to
 `~/.gemini/antigravity-cli/antigravity-oauth-token` inside the sandbox at
 prepare-time with `chmod 600` — agy's `fileTokenStorage` path, used when no
 system keyring is present (every headless sandbox). The refresh token **is**
