@@ -1970,6 +1970,11 @@ builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemQuestionStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<ITestCaseStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteTestCaseStore(opts.StateDatabasePath);
+});
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2893,6 +2898,7 @@ app.UseApiKeyAuth(
 IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
+TestCaseEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
