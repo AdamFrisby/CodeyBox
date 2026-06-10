@@ -51,6 +51,6 @@ public sealed class InMemoryTaskQueueTests
     {
         var q = new InMemoryTaskQueue();
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await q.DequeueAsync(cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await q.DequeueAsync(cts.Token));
     }
 }

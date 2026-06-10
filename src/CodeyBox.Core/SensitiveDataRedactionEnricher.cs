@@ -36,6 +36,7 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         + @"|sk-proj-[A-Za-z0-9_-]+"
         + @"|sk-[A-Za-z0-9_-]{20,}"
         + @"|sk_live_[A-Za-z0-9]{16,}"
+        + @"|sk_test_[A-Za-z0-9]+"
         + @"|rk_live_[A-Za-z0-9]{16,}"
         + @"|whsec_[A-Za-z0-9]{16,}"
         + @"|AIza[A-Za-z0-9_-]{35,}"

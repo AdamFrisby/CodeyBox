@@ -96,6 +96,14 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_StripeTestKey_IsReplaced()
+    {
+        var result = RawOutputRedactor.Redact("Update the changelog without leaking sk_test_123456.");
+        Assert.DoesNotContain("sk_test_123456", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
     public void Redact_SlackBotAppAndRefreshTokens_AreReplaced()
     {
         var result = RawOutputRedactor.Redact(
