@@ -68,11 +68,11 @@ public static class AntigravityKnownModels
         if (string.IsNullOrWhiteSpace(modelId)) return null;
         if (IsKnown(modelId)) return null;
         var message = $"AgentClass '{classId}': Antigravity member ModelId '{modelId}' is not in the known " +
-            $"provider list ({string.Join(", ", All)}). Quota probes will treat this id as unknown unless the " +
-            "model is in the live retrieveUserQuotaSummary response.";
+            $"provider list ({string.Join(", ", All)}). The agy CLI may accept newer ids this list hasn't been " +
+            "taught yet; double-check for a typo.";
         log.LogWarning(
             "AgentClass '{ClassId}': Antigravity member ModelId '{ModelId}' is not in the known provider list ({Known}). " +
-            "Quota probes will treat this id as unknown unless the model is in the live retrieveUserQuotaSummary response.",
+            "The agy CLI may accept newer ids this list hasn't been taught yet; double-check for a typo.",
             classId, modelId, string.Join(", ", All));
         return message;
     }

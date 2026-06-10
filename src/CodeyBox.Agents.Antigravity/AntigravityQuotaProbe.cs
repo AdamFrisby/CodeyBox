@@ -8,46 +8,75 @@ using CodeyBox.Core;
 namespace CodeyBox.Agents.Antigravity;
 
 /// <summary>
-/// Probes the cloudcode-pa Code Assist family for Antigravity (<c>agy</c>)
-/// availability. The CLI itself exposes <em>no</em> usage/quota/whoami
-/// command, so the probe must INFER availability from gateway state.
+/// Probes the Antigravity (<c>agy</c>) gateway for availability. The CLI exposes
+/// <em>no</em> usage/quota/whoami command, so the probe must INFER availability
+/// from gateway state.
 ///
-/// <para><b>Per-model gating.</b> Antigravity's gateway meters each gateway
-/// model (gemini-3.5-flash-high, claude-opus-4-6-thinking, gpt-oss-120b-medium,
-/// …) on its OWN request bucket. The router already keys exhaustion as
-/// <c>(AgentKind, ModelId)</c> so the natural design is one
-/// <see cref="AgentMembership"/> per accepted gateway model; the probe then
-/// gates each membership on its own bucket and the router fails over
-/// model-by-model. We do NOT introduce a separate "sub-subscription pool"
-/// subsystem — the existing per-model exhaustion key already gives us the
-/// pool semantics.</para>
+/// <para><b>Surface (verified 2026-06-10, agy 1.0.7).</b> The <c>agy</c> binary
+/// itself talks to <c>daily-cloudcode-pa.googleapis.com/v1internal</c> (NOT the
+/// <c>cloudcode-pa</c> host the Gemini Code Assist probes use). On that host,
+/// for our Sign-in-with-Google credential:
+/// <list type="bullet">
+///   <item><description><c>:loadCodeAssist</c> with
+///   <c>{"metadata":{"pluginType":"GEMINI"}}</c> → <b>200</b>, returning the
+///   account's tier (<c>currentTier</c>/<c>paidTier</c>, e.g.
+///   <c>g1-pro-tier</c> = Google One AI Pro). Costs no generation — it is a
+///   pure authorization/tier read.</description></item>
+///   <item><description><c>:retrieveUserQuotaSummary</c> and
+///   <c>:retrieveUserQuota</c> → <b>403 PERMISSION_DENIED</b> for every body
+///   shape. There is NO readable per-model quota meter on this surface, so the
+///   probe cannot report a real remaining-fraction.</description></item>
+///   <item><description><c>:fetchAvailableModels</c> → <b>403</b>; the gateway
+///   model list comes from <see cref="AntigravityKnownModels"/>, not a live
+///   read.</description></item>
+/// </list></para>
 ///
-/// <para><b>Signal selection.</b> Two endpoints share the family with the
-/// Gemini probe: <c>:retrieveUserQuotaSummary</c> (preferred when the response
-/// carries per-window/tier data cleanly) and <c>:retrieveUserQuota</c>
-/// (per-model bucket fragments). When neither endpoint yields a per-model
-/// reading for the requested model, the probe falls back to a minimum-cost
-/// <c>:generateContent</c> live ping at that model — 200 ⇒ available, 429 ⇒
-/// rate-limited (Retry-After / lockout reset is propagated), anything else ⇒
-/// unknown. This matches the Gemini live-ping fallback rationale (the per-
-/// model bucket reading can read 100% while a live call returns 429).</para>
+/// <para><b>Design.</b> Because no quota-number endpoint is reachable, the probe
+/// is an <em>authorization/liveness</em> signal: a 200 from <c>:loadCodeAssist</c>
+/// means the credential is valid and the subscription is active ⇒ dispatchable
+/// (reported as 100% available). A 429 surfaces the gateway reset so a weekly
+/// lockout parks the member. Any other status is Unknown (the router's
+/// QuotaUnknownPolicy decides). We deliberately do NOT issue a live
+/// <c>:generateContent</c> ping for routine probing — that would burn a request
+/// from the very (weekly-capped) quota we are trying to preserve.</para>
+///
+/// <para><b>Per-model 429 gating.</b> Antigravity meters each gateway model
+/// (gemini-3.5-flash-high, claude-opus-4-6-thinking, gpt-oss-120b-medium, …) on
+/// its own bucket, keyed by the router as <c>(AgentKind, ModelId)</c>. Since the
+/// buckets are not readable up front, per-model exhaustion is learned reactively:
+/// the runner calls <see cref="MarkExhaustedAsync"/> on a real 429 (with the
+/// gateway's reset / <c>lockout_until</c>), and that synthetic 0% override gates
+/// subsequent picks of that model until the reset moment.</para>
 ///
 /// <para><b>7-day lockout handling.</b> AI Pro caps weekly with up to a 7-day
-/// lockout on cap breach. The probe must surface that absolute reset time
-/// (not a "next 5 min" Retry-After) so failed work items park cleanly in
-/// <c>WaitingForQuotaReset</c> instead of churning. We honour both Retry-After
-/// (when the gateway emits delta-seconds) and the structured
-/// <c>quota_metadata.lockout_until</c> field that the gateway is observed to
-/// emit alongside 429.</para>
+/// lockout on cap breach. When a 429 carries an absolute reset (Retry-After date
+/// or the structured <c>quota_metadata.lockout_until</c> the failure detector
+/// reads), the probe surfaces that exact moment so failed items park cleanly in
+/// <c>WaitingForQuotaReset</c> instead of churning.</para>
 /// </summary>
 public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
 {
-    internal const string QuotaSummaryEndpoint =
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-    internal const string QuotaEndpoint =
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-    internal const string GenerateContentEndpoint =
-        "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+    /// <summary>
+    /// The <c>agy</c> gateway host. The <c>daily-</c> prefix is what agy 1.0.7
+    /// ships; kept as a single constant so a future build that moves hosts is a
+    /// one-line change shared by every RPC below.
+    /// </summary>
+    internal const string GatewayBase = "https://daily-cloudcode-pa.googleapis.com/v1internal";
+
+    /// <summary>
+    /// Authorization/tier read. 200 ⇒ credential valid + subscription active.
+    /// The only gateway RPC that answers for our credential without spending
+    /// quota; the <c>:retrieveUserQuota*</c> meters return 403.
+    /// </summary>
+    internal const string LoadCodeAssistEndpoint = GatewayBase + ":loadCodeAssist";
+
+    /// <summary>
+    /// Request body for <see cref="LoadCodeAssistEndpoint"/>. <c>pluginType</c>
+    /// must be <c>GEMINI</c> — the proto on this host rejects <c>ANTIGRAVITY</c>
+    /// (400 "Invalid value at 'metadata.plugin_type'"); GEMINI returns the same
+    /// account/tier the agy credential is backed by.
+    /// </summary>
+    private const string LoadCodeAssistBody = "{\"metadata\":{\"pluginType\":\"GEMINI\"}}";
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
@@ -111,9 +140,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
             if (_cache.TryGetValue(cacheKey, out var entry) && entry.ExpiresAt > now)
                 return entry.Snapshot;
 
-            snapshot = string.IsNullOrEmpty(modelKey)
-                ? await FetchTierSignalAsync(token, ct).ConfigureAwait(false)
-                : await FetchSingleAsync(token, modelKey, ct).ConfigureAwait(false);
+            snapshot = await ProbeAuthorizationAsync(token, modelKey, ct).ConfigureAwait(false);
             _cache[cacheKey] = new CacheEntry(snapshot, now + _cacheTtl);
         }
         finally
@@ -163,151 +190,70 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
     private const int MaxResponseChars = 64 * 1024;
 
     /// <summary>
-    /// Per-model probe. Prefers <c>:retrieveUserQuotaSummary</c>, then
-    /// <c>:retrieveUserQuota</c>, then a live <c>:generateContent</c> ping at
-    /// the requested model id.
+    /// Reads <c>:loadCodeAssist</c> as the authorization/liveness signal.
+    /// <list type="bullet">
+    ///   <item><description>200 ⇒ credential valid + subscription active ⇒
+    ///   available (100%). When a <paramref name="modelId"/> is supplied the
+    ///   reading is mirrored into <c>PerModel</c> so the router's per-model key
+    ///   has an entry.</description></item>
+    ///   <item><description>429 ⇒ rate-limited / weekly lockout; surfaces the
+    ///   gateway reset.</description></item>
+    ///   <item><description>anything else (401/403/5xx/transport) ⇒ Unknown; the
+    ///   router's QuotaUnknownPolicy decides.</description></item>
+    /// </list>
     /// </summary>
-    internal async Task<AgentQuotaSnapshot> FetchSingleAsync(string token, string modelId, CancellationToken ct)
-    {
-        var summary = await TryReadSummaryAsync(token, ct).ConfigureAwait(false);
-        if (summary is not null && summary.PerModel.TryGetValue(modelId, out var modelQuota))
-        {
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = modelQuota.AvailablePct,
-                ResetAt = modelQuota.ResetAt,
-                Notes = "retrieveUserQuotaSummary",
-                PerModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [modelId] = modelQuota,
-                },
-            };
-        }
-
-        var legacy = await TryReadQuotaAsync(token, ct).ConfigureAwait(false);
-        if (legacy is not null && legacy.PerModel.TryGetValue(modelId, out var legacyQuota))
-        {
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = legacyQuota.AvailablePct,
-                ResetAt = legacyQuota.ResetAt,
-                Notes = "retrieveUserQuota",
-                PerModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [modelId] = legacyQuota,
-                },
-            };
-        }
-
-        // Live ping fallback: matches GeminiQuotaProbe.ProbeOneAsync.
-        var live = await LivePingAsync(token, modelId, ct).ConfigureAwait(false);
-        if (live.Status is null)
-            return Unknown($"live probe of {modelId}: transient error");
-        if (live.Status == HttpStatusCode.OK)
-        {
-            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
-            {
-                [modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" },
-            };
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = 100.0,
-                ResetAt = null,
-                Notes = $"live probe via {modelId}",
-                PerModel = perModel,
-            };
-        }
-        if (live.Status == HttpStatusCode.TooManyRequests)
-        {
-            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
-            {
-                [modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = live.ResetAt, Window = "REQUESTS" },
-            };
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = 0.0,
-                ResetAt = live.ResetAt,
-                Notes = $"live probe via {modelId}: rate-limited",
-                PerModel = perModel,
-            };
-        }
-        return Unknown($"live probe of {modelId}: HTTP {(int)live.Status.Value}");
-    }
-
-    /// <summary>
-    /// Legacy fallback for callers that don't configure a ModelId. Hits
-    /// <c>:retrieveUserQuotaSummary</c> for an overall snapshot; falls back to
-    /// <c>:retrieveUserQuota</c>. The most-constrained bucket becomes the
-    /// reported <c>AvailablePct</c>.
-    /// </summary>
-    internal async Task<AgentQuotaSnapshot> FetchTierSignalAsync(string token, CancellationToken ct)
-    {
-        var summary = await TryReadSummaryAsync(token, ct).ConfigureAwait(false);
-        if (summary is not null) return summary;
-        var legacy = await TryReadQuotaAsync(token, ct).ConfigureAwait(false);
-        return legacy ?? Unknown("no tier signal");
-    }
-
-    private async Task<AgentQuotaSnapshot?> TryReadSummaryAsync(string token, CancellationToken ct)
-        => await TryReadJsonAsync(token, QuotaSummaryEndpoint, ParseSummaryResponse, ct).ConfigureAwait(false);
-
-    private async Task<AgentQuotaSnapshot?> TryReadQuotaAsync(string token, CancellationToken ct)
-        => await TryReadJsonAsync(token, QuotaEndpoint, ParseQuotaResponse, ct).ConfigureAwait(false);
-
-    private async Task<AgentQuotaSnapshot?> TryReadJsonAsync(
-        string token,
-        string endpoint,
-        Func<string, AgentQuotaSnapshot?> parser,
-        CancellationToken ct)
+    internal async Task<AgentQuotaSnapshot> ProbeAuthorizationAsync(string token, string modelId, CancellationToken ct)
     {
         try
         {
             var client = _httpClientFactory.CreateClient("agent-quota");
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            using var request = new HttpRequestMessage(HttpMethod.Post, LoadCodeAssistEndpoint);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            request.Content = new StringContent(LoadCodeAssistBody, Encoding.UTF8, "application/json");
 
             using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-            {
-                _log.LogDebug("Antigravity {Endpoint} returned {StatusCode}", endpoint, (int)response.StatusCode);
-                return null;
-            }
-            var body = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-            if (body is null) return null;
-            return parser(body);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _log.LogDebug(ex, "Antigravity quota endpoint {Endpoint} failed", endpoint);
-            return null;
-        }
-    }
 
-    internal async Task<LivePingResult> LivePingAsync(string token, string modelId, CancellationToken ct)
-    {
-        try
-        {
-            var client = _httpClientFactory.CreateClient("agent-quota");
-            using var request = new HttpRequestMessage(HttpMethod.Post, GenerateContentEndpoint);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            var body = "{\"model\":\"models/" + modelId
-                + "\",\"request\":{\"contents\":[{\"parts\":[{\"text\":\"ping\"}]}],"
-                + "\"generationConfig\":{\"maxOutputTokens\":1}}}";
-            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
-
-            using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
                 var reset = TryParseRetryAfter(response, _timeProvider.GetUtcNow())
                     ?? await TryParseStructuredResetAsync(response, ct).ConfigureAwait(false);
-                return new LivePingResult(response.StatusCode, reset);
+                var perModel0 = string.IsNullOrEmpty(modelId)
+                    ? new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [modelId] = new ModelQuota { AvailablePct = 0.0, ResetAt = reset, Window = "REQUESTS" },
+                    };
+                return new AgentQuotaSnapshot
+                {
+                    AvailablePct = 0.0,
+                    ResetAt = reset,
+                    Notes = "loadCodeAssist: rate-limited",
+                    PerModel = perModel0,
+                };
             }
-            return new LivePingResult(response.StatusCode, null);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogDebug("Antigravity loadCodeAssist returned {StatusCode}", (int)response.StatusCode);
+                return Unknown($"loadCodeAssist: HTTP {(int)response.StatusCode}");
+            }
+
+            var body = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            var tier = body is null ? null : ParseTier(body);
+            var note = tier is null ? "loadCodeAssist: authorized" : $"loadCodeAssist: authorized (tier={tier})";
+            var perModel = string.IsNullOrEmpty(modelId)
+                ? new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [modelId] = new ModelQuota { AvailablePct = 100.0, ResetAt = null, Window = "REQUESTS" },
+                };
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = 100.0,
+                ResetAt = null,
+                Notes = note,
+                PerModel = perModel,
+            };
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -315,9 +261,34 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex, "Antigravity live probe failed");
-            return new LivePingResult(null, null);
+            _log.LogDebug(ex, "Antigravity loadCodeAssist probe failed");
+            return Unknown("loadCodeAssist: transient error");
         }
+    }
+
+    /// <summary>
+    /// Extracts a human-readable tier label from a <c>:loadCodeAssist</c> 200
+    /// body for the snapshot Notes. Prefers <c>paidTier.id</c> (e.g.
+    /// <c>g1-pro-tier</c>) then <c>currentTier.id</c>. Display-only; never gates.
+    /// </summary>
+    internal static string? ParseTier(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+            return TierId(root, "paidTier") ?? TierId(root, "currentTier");
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        static string? TierId(JsonElement root, string name) =>
+            root.TryGetProperty(name, out var t) && t.ValueKind == JsonValueKind.Object
+                ? TryGetString(t, "id")
+                : null;
     }
 
     private static DateTimeOffset? TryParseRetryAfter(HttpResponseMessage response, DateTimeOffset now)
@@ -329,7 +300,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         return null;
     }
 
-    private static async Task<DateTimeOffset?> TryParseStructuredResetAsync(HttpResponseMessage response, CancellationToken ct)
+    private async Task<DateTimeOffset?> TryParseStructuredResetAsync(HttpResponseMessage response, CancellationToken ct)
     {
         // The gateway has been observed to surface lockout_until alongside 429
         // bodies. Try to parse it so a 7-day lockout pins ResetAt to the exact
@@ -345,8 +316,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
             return null;
         }
     }
-
-    internal record struct LivePingResult(HttpStatusCode? Status, DateTimeOffset? ResetAt);
 
     private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
     {
@@ -364,163 +333,12 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         return new string(buffer, 0, totalRead);
     }
 
-    /// <summary>
-    /// Parses the <c>retrieveUserQuotaSummary</c> response. Expected shape:
-    /// <code>
-    /// {
-    ///   "windows": [{"name":"weekly","remainingFraction":0.42,"resetTime":"2026-06-16T12:00:00Z"}, ...],
-    ///   "perModel": [{"modelId":"gemini-3.5-flash-high","remainingFraction":0.42,"resetTime":"...","window":"weekly"}, ...]
-    /// }
-    /// </code>
-    /// Either field may be absent on tiers without that meter. We also accept
-    /// the <c>retrieveUserQuota</c>-style <c>buckets</c> array as a defensive
-    /// alias so a quietly-renamed endpoint keeps parsing.
-    /// </summary>
-    internal static AgentQuotaSnapshot? ParseSummaryResponse(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return null;
-
-            var windows = new List<WindowQuota>();
-            ModelQuota? mostConstrained = null;
-
-            if (root.TryGetProperty("windows", out var winEl) && winEl.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var w in winEl.EnumerateArray())
-                {
-                    if (w.ValueKind != JsonValueKind.Object) continue;
-                    if (!TryGetDouble(w, "remainingFraction", out var remaining)) continue;
-                    var name = TryGetString(w, "name") ?? TryGetString(w, "window") ?? "window";
-                    var availPct = Math.Clamp(remaining * 100.0, 0.0, 100.0);
-                    var resetAt = TryGetResetTime(w);
-                    windows.Add(new WindowQuota { Name = name, AvailablePct = availPct, ResetAt = resetAt });
-                    var quota = new ModelQuota { AvailablePct = availPct, ResetAt = resetAt, Window = name };
-                    if (mostConstrained is null || quota.AvailablePct < mostConstrained.AvailablePct)
-                        mostConstrained = quota;
-                }
-            }
-
-            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
-            if (root.TryGetProperty("perModel", out var modelsEl) && modelsEl.ValueKind == JsonValueKind.Array)
-                CollectPerModel(modelsEl, perModel);
-            else if (root.TryGetProperty("buckets", out var bucketsEl) && bucketsEl.ValueKind == JsonValueKind.Array)
-                CollectPerModel(bucketsEl, perModel);
-
-            if (perModel.Count == 0 && mostConstrained is null) return null;
-
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = mostConstrained?.AvailablePct
-                    ?? (perModel.Count > 0 ? perModel.Values.Min(v => v.AvailablePct) : -1),
-                ResetAt = mostConstrained?.ResetAt,
-                Notes = null,
-                PerModel = perModel,
-                Windows = windows,
-            };
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Parses the legacy <c>retrieveUserQuota</c> response (the same bucket
-    /// array shape <c>GeminiQuotaProbe</c> reads). Used as a fallback when
-    /// <c>retrieveUserQuotaSummary</c> is absent or empty.
-    /// </summary>
-    internal static AgentQuotaSnapshot? ParseQuotaResponse(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("buckets", out var buckets) || buckets.ValueKind != JsonValueKind.Array)
-                return null;
-
-            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
-            CollectPerModel(buckets, perModel);
-            if (perModel.Count == 0) return null;
-
-            var mostConstrained = perModel.Values.MinBy(q => q.AvailablePct);
-            return new AgentQuotaSnapshot
-            {
-                AvailablePct = mostConstrained?.AvailablePct ?? -1,
-                ResetAt = mostConstrained?.ResetAt,
-                Notes = null,
-                PerModel = perModel,
-            };
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    private static void CollectPerModel(JsonElement array, Dictionary<string, ModelQuota> sink)
-    {
-        foreach (var bucket in array.EnumerateArray())
-        {
-            if (bucket.ValueKind != JsonValueKind.Object) continue;
-            var modelId = TryGetString(bucket, "modelId")
-                ?? TryGetString(bucket, "model")
-                ?? TryGetString(bucket, "limit_name");
-            if (string.IsNullOrWhiteSpace(modelId)) continue;
-            if (!TryGetDouble(bucket, "remainingFraction", out var remaining)
-                && !TryGetDouble(bucket, "remaining_fraction", out remaining))
-            {
-                continue;
-            }
-            var availPct = Math.Clamp(remaining * 100.0, 0.0, 100.0);
-            sink[modelId] = new ModelQuota
-            {
-                AvailablePct = availPct,
-                ResetAt = TryGetResetTime(bucket),
-                Window = TryGetString(bucket, "window") ?? TryGetString(bucket, "tokenType") ?? "REQUESTS",
-            };
-        }
-    }
-
-    private static bool TryGetDouble(JsonElement el, string name, out double value)
-    {
-        value = 0;
-        if (el.ValueKind != JsonValueKind.Object || !el.TryGetProperty(name, out var prop))
-            return false;
-        return prop.ValueKind switch
-        {
-            JsonValueKind.Number => prop.TryGetDouble(out value),
-            JsonValueKind.String => double.TryParse(prop.GetString(), out value),
-            _ => false,
-        };
-    }
-
     private static string? TryGetString(JsonElement el, string name) =>
         el.ValueKind == JsonValueKind.Object
         && el.TryGetProperty(name, out var value)
         && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
-
-    private static DateTimeOffset? TryGetResetTime(JsonElement el)
-    {
-        if (el.ValueKind != JsonValueKind.Object) return null;
-        foreach (var name in new[] { "resetTime", "reset_at", "lockoutUntil", "lockout_until" })
-        {
-            if (!el.TryGetProperty(name, out var prop)) continue;
-            if (prop.ValueKind == JsonValueKind.String
-                && DateTimeOffset.TryParse(prop.GetString(), out var parsed))
-                return parsed;
-            if (prop.ValueKind == JsonValueKind.Number && prop.TryGetInt64(out var unix))
-            {
-                try { return DateTimeOffset.FromUnixTimeSeconds(unix); }
-                catch (ArgumentOutOfRangeException) { /* fall through */ }
-            }
-        }
-        return null;
-    }
 
     private static AgentQuotaSnapshot Unknown(string reason) =>
         new() { AvailablePct = -1, Notes = reason };

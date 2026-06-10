@@ -1073,13 +1073,14 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
 builder.Services.AddSingleton<IAgentQuotaProbe>(_ => new OpencodeQuotaProbe());
-// Antigravity: shares the cloudcode-pa endpoint family with Gemini but is
-// metered separately per-model (each gateway model has its own bucket). The
-// probe prefers :retrieveUserQuotaSummary and falls back to :retrieveUserQuota
-// or a per-model live :generateContent ping. Token sources fall back to the
-// Gemini OAuth file since both CLIs use Sign-in-with-Google; operators with
-// distinct credentials can override via CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN or
-// per-instance CredentialReference.
+// Antigravity: the agy gateway exposes NO readable per-model quota meter
+// (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
+// :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
+// and learns per-model exhaustion reactively from runtime 429s. It does NOT
+// burn a live :generateContent ping for routine probing. Token sources fall
+// back to the Gemini OAuth file since both CLIs use Sign-in-with-Google;
+// operators with distinct credentials can override via
+// CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN or per-instance CredentialReference.
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
@@ -1358,21 +1359,12 @@ builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
         loggerFactory.CreateLogger<GeminiModelListProbe>());
 });
 builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
-// Antigravity model-list probe: reads the cloudcode-pa retrieveUserQuotaSummary
-// endpoint (with retrieveUserQuota fallback) using the same Sign-in-with-Google
-// OAuth source as Gemini, since `agy` shares Google's account/credentials path
-// but stores its tokens under a separate file.
-builder.Services.AddSingleton<IAgentModelListProbe>(sp =>
-{
-    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
-    return new AntigravityModelListProbe(
-        sp.GetRequiredService<IHttpClientFactory>(),
-        () => CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
-            ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
-            ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN"),
-        loggerFactory.CreateLogger<AntigravityModelListProbe>());
-});
+// Antigravity model-list probe: no reachable endpoint enumerates the agy
+// gateway models for our credential (the cloudcode-pa Code Assist surface
+// returns the wrong gemini-2.5 catalog; the daily-cloudcode-pa gateway 403s on
+// :retrieveUserQuota* and :fetchAvailableModels). The curated
+// AntigravityKnownModels list is authoritative, so the probe just returns it.
+builder.Services.AddSingleton<IAgentModelListProbe, AntigravityModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>

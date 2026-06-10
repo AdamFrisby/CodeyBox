@@ -3,82 +3,44 @@ using CodeyBox.Agents.Antigravity;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Parser-only tests for <see cref="AntigravityQuotaProbe"/>. The HTTP layer
-/// is exercised indirectly by the live-ping branch in
-/// <see cref="AntigravityAgentRunnerTests"/>; these tests pin the JSON
-/// shapes the probe is expected to accept across both
-/// <c>:retrieveUserQuotaSummary</c> and <c>:retrieveUserQuota</c>.
+/// Parser-only tests for <see cref="AntigravityQuotaProbe.ParseTier"/>. The
+/// JSON is a trimmed real <c>:loadCodeAssist</c> 200 response captured against
+/// agy 1.0.7 on 2026-06-10 (daily-cloudcode-pa). The tier label is display-only
+/// — it feeds the snapshot Notes, never gating — so the parser must be lenient.
 /// </summary>
 public sealed class AntigravityQuotaProbeParserTests
 {
     [Fact]
-    public void ParseSummaryResponse_PerModelArray_ReturnsPerModelQuotas()
+    public void ParseTier_RealLoadCodeAssistShape_PrefersPaidTier()
     {
+        // Captured shape: an AI Pro account carries both a currentTier
+        // (standard-tier) and a paidTier (g1-pro-tier). The paid tier is the
+        // more informative label for the Notes.
         var json = """
         {
-          "windows": [
-            {"name": "weekly", "remainingFraction": 0.42, "resetTime": "2026-06-16T12:00:00Z"}
-          ],
-          "perModel": [
-            {"modelId": "gemini-3.5-flash-high", "remainingFraction": 0.20, "resetTime": "2026-06-16T12:00:00Z", "window": "weekly"},
-            {"modelId": "claude-opus-4-6-thinking", "remainingFraction": 0.65, "resetTime": "2026-06-16T12:00:00Z", "window": "weekly"}
-          ]
+          "currentTier": {"id": "standard-tier", "name": "Gemini Code Assist"},
+          "allowedTiers": [{"id": "standard-tier", "isDefault": true}],
+          "cloudaicompanionProject": "example-project-id",
+          "gcpManaged": false,
+          "paidTier": {"id": "g1-pro-tier", "name": "Gemini Code Assist in Google One AI Pro"}
         }
         """;
 
-        var snap = AntigravityQuotaProbe.ParseSummaryResponse(json);
-
-        Assert.NotNull(snap);
-        Assert.Equal(2, snap!.PerModel.Count);
-        Assert.True(snap.PerModel.ContainsKey("gemini-3.5-flash-high"));
-        Assert.True(snap.PerModel.ContainsKey("claude-opus-4-6-thinking"));
-        Assert.Equal(20.0, snap.PerModel["gemini-3.5-flash-high"].AvailablePct, 1);
-        // Most-constrained window drives the aggregated AvailablePct.
-        Assert.Equal(42.0, snap.AvailablePct, 1);
+        Assert.Equal("g1-pro-tier", AntigravityQuotaProbe.ParseTier(json));
     }
 
     [Fact]
-    public void ParseSummaryResponse_BucketsAlias_StillParses()
+    public void ParseTier_NoPaidTier_FallsBackToCurrentTier()
     {
-        // Defensive alias: if Google quietly renames the array key back to
-        // "buckets" (matching retrieveUserQuota), the probe still works.
-        var json = """
-        {
-          "buckets": [
-            {"modelId": "gpt-oss-120b-medium", "remainingFraction": 0.10, "resetTime": "2026-06-16T12:00:00Z"}
-          ]
-        }
-        """;
-
-        var snap = AntigravityQuotaProbe.ParseSummaryResponse(json);
-
-        Assert.NotNull(snap);
-        Assert.Single(snap!.PerModel);
-        Assert.Equal(10.0, snap.PerModel["gpt-oss-120b-medium"].AvailablePct, 1);
+        var json = """{"currentTier": {"id": "standard-tier", "name": "Gemini Code Assist"}}""";
+        Assert.Equal("standard-tier", AntigravityQuotaProbe.ParseTier(json));
     }
 
     [Fact]
-    public void ParseQuotaResponse_PicksMostConstrainedBucket()
+    public void ParseTier_NoTierFields_ReturnsNull()
     {
-        var json = """
-        {
-          "buckets": [
-            {"modelId": "gemini-3.5-flash-medium", "remainingFraction": 0.90},
-            {"modelId": "gemini-3.5-flash-high", "remainingFraction": 0.05}
-          ]
-        }
-        """;
-
-        var snap = AntigravityQuotaProbe.ParseQuotaResponse(json);
-
-        Assert.NotNull(snap);
-        Assert.Equal(5.0, snap!.AvailablePct, 1);
-    }
-
-    [Fact]
-    public void ParseQuotaResponse_NoBuckets_ReturnsNull()
-    {
-        Assert.Null(AntigravityQuotaProbe.ParseQuotaResponse("""{"other":"shape"}"""));
-        Assert.Null(AntigravityQuotaProbe.ParseQuotaResponse("not json"));
+        Assert.Null(AntigravityQuotaProbe.ParseTier("""{"cloudaicompanionProject": "x"}"""));
+        Assert.Null(AntigravityQuotaProbe.ParseTier("{}"));
+        Assert.Null(AntigravityQuotaProbe.ParseTier("not json"));
     }
 }
