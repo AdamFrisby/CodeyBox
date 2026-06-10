@@ -4216,6 +4216,229 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("launch")]
+    [InlineData("start")]
+    [InlineData("stop")]
+    [InlineData("restart")]
+    [InlineData("suspend")]
+    [InlineData("delete")]
+    [InlineData("purge")]
+    [InlineData("mount")]
+    [InlineData("umount")]
+    [InlineData("transfer")]
+    [InlineData("clone")]
+    [InlineData("set")]
+    public void OpGate_ClassifiesLifecycleAndFilesystemOpsAsHeavy(string op)
+    {
+        // The verified contention surface on the snap-confined multipassd is
+        // lifecycle + filesystem ops, not exec or status polls. Pin every
+        // entry so a future rename of the gate semantic surfaces here.
+        Assert.True(MultipassSandboxProvider.IsHeavyMultipassOperation(
+            ["multipass", op, "some-vm"]));
+    }
+
+    [Theory]
+    [InlineData("exec")]
+    [InlineData("info")]
+    [InlineData("list")]
+    [InlineData("version")]
+    [InlineData("networks")]
+    [InlineData("get")]
+    [InlineData("find")]
+    [InlineData("alias")]
+    [InlineData("shell")]
+    public void OpGate_ClassifiesExecAndStatusOpsAsLight(string op)
+    {
+        // CRITICAL: `multipass exec` MUST classify as light. An agent run
+        // issues hundreds of exec calls against an already-booted VM, and
+        // gating those to N=2 would serialise the entire fleet.
+        Assert.False(MultipassSandboxProvider.IsHeavyMultipassOperation(
+            ["multipass", op, "some-vm"]));
+    }
+
+    [Fact]
+    public void OpGate_ClassifiesShortArgvAsLight()
+    {
+        // Defensive: a bare or unrecognised argv shouldn't accidentally
+        // serialise.
+        Assert.False(MultipassSandboxProvider.IsHeavyMultipassOperation([]));
+        Assert.False(MultipassSandboxProvider.IsHeavyMultipassOperation(["multipass"]));
+        Assert.False(MultipassSandboxProvider.IsHeavyMultipassOperation(
+            ["multipass", "definitely-not-a-real-subcommand"]));
+    }
+
+    [Fact]
+    public async Task OpGate_CapsConcurrentHeavyOpsAtConfiguredMax()
+    {
+        // Mirror of ProvisioningGate_CapsConcurrentBootsAtConfiguredMax but
+        // exercises the op-classifying entrypoint with the FULL heavy-op
+        // surface (mount / transfer / stop / delete / clone) — the verified
+        // root cause of the 2026-06-10/11 mount-stat-timeout cluster was
+        // these ops, not launch/start alone.
+        const int maxOps = 2;
+        var provider = NewProvider(maxConcurrentBoots: maxOps);
+        var concurrentCount = 0;
+        var maxObserved = 0;
+        var lockObj = new object();
+        var blocker = new SemaphoreSlim(0);
+        var filledBarrier = new TaskCompletionSource();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        // Vary the heavy op verb across acquisitions so the test pins that
+        // the SAME semaphore is shared across op types (transfer mustn't
+        // open its own ungated path because the verified breakage was a
+        // mix of mount + clone + transfer all hitting multipassd at once).
+        string[] heavyOps = ["mount", "transfer", "stop", "delete", "clone", "launch"];
+        const int totalTasks = 8;
+        var tasks = new Task[totalTasks];
+        for (var i = 0; i < tasks.Length; i++)
+        {
+            var op = heavyOps[i % heavyOps.Length];
+            tasks[i] = Task.Run(async () =>
+            {
+                var opts = new MultipassSandboxOptions { MaxConcurrentBoots = maxOps };
+                IReadOnlyList<string> argv = ["multipass", op, "vm-" + op];
+                using var gate = await provider.EnterMultipassOpGateAsync(opts, argv, cts.Token);
+                var count = Interlocked.Increment(ref concurrentCount);
+                lock (lockObj) { if (count > maxObserved) maxObserved = count; }
+                if (count >= maxOps)
+                    filledBarrier.TrySetResult();
+                await blocker.WaitAsync(cts.Token);
+                Interlocked.Decrement(ref concurrentCount);
+            });
+        }
+
+        await filledBarrier.Task.WaitAsync(cts.Token);
+        // Let any queued tasks settle so we can read the peak under lock.
+        await Task.Delay(200, cts.Token);
+
+        int observed;
+        lock (lockObj) { observed = maxObserved; }
+
+        Assert.True(observed <= maxOps,
+            $"Expected at most {maxOps} concurrent heavy multipass ops, observed {observed}");
+        Assert.True(observed == maxOps,
+            $"Expected exactly {maxOps} concurrent heavy multipass ops, observed {observed}");
+
+        blocker.Release(tasks.Length);
+        await Task.WhenAll(tasks);
+    }
+
+    [Fact]
+    public async Task OpGate_DoesNotGateExec()
+    {
+        // CRITICAL invariant from the work order: gating `multipass exec`
+        // would cripple fleet throughput (an agent run issues hundreds of
+        // execs against an already-booted VM). Pin that exec ALWAYS gets a
+        // no-op disposable so it runs at unbounded concurrency, even with
+        // MaxConcurrentBoots clamped to 1.
+        const int maxOps = 1;
+        var provider = NewProvider(maxConcurrentBoots: maxOps);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var opts = new MultipassSandboxOptions { MaxConcurrentBoots = maxOps };
+
+        const int execFanout = 16;
+        var concurrentExecs = 0;
+        var maxObservedExecs = 0;
+        var lockObj = new object();
+        var blocker = new TaskCompletionSource();
+        var saturated = new TaskCompletionSource();
+
+        var tasks = new Task[execFanout];
+        for (var i = 0; i < execFanout; i++)
+        {
+            tasks[i] = Task.Run(async () =>
+            {
+                IReadOnlyList<string> execArgv =
+                    ["multipass", "exec", "some-vm", "--", "echo", "hi"];
+                using var gate = await provider.EnterMultipassOpGateAsync(opts, execArgv, cts.Token);
+                var count = Interlocked.Increment(ref concurrentExecs);
+                lock (lockObj) { if (count > maxObservedExecs) maxObservedExecs = count; }
+                if (count >= execFanout)
+                    saturated.TrySetResult();
+                await blocker.Task.WaitAsync(cts.Token);
+                Interlocked.Decrement(ref concurrentExecs);
+            });
+        }
+
+        // If exec were being serialised by the boot gate (capacity 1),
+        // saturated would never complete and the timeout would fire.
+        await saturated.Task.WaitAsync(cts.Token);
+
+        int observed;
+        lock (lockObj) { observed = maxObservedExecs; }
+        Assert.Equal(execFanout, observed);
+
+        blocker.SetResult();
+        await Task.WhenAll(tasks);
+    }
+
+    [Fact]
+    public async Task OpGate_HeavyAndExecShareDifferentLanes()
+    {
+        // Pin the SCOPE separation directly: with MaxConcurrentBoots=1, a
+        // heavy op holds the only slot — but exec must still proceed
+        // immediately, because the op-gate hands exec a no-op disposable.
+        // Regression target: if a future refactor folds exec into the same
+        // semaphore, this test fails before fleet throughput silently
+        // collapses in production.
+        var provider = NewProvider(maxConcurrentBoots: 1);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var opts = new MultipassSandboxOptions { MaxConcurrentBoots = 1 };
+
+        // Hold the single heavy slot.
+        using var heavyHold = await provider.EnterMultipassOpGateAsync(
+            opts, ["multipass", "mount", "host", "vm:guest"], cts.Token);
+
+        // Exec must STILL acquire immediately even though the heavy lane is
+        // full — fan-out a few execs concurrently and require they all
+        // enter their gates within the deadline.
+        var execTasks = new Task[8];
+        for (var i = 0; i < execTasks.Length; i++)
+        {
+            execTasks[i] = Task.Run(async () =>
+            {
+                using var gate = await provider.EnterMultipassOpGateAsync(
+                    opts,
+                    ["multipass", "exec", "some-vm", "--", "echo", "hi"],
+                    cts.Token);
+                // Exit immediately; the assertion is "this completes
+                // without contending with the held heavy slot."
+            });
+        }
+        await Task.WhenAll(execTasks).WaitAsync(cts.Token);
+    }
+
+    [Fact]
+    public async Task OpGate_DoesNotApplyLaunchDelayToNonBootHeavyOps()
+    {
+        // BootLaunchDelay was added to stagger qemu spin-up; applying it
+        // to every transfer / stop / delete would needlessly slow down
+        // teardown without changing the IO-contention shape. Pin that
+        // non-boot heavy ops skip the stagger.
+        var provider = NewProvider(
+            maxConcurrentBoots: 4,
+            bootLaunchDelay: TimeSpan.FromMilliseconds(750));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var opts = new MultipassSandboxOptions
+        {
+            MaxConcurrentBoots = 4,
+            BootLaunchDelay = TimeSpan.FromMilliseconds(750),
+        };
+
+        var sw = Stopwatch.StartNew();
+        using var gate = await provider.EnterMultipassOpGateAsync(
+            opts, ["multipass", "transfer", "src", "dst"], cts.Token);
+        sw.Stop();
+
+        // 250ms slack covers thread-pool startup variance on cold runs.
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(250),
+            $"Expected transfer to skip BootLaunchDelay; elapsed {sw.Elapsed.TotalMilliseconds:F0}ms");
+    }
+
     [Fact]
     public async Task ProvisioningGate_ClampsInvalidMaxConcurrentBootsToOne()
     {

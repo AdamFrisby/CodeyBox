@@ -337,14 +337,15 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 var cloudInit = BuildCloudInit(opts.ExtraRuncmd, opts.ExtraCloudInit, spec.Flavor);
                 var cloudInitPath = Path.Combine(sandboxRoot, "cloud-init.yaml");
                 await File.WriteAllTextAsync(cloudInitPath, cloudInit, ct);
-                using (await EnterBootGateAsync(opts, ct))
+                // The op-gate inside RunAsync now bounds the `launch` CLI
+                // invocation against the heavy-op semaphore; the subsequent
+                // `info` polls in WaitForRunningAsync classify as light and
+                // run uncontended. No outer wrap needed.
+                await using (var launchScope = await TimingScope.BeginAsync(
+                    timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
                 {
-                    await using (var launchScope = await TimingScope.BeginAsync(
-                        timingStore, timingItemId, timingPhase, "vm.launch", log: _log))
-                    {
-                        await LaunchAsync(opts, name, spec, cloudInitPath, workItemId, ct);
-                        await WaitForRunningAsync(opts, name, workItemId, ct);
-                    }
+                    await LaunchAsync(opts, name, spec, cloudInitPath, workItemId, ct);
+                    await WaitForRunningAsync(opts, name, workItemId, ct);
                 }
                 // Stop the freshly-launched VM so we can mount (outside vm.launch scope).
                 var stop = await RunAsync(opts, [opts.MultipassBinary, "stop", name], stdin: null, ct: ct, workItemId: workItemId);
@@ -363,13 +364,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 await ApplyMountsAsync(opts, name, bindMounts, workItemId, ct);
             }
 
-            using (await EnterBootGateAsync(opts, ct))
+            // StartAndWaitForRunningAsync issues `multipass start` (heavy,
+            // gated inside RunAsync) followed by `info` polls (light,
+            // ungated). No outer wrap needed.
+            await using (var startScope = await TimingScope.BeginAsync(
+                timingStore, timingItemId, timingPhase, "vm.start", log: _log))
             {
-                await using (var startScope = await TimingScope.BeginAsync(
-                    timingStore, timingItemId, timingPhase, "vm.start", log: _log))
-                {
-                    await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
-                }
+                await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
             }
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
@@ -383,7 +384,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 onDisposed: MarkNoLongerActive,
                 onNoLongerTrackedActive: MarkNoLongerActive,
                 runner: _runner,
-                daemonRetryPolicy: _daemonRetryPolicy);
+                daemonRetryPolicy: _daemonRetryPolicy,
+                // Share the provider-wide heavy-op gate with the
+                // sandbox-instance lifecycle ops (transfer / stop /
+                // delete / suspend), so VM lifecycle calls and orchestrator
+                // provisioning calls compete for the same semaphore slots
+                // rather than each opening its own unbounded path to the
+                // multipass daemon.
+                opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct));
             // Register in the owner index ONLY when a work-item ID is present.
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
@@ -473,11 +481,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         // Wait for the transitional state to settle before starting.
         await WaitWhileSuspendingAsync(opts, name, ct);
 
-        ProcessRunResult run;
-        using (await EnterBootGateAsync(opts, ct))
-        {
-            run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
-        }
+        // `multipass start` classifies as heavy and is gated by RunAsync.
+        var run = await RunAsync(opts, [opts.MultipassBinary, "start", name], stdin: null, ct: ct);
         // Treat "already running" / "already started" as success: the goal of
         // ResumeSandboxAsync is "VM is Running afterwards", and multipass start
         // on an already-Running VM is the same desired postcondition. Exhausted
@@ -1485,20 +1490,19 @@ git push origin HEAD:{refName}";
 
         try
         {
-            using (await EnterBootGateAsync(opts, ct))
+            // baseline-launch is heavy and gated inside RunAsync; the
+            // follow-up WaitForRunning info polls are light and ungated.
+            var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
+            if (run.ExitCode != 0)
             {
-                var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
-                if (run.ExitCode != 0)
-                {
-                    ThrowIfProvisioningRetryExhausted("baseline-launch", run);
-                    throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
-                }
-
-                // Wait for the (now-minimal) cloud-init to finish — write_files
-                // and the route service install. Doesn't include the heavy
-                // installs, so should be fast.
-                await WaitForRunningAsync(opts, baselineName, workItemId, ct);
+                ThrowIfProvisioningRetryExhausted("baseline-launch", run);
+                throw new InvalidOperationException($"baseline launch failed: {run.Stderr}");
             }
+
+            // Wait for the (now-minimal) cloud-init to finish — write_files
+            // and the route service install. Doesn't include the heavy
+            // installs, so should be fast.
+            await WaitForRunningAsync(opts, baselineName, workItemId, ct);
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
@@ -2871,8 +2875,96 @@ test "$work" = present && test "$exec_wrapper" = present
     private MultipassSandboxOptions ReadOptions() => _optsAccessor();
 
     /// <summary>
+    /// Classifies a multipass argv as a "heavy" daemon/filesystem operation
+    /// that should be gated by the provisioning semaphore. Returns true for
+    /// the operations that exercise the daemon's MOUNT / lifecycle paths
+    /// (where the snap-confined multipassd has been observed stat-timing-out
+    /// under concurrent fan-out, breaking <c>git clone /repo /work</c> in the
+    /// sandbox with exit 128). Returns false for in-VM <c>multipass exec</c>
+    /// and read-only status calls (<c>info</c>, <c>list</c>, <c>version</c>,
+    /// …) — those are dispatched at fleet-wide concurrency, since serialising
+    /// them would gut throughput without addressing the contention source.
+    /// </summary>
+    internal static bool IsHeavyMultipassOperation(IReadOnlyList<string> argv)
+    {
+        if (argv.Count < 2) return false;
+        return argv[1] switch
+        {
+            // Lifecycle ops on the host VM (touch the daemon's instance store
+            // and qemu lifecycle): serialise.
+            "launch" or "start" or "stop" or "restart" or "suspend"
+            or "delete" or "purge"
+            // Filesystem ops (sshfs / native mounts, host↔VM file transfer,
+            // qcow2 clone): the verified contention point. SERIALISE.
+            or "mount" or "umount"
+            or "transfer" or "clone"
+            // Config writes (rare, but daemon-mutating).
+            or "set"
+                => true,
+            // exec: light. Hundreds per agent-run against an already-booted
+            // VM; gating these would cripple fleet throughput. info / list /
+            // version: read-only status polls used by WaitForRunning and
+            // friends. Anything else (networks, get, find, alias, shell, ...)
+            // is non-contention and falls through to ungated.
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// True iff this operation should incur the inter-boot stagger
+    /// (<see cref="MultipassSandboxOptions.BootLaunchDelay"/>) on gate
+    /// acquisition. Only <c>launch</c> and <c>start</c> need staggering —
+    /// that delay was added to space out qemu spin-up; applying it to
+    /// every transfer/stop/delete would needlessly slow down teardown
+    /// without changing the IO-contention shape.
+    /// </summary>
+    private static bool ShouldApplyLaunchDelay(IReadOnlyList<string> argv)
+    {
+        if (argv.Count < 2) return false;
+        return argv[1] is "launch" or "start";
+    }
+
+    /// <summary>
+    /// Acquires the provisioning gate for an operation classified as
+    /// "heavy" by <see cref="IsHeavyMultipassOperation"/> (mount / launch /
+    /// start / stop / transfer / delete / clone / …) — these are the
+    /// daemon/filesystem operations whose concurrent fan-out has been
+    /// observed to stat-time-out the snap-confined multipassd and fail
+    /// the in-sandbox <c>git clone /repo /work</c> with exit 128.
+    /// <para>
+    /// Light operations (<c>multipass exec</c>, status polls) return a
+    /// no-op disposable so they run at unbounded concurrency — gating
+    /// exec would cripple agent throughput without addressing the
+    /// observed contention source.
+    /// </para>
+    /// <para>
+    /// The gate is keyed off <see cref="MultipassSandboxOptions.MaxConcurrentBoots"/>
+    /// (kept for back-compat with the original boot-only semantic) and
+    /// is hot-reloadable: the semaphore is recreated when the configured
+    /// limit changes between acquisitions, under a lock guard.
+    /// </para>
+    /// </summary>
+    internal Task<IDisposable> EnterMultipassOpGateAsync(
+        MultipassSandboxOptions opts,
+        IReadOnlyList<string> argv,
+        CancellationToken ct)
+    {
+        if (!IsHeavyMultipassOperation(argv))
+            return Task.FromResult<IDisposable>(NoOpDisposable.Instance);
+        return AcquireGateSlotAsync(opts, ShouldApplyLaunchDelay(argv), ct);
+    }
+
+    /// <summary>
     /// Acquires the provisioning gate, limiting concurrent multipass
     /// launch/start operations to <see cref="MultipassSandboxOptions.MaxConcurrentBoots"/>.
+    /// <para>
+    /// Kept as the public/internal entry point for tests that exercise the
+    /// boot-stagger primitive directly. Always applies
+    /// <see cref="MultipassSandboxOptions.BootLaunchDelay"/>. For routing
+    /// arbitrary multipass operations through the same semaphore, prefer
+    /// <see cref="EnterMultipassOpGateAsync"/> which gates only heavy ops
+    /// and skips the delay for non-boot heavy operations.
+    /// </para>
     /// <para>
     /// The gate is hot-reloadable: if the configured limit changes between
     /// acquisitions the semaphore is recreated at the new size (lock-guarded).
@@ -2887,7 +2979,13 @@ test "$work" = present && test "$exec_wrapper" = present
     /// in-flight holders that later call Release() on a disposed object).
     /// </para>
     /// </summary>
-    internal async Task<IDisposable> EnterBootGateAsync(MultipassSandboxOptions opts, CancellationToken ct)
+    internal Task<IDisposable> EnterBootGateAsync(MultipassSandboxOptions opts, CancellationToken ct)
+        => AcquireGateSlotAsync(opts, applyLaunchDelay: true, ct);
+
+    private async Task<IDisposable> AcquireGateSlotAsync(
+        MultipassSandboxOptions opts,
+        bool applyLaunchDelay,
+        CancellationToken ct)
     {
         var desired = opts.MaxConcurrentBoots;
         if (desired < 1)
@@ -2921,6 +3019,9 @@ test "$work" = present && test "$exec_wrapper" = present
         }
 
         await sem.WaitAsync(ct);
+
+        if (!applyLaunchDelay)
+            return new BootGateReleaser(sem);
 
         var delay = opts.BootLaunchDelay;
         if (delay < TimeSpan.Zero)
@@ -2957,6 +3058,12 @@ test "$work" = present && test "$exec_wrapper" = present
         }
     }
 
+    private sealed class NoOpDisposable : IDisposable
+    {
+        internal static readonly NoOpDisposable Instance = new();
+        public void Dispose() { }
+    }
+
     private static IReadOnlyList<string> BuildFirstBootRuncmd(
         MultipassSandboxOptions opts,
         SandboxProfileFlavor flavor)
@@ -2972,7 +3079,7 @@ test "$work" = present && test "$exec_wrapper" = present
         return commands;
     }
 
-    private Task<ProcessRunResult> RunAsync(
+    private async Task<ProcessRunResult> RunAsync(
         MultipassSandboxOptions opts,
         IReadOnlyList<string> argv,
         string? stdin,
@@ -2980,7 +3087,18 @@ test "$work" = present && test "$exec_wrapper" = present
         WorkItemId? workItemId = null)
     {
         var environment = BuildHostProcessEnvironment(workItemId);
-        return MultipassDaemonRetry.RunWithRetryAsync(
+        // The op-gate is the choke point that bounds concurrent daemon /
+        // filesystem operations (mount / launch / start / stop / transfer
+        // / delete / clone) to MaxConcurrentBoots. Light operations
+        // (multipass exec, info polls, version) classify as non-heavy and
+        // get a no-op disposable so they run at unbounded concurrency —
+        // gating exec would cripple agent throughput, and the contention
+        // source verified on 2026-06-10/11 was the heavy ops, not exec.
+        // The gate is held for the full retry budget so a transient-failure
+        // retry doesn't release-and-reacquire (which would let other heavy
+        // ops barge in and re-amplify the concurrent-mount problem).
+        using var gate = await EnterMultipassOpGateAsync(opts, argv, ct).ConfigureAwait(false);
+        return await MultipassDaemonRetry.RunWithRetryAsync(
             argv,
             ctInner => _runner.RunAsync(argv, stdin, ctInner, environment: environment),
             ctInner => MultipassDaemonRetry.ProbeDaemonAsync(
@@ -2988,7 +3106,7 @@ test "$work" = present && test "$exec_wrapper" = present
             _log,
             workItemId,
             ct,
-            _daemonRetryPolicy);
+            _daemonRetryPolicy).ConfigureAwait(false);
     }
 
     internal static IReadOnlyDictionary<string, string>? BuildHostProcessEnvironment(WorkItemId? workItemId)
@@ -3628,11 +3746,28 @@ public sealed record MultipassSandboxOptions
     public MultipassDiskGuardOptions? DiskGuard { get; init; }
 
     /// <summary>
-    /// Maximum number of concurrent multipass launch/start operations.
-    /// Independent of <c>WorkerPool.MaxConcurrentWorkers</c>: workers can be
-    /// running (e.g. agent logic executing inside an already-booted VM) while
-    /// only N VMs boot at once, so no individual boot exceeds the 180 s
-    /// 'reach Running' timeout due to host CPU/IO contention.
+    /// Maximum number of concurrent "heavy" multipass daemon / filesystem
+    /// operations. Heavy = lifecycle (launch / start / stop / restart /
+    /// suspend / delete / purge), filesystem (mount / umount / transfer /
+    /// clone), and config (set). Light operations — <c>multipass exec</c>
+    /// (an agent run issues hundreds against an already-booted VM) and
+    /// status polls (<c>info</c>, <c>list</c>, <c>version</c>) — are NOT
+    /// gated and run at unbounded concurrency: serialising them would
+    /// cripple fleet throughput, and the verified contention source on the
+    /// snap-confined multipassd is the heavy ops, not exec.
+    /// <para>
+    /// Originally bounded only launch/start (hence the name); the gate now
+    /// also bounds mount / transfer / stop / delete / clone — without this,
+    /// audit-phase fan-out has been observed to overwhelm multipassd with
+    /// ~90+ concurrent mount calls in a 4-minute window, producing
+    /// <c>owner=stat-timeout</c> on the mount filesystem and downstream
+    /// <c>git clone /repo /work</c> exit-128 failures.
+    /// </para>
+    /// <para>
+    /// Independent of <c>WorkerPool.MaxConcurrentWorkers</c>: many workers
+    /// can be running agent logic inside already-booted VMs while only N
+    /// heavy multipass ops execute at once. Hot-reloadable.
+    /// </para>
     /// </summary>
     public int MaxConcurrentBoots { get; init; } = DefaultMaxConcurrentBoots;
 
@@ -3714,6 +3849,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private readonly string _timingPhase;
     private readonly Action<string>? _onDisposed;
     private readonly Action<string>? _onNoLongerTrackedActive;
+    private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -3761,7 +3897,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         ITimingStore? timings = null, WorkItemId timingItemId = default, string timingPhase = "work",
         Action<string>? onDisposed = null, Action<string>? onNoLongerTrackedActive = null, IProcessRunner? runner = null,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null)
+        int? maxScreenshotPngBytes = null, int? maxScreenshotStderrBytes = null,
+        Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -3776,6 +3913,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         _timingPhase = timingPhase;
         _onDisposed = onDisposed;
         _onNoLongerTrackedActive = onNoLongerTrackedActive;
+        // When the provider creates this sandbox it wires opGateAcquirer to
+        // the shared heavy-op semaphore. Tests that instantiate
+        // MultipassSandbox directly typically leave it null — every multipass
+        // call then runs ungated (existing behaviour preserved).
+        _opGateAcquirer = opGateAcquirer;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -4099,9 +4241,19 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
     private async Task TransferFileToVmAsync(string hostPath, string vmRelativePath, string description, CancellationToken ct)
     {
         var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
+        // `transfer` is a heavy op (sshfs / scp under the hood, which
+        // exercises the same daemon path that stat-times-out under
+        // concurrent mount load). Acquire the op-gate around the whole
+        // SSH-not-ready retry loop so transient retries don't release the
+        // slot mid-flight.
+        var transferArgv = new[]
+        {
+            _opts.MultipassBinary, "transfer", hostPath, $"{_name}:{vmRelativePath}",
+        };
+        using var gate = await AcquireOpGateAsync(transferArgv, ct).ConfigureAwait(false);
         var tx = await MultipassRetry.RunWithRetryAsync(
             ctInner => _runner.RunAsync(
-                [_opts.MultipassBinary, "transfer", hostPath, $"{_name}:{vmRelativePath}"],
+                transferArgv,
                 stdin: null,
                 ct: ctInner,
                 environment: environment),
@@ -4137,7 +4289,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         }
     }
 
-    private Task<ProcessRunResult> RunMultipassAsync(
+    private async Task<ProcessRunResult> RunMultipassAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
@@ -4148,7 +4300,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
         bool killOnOutputLimit = true)
     {
         var environment = MultipassSandboxProvider.BuildHostProcessEnvironment(_workItemId);
-        return MultipassDaemonRetry.RunWithRetryAsync(
+        // Route every multipass CLI call through the provider's heavy-op
+        // gate. The classifier returns a no-op disposable for `exec` and
+        // status polls so VM-internal calls (hundreds per agent run) stay
+        // unbounded — only mount / launch / start / stop / transfer /
+        // delete / clone / suspend / restart contend for the gate's
+        // MaxConcurrentBoots slots. The gate is acquired BEFORE the retry
+        // loop so transient-failure retries don't release-and-reacquire.
+        using var gate = await AcquireOpGateAsync(argv, ct).ConfigureAwait(false);
+        return await MultipassDaemonRetry.RunWithRetryAsync(
             argv,
             ctInner => _runner.RunAsync(
                 argv,
@@ -4165,7 +4325,18 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, ISuspendableSandbo
             _log,
             _workItemId,
             ct,
-            _daemonRetryPolicy);
+            _daemonRetryPolicy).ConfigureAwait(false);
+    }
+
+    private Task<IDisposable> AcquireOpGateAsync(IReadOnlyList<string> argv, CancellationToken ct)
+        => _opGateAcquirer is { } acquirer
+            ? acquirer(argv, ct)
+            : Task.FromResult<IDisposable>(NoOpGate.Instance);
+
+    private sealed class NoOpGate : IDisposable
+    {
+        internal static readonly NoOpGate Instance = new();
+        public void Dispose() { }
     }
 
     public async ValueTask DisposeAsync()
