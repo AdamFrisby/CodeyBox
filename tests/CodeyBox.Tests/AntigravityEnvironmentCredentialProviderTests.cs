@@ -4,11 +4,10 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins the host-env credential path for Antigravity: the
-/// <c>refresh_token</c> field MUST be stripped from the OAuth JSON before it
-/// crosses into the sandbox env var (the host CLI is the sole party allowed
-/// to refresh — matches the Claude isolation invariant; the documented
-/// guarantee in <c>docs/agents.md</c>).
+/// Pins the host-env credential path for Antigravity: the agy OAuth token
+/// bundle is shipped <em>verbatim</em> (refresh_token retained) into the sandbox
+/// env var, because the in-VM agy must self-refresh its short-lived access_token
+/// and the host authenticates from the keyring (a separate store).
 /// </summary>
 public sealed class AntigravityEnvironmentCredentialProviderTests : IDisposable
 {
@@ -43,7 +42,7 @@ public sealed class AntigravityEnvironmentCredentialProviderTests : IDisposable
     {
         Environment.SetEnvironmentVariable(
             AntigravityEnvironmentCredentialProvider.HostEnvironmentVariable,
-            """{"access_token":"ya29.x"}""");
+            """{"auth_method":"consumer","token":{"access_token":"ya29.x"}}""");
         var provider = new AntigravityEnvironmentCredentialProvider();
 
         var credential = await provider.GetAsync(AgentKind.Gemini, CancellationToken.None);
@@ -52,11 +51,12 @@ public sealed class AntigravityEnvironmentCredentialProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task GetAsync_StripsRefreshTokenFromBundle()
+    public async Task GetAsync_ShipsAgyTokenBundleVerbatimWithRefreshToken()
     {
+        const string raw =
+            """{"auth_method":"consumer","token":{"access_token":"ya29.live","token_type":"Bearer","refresh_token":"rt-in-vm","expiry":"2026-06-10T19:57:49+10:00"}}""";
         Environment.SetEnvironmentVariable(
-            AntigravityEnvironmentCredentialProvider.HostEnvironmentVariable,
-            """{"access_token":"ya29.live","refresh_token":"rt-host-only","expiry_date":1900000000000}""");
+            AntigravityEnvironmentCredentialProvider.HostEnvironmentVariable, raw);
         var provider = new AntigravityEnvironmentCredentialProvider();
 
         var credential = await provider.GetAsync(AgentKind.Antigravity, CancellationToken.None);
@@ -65,9 +65,10 @@ public sealed class AntigravityEnvironmentCredentialProviderTests : IDisposable
         Assert.Equal(AgentKind.Antigravity, credential!.Agent);
         Assert.True(credential.EnvironmentVariables.TryGetValue(
             AntigravityConstants.OAuthCredsEnvVar, out var sandboxBundle));
-        Assert.Contains("\"access_token\":\"ya29.live\"", sandboxBundle);
-        Assert.DoesNotContain("refresh_token", sandboxBundle, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("rt-host-only", sandboxBundle);
+        // Verbatim — agy's fileTokenStorage reads this exact envelope and needs
+        // the refresh_token to refresh the access_token in-VM.
+        Assert.Equal(raw, sandboxBundle);
+        Assert.Contains("rt-in-vm", sandboxBundle);
     }
 
     [Fact]

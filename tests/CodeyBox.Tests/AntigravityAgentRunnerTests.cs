@@ -126,13 +126,13 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_WithOAuthCredsBundle_WritesCredentialsFileToSandbox()
     {
-        // PrepareSandboxAsync must materialise the OAuth creds JSON into
-        // ~/.agy/oauth_creds.json (chmod 600) when the env-var bundle is
-        // present — the canonical auth path agy reads at startup. The bundle
-        // is shipped to the sandbox env var by upstream credential providers
-        // already sanitised (refresh_token stripped — see
-        // AntigravityEnvironmentCredentialProvider / AgentInstanceCredentialResolver
-        // / CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle).
+        // PrepareSandboxAsync must materialise the agy token bundle into
+        // ~/.gemini/antigravity-cli/antigravity-oauth-token (chmod 600) — agy's
+        // fileTokenStorage path when no system keyring is present (every headless
+        // sandbox). The bundle is shipped verbatim by upstream credential
+        // providers (refresh_token retained so the in-VM agy can self-refresh —
+        // see AntigravityEnvironmentCredentialProvider / AgentInstanceCredentialResolver
+        // / CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle).
         var sandbox = new MultiExecCapturingSandbox();
         var runner = new AntigravityAgentRunner();
         var credential = new AgentCredential(
@@ -140,7 +140,7 @@ public sealed class AntigravityAgentRunnerTests
             new Dictionary<string, string>
             {
                 [AntigravityConstants.OAuthCredsEnvVar] =
-                    """{"access_token":"ya29.abc","expiry":"2099-01-01T00:00:00Z"}""",
+                    """{"auth_method":"consumer","token":{"access_token":"ya29.abc","expiry":"2099-01-01T00:00:00Z"}}""",
             },
             new Dictionary<string, string>());
 
@@ -151,7 +151,7 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.agy/oauth_creds.json", script);
+        Assert.Contains("$HOME/.gemini/antigravity-cli/antigravity-oauth-token", script);
         Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
         Assert.Contains("chmod 600", script);
         // Second exec is the agy CLI invocation, not the prep hook.

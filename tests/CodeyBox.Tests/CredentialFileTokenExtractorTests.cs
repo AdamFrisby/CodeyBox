@@ -117,41 +117,47 @@ public sealed class CredentialFileTokenExtractorTests
     }
 
     [Fact]
-    public void TryBuildAntigravitySanitisedBundle_StripsRefreshTokenAndKeepsRest()
+    public void TryBuildAntigravityTokenBundle_NativeShape_KeepsRefreshTokenVerbatim()
     {
-        // The host CLI is the sole party that holds the Google OAuth
-        // refresh_token; the in-VM agy binary must not see it (otherwise an
-        // in-VM refresh would rotate the host's refresh_token out from under
-        // the host CLI / quota probes). Same isolation invariant Claude
-        // enforces via TryBuildClaudeSanitisedBundle.
+        // agy's native keyring/file shape: {auth_method, token:{...}}. The
+        // refresh_token MUST be kept — the in-VM agy has no other way to refresh
+        // the short-lived access_token, and the host authenticates from the
+        // keyring (a separate store), so shipping it is operationally safe.
         const string raw =
-            """{"access_token":"ya29.live","refresh_token":"rt-secret","client_id":"cid","client_secret":"csec","expiry_date":1900000000000,"token_type":"Bearer","scope":"https://www.googleapis.com/auth/cloud-platform"}""";
+            """{"auth_method":"consumer","token":{"access_token":"ya29.live","token_type":"Bearer","refresh_token":"rt-secret","expiry":"2026-06-10T19:57:49+10:00"}}""";
 
-        var ok = CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var bundle);
+        var ok = CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle(raw, out var bundle);
 
         Assert.True(ok);
-        Assert.Contains("\"access_token\":\"ya29.live\"", bundle);
-        Assert.Contains("\"expiry_date\":1900000000000", bundle);
-        // refresh_token must be gone in both the key and the secret value.
-        Assert.DoesNotContain("refresh_token", bundle, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("rt-secret", bundle);
-        // Non-secret companions (client_id, expiry, scope) survive — they are
-        // not the single-use refresh credential and the in-VM CLI may surface
-        // them for diagnostics.
-        Assert.Contains("\"token_type\":\"Bearer\"", bundle);
-        Assert.Contains("\"scope\":", bundle);
+        // Echoed byte-for-byte — agy's fileTokenStorage expects this exact envelope.
+        Assert.Equal(raw, bundle);
+        Assert.Contains("refresh_token", bundle);
+        Assert.Contains("rt-secret", bundle);
+    }
+
+    [Fact]
+    public void TryBuildAntigravityTokenBundle_LegacyFlatShape_Accepted()
+    {
+        const string raw = """{"access_token":"ya29.flat","refresh_token":"rt","token_type":"Bearer"}""";
+
+        var ok = CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle(raw, out var bundle);
+
+        Assert.True(ok);
+        Assert.Equal(raw, bundle);
     }
 
     [Theory]
     [InlineData("not-json")]
     [InlineData("")]
     [InlineData("""{"refresh_token":"rt-only"}""")]
+    [InlineData("""{"token":{"refresh_token":"rt-only"}}""")]
+    [InlineData("""{"token":{"access_token":""}}""")]
     [InlineData("""{"access_token":""}""")]
     [InlineData("""{"access_token":123}""")]
     [InlineData("[]")]
-    public void TryBuildAntigravitySanitisedBundle_ReturnsFalseForMalformedOrMissingAccessToken(string raw)
+    public void TryBuildAntigravityTokenBundle_ReturnsFalseForMalformedOrMissingAccessToken(string raw)
     {
-        var ok = CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var bundle);
+        var ok = CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle(raw, out var bundle);
 
         Assert.False(ok);
         Assert.Equal(string.Empty, bundle);

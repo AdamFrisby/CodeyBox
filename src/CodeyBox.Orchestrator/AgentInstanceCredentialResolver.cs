@@ -116,17 +116,17 @@ public static class AgentInstanceCredentialResolver
 
         if (agent == AgentKind.Antigravity)
         {
-            // The agy CLI uses Sign-in-with-Google OAuth and stores credentials
-            // under ~/.agy/oauth_creds.json. Strip refresh_token before
-            // shipping to the sandbox — the host is the sole party allowed to
-            // refresh, so an in-VM refresh can't rotate the refresh_token out
-            // from under the host CLI / quota probes. Matches Claude's
-            // sanitised-bundle path.
-            if (!CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var sanitised))
+            // The agy CLI authenticates from a token bundle written to
+            // ~/.gemini/antigravity-cli/antigravity-oauth-token (its
+            // fileTokenStorage path when no system keyring is present). Ship the
+            // bundle verbatim — the refresh_token MUST be kept so the in-VM agy
+            // can refresh the short-lived access_token; the host authenticates
+            // from the keyring, a separate store. See TryBuildAntigravityTokenBundle.
+            if (!CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle(raw, out var bundle))
                 return false;
             credential = new AgentCredential(
                 AgentKind.Antigravity,
-                new Dictionary<string, string> { [AntigravityConstants.OAuthCredsEnvVar] = sanitised },
+                new Dictionary<string, string> { [AntigravityConstants.OAuthCredsEnvVar] = bundle },
                 new Dictionary<string, string>());
             return true;
         }

@@ -4,17 +4,18 @@ using Microsoft.Extensions.Logging;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Reads the Antigravity (<c>agy</c>) OAuth credentials JSON from a host env
-/// var and ships a <em>sanitised</em> bundle to the sandbox: the
-/// <c>refresh_token</c> field is removed before the env var crosses the VM
-/// boundary so the in-VM CLI cannot self-refresh and rotate the refresh_token
-/// out from under the host CLI and quota probes (same isolation invariant the
-/// Claude credential path enforces).
+/// Reads the Antigravity (<c>agy</c>) OAuth token bundle from a host env var and
+/// ships it <em>verbatim</em> to the sandbox, where the runner writes it to
+/// <c>~/.gemini/antigravity-cli/antigravity-oauth-token</c> (agy's
+/// <c>fileTokenStorage</c> path, used when no system keyring is present). The
+/// <c>refresh_token</c> is intentionally retained — agy must self-refresh the
+/// short-lived access_token in-VM; see
+/// <see cref="CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle"/> for
+/// the isolation rationale (the host authenticates from the keyring, a separate
+/// store).
 ///
 /// <para>This is the env-var fallback for the canonical
-/// <see cref="AgentInstanceCredentialResolver"/> file/per-instance path; the
-/// generic <see cref="EnvironmentCredentialProvider"/> would copy the env var
-/// verbatim and break the invariant.</para>
+/// <see cref="AgentInstanceCredentialResolver"/> file/per-instance path.</para>
 /// </summary>
 public sealed class AntigravityEnvironmentCredentialProvider : ICredentialProvider
 {
@@ -42,17 +43,17 @@ public sealed class AntigravityEnvironmentCredentialProvider : ICredentialProvid
         if (string.IsNullOrEmpty(raw))
             return Task.FromResult<AgentCredential?>(null);
 
-        if (!CredentialFileTokenExtractor.TryBuildAntigravitySanitisedBundle(raw, out var sanitised))
+        if (!CredentialFileTokenExtractor.TryBuildAntigravityTokenBundle(raw, out var bundle))
         {
             _log?.LogWarning(
-                "Antigravity OAuth env var {EnvVar} is set but did not parse as Google OAuth creds JSON; ignoring.",
+                "Antigravity OAuth env var {EnvVar} is set but did not parse as an agy OAuth token bundle; ignoring.",
                 HostEnvironmentVariable);
             return Task.FromResult<AgentCredential?>(null);
         }
 
         var env = new Dictionary<string, string>
         {
-            [AntigravityConstants.OAuthCredsEnvVar] = sanitised,
+            [AntigravityConstants.OAuthCredsEnvVar] = bundle,
         };
         return Task.FromResult<AgentCredential?>(
             new AgentCredential(AgentKind.Antigravity, env, new Dictionary<string, string>()));

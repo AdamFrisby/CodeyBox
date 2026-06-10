@@ -32,20 +32,22 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
     public string Binary { get; init; } = DefaultBinary;
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories =>
-        // The agy binary stashes session state under ~/.agy (conversations
-        // index, transcripts). Capturing both lets a preempt/resume cycle
-        // pick the conversation back up via --conversation <id>.
-        [".agy/conversations", ".agy/history"];
+        // The agy binary stashes session state under ~/.gemini/antigravity-cli
+        // (conversations index + per-conversation "brain" transcripts).
+        // Capturing both lets a preempt/resume cycle pick the conversation back
+        // up via --conversation <id>.
+        [".gemini/antigravity-cli/conversations", ".gemini/antigravity-cli/brain"];
 
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
-    /// Materialises the Antigravity OAuth credentials JSON into the sandbox
-    /// under <c>~/.agy/oauth_creds.json</c> when the env-var bundle is
-    /// present. The runner refuses to embed the refresh token in the bundle
-    /// (the host CLI is the sole party allowed to refresh — same race
-    /// rationale as Claude / Gemini). When no bundle is present, the runner
-    /// falls back to whatever auth path the credential pipeline plugged in.
+    /// Materialises the Antigravity OAuth token bundle into the sandbox at
+    /// <c>~/.gemini/antigravity-cli/antigravity-oauth-token</c> — the path agy's
+    /// <c>fileTokenStorage</c> reads when no system keyring is present (every
+    /// headless sandbox). The bundle is written verbatim: it carries the
+    /// refresh_token so the in-VM agy can refresh the short-lived access_token
+    /// itself (it has no other refresh path). When no bundle is present, the
+    /// runner falls back to whatever auth path the credential pipeline plugged in.
     /// </summary>
     protected override async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
@@ -61,10 +63,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
         var script =
             "set -eu\n" +
             "umask 077\n" +
-            "mkdir -p \"$HOME/.agy\"\n" +
+            "mkdir -p \"$HOME/.gemini/antigravity-cli\"\n" +
             "if [ -n \"${CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON\" > \"$HOME/.agy/oauth_creds.json\"\n" +
-            "  chmod 600 \"$HOME/.agy/oauth_creds.json\"\n" +
+            "  printf '%s' \"$CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
+            "  chmod 600 \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
             "fi\n";
         var write = await sandbox.ExecAsync(new SandboxExec
         {

@@ -809,14 +809,16 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
         // for the relevant 'Don't do' rule and docs/agents.md for setup.
         // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
-        // OAuth bundle must be sanitised (refresh_token stripped) before it
-        // crosses the VM boundary; AntigravityEnvironmentCredentialProvider
-        // does that and is registered separately below.
+        // OAuth token bundle is shipped to the sandbox by the dedicated
+        // AntigravityEnvironmentCredentialProvider registered separately below.
     }));
-    // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider
-    // sanitises the env-var bundle (strips refresh_token) before shipping it
-    // to the sandbox so an in-VM refresh cannot rotate the host's
-    // refresh_token. Matches the Claude isolation invariant.
+    // Antigravity uses Sign-in-with-Google OAuth. The dedicated provider ships
+    // the agy token bundle verbatim (refresh_token RETAINED) into the sandbox,
+    // where the runner writes it to ~/.gemini/antigravity-cli/antigravity-oauth-token
+    // (agy's fileTokenStorage path). agy must self-refresh the short-lived
+    // access_token in-VM; the host authenticates from the keyring, a separate
+    // store, so this does not race the host CLI. (Unlike Claude/Gemini, which
+    // strip the refresh_token — agy has no other in-VM refresh path.)
     builtInLast.Add(new AntigravityEnvironmentCredentialProvider(
         sp.GetService<ILogger<AntigravityEnvironmentCredentialProvider>>()));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]

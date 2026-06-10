@@ -632,16 +632,20 @@ model-by-model. **Do not** introduce a separate "sub-subscription pool"
 subsystem — the existing per-model exhaustion key already gives the pool
 semantics for free.
 
-**Auth setup:** Sign-in-with-Google. On the host, run the agy install
-flow and complete the OAuth sign-in once; the binary writes its OAuth
-JSON to a local file. Point CodeyBox at it either by (a) configuring a
-per-instance `AgentCredentialReference` with `FilePath` set to that
-path, or (b) injecting the file's contents via the
-`CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` env var. The runner materialises
-the bundle to `~/.agy/oauth_creds.json` inside the sandbox at
-prepare-time with `chmod 600`; the refresh token is **not** shipped to
-the VM (single-use; the host CLI is the sole party allowed to refresh —
-same race rationale as Claude / Gemini).
+**Auth setup:** Sign-in-with-Google. On the host, complete the agy OAuth
+sign-in once. agy stores the token in the system keyring (Secret Service);
+extract it (service `gemini`, username `antigravity`) into a file — its native
+shape is `{"auth_method":…,"token":{"access_token":…,"refresh_token":…,"expiry":…}}`.
+Point CodeyBox at that file's contents via the
+`CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` env var (or a per-instance
+`AgentCredentialReference` `FilePath`). The runner materialises the bundle to
+`~/.gemini/antigravity-cli/antigravity-oauth-token` inside the sandbox at
+prepare-time with `chmod 600` — agy's `fileTokenStorage` path, used when no
+system keyring is present (every headless sandbox). The refresh token **is**
+shipped (verbatim): agy's access token is short-lived (~1h) and the in-VM agy
+has no other refresh path, so it must self-refresh. This does not race the host
+CLI, which authenticates from the keyring (a separate store) — unlike
+Claude / Gemini, whose refresh tokens are stripped.
 
 **Quota probe:** `AntigravityQuotaProbe` shares the `cloudcode-pa`
 endpoint family with `GeminiQuotaProbe`. It prefers

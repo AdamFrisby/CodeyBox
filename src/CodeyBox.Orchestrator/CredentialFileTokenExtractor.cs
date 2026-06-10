@@ -125,23 +125,34 @@ public static class CredentialFileTokenExtractor
     }
 
     /// <summary>
-    /// Builds a sandbox-safe Antigravity OAuth bundle: the input is the Google
-    /// OAuth creds JSON (same shape as <c>~/.gemini/oauth_creds.json</c>); the
-    /// output is identical except <c>refresh_token</c> is removed. The host
-    /// remains the sole party that holds the refresh token (matching the
-    /// Claude isolation invariant), so an in-VM refresh cannot rotate the
-    /// refresh_token out from under the host CLI / quota probes.
+    /// Validates an Antigravity (<c>agy</c>) OAuth token bundle and returns it
+    /// <b>verbatim</b> for materialisation into the sandbox at
+    /// <c>~/.gemini/antigravity-cli/antigravity-oauth-token</c> — the path agy's
+    /// <c>fileTokenStorage</c> reads when no system keyring (Secret Service) is
+    /// present, i.e. inside every headless sandbox.
+    ///
+    /// <para><b>Why the refresh_token is KEPT (unlike the Claude path).</b> agy's
+    /// access_token is short-lived (~1h) and the in-VM agy has no other refresh
+    /// path, so it must self-refresh via its <c>persistingTokenSource</c>; a
+    /// stripped bundle leaves it permanently "not logged into Antigravity". The
+    /// host's own agy authenticates from the system <em>keyring</em> — a separate
+    /// token store — so the file copy shipped to the sandbox is operationally
+    /// independent of the host CLI / quota probe.</para>
+    ///
+    /// <para>Accepts agy's native shape
+    /// <c>{"auth_method":"consumer","token":{"access_token":…,"refresh_token":…,"token_type":…,"expiry":…}}</c>
+    /// (the exact bytes agy stores in the keyring) and a legacy top-level
+    /// <c>{"access_token":…}</c> shape.</para>
     /// </summary>
     /// <returns>
-    /// True with a sanitised JSON in <paramref name="sanitisedBundle"/> when
-    /// the input parses and carries a non-empty <c>access_token</c>; false
-    /// otherwise.
+    /// True with the input echoed verbatim in <paramref name="bundle"/> when it
+    /// parses as a JSON object carrying a non-empty access token; false otherwise.
     /// </returns>
-    public static bool TryBuildAntigravitySanitisedBundle(
+    public static bool TryBuildAntigravityTokenBundle(
         string? rawContents,
-        out string sanitisedBundle)
+        out string bundle)
     {
-        sanitisedBundle = "";
+        bundle = "";
         if (string.IsNullOrEmpty(rawContents))
             return false;
 
@@ -151,32 +162,37 @@ public static class CredentialFileTokenExtractor
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
                 return false;
-            if (!root.TryGetProperty("access_token", out var token)
-                || token.ValueKind != JsonValueKind.String
-                || string.IsNullOrEmpty(token.GetString()))
-            {
+            if (!HasNonEmptyAntigravityAccessToken(root))
                 return false;
-            }
 
-            using var stream = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(stream))
-            {
-                writer.WriteStartObject();
-                foreach (var prop in root.EnumerateObject())
-                {
-                    if (prop.NameEquals("refresh_token"))
-                        continue;
-                    prop.WriteTo(writer);
-                }
-                writer.WriteEndObject();
-            }
-            sanitisedBundle = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+            // Verbatim — agy needs the refresh_token to refresh the ~1h
+            // access_token in-VM, and the native {auth_method, token} envelope
+            // is exactly what agy's fileTokenStorage expects.
+            bundle = rawContents;
             return true;
         }
         catch (JsonException)
         {
             return false;
         }
+    }
+
+    private static bool HasNonEmptyAntigravityAccessToken(JsonElement root)
+    {
+        // Native agy shape: token.access_token.
+        if (root.TryGetProperty("token", out var tok)
+            && tok.ValueKind == JsonValueKind.Object
+            && tok.TryGetProperty("access_token", out var nested)
+            && nested.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(nested.GetString()))
+        {
+            return true;
+        }
+
+        // Legacy flat shape: top-level access_token.
+        return root.TryGetProperty("access_token", out var flat)
+            && flat.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(flat.GetString());
     }
 
     private static string BuildClaudeSandboxBundle(JsonElement oauth, string token)
