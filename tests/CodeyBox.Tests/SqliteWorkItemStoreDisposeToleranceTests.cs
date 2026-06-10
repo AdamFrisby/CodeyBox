@@ -6,12 +6,15 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Pins the dispose-time tolerance for the
 /// <see cref="Microsoft.Data.Sqlite.SqliteConnection"/> teardown race:
-/// <c>SqliteConnection.Close()</c> has been observed to throw
-/// <see cref="NullReferenceException"/> intermittently when a still-in-flight
-/// async command races against connection disposal. The store swallows that
-/// one specific case so the rest of the dispose chain (notably the
-/// write-gate release) still runs. Any other exception type must bubble — we
-/// must NOT mask unrelated bugs.
+/// <c>SqliteConnection.Close()</c> has been observed to throw both
+/// <see cref="NullReferenceException"/> and the
+/// <see cref="InvalidOperationException"/> "Collection was modified" shape from
+/// <c>SqliteCommand.DisposePreparedStatements</c> when a still-in-flight async
+/// command races against connection disposal. The store swallows those two
+/// driver-internal cases so the rest of the dispose chain (notably the
+/// write-gate release) still runs. Any other exception type — including
+/// <see cref="InvalidOperationException"/> that does NOT originate inside the
+/// SQLite driver — must bubble: we must NOT mask unrelated bugs.
 /// </summary>
 public sealed class SqliteWorkItemStoreDisposeToleranceTests
 {
@@ -24,13 +27,81 @@ public sealed class SqliteWorkItemStoreDisposeToleranceTests
     }
 
     [Fact]
+    public void DisposeSqliteConnectionTolerantOfTeardownNre_SwallowsSqliteCollectionModifiedRace()
+    {
+        // The driver's SqliteCommand.DisposePreparedStatements iterates an
+        // internal List<> of prepared statements; an in-flight finalize that
+        // mutates the list mid-iteration throws InvalidOperationException
+        // "Collection was modified". Stack-trace inspection picks the driver
+        // frame; same race shape as the NRE, same tolerance.
+        var ioe = MakeInvalidOperationFromSqliteTeardown();
+        var thrower = new ThrowingDisposable(ioe);
+        SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(thrower);
+        Assert.True(thrower.DisposeCalled);
+    }
+
+    [Fact]
     public void DisposeSqliteConnectionTolerantOfTeardownNre_LetsOtherExceptionsBubble()
     {
-        // Anything that isn't NRE points at a real fault (corruption, IO,
-        // disposed-twice). Surfacing them keeps the bug visible.
+        // Anything that isn't a SQLite-driver teardown race points at a real
+        // fault (corruption, IO, disposed-twice). Surfacing them keeps the
+        // bug visible — including InvalidOperationException raised from
+        // outside Microsoft.Data.Sqlite.
         var thrower = new ThrowingDisposable(new InvalidOperationException("not the race"));
         Assert.Throws<InvalidOperationException>(() =>
             SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(thrower));
+    }
+
+    /// <summary>
+    /// Forges an <see cref="InvalidOperationException"/> whose
+    /// <see cref="Exception.StackTrace"/> contains a
+    /// <c>Microsoft.Data.Sqlite.SqliteCommand</c> frame so the tolerance
+    /// branch's stack-trace check matches it. We can't construct a real
+    /// driver-internal race deterministically from a test; the stack-trace
+    /// gate is the seam the tolerance method exposes.
+    /// </summary>
+    private static InvalidOperationException MakeInvalidOperationFromSqliteTeardown()
+    {
+        try
+        {
+            // The reflection cast forces an IOE whose stack includes a frame
+            // matching the driver namespace literal we filter on.
+            throw new MicrosoftDataSqliteSyntheticFrame().ThrowCollectionModified();
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ex;
+        }
+    }
+
+    private sealed class MicrosoftDataSqliteSyntheticFrame
+    {
+        // The full class name is irrelevant; only the runtime-formatted stack
+        // string is inspected, and the driver-namespace literal must appear
+        // somewhere in the trace. We synthesize that by setting an explicit
+        // remote stack trace prefix that mimics the real driver frame.
+        public InvalidOperationException ThrowCollectionModified()
+        {
+            var ioe = new InvalidOperationException(
+                "Collection was modified; enumeration operation may not execute.");
+            ExceptionDispatchInfoSetRemoteStackTrace(
+                ioe,
+                "   at System.Collections.Generic.List`1.Enumerator.MoveNext()\n" +
+                "   at Microsoft.Data.Sqlite.SqliteCommand.DisposePreparedStatements(Boolean disposing)\n" +
+                "   at Microsoft.Data.Sqlite.SqliteCommand.Dispose(Boolean disposing)\n");
+            throw ioe;
+        }
+
+        private static void ExceptionDispatchInfoSetRemoteStackTrace(Exception ex, string trace)
+        {
+            // .NET 10 still exposes Exception.SetRemoteStackTrace; older
+            // overloads expected (string trace) which is what we use here.
+            ex.GetType().GetMethod(
+                    "SetRemoteStackTrace",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public,
+                    [typeof(string)])!
+                .Invoke(ex, [trace]);
+        }
     }
 
     [Fact]

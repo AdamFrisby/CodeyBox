@@ -1567,16 +1567,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     }
 
     /// <summary>
-    /// Disposes a connection, tolerating the
-    /// <see cref="NullReferenceException"/> that
-    /// <c>Microsoft.Data.Sqlite.SqliteConnection.Close()</c> has been observed
-    /// to throw intermittently when a still-in-flight async command (from a
-    /// not-yet-fully-drained background worker) races against connection
-    /// teardown. The connection is being discarded either way, so swallowing
-    /// the NRE keeps the dispose contract clean — the caller's
-    /// <c>try/finally</c> still releases every other owned resource. Any other
-    /// exception bubbles. Exposed <c>internal</c> so the tolerance branch is
-    /// directly exercisable from unit tests.
+    /// Disposes a connection, tolerating the internal teardown-race exceptions
+    /// that <c>Microsoft.Data.Sqlite.SqliteConnection.Close()</c> has been
+    /// observed to throw intermittently when a still-in-flight async command
+    /// (from a not-yet-fully-drained background worker) races against connection
+    /// disposal:
+    /// <list type="bullet">
+    ///   <item><see cref="NullReferenceException"/> from inside the driver's
+    ///   connection close path.</item>
+    ///   <item><see cref="InvalidOperationException"/> "Collection was modified;
+    ///   enumeration operation may not execute" from
+    ///   <c>SqliteCommand.DisposePreparedStatements</c> when an in-flight
+    ///   finalize mutates the prepared-statement list mid-iteration.</item>
+    /// </list>
+    /// The connection is being discarded either way, so swallowing these races
+    /// keeps the dispose contract clean — the caller's <c>try/finally</c> still
+    /// releases every other owned resource. <see cref="InvalidOperationException"/>
+    /// that does NOT originate inside the SQLite driver bubbles unchanged so
+    /// unrelated bugs stay visible. Exposed <c>internal</c> so the tolerance
+    /// branches are directly exercisable from unit tests.
     /// </summary>
     internal static void DisposeSqliteConnectionTolerantOfTeardownNre(IDisposable connection)
     {
@@ -1588,6 +1597,24 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             // Internal Sqlite teardown race; safe to ignore — no further state to release.
         }
+        catch (InvalidOperationException ex) when (IsSqliteTeardownRace(ex))
+        {
+            // SqliteCommand.DisposePreparedStatements race against an in-flight
+            // finalize; same shape as the NRE above. Safe to ignore.
+        }
+    }
+
+    /// <summary>
+    /// True iff <paramref name="ex"/> was thrown from inside the
+    /// <c>Microsoft.Data.Sqlite</c> driver's dispose / close path. Narrowed by
+    /// stack-trace inspection so unrelated <see cref="InvalidOperationException"/>
+    /// instances (e.g. disposed-twice misuse from our own code) still surface.
+    /// </summary>
+    private static bool IsSqliteTeardownRace(Exception ex)
+    {
+        var trace = ex.StackTrace;
+        return trace is not null
+            && trace.Contains("Microsoft.Data.Sqlite", StringComparison.Ordinal);
     }
 
     private static string AuditProgressAttemptKey(DateTimeOffset? workAttemptStartedAt)
