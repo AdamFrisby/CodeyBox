@@ -3,8 +3,10 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -437,7 +439,126 @@ public sealed class GeminiStreamParserTests
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
 }
 
+public sealed class AntigravityStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    [
+        new AntigravityStreamParser(),
+        new ClaudeStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_RecognizesAntigravityWithModelAndUsage()
+    {
+        await using var stream1 = StreamOf("""
+            {"type":"assistant","message":{"model":"claude-opus-4-6-thinking"}}
+            """);
+        var kind1 = await AgentStreamParserSelection.SniffKindAsync(stream1, TestParsers());
+        Assert.Equal(AgentKind.Antigravity, kind1);
+
+        await using var stream2 = StreamOf("""
+            {"type":"result","model":"gemini-3.5-flash-high","usage":{"prompt_tokens":5000,"cached_input_tokens":1000,"completion_tokens":420}}
+            """);
+        var kind2 = await AgentStreamParserSelection.SniffKindAsync(stream2, TestParsers());
+        Assert.Equal(AgentKind.Antigravity, kind2);
+    }
+
+    [Fact]
+    public async Task ParseAsync_AnthropicShape_ParsesCacheBuckets()
+    {
+        var parser = new AntigravityStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"system","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:12Z","tool_use_id":"t1","content":"ok","is_error":false}
+            {"type":"result","timestamp":"2026-01-01T00:00:15Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":12000,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000,"output_tokens":650}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(TimeSpan.FromSeconds(2), summary.TimeToFirstToken);
+        Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
+        Assert.Equal(12000 + 300, summary.InputTokens);
+        Assert.Equal(650, summary.OutputTokens);
+        Assert.Equal(4000, summary.CachedInputTokens);
+        Assert.Equal(0.42m, summary.EstimatedUsd);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_GeminiShape_ParsesCachedInputTokens()
+    {
+        var parser = new AntigravityStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"result","timestamp":"2026-01-01T00:00:00Z","result":"done","total_cost_usd":0.07,"model":"gemini-3.5-flash-high","usage":{"prompt_tokens":5000,"cached_input_tokens":1000,"completion_tokens":420}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.Equal(5000 - 1000, summary.InputTokens);
+        Assert.Equal(1000, summary.CachedInputTokens);
+        Assert.Equal(420, summary.OutputTokens);
+        Assert.Equal(0.07m, summary.EstimatedUsd);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class CursorStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    [
+        new CursorStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_RecognizesCursorEvents()
+    {
+        await using var stream = StreamOf("""
+            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
+            """);
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
+        Assert.Equal(AgentKind.Cursor, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_ComputesToolDurationsAndUsage()
+    {
+        var parser = new CursorStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"system","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:12Z","tool_use_id":"t1","content":"ok","is_error":false}
+            {"type":"result","timestamp":"2026-01-01T00:00:15Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":5}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(TimeSpan.FromSeconds(2), summary.TimeToFirstToken);
+        Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
+        Assert.Equal(100, summary.InputTokens);
+        Assert.Equal(20, summary.OutputTokens);
+        Assert.Equal(5, summary.CachedInputTokens);
+        Assert.Equal(0.42m, summary.EstimatedUsd);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
 public sealed class StallDetectionTests
+
 {
     [Fact]
     public async Task ParseAsync_RecordsToolExecutionStalls()

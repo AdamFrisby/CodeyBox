@@ -169,9 +169,20 @@ internal sealed class FakeHubContext : IHubContext<AgentStdoutHub>
 
 internal sealed class CapturingHubClients : IHubClients
 {
-    public List<(string Group, string Method, object?[] Args)> Sent { get; } = [];
+    private readonly List<(string Group, string Method, object?[] Args)> _sent = [];
 
-    private IClientProxy Proxy(string groupName) => new CapturingClientProxy(groupName, Sent);
+    public List<(string Group, string Method, object?[] Args)> Sent
+    {
+        get
+        {
+            lock (_sent)
+            {
+                return new List<(string Group, string Method, object?[] Args)>(_sent);
+            }
+        }
+    }
+
+    private IClientProxy Proxy(string groupName) => new CapturingClientProxy(groupName, _sent);
 
     IClientProxy IHubClients<IClientProxy>.All => Proxy("*all*");
     IClientProxy IHubClients<IClientProxy>.AllExcept(IReadOnlyList<string> excluded) => Proxy("*all-except*");
