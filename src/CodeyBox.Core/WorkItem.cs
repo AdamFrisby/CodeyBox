@@ -564,6 +564,17 @@ public sealed record WorkItem
     public int? TemplateEntryIndex { get; init; }
 
     /// <summary>
+    /// Per-item knob values keyed by <see cref="IKnob.Key"/>. Validated against
+    /// the registered <see cref="IKnobRegistry"/> at set-time; unknown keys are
+    /// rejected by the API surface. An empty map means "use project defaults
+    /// for every knob". Resolution precedence is documented on
+    /// <see cref="IKnobRegistry.Resolve"/>: item &gt; project default &gt;
+    /// knob default. Stored as a JSON object on the work-item row.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Knobs { get; init; }
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Content-hashed identifier of the sandbox baseline image this work item is
     /// pinned to. Stamped at pickup time from the sandbox provider's live config
     /// (profile, flavor, cloud-init, extra runcmd, extra cloud-init) and preserved

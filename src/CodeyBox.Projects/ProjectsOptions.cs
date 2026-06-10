@@ -22,6 +22,15 @@ public sealed class ProjectDefaultsConfig
     public ProjectAuditConfig? Audit { get; set; }
     public ProjectNetworkProfilesConfig? NetworkProfiles { get; set; }
     public bool? GraphicalSandbox { get; set; }
+
+    /// <summary>
+    /// Default knob values applied to every project unless the project carries
+    /// its own override for the same key. Keys must match a registered
+    /// <c>IKnob.Key</c>; unknown keys are dropped at prompt-assembly time with
+    /// a warning. Values are case-insensitive matches against the knob's
+    /// <c>AllowedValues</c>.
+    /// </summary>
+    public Dictionary<string, string>? Knobs { get; set; }
 }
 
 public sealed class ProjectConfig
@@ -54,6 +63,13 @@ public sealed class ProjectConfig
     /// keeps the legacy per-phase fresh-sandbox pipeline.
     /// </summary>
     public ProjectClaudeSessionConfigOptions? ClaudeSession { get; set; }
+
+    /// <summary>
+    /// Per-project knob overrides. Composed with
+    /// <see cref="ProjectDefaultsConfig.Knobs"/> at resolution time: project
+    /// entries win on key collision; defaults fill gaps.
+    /// </summary>
+    public Dictionary<string, string>? Knobs { get; set; }
 }
 
 /// <summary>

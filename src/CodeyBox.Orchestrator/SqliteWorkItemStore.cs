@@ -297,6 +297,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN terminal_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_terminal_retry_at TEXT;");
 
+            // Per-item knob map (registered IKnob → string value). Stored as a
+            // JSON object; default '{}' so legacy rows behave as "no knobs set"
+            // and fall through to per-project / knob defaults at prompt time.
+            RunMigration("ALTER TABLE work_items ADD COLUMN knobs_json TEXT NOT NULL DEFAULT '{}';");
+
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
             // restart-recovery for the same iteration) overwrites the row via
@@ -435,7 +440,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
-                        terminal_retry_attempts, next_terminal_retry_at)
+                        terminal_retry_attempts, next_terminal_retry_at,
+                        knobs_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
@@ -450,7 +456,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
-                        $terminal_retry_attempts, $next_terminal_retry_at);
+                        $terminal_retry_attempts, $next_terminal_retry_at,
+                        $knobs);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -583,7 +590,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    knobs_json = $knobs
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -656,7 +664,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     template_entry_index = $template_entry_index,
                     preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
                     terminal_retry_attempts = $terminal_retry_attempts,
-                    next_terminal_retry_at = $next_terminal_retry_at
+                    next_terminal_retry_at = $next_terminal_retry_at,
+                    knobs_json = $knobs
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -2163,7 +2172,38 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$preserve_work_branch_on_queued_pickup", item.PreserveWorkBranchOnQueuedPickup ? 1 : 0);
         cmd.Parameters.AddWithValue("$terminal_retry_attempts", item.TerminalRetryAttempts);
         cmd.Parameters.AddWithValue("$next_terminal_retry_at", (object?)item.NextTerminalRetryAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$knobs", SerialiseKnobs(item.Knobs));
     }
+
+    private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
+    {
+        if (knobs is null || knobs.Count == 0) return "{}";
+        return JsonSerializer.Serialize(knobs);
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadKnobs(SqliteDataReader r)
+    {
+        var ord = r.GetOrdinal("knobs_json");
+        if (r.IsDBNull(ord)) return EmptyKnobs;
+        var json = r.GetString(ord);
+        if (string.IsNullOrEmpty(json) || json == "{}") return EmptyKnobs;
+        try
+        {
+            var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            if (dict is null || dict.Count == 0) return EmptyKnobs;
+            return new Dictionary<string, string>(dict, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (JsonException)
+        {
+            // Corruption-tolerant: unreadable knob map falls back to "no knobs
+            // set" so the work item is still pickable. The pipeline then uses
+            // project defaults / knob defaults, which is the safer fallback.
+            return EmptyKnobs;
+        }
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     private static WorkItem Read(SqliteDataReader r) => new()
     {
@@ -2238,6 +2278,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         PreserveWorkBranchOnQueuedPickup = ReadInt32OrDefault(r, "preserve_work_branch_on_queued_pickup", defaultValue: 0) != 0,
         TerminalRetryAttempts = ReadInt32OrDefault(r, "terminal_retry_attempts", defaultValue: 0),
         NextTerminalRetryAt = ReadNullableDateTimeOffset(r, "next_terminal_retry_at"),
+        Knobs = ReadKnobs(r),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)

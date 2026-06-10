@@ -321,7 +321,41 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             {
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
             },
+            Knobs = ResolveKnobs(pc.Knobs, defaults.Knobs),
         };
+    }
+
+    /// <summary>
+    /// Per-key merge of project and defaults knob maps; project entries win on
+    /// collision. Empty/whitespace values are dropped from both sides so an
+    /// operator can clear a default for one project with <c>"changeScope": ""</c>.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> ResolveKnobs(
+        Dictionary<string, string>? project,
+        Dictionary<string, string>? defaults)
+    {
+        if ((project is null || project.Count == 0) && (defaults is null || defaults.Count == 0))
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (defaults is not null)
+        {
+            foreach (var (k, v) in defaults)
+                if (!string.IsNullOrWhiteSpace(k) && !string.IsNullOrWhiteSpace(v))
+                    merged[k] = v;
+        }
+        if (project is not null)
+        {
+            foreach (var (k, v) in project)
+            {
+                if (string.IsNullOrWhiteSpace(k)) continue;
+                if (string.IsNullOrWhiteSpace(v))
+                    merged.Remove(k);
+                else
+                    merged[k] = v;
+            }
+        }
+        return merged;
     }
 
     /// <summary>

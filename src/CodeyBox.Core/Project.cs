@@ -200,6 +200,16 @@ public sealed record Project
     /// opts in here.</para>
     /// </summary>
     public ProjectClaudeSessionConfig ClaudeSession { get; init; } = new();
+
+    /// <summary>
+    /// Project-default knob values consulted when a work item does not set its
+    /// own value for a given knob. Resolved against the registered
+    /// <see cref="IKnobRegistry"/> at prompt-assembly time; unknown keys are
+    /// dropped silently from the effective map. Operator-supplied via the
+    /// project configuration file; immutable on the resolved Project.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Knobs { get; init; }
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 }
 
 /// <summary>

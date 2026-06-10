@@ -14,6 +14,7 @@ internal sealed class WorkItemCreationService
     private readonly ITaskQueue _queue;
     private readonly IProjectRepository _projects;
     private readonly IAgentRegistry _agents;
+    private readonly IKnobRegistry _knobs;
     private readonly IReleaseStore? _releaseStore;
     private readonly IWebhookDispatcher _webhooks;
 
@@ -22,6 +23,7 @@ internal sealed class WorkItemCreationService
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        IKnobRegistry knobs,
         IWebhookDispatcher webhooks,
         IReleaseStore? releaseStore = null)
     {
@@ -29,6 +31,7 @@ internal sealed class WorkItemCreationService
         _queue = queue;
         _projects = projects;
         _agents = agents;
+        _knobs = knobs;
         _webhooks = webhooks;
         _releaseStore = releaseStore;
     }
@@ -270,6 +273,15 @@ internal sealed class WorkItemCreationService
             requiredCapabilities = normalised!;
         }
 
+        IReadOnlyDictionary<string, string> knobs = EmptyKnobs;
+        if (req.Knobs is { Count: > 0 })
+        {
+            var (normalisedKnobs, knobErr) = NormaliseKnobs(req.Knobs, _knobs);
+            if (knobErr is not null)
+                return new PreparedWorkItemCreationResult(null, knobErr);
+            knobs = normalisedKnobs!;
+        }
+
         var jobType = JobType.Normal;
         CheckAndActSpec? checkSpec = null;
         AgentControlSpec? agentControlSpec = null;
@@ -415,6 +427,7 @@ internal sealed class WorkItemCreationService
             ExternalIds = canonicalExternalIds,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,
+            Knobs = knobs,
             JobType = jobType,
             Check = checkSpec,
             AgentControl = agentControlSpec,
@@ -491,6 +504,62 @@ internal sealed class WorkItemCreationService
                 new Dictionary<WorkItemId, WorkItemState>(),
                 new Dictionary<WorkItemId, string?>(),
                 Results.BadRequest(new { error = message }));
+    }
+
+    private const int MaxKnobEntries = 32;
+    private const int MaxKnobKeyLength = 64;
+    private const int MaxKnobValueLength = 128;
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyKnobs
+        = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    internal static (IReadOnlyDictionary<string, string>? Knobs, IResult? Error) NormaliseKnobs(
+        IReadOnlyDictionary<string, string> raw,
+        IKnobRegistry registry)
+    {
+        if (raw.Count > MaxKnobEntries)
+            return (null, Results.BadRequest(new
+            {
+                error = $"knobs may contain at most {MaxKnobEntries} entries",
+            }));
+
+        var normalised = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (rawKey, rawValue) in raw)
+        {
+            if (string.IsNullOrWhiteSpace(rawKey))
+                return (null, Results.BadRequest(new { error = "knob key must not be empty" }));
+            if (rawValue is null)
+                return (null, Results.BadRequest(new { error = $"knob '{rawKey}' value must not be null" }));
+            if (rawKey.Length > MaxKnobKeyLength)
+                return (null, Results.BadRequest(new
+                {
+                    error = $"knob key '{rawKey}' exceeds {MaxKnobKeyLength} chars",
+                }));
+            if (rawValue.Length > MaxKnobValueLength)
+                return (null, Results.BadRequest(new
+                {
+                    error = $"knob '{rawKey}' value exceeds {MaxKnobValueLength} chars",
+                }));
+            if (rawKey.Any(char.IsControl))
+                return (null, Results.BadRequest(new
+                {
+                    error = "knob keys must not contain control characters",
+                }));
+            if (rawValue.Any(char.IsControl))
+                return (null, Results.BadRequest(new
+                {
+                    error = $"knob '{rawKey}' value must not contain control characters",
+                }));
+
+            var key = rawKey.Trim();
+            var value = rawValue.Trim();
+            var verdict = registry.Validate(key, value);
+            if (!verdict.Ok)
+                return (null, Results.BadRequest(new { error = verdict.Error }));
+            normalised[key] = value;
+        }
+
+        return (normalised, null);
     }
 
     private static (IReadOnlyList<string>? Tags, IResult? Error) NormaliseRequiredCapabilities(

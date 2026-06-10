@@ -1071,6 +1071,7 @@ internal static class WorkItemEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        IKnobRegistry knobs,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -1084,7 +1085,8 @@ internal static class WorkItemEndpoints
             || body.WorkTimeoutMinutes is not null
             || body.MergeTimeoutMinutes is not null
             || body.MinModelScore is not null
-            || body.RequiredCapabilities is not null;
+            || body.RequiredCapabilities is not null
+            || body.Knobs is not null;
         var auditBudgetPatch = body.AuditMaxIterations is not null
             || body.AuditComplexity is not null;
 
@@ -1174,6 +1176,13 @@ internal static class WorkItemEndpoints
             var (normalised, capErr) = NormaliseRequiredCapabilities(patchCaps);
             if (capErr is not null) return capErr;
             updated = updated with { RequiredCapabilities = normalised!, UpdatedAt = now };
+        }
+
+        if (body.Knobs is { } patchKnobs)
+        {
+            var (normalisedKnobs, knobErr) = WorkItemCreationService.NormaliseKnobs(patchKnobs, knobs);
+            if (knobErr is not null) return knobErr;
+            updated = updated with { Knobs = normalisedKnobs!, UpdatedAt = now };
         }
 
         if (body.AuditMaxIterations is { } auditMaxIterations)
@@ -1266,7 +1275,8 @@ internal static class WorkItemEndpoints
                 mergeTimeoutChanged: body.MergeTimeoutMinutes is not null,
                 minModelScoreChanged: body.MinModelScore is not null,
                 requiredCapabilitiesChanged: body.RequiredCapabilities is not null,
-                auditBudgetChanged: auditBudgetPatch);
+                auditBudgetChanged: auditBudgetPatch,
+                knobsChanged: body.Knobs is not null);
         }
         if (depsPatch)
             AuditLog.WorkItemDependenciesChanged(updated.Id, oldDependsOn, newDependsOn!);
@@ -2080,7 +2090,10 @@ internal static class WorkItemEndpoints
             ReCheckVerdicts: item.ReCheckVerdicts.Count == 0 ? null : item.ReCheckVerdicts,
             AgentInstanceId: item.AgentInstanceId,
             TemplateName: item.TemplateName,
-            TemplateEntryIndex: item.TemplateEntryIndex);
+            TemplateEntryIndex: item.TemplateEntryIndex,
+            Knobs: item.Knobs.Count == 0
+                ? null
+                : item.Knobs.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
     }
 
     private static ProjectDto ToProjectDto(Project p)
@@ -2320,7 +2333,11 @@ public sealed record CreateWorkItemRequest(
     // once the project has zero other in-flight items, and while it runs no
     // other item for the same project may start. Mutually exclusive with
     // <c>Check</c> and <c>AgentControl</c>.
-    bool? IsRefactor = null);
+    bool? IsRefactor = null,
+    // Per-item knob overrides. Keys must match a registered IKnob.Key; values
+    // must satisfy the knob's AllowedValues (case-insensitive). Unknown keys
+    // and invalid values are rejected at create time with 400.
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 /// <summary>
 /// Request payload for the optional <c>check</c> block on
@@ -2382,7 +2399,11 @@ public sealed record PatchWorkItemRequest(
     // 'ns:value' externalId, or a bare externalId (unambiguous within the
     // project). Cap at 100 entries; cycle-checked; allowed on any non-terminal
     // item. Passing an empty array clears all dependencies.
-    string[]? DependsOn = null);
+    string[]? DependsOn = null,
+    // Replace-set knob edit (queued-only, like Title/Agent). Sending a non-null
+    // map replaces the entire stored map. Unknown keys and out-of-range values
+    // are rejected with 400. Send an empty map to clear all per-item overrides.
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 public sealed record PatchPriorityRequest(int Priority);
 
@@ -2490,7 +2511,9 @@ public sealed record WorkItemDto(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     string? TemplateName = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    int? TemplateEntryIndex = null);
+    int? TemplateEntryIndex = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyDictionary<string, string>? Knobs = null);
 
 /// <summary>
 /// One entry in a work item's per-phase agent involvement trail. Mirrors
