@@ -63,6 +63,48 @@ public sealed class OpencodeModelListProbeTests
         Assert.Equal(["opencode/big-pickle", "deepseek-v4-flash", "opencode-go/glm-5"], ids);
     }
 
+    // Boundary documentation for the regex broadening (provider/model → bare
+    // single token allowed). Anything matching `^[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?$`
+    // is accepted; lone lowercase words like "loading" / "models" / "provider"
+    // therefore parse as ids when the CLI prints them on their own line. We
+    // do NOT have a semantic blocklist for those — accepting one alongside
+    // real ids would produce a phantom routing entry that AgentClassConfigValidator
+    // rejects downstream as an unknown ModelId. This test pins the boundary so
+    // a future tightening of the regex doesn't silently drop real bare-id
+    // models like `deepseek-v4-flash` (the case the broadening exists to allow).
+    [Theory]
+    [InlineData("deepseek-v4-flash")]
+    [InlineData("loading")]
+    [InlineData("models")]
+    [InlineData("provider")]
+    [InlineData("providers")]
+    [InlineData("ready")]
+    [InlineData("done")]
+    public void ParseModelsOutput_LowercaseSingleToken_ParsesAsBareId(string line)
+    {
+        var ids = OpencodeModelListProbe.ParseModelsOutput(line);
+        Assert.Equal([line], ids);
+    }
+
+    // Coverage for inputs the parser still rejects after the broadening — guards
+    // against a future change that further loosens the regex and lets banner /
+    // preamble shapes through that the validator can no longer interpret.
+    [Theory]
+    [InlineData("INFO: cache hit")]               // colon + space + uppercase
+    [InlineData("Loading providers...")]          // uppercase + space + ellipsis
+    [InlineData("loading providers")]              // lowercase but multi-token
+    [InlineData("Loading")]                        // single uppercased token
+    [InlineData("opencode/Big-Pickle")]            // uppercase inside id
+    [InlineData("opencode//double-slash")]         // malformed separator
+    [InlineData("opencode/foo/bar")]               // too many path segments
+    [InlineData("=== header ===")]                 // banner punctuation
+    [InlineData("* opencode/foo")]                 // bullet-prefixed
+    public void ParseModelsOutput_RejectsNonIdShapes(string line)
+    {
+        var ids = OpencodeModelListProbe.ParseModelsOutput(line);
+        Assert.Empty(ids);
+    }
+
     [Fact]
     public async Task GetModelListAsync_EmptyStdout_ReturnsFailed()
     {

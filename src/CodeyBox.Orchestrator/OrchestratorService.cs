@@ -175,6 +175,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan SpawnPacingPausePollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan SpawnPacingPauseObservationWindow = TimeSpan.FromMilliseconds(250);
+    // WaitIfPausedAsync re-checks the queue controller's in-memory volatile
+    // state field on this cadence. Keeping it short (250ms) means a Resume
+    // takes effect promptly without an extra signal channel — matches the
+    // spawn-pacing pause poll. The read is a constant-time volatile field
+    // load on SqliteQueueController so cadence is not a contention concern.
+    private static readonly TimeSpan QueuePauseResumePollInterval = TimeSpan.FromMilliseconds(250);
 
     private enum SpawnPacingWaitResult
     {
@@ -1100,7 +1106,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (_queueController is null) return true;
         while (_queueController.State == QueueState.Paused)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
+            try { await Task.Delay(QueuePauseResumePollInterval, stoppingToken); }
             catch (OperationCanceledException) { return false; }
         }
         return true;
