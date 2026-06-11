@@ -42,11 +42,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private readonly IClaudeTokenRotationPusher? _rotationPusher;
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
+    private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
     private readonly HttpClient _textOnlyHttp;
 
-    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null) { }
+    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: null) { }
 
-    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null) { }
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null, networkTolerance: null) { }
 
     /// <summary>
     /// Primary constructor.
@@ -71,7 +72,16 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentDefaultsSnapshot? defaults,
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null)
-        : this(defaults, rotationPusher, sanitizerConfig, textOnlyHttp: null)
+        : this(defaults, rotationPusher, sanitizerConfig, networkTolerance: null, textOnlyHttp: null)
+    {
+    }
+
+    public ClaudeAgentRunner(
+        AgentDefaultsSnapshot? defaults,
+        IClaudeTokenRotationPusher? rotationPusher,
+        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
+        AgentNetworkToleranceSnapshot? networkTolerance)
+        : this(defaults, rotationPusher, sanitizerConfig, networkTolerance, textOnlyHttp: null)
     {
     }
 
@@ -85,11 +95,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentDefaultsSnapshot? defaults,
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
+        AgentNetworkToleranceSnapshot? networkTolerance,
         HttpClient? textOnlyHttp)
     {
         _defaults = defaults;
         _rotationPusher = rotationPusher;
         _sanitizerConfig = sanitizerConfig;
+        _networkTolerance = networkTolerance;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
 
@@ -413,7 +425,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add("--effort");
             argv.Add(reasoningMode);
         }
-        return new AgentInvocation(argv, Stdin: prompt);
+
+        IReadOnlyDictionary<string, string>? extraEnv = null;
+        var apiTimeout = _networkTolerance?.GetClaudeApiTimeoutMs();
+        if (apiTimeout.HasValue)
+        {
+            extraEnv = new Dictionary<string, string>
+            {
+                ["API_TIMEOUT_MS"] = apiTimeout.Value.ToString()
+            };
+        }
+
+        return new AgentInvocation(argv, ExtraEnvironment: extraEnv, Stdin: prompt);
     }
 
     /// <summary>

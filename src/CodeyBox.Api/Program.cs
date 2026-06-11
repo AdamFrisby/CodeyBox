@@ -1179,6 +1179,17 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
     return new CodeyBox.Core.AgentDefaultsSnapshot(dict);
 });
 
+// AgentNetworkToleranceSnapshot — per-agent network tolerance options,
+// swappable by the hot-reload coordinator. Every runner reads through this
+// same instance so an operator edit to CodeyBox:AgentNetworkTolerance takes
+// effect on the next dispatched agent run without a process restart.
+builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var dict = new Dictionary<string, CodeyBox.Core.AgentNetworkToleranceOptions>(opts.AgentNetworkTolerance, opts.AgentNetworkTolerance.Comparer);
+    return new CodeyBox.Core.AgentNetworkToleranceSnapshot(dict);
+});
+
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
 // thinking-block transcript sanitiser + reactive retry path.
 builder.Services.AddSingleton<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(sp =>
@@ -2348,6 +2359,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
         defaults: sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
         sanitizerConfig: sp.GetRequiredService<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(),
+        networkTolerance: sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
         costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
@@ -3078,6 +3090,16 @@ namespace CodeyBox.Api
         /// next dispatched agent run.
         /// </summary>
         public Dictionary<string, string?> AgentDefaults { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Per-agent network tolerance settings. Keyed by <c>AgentKind.Value</c>
+        /// (case-insensitive). The runner uses these values to override the CLI
+        /// network tolerance settings (e.g. retries, timeouts). Edits hot-reload via
+        /// <see cref="Core.AgentNetworkToleranceSnapshot"/> and take effect on the
+        /// next dispatched agent run.
+        /// </summary>
+        public Dictionary<string, Core.AgentNetworkToleranceOptions> AgentNetworkTolerance { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>

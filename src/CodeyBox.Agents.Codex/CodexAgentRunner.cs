@@ -22,11 +22,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
     private readonly HttpClient _textOnlyHttp;
 
-    public CodexAgentRunner() : this(defaults: null, textOnlyHttp: null) { }
+    public CodexAgentRunner() : this(defaults: null, networkTolerance: null, textOnlyHttp: null) { }
 
-    public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, textOnlyHttp: null) { }
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, networkTolerance: null, textOnlyHttp: null) { }
+
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults, AgentNetworkToleranceSnapshot? networkTolerance) : this(defaults, networkTolerance, textOnlyHttp: null) { }
 
     /// <summary>
     /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
@@ -34,9 +37,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     /// path can be exercised offline without reaching api.openai.com.
     /// Production wiring uses the process-wide shared HttpClient.
     /// </summary>
-    internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, HttpClient? textOnlyHttp)
+    internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, AgentNetworkToleranceSnapshot? networkTolerance, HttpClient? textOnlyHttp)
     {
         _defaults = defaults;
+        _networkTolerance = networkTolerance;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
 
@@ -234,6 +238,33 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             argv.Add("-c");
             argv.Add($"model_reasoning_effort={reasoningMode}");
         }
+
+        // Network tolerance overrides
+        if (_networkTolerance != null)
+        {
+            var reqRetries = _networkTolerance.GetCodexRequestMaxRetries();
+            argv.Add("-c");
+            argv.Add($"model_providers.openai.request_max_retries={reqRetries}");
+
+            var streamRetries = _networkTolerance.GetCodexStreamMaxRetries();
+            argv.Add("-c");
+            argv.Add($"model_providers.openai.stream_max_retries={streamRetries}");
+
+            var idleTimeout = _networkTolerance.GetCodexStreamIdleTimeoutMs();
+            if (idleTimeout.HasValue)
+            {
+                argv.Add("-c");
+                argv.Add($"model_providers.openai.stream_idle_timeout_ms={idleTimeout.Value}");
+            }
+        }
+        else
+        {
+            argv.Add("-c");
+            argv.Add($"model_providers.openai.request_max_retries={AgentNetworkToleranceOptions.DefaultCodexRequestMaxRetries}");
+            argv.Add("-c");
+            argv.Add($"model_providers.openai.stream_max_retries={AgentNetworkToleranceOptions.DefaultCodexStreamMaxRetries}");
+        }
+
         // Pass the prompt via stdin rather than as a positional argv. Linux's
         // MAX_ARG_STRLEN is 128 KiB per single argv element; rework prompts that
         // include many audit findings can exceed that and surface as exit 126

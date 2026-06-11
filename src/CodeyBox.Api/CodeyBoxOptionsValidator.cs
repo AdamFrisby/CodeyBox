@@ -23,6 +23,28 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxTemplateChecks must be between 1 and {CodeyBoxOptions.MaximumMaxTemplateChecks}");
         }
 
+        foreach (var (agent, tolerance) in options.AgentNetworkTolerance)
+        {
+            if (string.IsNullOrWhiteSpace(agent))
+            {
+                failures.Add("CodeyBox:AgentNetworkTolerance keys must not be empty");
+                continue;
+            }
+            if (tolerance is null)
+            {
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent} must not be null");
+                continue;
+            }
+            if (tolerance.RequestMaxRetries is { } req && req < 0)
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be non-negative");
+            if (tolerance.StreamMaxRetries is { } str && str < 0)
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be non-negative");
+            if (tolerance.StreamIdleTimeoutMs is { } idle && idle < 0)
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
+            if (tolerance.ApiTimeoutMs is { } api && api < 0)
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
+        }
+
         foreach (var (agent, pause) in options.AgentPauses)
         {
             if (string.IsNullOrWhiteSpace(agent))
