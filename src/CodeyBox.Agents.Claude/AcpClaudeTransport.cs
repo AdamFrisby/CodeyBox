@@ -384,6 +384,11 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 foreach (var (k, v) in extra)
                     env[k] = v;
             }
+            var apiTimeout = _transport.BindApiTimeout();
+            if (apiTimeout.HasValue)
+            {
+                env["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
+            }
             return env;
         }
 
