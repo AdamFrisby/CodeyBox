@@ -1859,6 +1859,24 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.RefactorExclusivityRecheck);
 
+        // Hot-reload: change only the refactor recheck. This pins
+        // SerializeBudgetDeferralRecheck's refactor field; changing an unrelated
+        // interval must not be required for the snapshot to refresh.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = TimeSpan.FromMinutes(1),
+                HourlyLimitRecheck = TimeSpan.FromMinutes(5),
+                DailyLimitRecheck = TimeSpan.FromHours(1),
+                ConcurrentLimitRecheck = TimeSpan.FromMinutes(1),
+                RefactorExclusivityRecheck = TimeSpan.FromMinutes(12),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(12), snapshot.Current.RefactorExclusivityRecheck);
+
         // Hot-reload: shorten the hourly recheck and lengthen the paused/refactor rechecks.
         monitor.Fire(new CodeyBoxOptions
         {

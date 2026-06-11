@@ -235,18 +235,7 @@ public interface IWorkItemStore
         {
             if (item.ProjectId != projectId) continue;
             if (excludeId is { } excluded && item.Id == excluded) continue;
-            if (item.StartedAt is null) continue;
-            if (item.PreemptCheckpoint is not null) continue;
-            if (item.State is WorkItemState.Done
-                or WorkItemState.Failed
-                or WorkItemState.Cancelled
-                or WorkItemState.AuditFailed
-                or WorkItemState.MergeConflictResolutionFailed
-                or WorkItemState.NeedsOperatorInput
-                or WorkItemState.WaitingForQuotaReset
-                or WorkItemState.WaitingForAgentResume
-                or WorkItemState.AbandonedAfterRecoveryAttempts)
-                continue;
+            if (!WorkItemInFlight.IsInFlight(item)) continue;
             if (item.JobType == JobType.Refactor) refactor++;
             else other++;
         }

@@ -17,6 +17,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         Converters = { new JsonStringEnumConverter() },
     };
+    private static readonly string InFlightExcludedStatesSql =
+        string.Join(", ", WorkItemInFlight.ExcludedStates.Select(state => (int)state));
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
     private readonly SqliteDatabaseWriteGate _writeLock;
@@ -1023,7 +1025,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             WHERE project_id = $pid
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.WaitingForAgentResume}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({InFlightExcludedStatesSql});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -1050,7 +1052,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
               AND ($exclude_id IS NULL OR id != $exclude_id)
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
-              AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.WaitingForAgentResume}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
+              AND state NOT IN ({InFlightExcludedStatesSql});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         cmd.Parameters.AddWithValue("$refactor", JobType.Refactor.ToString());
