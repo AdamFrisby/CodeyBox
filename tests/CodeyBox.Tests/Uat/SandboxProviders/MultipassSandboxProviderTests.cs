@@ -125,6 +125,61 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         return string.Empty;
     }
 
+    [Fact]
+    public void CloudInit_BaselineManifestRedactsSecretShapedTokens()
+    {
+        // The manifest is persisted to /var/lib/codeybox/baseline-install-commands.sh
+        // inside the baked baseline, then inherited by every clone. Raw install
+        // commands can carry operator-supplied registry tokens, basic-auth
+        // URLs, or env-assigned API keys — keeping those out of the manifest
+        // image avoids leaking them into every LLM-controlled VM disk.
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: null,
+            includeGraphicalInstall: false,
+            baselineInstallCommands:
+            [
+                "npm install --registry https://my-registry.example/ --token=npm_abc123XYZdefSecretToken --save",
+                "curl -fsSL https://user:p@ssword1@private.example/install.sh | bash",
+                "GITHUB_TOKEN=ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee npm i -g something",
+                "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\" https://api.example/install",
+            ]);
+
+        var manifest = ExtractWriteFilesEntryContent(cloudInit, "/var/lib/codeybox/baseline-install-commands.sh");
+
+        Assert.DoesNotContain("npm_abc123XYZdefSecretToken", manifest);
+        Assert.DoesNotContain("p@ssword1", manifest);
+        Assert.DoesNotContain("ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee", manifest);
+        Assert.DoesNotContain("eyJhbGciOiJIUzI1NiJ9.payload.sig", manifest);
+        Assert.Contains("***REDACTED***", manifest);
+        // Structural shape preserved so the manifest is still diagnostic.
+        Assert.Contains("npm install --registry https://my-registry.example/", manifest);
+        Assert.Contains("GITHUB_TOKEN=***REDACTED***", manifest);
+        Assert.Contains("Authorization: Bearer ***REDACTED***", manifest);
+    }
+
+    [Theory]
+    [InlineData(
+        "npm install --token=secret_token_abc --save",
+        "npm install --token=***REDACTED*** --save")]
+    [InlineData(
+        "curl https://user:secretpw@host.example/install",
+        "curl https://user:***REDACTED***@host.example/install")]
+    [InlineData(
+        "API_KEY=long_secret_value_here run",
+        "API_KEY=***REDACTED*** run")]
+    [InlineData(
+        "curl -H \"Authorization: Bearer abcDEF123\" https://x",
+        "curl -H \"Authorization: Bearer ***REDACTED***\" https://x")]
+    // Commands without secret-shaped tokens are left untouched.
+    [InlineData(
+        "apt-get install -y curl",
+        "apt-get install -y curl")]
+    public void RedactSecretLikeTokens_ScrubsCommonShapesAndLeavesOthersUntouched(string input, string expected)
+    {
+        Assert.Equal(expected, MultipassSandboxProvider.RedactSecretLikeTokens(input));
+    }
+
     [Theory]
     // Bare keys must be rejected so a runcmd: / write_files: in the operator fragment
     // doesn't duplicate (and silently clobber) CodeyBox's own generated block.

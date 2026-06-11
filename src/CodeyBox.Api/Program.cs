@@ -416,10 +416,20 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
             var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
             var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
-            var baselineVerificationCommands = BaselineVerificationProbeBuilder.Build(
-                live,
-                projects,
-                sp.GetServices<IInVmSmokeProbe>());
+            // Post-bake binary verification is only meaningful on the baseline-
+            // clone path. When baseline images are disabled the per-launch
+            // cloud-init flow exists no baseline to verify, so skip the build
+            // entirely — both to avoid unnecessary work and to keep ordinary
+            // Multipass provisioning insulated from any future bake-only fault
+            // in the builder.
+            var baselineVerificationCommands = live.MultipassUseBaselineImages
+                ? BaselineVerificationProbeBuilder.Build(
+                    live,
+                    projects,
+                    sp.GetServices<IInVmSmokeProbe>(),
+                    sp.GetService<InVmSmokeOptions>(),
+                    sp.GetService<SmokeOptionsSnapshot>())
+                : Array.Empty<MultipassBaselineVerificationCommand>();
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
@@ -1276,7 +1286,9 @@ builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
-// Copilot has no smoke probe: its auth surface is not directly probeable.
+// Copilot has no host-side credential smoke probe (its auth surface is not
+// directly probeable). The in-VM probe covers binary-presence verification,
+// see CopilotInVmSmokeProbe registered below.
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new ClaudeSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
@@ -1317,9 +1329,12 @@ builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
-// at smoke time, not first dispatch). Agents with no sandbox CLI — copilot by
-// default, see InVmSmokeOptions.ExemptAgentsWithoutProbe — are warned but not
-// benched.
+// at smoke time, not first dispatch). Agents on
+// InVmSmokeOptions.ExemptAgentsWithoutProbe (the default still names copilot
+// to preserve back-compat for operators who haven't installed the copilot CLI
+// yet) are warned but not benched; a registered IInVmSmokeProbe — including
+// CopilotInVmSmokeProbe above — supersedes that exemption and is what actually
+// gets executed at probe time.
 builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
@@ -3847,7 +3862,10 @@ namespace CodeyBox.Api
         /// <summary>
         /// Agents allowed to route without a registered in-VM smoke probe.
         /// Uncovered agents are otherwise benched at startup (AC#1). Defaults to
-        /// <c>copilot</c> when unset (no sandbox CLI). Set explicitly to override.
+        /// <c>copilot</c> when unset, preserving back-compat for operators who
+        /// have not yet installed the Copilot CLI in their baseline image —
+        /// when CopilotInVmSmokeProbe is registered the probe runs and the
+        /// exemption is unused. Set explicitly to override.
         /// </summary>
         public List<string>? ExemptAgentsWithoutProbe { get; set; }
     }

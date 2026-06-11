@@ -409,6 +409,57 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         Assert.False(states.ContainsKey(baselineName));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task EnsureBaselineImageAsync_VerificationFailureWithoutHint_FallsBackToCanonicalDiagnostic(string? hint)
+    {
+        // VerifyBaselineRequiredBinariesAsync has a fallback branch that
+        // substitutes a canonical diagnostic when the command's FailureHint
+        // is null or whitespace. Without this coverage a typo'd fallback —
+        // or a swap of the branches — would not surface in CI, leaving
+        // operators staring at a missing diagnostic line.
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineVerification: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity-hintless"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        FailureHint: hint),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command (label 'antigravity') failed", ex.Message);
+        Assert.Contains("required baseline binary not runnable on sandbox PATH", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+    }
+
     [Fact]
     public async Task EnsureBaselineImageAsync_EmptyBaselineVerificationArgv_PurgesPartialBaseline()
     {

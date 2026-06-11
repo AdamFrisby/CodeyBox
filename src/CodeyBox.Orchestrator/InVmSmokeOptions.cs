@@ -110,9 +110,10 @@ public sealed record InVmSmokeOptions
     /// in-VM probe is benched at startup (AC#1: caught at smoke time, not first
     /// dispatch) unless its <see cref="AgentKind.Value"/> is listed here —
     /// the escape hatch for agents with no first-party sandbox CLI driven by
-    /// this pipeline. Defaults to <c>copilot</c> (no CLI / no <c>--model</c>
-    /// flag, so it never runs the in-VM dispatch path). Matched
-    /// case-insensitively.
+    /// this pipeline. Defaults to <c>copilot</c> to preserve back-compat for
+    /// operators who have not yet installed the Copilot CLI in their baseline
+    /// image; once <c>CopilotInVmSmokeProbe</c> is registered the probe runs
+    /// and the entry has no effect for that agent. Matched case-insensitively.
     /// </summary>
     public IReadOnlyList<string> ExemptAgentsWithoutProbe { get; init; } = [AgentKind.Copilot.Value];
 
