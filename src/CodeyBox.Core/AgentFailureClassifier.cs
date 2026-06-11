@@ -106,15 +106,23 @@ public static class AgentFailureClassifier
     /// than running the task. These are separated from <see cref="AuthPatterns"/>
     /// because they can occur on exit-0 runs that otherwise look like a benign
     /// no-diff outcome.
+    ///
+    /// <para>Patterns are deliberately CLI-specific phrasings (full-sentence
+    /// prompts, OAuth-callback URLs, <c>`agy login`</c>-style suggestions) so a
+    /// matching string in a model's task response — e.g. explaining a 401
+    /// response shape, or coding an auth flow — does NOT trip the breaker on
+    /// an otherwise healthy agent. Generic substrings like "not logged in"
+    /// were intentionally rejected after the auditor flagged them as too
+    /// broad; operators can re-add them per-agent via
+    /// <c>CodeyBox:AuthFailurePatterns</c> if they want a looser default.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
     {
-        "Authentication required",
+        "Authentication required. Please visit",
         "Please visit the URL to log in",
-        "Waiting for authentication",
+        "Waiting for authentication (timeout",
         "authentication timed out",
         "not logged into",
-        "not logged in",
         "accounts.google.com/o/oauth2",
         "/oauth-callback",
         "run `agy login`",

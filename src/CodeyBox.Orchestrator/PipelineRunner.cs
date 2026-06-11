@@ -2439,6 +2439,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
                 {
+                    // Inspect the captured agent output for a login prompt
+                    // BEFORE raising MergeConflictResolutionFailedException —
+                    // an exit-0 login prompt that left unmerged paths would
+                    // otherwise park as a generic conflict failure with no
+                    // bench, no alert, and the unauthenticated agent stays
+                    // routable. Use LastAttemptedRunner (populated by the
+                    // resolver even on the failure path) so the correct
+                    // candidate gets benched when a fallback emitted the
+                    // prompt rather than the primary.
+                    var emittingAgent = resolveResult.LastAttemptedRunner?.Kind ?? runner.Kind;
+                    await ThrowIfAuthRequiredOutputAsync(
+                        item, project, emittingAgent, "rebase-resolver",
+                        resolveResult.Stdout, resolveResult.Stderr);
+
                     if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
                     {
                         throw new AgentClassExhaustedException(
@@ -2491,6 +2505,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (ex is MergeConflictResolutionFailedException
                     or AgentUnavailableException
                     or AgentPausedException
+                    or AgentAuthRequiredException
                     or AgentClassExhaustedException
                     or TerminalTransientNetworkError)
                     throw;
@@ -3990,6 +4005,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
             await TransitionWaitingForTransientRetryAsync(item, ex, project);
         }
+        catch (AgentAuthRequiredException authEx)
+        {
+            // failureKind=infrastructure (not "other") so the dispatch retry
+            // policy and operator dashboards treat this as the broken-agent
+            // bench it is — matching the work/merge AgentAuthRequired catch
+            // around RunAsync.
+            _log.LogWarning(
+                "Work item {Id} check-and-act paused because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
+                item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
+            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
@@ -4348,6 +4374,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         await TryRecordCostAsync(aggregatedStdout, result.Stderr,
             agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
+
+        // An exit-0 login prompt from a check-and-act CLI would otherwise be
+        // handed to the verdict parser and surface as a generic verdict-parse
+        // failure — the broken agent stays routable. Inspect aggregated stdout
+        // (covers both streamed chunks and the final payload) so the auth
+        // breaker fires regardless of result.Success.
+        await ThrowIfAuthRequiredOutputAsync(item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr);
 
         if (!result.Success)
         {
@@ -4842,6 +4875,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             agentRunner.Kind, item.AgentInstanceId, item.Id, "post-act-recheck", iteration,
             startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
 
+        // See RunCheckAndActAgentAsync above for the rationale: an exit-0 login
+        // prompt during post-act re-validation would otherwise reach the
+        // verdict parser as a malformed payload, leaving the unauthenticated
+        // agent routable for the next item.
+        await ThrowIfAuthRequiredOutputAsync(item, project, agentRunner.Kind, "post-act-recheck", aggregatedStdout, result.Stderr);
+
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
@@ -5192,9 +5231,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Project project,
         AgentKind agent,
         string phase,
-        AgentResult result)
+        string? stdout,
+        string? stderr)
     {
-        var classification = _authFailureClassifier.Detect(agent, result.Stderr, result.Stdout);
+        var classification = _authFailureClassifier.Detect(agent, stderr, stdout);
         if (classification is null || classification.Kind != AgentFailureKind.AuthRequired)
             return;
 
@@ -5211,10 +5251,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AvailabilityTransition? transition = null;
         if (_availability is ISmokeAvailabilityRegistry smokeRegistry)
         {
+            // SmokeExclusionSource.AuthRequired is intentionally outside the
+            // smoke-gate taxonomy: if the operator disables the master smoke
+            // switch (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/
+            // MissingProbe exclusions are ignored at dispatch — but a real
+            // login prompt is authoritative evidence the binary is broken, not
+            // a probe verdict to second-guess, so AuthRequired survives the
+            // smoke-disabled gate via AgentAvailabilityRegistry.IsNonSmokeExclusion.
             transition = smokeRegistry.MarkSmokeResult(
                 agent,
                 smokeResult,
-                SmokeExclusionSource.InVmSmoke,
+                SmokeExclusionSource.AuthRequired,
                 clearsFastFail: false);
         }
 
@@ -5236,6 +5283,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         throw new AgentAuthRequiredException(agent, phase, reason);
     }
+
+    private Task ThrowIfAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentResult result)
+        => ThrowIfAuthRequiredOutputAsync(item, project, agent, phase, result.Stdout, result.Stderr);
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
@@ -7002,7 +7057,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         passedBuildTestGateEvidence |= passedGateEvidence;
                         buildTestGateFailed |= failedGate;
 
-                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                         if (needsCreds && runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= runner.Kind;
                         findings.AddRange(run.Result.Findings);
@@ -7394,7 +7449,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     foreach (var entry in completedSnapshot)
                     {
                         var run = entry.Run;
-                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                        await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                         if (needsCreds && run.Runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= run.Runner.Kind;
                         if (detectDeclaredShortCircuit
@@ -7438,7 +7493,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 foreach (var entry in llmRuns)
                 {
                     var run = entry.Run;
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, project.Id, ctx, ct);
+                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                     if (needsCreds && run.Runner.Kind != workRunner.Kind)
                         activeAuditAgentKind ??= run.Runner.Kind;
                     findings.AddRange(run.Result.Findings);
@@ -8040,11 +8095,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AuditorRunRecord run,
         IAgentRunner workRunner,
         bool needsCreds,
-        ProjectId projectId,
+        WorkItem item,
+        Project project,
         AuditContext ctx,
         CancellationToken ct)
     {
-        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, projectId, ct);
+        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
+        // Auth/login-prompt check runs alongside the quota check: an exit-0
+        // login prompt from an LLM auditor's agent that suppressed
+        // audit/result.json was previously surfaced as a normal "agent did not
+        // write audit/result.json" finding, leaving the unauthenticated agent
+        // routable for the next iteration. Inspects AgentStdout / AgentStderr
+        // (now populated unconditionally by LlmReviewAuditor) plus RawOutput
+        // as a fallback for any auditor that did not propagate the stream.
+        await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, ct);
 
         if (needsCreds)
         {
@@ -8073,6 +8137,35 @@ public sealed partial class PipelineRunner : IPipelineRunner
             : "none";
         AuditLog.AuditorRun(run.Auditor.Name, worstSeverity, run.Elapsed, run.Runner.Kind);
         await PersistAuditReportAsync(ctx, run.Auditor, run.Result, run.StartedAt, run.Elapsed, ct);
+    }
+
+    private async Task ThrowIfAuditorRunAuthRequiredAsync(
+        AuditorRunRecord run,
+        bool needsCreds,
+        WorkItem item,
+        Project project,
+        CancellationToken ct)
+    {
+        _ = ct;
+        if (!needsCreds)
+            return;
+
+        // AgentStdout / AgentStderr are the structured agent-output fields
+        // (set by LlmReviewAuditor on every return path now). RawOutput is the
+        // belt-and-braces fallback — some auditors fold the agent's last reply
+        // into RawOutput without splitting into stdout/stderr, and an exit-0
+        // login prompt that landed only there would otherwise escape the
+        // detector and surface as an "agent did not write audit/result.json"
+        // finding.
+        var stdout = !string.IsNullOrEmpty(run.Result.AgentStdout)
+            ? run.Result.AgentStdout
+            : run.Result.RawOutput;
+        var stderr = run.Result.AgentStderr;
+        if (string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(stderr))
+            return;
+
+        await ThrowIfAuthRequiredOutputAsync(
+            item, project, run.Runner.Kind, $"audit:{run.Auditor.Name}", stdout, stderr);
     }
 
     private async Task ThrowIfAuditorRunQuotaAsync(
@@ -10504,6 +10597,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         chosenMergeCredential = resolverResult.FailureCredential;
                         agentResultForAvailabilityClassification = resolverResult.FailureClassificationResult;
                     }
+                    else if (!resolverResult.Success && resolverResult.LastAttemptedRunner is not null)
+                    {
+                        // ChosenRunner is success-only; on a failed resolver
+                        // result it stays null and the catch-all below would
+                        // bench the original work runner even when a fallback
+                        // candidate actually emitted the failure. Surfacing the
+                        // last-attempted candidate here keeps the auth detector,
+                        // quota classifier, and availability breaker pointed at
+                        // the agent whose stdout/stderr we captured.
+                        chosenMergeRunner = resolverResult.LastAttemptedRunner;
+                    }
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
                 mergeEndedAt = DateTimeOffset.UtcNow;
@@ -12516,6 +12620,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 : transientFailure ? "failure:transient"
                 : !agentResult.Success ? "failure:agent"
                 : "success");
+            // An exit-0 conflict-rework run that printed a login prompt would
+            // otherwise fall through to the rebase/status handling below and be
+            // recorded as an ordinary dirty/conflict rework failure, leaving
+            // the unauthenticated agent routable. Detection runs before the
+            // semantic-incompatible branch so an auth break is always reported
+            // as the breaking signal, not as the agent's own reasoned refusal.
+            await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, ConflictReworkPhaseKey, agentResult);
             if (semanticIncompatible is not null)
             {
                 return new ConflictReworkAgentOutcome(

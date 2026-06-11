@@ -99,7 +99,14 @@ public enum AgenticConflictResolverOperation
 /// and (when enabled) build-verify checks all pass after one of the candidate
 /// agents finished. <see cref="ChosenRunner"/> / <see cref="ChosenCredential"/>
 /// carry the agent that actually succeeded so callers can attribute the work
-/// for audit-log and usage accounting.
+/// for audit-log and usage accounting. <see cref="FailureRunner"/> /
+/// <see cref="FailureCredential"/> / <see cref="FailureClassificationResult"/>
+/// carry the candidate and concrete output that caused the terminal resolver
+/// failure. <see cref="LastAttemptedRunner"/> is also populated when at least
+/// one candidate ran so older/custom callers can still bench the specific
+/// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>
+/// (e.g. when a fallback candidate, not the original work runner, emitted a
+/// login prompt).
 /// </summary>
 public sealed record AgenticConflictResolverResult(
     bool Success,
@@ -109,7 +116,8 @@ public sealed record AgenticConflictResolverResult(
     IReadOnlyList<string> ConflictFiles,
     int IterationsUsed,
     string? Stdout,
-    string? Stderr)
+    string? Stderr,
+    IAgentRunner? LastAttemptedRunner = null)
 {
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
@@ -234,6 +242,7 @@ public sealed class AgenticConflictResolver
         var attemptTrail = new List<string>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
+        IAgentRunner? lastAttemptedRunner = null;
         IAgentRunner? lastFailureRunner = null;
         AgentCredential? lastFailureCredential = null;
         AgentResult? lastFailureClassificationResult = null;
@@ -341,15 +350,20 @@ public sealed class AgenticConflictResolver
                     lastVerificationError);
 
                 AgentResult agentResult;
+                // Record the attempted runner BEFORE the call so a throw still
+                // identifies which candidate the captured exception came from —
+                // callers (auth detector, audit log) need the runner identity
+                // even when no AgentResult survives.
+                lastAttemptedRunner = runner;
                 var supervision = await StartSupervisionSessionAsync(
                     workItemId,
                     context,
                     runner,
                     candidate,
                     sandbox,
-                        workingDirectory,
-                        attempt,
-                        ct);
+                    workingDirectory,
+                    attempt,
+                    ct);
                 Action<string>? stdoutCallback = null;
                 var captureStructuredStream = NeedsStructuredStreamForResume(runner);
                 try
@@ -477,7 +491,8 @@ public sealed class AgenticConflictResolver
                         ConflictFiles: conflictFiles,
                         IterationsUsed: totalIterations,
                         Stdout: agentResult.Stdout,
-                        Stderr: agentResult.Stderr);
+                        Stderr: agentResult.Stderr,
+                        LastAttemptedRunner: runner);
                 }
 
                 lastVerificationError = verification.Reason;
@@ -516,7 +531,8 @@ public sealed class AgenticConflictResolver
             ConflictFiles: conflictFiles,
             IterationsUsed: totalIterations,
             Stdout: lastAgentResult?.Stdout,
-            Stderr: lastAgentResult?.Stderr)
+            Stderr: lastAgentResult?.Stderr,
+            LastAttemptedRunner: lastAttemptedRunner)
         {
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,

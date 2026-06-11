@@ -466,6 +466,15 @@ public enum SmokeExclusionSource
     /// operator <see cref="AgentAvailabilityRegistry.Reset"/>.
     /// </summary>
     NoChangesBreaker,
+
+    /// <summary>
+    /// Runtime auth/login prompt detected in real agent output (not a probe).
+    /// Tracked outside the smoke gate so a deployment with
+    /// <c>CodeyBox:Smoke:Enabled=false</c> still benches an unauthenticated
+    /// agent — the operator's "trust the smoke probes less" knob must not
+    /// keep routing work to a CLI that printed an OAuth login URL and exited 0.
+    /// </summary>
+    AuthRequired,
 }
 
 /// <summary>

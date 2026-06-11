@@ -454,6 +454,127 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedWorkRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        // The work-phase fix scans BOTH the Success=true (exit 0, no diff) and
+        // Success=false (non-zero exit) outputs for a login prompt. Without
+        // this case, a regression that only kept the Success=true call would
+        // still pass the pre-existing test but silently regress the more
+        // common failure shape: a nonzero exit whose stderr/stdout contains
+        // the captured login transcript.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: transcript));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Equal("infrastructure", final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task AuthLoginPrompt_SurvivesSmokeDisabled_GateBenchesAgentForNextItem()
+    {
+        // Master smoke switch OFF. The non-smoke exclusion source
+        // (SmokeExclusionSource.AuthRequired) MUST still hold the agent
+        // benched — if the auth source were tracked as InVmSmoke/HostSmoke,
+        // AgentDispatchAvailability.GetAvailabilityWithoutSmokeGateExclusions
+        // would silently ignore it and route the next item to the same
+        // unauthenticated CLI. Pin the regression so a future refactor that
+        // re-classifies AuthRequired as a smoke source fails this test.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Even with smoke disabled the dispatch-availability view must
+        // report the agent as unavailable.
+        var dispatch = new AgentDispatchAvailability(fix.Registry, inVmSmokeGate: null, smokeOptions: smokeOptions);
+        var verdict = dispatch.GetAvailability(AgentKind.Codex);
+        Assert.NotNull(verdict);
+        Assert.False(verdict!.Available);
+        Assert.Contains("auth required from agent output", verdict.Reason);
+    }
+
+    [Fact]
+    public async Task MergePhaseDirectAgentRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        // The merge-phase fix call site is decoupled from the work-phase call
+        // site: a regression that drops EITHER would leave half the outage
+        // unmitigated. Pin the merge path independently so a removed/wrong-
+        // phase-name detector call there can't pass off the work-phase test
+        // as full coverage.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        // Work phase succeeds; merge phase returns exit 0 with a captured
+        // login prompt — the silent-broken-agent shape from the antigravity
+        // outage, but inside the merge call site.
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("merge", final.LastError);
+        Assert.Equal("infrastructure", final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        // Pin the phase tag so a future refactor that copies the work-phase
+        // call into merge without updating the label is caught — operator
+        // dashboards need merge vs. work attribution.
+        Assert.Contains("merge", details.Reason);
+    }
+
+    [Fact]
     public async Task SuccessfulNoDiffRun_WithoutAuthLoginPrompt_RemainsNormalNoChangesFailure()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

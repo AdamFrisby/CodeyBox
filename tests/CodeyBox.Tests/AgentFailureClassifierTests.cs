@@ -92,6 +92,20 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
+    [Theory]
+    // Plausible task-response phrasing that previously tripped the breaker on a
+    // healthy agent. Pinning these as NOT-AuthRequired catches a regression
+    // that reintroduces the over-broad "Authentication required" / "not logged
+    // in" substrings into the default pattern list.
+    [InlineData("The endpoint requires Authentication required for users in role admin.")]
+    [InlineData("If the user is not logged in we should redirect to /signin.")]
+    [InlineData("Waiting for authentication to complete before issuing the JWT.")]
+    public void GenericTaskResponse_NotClassified_AsAuthRequired(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
     [Fact]
     public async Task AgentAuthFailureClassifier_DetectsCapturedAgyLoginPrompt()
     {

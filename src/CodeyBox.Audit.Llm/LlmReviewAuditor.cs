@@ -161,12 +161,21 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
         }, ct);
         if (!read.Success || string.IsNullOrWhiteSpace(read.Stdout))
         {
+            // Carry AgentStdout / AgentStderr unconditionally so the pipeline's
+            // post-processing auth/login-prompt classifier can fire even on
+            // this no-result.json path — without these fields, an exit-0 login
+            // prompt that suppressed audit/result.json would surface as a
+            // normal audit finding and the unauthenticated agent would stay
+            // routable.
             return new AuditResult(false, [new AuditFinding(
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
                 Title: $"agent did not write {ResultFile}",
                 Description: agentResult.Stdout ?? "")],
-                RawOutput: rawOutput);
+                RawOutput: rawOutput,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
 
         try
@@ -180,7 +189,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Title: f.Title ?? "(no title)",
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
-            return new AuditResult(parsed.Passed, findings, RawOutput: rawOutput);
+            return new AuditResult(parsed.Passed, findings, RawOutput: rawOutput,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
         catch (JsonException ex)
         {
@@ -189,7 +201,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Severity: AuditSeverity.Error,
                 Title: "review agent produced invalid JSON",
                 Description: $"{ex.Message}\n---\n{Truncate(read.Stdout, 1024)}")],
-                RawOutput: rawOutput);
+                RawOutput: rawOutput,
+                AgentStderr: agentResult.Stderr,
+                AgentSummary: agentResult.Summary,
+                AgentStdout: agentResult.Stdout);
         }
     }
 

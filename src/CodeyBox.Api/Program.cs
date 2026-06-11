@@ -2275,18 +2275,7 @@ builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
 builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var extras = cbOpts.AuthFailurePatterns is null
-        ? new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
-        : cbOpts.AuthFailurePatterns
-            .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key))
-            .ToDictionary(
-                kvp => kvp.Key,
-                kvp => (IReadOnlyList<AuthFailurePattern>)(kvp.Value ?? new List<AuthFailurePatternOptions>())
-                    .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
-                    .Select(p => new AuthFailurePattern(p.Pattern))
-                    .ToArray(),
-                StringComparer.OrdinalIgnoreCase);
-    return new AgentAuthFailureClassifier(extras);
+    return AuthFailurePatternBinder.Build(cbOpts);
 });
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
@@ -4777,6 +4766,36 @@ namespace CodeyBox.Api
     {
         /// <summary>The substring to search for in stderr/stdout.</summary>
         public string Pattern { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Pure conversion from operator-supplied
+    /// <see cref="CodeyBoxOptions.AuthFailurePatterns"/> to a wired
+    /// <see cref="AgentAuthFailureClassifier"/>. Extracted from the DI factory
+    /// so the binding shape (config section name, per-agent dictionary,
+    /// pattern filtering, conversion to <see cref="AuthFailurePattern"/>) is
+    /// reachable from unit tests without booting the full host — a bug in
+    /// any of those steps would otherwise silently disable the operator's
+    /// extensibility hook for new CLI login prompts.
+    /// </summary>
+    public static class AuthFailurePatternBinder
+    {
+        public static AgentAuthFailureClassifier Build(CodeyBoxOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            var extras = options.AuthFailurePatterns is null
+                ? new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+                : options.AuthFailurePatterns
+                    .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key))
+                    .ToDictionary(
+                        kvp => kvp.Key,
+                        kvp => (IReadOnlyList<AuthFailurePattern>)(kvp.Value ?? new List<AuthFailurePatternOptions>())
+                            .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
+                            .Select(p => new AuthFailurePattern(p.Pattern))
+                            .ToArray(),
+                        StringComparer.OrdinalIgnoreCase);
+            return new AgentAuthFailureClassifier(extras);
+        }
     }
 
     /// <summary>
