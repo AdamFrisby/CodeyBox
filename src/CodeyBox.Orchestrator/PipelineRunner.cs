@@ -1080,7 +1080,8 @@ public sealed class PipelineRunner : IPipelineRunner
                                         sandboxFlavor: sandboxTarget.Flavor,
                                         project: project,
                                         phaseCt,
-                                        hostShutdownToken),
+                                        hostShutdownToken,
+                                        buildFailurePolicy: RequiredBuildPolicy.Terminal),
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: workPhase,
@@ -1136,7 +1137,11 @@ public sealed class PipelineRunner : IPipelineRunner
                                         sandboxFlavor: sandboxTarget.Flavor,
                                         project: project,
                                         phaseCt,
-                                        hostShutdownToken),
+                                        hostShutdownToken,
+                                        // The audit loop runs immediately after this resume-rework
+                                        // path, so a non-compiling tree is re-detected by the audit
+                                        // build gate and folded into the iteration's findings.
+                                        buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop),
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: reworkPhase,
@@ -2864,6 +2869,7 @@ public sealed class PipelineRunner : IPipelineRunner
         Project project,
         CancellationToken ct,
         CancellationToken hostShutdownToken,
+        RequiredBuildPolicy buildFailurePolicy,
         int? iteration = null)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
@@ -3483,12 +3489,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     if (isInitial && suggestionsJson is not null)
                         await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
                     return agentResult.Stdout;
                 }
 
                 if (checkedOutExistingBranch)
-                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
                 var msg = isInitial
                     ? "Agent produced no changes to commit"
@@ -3516,7 +3522,7 @@ public sealed class PipelineRunner : IPipelineRunner
             if (isInitial && suggestionsJson is not null)
                 await PickUpSuggestionsAsync(item, project, suggestionsJson, ct);
 
-            await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, ct);
+            await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
 
             phaseSucceeded = true;
             return agentResult.Stdout;
@@ -4501,6 +4507,12 @@ public sealed class PipelineRunner : IPipelineRunner
                                 project: project,
                                 phaseCt,
                                 hostShutdownToken,
+                                // Post-act rework is followed by another check-verdict iteration,
+                                // NOT a build-gated audit iteration. A non-compiling tree here will
+                                // not be re-surfaced by any subsequent gate, so a build failure
+                                // produced by this rework must terminal-fail the item rather than
+                                // silently slip toward the merge / merged path.
+                                buildFailurePolicy: RequiredBuildPolicy.Terminal,
                                 iteration: null),
                             workToken: attemptCt),
                     ct,
@@ -5390,6 +5402,11 @@ public sealed class PipelineRunner : IPipelineRunner
                             project: project,
                             phaseCt,
                             hostShutdownToken,
+                            // Audit-driven rework: the next iteration of the audit/rework loop
+                            // re-runs the build gate via RunForAuditAsync, which surfaces the
+                            // failure as a blocking finding. Terminal-failing here would defeat
+                            // the loop's purpose of converging on a fix within the audit budget.
+                            buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
                             iteration: reworkIterationNumber),
                         workToken: attemptCt),
                 ct,

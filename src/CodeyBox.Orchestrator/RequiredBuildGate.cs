@@ -7,6 +7,32 @@ using CodeyBox.Sandbox;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
+/// How <see cref="RequiredBuildGate.EnforceForWorkPhaseAsync"/> should treat
+/// a build failure. The caller picks the policy; the gate does not infer it
+/// from the agent phase string (which is shared by multiple dispatch
+/// pathways with different downstream guarantees).
+/// </summary>
+internal enum RequiredBuildPolicy
+{
+    /// <summary>
+    /// Throw <see cref="RequiredBuildFailedException"/> on build failure so
+    /// the outer pipeline catch terminal-fails the work item with
+    /// <c>failureKind=build</c>. Use when no following audit iteration will
+    /// re-detect and surface the failure (initial work; post-act rework).
+    /// </summary>
+    Terminal,
+
+    /// <summary>
+    /// Return silently on build failure. The caller GUARANTEES a build-gated
+    /// audit iteration runs next, which will re-detect the same failure via
+    /// <see cref="RequiredBuildGate.RunForAuditAsync"/> and surface it as a
+    /// blocking finding for the audit/rework loop to converge on (bounded by
+    /// the audit ceiling).
+    /// </summary>
+    DeferToAuditLoop,
+}
+
+/// <summary>
 /// Cohesive build-gate service that owns the entire required-build workflow:
 /// applicability probing, phase-specific enforcement (work / audit / merge),
 /// timeout wrapping around the verifier, audit-finding construction, and
@@ -86,27 +112,34 @@ internal sealed class RequiredBuildGate
     }
 
     /// <summary>
-    /// Enforces the build gate for the work / rework phase.
+    /// Enforces the build gate for the work / rework phase. The caller passes
+    /// an explicit <see cref="RequiredBuildPolicy"/> instead of the gate
+    /// inferring the policy from <paramref name="agentPhase"/> — the phase
+    /// string is shared by the audit-driven rework loop and other rework
+    /// dispatches (e.g. the post-act revalidation loop) which have different
+    /// downstream guarantees, so phase-string inference is a loose coupling
+    /// the caller must own.
     ///
-    /// <para><b>Work (initial) phase:</b> on failure throws
-    /// <see cref="RequiredBuildFailedException"/> so the outer pipeline catch
-    /// transitions the item to Failed with <c>failureKind=build</c>. The
-    /// initial work phase has no audit/rework loop behind it that could
-    /// converge on a fix, so terminal failure is the only sensible outcome.
-    /// </para>
+    /// <para><b><see cref="RequiredBuildPolicy.Terminal"/>:</b> on failure
+    /// throws <see cref="RequiredBuildFailedException"/> so the outer pipeline
+    /// catch transitions the item to Failed with <c>failureKind=build</c>.
+    /// Used for the initial work phase (no rework loop sits behind it) and
+    /// for rework dispatches that are NOT followed by another audit iteration
+    /// (e.g. the post-act revalidation loop's remediation rework, whose
+    /// follow-up is a non-actionable check verdict — not a build-gated audit
+    /// iteration).</para>
     ///
-    /// <para><b>Rework phase:</b> on failure does NOT throw. The next audit
-    /// iteration's <see cref="RunForAuditAsync"/> call detects the same
-    /// non-compile state and surfaces it as a blocking finding, giving the
-    /// audit/rework loop another iteration to recover within the existing
+    /// <para><b><see cref="RequiredBuildPolicy.DeferToAuditLoop"/>:</b> on
+    /// failure does NOT throw. The next audit iteration's
+    /// <see cref="RunForAuditAsync"/> call detects the same non-compile state
+    /// and surfaces it as a blocking finding, giving the audit/rework loop
+    /// another iteration to recover within the existing
     /// <see cref="ProjectAudit.MaxIterations"/> budget. Only when that budget
     /// is exhausted does the audit ceiling (park-if-progress / fail-if-not)
-    /// take over. This mirrors the unified "unsuccessful-rework =&gt;
-    /// loop-back-not-terminal" policy documented alongside the audit-loop
-    /// docs and avoids the asymmetry where a build failure DISCOVERED in
-    /// audit self-corrects but the SAME failure PRODUCED by a rework
-    /// terminal-failed.
-    /// </para>
+    /// take over. Used by audit-driven rework dispatches AND by any other
+    /// dispatch that is GUARANTEED to be followed by a build-gated audit
+    /// iteration (e.g. the resume-after-preempt rework path, which is
+    /// immediately followed by <see cref="RunAuditLoopAsync"/>).</para>
     /// </summary>
     public async Task EnforceForWorkPhaseAsync(
         WorkItem item,
@@ -115,6 +148,7 @@ internal sealed class RequiredBuildGate
         string baseBranch,
         string workBranch,
         string agentPhase,
+        RequiredBuildPolicy policy,
         CancellationToken ct)
     {
         var result = await VerifyAsync(
@@ -122,11 +156,11 @@ internal sealed class RequiredBuildGate
         if (result.Status != RequiredBuildVerificationStatus.Failed)
             return;
 
-        if (agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase))
+        if (policy == RequiredBuildPolicy.DeferToAuditLoop)
             return;
 
         throw new RequiredBuildFailedException(
-            $"work left the branch non-compiling: {BuildFailureSummary(result)}");
+            $"{agentPhase} left the branch non-compiling: {BuildFailureSummary(result)}");
     }
 
     /// <summary>

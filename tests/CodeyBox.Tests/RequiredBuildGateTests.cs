@@ -312,6 +312,85 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task EnforceForWorkPhase_TerminalPolicy_ReworkPhaseString_StillThrowsOnBuildFailure()
+    {
+        // Pins the explicit-policy contract: the gate decides terminal vs
+        // deferred from the RequiredBuildPolicy argument, NOT the phase
+        // string. The post-act revalidation loop dispatches rework with
+        // phase="rework" but has no subsequent build-gated audit iteration
+        // to convert the failure into a finding, so it passes Terminal —
+        // and the gate must throw even though the phase reads "rework".
+        // A regression that re-introduces phase-string inference would
+        // silently swallow the failure and let the item walk toward merge
+        // with a broken build.
+        var item = NewItem("feature/policy-terminal-pin");
+        var project = NewProject(item);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "fake build error"));
+        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+
+        var ex = await Assert.ThrowsAsync<RequiredBuildFailedException>(() =>
+            gate.EnforceForWorkPhaseAsync(
+                item, project, repoId: "ignored",
+                baseBranch: item.BaseBranch!, workBranch: item.WorkBranch!,
+                agentPhase: "rework",
+                policy: RequiredBuildPolicy.Terminal,
+                ct: CancellationToken.None));
+        Assert.Contains("rework left the branch non-compiling", ex.Message);
+        Assert.Contains("fake build error", ex.Message);
+    }
+
+    [Fact]
+    public async Task EnforceForWorkPhase_DeferPolicy_ReworkPhaseString_DoesNotThrowOnBuildFailure()
+    {
+        // The mirror of the Terminal pin: when the caller GUARANTEES a
+        // subsequent build-gated audit iteration (audit-driven rework,
+        // resume-after-preempt rework), the gate must NOT throw on a
+        // non-compile — RunForAuditAsync picks it up as a blocking finding
+        // and the audit/rework loop converges on it.
+        var item = NewItem("feature/policy-defer-pin");
+        var project = NewProject(item);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "fake build error"));
+        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+
+        // No exception → DeferToAuditLoop returns silently on failure.
+        await gate.EnforceForWorkPhaseAsync(
+            item, project, repoId: "ignored",
+            baseBranch: item.BaseBranch!, workBranch: item.WorkBranch!,
+            agentPhase: "rework",
+            policy: RequiredBuildPolicy.DeferToAuditLoop,
+            ct: CancellationToken.None);
+
+        Assert.Equal(1, verifier.VerifyCalls);
+    }
+
+    [Fact]
+    public async Task EnforceForWorkPhase_TerminalPolicy_WorkPhaseString_ThrowsOnBuildFailure()
+    {
+        // Pins initial-work behavior: phase="work" + Terminal still throws.
+        // This is the unchanged initial-work path; if the policy plumbing
+        // ever inverts the meaning of the enum, this catches it.
+        var item = NewItem("feature/policy-initial-work-pin");
+        var project = NewProject(item);
+        var verifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Failed(1, "fake build error"));
+        var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
+
+        var ex = await Assert.ThrowsAsync<RequiredBuildFailedException>(() =>
+            gate.EnforceForWorkPhaseAsync(
+                item, project, repoId: "ignored",
+                baseBranch: item.BaseBranch!, workBranch: item.WorkBranch!,
+                agentPhase: "work",
+                policy: RequiredBuildPolicy.Terminal,
+                ct: CancellationToken.None));
+        Assert.Contains("work left the branch non-compiling", ex.Message);
+    }
+
+    [Fact]
     public async Task AuditPass_CannotReachAuditPassed_WhenRequiredBuildFails()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1229,16 +1308,21 @@ public sealed class RequiredBuildGateTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        // The exact terminal state depends on whether the audit ceiling
-        // converges or hard-fails; the load-bearing invariant is that the
-        // item never reaches AuditPassed / Done with a broken build.
+        // The agent makes no commit, so the work branch tip never moves;
+        // with a single audit iteration the convergence history has < 2
+        // entries, so HasAuditConvergenceProgress returns false and the
+        // audit ceiling MUST terminal-fail (AuditFailed) rather than park
+        // for operator review. Accepting NeedsOperatorInput here would
+        // make this test pass under a regression that parks every
+        // non-compiling rework at the budget ceiling regardless of
+        // convergence — exactly the fail-if-no-progress half of the new
+        // policy that needs to be pinned.
         Assert.NotEqual(WorkItemState.AuditPassed, final!.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.NotEqual(WorkItemState.NeedsOperatorInput, final.State);
         Assert.True(
-            final.State is WorkItemState.AuditFailed
-                or WorkItemState.NeedsOperatorInput
-                or WorkItemState.Failed,
-            $"expected a non-success terminal state, got {final.State}");
+            final.State is WorkItemState.AuditFailed or WorkItemState.Failed,
+            $"expected AuditFailed or Failed (no-progress audit ceiling), got {final.State}");
         Assert.Contains("required build failed", final.LastError, StringComparison.OrdinalIgnoreCase);
     }
 
