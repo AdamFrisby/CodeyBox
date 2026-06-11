@@ -76,6 +76,61 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         Assert.Equal("agent binary was not found in the sandbox", GetScalar<string>(evt, "Reason"));
     }
 
+    [Fact]
+    public async Task InfrastructureMergeFailure_EmitsSandboxInfraAuditSignalFromPipeline_WithMergePhase()
+    {
+        // Companion to the work-phase signal test above: the merge-phase
+        // RecordAvailabilityOutcomeAsync call site must surface its own
+        // sandbox.agent_infra_failure audit event tagged with Phase=merge.
+        // A regression that tied the phase argument to the work-phase literal
+        // (or dropped the merge call entirely) would silently lose the merge
+        // infra signal, leaving sandbox/provisioning incidents on the merge
+        // path invisible to dashboards.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        // Work phase succeeds end-to-end (a single file write) so the pipeline
+        // reaches the merge phase, which is where the scripted infra failure
+        // fires.
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agentic conflict resolution failed: agent exited 127 (attempts: codex#1(agent exited 127))",
+            Stdout: null,
+            Stderr: "env: 'codex': No such file or directory"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "merge infra audit signal",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            Agent = AgentKind.Codex,
+            PushUpstream = false,
+        };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // Registry untouched — infra filter must also fire on the merge path.
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
+        Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+
+        // The merge-phase infra event is the assertion this test exists for.
+        // Filter on Phase=merge specifically: any work-phase event in the sink
+        // (none expected here, but defended) must not satisfy the assertion.
+        var evt = Assert.Single(
+            _sink.Events,
+            e => GetScalar<string>(e, "EventName") == "sandbox.agent_infra_failure"
+                 && GetScalar<string>(e, "Phase") == "merge");
+        Assert.Equal(item.Id.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("codex", GetScalar<string>(evt, "Agent"));
+        Assert.Equal("agent binary was not found in the sandbox", GetScalar<string>(evt, "Reason"));
+    }
+
     private TestFixture BuildPipeline(string seedRepoUrl)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);

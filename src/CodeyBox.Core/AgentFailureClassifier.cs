@@ -92,14 +92,25 @@ public static class AgentFailureClassifier
 
     /// <summary>
     /// Substrings that only become an infrastructure failure when paired with
-    /// an exit-127 summary. Kept separate from normal failure matching so
-    /// repository-level messages like "ENOENT: no such file 'foo.txt'" remain
-    /// work failures, not sandbox provisioning defects.
+    /// an exit-127 summary. Each pattern carries enough syntactic context to
+    /// distinguish a shell binary-launch failure from a repository-level
+    /// filesystem error such as Node.js's
+    /// <c>ENOENT: no such file or directory, open 'foo.txt'</c> — a bare
+    /// "No such file or directory" match would conflate the two and silently
+    /// turn the latter into an infrastructure signal.
     /// </summary>
     public static readonly IReadOnlyList<string> BinaryNotFoundPatterns = new[]
     {
+        // bash / zsh: "bash: codex: command not found"
         "command not found",
-        "No such file or directory",
+        // GNU coreutils env: "env: 'codex': No such file or directory" —
+        // the close-quote + ": No such file" sequence is the discriminator;
+        // Node's fs ENOENT shape is "ENOENT: no such file or directory, open '..."
+        // which never contains the close-quote-before-colon prefix.
+        "': No such file or directory",
+        // POSIX /bin/sh: "/bin/sh: 1: codex: not found"
+        ": not found",
+        // CodeyBox-side explicit signal raised by the in-VM smoke prober.
         "not found in sandbox",
     };
 

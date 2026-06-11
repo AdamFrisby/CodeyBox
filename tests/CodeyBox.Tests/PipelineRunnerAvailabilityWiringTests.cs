@@ -81,6 +81,68 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task InfrastructureFailure_PreservesExistingFastFailCount_AndStillTripsOnNextGenuineFail()
+    {
+        // Inverse of the zero-counter case above: prove the infra filter is
+        // genuinely a NO-OP on the registry, not a "record-as-success" reset.
+        // Seed two genuine fast-fails (counter=2, threshold=3). Run one infra
+        // failure. Then run one more genuine fast-fail and verify the breaker
+        // trips — proving the prior counter survived intact.
+        //
+        // A regression that recorded infra as success would zero the counter
+        // and the breaker would never trip on the third real crash. A
+        // regression that recorded infra as a slow non-zero run would bump
+        // the counter but reset LastFastFailAt and break the time-window
+        // logic; this test pins the counter directly.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        // Seed two genuine fast-fails directly into the registry.
+        for (var i = 0; i < 2; i++)
+            fix.Registry.RecordRunOutcome(
+                AgentKind.Codex,
+                success: false,
+                duration: TimeSpan.FromMilliseconds(500));
+
+        var beforeSnap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
+        Assert.Equal(2, beforeSnap.ConsecutiveFastFails);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+
+        // Run an infra-shaped failure through the pipeline.
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'codex': No such file or directory"));
+        var infraItem = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(infraItem);
+        await fix.Pipeline.RunAsync(infraItem, CancellationToken.None);
+
+        // Counter is unchanged — the filter was a no-op, not a reset.
+        var midSnap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
+        Assert.Equal(2, midSnap.ConsecutiveFastFails);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+
+        // One more genuine fast-fail must trip the breaker (2 + 1 == threshold).
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 2",
+            Stdout: null,
+            Stderr: "panic: fatal agent runtime crash"));
+        var crashItem = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(crashItem);
+        await fix.Pipeline.RunAsync(crashItem, CancellationToken.None);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("fast-fail circuit breaker", availability.Reason);
+        var transition = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(transition.Details);
+        Assert.Equal("codex", details.AgentKind);
+    }
+
+    [Fact]
     public async Task ThreeConsecutiveFastAgentCrashes_ExcludeAgent_AndPublishOneTransitionWebhook()
     {
         // Stand up an availability registry with the production defaults and

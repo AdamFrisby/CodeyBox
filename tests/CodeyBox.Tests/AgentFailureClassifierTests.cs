@@ -84,14 +84,39 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
     }
 
-    [Fact]
-    public void Exit127NonBinaryFailure_RemainsNormal()
+    // Realistic non-binary filesystem ENOENT shapes that the broad
+    // "No such file or directory" pattern used to swallow. The Node.js fs
+    // syscall message and the GNU open-file ENOENT both carry the directory
+    // suffix verbatim, so a regression that re-introduced the broad pattern
+    // would silently flip a repo-level file-missing error into an
+    // infrastructure signal, hiding it from the work-item failure path.
+    [Theory]
+    [InlineData("ENOENT: no such file or directory, open 'foo.txt'")]
+    [InlineData("Error: ENOENT: no such file or directory, scandir '/work/src/missing'")]
+    [InlineData("fopen('foo.txt'): No such file or directory")]
+    public void Exit127NonBinaryFailure_RemainsNormal(string stderr)
     {
         var c = AgentFailureClassifier.Classify(
-            stderr: "ENOENT: no such file foo.txt",
+            stderr: stderr,
             summary: "agent exited 127");
 
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    // POSIX /bin/sh emits "1: <name>: not found" rather than the bash
+    // "command not found" shape. The classifier must still catch this as a
+    // binary-launch failure (the sandbox is missing the agent binary) without
+    // matching a generic "Not Found" HTTP body.
+    [Theory]
+    [InlineData("/bin/sh: 1: agy: not found")]
+    [InlineData("sh: 1: codex: not found")]
+    public void Exit127PosixShellNotFound_Classified_AsInfrastructure(string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: stderr,
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
     }
 
     [Theory]
