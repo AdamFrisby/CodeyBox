@@ -197,6 +197,7 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         var claudeItem = NewItem() with { Agent = AgentKind.Claude };
         var codexItem = NewItem() with { Agent = AgentKind.Codex };
         var checkItem = NewItem() with { Agent = AgentKind.Claude, JobType = JobType.CheckAndAct };
+        var controlItem = NewItem() with { Agent = AgentKind.Claude, JobType = JobType.AgentControl };
 
         // Helper to spin up a PipelineRunner with the given knobs and ask it.
         bool Gate(ClaudeSessionWorker? worker, ClaudeSessionWorkerOptions options, Project project, WorkItem item, AgentKind runnerKind)
@@ -224,6 +225,11 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, codexItem, AgentKind.Codex));
         // Gate OFF for CheckAndAct items even when everything else is on.
         Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, checkItem, AgentKind.Claude));
+        // Gate OFF for AgentControl items even when everything else is on —
+        // operator control-plane items (pause/resume) have no rework loop, so
+        // the session-share benefit doesn't apply and dropping this bypass
+        // would route them through the worker VM unnecessarily.
+        Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, controlItem, AgentKind.Claude));
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────
