@@ -2348,6 +2348,38 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task AgentNetworkTolerance_Codex_PartialConfigFillsMissingRetryDefaults()
+    {
+        var requestOnlySnapshot = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = new AgentNetworkToleranceOptions { RequestMaxRetries = 11 },
+            });
+        var requestOnlyRunner = new CodexAgentRunner(defaults: null, networkTolerance: requestOnlySnapshot);
+        var requestOnlySandbox = new CapturingSandbox();
+
+        await requestOnlyRunner.RunAsync(requestOnlySandbox, "/work", "prompt", credential: null);
+
+        var requestOnlyArgv = requestOnlySandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("model_providers.openai.request_max_retries=11", requestOnlyArgv);
+        Assert.Contains("model_providers.openai.stream_max_retries=15", requestOnlyArgv);
+
+        var streamOnlySnapshot = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = new AgentNetworkToleranceOptions { StreamMaxRetries = 12 },
+            });
+        var streamOnlyRunner = new CodexAgentRunner(defaults: null, networkTolerance: streamOnlySnapshot);
+        var streamOnlySandbox = new CapturingSandbox();
+
+        await streamOnlyRunner.RunAsync(streamOnlySandbox, "/work", "prompt", credential: null);
+
+        var streamOnlyArgv = streamOnlySandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("model_providers.openai.request_max_retries=8", streamOnlyArgv);
+        Assert.Contains("model_providers.openai.stream_max_retries=12", streamOnlyArgv);
+    }
+
+    [Fact]
     public async Task AgentNetworkTolerance_Claude_ApiTimeoutMs_EnvVar()
     {
         // Unset case (should not have API_TIMEOUT_MS)
