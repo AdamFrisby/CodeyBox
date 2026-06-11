@@ -1031,7 +1031,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     }
 
     public async Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(
-        ProjectId projectId, CancellationToken ct = default)
+        ProjectId projectId,
+        CancellationToken ct = default,
+        WorkItemId? excludeId = null)
     {
         // Mirrors CountInFlightAsync's in-flight predicate exactly so the
         // refactor-exclusive gate sees the same row population the
@@ -1045,12 +1047,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 SUM(CASE WHEN job_type = $refactor THEN 0 ELSE 1 END) AS other_count
             FROM work_items
             WHERE project_id = $pid
+              AND ($exclude_id IS NULL OR id != $exclude_id)
               AND started_at IS NOT NULL
               AND preempt_checkpoint IS NULL
               AND state NOT IN ({(int)WorkItemState.Done}, {(int)WorkItemState.Failed}, {(int)WorkItemState.Cancelled}, {(int)WorkItemState.AuditFailed}, {(int)WorkItemState.MergeConflictResolutionFailed}, {(int)WorkItemState.NeedsOperatorInput}, {(int)WorkItemState.WaitingForQuotaReset}, {(int)WorkItemState.WaitingForAgentResume}, {(int)WorkItemState.AbandonedAfterRecoveryAttempts});
             """;
         cmd.Parameters.AddWithValue("$pid", projectId.Value);
         cmd.Parameters.AddWithValue("$refactor", JobType.Refactor.ToString());
+        cmd.Parameters.AddWithValue("$exclude_id", excludeId?.ToString() ?? (object)DBNull.Value);
         using var reader = await cmd.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) return (0, 0);
         var refactor = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetInt64(0));

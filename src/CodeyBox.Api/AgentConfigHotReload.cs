@@ -964,6 +964,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 HourlyLimitRecheckSeconds = opts.HourlyLimitRecheck.TotalSeconds,
                 DailyLimitRecheckSeconds = opts.DailyLimitRecheck.TotalSeconds,
                 ConcurrentLimitRecheckSeconds = opts.ConcurrentLimitRecheck.TotalSeconds,
+                RefactorExclusivityRecheckSeconds = opts.RefactorExclusivityRecheck.TotalSeconds,
             },
             JsonOpts);
 }

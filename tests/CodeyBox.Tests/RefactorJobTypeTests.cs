@@ -144,6 +144,69 @@ public sealed class RefactorJobTypeTests : IDisposable
         Assert.Equal((0, 1), b);
     }
 
+    [Fact]
+    public async Task CountInFlightSplit_CanExcludeCandidateRow()
+    {
+        var pid = new ProjectId("proj-exclude-current");
+        var refactor = MakeQueued(pid.Value, JobType.Refactor) with
+        {
+            State = WorkItemState.WorkComplete,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var normal = MakeQueued(pid.Value) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(refactor);
+        await _store.CreateAsync(normal);
+
+        var excludingRefactor = await _store.CountInFlightSplitByRefactorAsync(
+            pid,
+            excludeId: refactor.Id);
+        var excludingNormal = await _store.CountInFlightSplitByRefactorAsync(
+            pid,
+            excludeId: normal.Id);
+
+        Assert.Equal((0, 1), excludingRefactor);
+        Assert.Equal((1, 0), excludingNormal);
+    }
+
+    [Fact]
+    public async Task DefaultCountInFlightSplit_PartitionsAndExcludesCandidate()
+    {
+        var pid = new ProjectId("proj-default-split");
+        var refactor = MakeQueued(pid.Value, JobType.Refactor) with
+        {
+            State = WorkItemState.WorkComplete,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var normal = MakeQueued(pid.Value) with
+        {
+            State = WorkItemState.Auditing,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var preempted = MakeQueued(pid.Value, JobType.Refactor) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+            PreemptCheckpoint = "checkpoint",
+        };
+        var otherProject = MakeQueued("other-project", JobType.Refactor) with
+        {
+            State = WorkItemState.Working,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        var store = new StubWorkItemStore();
+        store.Items.AddRange([refactor, normal, preempted, otherProject]);
+
+        var counts = await ((IWorkItemStore)store).CountInFlightSplitByRefactorAsync(
+            pid,
+            excludeId: refactor.Id);
+
+        Assert.Equal((0, 1), counts);
+    }
+
     // ── OrchestratorService integration ──────────────────────────────────────
 
     /// <summary>
@@ -374,6 +437,116 @@ public sealed class RefactorJobTypeTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task RecoveredRefactorContinuationDoesNotBlockOnItself()
+    {
+        var pid = "proj-refactor-resume";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Resume",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource<WorkItemId>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new ManualReleasePipelineRunner(_store, releaseGate.Task, entered);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMilliseconds(200),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var refactor = MakeQueued(pid, JobType.Refactor) with
+        {
+            State = WorkItemState.WorkComplete,
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(refactor);
+        await queue.EnqueueAsync(refactor.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        var enteredId = await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(refactor.Id, enteredId);
+        Assert.False(svc.IsDeferredForTest(refactor.Id));
+
+        releaseGate.TrySetResult();
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RefactorGateRunsBeforeRouterSideEffects()
+    {
+        var pid = "proj-refactor-before-router";
+        var projectRepo = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId(pid),
+            DisplayName = "Refactor Before Router",
+            RepositoryUrl = "https://github.com/test/repo",
+        });
+
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "empty-class",
+                    DisplayName = "Empty Class",
+                    Members = [],
+                },
+            ],
+            [],
+            new QuotaRouterOptions(),
+            NullLogger<AgentClassRouter>.Instance);
+        var pipelineGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new ManualReleasePipelineRunner(_store, pipelineGate.Task);
+        var queue = new InMemoryTaskQueue();
+        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 2 };
+        var reg = new CancellationRegistry(CancellationToken.None);
+        var snapshot = new BudgetDeferralRecheckSnapshot(new BudgetDeferralRecheckOptions
+        {
+            RefactorExclusivityRecheck = TimeSpan.FromMinutes(5),
+        });
+        var svc = new OrchestratorService(
+            queue, _store, pipeline, reg, opts,
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            projects: projectRepo,
+            budgetDeferralRecheck: snapshot);
+
+        var refactor = MakeQueued(pid, JobType.Refactor);
+        await _store.CreateAsync(refactor);
+        await queue.EnqueueAsync(refactor.Id);
+
+        await svc.StartAsync(CancellationToken.None);
+
+        await WaitForStartedAsync(_store, refactor.Id);
+
+        var blockedNormal = MakeQueued(pid) with
+        {
+            AgentClassId = "empty-class",
+        };
+        await _store.CreateAsync(blockedNormal);
+        await queue.EnqueueAsync(blockedNormal.Id);
+
+        await WaitForDeferredAsync(svc, blockedNormal.Id);
+        var stored = await _store.GetAsync(blockedNormal.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Null(stored.StartedAt);
+        Assert.Null(stored.LastError);
+
+        pipelineGate.TrySetResult();
+        await svc.StopAsync(CancellationToken.None);
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static async Task WaitForStartedAsync(
@@ -413,15 +586,21 @@ public sealed class RefactorJobTypeTests : IDisposable
     {
         private readonly IWorkItemStore _store;
         private readonly Task _releaseGate;
+        private readonly TaskCompletionSource<WorkItemId>? _entered;
 
-        public ManualReleasePipelineRunner(IWorkItemStore store, Task releaseGate)
+        public ManualReleasePipelineRunner(
+            IWorkItemStore store,
+            Task releaseGate,
+            TaskCompletionSource<WorkItemId>? entered = null)
         {
             _store = store;
             _releaseGate = releaseGate;
+            _entered = entered;
         }
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
+            _entered?.TrySetResult(item.Id);
             try { await _releaseGate.WaitAsync(ct); }
             catch (OperationCanceledException) { return; }
             await _store.UpdateAsync(item.With(WorkItemState.Done), ct);

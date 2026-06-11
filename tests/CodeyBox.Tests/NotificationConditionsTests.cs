@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using CodeyBox.Core;
 using CodeyBox.Notifications;
 using CodeyBox.Orchestrator;
@@ -468,6 +469,7 @@ public sealed class StubWorkItemStore : IWorkItemStore
     public int WorkingCount { get; set; }
     public int FailedCount { get; set; }
     public int AbandonedCount { get; set; }
+    public List<WorkItem> Items { get; } = [];
 
     public StubWorkItemStore(int workingCount = 0, int failedCount = 0, int abandonedCount = 0)
     {
@@ -492,7 +494,15 @@ public sealed class StubWorkItemStore : IWorkItemStore
     public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(WorkItemId id, int? auditMaxIterations, string? auditComplexity, DateTimeOffset updatedAt, CancellationToken ct = default) => throw new NotImplementedException();
     public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) => throw new NotImplementedException();
-    public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) => throw new NotImplementedException();
+    public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
+    {
+        foreach (var item in Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return item;
+            await Task.Yield();
+        }
+    }
     public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) => throw new NotImplementedException();
     public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) => throw new NotImplementedException();
     public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default) => throw new NotImplementedException();

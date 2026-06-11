@@ -215,10 +215,15 @@ public interface IWorkItemStore
     /// "in-flight" predicate as <see cref="CountInFlightAsync"/>. Used by the
     /// refactor project-exclusive gate: a <see cref="JobType.Refactor"/> item
     /// may only start when both counters are zero, and while one is in flight
-    /// every other item for the same project must defer.
+    /// every other item for the same project must defer. When
+    /// <paramref name="excludeId"/> is provided, that row is omitted from the
+    /// split so recovered pass-through pickups do not count themselves as
+    /// already in flight.
     /// </summary>
     async Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(
-        ProjectId projectId, CancellationToken ct = default)
+        ProjectId projectId,
+        CancellationToken ct = default,
+        WorkItemId? excludeId = null)
     {
         // Default implementation streams all items and partitions in-process so
         // existing IWorkItemStore implementations (in-memory test stubs) work
@@ -229,6 +234,7 @@ public interface IWorkItemStore
         await foreach (var item in ListAsync(ct).ConfigureAwait(false))
         {
             if (item.ProjectId != projectId) continue;
+            if (excludeId is { } excluded && item.Id == excluded) continue;
             if (item.StartedAt is null) continue;
             if (item.PreemptCheckpoint is not null) continue;
             if (item.State is WorkItemState.Done

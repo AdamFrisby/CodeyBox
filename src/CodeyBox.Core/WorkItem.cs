@@ -423,6 +423,9 @@ public sealed record WorkItem
     /// optionally enqueues a follow-up <see cref="JobType.Normal"/> item.
     /// <see cref="JobType.AgentControl"/> runs an operator control-plane pause
     /// or resume action without launching an agent sandbox.
+    /// <see cref="JobType.Refactor"/> runs the normal pipeline as a
+    /// project-exclusive item: it starts only after the project has no in-flight
+    /// work, and it blocks other same-project pickups while it is in flight.
     /// </summary>
     public JobType JobType { get; init; } = JobType.Normal;
 
