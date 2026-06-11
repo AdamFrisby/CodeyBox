@@ -511,8 +511,9 @@ See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger se
 ### `agent_smoke_failed` details
 
 When `event` is `agent.smoke_failed`, the `details` field is always populated.
-`workItem` and `project` are `null` when the event fires at **startup** (no
-work-item context). At **work-item pickup**, both `workItem` and `project` are
+`workItem` and `project` are `null` when the event fires at **startup** or from
+background sweeps (no work-item context). At **work-item pickup** or after a
+runtime agent auth/login-prompt detection, both `workItem` and `project` are
 populated with the affected item and its project.
 
 ```json
@@ -520,6 +521,7 @@ populated with the affected item and its project.
   "details": {
     "agentKind": "claude",
     "reason": "auth",
+    "category": "Persistent",
     "occurredAt": "2026-04-29T12:00:00.000+00:00"
   }
 }
@@ -528,13 +530,16 @@ populated with the affected item and its project.
 | Field | Type | Description |
 |---|---|---|
 | `agentKind` | string | Agent whose credential failed (e.g. `"claude"`, `"codex"`) |
-| `reason` | string\|null | `"auth"` for 401/403, `"transient: try later"` for 5xx/network errors, `"timeout"` if the probe timed out, `"no token"` if no credential is configured |
+| `reason` | string\|null | `"auth"` for 401/403, `"transient: try later"` for 5xx/network errors, `"timeout"` if the probe timed out, `"no token"` if no credential is configured, or an auth-required runtime reason such as `"auth required from agent output during work: auth/login prompt pattern matched"` |
+| `category` | string | `Persistent` for auth/login, missing binary, malformed credential, and fast-fail exclusions; `Transient` for retryable network/5xx/timeout smoke failures; `Unknown` when the producer cannot bucket it |
 | `occurredAt` | ISO-8601 | When the failure was recorded |
 
-`agent.smoke_failed` can fire at **startup** (no `workItem`, no `project`) or
-at **work-item pickup** (a subsequent `work_item.failed` event also fires and
-carries the work-item context). Subscribe to `agent.smoke_failed` to alert on
-credential problems independently of whether any work items were affected.
+`agent.smoke_failed` can fire at **startup** (no `workItem`, no `project`),
+**work-item pickup**, or after an agent invocation emits a login prompt. On
+work-item-associated auth failures, a subsequent `work_item.failed` event also
+fires and carries the same work-item context. Subscribe to `agent.smoke_failed`
+to alert on credential problems independently of whether any work items were
+affected.
 
 ---
 

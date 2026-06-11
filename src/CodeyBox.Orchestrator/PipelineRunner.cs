@@ -152,6 +152,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
     private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly CancellationRegistry? _cancellations;
@@ -279,7 +280,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IWorkItemTerminalTransition? terminalTransitions = null,
         IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
-        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null)
+        IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -325,6 +327,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _quotaAuditEmitter = quotaClassifier as IQuotaFailureAuditEmitter
                 ?? NullQuotaFailureAuditEmitter.Instance;
         }
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
         _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
@@ -1525,6 +1528,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Work item {Id} parking in WaitingForAgentResume: {Reason}",
                 item.Id, ex.Message);
             await TransitionWaitingForAgentResumeAsync(item, ex.Message, project, ex.Agent);
+        }
+        catch (AgentAuthRequiredException ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
+                item.Id, ex.Agent.Value, ex.Phase, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
         }
         catch (AgentUnavailableException ex)
         {
@@ -3472,6 +3482,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // but produces no useful diff — without this log, we have no
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
+            if (agentResult.Success)
+                await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, agentPhase, agentResult);
             if (!agentResult.Success)
             {
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
@@ -3513,6 +3525,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ct,
                     projectId: item.ProjectId,
                     stdout: agentResult.Stdout);
+
+                await ThrowIfAuthRequiredOutputAsync(item, project, runner.Kind, agentPhase, agentResult);
 
                 // Redact and truncate agent-controlled output before it reaches
                 // LastError, audit persistence, webhooks, or API responses via the
@@ -5172,6 +5186,56 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             RequiresStructuredStreamForSessionId: true,
         };
+
+    private async Task ThrowIfAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentResult result)
+    {
+        var classification = _authFailureClassifier.Detect(agent, result.Stderr, result.Stdout);
+        if (classification is null || classification.Kind != AgentFailureKind.AuthRequired)
+            return;
+
+        var reason = SingleLineSummary(
+            $"auth required from agent output during {phase}: {classification.Reason ?? "login prompt matched"}");
+        var smokeResult = new AgentSmokeResult(
+            Ok: false,
+            FailureReason: reason,
+            Duration: TimeSpan.Zero,
+            Category: SmokeFailureCategory.Persistent);
+
+        AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
+
+        AvailabilityTransition? transition = null;
+        if (_availability is ISmokeAvailabilityRegistry smokeRegistry)
+        {
+            transition = smokeRegistry.MarkSmokeResult(
+                agent,
+                smokeResult,
+                SmokeExclusionSource.InVmSmoke,
+                clearsFastFail: false);
+        }
+
+        if (transition is null || (!transition.PreviouslyExcluded && transition.NowExcluded))
+        {
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = agent.Value,
+                    Reason = reason,
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
+        }
+
+        throw new AgentAuthRequiredException(agent, phase, reason);
+    }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
@@ -10567,6 +10631,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
+            if (agentResult.Success)
+                await ThrowIfAuthRequiredOutputAsync(item, project, chosenMergeRunner.Kind, "merge", agentResult);
             if (!agentResult.Success)
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
@@ -10605,6 +10671,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ct,
                     projectId: item.ProjectId,
                     stdout: classificationResult.Stdout);
+
+                await ThrowIfAuthRequiredOutputAsync(item, project, chosenMergeRunner.Kind, "merge", agentResult);
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");

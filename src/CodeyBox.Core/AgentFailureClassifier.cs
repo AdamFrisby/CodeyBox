@@ -102,6 +102,30 @@ public static class AgentFailureClassifier
     };
 
     /// <summary>
+    /// Substrings that signal a CLI is prompting for interactive login rather
+    /// than running the task. These are separated from <see cref="AuthPatterns"/>
+    /// because they can occur on exit-0 runs that otherwise look like a benign
+    /// no-diff outcome.
+    /// </summary>
+    public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
+    {
+        "Authentication required",
+        "Please visit the URL to log in",
+        "Waiting for authentication",
+        "authentication timed out",
+        "not logged into",
+        "not logged in",
+        "accounts.google.com/o/oauth2",
+        "/oauth-callback",
+        "run `agy login`",
+        "run `gemini auth login`",
+        "run `agent login`",
+        "run `opencode auth login`",
+        "run `codex login`",
+        "run `claude login`",
+    };
+
+    /// <summary>
     /// Substrings that signal a transient connectivity failure where a retry
     /// (against the same agent or another) may succeed without operator action.
     /// </summary>
@@ -215,7 +239,8 @@ public static class AgentFailureClassifier
     /// Order of checks is fixed: prerequisite materialisation and exit-127
     /// sandbox provisioning failures first, then quota (so a 429 in stderr is
     /// never stolen by a generic "connection reset" hint somewhere else in the
-    /// payload), then auth, then network. Never throws.
+    /// payload), then interactive-login auth, then auth, then network. Never
+    /// throws.
     /// </para>
     /// </summary>
     public static AgentFailureClassification Classify(string? stderr, string? stdout = null) =>
@@ -244,6 +269,9 @@ public static class AgentFailureClassifier
                 AgentFailureKind.QuotaExhausted,
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
+
+        if (ContainsAny(stderr, AuthRequiredPatterns) || ContainsAny(stdout, AuthRequiredPatterns))
+            return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");

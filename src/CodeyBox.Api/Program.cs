@@ -2272,6 +2272,22 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDe
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
+builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var extras = cbOpts.AuthFailurePatterns is null
+        ? new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+        : cbOpts.AuthFailurePatterns
+            .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key))
+            .ToDictionary(
+                kvp => kvp.Key,
+                kvp => (IReadOnlyList<AuthFailurePattern>)(kvp.Value ?? new List<AuthFailurePatternOptions>())
+                    .Where(p => !string.IsNullOrWhiteSpace(p.Pattern))
+                    .Select(p => new AuthFailurePattern(p.Pattern))
+                    .ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+    return new AgentAuthFailureClassifier(extras);
+});
 
 builder.Services.AddSingleton<PipelineOptions>(sp =>
 {
@@ -2396,7 +2412,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     terminalTransitions: sp.GetRequiredService<IWorkItemTerminalTransition>(),
     terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
-    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>()));
+    mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
+    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -3731,6 +3748,13 @@ namespace CodeyBox.Api
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
+        /// Operator-extensible per-agent auth/login-prompt stdout/stderr patterns.
+        /// Keys are agent kind values (e.g. <c>antigravity</c>); each entry adds
+        /// a case-insensitive substring to the built-in login-prompt detector.
+        /// </summary>
+        public Dictionary<string, List<AuthFailurePatternOptions>> AuthFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
         /// See docs/configuration.md for the schedule schema.
@@ -4741,6 +4765,18 @@ namespace CodeyBox.Api
         public string Pattern { get; set; } = string.Empty;
         /// <summary>How to classify the failure when the substring matches.</summary>
         public QuotaFailureKind Kind { get; set; } = QuotaFailureKind.LimitReached;
+    }
+
+    /// <summary>
+    /// One operator-supplied auth/login-prompt pattern entry. Appended to the
+    /// built-in defaults and matched against stderr and stdout substring
+    /// case-insensitively. Bound from
+    /// <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
+    /// </summary>
+    public sealed class AuthFailurePatternOptions
+    {
+        /// <summary>The substring to search for in stderr/stdout.</summary>
+        public string Pattern { get; set; } = string.Empty;
     }
 
     /// <summary>

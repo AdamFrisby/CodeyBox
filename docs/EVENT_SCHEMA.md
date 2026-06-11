@@ -91,7 +91,7 @@ subscribe to.
 | `queue.resumed` | 1.0 | Operator resumed the global pickup queue. |
 | `worker_pool.stalled` | 1.2 | Worker pool had free slots and runnable work with an available agent, but no worker spawn occurred past the configured watchdog threshold; self-recovery was attempted. |
 | `worker_pool.restart_required` | 1.2 | Worker-pool watchdog self-recovery did not restore dispatch progress; operator restart is required. |
-| `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
+| `agent.smoke_failed` | 1.0 | Credential smoke probe failed at startup or pickup, runtime auth/login-prompt detection benched the agent, or fast-fail circuit breaker excluded the agent after consecutive sub-threshold non-zero exits. |
 | `agent.smoke_recovered` | 1.0 | Previously-excluded agent recovered: a subsequent smoke probe passed. |
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
 | `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind or pooled instance route. |

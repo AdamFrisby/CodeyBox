@@ -1,6 +1,7 @@
 using System.Text;
 using CodeyBox.Api;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -77,6 +78,43 @@ public sealed class AgentFailureClassifierTests
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Theory]
+    [InlineData("Authentication required. Please visit the URL to log in:")]
+    [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
+    [InlineData("not logged into agy; run `agy login`")]
+    [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("http://localhost:3000/oauth-callback")]
+    public void LoginPromptPatterns_Classified_AsAuthRequired(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public async Task AgentAuthFailureClassifier_DetectsCapturedAgyLoginPrompt()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        var c = new AgentAuthFailureClassifier().Detect(AgentKind.Antigravity, stderr: null, stdout: transcript);
+
+        Assert.NotNull(c);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public void AgentAuthFailureClassifier_HonorsPerAgentConfiguredPatterns()
+    {
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
+            });
+
+        Assert.NotNull(classifier.Detect(new AgentKind("custom"), "custom auth ceremony required", null));
+        Assert.Null(classifier.Detect(AgentKind.Codex, "custom auth ceremony required", null));
     }
 
     [Theory]

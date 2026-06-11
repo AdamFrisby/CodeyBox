@@ -220,6 +220,32 @@ Built-in cursor defaults already cover the observed exhaustion stderr
 (`out of usage`, `Switch to Auto`, `increase your limit`) — the config hook is
 for follow-on shapes that surface before a code release can land.
 
+### Runtime Auth/Login-Prompt Patterns
+
+`CodeyBox:AuthFailurePatterns` lets operators append per-agent stdout/stderr
+substrings for CLI login prompts without recompiling. This detector is separate
+from quota detection because the broken CLI can exit `0` and produce no diff,
+which would otherwise look like a benign "agent produced no changes" outcome.
+
+Built-in defaults cover prompts such as `Authentication required`, OAuth consent
+URLs, `Please visit the URL to log in`, `authentication timed out`, and common
+`run \`... login\`` hints. Add only the new substring under the affected agent:
+
+```json
+"CodeyBox": {
+  "AuthFailurePatterns": {
+    "antigravity": [
+      { "pattern": "complete browser sign-in before continuing" }
+    ]
+  }
+}
+```
+
+When a runtime auth/login prompt is detected, the agent is benched via the
+availability registry, an `agent.smoke_failed` webhook with
+`category=persistent` is emitted, and the affected work item fails as
+infrastructure/auth rather than being treated as a normal no-diff run.
+
 ## Operator Endpoint
 
 `GET /quota` returns:

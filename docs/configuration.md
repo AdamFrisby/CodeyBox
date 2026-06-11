@@ -157,6 +157,7 @@ startup); we add explicit guards as we tighten the contract.
 | `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. Add third-party hosts only for deployments that intentionally route work to agents that require them. |
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
 | `BuildScriptAudit.TimeoutSeconds` | int | `1800` | Hot-reloadable per-run timeout for the credential-free `process:build-script` auditor that executes repo-root `./build.sh`. |
+| `AuthFailurePatterns.<agent>[]` | object[] | `[]` | Extra runtime auth/login-prompt substrings for one agent kind. Each entry is `{ "pattern": "..." }`; built-in defaults already cover common OAuth/login prompts. |
 | `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |

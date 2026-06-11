@@ -11,6 +11,12 @@ namespace CodeyBox.Core;
 /// daily). The pipeline should mark the member exhausted and try the next one.
 /// </para>
 /// <para>
+/// <see cref="AuthRequired"/> is a persistent environment/authentication
+/// failure where the CLI is prompting for an interactive login instead of
+/// doing work. The pipeline should bench the agent and alert the operator
+/// rather than treating an exit-0/no-diff run as benign.
+/// </para>
+/// <para>
 /// <see cref="Normal"/> covers genuine work failures — compile errors, agent
 /// refusals, malformed output, etc. The iteration must fail; a retry against
 /// a different member would just waste compute on the same task that the
@@ -45,6 +51,12 @@ public enum AgentFailureKind
     /// materialisation failed before the CLI meaningfully started.
     /// </summary>
     Infrastructure = 5,
+
+    /// <summary>
+    /// The CLI surfaced an interactive login / OAuth prompt. This is operator
+    /// action required, not a code-work failure and not a successful no-op.
+    /// </summary>
+    AuthRequired = 6,
 }
 
 /// <summary>

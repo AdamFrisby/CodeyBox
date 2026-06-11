@@ -420,6 +420,63 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task SuccessfulNoDiffRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Equal("infrastructure", final.FailureKind);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("auth required from agent output", details.Reason);
+    }
+
+    [Fact]
+    public async Task SuccessfulNoDiffRun_WithoutAuthLoginPrompt_RemainsNormalNoChangesFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "No repository changes were necessary.",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Agent produced no changes to commit", final.LastError);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
     public async Task SuccessfulWorkRun_ResetsFastFailCounterFromPipeline()
     {
         // Pin the contract that a SUCCESSFUL run also feeds the registry — a
