@@ -114,7 +114,9 @@ internal static class TestSupport
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
         IAgentSupervisionService? agentSupervision = null,
         CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
-        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null)
+        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
+        ISessionAgentRunner? sessionAgentRunnerOverride = null,
+        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -209,7 +211,9 @@ internal static class TestSupport
             checkCompletionRunner: checkCompletionRunner,
             agentSupervision: agentSupervision,
             claudeSessionWorker: claudeSessionWorker,
-            claudeSessionOptions: claudeSessionOptions);
+            claudeSessionOptions: claudeSessionOptions,
+            sessionAgentRunnerOverride: sessionAgentRunnerOverride,
+            sessionHandleSnapshotOverride: sessionHandleSnapshotOverride);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }
