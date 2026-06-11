@@ -349,6 +349,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// assert the prompt scaffolding (forbidden actions, file list, etc.).
     /// </summary>
     public List<string> ConflictReworkPrompts { get; } = new();
+    public List<bool> ConflictReworkCaptureStructuredStreamCalls { get; } = new();
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
     /// <summary>
@@ -539,6 +540,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         if (prompt.Contains("# Conflict-resolution mode (third-line fallback)", StringComparison.Ordinal))
         {
             ConflictReworkPrompts.Add(prompt);
+            ConflictReworkCaptureStructuredStreamCalls.Add(captureStructuredStream);
             if (ConflictReworkPlan.Count == 0)
                 return new AgentResult(false, "ScriptedAgent: ran out of conflict-rework plan entries", null, null);
             var handler = ConflictReworkPlan.Dequeue();

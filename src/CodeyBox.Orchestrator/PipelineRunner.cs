@@ -5873,6 +5873,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 outcome = "canceled";
                 throw;
             }
+            catch (AgentSessionResumeExhaustedException ex)
+            {
+                if (await TryConvertResumeExhaustionToQuotaAsync(runner, trialItem, ex, attemptCt)
+                    .ConfigureAwait(false) is { } quotaEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:quota");
+                    throw quotaEx;
+                }
+
+                await FinalizeInvolvementAsync(involvementId, "failure:agent");
+                throw;
+            }
             catch (Exception ex)
             {
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
@@ -5889,6 +5901,44 @@ public sealed class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("phase", phase),
                     new KeyValuePair<string, object?>("outcome", outcome));
             }
+        }
+
+        async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
+            IAgentRunner runner,
+            WorkItem trialItem,
+            AgentSessionResumeExhaustedException resumeEx,
+            CancellationToken token)
+        {
+            var last = resumeEx.LastResult;
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                runner.Kind, last.Stderr, last.Stdout, phase, sandboxName: null);
+
+            var classification = _quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout);
+            if (classification is not
+                {
+                    Kind: QuotaFailureClassificationKind.Quota,
+                    Detection: { } detection,
+                })
+            {
+                return null;
+            }
+
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                runner.Kind,
+                ResolveObservedModelId(runner, trialItem.ModelId),
+                last.Summary,
+                last.Stderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                token,
+                projectId: trialItem.ProjectId,
+                stdout: last.Stdout).ConfigureAwait(false);
+
+            return new TerminalQuotaError(
+                detection.Kind,
+                $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}",
+                detection.ResetAt);
         }
 
         // Resolve the initial member from the work item's currently-selected agent.
@@ -8607,7 +8657,8 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 agentResult = await runner.RunAsync(
                     sandbox, SandboxConventions.WorkDir, prompt, credential,
-                    item.ModelId, item.ReasoningMode, phase.Token);
+                    item.ModelId, item.ReasoningMode, phase.Token,
+                    captureStructuredStream: NeedsStructuredStreamForSessionResume(runner));
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {

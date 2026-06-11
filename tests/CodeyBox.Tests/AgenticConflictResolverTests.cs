@@ -69,6 +69,34 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_WrappedResumableRunner_ForcesStructuredCapture()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var inner = new ResumableCaptureRecordingRunner();
+        var wrapped = PromptPreprocessingAgentRunner.Wrap(
+            inner,
+            new AgentPromptPreprocessorChain([new NoopPreprocessor()]),
+            WorkItemId.New(),
+            AgentPromptPhase.Merge,
+            1,
+            NewProject());
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(wrapped, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal([true], inner.CaptureStructuredStreamCalls);
+    }
+
+    [Fact]
     public async Task ResolveAsync_AgentLeavesMarkers_FailsWithReason()
     {
         var sandbox = new ConflictSandbox();
@@ -780,4 +808,23 @@ public sealed class AgenticConflictResolverTests
                 => null;
         }
     }
+
+    private sealed class NoopPreprocessor : IAgentPromptPreprocessor
+    {
+        public int Order => 0;
+
+        public Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
+        {
+            _ = ctx;
+            _ = ct;
+            return Task.FromResult(prompt);
+        }
+    }
+
+    private static Project NewProject() => new()
+    {
+        Id = new ProjectId("test-project"),
+        DisplayName = "Test Project",
+        RepositoryUrl = "file:///tmp/repo.git",
+    };
 }

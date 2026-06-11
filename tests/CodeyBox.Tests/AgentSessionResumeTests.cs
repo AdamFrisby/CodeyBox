@@ -170,6 +170,26 @@ public sealed class AgentSessionResumeTests : IDisposable
                 """{"type":"thread.started","payload":{"thread_id":"thread_abc123"}}"""));
     }
 
+    public static IEnumerable<object[]> InvalidCodexResumeIds()
+    {
+        yield return ["-danger"];
+        yield return ["abc def"];
+        yield return ["abc\tdef"];
+        yield return ["abc\ndef"];
+        yield return [new string('a', 201)];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidCodexResumeIds))]
+    public void CodexRunner_RejectsInvalidNonUuidResumeIds(string id)
+    {
+        var runner = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(new CodexAgentRunner());
+        var encodedId = System.Text.Json.JsonSerializer.Serialize(id);
+        var stdout = "{\"type\":\"session_meta\",\"payload\":{\"id\":" + encodedId + "}}";
+
+        Assert.Null(runner.TryExtractSessionId(stdout));
+    }
+
     [Theory]
     [InlineData("terminal")]
     [InlineData("scope")]
@@ -298,6 +318,29 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Equal("--", second[sessionIdx - 1]);
         Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
         Assert.NotEqual("prompt", sandbox.ClaudeExecs[1].Stdin);
+    }
+
+    [Fact]
+    public async Task CodexRunner_HardQuotaFailureWithCapturedSessionId_DoesNotResumeHammer()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(3);
+        var sessionId = "019e8a0f-4c27-7b61-940f-e344bafa43d5";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(1,
+            Stdout: $"{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sessionId}\"}}}}",
+            Stderr: "hit your usage limit"),
+            structuredStreamHelpResult: new SandboxExecResult(0, "--json", ""));
+
+        var result = await new CodexAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.Equal(["codex", "exec"], sandbox.ClaudeInvocations[0].Take(2).ToArray());
+        Assert.DoesNotContain("resume", sandbox.ClaudeInvocations[0]);
     }
 
     [Fact]

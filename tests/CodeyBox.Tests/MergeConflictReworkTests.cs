@@ -207,6 +207,40 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Contains("main side", lsOut);
     }
 
+    [Fact]
+    public async Task ConflictRework_ResumableRunner_ForcesStructuredCapture()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            cliSessionResumableAgent: true);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        {
+            await WriteFileAsync(sandbox, workDir, "README.md", "main side\nwork side\n", ct);
+            await Run(sandbox, "git", "-C", workDir, "add", "README.md");
+            await Run(sandbox, "git", "-C", workDir,
+                "-c", "core.editor=true",
+                "-c", "sequence.editor=true",
+                "rebase", "--continue");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([true], tp.Agent.ConflictReworkCaptureStructuredStreamCalls);
+    }
+
     /// <summary>
     /// Semantic-incompatible exit: the rework agent declares the two
     /// intents cannot coexist. The orchestrator parks at
