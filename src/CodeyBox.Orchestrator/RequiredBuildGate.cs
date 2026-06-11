@@ -86,9 +86,27 @@ internal sealed class RequiredBuildGate
     }
 
     /// <summary>
-    /// Enforces the build gate for the work / rework phase. On failure throws
+    /// Enforces the build gate for the work / rework phase.
+    ///
+    /// <para><b>Work (initial) phase:</b> on failure throws
     /// <see cref="RequiredBuildFailedException"/> so the outer pipeline catch
-    /// transitions the item to Failed with a build-specific failure kind.
+    /// transitions the item to Failed with <c>failureKind=build</c>. The
+    /// initial work phase has no audit/rework loop behind it that could
+    /// converge on a fix, so terminal failure is the only sensible outcome.
+    /// </para>
+    ///
+    /// <para><b>Rework phase:</b> on failure does NOT throw. The next audit
+    /// iteration's <see cref="RunForAuditAsync"/> call detects the same
+    /// non-compile state and surfaces it as a blocking finding, giving the
+    /// audit/rework loop another iteration to recover within the existing
+    /// <see cref="ProjectAudit.MaxIterations"/> budget. Only when that budget
+    /// is exhausted does the audit ceiling (park-if-progress / fail-if-not)
+    /// take over. This mirrors the unified "unsuccessful-rework =&gt;
+    /// loop-back-not-terminal" policy documented alongside the audit-loop
+    /// docs and avoids the asymmetry where a build failure DISCOVERED in
+    /// audit self-corrects but the SAME failure PRODUCED by a rework
+    /// terminal-failed.
+    /// </para>
     /// </summary>
     public async Task EnforceForWorkPhaseAsync(
         WorkItem item,
@@ -101,14 +119,14 @@ internal sealed class RequiredBuildGate
     {
         var result = await VerifyAsync(
             item, project, repoId, baseBranch, workBranch, phase: agentPhase, iteration: null, ct);
-        if (result.Status == RequiredBuildVerificationStatus.Failed)
-        {
-            var phaseLabel = agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase)
-                ? "rework"
-                : "work";
-            throw new RequiredBuildFailedException(
-                $"{phaseLabel} left the branch non-compiling: {BuildFailureSummary(result)}");
-        }
+        if (result.Status != RequiredBuildVerificationStatus.Failed)
+            return;
+
+        if (agentPhase.Equals("rework", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        throw new RequiredBuildFailedException(
+            $"work left the branch non-compiling: {BuildFailureSummary(result)}");
     }
 
     /// <summary>

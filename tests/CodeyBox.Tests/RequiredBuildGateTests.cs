@@ -220,8 +220,17 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditRework_NewCommitThatBreaksRequiredBuild_FailsWithReworkBuildError()
+    public async Task AuditRework_NonCompilingAtBudgetCeilingWithProgress_ParksForOperatorReview()
     {
+        // A non-compiling rework no longer terminal-fails: the audit loop's
+        // next iteration picks the failure up as a blocking finding via
+        // RunForAuditAsync (same shape audit-discovered build failures
+        // already produced). When the iteration budget exhausts with the
+        // branch still non-compiling AND convergence signals visible
+        // (different blocking findings between iterations, work-branch tip
+        // changed), the item parks for operator review instead of
+        // terminal-failing — matching the audit ceiling's park-if-progress
+        // semantics.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateFakeDotnetAsync();
@@ -240,10 +249,66 @@ public sealed class RequiredBuildGateTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("rework left the branch non-compiling", final.LastError);
-        Assert.Contains("error CS1061", final.LastError);
-        Assert.Equal("build", final.FailureKind);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains("max iteration budget", final.LastError);
+        Assert.Contains("required build failed", final.LastError);
+    }
+
+    [Fact]
+    public async Task AuditRework_NonCompilingMidBudget_LoopsBackAndRecovers()
+    {
+        // Mid-budget non-compiling rework is recoverable: the next audit
+        // iteration surfaces the build failure as a blocking finding, the
+        // rework agent fixes the compile error, and a subsequent audit
+        // iteration passes. The work item reaches Done — proof that the
+        // loop did NOT terminal-fail at the first non-compiling rework.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var fakeDotnet = await CreateFakeDotnetAsync();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new OneTimeFailingAuditor()],
+            maxAuditIterations: 4,
+            sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
+
+        var item = NewItem("feature/rework-build-recover");
+        // Call 1 (work): write initial.txt → compiles. WorkComplete.
+        // Audit iter 1: OneTimeFailing fires (blocking). Build gate passes.
+        //   → rework iter 2.
+        // Call 2 (rework iter 2): write build.fail → non-compile. Under the
+        //   new policy the gate defers instead of terminal-failing.
+        // Audit iter 2: OneTimeFailing passed; build gate detects
+        //   non-compile (blocking). → rework iter 3.
+        // Call 3 (rework iter 3): BeforeWorkAsync deletes build.fail
+        //   first, then the agent writes fixed.txt. The commit stages
+        //   the deletion + addition; branch recompiles.
+        // Audit iter 3: OneTimeFailing passed; build gate passes; zero
+        //   blocking findings → audit passes → merge → Done.
+        var callCount = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, wd, ct) =>
+        {
+            var n = Interlocked.Increment(ref callCount);
+            if (n == 3)
+            {
+                await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["rm", "-f", $"{wd}/build.fail"],
+                }, ct);
+            }
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("initial.txt", "initial\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("build.fail", "broken\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fixed.txt", "fixed\n"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // No terminal build-failure trail on the item.
+        Assert.True(string.IsNullOrEmpty(final.LastError) || !final.LastError.Contains("non-compiling"),
+            $"expected loop-back recovery, got LastError={final.LastError}");
     }
 
     [Fact]
@@ -1109,26 +1174,29 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
-    public async Task PreemptResumeRework_NoChangeOnBrokenCheckpoint_FailsWithBuildErrorNotWorkComplete()
+    public async Task PreemptResumeRework_NoChangeOnBrokenCheckpoint_DoesNotReachAuditPassedOrDone()
     {
-        // Coverage gap on the resumingPreempt branch of RunAgentPhaseAsync
-        // (PipelineRunner.cs:2398-2410). When a Reworking item resumes from
-        // a PreemptCheckpoint and the resumed agent produces no new commit,
-        // the runner must still verify the branch compiles before pushing
-        // and returning success. Without this gate, a non-compiling
-        // checkpoint resumes, declares "no changes" silently, then walks
-        // through WorkComplete → AuditPassed and on to merge — the same
-        // class of failure the work/rework no-change gate catches on the
-        // ordinary pickup path. A regression that removed or bypassed the
-        // EnforceForWorkPhaseAsync call on this branch would leave only the
-        // initial-work, audit-rework, and queued-from-work tests as
-        // coverage, none of which exercise the preempt-resume entry.
+        // Coverage on the resumingPreempt branch of RunAgentPhaseAsync. When
+        // a Reworking item resumes from a PreemptCheckpoint and the resumed
+        // agent produces no new commit, the broken branch must NOT silently
+        // walk through WorkComplete → AuditPassed → merge.
+        //
+        // Under the unified rework-failure policy, the rework build gate no
+        // longer terminal-fails — it defers to the audit loop, which picks
+        // the same non-compile up as a blocking finding through
+        // RunForAuditAsync. With maxAuditIterations=1 and no further
+        // rework-agent capacity (the WorkPlan is empty), the audit ceiling
+        // converts a single failed iteration into AuditFailed (no
+        // convergence yet) rather than terminal-failing with failureKind=build.
+        // The invariant under test is that the item never reaches
+        // AuditPassed/Done with a broken build.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddDotnetSolutionMarkerAsync(seed);
         var fakeDotnet = await CreateFakeDotnetAsync();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
+            maxAuditIterations: 1,
             sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
 
         // Non-default branch name keeps the pickup-time rebase out of the
@@ -1154,20 +1222,24 @@ public sealed class RequiredBuildGateTests : IDisposable
         // Agent re-writes the same content the checkpoint already has, so
         // `git diff --cached --quiet` exits 0 and the resume path observes
         // shaBefore == shaAfter — the precise condition under which the
-        // resumingPreempt build gate must still run.
+        // resumingPreempt build gate must still see the broken state.
         tp.Agent.WorkPlan.Enqueue(new FileWrite("build.fail", "broken\n"));
 
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("build", final.FailureKind);
-        Assert.Contains("rework left the branch non-compiling", final.LastError);
-        Assert.Contains("error CS1061", final.LastError);
-        Assert.NotEqual(WorkItemState.WorkComplete, final.State);
-        Assert.NotEqual(WorkItemState.AuditPassed, final.State);
+        // The exact terminal state depends on whether the audit ceiling
+        // converges or hard-fails; the load-bearing invariant is that the
+        // item never reaches AuditPassed / Done with a broken build.
+        Assert.NotEqual(WorkItemState.AuditPassed, final!.State);
         Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.True(
+            final.State is WorkItemState.AuditFailed
+                or WorkItemState.NeedsOperatorInput
+                or WorkItemState.Failed,
+            $"expected a non-success terminal state, got {final.State}");
+        Assert.Contains("required build failed", final.LastError, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
