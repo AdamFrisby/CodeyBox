@@ -112,6 +112,9 @@ public static class AgentClassesConfigBuilder
                     QualityScore = score,
                     ReasoningMode = m.ReasoningMode,
                     Capabilities = capabilities,
+                    ClaudeSession = m.ClaudeSession?.Enabled is null
+                        ? null
+                        : new AgentClassClaudeSessionConfig { Enabled = m.ClaudeSession.Enabled.Value },
                 };
                 var memberKey = (member.RouteKey, m.ModelId ?? string.Empty);
                 if (!seenMemberKeys.Add(memberKey))
@@ -149,6 +152,9 @@ public static class AgentClassesConfigBuilder
                     ? classOpts.Id
                     : classOpts.DisplayName,
                 Members = members,
+                ClaudeSession = classOpts.ClaudeSession?.Enabled is null
+                    ? null
+                    : new AgentClassClaudeSessionConfig { Enabled = classOpts.ClaudeSession.Enabled.Value },
             });
         }
 

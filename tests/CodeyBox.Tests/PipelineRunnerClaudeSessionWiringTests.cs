@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
 
 namespace CodeyBox.Tests;
@@ -291,6 +292,68 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         Assert.False(Gate(workerRegistered, enabledOptions, optedInProject, controlItem, AgentKind.Claude));
     }
 
+    [Fact]
+    public async Task ShouldEnterClaudeSessionMode_ClassRoutedItemsRequireClassOrMemberOptIn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var worker = BuildClaudeSessionWorker();
+        var options = new ClaudeSessionWorkerOptions { Enabled = true };
+        var project = ProjectWithSessionEnabled(seed) with { DefaultAgentClass = "frontier" };
+        var item = NewItem() with
+        {
+            Agent = AgentKind.Claude,
+            AgentClassId = "frontier",
+            ModelId = "claude-opus-4-7",
+        };
+        var runner = new StubAgentRunner(AgentKind.Claude);
+
+        bool Gate(AgentClass agentClass)
+        {
+            var router = new AgentClassRouter(
+                [agentClass],
+                [],
+                new QuotaRouterOptions(),
+                NullLogger<AgentClassRouter>.Instance);
+            using var tp = TestSupport.BuildPipeline(
+                _workspace,
+                seed,
+                projectRepository: new InMemoryProjectRepository(project),
+                claudeSessionWorker: worker,
+                claudeSessionOptions: options,
+                classRouter: router);
+            return tp.Pipeline.ShouldEnterClaudeSessionMode(item, project, runner);
+        }
+
+        AgentClass Class(AgentClassClaudeSessionConfig? classSession, AgentClassClaudeSessionConfig? memberSession) => new()
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            ClaudeSession = classSession,
+            Members =
+            [
+                new AgentMembership
+                {
+                    Agent = AgentKind.Claude,
+                    Billing = AgentBilling.Subscription,
+                    ModelId = "claude-opus-4-7",
+                    QualityScore = 100,
+                    ClaudeSession = memberSession,
+                },
+            ],
+        };
+
+        Assert.False(Gate(Class(classSession: null, memberSession: null)));
+        Assert.True(Gate(Class(
+            classSession: new AgentClassClaudeSessionConfig { Enabled = true },
+            memberSession: null)));
+        Assert.False(Gate(Class(
+            classSession: new AgentClassClaudeSessionConfig { Enabled = true },
+            memberSession: new AgentClassClaudeSessionConfig { Enabled = false })));
+        Assert.True(Gate(Class(
+            classSession: new AgentClassClaudeSessionConfig { Enabled = false },
+            memberSession: new AgentClassClaudeSessionConfig { Enabled = true })));
+    }
+
     // ─── helpers ─────────────────────────────────────────────────────────
 
     private static Project ProjectWithSessionEnabled(
@@ -411,11 +474,15 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         Assert.Equal(2, handleIdsObserved.Length);
         Assert.All(handleIdsObserved, id => Assert.Equal(sessionRunner.OpenedHandleId, id));
 
-        // VM was SUSPENDED between turns and RESUMED for rework.
-        Assert.True(sessionRunner.SuspendCalls >= 1,
-            $"expected SuspendSessionAsync to fire between turns; got {sessionRunner.SuspendCalls}");
-        Assert.True(sessionRunner.ResumeCalls >= 1,
-            $"expected ResumeSessionAsync before the rework turn; got {sessionRunner.ResumeCalls}");
+        // VM was SUSPENDED before each audit (after work and after rework)
+        // and RESUMED exactly once for the rework turn.
+        Assert.Equal(2, sessionRunner.SuspendCalls);
+        Assert.Equal(1, sessionRunner.ResumeCalls);
+
+        var prompts = sessionRunner.PromptsSent.ToArray();
+        Assert.Equal(2, prompts.Length);
+        Assert.All(prompts, prompt =>
+            Assert.Contains("CodeyBox-Prompt-Revision` trailer value for this turn MUST be the literal integer **1**", prompt));
 
         // CloseSessionAsync runs at the end (lifecycle disposal): the
         // worker VM must be disposed on terminal so no idle VM leaks.
@@ -480,6 +547,166 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         foreach (var auditorSandboxId in auditor.SandboxIdsObserved)
             Assert.False(workerSandboxIds.Contains(auditorSandboxId),
                 $"auditor reused the worker sandbox '{auditorSandboxId}' — session leakage!");
+    }
+
+    [Fact]
+    public async Task SessionMode_ClassRoutedOpenPassesProjectAndMemberScope()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed) with { DefaultAgentClass = "frontier" };
+        var classRouter = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "frontier",
+                    DisplayName = "Frontier",
+                    ClaudeSession = new AgentClassClaudeSessionConfig { Enabled = true },
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Claude,
+                            Billing = AgentBilling.Subscription,
+                            ModelId = "claude-opus-4-7",
+                            QualityScore = 100,
+                        },
+                    ],
+                },
+            ],
+            [],
+            new QuotaRouterOptions(),
+            NullLogger<AgentClassRouter>.Instance);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+        ]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
+            sessionAgentRunnerOverride: sessionRunner,
+            classRouter: classRouter);
+
+        var item = NewItem() with
+        {
+            AgentClassId = "frontier",
+            ModelId = "claude-opus-4-7",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal("test-project", sessionRunner.OpenedProjectId);
+        Assert.Equal("claude", sessionRunner.OpenedAgentClassMember);
+        Assert.Equal("claude-opus-4-7", sessionRunner.OpenedModelId);
+    }
+
+    [Fact]
+    public async Task SessionMode_SuspendFailureClosesSession_AndReworkFallsBackToLegacySandbox()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed, withScriptedAuditors: true);
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("a.txt", "v1"),
+        ])
+        {
+            FailNextSuspend = true,
+        };
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs fix", "x")]),
+            new AuditOutcome(true, []),
+        ]);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectRepository: new InMemoryProjectRepository(project),
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
+            sessionAgentRunnerOverride: sessionRunner);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v2-legacy-rework"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, sessionRunner.SendTurns);
+        Assert.Equal(1, sessionRunner.SuspendCalls);
+        Assert.Equal(1, sessionRunner.CloseCalls);
+        Assert.Equal(0, sessionRunner.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task SessionMode_QuotaFailureClosesSessionBeforeSameKindFallback()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var project = ProjectWithSessionEnabled(seed) with { DefaultAgentClass = "frontier" };
+        var classRouter = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "frontier",
+                    DisplayName = "Frontier",
+                    ClaudeSession = new AgentClassClaudeSessionConfig { Enabled = true },
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Claude,
+                            Billing = AgentBilling.Subscription,
+                            ModelId = "primary-model",
+                            QualityScore = 100,
+                        },
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Claude,
+                            Billing = AgentBilling.PayPerApi,
+                            ModelId = "fallback-model",
+                            QualityScore = 99,
+                        },
+                    ],
+                },
+            ],
+            [],
+            new QuotaRouterOptions(),
+            NullLogger<AgentClassRouter>.Instance);
+        var sessionRunner = new RecordingSessionRunner(turnFiles: []);
+        sessionRunner.EnqueueTurnResult(new AgentResult(
+            Success: false,
+            Summary: "quota",
+            Stdout: null,
+            Stderr: "rate_limit_exceeded"));
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
+            sessionAgentRunnerOverride: sessionRunner,
+            classRouter: classRouter);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "fallback wrote this"));
+
+        var item = NewItem() with
+        {
+            AgentClassId = "frontier",
+            ModelId = "primary-model",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, sessionRunner.SendTurns);
+        Assert.Equal(1, sessionRunner.CloseCalls);
+        Assert.Equal(0, sessionRunner.SuspendCalls);
+        Assert.Equal(0, sessionRunner.ResumeCalls);
     }
 
     [Fact]
@@ -562,9 +789,10 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
     /// is reused for every turn — tests assert session-id continuity by
     /// inspecting <see cref="HandleIdsObserved"/>.
     /// </summary>
-    private sealed class RecordingSessionRunner : ISessionAgentRunner
+    private sealed class RecordingSessionRunner : IScopedSessionAgentRunner
     {
         private readonly Queue<RecordingFileWrite> _turnFiles;
+        private readonly Queue<AgentResult> _turnResults = new();
         private ISandbox? _capturedSandbox;
         private string? _workingDirectory;
 
@@ -581,8 +809,16 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         public int CloseCalls;
         public int OneShotRunAsyncCalls;
         public string? OpenedHandleId;
+        public string? OpenedProjectId;
+        public string? OpenedAgentClassMember;
+        public string? OpenedModelId;
+        public string? OpenedReasoningMode;
+        public bool FailNextSuspend { get; set; }
         public ConcurrentQueue<string> HandleIdsObserved { get; } = new();
         public ConcurrentQueue<string> SandboxIdsObservedOnTurns { get; } = new();
+        public ConcurrentQueue<string> PromptsSent { get; } = new();
+
+        public void EnqueueTurnResult(AgentResult result) => _turnResults.Enqueue(result);
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential,
@@ -607,6 +843,8 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
             Interlocked.Increment(ref OpenedSessions);
             _capturedSandbox = sandbox;
             _workingDirectory = workingDirectory;
+            OpenedModelId = modelId;
+            OpenedReasoningMode = reasoningMode;
             var handleId = $"claude-session-test-{OpenedSessions}";
             OpenedHandleId = handleId;
             return Task.FromResult(new AgentSessionHandle(
@@ -618,14 +856,31 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
                 reasoningMode));
         }
 
+        public Task<AgentSessionHandle> OpenSessionAsync(AgentSessionOpenRequest request, CancellationToken ct = default)
+        {
+            OpenedProjectId = request.ProjectId;
+            OpenedAgentClassMember = request.AgentClassMember;
+            return OpenSessionAsync(
+                request.Sandbox,
+                request.WorkingDirectory,
+                request.Credential,
+                request.ModelId,
+                request.ReasoningMode,
+                ct);
+        }
+
         public async Task<AgentResult> SendTurnAsync(
             AgentSessionHandle sessionHandle, string prompt,
             CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)
         {
             Interlocked.Increment(ref SendTurns);
             HandleIdsObserved.Enqueue(sessionHandle.SessionId);
+            PromptsSent.Enqueue(prompt);
             if (_capturedSandbox is not null)
                 SandboxIdsObservedOnTurns.Enqueue(_capturedSandbox.Id);
+
+            if (_turnResults.Count > 0)
+                return _turnResults.Dequeue();
 
             if (_turnFiles.Count == 0)
                 return new AgentResult(true, "ok", null, null);
@@ -645,6 +900,11 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         public Task SuspendSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         {
             Interlocked.Increment(ref SuspendCalls);
+            if (FailNextSuspend)
+            {
+                FailNextSuspend = false;
+                throw new InvalidOperationException("suspend failed");
+            }
             return Task.CompletedTask;
         }
 

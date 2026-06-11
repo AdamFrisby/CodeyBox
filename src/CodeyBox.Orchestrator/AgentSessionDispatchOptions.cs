@@ -4,7 +4,7 @@ namespace CodeyBox.Orchestrator;
 /// Orchestrator-owned dispatch gate for the resumable agent-session pipeline.
 /// Carries only the orchestration-side decision ("is the resumable session
 /// path enabled at all") so <see cref="PipelineRunner"/> never needs to
-/// reference a provider-specific options shape (e.g. <c>ClaudeSessionWorkerOptions</c>)
+/// reference a provider-specific options shape
 /// to make its dispatch decision. The composition root reads the underlying
 /// per-provider options at registration time and projects the master switch
 /// into this struct.

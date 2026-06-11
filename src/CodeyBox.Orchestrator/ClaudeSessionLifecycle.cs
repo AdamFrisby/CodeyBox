@@ -4,7 +4,7 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Drives the resumable-Claude worker's lifecycle across one work item's
+/// Drives the resumable session worker's lifecycle across one work item's
 /// work→audit→rework cycle. The session is OPENED once at the start of the
 /// work phase, used for every worker turn (work + each rework iteration),
 /// SUSPENDED before each audit, RESUMED before the next rework, and CLOSED
@@ -37,34 +37,41 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     private bool _suspended;
     private bool _closed;
     private bool _firstTurnComplete;
+    private readonly string _openedAgentRouteKey;
+    private readonly string? _openedModelId;
+    private readonly string? _openedReasoningMode;
 
     private ClaudeSessionLifecycle(
         ISessionAgentRunner worker,
         Func<AgentSessionHandle, AgentSessionHandle>? handleSnapshot,
         ISandbox sandbox,
-        AgentSessionHandle handle)
+        AgentSessionHandle handle,
+        string openedAgentRouteKey,
+        string? openedModelId,
+        string? openedReasoningMode)
     {
         _worker = worker;
         _handleSnapshot = handleSnapshot;
         Sandbox = sandbox;
         Handle = handle;
+        _openedAgentRouteKey = openedAgentRouteKey;
+        _openedModelId = openedModelId;
+        _openedReasoningMode = openedReasoningMode;
     }
 
     /// <summary>
     /// The live worker sandbox. The same instance is returned for every turn
     /// of the same lifecycle, even after a suspend/resume cycle — the
-    /// underlying <see cref="ClaudeSessionWorker"/> performs the resume via
-    /// its configured <c>sandboxResumeHook</c> (<c>multipass start &lt;vm&gt;</c>
-    /// in production).
+    /// underlying session runner performs the resume via its configured
+    /// provider hook (<c>multipass start &lt;vm&gt;</c> in production).
     /// </summary>
     public ISandbox Sandbox { get; }
 
     /// <summary>
     /// The session handle returned by
-    /// <see cref="ClaudeSessionWorker.OpenSessionAsync"/>. Carries the
-    /// runner kind, a durable sandbox reference, and (after the first turn)
-    /// the captured CLI session id under
-    /// <see cref="ClaudeSessionWorker.CliSessionIdMetadataKey"/>.
+    /// <see cref="ISessionAgentRunner.OpenSessionAsync"/>. Carries the
+    /// runner kind, a durable sandbox reference, and provider-specific
+    /// metadata captured by the concrete session runner.
     /// </summary>
     public AgentSessionHandle Handle { get; private set; }
 
@@ -85,6 +92,22 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     /// <c>--resume</c> on every subsequent turn).
     /// </summary>
     public int TurnsCompleted { get; private set; }
+
+    /// <summary>
+    /// True when the requested turn still matches the agent instance, model,
+    /// and reasoning mode used to open this lifecycle. Class-level fallback can
+    /// retry another Claude member; that must not reuse the original member's
+    /// session, credential, or model.
+    /// </summary>
+    public bool CanRunTurn(IAgentRunner runner, WorkItem item)
+    {
+        ArgumentNullException.ThrowIfNull(runner);
+        ArgumentNullException.ThrowIfNull(item);
+        return runner.Kind == Handle.RunnerKind
+            && string.Equals(_openedAgentRouteKey, RouteKeyFor(runner.Kind, item.AgentInstanceId), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(_openedModelId ?? string.Empty, item.ModelId ?? string.Empty, StringComparison.Ordinal)
+            && string.Equals(_openedReasoningMode ?? string.Empty, item.ReasoningMode ?? string.Empty, StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// Provider-specific session identifier captured after the first turn,
@@ -120,8 +143,8 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     /// disposes it via the runner's <c>CloseSessionAsync</c>.
     /// <paramref name="handleSnapshot"/> is an optional persistence hook
     /// the production composition root wires to the concrete runner's
-    /// snapshot method (e.g. <c>ClaudeSessionWorker.SnapshotPersistedHandle</c>);
-    /// tests pass null when they don't exercise the persistence shape.
+    /// snapshot method; tests pass null when they don't exercise the
+    /// persistence shape.
     /// </summary>
     public static async Task<ClaudeSessionLifecycle> OpenAsync(
         ISessionAgentRunner worker,
@@ -131,6 +154,9 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
         AgentCredential? credential,
         string? modelId,
         string? reasoningMode,
+        string openedAgentRouteKey,
+        string? projectId,
+        string? agentClassMember,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(worker);
@@ -140,8 +166,19 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
         AgentSessionHandle handle;
         try
         {
-            handle = await worker.OpenSessionAsync(
-                sandbox, workingDirectory, credential, modelId, reasoningMode, ct).ConfigureAwait(false);
+            handle = worker is IScopedSessionAgentRunner scoped
+                ? await scoped.OpenSessionAsync(
+                    new AgentSessionOpenRequest(
+                        sandbox,
+                        workingDirectory,
+                        credential,
+                        modelId,
+                        reasoningMode,
+                        projectId,
+                        agentClassMember),
+                    ct).ConfigureAwait(false)
+                : await worker.OpenSessionAsync(
+                    sandbox, workingDirectory, credential, modelId, reasoningMode, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -152,12 +189,19 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
             throw;
         }
 
-        return new ClaudeSessionLifecycle(worker, handleSnapshot, sandbox, handle);
+        return new ClaudeSessionLifecycle(
+            worker,
+            handleSnapshot,
+            sandbox,
+            handle,
+            openedAgentRouteKey,
+            modelId,
+            reasoningMode);
     }
 
     /// <summary>
     /// Returns the sandbox to use for the next worker turn, resuming the
-    /// VM via <see cref="ClaudeSessionWorker.ResumeSessionAsync"/> when the
+    /// VM via <see cref="ISessionAgentRunner.ResumeSessionAsync"/> when the
     /// lifecycle is currently suspended.
     /// </summary>
     public async Task<ISandbox> GetSandboxAsync(CancellationToken ct)
@@ -169,6 +213,14 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
             if (_suspended)
             {
                 await _worker.ResumeSessionAsync(Handle, ct).ConfigureAwait(false);
+                if (_handleSnapshot is not null)
+                    Handle = _handleSnapshot(Handle);
+                if (AgentSessionMetadataKeys.IsFallbackToOneShot(Handle.Metadata))
+                {
+                    await CloseLockedAsync().ConfigureAwait(false);
+                    throw new AgentSessionDegradedException(
+                        "Session runner reported fallback-to-one-shot after resume; use a fresh sandbox for the next turn.");
+                }
                 _suspended = false;
             }
             return Sandbox;
@@ -223,7 +275,7 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
 
     /// <summary>
     /// Stops the worker VM via
-    /// <see cref="ClaudeSessionWorker.SuspendSessionAsync"/>. Called by
+    /// <see cref="ISessionAgentRunner.SuspendSessionAsync"/>. Called by
     /// PipelineRunner after each worker turn completes its post-agent git
     /// work (commit + push to the bare host repo) so the VM is OFF while
     /// the (long) audit runs in its own isolated sandbox.
@@ -255,19 +307,7 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
         await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            if (_closed)
-                return;
-            _closed = true;
-            try
-            {
-                await _worker.CloseSessionAsync(Handle, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Disposal must never throw — the work item's terminal-
-                // transition path is the surface that surfaces the real
-                // error and would re-throw a more useful summary anyway.
-            }
+            await CloseLockedAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -275,9 +315,32 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
         }
     }
 
+    private async Task CloseLockedAsync()
+    {
+        if (_closed)
+            return;
+        await _worker.CloseSessionAsync(Handle, CancellationToken.None).ConfigureAwait(false);
+        _closed = true;
+    }
+
     private void ThrowIfClosed()
     {
         if (_closed)
             throw new InvalidOperationException("Claude session lifecycle has been closed.");
     }
+
+    private static string RouteKeyFor(AgentKind kind, string? agentInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(agentInstanceId))
+            return kind.Value;
+
+        var id = agentInstanceId.Trim();
+        if (id.Contains('/', StringComparison.Ordinal)
+            || string.Equals(id, kind.Value, StringComparison.OrdinalIgnoreCase))
+            return id;
+
+        return AgentInstanceIds.RouteKey(kind, id);
+    }
 }
+
+internal sealed class AgentSessionDegradedException(string message) : InvalidOperationException(message);

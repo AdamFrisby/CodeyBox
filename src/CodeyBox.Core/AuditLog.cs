@@ -1157,8 +1157,8 @@ public static class AuditLog
                 summary, stderr ?? "none");
 
     /// <summary>
-    /// Emitted by <c>CodeyBox.Agents.Claude.ClaudeSessionWorker</c> when it
-    /// degrades the active transport for a session from ACP to print at
+    /// Emitted by the Claude session runner when it degrades the active
+    /// transport for a session from ACP to print at
     /// runtime — either because the ACP transport could not open at session
     /// start or because a turn surfaced an
     /// <c>AcpTransportUnavailableException</c>. The work item is NOT
@@ -1200,6 +1200,12 @@ public static class AuditLog
             .Warning(
                 "Claude session suspend failed for work item {WorkItemId} session {SessionId}: {Reason}. " +
                 "Closing the session and degrading to the legacy fresh-sandbox rework path.",
+                itemId, sessionId, reason);
+
+    public static void ClaudeSessionCloseFailed(WorkItemId itemId, string sessionId, string reason) =>
+        Audit("agent.claude_session_close_failed")
+            .Warning(
+                "Claude session close failed for work item {WorkItemId} session {SessionId}: {Reason}",
                 itemId, sessionId, reason);
 
     // ── Live agent supervision ───────────────────────────────────────────────

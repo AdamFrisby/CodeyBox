@@ -22,6 +22,13 @@ public sealed record AgentClass
     /// is driven by <see cref="AgentMembership.QualityScore"/>, not position.
     /// </summary>
     public required IReadOnlyList<AgentMembership> Members { get; init; }
+
+    /// <summary>
+    /// Optional class-level opt-in for the resumable Claude session pipeline.
+    /// Null or <c>Enabled=false</c> keeps members on the legacy per-phase
+    /// sandbox path unless an individual member overrides it.
+    /// </summary>
+    public AgentClassClaudeSessionConfig? ClaudeSession { get; init; }
 }
 
 /// <summary>A single agent option within an <see cref="AgentClass"/>.</summary>
@@ -95,6 +102,23 @@ public sealed record AgentMembership
     /// Tag comparison is ordinal, case-insensitive. Default empty.
     /// </summary>
     public IReadOnlyList<string> Capabilities { get; init; } = [];
+
+    /// <summary>
+    /// Optional member-level override for the resumable Claude session pipeline.
+    /// Null inherits the containing class setting; <c>Enabled=false</c> opts
+    /// this member out even when the class is enabled.
+    /// </summary>
+    public AgentClassClaudeSessionConfig? ClaudeSession { get; init; }
+}
+
+/// <summary>
+/// Agent-class/member opt-in for the Claude session worker. The generic
+/// routing model carries the flag so the orchestrator can decide without
+/// referencing a concrete Claude implementation assembly.
+/// </summary>
+public sealed record AgentClassClaudeSessionConfig
+{
+    public bool Enabled { get; init; }
 }
 
 /// <summary>

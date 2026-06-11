@@ -159,7 +159,7 @@ public sealed class PipelineRunner : IPipelineRunner
     //
     // Stored as ISessionAgentRunner (not the concrete worker) so tests can
     // inject a fake without spinning up the real Claude CLI machinery. The
-    // production DI path supplies a ClaudeSessionWorker whose snapshot
+    // production DI path supplies a provider session runner whose snapshot
     // delegate flows through _claudeHandleSnapshot for restart recovery.
     private readonly ISessionAgentRunner? _claudeSessionWorker;
     private readonly Func<AgentSessionHandle, AgentSessionHandle>? _claudeHandleSnapshot;
@@ -250,7 +250,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // Resumable session runner — accepted as an abstraction so the
         // orchestration boundary doesn't take a hard dependency on any
         // provider-specific concrete type. The composition root (Program.cs)
-        // hands in the per-provider concrete (e.g. ClaudeSessionWorker)
+        // hands in the per-provider concrete session runner
         // implementing ISessionAgentRunner; tests substitute fakes through
         // the same parameter. Null disables session-mode dispatch entirely
         // (every item takes the legacy independent-phase path).
@@ -369,7 +369,7 @@ public sealed class PipelineRunner : IPipelineRunner
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
         // The session-runner abstraction is the single seam: production
-        // hands in the per-provider concrete (e.g. ClaudeSessionWorker)
+        // hands in the per-provider concrete session runner
         // implementing ISessionAgentRunner; tests substitute a fake
         // through the same parameter. The snapshot hook is forwarded
         // verbatim — the composition root chooses whether to wire it.
@@ -392,6 +392,7 @@ public sealed class PipelineRunner : IPipelineRunner
     ///   <item>The global flag <c>CodeyBox:ClaudeSession:Enabled</c> is true.</item>
     ///   <item>The per-project flag <c>Project.ClaudeSession.Enabled</c> is true.</item>
     ///   <item>The work item's effective agent is Claude (the worker is Claude-only).</item>
+    ///   <item>For class-routed items, the selected class/member opts in to Claude sessions.</item>
     /// </list>
     /// <para>Items that fail any one of these conditions take the legacy
     /// independent-phase pipeline (fresh sandbox per work / rework call,
@@ -411,6 +412,15 @@ public sealed class PipelineRunner : IPipelineRunner
         // rework loop, so the session-share benefit doesn't apply.
         if (item.JobType == JobType.CheckAndAct) return false;
         if (item.JobType == JobType.AgentControl) return false;
+        var classId = item.AgentClassId ?? project.DefaultAgentClass;
+        if (!string.IsNullOrWhiteSpace(classId))
+        {
+            if (_classRouter is null)
+                return false;
+            var selectedMember = _classRouter.FindMember(classId, runner.Kind, item.ModelId, item.AgentInstanceId);
+            if (selectedMember is null || !_classRouter.IsClaudeSessionEnabled(classId, selectedMember))
+                return false;
+        }
         // The session worker opens ONE VM with the work-phase sandbox target
         // and reuses it across every rework turn. When the operator
         // configured Work and Rework with different network profiles (e.g.
@@ -461,7 +471,13 @@ public sealed class PipelineRunner : IPipelineRunner
         // worker turn for this item.
         var access = _gitHost.GetSandboxAccess(repoId);
         var sandboxTarget = SandboxTargetResolver.ResolveProjectPhase(project, project.NetworkProfiles.Work);
-        var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct).ConfigureAwait(false);
+        var selectedMember = TryResolveSelectedMember(runner.Kind, project, item);
+        var openedRouteKey = selectedMember?.RouteKey ?? CanonicalAgentRouteKey(runner.Kind, item.AgentInstanceId);
+        var openedModelId = selectedMember?.ModelId ?? item.ModelId;
+        var openedReasoningMode = selectedMember?.ReasoningMode ?? item.ReasoningMode;
+        var credential = selectedMember is not null
+            ? await ResolveAgentCredentialAsync(selectedMember, project, ct).ConfigureAwait(false)
+            : await ResolveAgentCredentialAsync(runner.Kind, project, item, ct).ConfigureAwait(false);
         var spec = BuildSandboxSpec(
             access,
             includeAgentCredential: credential,
@@ -488,8 +504,11 @@ public sealed class PipelineRunner : IPipelineRunner
                 sandbox,
                 SandboxConventions.WorkDir,
                 credential,
-                item.ModelId,
-                item.ReasoningMode,
+                openedModelId,
+                openedReasoningMode,
+                openedRouteKey,
+                project.Id.Value,
+                selectedMember?.RouteKey,
                 ct).ConfigureAwait(false);
             // sandbox ownership transferred to the lifecycle. The AsyncLocal
             // is published by the caller (RunAsync) on the returned value, in
@@ -1562,12 +1581,17 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 try
                 {
-                    await claudeSessionLifecycle.DisposeAsync();
+                    await CloseAmbientClaudeSessionAsync(
+                        claudeSessionLifecycle,
+                        item,
+                        project,
+                        "pipeline terminal cleanup");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Disposal is best-effort; SandboxLeakReaper sweeps any
-                    // orphaned VM the close path couldn't reach.
+                    _log.LogWarning(ex,
+                        "Claude session terminal cleanup failed for work item {Id}; continuing after surfacing the cleanup failure",
+                        item.Id);
                 }
                 _ambientSessionLifecycle.Value = null;
             }
@@ -2868,6 +2892,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var useClaudeSession = sessionLifecycle is not null
             && !sessionLifecycle.IsClosed
             && runner.Kind == AgentKind.Claude
+            && sessionLifecycle.CanRunTurn(runner, item)
             && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
         ISandbox sandbox;
@@ -2878,13 +2903,31 @@ public sealed class PipelineRunner : IPipelineRunner
             // GetSandboxAsync resumes the VM via the worker's resume hook
             // (multipass start) when the lifecycle is currently suspended;
             // on the very first call it is already running.
-            sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
-            sandboxOwnedByPhase = false;
-            // On subsequent worker turns (rework) the previous turn already
-            // cloned into /work; re-cloning would fail and would also throw
-            // away the agent's mid-tree scratch state. We refresh against
-            // origin via fetch + checkout below instead of cloning.
-            skipClone = sessionLifecycle.FirstTurnComplete;
+            try
+            {
+                sandbox = await sessionLifecycle!.GetSandboxAsync(ct);
+                sandboxOwnedByPhase = false;
+                // On subsequent worker turns (rework) the previous turn already
+                // cloned into /work; re-cloning would fail and would also throw
+                // away the agent's mid-tree scratch state. We refresh against
+                // origin via fetch + checkout below instead of cloning.
+                skipClone = sessionLifecycle.FirstTurnComplete;
+            }
+            catch (AgentSessionDegradedException ex)
+            {
+                _log.LogWarning(ex,
+                    "Claude session lifecycle degraded before phase '{Phase}' for work item {Id}; using the legacy fresh-sandbox path for this turn",
+                    agentPhase, item.Id);
+                _ambientSessionLifecycle.Value = null;
+                sessionLifecycle = null;
+                useClaudeSession = false;
+                var sandboxStartSw = Stopwatch.StartNew();
+                sandbox = await _sandboxes.CreateAsync(spec, ct);
+                sandboxStartSw.Stop();
+                CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
+                sandboxOwnedByPhase = true;
+                skipClone = false;
+            }
         }
         else
         {
@@ -2893,6 +2936,20 @@ public sealed class PipelineRunner : IPipelineRunner
             // sandbox across the work + audit phases of the same item; the
             // wrapper it returns has a cheap DisposeAsync so the
             // sandboxOwnedByPhase finally below stays safe.
+            if (sessionLifecycle is not null
+                && !sessionLifecycle.IsClosed
+                && runner.Kind == AgentKind.Claude
+                && string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+                && !sessionLifecycle.CanRunTurn(runner, item))
+            {
+                await CloseAmbientClaudeSessionAsync(
+                    sessionLifecycle,
+                    item,
+                    project,
+                    "selected Claude fallback member does not match the opened session");
+                _ambientSessionLifecycle.Value = null;
+                sessionLifecycle = null;
+            }
             var sandboxStartSw = Stopwatch.StartNew();
             sandbox = WorkSandboxContext.Current != null
                 ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
@@ -3462,63 +3519,71 @@ public sealed class PipelineRunner : IPipelineRunner
                     // the meaningful failure.
                 }
             }
-            else if (useClaudeSession && phaseSucceeded)
+            else if (useClaudeSession)
             {
-                // Session-mode success path: suspend the worker VM so the
-                // (long) audit phase doesn't burn host resources holding an
-                // idle worker, while preserving the in-VM transcript and the
-                // server-side prompt cache (within its TTL) for the next
-                // rework turn. On failure we MUST NOT silently swallow: a
-                // failed multipass stop/resume boundary is exactly the
-                // session-mode acceptance criterion the brief lists as
-                // non-negotiable. Surface the failure to operators via the
-                // audit log and a webhook, then close the lifecycle so:
-                //   (a) the worker VM is torn down before the long audit
-                //       (no idle VM holding host resources), and
-                //   (b) the next rework turn falls back to the legacy
-                //       fresh-sandbox path (RunAgentPhaseAsync checks
-                //       IsClosed to opt out of the session branch).
-                try
+                if (phaseSucceeded)
                 {
-                    await sessionLifecycle!.SuspendAsync(CancellationToken.None);
-                }
-                catch (Exception suspendEx)
-                {
-                    var sessionIdForLog = sessionLifecycle!.Handle.SessionId;
-                    AuditLog.ClaudeSessionSuspendFailed(item.Id, sessionIdForLog, suspendEx.Message);
-                    _log.LogWarning(suspendEx,
-                        "ClaudeSessionLifecycle.SuspendAsync failed for work item {Id} session {SessionId}; closing the session and degrading to legacy fresh-sandbox rework",
-                        item.Id, sessionIdForLog);
+                    // Session-mode success path: suspend the worker VM so the
+                    // (long) audit phase doesn't burn host resources holding an
+                    // idle worker, while preserving the in-VM transcript and the
+                    // server-side prompt cache (within its TTL) for the next
+                    // rework turn. On failure we MUST NOT silently swallow: a
+                    // failed multipass stop/resume boundary is exactly the
+                    // session-mode acceptance criterion the brief lists as
+                    // non-negotiable. Surface the failure to operators via the
+                    // audit log and a webhook, then close the lifecycle so:
+                    //   (a) the worker VM is torn down before the long audit
+                    //       (no idle VM holding host resources), and
+                    //   (b) the next rework turn falls back to the legacy
+                    //       fresh-sandbox path (RunAgentPhaseAsync checks
+                    //       IsClosed to opt out of the session branch).
                     try
                     {
-                        await _webhooks.PublishAsync(new WebhookEvent
+                        await sessionLifecycle!.SuspendAsync(CancellationToken.None);
+                    }
+                    catch (Exception suspendEx)
+                    {
+                        var sessionIdForLog = sessionLifecycle!.Handle.SessionId;
+                        AuditLog.ClaudeSessionSuspendFailed(item.Id, sessionIdForLog, suspendEx.Message);
+                        _log.LogWarning(suspendEx,
+                            "ClaudeSessionLifecycle.SuspendAsync failed for work item {Id} session {SessionId}; closing the session and degrading to legacy fresh-sandbox rework",
+                            item.Id, sessionIdForLog);
+                        try
                         {
-                            Event = "agent.claude_session_suspend_failed",
-                            WorkItem = item,
-                            Project = project,
-                            Details = new
+                            await _webhooks.PublishAsync(new WebhookEvent
                             {
-                                workItemId = item.Id.ToString(),
-                                sessionId = sessionIdForLog,
-                                reason = suspendEx.Message,
-                            },
-                        }, CancellationToken.None);
+                                Event = "agent.claude_session_suspend_failed",
+                                WorkItem = item,
+                                Project = project,
+                                Details = new
+                                {
+                                    workItemId = item.Id.ToString(),
+                                    sessionId = sessionIdForLog,
+                                    reason = suspendEx.Message,
+                                },
+                            }, CancellationToken.None);
+                        }
+                        catch
+                        {
+                            // Webhook delivery is best-effort; the audit log is
+                            // the durable surface.
+                        }
+                        await CloseAmbientClaudeSessionAsync(
+                            sessionLifecycle!,
+                            item,
+                            project,
+                            "suspend failed before audit");
+                        _ambientSessionLifecycle.Value = null;
                     }
-                    catch
-                    {
-                        // Webhook delivery is best-effort; the audit log is
-                        // the durable surface.
-                    }
-                    try
-                    {
-                        await sessionLifecycle!.DisposeAsync();
-                    }
-                    catch
-                    {
-                        // Close failure on top of suspend failure is best-
-                        // effort; SandboxLeakReaper sweeps any orphaned VM
-                        // the close path couldn't reach.
-                    }
+                }
+                else
+                {
+                    await CloseAmbientClaudeSessionAsync(
+                        sessionLifecycle!,
+                        item,
+                        project,
+                        "session-backed attempt failed before phase success");
+                    _ambientSessionLifecycle.Value = null;
                 }
             }
         }
@@ -3552,6 +3617,47 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private static string PreemptRefFor(WorkItemId id) => $"refs/heads/codeybox/preempt/{id}";
+
+    private async Task CloseAmbientClaudeSessionAsync(
+        ClaudeSessionLifecycle lifecycle,
+        WorkItem item,
+        Project project,
+        string reason)
+    {
+        var sessionId = lifecycle.Handle.SessionId;
+        try
+        {
+            await lifecycle.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            AuditLog.ClaudeSessionCloseFailed(item.Id, sessionId, ex.Message);
+            _log.LogWarning(ex,
+                "Claude session close failed for work item {Id} session {SessionId} while {Reason}",
+                item.Id, sessionId, reason);
+            try
+            {
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "agent.claude_session_close_failed",
+                    WorkItem = item,
+                    Project = project,
+                    Details = new
+                    {
+                        workItemId = item.Id.ToString(),
+                        sessionId,
+                        reason,
+                        error = ex.Message,
+                    },
+                }, CancellationToken.None);
+            }
+            catch
+            {
+                // Best-effort; the structured audit log above is durable.
+            }
+            throw;
+        }
+    }
 
     private static string ValidatePreemptCheckpoint(WorkItem item, string checkpointRef)
     {
@@ -6994,6 +7100,19 @@ public sealed class PipelineRunner : IPipelineRunner
         return classId is null
             ? null
             : _classRouter.FindMember(classId, kind, item.ModelId, item.AgentInstanceId);
+    }
+
+    private static string CanonicalAgentRouteKey(AgentKind kind, string? agentInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(agentInstanceId))
+            return kind.Value;
+
+        var id = agentInstanceId.Trim();
+        if (id.Contains('/', StringComparison.Ordinal)
+            || string.Equals(id, kind.Value, StringComparison.OrdinalIgnoreCase))
+            return id;
+
+        return AgentInstanceIds.RouteKey(kind, id);
     }
 
     /// <summary>

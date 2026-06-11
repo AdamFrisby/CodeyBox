@@ -746,9 +746,10 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : ISandbox
+internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
 {
     private readonly ISandbox _inner;
+    private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
     private readonly SandboxAdmissionLease _lease;
     private readonly Func<ISandbox, SandboxAdmissionLease, bool, ValueTask> _onDisposed;
     private readonly ILogger _log;
@@ -765,6 +766,7 @@ internal class AdmissionControlledSandbox : ISandbox
         ArgumentNullException.ThrowIfNull(onDisposed);
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
+        _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
         _lease = lease;
         _onDisposed = onDisposed;
         _log = log;
@@ -825,6 +827,8 @@ internal class AdmissionControlledSandbox : ISandbox
             }
         }
     }
+
+    public void DisablePreserveOnDispose() => _preserveOnDispose?.DisablePreserveOnDispose();
 }
 
 internal sealed class AdmissionControlledPreemptibleSandbox(

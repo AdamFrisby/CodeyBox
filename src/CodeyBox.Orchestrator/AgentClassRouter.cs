@@ -963,6 +963,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     }
 
     /// <summary>
+    /// Returns the effective class/member opt-in for the Claude session worker.
+    /// Member-level config wins; otherwise the containing class config applies.
+    /// Missing class/member or unset config returns false so legacy per-phase
+    /// dispatch remains the default.
+    /// </summary>
+    public bool IsClaudeSessionEnabled(string classId, AgentMembership member)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(classId);
+        ArgumentNullException.ThrowIfNull(member);
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return false;
+
+        var configuredMember = agentClass.Members.FirstOrDefault(m =>
+            string.Equals(m.RouteKey, member.RouteKey, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(m.ModelId ?? string.Empty, member.ModelId ?? string.Empty, StringComparison.Ordinal));
+
+        return configuredMember?.ClaudeSession?.Enabled
+            ?? agentClass.ClaudeSession?.Enabled
+            ?? false;
+    }
+
+    /// <summary>
     /// Returns the set of agent kinds in <paramref name="classId"/> that
     /// declare <paramref name="capability"/> in their
     /// <see cref="AgentMembership.Capabilities"/> list, or <c>null</c> when

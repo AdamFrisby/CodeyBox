@@ -38,7 +38,10 @@ public sealed class ClaudeSessionLifecycleTests
             credential: null,
             modelId: null,
             reasoningMode: null,
-            CancellationToken.None);
+            openedAgentRouteKey: AgentKind.Claude.Value,
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
 
         // --- Work turn (turn 1) ---
         var workSandbox = await lifecycle.GetSandboxAsync(CancellationToken.None);
@@ -69,7 +72,9 @@ public sealed class ClaudeSessionLifecycleTests
         // SendTurn call.
         Assert.Equal(1, worker.OpenedSessions);
         Assert.Equal(3, worker.SendTurns);
-        Assert.All(worker.PromptsSent, _ => Assert.Equal(worker.OpenedHandleId, worker.LastHandleIdOnTurn));
+        var observedHandleIds = worker.HandleIdsObserved.ToArray();
+        Assert.Equal(3, observedHandleIds.Length);
+        Assert.All(observedHandleIds, id => Assert.Equal(worker.OpenedHandleId, id));
 
         // The VM was suspended between each turn (3 turns, 3 suspends).
         Assert.Equal(3, worker.SuspendCalls);
@@ -94,7 +99,8 @@ public sealed class ClaudeSessionLifecycleTests
         worker.SandboxToDisposeOnClose = sandbox;
 
         var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         Assert.False(sandbox.Disposed);
 
@@ -112,7 +118,8 @@ public sealed class ClaudeSessionLifecycleTests
         var sandbox = new RecordingSandbox("worker-vm-3");
 
         var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         await lifecycle.DisposeAsync();
         await lifecycle.DisposeAsync(); // second call is a no-op
@@ -128,7 +135,8 @@ public sealed class ClaudeSessionLifecycleTests
         var sandbox = new RecordingSandbox("worker-vm-4");
 
         await using var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         await lifecycle.SendTurnAsync("first", CancellationToken.None, stdoutChunkCallback: null);
         await lifecycle.SuspendAsync(CancellationToken.None);
@@ -147,7 +155,8 @@ public sealed class ClaudeSessionLifecycleTests
         var sandbox = new RecordingSandbox("worker-vm-5");
 
         var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         await lifecycle.DisposeAsync();
 
@@ -165,7 +174,8 @@ public sealed class ClaudeSessionLifecycleTests
         var sandbox = new RecordingSandbox("worker-vm-6");
 
         await using var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: null, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         Assert.False(lifecycle.FirstTurnComplete);
         await lifecycle.SendTurnAsync("first", CancellationToken.None, stdoutChunkCallback: null);
@@ -196,7 +206,8 @@ public sealed class ClaudeSessionLifecycleTests
         }
 
         await using var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
-            worker, handleSnapshot: Snapshot, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
+            worker, handleSnapshot: Snapshot, sandbox, "/work", credential: null, modelId: null, reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value, projectId: null, agentClassMember: null, ct: CancellationToken.None);
 
         // The lifecycle no longer hardcodes the Claude-specific metadata
         // key — callers pass the key their runner stamps under. Provider
@@ -206,6 +217,103 @@ public sealed class ClaudeSessionLifecycleTests
         Assert.Null(lifecycle.GetSessionIdFromMetadata(claudeKey));
         await lifecycle.SendTurnAsync("first", CancellationToken.None, stdoutChunkCallback: null);
         Assert.Equal("cli-sess-fake-1", lifecycle.GetSessionIdFromMetadata(claudeKey));
+    }
+
+    [Fact]
+    public async Task OpenAsync_WhenRunnerOpenFails_DisposesProvisionedSandbox()
+    {
+        var worker = new FakeSessionRunner(failOpen: true);
+        var sandbox = new RecordingSandbox("worker-vm-open-fail");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ClaudeSessionLifecycle.OpenAsync(
+                worker,
+                handleSnapshot: null,
+                sandbox,
+                "/work",
+                credential: null,
+                modelId: null,
+                reasoningMode: null,
+                openedAgentRouteKey: AgentKind.Claude.Value,
+                projectId: null,
+                agentClassMember: null,
+                ct: CancellationToken.None));
+
+        Assert.Equal("open failed", ex.Message);
+        Assert.True(sandbox.Disposed);
+    }
+
+    [Fact]
+    public async Task GetSandboxAsync_WhenResumeMarksFallback_ClosesAndRequiresFreshSandbox()
+    {
+        var worker = new FakeSessionRunner(disposeSandboxOnClose: true)
+        {
+            MarkFallbackOnResume = true,
+        };
+        var sandbox = new RecordingSandbox("worker-vm-resume-degrade");
+        worker.SandboxToDisposeOnClose = sandbox;
+
+        AgentSessionHandle Snapshot(AgentSessionHandle h)
+        {
+            if (!worker.FallbackMarked)
+                return h;
+
+            var metadata = h.Metadata is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(h.Metadata, StringComparer.Ordinal);
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+            return h with { Metadata = metadata };
+        }
+
+        var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+            worker,
+            handleSnapshot: Snapshot,
+            sandbox,
+            "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value,
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
+
+        await lifecycle.SendTurnAsync("first", CancellationToken.None, stdoutChunkCallback: null);
+        await lifecycle.SuspendAsync(CancellationToken.None);
+
+        await Assert.ThrowsAsync<AgentSessionDegradedException>(() =>
+            lifecycle.GetSandboxAsync(CancellationToken.None));
+
+        Assert.True(lifecycle.IsClosed);
+        Assert.True(sandbox.Disposed);
+        Assert.Equal(1, worker.CloseCalls);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhenCloseFails_DoesNotMarkClosed_AndCanRetry()
+    {
+        var worker = new FakeSessionRunner(closeFailures: 1);
+        var sandbox = new RecordingSandbox("worker-vm-close-retry");
+
+        var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
+            worker,
+            handleSnapshot: null,
+            sandbox,
+            "/work",
+            credential: null,
+            modelId: null,
+            reasoningMode: null,
+            openedAgentRouteKey: AgentKind.Claude.Value,
+            projectId: null,
+            agentClassMember: null,
+            ct: CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await lifecycle.DisposeAsync());
+        Assert.False(lifecycle.IsClosed);
+
+        await lifecycle.DisposeAsync();
+        Assert.True(lifecycle.IsClosed);
+        Assert.Equal(2, worker.CloseCalls);
     }
 
     // ─── test doubles ─────────────────────────────────────────────────────
@@ -219,9 +327,16 @@ public sealed class ClaudeSessionLifecycleTests
     private sealed class FakeSessionRunner : ISessionAgentRunner
     {
         private readonly bool _disposeSandboxOnClose;
-        public FakeSessionRunner(bool disposeSandboxOnClose = false)
+        private readonly bool _failOpen;
+        private int _closeFailuresRemaining;
+        public FakeSessionRunner(
+            bool disposeSandboxOnClose = false,
+            bool failOpen = false,
+            int closeFailures = 0)
         {
             _disposeSandboxOnClose = disposeSandboxOnClose;
+            _failOpen = failOpen;
+            _closeFailuresRemaining = closeFailures;
         }
         public AgentKind Kind => AgentKind.Claude;
         public int OpenedSessions;
@@ -231,8 +346,11 @@ public sealed class ClaudeSessionLifecycleTests
         public int CloseCalls;
         public string? OpenedHandleId;
         public string? LastHandleIdOnTurn;
+        public bool MarkFallbackOnResume { get; set; }
+        public bool FallbackMarked { get; private set; }
         public RecordingSandbox? SandboxToDisposeOnClose { get; set; }
         public ConcurrentQueue<string> PromptsSent { get; } = new();
+        public ConcurrentQueue<string> HandleIdsObserved { get; } = new();
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential,
@@ -247,6 +365,8 @@ public sealed class ClaudeSessionLifecycleTests
             ISandbox sandbox, string workingDirectory, AgentCredential? credential,
             string? modelId = null, string? reasoningMode = null, CancellationToken ct = default)
         {
+            if (_failOpen)
+                throw new InvalidOperationException("open failed");
             OpenedSessions++;
             var handleId = $"claude-session-{OpenedSessions}";
             OpenedHandleId = handleId;
@@ -265,6 +385,7 @@ public sealed class ClaudeSessionLifecycleTests
         {
             SendTurns++;
             LastHandleIdOnTurn = sessionHandle.SessionId;
+            HandleIdsObserved.Enqueue(sessionHandle.SessionId);
             PromptsSent.Enqueue(prompt);
             return Task.FromResult(new AgentResult(true, "ok", null, null));
         }
@@ -278,12 +399,19 @@ public sealed class ClaudeSessionLifecycleTests
         public Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         {
             ResumeCalls++;
+            if (MarkFallbackOnResume)
+                FallbackMarked = true;
             return Task.CompletedTask;
         }
 
         public async Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default)
         {
             CloseCalls++;
+            if (_closeFailuresRemaining > 0)
+            {
+                _closeFailuresRemaining--;
+                throw new InvalidOperationException("close failed");
+            }
             if (_disposeSandboxOnClose && SandboxToDisposeOnClose is not null)
                 await SandboxToDisposeOnClose.DisposeAsync();
         }

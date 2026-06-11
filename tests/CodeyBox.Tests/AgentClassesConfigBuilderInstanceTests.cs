@@ -115,6 +115,39 @@ public sealed class AgentClassesConfigBuilderInstanceTests
     }
 
     [Fact]
+    public void Build_PreservesClaudeSessionClassAndMemberSettings()
+    {
+        var classes = new List<AgentClassOptions>
+        {
+            new()
+            {
+                Id = "frontier",
+                ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = true },
+                Members =
+                {
+                    new AgentMembershipOptions
+                    {
+                        Agent = "claude",
+                        QualityScore = 100,
+                    },
+                    new AgentMembershipOptions
+                    {
+                        Agent = "codex",
+                        QualityScore = 90,
+                        ClaudeSession = new AgentClassClaudeSessionOptions { Enabled = false },
+                    },
+                },
+            },
+        };
+
+        var catalog = AgentClassesConfigBuilder.Build(classes, NullLogger.Instance);
+
+        Assert.True(catalog[0].ClaudeSession?.Enabled);
+        Assert.Null(catalog[0].Members[0].ClaudeSession);
+        Assert.False(catalog[0].Members[1].ClaudeSession?.Enabled);
+    }
+
+    [Fact]
     public void Build_RejectsFullRouteKeyWhosePrefixDoesNotMatchAgent()
     {
         var classes = new List<AgentClassOptions>

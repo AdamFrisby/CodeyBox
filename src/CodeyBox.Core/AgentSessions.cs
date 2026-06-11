@@ -36,6 +36,36 @@ public sealed record AgentSessionHandle(
     IReadOnlyDictionary<string, string>? Metadata = null);
 
 /// <summary>
+/// Provider-neutral context for opening a scoped session. Concrete runners may
+/// use the project/member hints to resolve transport or quota sub-pools, while
+/// generic orchestration code still depends only on Core abstractions.
+/// </summary>
+public sealed record AgentSessionOpenRequest(
+    ISandbox Sandbox,
+    string WorkingDirectory,
+    AgentCredential? Credential,
+    string? ModelId = null,
+    string? ReasoningMode = null,
+    string? ProjectId = null,
+    string? AgentClassMember = null);
+
+/// <summary>Common metadata keys understood by generic session orchestration.</summary>
+public static class AgentSessionMetadataKeys
+{
+    /// <summary>
+    /// Set to <c>true</c> by a runner when the current session can no longer be
+    /// safely resumed and the caller should close it and fall back to a fresh
+    /// one-shot sandbox path.
+    /// </summary>
+    public const string FallbackToOneShot = "session.fallbackToOneShot";
+
+    public static bool IsFallbackToOneShot(IReadOnlyDictionary<string, string>? metadata) =>
+        metadata is not null
+        && metadata.TryGetValue(FallbackToOneShot, out var value)
+        && string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
 /// Optional runner capability for logical sessions that span multiple turns.
 /// Session-capable runners can keep model conversation context and provider
 /// prompt-cache identity across work, audit, and rework phases while the
@@ -63,6 +93,18 @@ public interface ISessionAgentRunner : IAgentRunner
     Task ResumeSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default);
 
     Task CloseSessionAsync(AgentSessionHandle sessionHandle, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Optional extension for session runners that can use project/member context
+/// when opening a session. The base <see cref="ISessionAgentRunner"/> contract
+/// stays context-free for providers that do not need scoped dispatch hints.
+/// </summary>
+public interface IScopedSessionAgentRunner : ISessionAgentRunner
+{
+    Task<AgentSessionHandle> OpenSessionAsync(
+        AgentSessionOpenRequest request,
+        CancellationToken ct = default);
 }
 
 /// <summary>

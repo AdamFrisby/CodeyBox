@@ -3980,7 +3980,17 @@ namespace CodeyBox.Api
     {
         public string Id { get; set; } = string.Empty;
         public string DisplayName { get; set; } = string.Empty;
+        /// <summary>
+        /// Optional class-level opt-in for the Claude resumable-session worker.
+        /// Per-member settings override this value.
+        /// </summary>
+        public AgentClassClaudeSessionOptions? ClaudeSession { get; set; }
         public List<AgentMembershipOptions> Members { get; set; } = [];
+    }
+
+    public sealed class AgentClassClaudeSessionOptions
+    {
+        public bool? Enabled { get; set; }
     }
 
     /// <summary>Config binding for a reusable routable agent instance.</summary>
@@ -4055,6 +4065,11 @@ namespace CodeyBox.Api
         /// docs/agent-classes.md for the recommended tag vocabulary.
         /// </summary>
         public List<string> Capabilities { get; set; } = [];
+        /// <summary>
+        /// Optional member-level override for the Claude resumable-session
+        /// worker. Null inherits the containing class setting.
+        /// </summary>
+        public AgentClassClaudeSessionOptions? ClaudeSession { get; set; }
     }
 
     /// <summary>Quota router tuning. Bound from CodeyBox:QuotaRouter.</summary>

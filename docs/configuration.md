@@ -321,6 +321,11 @@ values, `QualityScore` present and in 0–200, Gemini members with
 `Subscription` members emits a warning. `Capabilities` is optional; the
 builder de-dupes case-insensitively and trims whitespace.
 
+`ClaudeSession.Enabled` may be set on an agent class or on an individual
+member. For class-routed Claude work items, this class/member opt-in composes
+with the global `CodeyBox:ClaudeSession:Enabled` switch and the per-project
+`ClaudeSession.Enabled` flag; member settings override the class setting.
+
 ---
 
 ## `AgentScoreModifiers`

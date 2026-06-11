@@ -45,7 +45,7 @@ namespace CodeyBox.Agents.Claude;
 /// global <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>) regardless
 /// of which transport is in use.</para>
 /// </summary>
-public sealed class ClaudeSessionWorker : ISessionAgentRunner
+public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner
 {
     /// <summary>
     /// Metadata key under <see cref="AgentSessionHandle.Metadata"/> carrying
@@ -203,6 +203,23 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
         CancellationToken ct = default)
         => OpenSessionAsync(sandbox, workingDirectory, credential, modelId, reasoningMode,
             projectId: null, agentClassMember: null, ct: ct);
+
+    /// <inheritdoc/>
+    public Task<AgentSessionHandle> OpenSessionAsync(
+        AgentSessionOpenRequest request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return OpenSessionAsync(
+            request.Sandbox,
+            request.WorkingDirectory,
+            request.Credential,
+            request.ModelId,
+            request.ReasoningMode,
+            request.ProjectId,
+            request.AgentClassMember,
+            ct);
+    }
 
     /// <summary>
     /// Override for callers that know the dispatch context. <paramref name="projectId"/> and
@@ -439,6 +456,8 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             try { await state.TransportSession.DisposeAsync().ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
             catch { /* Transport teardown must not strand */ }
+            if (state.Sandbox is IPreserveOnDisposeSandbox preserveOnDispose)
+                preserveOnDispose.DisablePreserveOnDispose();
             await state.Sandbox.DisposeAsync().ConfigureAwait(false);
             state.Closed = true;
             _closedSessions[sessionHandle.SessionId] = 0;
@@ -474,9 +493,15 @@ public sealed class ClaudeSessionWorker : ISessionAgentRunner
             metadata.Remove(CliSessionIdMetadataKey);
 
         if (state.FallbackToFresh)
+        {
             metadata[FallbackMetadataKey] = "true";
+            metadata[AgentSessionMetadataKeys.FallbackToOneShot] = "true";
+        }
         else
+        {
             metadata.Remove(FallbackMetadataKey);
+            metadata.Remove(AgentSessionMetadataKeys.FallbackToOneShot);
+        }
 
         if (state.DegradedFromAcp)
             metadata[AcpFallbackToPrintMetadataKey] = "true";

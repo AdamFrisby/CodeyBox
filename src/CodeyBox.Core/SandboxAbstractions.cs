@@ -133,6 +133,17 @@ public interface IPreemptibleSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional capability for sandbox implementations whose preserve/recovery
+/// operations make later <see cref="IAsyncDisposable.DisposeAsync"/> a no-op.
+/// Terminal cleanup calls this before disposing when it must destroy the
+/// sandbox even after a previous stop/preserve.
+/// </summary>
+public interface IPreserveOnDisposeSandbox : ISandbox
+{
+    void DisablePreserveOnDispose();
+}
+
+/// <summary>
 /// Optional sandbox capability for live sandboxes that participate in the
 /// orchestrator's graceful shutdown teardown sweep. The marker lets the normal
 /// phase runner detect that shutdown teardown has already become authoritative

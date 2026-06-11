@@ -169,7 +169,7 @@ VM's disk so conversation context is preserved regardless.
 
 The worker is OFF by default — the existing one-shot `ClaudeAgentRunner`
 remains the registered `IAgentRunner` for Claude until config opts an item
-in. **All three** of the following gates must be true before a work item
+in. The following dispatch gates must be true before a work item
 takes the session path; any one of them off keeps the legacy
 independent-phase pipeline (fresh sandbox per work / rework call, no
 `--resume`, no shared VM across phases):
@@ -178,8 +178,9 @@ independent-phase pipeline (fresh sandbox per work / rework call, no
 |------|-------|---------|-------------|
 | Global flag | `CodeyBox:ClaudeSession:Enabled` | `false` | Master switch. When false, Claude work items always use the one-shot path. |
 | Per-project flag | `CodeyBox:Projects:<id>:ClaudeSession:Enabled` | `false` | Per-project opt-in. Unset projects keep the legacy pipeline even with the global flag on. |
+| Class/member flag | `CodeyBox:AgentClasses:<idx>:ClaudeSession:Enabled` or `Members:<idx>:ClaudeSession:Enabled` | unset / `false` | Required for class-routed items. Member settings override the class setting, so one Claude member can use sessions while another stays legacy. Direct non-class Claude items are controlled by the project flag. |
 | Agent kind | item's effective `Agent` | — | Must resolve to `claude`. The session worker is Claude-only. |
-| Metrics knob | `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Emit per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
+| Metrics knob | `CodeyBox:ClaudeSession:EmitTurnMetrics` | `true` | Not a dispatch gate; emits per-turn cache_read vs fresh-input metrics via `IClaudeSessionMetricsSink`. |
 
 **Transport configuration keys** (independent of the gate set above —
 these select how each turn is delivered once the session path is in
@@ -226,11 +227,23 @@ metered pool.
 {
   "CodeyBox": {
     "ClaudeSession": { "Enabled": true },
+    "AgentClasses": [
+      {
+        "Id": "frontier-session",
+        "DisplayName": "Frontier coding with Claude sessions",
+        "ClaudeSession": { "Enabled": true },
+        "Members": [
+          { "Agent": "claude", "Billing": "Subscription", "ModelId": "claude-opus-4-7", "QualityScore": 100 },
+          { "Agent": "codex", "Billing": "Subscription", "ModelId": "gpt-5.5", "QualityScore": 100 }
+        ]
+      }
+    ],
     "Projects": [
       {
         "Id": "my-project",
         "RepositoryUrl": "https://github.com/me/repo.git",
         "Agent": "claude",
+        "DefaultAgentClass": "frontier-session",
         "ClaudeSession": { "Enabled": true }
       },
       {
