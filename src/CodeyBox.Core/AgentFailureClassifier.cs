@@ -109,8 +109,9 @@ public static class AgentFailureClassifier
     /// a work-related failure (failed tests, refused task, malformed output).
     ///
     /// <para>
-    /// Order of checks is fixed: quota first (so a 429 in stderr is never
-    /// stolen by a generic "connection reset" hint somewhere else in the
+    /// Order of checks is fixed: prerequisite materialisation and exit-127
+    /// sandbox provisioning failures first, then quota (so a 429 in stderr is
+    /// never stolen by a generic "connection reset" hint somewhere else in the
     /// payload), then auth, then network. Never throws.
     /// </para>
     /// </summary>
@@ -153,10 +154,26 @@ public static class AgentFailureClassifier
             return false;
 
         var trimmed = summary.Trim();
-        return string.Equals(trimmed, "agent exited 127", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(trimmed, "exit 127", StringComparison.OrdinalIgnoreCase)
-            || trimmed.StartsWith("agent exited 127:", StringComparison.OrdinalIgnoreCase)
-            || trimmed.StartsWith("exit 127:", StringComparison.OrdinalIgnoreCase);
+        return ContainsExit127Shape(trimmed, "agent exited 127")
+            || ContainsExit127Shape(trimmed, "exit 127");
+    }
+
+    private static bool ContainsExit127Shape(string haystack, string needle)
+    {
+        var index = -1;
+        while ((index = haystack.IndexOf(needle, index + 1, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            if (index > 0 && char.IsLetterOrDigit(haystack[index - 1]))
+                continue;
+
+            var after = index + needle.Length;
+            if (after < haystack.Length && char.IsLetterOrDigit(haystack[after]))
+                continue;
+
+            return true;
+        }
+
+        return false;
     }
 
     private static bool ContainsAny(string? haystack, IReadOnlyList<string> needles)

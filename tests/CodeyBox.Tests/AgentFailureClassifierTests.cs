@@ -66,10 +66,32 @@ public sealed class AgentFailureClassifierTests
     [InlineData("agent exited 127", "bash: codex: command not found")]
     [InlineData("agent exited 127", "")]
     [InlineData("exit 127", "command not found")]
+    [InlineData("agentic conflict resolution failed: agent exited 127 (attempts: codex#1(agent exited 127))", "env: 'codex': No such file or directory")]
     public void Exit127BinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
     {
         var c = AgentFailureClassifier.Classify(stderr: stderr, summary: summary);
         Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void Exit127BinaryLaunchFailure_InStdout_Classified_AsInfrastructure()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: "bash: codex: command not found",
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void Exit127NonBinaryFailure_RemainsNormal()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: "ENOENT: no such file foo.txt",
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
     }
 
     [Theory]
