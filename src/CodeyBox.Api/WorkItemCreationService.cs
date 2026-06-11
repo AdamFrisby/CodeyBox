@@ -273,10 +273,13 @@ internal sealed class WorkItemCreationService
         var jobType = JobType.Normal;
         CheckAndActSpec? checkSpec = null;
         AgentControlSpec? agentControlSpec = null;
+        var isRefactor = req.IsRefactor == true;
         if (req.Check is not null)
         {
             if (req.AgentControl is not null)
                 return Error("check and agentControl cannot both be provided");
+            if (isRefactor)
+                return Error("check and isRefactor cannot both be provided");
 
             var check = req.Check;
             if (string.IsNullOrWhiteSpace(check.Question))
@@ -339,6 +342,8 @@ internal sealed class WorkItemCreationService
         }
         else if (req.AgentControl is not null)
         {
+            if (isRefactor)
+                return Error("agentControl and isRefactor cannot both be provided");
             var control = req.AgentControl;
             if (string.IsNullOrWhiteSpace(control.Agent))
                 return Error("agentControl.agent is required");
@@ -381,6 +386,10 @@ internal sealed class WorkItemCreationService
                 ExpiresAt = control.ExpiresAt,
             };
             jobType = JobType.AgentControl;
+        }
+        else if (isRefactor)
+        {
+            jobType = JobType.Refactor;
         }
 
         var item = new WorkItem

@@ -91,6 +91,14 @@ Queue a new work item.
   "durationSeconds": 21600 }`. `reason` is required for `pause`; use either
   `durationSeconds` or an absolute `expiresAt`, not both. `agentControl`
   cannot be combined with `check`.
+* `isRefactor` — optional boolean. When `true`, the item is created with
+  `jobType: "Refactor"` and runs the same work → audit → merge → upstream
+  pipeline as a Normal item but the dispatcher treats it as project-
+  exclusive: it only starts when the project has zero other in-flight
+  items, and while it runs no other item for the project may start. Mutually
+  exclusive with `check` and `agentControl`. See
+  [`work-items.md`](work-items.md#refactor-work-items) for full dispatch
+  semantics.
 
 Response: `201 Created` with the work item record.
 

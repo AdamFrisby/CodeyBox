@@ -1790,6 +1790,44 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 await budgetLock.WaitAsync(ct);
                 try
                 {
+                    // Refactor project-exclusivity gate. Reads the same in-flight
+                    // population CountInFlightAsync sees, then partitions by JobType
+                    // so we can answer two questions atomically:
+                    //   - a Refactor item only starts when its project has zero
+                    //     in-flight items (refactor or otherwise),
+                    //   - a non-Refactor item defers while any Refactor is in
+                    //     flight for the same project.
+                    // The check runs INSIDE the per-project budget lock so a
+                    // concurrent worker for the same project cannot pass and
+                    // commit StartedAt between our split-read and our deferral
+                    // decision. Other projects' in-flight counts are not touched
+                    // — the gate is strictly project-scoped, so refactor work in
+                    // project X does not block work in project Y.
+                    var (refactorInFlight, otherInFlight) =
+                        await _store.CountInFlightSplitByRefactorAsync(item.ProjectId, ct);
+                    var refactorRecheck =
+                        _budgetDeferralRecheck?.Current.RefactorExclusivityRecheck
+                        ?? TimeSpan.FromMinutes(1);
+                    if (item.JobType == JobType.Refactor)
+                    {
+                        if (refactorInFlight > 0 || otherInFlight > 0)
+                        {
+                            var reason = refactorInFlight > 0
+                                ? $"refactor exclusivity: another refactor is in flight for project '{item.ProjectId.Value}' (refactor={refactorInFlight}, other={otherInFlight})"
+                                : $"refactor exclusivity: project '{item.ProjectId.Value}' has {otherInFlight} in-flight non-refactor item(s); refactor waits for the project to drain";
+                            AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
+                            ScheduleDeferredRequeue(item.Id, refactorRecheck, ct);
+                            return;
+                        }
+                    }
+                    else if (refactorInFlight > 0)
+                    {
+                        var reason = $"refactor exclusivity: a refactor is in flight for project '{item.ProjectId.Value}'; non-refactor items wait until it completes";
+                        AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
+                        ScheduleDeferredRequeue(item.Id, refactorRecheck, ct);
+                        return;
+                    }
+
                     var deferReason = await CheckBudgetAsync(item, project.Budget, ct);
                     if (deferReason is not null)
                     {

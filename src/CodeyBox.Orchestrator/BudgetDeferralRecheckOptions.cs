@@ -32,6 +32,15 @@ public sealed class BudgetDeferralRecheckOptions
     /// Default 60 seconds.
     /// </summary>
     public TimeSpan ConcurrentLimitRecheck { get; set; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Recheck interval for items deferred by the per-project refactor
+    /// exclusivity gate. Refactor items wait for their project to drain;
+    /// non-refactor items wait while a refactor is in flight. Default 60
+    /// seconds — same cadence as the concurrent-cap deferral, since both gate
+    /// on in-flight count changes.
+    /// </summary>
+    public TimeSpan RefactorExclusivityRecheck { get; set; } = TimeSpan.FromMinutes(1);
 }
 
 /// <summary>

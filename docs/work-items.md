@@ -529,6 +529,70 @@ must not strand the follow-up.
 
 ---
 
+## Refactor work items
+
+A *refactor* work item is a `JobType` flag that runs the same
+work → audit → merge → upstream pipeline as a `Normal` item, but the
+dispatcher treats it as **project-exclusive**: refactors touch broad surface
+area and would conflict badly with concurrent work in the same project, so
+the orchestrator gates them at pickup time.
+
+### Dispatch rules
+
+For each project independently:
+
+1. A refactor item only STARTS once the project has **zero other in-flight
+   work items** (any non-terminal, actively-running state — `Working`,
+   `Auditing`, `Reworking`, `Merging`, etc.).
+2. While a refactor item is in flight for a project, **no other work item
+   for that project may start** — the refactor holds an exclusive
+   project-scoped lock.
+3. Refactors are themselves mutually exclusive per project: only one
+   refactor can be in flight per project at a time.
+
+The gate is strictly project-scoped: a refactor on project X does not
+delay anything in project Y. Items that would otherwise dispatch are
+*deferred* (not failed), and re-enqueued automatically once the gate
+opens; this matches the existing per-project budget-cap deferral pattern.
+
+The recheck interval is configurable via
+`CodeyBox:BudgetDeferralRecheck:RefactorExclusivityRecheck` (default
+60 seconds).
+
+### Creating a refactor item
+
+Add `"isRefactor": true` to the `POST /workitems` payload. The flag is
+mutually exclusive with the `check` and `agentControl` blocks (the API
+returns `400` if more than one is supplied):
+
+```json
+POST /workitems
+{
+  "projectId": "my-app",
+  "title":     "Rename FooService → BarService throughout the codebase",
+  "prompt":    "Rename the FooService class and all references…",
+  "isRefactor": true
+}
+```
+
+The returned work-item DTO reports `"jobType": "Refactor"` and behaves
+identically to a Normal item in every later phase — same audit profile,
+same merge path, same upstream push. The only difference is the
+dispatch-time exclusivity gate.
+
+### Anti-starvation
+
+A refactor can in principle sit deferred indefinitely if the project
+never drains. Anti-starvation policy (e.g. quiescing new pickups to let
+a refactor through) is intentionally out of scope for the gate itself
+and will be tracked as a separate follow-up. Until that ships,
+operators that want a refactor to land on a busy project should pause
+the project queue (`POST /projects/{id}/pause`) until the in-flight
+items finish, then unpause; the refactor will pick up at the next
+dispatch tick.
+
+---
+
 ## Editing dependencies post-hoc
 
 `dependsOn` is editable via `PATCH /workitems/{id}` with replace-set
