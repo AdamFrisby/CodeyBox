@@ -1391,7 +1391,12 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         WorkerProgressActivityProbe probe,
         string? requiredReason = null)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
+        // Polling deadline is generous (10s) because the underlying signal
+        // for "process-cpu" relies on the replacement process accumulating
+        // observable utime/stime between samples; under loaded CI the
+        // nice-19 busy process can be starved long enough that a 2-second
+        // deadline races the scheduler.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
         WorkerProgressActivity? last = null;
         while (DateTimeOffset.UtcNow < deadline)
         {

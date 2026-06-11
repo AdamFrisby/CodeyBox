@@ -2023,6 +2023,7 @@ builder.Services.AddSingleton(sp =>
 builder.Services.AddSingleton<IAgentStreamParser, AntigravityStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, CopilotStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();

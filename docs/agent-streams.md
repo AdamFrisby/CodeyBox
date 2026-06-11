@@ -139,19 +139,33 @@ for every line — their on-wire event shapes are byte-identical to Claude's,
 so claiming by shape would mis-attribute real Claude streams. Attribution for
 those two agents instead comes from the cost row (phase-matched, recorded by
 the orchestrator at dispatch) and the work item's declared agent. The
-production registration order is `antigravity, claude, codex, cursor,
-gemini, opencode, unknown`; a parser-collision regression test pins the
-expected sniff outcome.
+production registration order is `antigravity, claude, codex, copilot,
+cursor, gemini, opencode, unknown`; a parser-collision regression test
+pins the expected sniff outcome. `CopilotStreamParser` and
+`OpencodeStreamParser` follow the same "claims nothing by shape" rule —
+their CLIs emit plaintext, so attribution comes from the work-item's
+declared agent kind and the plaintext-fallback path produces the row.
 
 ### Stderr capture
 
-For agents that emit structured stream-json, the capture file is stdout only
-— interleaving stderr would corrupt NDJSON framing when chunk boundaries
-race across threads. For plaintext-fallback runs (no structured mode
-requested), the runner tees stderr into the same callback so the captured
-file carries diagnostics too (CLI banners, OAuth refresh chatter, error
-text). The plaintext summariser's `errors=` count reflects the merged
-stream.
+For plaintext-fallback runs the runner tees stderr verbatim into the same
+callback so the captured file carries diagnostics (CLI banners, OAuth
+refresh chatter, error text); the plaintext summariser's `errors=` count
+reflects the merged stream.
+
+For agents that emit structured stream-json, the runner line-buffers
+stderr until the next newline and then wraps each complete line in a
+single-line JSON envelope of the form
+`{"type":"codeybox.stderr","text":"<line>"}` before forwarding it through
+the same callback. The envelope keeps stderr visible in the captured
+.jsonl (so auth/usage diagnostics that fire BEFORE any structured event
+is emitted — the failure mode that produced the antigravity
+observability black hole — are recoverable from post-mortem inspection)
+without ever interleaving non-JSON noise into the file. Provider parsers
+ignore `codeybox.stderr` because it is not in their recognised event
+vocabulary; when no real structured event is recognised, the run falls
+through to the plaintext summariser whose `errors=` count and tail
+naturally surface the envelope lines.
 
 ### Tool-Auditor Files
 

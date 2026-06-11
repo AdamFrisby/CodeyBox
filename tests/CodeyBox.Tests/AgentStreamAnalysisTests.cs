@@ -1228,6 +1228,98 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ClaudeShapedCursorRun_PersistsRowAsCursor()
+    {
+        // End-to-end persistence test for shared-shape attribution.
+        // Cursor CLI emits literal Claude-shape NDJSON when --output-format
+        // stream-json is set. The sniffer therefore returns AgentKind.Claude
+        // for a Cursor-dispatched run; AgentStreamParserSelection.ResolveKind
+        // is responsible for re-attributing the run to AgentKind.Cursor using
+        // the work item's declared agent (and/or a cost-row override). This
+        // test runs the full AnalyzeRecentTerminalWorkItemsAsync path on a
+        // realistic Cursor-dispatched, Claude-shaped capture and asserts the
+        // persisted agent_stream_summaries row carries AgentKind.Cursor with
+        // a real parsed summary (tool calls + final assistant message),
+        // catching regressions to either ResolveKind or the parser selection
+        // that would put the row back under AgentKind.Claude.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Cursor };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a.ts"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"t1","content":"ok"}
+            {"type":"result","timestamp":"2026-01-01T00:00:02Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":12,"output_tokens":3}}
+            """);
+
+        var service = new StreamAnalysisService(
+            _workItems,
+            _streams,
+            _summaries,
+            [new ClaudeStreamParser(), new CursorStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        // Attribution: the row MUST carry AgentKind.Cursor even though the
+        // on-wire shape is Claude. A regression that drops the shared-shape
+        // override would land this as AgentKind.Claude.
+        Assert.Equal(AgentKind.Cursor, row.AgentKind);
+        // Parsed summary content: the resolver picks the Claude parser to
+        // actually read the events (since Cursor parses through the same
+        // shape); verify a real round-tripped summary, not an Unsupported
+        // shell or a plaintext-fallback header.
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.Equal("done", row.Summary.FinalAssistantMessage);
+        var tool = Assert.Single(row.Summary.ToolCalls);
+        Assert.Equal("Read", tool.ToolName);
+        Assert.Equal(12, row.Summary.InputTokens);
+        Assert.Equal(3, row.Summary.OutputTokens);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ClaudeShapedAntigravityRun_PersistsRowAsAntigravity()
+    {
+        // Companion to the Cursor case above: agy (Antigravity) is a
+        // multi-model gateway whose claude-* gateway models emit literal
+        // Anthropic stream-json. A Claude-sniffed run dispatched to
+        // Antigravity must persist as AgentKind.Antigravity, not Claude.
+        // This is the original observability failure mode (an empty agy
+        // rework looked like Claude in the summary table), so a fresh
+        // regression here would be the highest-impact symptom we can
+        // protect against.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Antigravity };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "rework-2-abcdef.jsonl", """
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Edit","input":{"path":"b.ts"}}]}}
+            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"a1","content":"ok"}
+            {"type":"result","timestamp":"2026-01-01T00:00:02Z","result":"applied","usage":{"input_tokens":8,"output_tokens":4}}
+            """);
+
+        var service = new StreamAnalysisService(
+            _workItems,
+            _streams,
+            _summaries,
+            [new AntigravityStreamParser(), new ClaudeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        // Attribution: the row MUST carry AgentKind.Antigravity, not Claude.
+        Assert.Equal(AgentKind.Antigravity, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.Equal("applied", row.Summary.FinalAssistantMessage);
+        var tool = Assert.Single(row.Summary.ToolCalls);
+        Assert.Equal("Edit", tool.ToolName);
+        Assert.Equal(8, row.Summary.InputTokens);
+        Assert.Equal(4, row.Summary.OutputTokens);
+    }
+
+    [Fact]
     public async Task AnalyzeRecentTerminalWorkItemsAsync_PropagatesStreamAnalysisFailures()
     {
         var item = CreateItem(WorkItemState.Done);
