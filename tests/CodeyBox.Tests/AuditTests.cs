@@ -19,6 +19,23 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public void Registry_OrdersDeclaredShortCircuitAuditorsFirst()
+    {
+        var first = new FakeAuditor("first", AuditCapabilities.None, _ => new(true, []));
+        var gate = new FakeAuditor(
+            "gate",
+            AuditCapabilities.None,
+            _ => new(true, []),
+            canShortCircuitOnBlockingFinding: true);
+
+        var reg = new AuditorRegistry([first, gate]);
+
+        Assert.Collection(reg.All,
+            a => Assert.Equal("gate", a.Name),
+            a => Assert.Equal("first", a.Name));
+    }
+
+    [Fact]
     public void ReworkPromptBuilder_GroupsByAuditorAndIncludesOriginal()
     {
         var findings = new[]
@@ -497,15 +514,21 @@ public sealed class AuditTests
     private sealed class FakeAuditor : IAuditor
     {
         private readonly Func<AuditContext, AuditResult> _impl;
-        public FakeAuditor(string name, AuditCapabilities required, Func<AuditContext, AuditResult> impl)
+        public FakeAuditor(
+            string name,
+            AuditCapabilities required,
+            Func<AuditContext, AuditResult> impl,
+            bool canShortCircuitOnBlockingFinding = false)
         {
             Name = name;
             Required = required;
             _impl = impl;
+            CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding;
         }
         public string Name { get; }
         public string Kind => "tool";
         public AuditCapabilities Required { get; }
+        public bool CanShortCircuitOnBlockingFinding { get; }
         public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ctx, CancellationToken ___ = default)
             => Task.FromResult(_impl(ctx));
     }

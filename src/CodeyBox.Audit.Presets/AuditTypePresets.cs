@@ -38,7 +38,7 @@ internal static class AuditTypePresets
         {
             if (string.IsNullOrWhiteSpace(a.Script))
             {
-                auditors.Add(Shell(a.Name, [.. a.Argv]));
+                auditors.Add(Shell(a.Name, a.CanShortCircuitOnBlockingFinding, [.. a.Argv]));
             }
             else
             {
@@ -51,6 +51,7 @@ internal static class AuditTypePresets
                     Argv = ["sh", "-c", a.Script],
                     ToolName = a.ToolName,
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
+                    CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                 }));
             }
         }
@@ -91,8 +92,13 @@ internal static class AuditTypePresets
             FrameTemplate = frameTemplate,
         });
 
-    private static IAuditor Shell(string name, params string[] argv)
-        => new ShellCommandAuditor(new ShellCommandAuditorOptions { Name = name, Argv = argv });
+    private static IAuditor Shell(string name, bool canShortCircuitOnBlockingFinding, params string[] argv)
+        => new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = name,
+            Argv = argv,
+            CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
+        });
 }
 
 /// <summary>

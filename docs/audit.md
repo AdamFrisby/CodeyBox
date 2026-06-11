@@ -262,6 +262,11 @@ re-queue the work item with a clearer prompt or merge by hand.
   returns a blocking finding. Useful when expensive LLM auditors come
   after cheap linters: no point paying for tokens if a linter already
   failed.
+* `CodeyBox:PipelineTuning:AuditShortCircuitEnabled` — global,
+  hot-reloadable switch for declared audit gates. Default `true`. When
+  enabled, auditors with `CanShortCircuitOnBlockingFinding=true` run before
+  the rest; a blocking gate result skips all remaining auditors for that
+  iteration and sends the preserved gate findings to rework.
 
 ## Adding a new auditor
 
@@ -458,15 +463,23 @@ you trade total wall-clock time for reduced concurrent token draw.
 If your rate limit sits between 1× and 3× your per-auditor peak token draw,
 set `MaxLlmAuditorParallelism: 2` rather than dropping all the way to `1`.
 
-### Known limitations
+### Declared Short-Circuit Gates
 
-**`StopOnFirstFailure` within the LLM group**: once parallel execution begins,
-all LLM auditors run to completion before findings are checked against
-`StopOnFirstFailure`. Short-circuiting still works between the tool-auditor
-phase and the LLM-auditor phase (a failing tool auditor still prevents LLM
-auditors from starting), but within the LLM group there is no early exit.
-A project that relies on `StopOnFirstFailure` to cap LLM token spend should
-set `MaxLlmAuditorParallelism: 1` so the sequential short-circuit applies.
+`IAuditor.CanShortCircuitOnBlockingFinding` is a first-class auditor
+capability. When the global `CodeyBox:PipelineTuning:AuditShortCircuitEnabled`
+toggle is `true`, the pipeline runs all declaring auditors before the remaining
+auditors. If any declared gate returns `Passed=false` or an Error finding, the
+pipeline records that gate's report and findings, skips all remaining auditors
+for the iteration, and reworks from those findings.
+
+The built-in C# compile and full-test gates declare this capability:
+`csharp:build-WaE` and `csharp:test-pass`. LLM review auditors do not.
+This is separate from `Kind`; future auditors opt in by returning `true`.
+
+`StopOnFirstFailure` is still available as the older project-level broad
+fail-fast knob. It is order-dependent and, once parallel LLM execution begins,
+all already-started LLM auditors run to completion. Declared short-circuit gates
+avoid that cost by running before LLM fan-out starts.
 
 **Baseline-image baking**: if sandbox baseline images have not been pre-baked,
 parallel LLM auditor clones serialise on the bake step during the first audit

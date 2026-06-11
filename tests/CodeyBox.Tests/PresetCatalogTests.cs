@@ -92,6 +92,18 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void CSharpPreset_DeclaresBuildAndTestAsShortCircuitGates()
+    {
+        var auditors = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .ToDictionary(a => a.Name, StringComparer.Ordinal);
+
+        Assert.False(auditors["csharp:format-check"].CanShortCircuitOnBlockingFinding);
+        Assert.True(auditors["csharp:build-WaE"].CanShortCircuitOnBlockingFinding);
+        Assert.True(auditors["csharp:test-pass"].CanShortCircuitOnBlockingFinding);
+    }
+
+    [Fact]
     public async Task CSharpPreset_TestPassUsesDotnetOutputClassifier()
     {
         var auditor = new PresetCatalog()

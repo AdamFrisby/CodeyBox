@@ -81,6 +81,7 @@ public sealed class ConfiguredAuditor
     public string? Script { get; set; }
     public string? ToolName { get; set; }
     public bool? TreatExit127AsMissingTool { get; set; }
+    public bool CanShortCircuitOnBlockingFinding { get; set; }
 
     public ConfiguredAuditor Clone()
         => new()
@@ -90,6 +91,7 @@ public sealed class ConfiguredAuditor
             Script = Script,
             ToolName = ToolName,
             TreatExit127AsMissingTool = TreatExit127AsMissingTool,
+            CanShortCircuitOnBlockingFinding = CanShortCircuitOnBlockingFinding,
         };
 }
 
