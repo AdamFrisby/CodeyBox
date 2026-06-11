@@ -360,33 +360,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             // attempt without a process restart. Probe-side knobs (cache TTL
             // bound at construction) are NOT reloaded here — they have their
             // own IOptionsMonitor-driven resilience-provider delegate.
-            var src = opts.QuotaRouter;
-            _quotaRouterOptions.MinQuotaPct = src.MinQuotaPct;
-            var windowFloors = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in src.MinQuotaPctByWindow)
-            {
-                if (kv.Value < 0) continue;
-                windowFloors[kv.Key] = kv.Value;
-            }
-            _quotaRouterOptions.MinQuotaPctByWindow = windowFloors;
-            _quotaRouterOptions.StartFloorPct = src.StartFloorPct;
-            _quotaRouterOptions.EndFloorPct = src.EndFloorPct;
-            if (src.RampWindowSeconds > 0)
-                _quotaRouterOptions.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
-            var overrides = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kv in src.RampWindowByAgentSeconds)
-            {
-                if (kv.Value <= 0) continue;
-                overrides[kv.Key] = TimeSpan.FromSeconds(kv.Value);
-            }
-            _quotaRouterOptions.RampWindowByAgent = overrides;
-            _quotaRouterOptions.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
-            _quotaRouterOptions.UnknownPolicy = src.UnknownPolicy;
-            _quotaRouterOptions.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
-            _quotaRouterOptions.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
-            _quotaRouterOptions.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
-            _quotaRouterOptions.ColdStartFitInWindow = src.ColdStartFitInWindow;
-            _quotaRouterOptions.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
+            QuotaRouterConfigMapper.ApplyHotReload(_quotaRouterOptions, opts.QuotaRouter);
 
             _lastQuotaRouter = next;
             AuditLog.ConfigReloaded("QuotaRouter", prev, next);
@@ -810,20 +784,33 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private static string SerializeSanitizer(ClaudeThinkingBlockSanitizerOptions opts) =>
         JsonSerializer.Serialize(new { opts.Enabled }, JsonOpts);
 
-    private static string SerializeQuotaRouter(QuotaRouterConfig opts) =>
-        JsonSerializer.Serialize(
+    private static string SerializeQuotaRouter(QuotaRouterConfig opts)
+    {
+        var mapped = QuotaRouterConfigMapper.ToOptions(opts);
+        return JsonSerializer.Serialize(
             new
             {
                 opts.MinQuotaPct,
-                MinQuotaPctByWindow = opts.MinQuotaPctByWindow
+                MinQuotaPctByWindow = mapped.MinQuotaPctByWindow
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                     .ToDictionary(kv => kv.Key, kv => kv.Value),
                 opts.StartFloorPct,
                 opts.EndFloorPct,
                 opts.RampWindowSeconds,
-                RampWindowByAgentSeconds = opts.RampWindowByAgentSeconds
+                RampWindowByAgentSeconds = mapped.RampWindowByAgent
                     .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
-                    .ToDictionary(kv => kv.Key, kv => kv.Value),
+                    .ToDictionary(kv => kv.Key, kv => (int)kv.Value.TotalSeconds),
+                FloorByAgent = mapped.FloorByAgent
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => new
+                    {
+                        kv.Value.MinQuotaPct,
+                        kv.Value.StartFloorPct,
+                        kv.Value.EndFloorPct,
+                        RampWindowSeconds = kv.Value.RampWindow is { } rampWindow
+                            ? checked((int)rampWindow.TotalSeconds)
+                            : (int?)null,
+                    }),
                 opts.QuotaRecheckIntervalSeconds,
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
                 opts.ObservedFailureWindowMinutes,
@@ -833,6 +820,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);
+    }
 
     private void ApplyPipelineTuningIfChanged(CodeyBoxOptions opts)
     {

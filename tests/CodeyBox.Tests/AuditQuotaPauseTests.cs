@@ -337,18 +337,22 @@ public sealed class AuditQuotaPauseTests : IDisposable
         var auditProbes = classMembers
             .Select(kind => new RecordingProbe(
                 kind,
-                auditProbeAvailablePct is not null
-                    && auditProbeAvailablePct.TryGetValue(kind, out var pct)
-                    ? pct
-                    : 80.0))
+                new AgentQuotaSnapshot
+                {
+                    AvailablePct = auditProbeAvailablePct is not null
+                        && auditProbeAvailablePct.TryGetValue(kind, out var pct)
+                        ? pct
+                        : 80.0,
+                }))
             .ToList();
         var dispatchAvailability = pauses is null
             ? null
             : new AgentDispatchAvailability(pauses: pauses);
+        var sharedQuotaOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
         var router = new AgentClassRouter(
             [frontier],
             routeProbes,
-            new QuotaRouterOptions { MinQuotaPct = 10 },
+            sharedQuotaOptions,
             NullLogger<AgentClassRouter>.Instance,
             time,
             dispatchAvailability: dispatchAvailability);
@@ -406,6 +410,7 @@ public sealed class AuditQuotaPauseTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: auditProbes,
+            auditQuotaOptions: sharedQuotaOptions,
             retryScheduler: scheduler,
             classRouter: router,
             fallbackHistory: fallbackHistory,

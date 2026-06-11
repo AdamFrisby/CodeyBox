@@ -127,12 +127,12 @@ public sealed class PerModelObservedFailureBreakerTests : IDisposable
             AgentKind.Gemini, "gemini-3-flash-preview", TimeSpan.FromMinutes(10), DateTimeOffset.UtcNow);
         var opts = new QuotaRouterOptions { MinQuotaPct = 10 };
 
-        Assert.False(QuotaRouter.WouldAllow(availablePct: 100, recentFailure: hasRecent, opts));
+        Assert.False(QuotaRouter.WouldAllow(AgentKind.Gemini, availablePct: 100, recentFailure: hasRecent, opts));
 
         // Same flag computed for a different model on the same agent must allow.
         var hasRecentOther = await _failures.HasRecentAsync(
             AgentKind.Gemini, "gemini-2.5-pro", TimeSpan.FromMinutes(10), DateTimeOffset.UtcNow);
-        Assert.True(QuotaRouter.WouldAllow(availablePct: 100, recentFailure: hasRecentOther, opts));
+        Assert.True(QuotaRouter.WouldAllow(AgentKind.Gemini, availablePct: 100, recentFailure: hasRecentOther, opts));
     }
 
     private AgentClassRouter BuildRouter(double perAgentAvailablePct)

@@ -175,6 +175,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static readonly TimeSpan SlotReleasedDispatchWakeRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan SpawnPacingPausePollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan SpawnPacingPauseObservationWindow = TimeSpan.FromMilliseconds(250);
+    // WaitIfPausedAsync re-checks the queue controller's in-memory volatile
+    // state field on this cadence. Keeping it short (250ms) means a Resume
+    // takes effect promptly without an extra signal channel — matches the
+    // spawn-pacing pause poll. The read is a constant-time volatile field
+    // load on SqliteQueueController so cadence is not a contention concern.
+    private static readonly TimeSpan QueuePauseResumePollInterval = TimeSpan.FromMilliseconds(250);
+
+    private enum SpawnPacingWaitResult
+    {
+        Completed,
+        QueuePaused,
+        DispatchPaused,
+        Cancelled,
+    }
 
     // Per-project semaphores: serialise budget check + StartedAt write to prevent
     // TOCTOU races where multiple concurrent workers all pass the budget check before
@@ -661,25 +675,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private ValueTask RequeueDispatchWakeAsync(CancellationToken ct)
         => _queue.EnqueueDispatchWakeAsync(ct);
 
-    private async Task<bool> WaitForSpawnPacingOrPauseAsync(TimeSpan wait, CancellationToken stoppingToken)
-    {
-        var deadline = DateTimeOffset.UtcNow + wait;
-        while (true)
-        {
-            if (IsQueuePaused || IsDispatchPaused)
-                return false;
-
-            var remaining = deadline - DateTimeOffset.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-                return true;
-
-            var slice = remaining < SpawnPacingPausePollInterval
-                ? remaining
-                : SpawnPacingPausePollInterval;
-            await Task.Delay(slice, stoppingToken);
-        }
-    }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // R8-core suspend/resume: SandboxResumeOnStartupService now runs in the
@@ -860,28 +855,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         {
                             if (nextEligible > DateTimeOffset.UtcNow)
                                 AuditLog.WorkerPoolSpawnThrottled((long)wait.TotalMilliseconds);
-                            try
-                            {
-                                if (!await WaitForSpawnPacingOrPauseAsync(wait, stoppingToken))
-                                {
-                                    _activeItems.TryRemove(id.Value, out _);
-                                    TryReleaseConcurrencyGate();
-                                    if (IsDispatchPaused)
-                                    {
-                                        stopDispatchLoop = true;
-                                    }
-                                    else
-                                    {
-                                        await RequeueDispatchWakeAsync(stoppingToken);
-                                    }
-                                    break;
-                                }
-                            }
-                            catch (OperationCanceledException)
+                            var pacing = await WaitForSpawnPacingAsync(wait, stoppingToken);
+                            if (pacing == SpawnPacingWaitResult.Cancelled)
                             {
                                 _activeItems.TryRemove(id.Value, out _);
                                 TryReleaseConcurrencyGate();
                                 stopDispatchLoop = true;
+                                break;
+                            }
+                            if (pacing == SpawnPacingWaitResult.DispatchPaused)
+                            {
+                                _activeItems.TryRemove(id.Value, out _);
+                                TryReleaseConcurrencyGate();
+                                stopDispatchLoop = true;
+                                break;
+                            }
+                            if (pacing == SpawnPacingWaitResult.QueuePaused)
+                            {
+                                _activeItems.TryRemove(id.Value, out _);
+                                TryReleaseConcurrencyGate();
+                                await _queue.EnqueueDispatchWakeAsync(stoppingToken);
                                 break;
                             }
                         }
@@ -1113,10 +1106,34 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (_queueController is null) return true;
         while (_queueController.State == QueueState.Paused)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
+            try { await Task.Delay(QueuePauseResumePollInterval, stoppingToken); }
             catch (OperationCanceledException) { return false; }
         }
         return true;
+    }
+
+    private async Task<SpawnPacingWaitResult> WaitForSpawnPacingAsync(
+        TimeSpan wait,
+        CancellationToken stoppingToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + wait;
+        while (true)
+        {
+            if (IsDispatchPaused)
+                return SpawnPacingWaitResult.DispatchPaused;
+            if (IsQueuePaused)
+                return SpawnPacingWaitResult.QueuePaused;
+
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                return SpawnPacingWaitResult.Completed;
+
+            var delay = remaining <= SpawnPacingPausePollInterval
+                ? remaining
+                : SpawnPacingPausePollInterval;
+            try { await Task.Delay(delay, stoppingToken); }
+            catch (OperationCanceledException) { return SpawnPacingWaitResult.Cancelled; }
+        }
     }
 
     // Exposed as internal so tests can invoke recovery in isolation without

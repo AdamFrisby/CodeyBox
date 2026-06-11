@@ -158,10 +158,11 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             DisplayName = "Frontier",
             Members = classMembers,
         };
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [agentClass],
             probes: [],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var project = new Project
@@ -189,6 +190,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new NullWebhookDispatcher(),
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
+            auditQuotaOptions: quotaOptions,
             classRouter: router,
             auditReports: auditReportStore,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);

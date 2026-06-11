@@ -11,7 +11,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 {
     private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan NoDispatchQuietPeriod = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan SpawnPacingDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SpawnPacingBranchInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan SpawnPacingEarlyExitTimeout = TimeSpan.FromSeconds(4);
 
     private readonly string _dbPath =
@@ -325,7 +325,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
-                MinSpawnInterval = SpawnPacingDelay,
+                MinSpawnInterval = SpawnPacingBranchInterval,
                 OnWorkerReservedForTest = id =>
                 {
                     if (id != pauseOnReserve || pauseApplied)
@@ -362,10 +362,10 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             "The queue-pause branch after spawn pacing must unreserve the item and release the gate.");
         Assert.False(pipeline.HasEntered(second.Id));
 
-        svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow - SpawnPacingDelay);
+        svc.SetLastSpawnAtForTest(DateTimeOffset.UtcNow - SpawnPacingBranchInterval);
         await controller.ResumeAsync();
         Assert.True(
-            await pipeline.WaitForEnteredAsync(second.Id, TimeSpan.FromSeconds(20)),
+            await pipeline.WaitForEnteredAsync(second.Id, DispatchWaitTimeout + SpawnPacingBranchInterval),
             "The post-pickup queue-pause branch should preserve a wake so resume dispatches the item.");
 
         pipeline.Release(second.Id);
@@ -512,7 +512,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             new OrchestratorOptions
             {
                 MaxConcurrentWorkers = 1,
-                MinSpawnInterval = SpawnPacingDelay,
+                MinSpawnInterval = SpawnPacingBranchInterval,
                 OnWorkerReservedForTest = id =>
                 {
                     if (id == pauseOnReserve && !pauseApplied)

@@ -126,7 +126,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
             MinQuotaPct = 10,
             UnknownPolicy = QuotaUnknownPolicy.FailCautious,
         };
-        Assert.True(QuotaRouter.WouldAllow(stale.AvailablePct, recentFailure: false, routerOpts),
+        Assert.True(QuotaRouter.WouldAllow(AgentKind.Claude, stale.AvailablePct, recentFailure: false, routerOpts),
             "floor must evaluate against retained 71%, not -1");
     }
 
@@ -158,7 +158,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
 
         Assert.Equal(5, stale.AvailablePct, precision: 5);
         var routerOpts = new QuotaRouterOptions { MinQuotaPct = 10 };
-        Assert.False(QuotaRouter.WouldAllow(stale.AvailablePct, recentFailure: false, routerOpts));
+        Assert.False(QuotaRouter.WouldAllow(AgentKind.Claude, stale.AvailablePct, recentFailure: false, routerOpts));
     }
 
     // ── Falling out of retention ──────────────────────────────────────────────
@@ -290,7 +290,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
         })
         {
             var opts = new QuotaRouterOptions { MinQuotaPct = 10, UnknownPolicy = policy };
-            Assert.True(QuotaRouter.WouldAllow(stale.AvailablePct, recentFailure: false, opts),
+            Assert.True(QuotaRouter.WouldAllow(AgentKind.Claude, stale.AvailablePct, recentFailure: false, opts),
                 $"policy {policy}: must allow against retained 71%");
         }
     }

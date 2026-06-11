@@ -52,6 +52,12 @@ Hot-reloadable today:
 - `AgentPricing` — re-applied via `AgentConfigHotReload` to the live
   `AgentCostCalculator`. Negative-rate validation runs on the reload candidate
   before the swap; rejected reloads keep the prior pricing.
+- `QuotaRouter` decision fields — re-applied via `AgentConfigHotReload` to the
+  live `QuotaRouterOptions` singleton. This includes global floors,
+  `MinQuotaPctByWindow`, `FloorByAgent`, per-agent ramp windows, unknown-policy
+  handling, observed-failure windows, cap-retry cadence, and cold-start
+  fit-in-window. `QuotaCacheTtlSeconds` is still sampled by quota probe
+  constructors at startup.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `WorkerProgressWatchdog.ProgressTimeout`,
@@ -113,8 +119,9 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   shutdown-service constructors.
 - `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
   `OrchestratorOptions` and the worker-pool plumbing at startup.
-- `QuotaRouter.QuotaCacheTtlSeconds` — per-provider quota probe caches are sized
-  at construction. Other router gate fields are hot-reloaded.
+- `QuotaRouter.QuotaCacheTtlSeconds` — captured by the per-provider quota probes
+  at construction (probe caches are sized once). Other router gate fields are
+  hot-reloaded.
 - `Smoke.CacheTtlMinutes` / `Smoke.Availability.*` — cache and availability
   registry singletons are sized at startup.
 - `BudgetAlerts.CheckInterval` — sized into the `BudgetAlertService`'s
@@ -351,6 +358,16 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 ```json
 "QuotaRouter": {
   "MinQuotaPct": 10,
+  "StartFloorPct": 25,
+  "EndFloorPct": 3,
+  "RampWindowSeconds": 604800,
+  "FloorByAgent": {
+    "codex": {
+      "StartFloorPct": 1,
+      "EndFloorPct": 0,
+      "MinQuotaPct": 1
+    }
+  },
   "QuotaRecheckIntervalSeconds": 300,
   "QuotaCacheTtlSeconds": 60,
   "UnknownPolicy": "UseObservedFailures",
@@ -366,7 +383,11 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `MinQuotaPct` | `10` | Minimum available-quota percentage before a Subscription member is skipped. |
+| `MinQuotaPct` | `10` | Global fallback minimum available-quota percentage when a ramp cannot be computed. |
+| `StartFloorPct` | `25` | Global early-window ramp floor just after a quota reset. |
+| `EndFloorPct` | `3` | Global late-window ramp floor as reset approaches. |
+| `RampWindowSeconds` | `604800` | Global quota-window length used for the ramp calculation. |
+| `FloorByAgent` | `{}` | Optional per-agent overrides keyed by agent kind, e.g. `codex` or `claude`. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted fields inherit global values, and omitted agents use the global ramp. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
@@ -377,6 +398,13 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `ProbeRetryInitialDelayMs` | `250` | Base retry backoff in milliseconds; doubles each attempt. Hot-reloadable. |
 | `ProbeMaxConsecutiveFailures` | `3` | Consecutive probe failures tolerated before the probe stops returning the retained last-known-good snapshot. A single transient blip cannot silently disable the `MinQuotaPct` floor. Hot-reloadable. |
 | `ProbeMaxStalenessSeconds` | `300` | Maximum age of a retained last-known-good snapshot before it is dropped in favour of `AvailablePct=-1` (unknown). Hot-reloadable. |
+
+Use `FloorByAgent` to keep reserve on the operator's oversight model while
+burning work-only agents close to empty. For example,
+`FloorByAgent:codex:{StartFloorPct:1,EndFloorPct:0,MinQuotaPct:1}` lets codex
+dispatch at about 1% quota, while claude remains on the global 25% to 3% ramp
+if omitted. When an agent override sets `MinQuotaPct`, that value also replaces
+the global per-window fallback floor for that agent.
 
 ---
 

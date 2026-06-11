@@ -891,49 +891,14 @@ builder.Services.AddHttpClient("agent-modellist", client =>
 builder.Services.AddSingleton<QuotaRouterOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var qr = cbOpts.QuotaRouter;
-    return new QuotaRouterOptions
-    {
-        MinQuotaPct = qr.MinQuotaPct,
-        MinQuotaPctByWindow = BuildWindowFloorOverrides(qr.MinQuotaPctByWindow),
-        StartFloorPct = qr.StartFloorPct,
-        EndFloorPct = qr.EndFloorPct,
-        RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
-        RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
-        QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
-        QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
-        UnknownPolicy = qr.UnknownPolicy,
-        ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
-        ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
-        CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
-        ColdStartFitInWindow = qr.ColdStartFitInWindow,
-        IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
-    };
-
-    static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)
-    {
-        var dst = new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
-        if (src is null) return dst;
-        foreach (var kv in src)
-        {
-            if (kv.Value <= 0) continue;
-            dst[kv.Key] = TimeSpan.FromSeconds(kv.Value);
-        }
-        return dst;
-    }
-
-    static Dictionary<string, double> BuildWindowFloorOverrides(IDictionary<string, double>? src)
-    {
-        var dst = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        if (src is null) return dst;
-        foreach (var kv in src)
-        {
-            if (kv.Value < 0) continue;
-            dst[kv.Key] = kv.Value;
-        }
-        return dst;
-    }
+    return QuotaRouterConfigMapper.ToOptions(cbOpts.QuotaRouter);
 });
+builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
+    new QuotaGatePolicy(sp.GetRequiredService<QuotaRouterOptions>()));
+builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
+    sp.GetRequiredService<QuotaGatePolicy>(),
+    sp.GetService<IQuotaFailureStore>(),
+    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow));
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1688,7 +1653,7 @@ builder.Services.AddSingleton<INotificationProvider>(sp =>
 builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
     sp.GetRequiredService<IEnumerable<IAgentQuotaProbe>>(),
-    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.QuotaRouter.MinQuotaPct,
+    sp.GetRequiredService<IAgentQuotaGate>(),
     sp.GetRequiredService<IAgentRegistry>(),
     sp.GetRequiredService<ILogger<AllQuotasExhaustedCondition>>()));
 builder.Services.AddSingleton<ICondition, WorkItemPermanentlyFailedCondition>();
@@ -2574,6 +2539,7 @@ app.MapGet("/quota", async (
     AgentClassRouter? router,
     IQuotaFailureStore? failureStore,
     QuotaRouterOptions options,
+    IAgentQuotaGate quotaGate,
     IAgentBudgetProvider? budgetProvider,
     IAgentPauseController? agentPauses,
     ILoggerFactory loggerFactory,
@@ -2614,12 +2580,17 @@ app.MapGet("/quota", async (
         var recentFailure = recentFailuresForProbe.Count > 0;
         var paused = pausedByKey.TryGetValue(member.RouteKey, out var pause)
             || pausedByAgent.TryGetValue(member.Agent, out pause);
-        var quotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentFailure, options);
-        var defaultQuotaWouldAllow = QuotaRouter.WouldAllow(snapshot.AvailablePct, recentDefaultFailure, options);
         var modelKeys = snapshot.PerModel.Keys
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        bool WouldAllow(AgentMembership gateMember, bool hasRecentFailure) =>
+            quotaGate.Allows(
+                gateMember,
+                snapshot,
+                now,
+                hasRecentFailure,
+                "recent observed quota failure");
         snapshots.Add(new
         {
             agent = member.Agent.Value,
@@ -2649,16 +2620,19 @@ app.MapGet("/quota", async (
             pauseExpiresAt = pause?.ExpiresAt,
             dispatchStatus = paused ? "paused" : "quota",
             dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
-            wouldAllow = !paused && quotaWouldAllow,
-            defaultModelWouldAllow = !paused && defaultQuotaWouldAllow,
+            wouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentFailure),
+            defaultModelWouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentDefaultFailure),
             perModelWouldAllow = modelKeys.ToDictionary(
                 modelId => modelId,
-                modelId => !paused && QuotaRouter.WouldAllow(
-                        snapshot.PerModel.TryGetValue(modelId, out var modelQuota) ? modelQuota.AvailablePct : snapshot.AvailablePct,
-                        recentFailuresForProbe.Any(f =>
-                            f.Agent == member.Agent &&
-                            string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase)),
-                        options),
+                modelId =>
+                {
+                    if (paused) return false;
+                    var modelMember = member with { ModelId = modelId };
+                    var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
+                        f.Agent == probe.Kind &&
+                        string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
+                    return WouldAllow(modelMember, modelHasRecentFailure);
+                },
                 StringComparer.OrdinalIgnoreCase),
         });
         kindAggregateCounts[member.Agent.Value] =
@@ -3982,6 +3956,16 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, int> RampWindowByAgentSeconds { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Optional per-agent floor overrides keyed by agent kind value
+        /// (e.g. <c>codex</c>, <c>claude</c>). Omitted agents and omitted
+        /// fields inherit the global ramp/fallback settings above. Set
+        /// low values such as StartFloorPct=1, EndFloorPct=0, MinQuotaPct=1
+        /// to burn a work-only agent close to empty while keeping oversight
+        /// agents on the global reserve. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, QuotaRouterFloorConfig> FloorByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
@@ -4035,6 +4019,25 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public int ProbeMaxStalenessSeconds { get; set; } = 300;
+    }
+
+    /// <summary>
+    /// Per-agent quota floor override. Null fields inherit the corresponding
+    /// global <see cref="QuotaRouterConfig"/> setting.
+    /// </summary>
+    public sealed class QuotaRouterFloorConfig
+    {
+        /// <summary>Fallback floor used when the ramp cannot be computed.</summary>
+        public double? MinQuotaPct { get; set; }
+
+        /// <summary>Early-window ramp floor for this agent.</summary>
+        public double? StartFloorPct { get; set; }
+
+        /// <summary>Late-window ramp floor for this agent.</summary>
+        public double? EndFloorPct { get; set; }
+
+        /// <summary>Optional ramp-window length in seconds for this agent.</summary>
+        public int? RampWindowSeconds { get; set; }
     }
 
     /// <summary>

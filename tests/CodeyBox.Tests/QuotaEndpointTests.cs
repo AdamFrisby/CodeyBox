@@ -79,6 +79,60 @@ public sealed class QuotaEndpointTests
     }
 
     [Fact]
+    public async Task GetQuota_WouldAllowUsesPerAgentFloorPolicy()
+    {
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var options = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            StartFloorPct = 25.0,
+            EndFloorPct = 3.0,
+            RampWindow = TimeSpan.FromDays(7),
+        };
+        options.FloorByAgent[AgentKind.Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+
+        using var factory = new WorkItemApiFactory();
+        var client = factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Codex, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 5.0,
+                    ResetAt = reset,
+                }));
+                services.AddSingleton<IAgentQuotaProbe>(new FakeProbe(AgentKind.Claude, new AgentQuotaSnapshot
+                {
+                    AvailablePct = 20.0,
+                    ResetAt = reset,
+                }));
+                services.RemoveAll<QuotaRouterOptions>();
+                services.AddSingleton(options);
+                services.RemoveAll<QuotaGatePolicy>();
+                services.AddSingleton(new QuotaGatePolicy(options));
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/quota");
+        response.EnsureSuccessStatusCode();
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        var probes = doc.RootElement.GetProperty("probes").EnumerateArray().ToList();
+        Assert.All(
+            probes.Where(p => string.Equals(p.GetProperty("agent").GetString(), "codex", StringComparison.OrdinalIgnoreCase)),
+            p => Assert.True(p.GetProperty("wouldAllow").GetBoolean()));
+        Assert.All(
+            probes.Where(p => string.Equals(p.GetProperty("agent").GetString(), "claude", StringComparison.OrdinalIgnoreCase)),
+            p => Assert.False(p.GetProperty("wouldAllow").GetBoolean()));
+    }
+
+    [Fact]
     public async Task GetQuota_IncludesBudgetsArray_WhenProviderConfigured()
     {
         using var factory = new WorkItemApiFactory();

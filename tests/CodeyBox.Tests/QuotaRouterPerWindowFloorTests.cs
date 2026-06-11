@@ -26,6 +26,7 @@ namespace CodeyBox.Tests;
 public sealed class QuotaRouterPerWindowFloorTests
 {
     private static readonly AgentKind Claude = AgentKind.Claude;
+    private static readonly AgentKind Codex = AgentKind.Codex;
 
     private static readonly DateTimeOffset Now =
         new(2026, 5, 31, 12, 0, 0, TimeSpan.Zero);
@@ -205,6 +206,49 @@ public sealed class QuotaRouterPerWindowFloorTests
     }
 
     [Fact]
+    public void AgentMinOverride_BeatsGlobalWindowFloorForThatAgentOnly()
+    {
+        var opts = Opts(
+            new(StringComparer.OrdinalIgnoreCase) { ["five_hour"] = 25.0 },
+            minQuotaPct: 10.0);
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+        };
+        var router = new AgentClassRouter(
+            catalog: [ClaudeOnlyClass()],
+            probes: Array.Empty<IAgentQuotaProbe>(),
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance);
+
+        Assert.Equal(1.0, router.ResolveWindowFloorPct(Codex, "five_hour"));
+        Assert.Equal(25.0, router.ResolveWindowFloorPct(Claude, "five_hour"));
+        Assert.Equal(1.0, router.ResolveWindowFloorPct(Codex, "unlisted-window"));
+        Assert.Equal(10.0, router.ResolveWindowFloorPct(Claude, "unlisted-window"));
+    }
+
+    [Fact]
+    public void PartialAgentOverrideWithoutMin_StillUsesGlobalWindowFloor()
+    {
+        var opts = Opts(
+            new(StringComparer.OrdinalIgnoreCase) { ["five_hour"] = 25.0 },
+            minQuotaPct: 10.0);
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var router = new AgentClassRouter(
+            catalog: [ClaudeOnlyClass()],
+            probes: Array.Empty<IAgentQuotaProbe>(),
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance);
+
+        Assert.Equal(25.0, router.ResolveWindowFloorPct(Codex, "five_hour"));
+        Assert.Equal(10.0, router.ResolveWindowFloorPct(Codex, "unlisted-window"));
+    }
+
+    [Fact]
     public void DefaultOptions_HasNoPerWindowFloors_SoLegacyBehaviourPreserved()
     {
         // Constructing QuotaRouterOptions directly (the test path) must not
@@ -310,6 +354,60 @@ public sealed class QuotaRouterPerWindowFloorTests
         // The per-model 5h reading (20%) is below the 25% floor — block.
         Assert.Null(decision.Chosen);
         Assert.True(decision.ShouldWait);
+    }
+
+    [Fact]
+    public async Task BurnToZeroAgent_WindowBelowGlobalFloor_AboveAgentFloor_Dispatches()
+    {
+        // Regression for KnownQuotaMeetsFloor using the legacy per-window
+        // resolver (default AgentKind) instead of member.Agent. A codex member
+        // configured to burn-to-zero (FloorByAgent[codex].MinQuotaPct=1) with a
+        // five_hour window reading of 5% must dispatch even when the GLOBAL
+        // five_hour floor is 25%. Before the fix, the per-window check above
+        // would deny because it asked for the default-agent floor (25%),
+        // bypassing the codex override and stranding the probe-cleared dispatch.
+        var snapshot = new AgentQuotaSnapshot
+        {
+            AvailablePct = 5,
+            Windows = [
+                new WindowQuota { Name = "five_hour", AvailablePct = 5 },
+                new WindowQuota { Name = "seven_day", AvailablePct = 60 },
+            ],
+        };
+        var probe = new FakeProbe(Codex, snapshot);
+        var opts = Opts(new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["five_hour"] = 25.0,
+            ["seven_day"] = 10.0,
+        });
+        opts.FloorByAgent[Codex.Value] = new QuotaFloorOverrideOptions
+        {
+            MinQuotaPct = 1.0,
+            StartFloorPct = 1.0,
+            EndFloorPct = 0.0,
+        };
+        var router = new AgentClassRouter(
+            catalog: [new AgentClass
+            {
+                Id = "x",
+                DisplayName = "x",
+                Members = [
+                    new AgentMembership
+                    {
+                        Agent = Codex,
+                        Billing = AgentBilling.Subscription,
+                        QualityScore = 100,
+                    },
+                ],
+            }],
+            probes: [probe],
+            opts: opts,
+            log: NullLogger<AgentClassRouter>.Instance);
+
+        var decision = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+
+        Assert.NotNull(decision.Chosen);
+        Assert.Equal(Codex, decision.Chosen!.Agent);
     }
 
     [Fact]

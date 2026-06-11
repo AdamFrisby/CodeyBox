@@ -156,10 +156,11 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
         var cursorProbe = new RecordingProbe(AgentKind.Cursor);
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
 
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [frontier],
             [cursorProbe, claudeProbe],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -171,6 +172,7 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [cursorProbe, claudeProbe],
+            auditQuotaOptions: quotaOptions,
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]
@@ -228,10 +230,11 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
         var cursorProbe = new RecordingProbe(AgentKind.Cursor);
         var claudeProbe = new RecordingProbe(AgentKind.Claude);
 
+        var quotaOptions = new QuotaRouterOptions { MinQuotaPct = 10.0 };
         var router = new AgentClassRouter(
             [soloCursor],
             [cursorProbe, claudeProbe],
-            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            quotaOptions,
             NullLogger<AgentClassRouter>.Instance);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
@@ -243,6 +246,7 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaProbes: [cursorProbe, claudeProbe],
+            auditQuotaOptions: quotaOptions,
             classRouter: router,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]

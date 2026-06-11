@@ -1441,7 +1441,7 @@ public sealed class AgentConfigHotReloadTests
     {
         var initialDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["opencode"] = "deepseek/deepseek-coder",
+            ["opencode"] = "deepseek-v4-flash",
         };
         var snapshot = new AgentDefaultsSnapshot(initialDefaults);
         var runner = new OpencodeAgentRunner(snapshot);
@@ -1452,7 +1452,7 @@ public sealed class AgentConfigHotReloadTests
         var argv = sandbox.CapturedExec!.Argv.ToList();
         var modelIdx = argv.IndexOf("--model");
         Assert.True(modelIdx >= 0);
-        Assert.Equal("deepseek/deepseek-coder", argv[modelIdx + 1]);
+        Assert.Equal("deepseek-v4-flash", argv[modelIdx + 1]);
 
         var updatedDefaults = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
@@ -2116,6 +2116,88 @@ public sealed class AgentConfigHotReloadTests
             },
         });
         Assert.Equal(IntraKindRoutingPolicy.Sticky, qro.IntraKindRoutingPolicy);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterFloorByAgentPropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0 },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = new QuotaRouterOptions
+        {
+            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
+            StartFloorPct = initial.QuotaRouter.StartFloorPct,
+            EndFloorPct = initial.QuotaRouter.EndFloorPct,
+        };
+        var reset = DateTimeOffset.UtcNow + TimeSpan.FromDays(7);
+        var router = new AgentClassRouter(
+            [MakeClass("frontier", Codex)],
+            [new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 5.0, ResetAt = reset })],
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("p"),
+            Title = "t",
+            Prompt = "p",
+            AgentClassId = "frontier",
+        };
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                FloorByAgent = new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["codex"] = new QuotaRouterFloorConfig
+                    {
+                        MinQuotaPct = 1.0,
+                        StartFloorPct = 1.0,
+                        EndFloorPct = 0.0,
+                        RampWindowSeconds = 86_400,
+                    },
+                },
+            },
+        });
+
+        Assert.True(qro.FloorByAgent.TryGetValue("codex", out var codexFloor));
+        Assert.NotNull(codexFloor);
+        Assert.Equal(1.0, codexFloor.MinQuotaPct);
+        Assert.Equal(1.0, codexFloor.StartFloorPct);
+        Assert.Equal(0.0, codexFloor.EndFloorPct);
+        Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
+
+        var allowedAfterReload = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Equal(Codex, allowedAfterReload.Chosen!.Agent);
+        Assert.False(allowedAfterReload.ShouldWait);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0 },
+        });
+
+        Assert.Empty(qro.FloorByAgent);
+
+        var deniedAfterClear = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.Null(deniedAfterClear.Chosen);
+        Assert.True(deniedAfterClear.ShouldWait);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

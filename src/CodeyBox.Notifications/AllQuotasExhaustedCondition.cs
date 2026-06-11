@@ -5,13 +5,16 @@ namespace CodeyBox.Notifications;
 
 /// <summary>
 /// Evaluates true when every configured agent with a subscription quota probe
-/// reports available percentage below <paramref name="minQuotaPct"/>.
-/// Clears when at least one agent reports above the threshold.
+/// is denied by the shared quota gate. Clears when at least one agent is
+/// routable. Routes through <see cref="IAgentQuotaGate.AllowsAsync"/> so the
+/// gate's observed-failure breaker (consulted internally) gates this evaluation
+/// the same way it gates dispatch — without it the condition could report
+/// quotas available while every dispatch candidate is blocked by the breaker.
 /// </summary>
 public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 {
     private readonly IEnumerable<IAgentQuotaProbe> _probes;
-    private readonly double _minQuotaPct;
+    private readonly IAgentQuotaGate _quotaGate;
     private readonly IAgentRegistry _agentRegistry;
     private readonly ILogger<AllQuotasExhaustedCondition> _log;
 
@@ -19,12 +22,12 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 
     public AllQuotasExhaustedCondition(
         IEnumerable<IAgentQuotaProbe> probes,
-        double minQuotaPct,
+        IAgentQuotaGate quotaGate,
         IAgentRegistry agentRegistry,
         ILogger<AllQuotasExhaustedCondition> log)
     {
         _probes = probes;
-        _minQuotaPct = minQuotaPct;
+        _quotaGate = quotaGate;
         _agentRegistry = agentRegistry;
         _log = log;
     }
@@ -38,29 +41,36 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
         if (probes.Count == 0)
             return false;
 
+        var now = DateTimeOffset.UtcNow;
         foreach (var probe in probes)
         {
+            var member = new AgentMembership
+            {
+                Agent = probe.Kind,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100,
+            };
+
+            AgentQuotaSnapshot snapshot;
             try
             {
-                var snapshot = await probe.GetAvailabilityAsync(
-                    new AgentMembership
-                    {
-                        Agent = probe.Kind,
-                        Billing = AgentBilling.Subscription,
-                        QualityScore = 100,
-                    }, ct);
-
-                if (!snapshot.IsKnown || snapshot.AvailablePct >= _minQuotaPct)
-                    return false;
+                snapshot = await probe.GetAvailabilityAsync(member, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "AllQuotasExhaustedCondition: probe {AgentKind} failed; treating as below threshold", probe.Kind);
                 continue;
             }
+
+            if (await _quotaGate.AllowsAsync(member, snapshot, now, ct))
+                return false;
         }
 
-        return probes.Count > 0;
+        return true;
     }
 
     public void Dispose() { }
@@ -93,11 +103,12 @@ public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder
         return new Notification
         {
             ConditionId = "all_quotas_exhausted",
-            Title = $"All agent quotas exhausted (threshold: {_minQuotaPct:F0}%)",
+            Title = "All agent quotas denied by quota gate",
             Summary = $"Every configured subscription agent ({string.Join(", ", agentNames)}) " +
-                      $"is below the {_minQuotaPct:F0}% minimum threshold.",
-            Body = $"As of {evaluatedAt:R}, all subscription agent quotas are below " +
-                   $"the configured minimum ({_minQuotaPct:F0}%). " +
+                      "is currently denied by the effective quota gate.",
+            Body = $"As of {evaluatedAt:R}, all subscription agent quotas are denied " +
+                   "by the effective gate policy, including any ramped, per-window, " +
+                   "or per-agent floors. " +
                    $"Agents monitored: {string.Join(", ", agentNames)}. " +
                    "The orchestrator will not dispatch new work items until at least one " +
                    "agent recovers.",
@@ -105,7 +116,8 @@ public sealed class AllQuotasExhaustedNotificationBuilder : INotificationBuilder
             Timestamp = evaluatedAt,
             Fields = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["minQuotaPct"] = _minQuotaPct.ToString("F0"),
+                ["globalMinQuotaPct"] = _minQuotaPct.ToString("F0"),
+                ["gate"] = "effective",
                 ["agents"] = string.Join(",", agentNames),
             },
         };
