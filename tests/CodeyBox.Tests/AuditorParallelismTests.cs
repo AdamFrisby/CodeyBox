@@ -360,6 +360,58 @@ public sealed class AuditorShortCircuitTests : IDisposable
     }
 
     [Fact]
+    public async Task ErrorFindingFromPassingShortCircuitGate_SkipsSubsequentAuditors()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var reports = new CapturingAuditReportStore();
+        var gateCalls = 0;
+        var laterToolCalls = 0;
+        var llmCalls = 0;
+        var gate = new FakeToolAuditor("gate:build", (_, _, _) =>
+        {
+            gateCalls++;
+            return Task.FromResult(new AuditResult(true, [new AuditFinding(
+                "gate:build-error",
+                AuditSeverity.Error,
+                "build failed",
+                "reported as blocking through an Error finding")]));
+        }, canShortCircuitOnBlockingFinding: true);
+        var laterTool = new FakeToolAuditor("tool:later", (_, _, _) =>
+        {
+            laterToolCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+        var llm = new FakeLlmAuditor("llm:review", (_, _, _) =>
+        {
+            llmCalls++;
+            return Task.FromResult(new AuditResult(true, []));
+        });
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [laterTool, llm, gate],
+            maxAuditIterations: 1,
+            auditReportStore: reports);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = AuditorTestHelpers.NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Equal(1, gateCalls);
+        Assert.Equal(0, laterToolCalls);
+        Assert.Equal(0, llmCalls);
+        var report = Assert.Single(reports.Reports);
+        Assert.Equal("gate:build", report.AuditorName);
+        var finding = Assert.Single(report.Findings);
+        Assert.Equal("Error", finding.Severity);
+        Assert.Equal("build failed", finding.Title);
+    }
+
+    [Fact]
     public async Task PassingShortCircuitGate_RunsAllAuditorsWithGateFirst()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
