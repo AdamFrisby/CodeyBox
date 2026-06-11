@@ -2787,30 +2787,17 @@ public sealed class PipelineRunner : IPipelineRunner
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
         agentSw.Stop();
-        // Feed the availability registry so the fast-fail circuit breaker can
-        // exclude an agent that exits non-zero in under FastFailThresholdSeconds
-        // for MaxConsecutiveFastFails attempts in a row. Captures the exit-127
-        // missing-binary cascade scenario explicitly.
         if (_availability is { } regOnFinish)
         {
-            var transition = regOnFinish.RecordRunOutcome(runner.Kind, agentResult.Success, agentSw.Elapsed);
-            if (!transition.PreviouslyExcluded && transition.NowExcluded)
-            {
-                await _webhooks.PublishAsync(new WebhookEvent
-                {
-                    Event = "agent.smoke_failed",
-                    WorkItem = item,
-                    Project = project,
-                    Details = new AgentSmokeFailedDetails
-                    {
-                        AgentKind = runner.Kind.Value,
-                        Reason = transition.Reason,
-                        // Fast-fail circuit-breaker exclusions are persistent
-                        // by construction (see merge-phase branch above).
-                        Category = SmokeFailureCategory.Persistent,
-                    },
-                }, CancellationToken.None);
-            }
+            await RecordAvailabilityOutcomeAsync(
+                regOnFinish,
+                runner,
+                agentResult,
+                agentSw.Elapsed,
+                item,
+                project,
+                sandbox.Id,
+                agentPhase);
         }
         AuditLog.AgentFinished(runner.Kind, sandbox.Id, agentResult.Success, null, agentSw.Elapsed,
             stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
@@ -3780,6 +3767,66 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         const int max = 2000;
         return string.IsNullOrEmpty(s) ? null : s.Length <= max ? s : "…" + s[^max..];
+    }
+
+    private async Task RecordAvailabilityOutcomeAsync(
+        IAgentAvailabilityRegistry registry,
+        IAgentRunner runner,
+        AgentResult result,
+        TimeSpan duration,
+        WorkItem item,
+        Project project,
+        string sandboxId,
+        string phase)
+    {
+        if (!result.Success)
+        {
+            var classification = runner.ClassifyFailure(result);
+            if (classification.Kind == AgentFailureKind.Infrastructure)
+            {
+                AuditLog.SandboxAgentInfrastructureFailure(
+                    item.Id,
+                    runner.Kind,
+                    sandboxId,
+                    phase,
+                    result.Summary,
+                    classification.Reason);
+                _log.LogWarning(
+                    "Agent {Agent} infrastructure failure in sandbox {Sandbox} during {Phase}; skipping fast-fail breaker: {Summary} ({Reason})",
+                    runner.Kind.Value,
+                    sandboxId,
+                    phase,
+                    result.Summary,
+                    classification.Reason);
+                return;
+            }
+        }
+
+        // Feed the availability registry so the fast-fail circuit breaker can
+        // exclude an agent that genuinely exits non-zero in under
+        // FastFailThresholdSeconds for MaxConsecutiveFastFails attempts in a
+        // row. Infrastructure-shaped failures are filtered above because they
+        // belong to sandbox/provisioning health, not agent availability.
+        var transition = registry.RecordRunOutcome(runner.Kind, result.Success, duration);
+        if (!transition.PreviouslyExcluded && transition.NowExcluded)
+        {
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = runner.Kind.Value,
+                    Reason = transition.Reason,
+                    // Fast-fail circuit-breaker exclusions are persistent by
+                    // construction: the binary launched, exited non-zero fast,
+                    // and did so repeatedly. A retry without operator
+                    // intervention will produce the same outcome.
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
+        }
     }
 
     /// <summary>
@@ -6846,27 +6893,15 @@ public sealed class PipelineRunner : IPipelineRunner
             mergeSw.Stop();
             if (_availability is { } regOnMergeFinish)
             {
-                var transition = regOnMergeFinish.RecordRunOutcome(chosenMergeRunner.Kind, agentResult.Success, mergeSw.Elapsed);
-                if (!transition.PreviouslyExcluded && transition.NowExcluded)
-                {
-                    await _webhooks.PublishAsync(new WebhookEvent
-                    {
-                        Event = "agent.smoke_failed",
-                        WorkItem = item,
-                        Project = project,
-                        Details = new AgentSmokeFailedDetails
-                        {
-                            AgentKind = chosenMergeRunner.Kind.Value,
-                            Reason = transition.Reason,
-                            // Fast-fail circuit-breaker exclusions are
-                            // persistent by construction: the binary launched,
-                            // exited non-zero fast, and did so repeatedly. A
-                            // retry without operator intervention will produce
-                            // the same outcome.
-                            Category = SmokeFailureCategory.Persistent,
-                        },
-                    }, CancellationToken.None);
-                }
+                await RecordAvailabilityOutcomeAsync(
+                    regOnMergeFinish,
+                    chosenMergeRunner,
+                    agentResult,
+                    mergeSw.Elapsed,
+                    item,
+                    project,
+                    sandbox.Id,
+                    "merge");
             }
             AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));

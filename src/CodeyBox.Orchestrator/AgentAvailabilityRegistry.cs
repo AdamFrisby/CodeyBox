@@ -16,9 +16,10 @@ namespace CodeyBox.Orchestrator;
 ///     the agent until a subsequent probe passes or an operator resets it.
 ///   </item>
 ///   <item>
-///     <b>Fast-fail circuit breaker</b> — runs that exit non-zero in less than
+///     <b>Fast-fail circuit breaker</b> — genuine agent runs that exit non-zero in less than
 ///     <see cref="AvailabilityOptions.FastFailThresholdSeconds"/> count as
-///     "smoke-style" failures. After
+///     "smoke-style" failures after infrastructure-shaped failures have been
+///     filtered by the pipeline. After
 ///     <see cref="AvailabilityOptions.MaxConsecutiveFastFails"/> consecutive
 ///     fast-fails the agent is excluded. A successful run (or a normal-length
 ///     failure) resets the counter.
@@ -28,9 +29,9 @@ namespace CodeyBox.Orchestrator;
 /// <para>
 /// Distinct from <see cref="IQuotaFailureStore"/>: that store handles
 /// rate-limit / quota-shaped failures (exit 1 with provider quota signals);
-/// this registry handles "the binary isn't even working" failures (exit 127,
-/// instant non-zero exits, broken credentials). Both excluded paths show up
-/// separately in audit and <c>/concurrency</c> so operators can tell them apart.
+/// this registry handles smoke exclusions plus genuine fast agent crash loops.
+/// Binary-not-found and runner materialisation failures are sandbox/provisioning
+/// defects and are filtered before the fast-fail counter is touched.
 /// </para>
 ///
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
@@ -422,7 +423,7 @@ public sealed record AvailabilityOptions
 {
     /// <summary>
     /// Runs that exit non-zero in less than this many seconds count as a
-    /// fast-fail (the binary failed before it could meaningfully start).
+    /// fast-fail after the pipeline filters infrastructure-shaped failures.
     /// Default 10.
     /// </summary>
     public int FastFailThresholdSeconds { get; init; } = 10;

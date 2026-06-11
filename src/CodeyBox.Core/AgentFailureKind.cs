@@ -36,6 +36,13 @@ public enum AgentFailureKind
     /// <summary>Authentication or authorisation failure (revoked token, expired creds).</summary>
     AuthError,
 
+    /// <summary>
+    /// Sandbox/provisioning failure rather than an agent-health failure: the
+    /// agent binary could not be launched, or runner prerequisite
+    /// materialisation failed before the CLI meaningfully started.
+    /// </summary>
+    Infrastructure,
+
     /// <summary>Failure shape the classifier didn't recognise.</summary>
     Unknown,
 }

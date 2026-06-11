@@ -91,6 +91,19 @@ public static class AgentFailureClassifier
     };
 
     /// <summary>
+    /// Substrings that only become an infrastructure failure when paired with
+    /// an exit-127 summary. Kept separate from normal failure matching so
+    /// repository-level messages like "ENOENT: no such file 'foo.txt'" remain
+    /// work failures, not sandbox provisioning defects.
+    /// </summary>
+    public static readonly IReadOnlyList<string> BinaryNotFoundPatterns = new[]
+    {
+        "command not found",
+        "No such file or directory",
+        "not found in sandbox",
+    };
+
+    /// <summary>
     /// Classifies an agent failure. Returns <see cref="AgentFailureKind.Normal"/>
     /// when no exceptional shape was detected — i.e. the agent ran and reported
     /// a work-related failure (failed tests, refused task, malformed output).
@@ -101,8 +114,19 @@ public static class AgentFailureClassifier
     /// payload), then auth, then network. Never throws.
     /// </para>
     /// </summary>
-    public static AgentFailureClassification Classify(string? stderr, string? stdout = null)
+    public static AgentFailureClassification Classify(string? stderr, string? stdout = null, string? summary = null)
     {
+        if (IsMaterialisationFailure(summary))
+            return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent prerequisite materialisation failed");
+
+        if (IsExit127(summary)
+            && (ContainsAny(stderr, BinaryNotFoundPatterns)
+                || ContainsAny(stdout, BinaryNotFoundPatterns)
+                || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
+        {
+            return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
+        }
+
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
@@ -116,6 +140,23 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "network pattern matched");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
+    }
+
+    private static bool IsMaterialisationFailure(string? summary) =>
+        !string.IsNullOrWhiteSpace(summary)
+        && (summary.TrimStart().StartsWith("failed to materialise ", StringComparison.OrdinalIgnoreCase)
+            || summary.TrimStart().StartsWith("failed to materialize ", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsExit127(string? summary)
+    {
+        if (string.IsNullOrWhiteSpace(summary))
+            return false;
+
+        var trimmed = summary.Trim();
+        return string.Equals(trimmed, "agent exited 127", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(trimmed, "exit 127", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("agent exited 127:", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("exit 127:", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool ContainsAny(string? haystack, IReadOnlyList<string> needles)

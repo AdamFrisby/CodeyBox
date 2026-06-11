@@ -38,27 +38,25 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
     public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
 
-    [Fact]
-    public async Task ThreeConsecutiveFastFailWorkRuns_ExcludeAgent_AndPublishOneTransitionWebhook()
+    [Theory]
+    [InlineData("agent exited 127", "env: 'codex': No such file or directory")]
+    [InlineData("failed to materialise codex auth: exit 1", "permission denied")]
+    public async Task InfrastructureWorkFailures_DoNotFeedFastFailBreaker(string summary, string stderr)
     {
-        // Stand up an availability registry with the production defaults and
-        // wire it into the pipeline. The work item runs through and the agent
-        // returns an exit-127-shaped failure (non-quota, sub-threshold). After
-        // 3 separate work items the circuit breaker must have flipped — and
-        // exactly one `agent.smoke_failed` webhook event must have been
-        // published, on the transition.
+        // Exit 127 / missing binary and runner prerequisite materialisation
+        // failures are sandbox/provisioning defects. They should fail the item
+        // and emit an infra audit signal, but they must not increment the
+        // agent fast-fail counter or bench the agent.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
 
-        // Three items, each yields a fast-fail (sub-10s, non-quota stderr so
-        // the quota classifier does NOT swap agents) on Codex.
         for (var i = 0; i < 3; i++)
         {
             fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
                 Success: false,
-                Summary: "agent exited 127",
+                Summary: summary,
                 Stdout: null,
-                Stderr: "env: 'agent': No such file or directory"));
+                Stderr: stderr));
         }
 
         for (var i = 0; i < 3; i++)
@@ -74,11 +72,46 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         }
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available);
+
+        var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
+        Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
+        Assert.True(snap is null || snap.LastFastFailAt is null);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task ThreeConsecutiveFastAgentCrashes_ExcludeAgent_AndPublishOneTransitionWebhook()
+    {
+        // Stand up an availability registry with the production defaults and
+        // wire it into the pipeline. A crash-shaped non-quota, non-infra
+        // sub-threshold failure must still trip the breaker after 3 separate
+        // work items.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        for (var i = 0; i < 3; i++)
+        {
+            fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+                Success: false,
+                Summary: "agent exited 2",
+                Stdout: null,
+                Stderr: "panic: fatal agent runtime crash"));
+        }
+
+        for (var i = 0; i < 3; i++)
+        {
+            var item = NewItem(AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+            var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            Assert.Equal(WorkItemState.Failed, final!.State);
+        }
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
         Assert.Contains("fast-fail circuit breaker", availability.Reason);
 
-        // Exactly one transition webhook — steady-state failures past the
-        // initial transition must NOT re-publish.
         var transitionEvents = fix.Webhooks.Events
             .Where(e => e.Event == "agent.smoke_failed")
             .ToList();
@@ -107,9 +140,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: false,
-            Summary: "agent exited 127",
+            Summary: "agent exited 2",
             Stdout: null,
-            Stderr: "env: 'agent': No such file or directory"));
+            Stderr: "panic: fatal agent runtime crash"));
 
         var item = NewItem(AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -137,10 +170,10 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
 
-        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(false, "exit 127", null,
-            "env: 'agent': No such file or directory"));
-        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(false, "exit 127", null,
-            "env: 'agent': No such file or directory"));
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(false, "agent exited 2", null,
+            "panic: fatal agent runtime crash"));
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(false, "agent exited 2", null,
+            "panic: fatal agent runtime crash"));
         fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
 
         // Two items fail fast, third succeeds end-to-end.
@@ -181,9 +214,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
         fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
             Success: false,
-            Summary: "merge agent exited 127",
+            Summary: "agent exited 2",
             Stdout: null,
-            Stderr: "env: 'agent': No such file or directory"));
+            Stderr: "panic: fatal merge agent runtime crash"));
 
         var item = NewItem(AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -213,6 +246,35 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(item.Id, transition.WorkItem.Id);
         Assert.NotNull(transition.Project);
         Assert.Equal("test-project", transition.Project.Id.Value);
+    }
+
+    [Fact]
+    public async Task MergePhaseInfrastructureFailure_DoesNotFeedFastFailBreaker()
+    {
+        // Pin the merge-phase branch of the infra filter separately: the work
+        // phase succeeds, then merge sees a missing-binary-shaped failure. Even
+        // with a threshold of 1, this must not bench the agent.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, maxConsecutiveFastFails: 1);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
+        fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'codex': No such file or directory"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+
+        var snap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
+        Assert.Equal(0, snap.ConsecutiveFastFails);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]

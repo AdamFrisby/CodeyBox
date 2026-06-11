@@ -61,6 +61,26 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
     }
 
+    [Theory]
+    [InlineData("agent exited 127", "env: 'agy': No such file or directory")]
+    [InlineData("agent exited 127", "bash: codex: command not found")]
+    [InlineData("agent exited 127", "")]
+    [InlineData("exit 127", "command not found")]
+    public void Exit127BinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: stderr, summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("failed to materialise codex auth: exit 1")]
+    [InlineData("failed to materialize cursor auth: exit 7")]
+    public void MaterialisationFailures_Classified_AsInfrastructure(string summary)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: "permission denied", summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
     [Fact]
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
@@ -113,6 +133,14 @@ public sealed class AgentFailureClassifierTests
         IAgentRunner runner = new ProbeOnlyRunner();
         var c = runner.ClassifyFailure(new AgentResult(false, "exit 1", "", "RESOURCE_EXHAUSTED"));
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void DefaultClassifyFailure_PassesSummaryToSharedClassifier()
+    {
+        IAgentRunner runner = new ProbeOnlyRunner();
+        var c = runner.ClassifyFailure(new AgentResult(false, "agent exited 127", "", ""));
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
     }
 
     private sealed class ProbeOnlyRunner : IAgentRunner
