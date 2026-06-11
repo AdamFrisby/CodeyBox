@@ -134,6 +134,34 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public void ComposeBaselineNameFromLiveConfig_ChangesWhenVerificationProbesChange()
+    {
+        var noProbe = MakeOptions(["touch /opt/codeybox-hash"]);
+        var withProbe = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineBinaryProbe("antigravity", ["agy", "--version"], "agy missing")]);
+        var withChangedArgv = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineBinaryProbe("antigravity", ["agy", "version"], "agy missing")]);
+        var withChangedHint = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineBinaryProbe("antigravity", ["agy", "--version"], "agy not runnable")]);
+
+        var noProbeName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            noProbe, "claude", SandboxProfileFlavor.Headless);
+        var withProbeName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withProbe, "claude", SandboxProfileFlavor.Headless);
+        var withChangedArgvName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withChangedArgv, "claude", SandboxProfileFlavor.Headless);
+        var withChangedHintName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withChangedHint, "claude", SandboxProfileFlavor.Headless);
+
+        Assert.NotEqual(noProbeName, withProbeName);
+        Assert.NotEqual(withProbeName, withChangedArgvName);
+        Assert.NotEqual(withProbeName, withChangedHintName);
+    }
+
+    [Fact]
     public async Task EnsureBaselineImageAsync_WithPinnedBaselineRef_BakesPinnedName()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -291,13 +319,15 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         var launchNames = new ConcurrentQueue<string>();
         var cloneSources = new ConcurrentQueue<string>();
         var verificationArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+        var multipassArgv = new ConcurrentQueue<IReadOnlyList<string>>();
 
         var runner = NewRecordingRunner(
             states,
             infoQueries,
             launchNames,
             cloneSources,
-            baselineVerificationArgv: verificationArgv);
+            baselineVerificationArgv: verificationArgv,
+            multipassArgv: multipassArgv);
         var provider = new MultipassSandboxProvider(
             MakeOptions(
                 ["touch /opt/codeybox-antigravity"],
@@ -320,6 +350,20 @@ public sealed class MultipassBaselinePinningTests : IDisposable
 
         var argv = Assert.Single(verificationArgv);
         Assert.Equal(["agy", "--version"], argv);
+
+        var baselineName = Assert.Single(launchNames);
+        var calls = multipassArgv.ToArray();
+        var installIndex = Array.FindIndex(calls, argv =>
+            argv is [_, "exec", var name, "--", "sudo", "bash", "-c", ..]
+            && name == baselineName);
+        var verificationIndex = Array.FindIndex(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "agy", "--version"]));
+        var stopIndex = Array.FindIndex(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "stop", baselineName]));
+
+        Assert.True(installIndex >= 0, "baseline install command was not recorded");
+        Assert.True(verificationIndex > installIndex, "baseline verification must run after install commands");
+        Assert.True(stopIndex > verificationIndex, "baseline verification must run before the baseline is stopped");
     }
 
     [Fact]
@@ -360,6 +404,37 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 CancellationToken.None));
 
         Assert.Contains("baseline verification for agent 'antigravity' failed", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_EmptyBaselineVerificationArgv_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources, deleteNames);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-empty-probe"],
+                baselineVerificationProbes: [new MultipassBaselineBinaryProbe("broken", [])]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification probe 1 for agent 'broken' has empty argv", ex.Message);
         var baselineName = Assert.Single(launchNames);
         Assert.Contains(baselineName, deleteNames);
         Assert.False(states.ContainsKey(baselineName));
@@ -442,14 +517,14 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     private MultipassSandboxOptions MakeOptions(
         IReadOnlyList<string> extraRuncmd,
         IReadOnlyList<MultipassBaselineBinaryProbe>? baselineVerificationProbes = null) => new()
-    {
-        MultipassBinary = "/bin/false",
-        StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
-        NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
-        UseBaselineImages = true,
-        ExtraRuncmd = extraRuncmd,
-        BaselineVerificationProbes = baselineVerificationProbes ?? [],
-    };
+        {
+            MultipassBinary = "/bin/false",
+            StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
+            NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
+            UseBaselineImages = true,
+            ExtraRuncmd = extraRuncmd,
+            BaselineVerificationProbes = baselineVerificationProbes ?? [],
+        };
 
     /// <summary>
     /// Common runner: handles every multipass call the provider issues during
@@ -466,10 +541,12 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         ConcurrentQueue<IReadOnlyList<string>>? baselineVerificationArgv = null,
         bool failBaselineVerification = false,
         bool failDeletePurge = false,
-        bool dropStateOnDeleteAttempt = false)
+        bool dropStateOnDeleteAttempt = false,
+        ConcurrentQueue<IReadOnlyList<string>>? multipassArgv = null)
     {
         return new RecordingMultipassRunner((argv, _, _) =>
         {
+            multipassArgv?.Enqueue(argv.ToArray());
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 infoQueries.Enqueue(name);

@@ -414,15 +414,17 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
         () =>
         {
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
             var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
+            var baselineVerificationProbes = BaselineVerificationProbeBuilder.Build(
+                live,
+                projects,
+                sp.GetServices<IInVmSmokeProbe>());
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
                 ExtraRuncmd = live.MultipassExtraRuncmd,
-                BaselineVerificationProbes = BuildBaselineVerificationProbes(
-                    live,
-                    sp.GetServices<IInVmSmokeProbe>(),
-                    startupLog),
+                BaselineVerificationProbes = baselineVerificationProbes,
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
@@ -446,61 +448,6 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
     }
 
     return provider;
-}
-
-static IReadOnlyList<MultipassBaselineBinaryProbe> BuildBaselineVerificationProbes(
-    CodeyBoxOptions opts,
-    IEnumerable<IInVmSmokeProbe> probes,
-    ILogger log)
-{
-    var configuredAgents = new List<string>();
-    var seenAgents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    foreach (var agent in opts.AgentClasses
-        .SelectMany(c => c.Members)
-        .Select(m => m.Agent.Trim())
-        .Where(a => !string.IsNullOrWhiteSpace(a)))
-    {
-        if (seenAgents.Add(agent))
-            configuredAgents.Add(agent);
-    }
-
-    if (configuredAgents.Count == 0)
-        return [];
-
-    var probesByKind = probes.ToDictionary(p => p.Kind.Value, StringComparer.OrdinalIgnoreCase);
-    var result = new List<MultipassBaselineBinaryProbe>(configuredAgents.Count);
-    foreach (var agent in configuredAgents)
-    {
-        if (probesByKind.TryGetValue(agent, out var probe))
-        {
-            var step = probe.BuildSteps(credential: null).FirstOrDefault(s => s.Argv.Count > 0 && s.Stdin is null);
-            if (step is null)
-            {
-                log.LogWarning(
-                    "Baseline verification skipped for configured agent {Agent}: its in-VM smoke probe has no credential-independent command",
-                    agent);
-                continue;
-            }
-
-            result.Add(new MultipassBaselineBinaryProbe(agent, step.Argv, step.FailureHint));
-            continue;
-        }
-
-        if (string.Equals(agent, AgentKind.Copilot.Value, StringComparison.OrdinalIgnoreCase))
-        {
-            result.Add(new MultipassBaselineBinaryProbe(
-                AgentKind.Copilot.Value,
-                ["copilot", "--version"],
-                "copilot binary not runnable on sandbox PATH"));
-            continue;
-        }
-
-        log.LogWarning(
-            "Baseline verification skipped for configured agent {Agent}: no IInVmSmokeProbe or known binary fallback is registered",
-            agent);
-    }
-
-    return result;
 }
 
 static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)
@@ -1361,8 +1308,8 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
 // These exec the agent CLI inside a sandbox cloned from the active baseline,
 // catching exit-127 / auth-path failures the host-only probes above cannot see.
-// Copilot has no in-VM probe (no first-party CLI driven by this pipeline).
 builder.Services.AddSingleton<IInVmSmokeProbe, ClaudeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CopilotInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
