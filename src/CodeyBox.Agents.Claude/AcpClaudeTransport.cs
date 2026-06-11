@@ -31,6 +31,13 @@ namespace CodeyBox.Agents.Claude;
 /// </summary>
 public sealed class AcpClaudeTransport : IClaudeTransport
 {
+    private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
+
+    public AcpClaudeTransport(AgentNetworkToleranceSnapshot? networkTolerance = null)
+    {
+        _networkTolerance = networkTolerance;
+    }
+
     /// <summary>
     /// Effective claude binary the bridge spawns. Overrideable for tests.
     /// </summary>
@@ -44,6 +51,17 @@ public sealed class AcpClaudeTransport : IClaudeTransport
 
     public string Name => "acp";
     public ClaudeSessionTransport Transport => ClaudeSessionTransport.Acp;
+
+    internal int? BindApiTimeout()
+    {
+        if (_networkTolerance == null) return null;
+        var dict = _networkTolerance.GetTolerance(ClaudeBinary);
+        if (dict != null && dict.TryGetValue("ApiTimeoutMs", out var val) && int.TryParse(val, out var apiTimeoutMs))
+        {
+            return apiTimeoutMs;
+        }
+        return null;
+    }
 
     public async Task<IClaudeTransportSession> OpenAsync(
         ClaudeTransportOpenRequest request,
@@ -131,12 +149,20 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 request.StdoutChunkCallback?.Invoke(chunk);
             };
 
+            var extraEnv = new Dictionary<string, string>();
+            var apiTimeout = _transport.BindApiTimeout();
+            if (apiTimeout.HasValue)
+            {
+                extraEnv["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
+            }
+
             var exec = new SandboxExec
             {
                 Argv = ["bash", "-lc", "exec " + EscapeForShell(_transport.NodeBinary) + " " + AcpBridgeScript.BridgeScriptPath],
                 WorkingDirectory = _open.WorkingDirectory,
                 Stdin = stdin,
                 StdoutChunkCallback = aggregator,
+                ExtraEnvironment = extraEnv.Count > 0 ? extraEnv : null
             };
 
             SandboxExecResult exec_result;

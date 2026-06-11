@@ -7,61 +7,47 @@ namespace CodeyBox.Core;
 /// <summary>
 /// Shared, swappable holder for the current per-agent network tolerance options.
 /// Registered as a DI singleton so every runner reads through the same
-/// reference. The hot-reload coordinator updates this holder via
-/// <see cref="Replace"/>, and subsequent agent runs pick up the new
-/// tolerance settings without a process restart.
+/// reference. The hot-reload coordinator updates this holder,
+/// and subsequent agent runs pick up the new settings without a process restart.
 /// </summary>
 public sealed class AgentNetworkToleranceSnapshot
 {
-    private IReadOnlyDictionary<string, AgentNetworkToleranceOptions> _current;
+    private IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> _current;
 
-    public AgentNetworkToleranceSnapshot(IReadOnlyDictionary<string, AgentNetworkToleranceOptions> initial)
+    public AgentNetworkToleranceSnapshot(IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> initial)
     {
         ArgumentNullException.ThrowIfNull(initial);
-        _current = initial;
+        _current = CopyTolerance(initial);
     }
 
-    public IReadOnlyDictionary<string, AgentNetworkToleranceOptions> Current => Volatile.Read(ref _current);
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> Current => Volatile.Read(ref _current);
 
-    public void Replace(IReadOnlyDictionary<string, AgentNetworkToleranceOptions> next)
+    public void Replace(IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> next)
     {
         ArgumentNullException.ThrowIfNull(next);
-        Volatile.Write(ref _current, next);
+        Volatile.Write(ref _current, CopyTolerance(next));
     }
 
-    public int GetCodexRequestMaxRetries()
+    public IReadOnlyDictionary<string, string>? GetTolerance(string agentKind)
     {
-        if (Current.TryGetValue("codex", out var opts) && opts.RequestMaxRetries.HasValue)
+        if (Current.TryGetValue(agentKind, out var dict))
         {
-            return opts.RequestMaxRetries.Value;
-        }
-        return AgentNetworkToleranceOptions.DefaultCodexRequestMaxRetries;
-    }
-
-    public int GetCodexStreamMaxRetries()
-    {
-        if (Current.TryGetValue("codex", out var opts) && opts.StreamMaxRetries.HasValue)
-        {
-            return opts.StreamMaxRetries.Value;
-        }
-        return AgentNetworkToleranceOptions.DefaultCodexStreamMaxRetries;
-    }
-
-    public int? GetCodexStreamIdleTimeoutMs()
-    {
-        if (Current.TryGetValue("codex", out var opts) && opts.StreamIdleTimeoutMs.HasValue)
-        {
-            return opts.StreamIdleTimeoutMs.Value;
+            return dict;
         }
         return null;
     }
 
-    public int? GetClaudeApiTimeoutMs()
+    private static Dictionary<string, IReadOnlyDictionary<string, string>> CopyTolerance(
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> source)
     {
-        if (Current.TryGetValue("claude", out var opts) && opts.ApiTimeoutMs.HasValue)
+        var copy = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in source)
         {
-            return opts.ApiTimeoutMs.Value;
+            if (kvp.Value != null)
+            {
+                copy[kvp.Key] = new Dictionary<string, string>(kvp.Value, StringComparer.OrdinalIgnoreCase);
+            }
         }
-        return null;
+        return copy;
     }
 }

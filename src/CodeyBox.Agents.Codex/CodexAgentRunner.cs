@@ -240,29 +240,44 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         }
 
         // Network tolerance overrides
-        if (_networkTolerance != null)
+        var toleranceDict = _networkTolerance?.GetTolerance(Kind.Value);
+        var reqRetries = CodexNetworkTolerance.DefaultRequestMaxRetries;
+        var streamRetries = CodexNetworkTolerance.DefaultStreamMaxRetries;
+        int? idleTimeout = null;
+        string? configProvider = null;
+
+        if (toleranceDict != null)
         {
-            var reqRetries = _networkTolerance.GetCodexRequestMaxRetries();
-            argv.Add("-c");
-            argv.Add($"model_providers.openai.request_max_retries={reqRetries}");
-
-            var streamRetries = _networkTolerance.GetCodexStreamMaxRetries();
-            argv.Add("-c");
-            argv.Add($"model_providers.openai.stream_max_retries={streamRetries}");
-
-            var idleTimeout = _networkTolerance.GetCodexStreamIdleTimeoutMs();
-            if (idleTimeout.HasValue)
+            if (toleranceDict.TryGetValue("RequestMaxRetries", out var reqVal) && int.TryParse(reqVal, out var parsedReq))
             {
-                argv.Add("-c");
-                argv.Add($"model_providers.openai.stream_idle_timeout_ms={idleTimeout.Value}");
+                reqRetries = parsedReq;
+            }
+            if (toleranceDict.TryGetValue("StreamMaxRetries", out var strVal) && int.TryParse(strVal, out var parsedStr))
+            {
+                streamRetries = parsedStr;
+            }
+            if (toleranceDict.TryGetValue("StreamIdleTimeoutMs", out var idleVal) && int.TryParse(idleVal, out var parsedIdle))
+            {
+                idleTimeout = parsedIdle;
+            }
+            if (toleranceDict.TryGetValue("Provider", out var provVal))
+            {
+                configProvider = provVal;
             }
         }
-        else
+
+        var providerId = ResolveProviderId(modelId, configProvider);
+
+        argv.Add("-c");
+        argv.Add($"model_providers.{providerId}.request_max_retries={reqRetries}");
+
+        argv.Add("-c");
+        argv.Add($"model_providers.{providerId}.stream_max_retries={streamRetries}");
+
+        if (idleTimeout.HasValue)
         {
             argv.Add("-c");
-            argv.Add($"model_providers.openai.request_max_retries={AgentNetworkToleranceOptions.DefaultCodexRequestMaxRetries}");
-            argv.Add("-c");
-            argv.Add($"model_providers.openai.stream_max_retries={AgentNetworkToleranceOptions.DefaultCodexStreamMaxRetries}");
+            argv.Add($"model_providers.{providerId}.stream_idle_timeout_ms={idleTimeout.Value}");
         }
 
         // Pass the prompt via stdin rather than as a positional argv. Linux's
@@ -346,5 +361,36 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         }
 
         return string.Concat(parts);
+    }
+
+    private string ResolveProviderId(string? modelId, string? configuredProvider)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredProvider))
+        {
+            return configuredProvider;
+        }
+
+        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
+        {
+            var slashIdx = effectiveModel.IndexOf('/');
+            if (slashIdx > 0)
+            {
+                return effectiveModel.Substring(0, slashIdx);
+            }
+        }
+
+        return "openai";
+    }
+
+    private sealed class CodexNetworkTolerance
+    {
+        public const int DefaultRequestMaxRetries = 8;
+        public const int DefaultStreamMaxRetries = 15;
+
+        public int RequestMaxRetries { get; set; } = DefaultRequestMaxRetries;
+        public int StreamMaxRetries { get; set; } = DefaultStreamMaxRetries;
+        public int? StreamIdleTimeoutMs { get; set; }
+        public string? Provider { get; set; }
     }
 }

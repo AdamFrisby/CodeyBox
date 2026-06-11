@@ -282,6 +282,97 @@ public sealed class CodeyBoxOptionsValidatorTests
             result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData("-1", "must be between 0 and 100")]
+    [InlineData("101", "must be between 0 and 100")]
+    [InlineData("not-an-integer", "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexRequestMaxRetries(string value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        {
+            ["RequestMaxRetries"] = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("-1", "must be between 0 and 100")]
+    [InlineData("101", "must be between 0 and 100")]
+    [InlineData("not-an-integer", "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexStreamMaxRetries(string value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        {
+            ["StreamMaxRetries"] = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("-1", "must be non-negative")]
+    [InlineData("not-an-integer", "must be non-negative")]
+    public void Validate_RejectsInvalidCodexStreamIdleTimeoutMs(string value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        {
+            ["StreamIdleTimeoutMs"] = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("-1", "must be non-negative")]
+    [InlineData("not-an-integer", "must be non-negative")]
+    public void Validate_RejectsInvalidClaudeApiTimeoutMs(string value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["claude"] = new Dictionary<string, string>
+        {
+            ["ApiTimeoutMs"] = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsValidAgentNetworkTolerance()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        {
+            ["RequestMaxRetries"] = "5",
+            ["StreamMaxRetries"] = "10",
+            ["StreamIdleTimeoutMs"] = "120000",
+            ["Provider"] = "azure"
+        };
+        options.AgentNetworkTolerance["claude"] = new Dictionary<string, string>
+        {
+            ["ApiTimeoutMs"] = "30000"
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_AcceptsValidAgentPauseEntry()
     {

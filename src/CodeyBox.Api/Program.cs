@@ -529,8 +529,9 @@ builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSin
 // ACP transport. Always registered so the operator can flip
 // CodeyBox:ClaudeSession:Transport=acp at runtime; the worker only opens an
 // ACP transport when the resolved config asks for it.
-builder.Services.AddSingleton<CodeyBox.Agents.Claude.AcpClaudeTransport>(_ =>
-    new CodeyBox.Agents.Claude.AcpClaudeTransport());
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.AcpClaudeTransport>(sp =>
+    new CodeyBox.Agents.Claude.AcpClaudeTransport(
+        sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>()));
 builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
 {
     var runner = sp.GetServices<IAgentRunner>()
@@ -1186,7 +1187,11 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
 builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var dict = new Dictionary<string, CodeyBox.Core.AgentNetworkToleranceOptions>(opts.AgentNetworkTolerance, opts.AgentNetworkTolerance.Comparer);
+    var dict = new Dictionary<string, IReadOnlyDictionary<string, string>>(opts.AgentNetworkTolerance.Comparer);
+    foreach (var kvp in opts.AgentNetworkTolerance)
+    {
+        dict[kvp.Key] = kvp.Value;
+    }
     return new CodeyBox.Core.AgentNetworkToleranceSnapshot(dict);
 });
 
@@ -3099,7 +3104,7 @@ namespace CodeyBox.Api
         /// <see cref="Core.AgentNetworkToleranceSnapshot"/> and take effect on the
         /// next dispatched agent run.
         /// </summary>
-        public Dictionary<string, Core.AgentNetworkToleranceOptions> AgentNetworkTolerance { get; set; } =
+        public Dictionary<string, Dictionary<string, string>> AgentNetworkTolerance { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>

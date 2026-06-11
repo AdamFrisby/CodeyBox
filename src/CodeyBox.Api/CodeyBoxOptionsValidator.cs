@@ -35,14 +35,54 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 failures.Add($"CodeyBox:AgentNetworkTolerance:{agent} must not be null");
                 continue;
             }
-            if (tolerance.RequestMaxRetries is { } req && req < 0)
-                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be non-negative");
-            if (tolerance.StreamMaxRetries is { } str && str < 0)
-                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be non-negative");
-            if (tolerance.StreamIdleTimeoutMs is { } idle && idle < 0)
-                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
-            if (tolerance.ApiTimeoutMs is { } api && api < 0)
-                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
+
+            if (string.Equals(agent, "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var (key, val) in tolerance)
+                {
+                    if (string.Equals(key, "RequestMaxRetries", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!int.TryParse(val, out var req) || req < 0 || req > 100)
+                        {
+                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and 100");
+                        }
+                    }
+                    else if (string.Equals(key, "StreamMaxRetries", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!int.TryParse(val, out var str) || str < 0 || str > 100)
+                        {
+                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and 100");
+                        }
+                    }
+                    else if (string.Equals(key, "StreamIdleTimeoutMs", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!int.TryParse(val, out var idle) || idle < 0)
+                        {
+                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
+                        }
+                    }
+                    else if (string.Equals(key, "Provider", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (string.IsNullOrWhiteSpace(val))
+                        {
+                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
+                        }
+                    }
+                }
+            }
+            else if (string.Equals(agent, "claude", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var (key, val) in tolerance)
+                {
+                    if (string.Equals(key, "ApiTimeoutMs", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!int.TryParse(val, out var api) || api < 0)
+                        {
+                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
+                        }
+                    }
+                }
+            }
         }
 
         foreach (var (agent, pause) in options.AgentPauses)

@@ -427,7 +427,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         }
 
         IReadOnlyDictionary<string, string>? extraEnv = null;
-        var apiTimeout = _networkTolerance?.GetClaudeApiTimeoutMs();
+        var apiTimeout = BindApiTimeout();
         if (apiTimeout.HasValue)
         {
             extraEnv = new Dictionary<string, string>
@@ -728,5 +728,16 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             return false;
         apiKey = v;
         return true;
+    }
+
+    private int? BindApiTimeout()
+    {
+        if (_networkTolerance == null) return null;
+        var dict = _networkTolerance.GetTolerance(Kind.Value);
+        if (dict != null && dict.TryGetValue("ApiTimeoutMs", out var val) && int.TryParse(val, out var apiTimeoutMs))
+        {
+            return apiTimeoutMs;
+        }
+        return null;
     }
 }

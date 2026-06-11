@@ -626,7 +626,11 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastNetworkTolerance;
         try
         {
-            var dict = new Dictionary<string, AgentNetworkToleranceOptions>(opts.AgentNetworkTolerance, opts.AgentNetworkTolerance.Comparer);
+            var dict = new Dictionary<string, IReadOnlyDictionary<string, string>>(opts.AgentNetworkTolerance.Comparer);
+            foreach (var kvp in opts.AgentNetworkTolerance)
+            {
+                dict[kvp.Key] = kvp.Value;
+            }
             _networkTolerance.Replace(dict);
             _lastNetworkTolerance = next;
             AuditLog.ConfigReloaded("AgentNetworkTolerance", prev, next);
@@ -789,18 +793,13 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             },
             JsonOpts);
 
-    private static string SerializeNetworkTolerance(Dictionary<string, AgentNetworkToleranceOptions> tolerance) =>
+    private static string SerializeNetworkTolerance(Dictionary<string, Dictionary<string, string>> tolerance) =>
         JsonSerializer.Serialize(
             tolerance.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     kv => kv.Key,
-                    kv => new
-                    {
-                        kv.Value.RequestMaxRetries,
-                        kv.Value.StreamMaxRetries,
-                        kv.Value.StreamIdleTimeoutMs,
-                        kv.Value.ApiTimeoutMs,
-                    },
+                    kv => kv.Value.OrderBy(ikv => ikv.Key, StringComparer.OrdinalIgnoreCase)
+                        .ToDictionary(ikv => ikv.Key, ikv => ikv.Value, StringComparer.OrdinalIgnoreCase),
                     StringComparer.OrdinalIgnoreCase),
             JsonOpts);
 
