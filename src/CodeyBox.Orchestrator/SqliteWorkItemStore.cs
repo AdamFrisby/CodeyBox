@@ -1052,7 +1052,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
                     {(int)WorkItemState.NeedsOperatorInput},
                     {(int)WorkItemState.WaitingForQuotaReset},
-                    {(int)WorkItemState.WaitingForAgentResume}
+                    {(int)WorkItemState.WaitingForAgentResume},
+                    {(int)WorkItemState.WaitingForTransientRetry}
                 )
                 ORDER BY
                     CASE
@@ -1150,6 +1151,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                   $inflight_needs_operator_input,
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
+                  $inflight_waiting_for_transient_retry,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -1188,6 +1190,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                   $inflight_needs_operator_input,
                   $inflight_waiting_for_quota_reset,
                   $inflight_waiting_for_agent_resume,
+                  $inflight_waiting_for_transient_retry,
                   $inflight_abandoned_after_recovery_attempts
               );
             """;
@@ -1212,6 +1215,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$inflight_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
         cmd.Parameters.AddWithValue("$inflight_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+        cmd.Parameters.AddWithValue("$inflight_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
         cmd.Parameters.AddWithValue("$inflight_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
     }
 

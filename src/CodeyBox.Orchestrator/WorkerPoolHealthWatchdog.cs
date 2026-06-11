@@ -215,7 +215,8 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             }
 
             var enqueueIds = condition.RunnableCandidates
-                .Where(static i => i.State != WorkItemState.WaitingForQuotaReset)
+                .Where(static i => i.State is not WorkItemState.WaitingForQuotaReset
+                    and not WorkItemState.WaitingForTransientRetry)
                 .Take(opts.MaxRecoveryEnqueueBatchSize)
                 .Select(i => i.Id);
             var enqueued = await _pool.TriggerDispatchRecoveryAsync(enqueueIds, ct);

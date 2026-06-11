@@ -278,6 +278,7 @@ builder.Services.AddSingleton(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var snapshot = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
     AgentClassesOverrideResolver.ApplyTo(snapshot, config);
+    AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(snapshot.TransientNetworkFailurePatterns);
     return new CodeyBoxOptionsStartupSnapshot(snapshot);
 });
 builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(

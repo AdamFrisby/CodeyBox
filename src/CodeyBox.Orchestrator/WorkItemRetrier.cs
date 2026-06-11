@@ -163,8 +163,9 @@ public sealed class WorkItemRetrier
         // Atomic conditional update to prevent race conditions.
         // We retry from Failed, AuditFailed, MergeConflictResolutionFailed,
         // Cancelled, AbandonedAfterRecoveryAttempts, NeedsOperatorInput, or
-        // WaitingForQuotaReset. Eligibility gates that must apply across HTTP,
-        // scheduler, and operator paths live in this retrier before the write.
+        // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
+        // that must apply across HTTP, scheduler, and operator paths live in
+        // this retrier before the write.
         var updated = await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {

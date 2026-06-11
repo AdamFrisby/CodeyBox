@@ -183,6 +183,21 @@ public sealed class BudgetEnforcementTests : IDisposable
     }
 
     [Fact]
+    public async Task CountInFlight_WaitingForTransientRetryWithStartedAt_NotCounted()
+    {
+        var item = MakeQueued() with
+        {
+            State = WorkItemState.WaitingForTransientRetry,
+            FailureKind = "transient",
+            StartedAt = DateTimeOffset.UtcNow,
+        };
+        await _store.CreateAsync(item);
+
+        var count = await _store.CountInFlightAsync(new ProjectId("proj-a"));
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
     public async Task CountInFlight_AllActiveStates_Counted()
     {
         var pid = new ProjectId("proj-multi");

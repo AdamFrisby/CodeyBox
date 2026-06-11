@@ -127,7 +127,9 @@ internal static class TestSupport
         // passes claudeSessionOptions (legacy shape), its Enabled flag is
         // projected into AgentSessionDispatchOptions at the seam below so
         // existing test signatures keep working.
-        AgentSessionDispatchOptions? sessionDispatchOptions = null)
+        AgentSessionDispatchOptions? sessionDispatchOptions = null,
+        AutoRetryOnTransientFailureOptions? transientRetryOptions = null,
+        TimeProvider? retryTimeProvider = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -187,6 +189,30 @@ internal static class TestSupport
             AgentAllowedHosts = [],
             HostGitIdentity = hostGitIdentity,
         };
+        QuotaRetryScheduler? retryScheduler = null;
+        if (transientRetryOptions is not null)
+        {
+            var retryOptions = new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions { Enabled = false },
+                AutoRetryOnTransientFailure = transientRetryOptions,
+            };
+            var retrier = new WorkItemRetrier(
+                pipelineStore,
+                queue,
+                gitHost,
+                NullLogger<WorkItemRetrier>.Instance,
+                projects: projects);
+            retryScheduler = new QuotaRetryScheduler(
+                pipelineStore,
+                retrier,
+                retryOptions,
+                NullLogger<QuotaRetryScheduler>.Instance,
+                projects: projects,
+                webhooks: webhookDispatcher,
+                timeProvider: retryTimeProvider,
+                transientRetryOptionsAccessor: () => transientRetryOptions);
+        }
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
@@ -209,6 +235,7 @@ internal static class TestSupport
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
             }),
+            retryScheduler: retryScheduler,
             preMergeVerifier: preMergeVerifier,
             incrementalRebase: incrementalRebase,
             pipelineTuning: pipelineTuning,
@@ -241,7 +268,7 @@ internal static class TestSupport
                     ? null
                     : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)));
 
-        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
+        return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement, retryScheduler);
     }
 }
 
@@ -255,10 +282,12 @@ internal sealed class TestPipeline : IDisposable
     public string GitRoot { get; }
     public ITaskQueue Queue { get; }
     public IAgentInvolvementStore? Involvement { get; }
+    public QuotaRetryScheduler? RetryScheduler { get; }
 
     public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot,
         ITaskQueue? queue = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        QuotaRetryScheduler? retryScheduler = null)
     {
         Pipeline = pipeline;
         Store = store;
@@ -267,9 +296,14 @@ internal sealed class TestPipeline : IDisposable
         GitRoot = gitRoot;
         Queue = queue ?? new InMemoryTaskQueue();
         Involvement = involvement;
+        RetryScheduler = retryScheduler;
     }
 
-    public void Dispose() => Store.Dispose();
+    public void Dispose()
+    {
+        RetryScheduler?.Dispose();
+        Store.Dispose();
+    }
 }
 
 internal sealed class StaticCredentialProvider : ICredentialProvider
@@ -374,6 +408,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
+    public Queue<AgentResult> WorkResults { get; } = new();
     public Queue<Func<IReadOnlyList<ConflictResolverFile>, IReadOnlyDictionary<string, string>>> ConflictResolutionPlan { get; } = new();
     /// <summary>
     /// Handlers invoked when the scripted agent recognises the conflict-rework
@@ -749,6 +784,9 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         WorkPrompts.Add(prompt);
         if (BeforeWorkAsync is not null)
             await BeforeWorkAsync(sandbox, workingDirectory, ct);
+
+        if (WorkResults.Count > 0)
+            return WorkResults.Dequeue();
 
         if (WorkPlan.Count == 0)
             throw new InvalidOperationException("ScriptedAgent: ran out of work-phase plan entries");

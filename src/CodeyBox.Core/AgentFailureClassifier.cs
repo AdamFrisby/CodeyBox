@@ -22,6 +22,8 @@ public static class AgentFailureClassifier
     public const string HardQuotaReason = "hard quota pattern matched";
     public const string SoftRateLimitReason = "soft rate-limit pattern matched";
 
+    private const int MaxStructuredOutputLineChars = 64 * 1024;
+
     /// <summary>
     /// Quota / capacity exhaustion shapes where an immediate same-agent resume
     /// would almost certainly re-fail.
@@ -301,10 +303,14 @@ public static class AgentFailureClassifier
         if (string.IsNullOrWhiteSpace(output))
             return false;
 
-        foreach (var rawLine in output.Split('\n'))
+        using var reader = new StringReader(output);
+        string? rawLine;
+        while ((rawLine = reader.ReadLine()) is not null)
         {
             var line = rawLine.Trim();
-            if (line.Length == 0 || line[0] != '{')
+            if (line.Length == 0
+                || line.Length > MaxStructuredOutputLineChars
+                || line[0] != '{')
                 continue;
 
             try

@@ -1745,11 +1745,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
-        // WaitingForQuotaReset is owned by QuotaRetryScheduler; the periodic
-        // sweep re-enqueues when any member becomes available. Treat it as a
-        // resting point on startup so a routine restart doesn't burn a recovery
-        // credit or jump the queue.
-        if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
+        // Scheduler/operator parked states are resting points on startup:
+        // a routine restart must not burn a recovery credit or jump the queue.
+        // Parked items are resumed by their scheduler or operator path; running
+        // them here would repeat the condition that parked them.
+        if (item.State is WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry)
             return null;
 
         WorkItemState? targetState = WorkItemRecoveryPolicy.MapToRecoveryState(item.State);
@@ -1813,19 +1815,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return;
         }
 
-        // Items parked waiting for quota to reset must not be processed.
-        // The quota retry scheduler will re-enqueue when any class member becomes
-        // available again; running here would just repeat the exhaustion that
-        // got us into this state.
-        if (item.State is WorkItemState.WaitingForQuotaReset)
+        if (item.State is WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForAgentResume
+            or WorkItemState.WaitingForTransientRetry)
         {
-            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForQuotaReset", workerIndex, id);
-            ClearPreStartRefactorDrainClaim(item);
-            return;
-        }
-        if (item.State is WorkItemState.WaitingForAgentResume)
-        {
-            _log.LogInformation("Worker {WorkerId} skipping {Id}: still WaitingForAgentResume", workerIndex, id);
+            _log.LogInformation("Worker {WorkerId} skipping {Id}: parked state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
             return;
         }
@@ -1897,7 +1891,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             item = current;
 
-            if (item.State is WorkItemState.WaitingForQuotaReset or WorkItemState.WaitingForAgentResume)
+            if (item.State is WorkItemState.WaitingForQuotaReset
+                or WorkItemState.WaitingForAgentResume
+                or WorkItemState.WaitingForTransientRetry)
             {
                 _log.LogInformation(
                     "Worker {WorkerId} skipping {Id} after active claim: parked state {State}",

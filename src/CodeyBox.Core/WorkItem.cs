@@ -588,19 +588,20 @@ public sealed record WorkItem
             : null;
         var carriesQuotaRetry = IsQuotaShapedState(state);
         var carriesTransientRetry =
-            state == WorkItemState.Failed
+            state == WorkItemState.WaitingForTransientRetry
             && string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase);
         var carriesTransientHistory =
-            state == WorkItemState.Failed
-            && (string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
+            (state == WorkItemState.WaitingForTransientRetry
+                && string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase))
+            || (state == WorkItemState.Failed
+                && string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
         var preservesTransientHistory = carriesTransientHistory || ShouldPreserveTransientRetryHistory(state);
 
         return this with
         {
             State = state,
             LastError = error,
-            // Both Failed("quota") and WaitingForQuotaReset are quota-shaped
+            // Failed("quota") and WaitingForQuotaReset are quota-shaped
             // states that must preserve FailureKind / QuotaResetAt /
             // NextQuotaRetryAt so the retry scheduler can re-arm timers
             // across host restarts.
@@ -638,7 +639,9 @@ public sealed record WorkItem
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
 
     private static bool IsFailureKindCarryingState(WorkItemState state) =>
-        state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
+        state is WorkItemState.Failed
+            or WorkItemState.WaitingForQuotaReset
+            or WorkItemState.WaitingForTransientRetry;
 
     private static bool IsCancellationSourceCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.Cancelled;
@@ -654,5 +657,6 @@ public sealed record WorkItem
             or WorkItemState.Merged
             or WorkItemState.UpstreamPushing
             or WorkItemState.ReworkingForConflict
+            or WorkItemState.WaitingForTransientRetry
             or WorkItemState.NeedsOperatorInput;
 }

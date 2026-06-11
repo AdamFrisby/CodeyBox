@@ -149,5 +149,8 @@ internal static class FleetEndpoints
             or (int)WorkItemState.Failed
             or (int)WorkItemState.Cancelled
             or (int)WorkItemState.AuditFailed
-            or (int)WorkItemState.MergeConflictResolutionFailed);
+            or (int)WorkItemState.MergeConflictResolutionFailed
+            or (int)WorkItemState.WaitingForQuotaReset
+            or (int)WorkItemState.WaitingForAgentResume
+            or (int)WorkItemState.WaitingForTransientRetry);
 }

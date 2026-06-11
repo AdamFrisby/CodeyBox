@@ -38,6 +38,17 @@ public sealed class MergeConflictReworkTests : IDisposable
         PushUpstream = false,
     };
 
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
+
     /// <summary>
     /// Load-bearing branch-preservation test. The conflict-rework iteration
     /// must start with the work branch checked out at its existing tip — NOT
@@ -431,6 +442,57 @@ public sealed class MergeConflictReworkTests : IDisposable
             await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
             r => r.Phase == "conflict_rework");
         Assert.Equal("failure:agent", conflictRow.Outcome);
+        Assert.NotNull(conflictRow.EndedAt);
+    }
+
+    [Fact]
+    public async Task ConflictRework_TransientAgentFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var involvement = new InMemoryAgentInvolvementStore();
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            involvement: involvement,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue((sandbox, workDir, ct) =>
+        {
+            _ = sandbox;
+            _ = workDir;
+            _ = ct;
+            return Task.FromResult(new AgentResult(
+                Success: false,
+                Summary: "transport closed",
+                Stdout: null,
+                Stderr: "Transport channel closed"));
+        });
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Equal(1, final.ConflictReworkAttempts);
+
+        var conflictRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "conflict_rework");
+        Assert.Equal("failure:transient", conflictRow.Outcome);
         Assert.NotNull(conflictRow.EndedAt);
     }
 

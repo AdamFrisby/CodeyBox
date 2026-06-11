@@ -148,6 +148,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         };
         var normal = NewTransientItem() with
         {
+            State = WorkItemState.Failed,
             FailureKind = "other",
             NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
         };
@@ -200,7 +201,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(firstFailedAt, retried.TransientRetryFirstFailedAt);
 
         var failedAgain = retried.With(
-            WorkItemState.Failed,
+            WorkItemState.WaitingForTransientRetry,
             "Agent claude reported transient transport failure again",
             failureKind: "transient");
         await fixture.Store.UpdateAsync(failedAgain);
@@ -235,9 +236,120 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
 
         var stored = await fixture.Store.GetAsync(item.Id);
         Assert.NotNull(stored);
-        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
         Assert.Equal(0, stored.TransientRetryAttempts);
         Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task NotifyTransientFailure_WhenDisabled_LeavesTransientFailureUnscheduled()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = false,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem();
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal("transient", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenDisabled_DoesNotRetryDueTransientFailure()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = false,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem() with { NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1) };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Theory]
+    [InlineData(1, 60)]
+    [InlineData(8, 300)]
+    public async Task NotifyTransientFailure_UsesMultiplierAndMaxDelayCap(int priorAttempts, int expectedDelaySeconds)
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(5),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 10,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem() with { TransientRetryAttempts = priorAttempts };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(expectedDelaySeconds), stored!.NextTransientRetryAt);
+    }
+
+    [Fact]
+    public async Task StartAsync_RearmsPersistedTransientRetryAndTargetedTimerRequeues()
+    {
+        var gitHost = new RecordingGitHost { Ahead = false };
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            PeriodicCheckInterval = TimeSpan.FromMinutes(10),
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        }, gitHost: gitHost);
+        var item = NewTransientItem() with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddMinutes(1),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.StartAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(1));
+
+        var retried = await WaitForAsync(
+            async () => (await fixture.Store.GetAsync(item.Id))?.State == WorkItemState.Queued);
+        Assert.True(retried);
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(1, stored!.TransientRetryAttempts);
+        Assert.Equal(item.Id, await fixture.Queue.DequeueAsync(CancellationToken.None));
+
+        await fixture.Scheduler.StopAsync(CancellationToken.None);
     }
 
     private SchedulerFixture BuildScheduler(
@@ -290,11 +402,25 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         ProjectId = TestProjectId,
         Title = "Transient retry",
         Prompt = "retry after transient transport failure",
-        State = WorkItemState.Failed,
+        State = WorkItemState.WaitingForTransientRetry,
         LastError = "Agent claude reported transient transport failure",
         FailureKind = "transient",
         PushUpstream = false,
     };
+
+    private async Task<bool> WaitForAsync(Func<Task<bool>> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+                return true;
+            _time.Advance(TimeSpan.Zero);
+            await Task.Delay(20);
+        }
+
+        return await condition();
+    }
 
     private sealed record SchedulerFixture(
         SqliteWorkItemStore Store,

@@ -1,4 +1,13 @@
+using CodeyBox.Api;
 using CodeyBox.Core;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -10,6 +19,7 @@ namespace CodeyBox.Tests;
 /// every class member on a task no agent can complete; the inverse would
 /// silently fail items that a fallback could have rescued.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AgentFailureClassifierTests
 {
     [Theory]
@@ -228,6 +238,49 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
+    public void ProgramWiresTransientNetworkFailurePatternsFromConfigAndReload()
+    {
+        var root = Directory.CreateTempSubdirectory("codeybox-transient-patterns-").FullName;
+        var source = new ReloadableMemorySource
+        {
+            Data = BuildProgramConfig(root, "operator initial transport marker"),
+        };
+
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+            using var factory = new TransientPatternWiringFactory(source);
+            var monitor = factory.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+
+            Assert.Contains(
+                "operator initial transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+
+            source.TriggerReload(BuildProgramConfig(root, "operator reloaded transport marker"));
+            Assert.Contains(
+                "operator reloaded transport marker",
+                monitor.CurrentValue.TransientNetworkFailurePatterns);
+            Assert.Equal(
+                AgentFailureKind.TransientNetwork,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator reloaded transport marker").Kind);
+            Assert.Equal(
+                AgentFailureKind.Normal,
+                AgentFailureClassifier.Classify(stderr: "fatal: operator initial transport marker").Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
         // A 429-with-ECONNRESET-tail must classify as quota — falling back to
@@ -320,5 +373,72 @@ public sealed class AgentFailureClassifierTests
             Action<string>? stdoutChunkCallback = null,
             bool captureStructuredStream = false)
             => throw new NotSupportedException("test fixture only");
+    }
+
+    private static Dictionary<string, string?> BuildProgramConfig(string root, string pattern) => new()
+    {
+        ["CodeyBox:DangerouslyDisableAuth"] = "true",
+        ["CodeyBox:StateDatabasePath"] = Path.Combine(root, "state.db"),
+        ["CodeyBox:GitRootDirectory"] = Path.Combine(root, "git"),
+        ["CodeyBox:AuditLog:Path"] = Path.Combine(root, "logs", "api-.json"),
+        ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(root, "logs", "audit-.json"),
+        ["CodeyBox:AgentStreams:Path"] = Path.Combine(root, "agent-streams"),
+        ["CodeyBox:TransientNetworkFailurePatterns:0"] = pattern,
+    };
+
+    private sealed class TransientPatternWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public TransientPatternWiringFactory(ReloadableMemorySource source) => _source = source;
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                cfg.Add(_source);
+            });
+            builder.ConfigureTestServices(services => services.RemoveAll<IHostedService>());
+        }
+    }
+
+    private sealed class ReloadableMemorySource : IConfigurationSource
+    {
+        public Dictionary<string, string?> Data { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public ReloadableMemoryProvider? Provider { get; private set; }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            Provider = new ReloadableMemoryProvider(this);
+            return Provider;
+        }
+
+        public void TriggerReload(Dictionary<string, string?> next)
+        {
+            Data = new Dictionary<string, string?>(next, StringComparer.OrdinalIgnoreCase);
+            Provider!.ReloadFromSource();
+        }
+    }
+
+    private sealed class ReloadableMemoryProvider : ConfigurationProvider
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public ReloadableMemoryProvider(ReloadableMemorySource source)
+        {
+            _source = source;
+            ReloadFromSource();
+        }
+
+        public override void Load() { }
+
+        public void ReloadFromSource()
+        {
+            Data = new Dictionary<string, string?>(_source.Data, StringComparer.OrdinalIgnoreCase);
+            OnReload();
+        }
     }
 }

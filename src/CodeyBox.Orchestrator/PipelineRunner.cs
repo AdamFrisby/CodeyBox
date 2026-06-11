@@ -1577,7 +1577,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 ex.Phase ?? "(unknown)",
                 ex.Agent.Value,
                 ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "transient");
+            await TransitionWaitingForTransientRetryAsync(item, ex, project);
         }
         catch (SandboxDiskDeferredException)
         {
@@ -3887,7 +3887,7 @@ public sealed class PipelineRunner : IPipelineRunner
         catch (TerminalTransientNetworkError ex)
         {
             _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "transient");
+            await TransitionWaitingForTransientRetryAsync(item, ex, project);
         }
         catch (Exception ex)
         {
@@ -9575,6 +9575,7 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         TerminalQuotaError => "failure:quota",
         AuditorIdleTimeoutException => "failure:timeout",
+        TerminalTransientNetworkError => "failure:transient",
         AgentAttemptTimeoutException => "failure:timeout",
         OperationCanceledException => "failure:cancelled",
         _ => "failure:agent",
@@ -11484,6 +11485,17 @@ public sealed class PipelineRunner : IPipelineRunner
                 priorWorkTip, baseTip, conflictFiles, originalFailure,
                 ct, hostShutdownToken);
         }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning(ex,
+                "Conflict rework agent invocation hit transient transport failure for work item {Id}: {Message}",
+                item.Id, ex.Message);
+            await PublishConflictReworkFinishedAsync(item, project, baseBranch, workBranch,
+                success: false, newTip: null, filesChanged: null,
+                insertions: null, deletions: null, semanticIncompatible: null,
+                parkReason: ex.Message, ct);
+            throw;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
             && ex is not AgentPausedException)
@@ -11808,8 +11820,11 @@ public sealed class PipelineRunner : IPipelineRunner
             // legitimately exits non-zero to signal it — so it must be checked
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
+            var transientFailure = !agentResult.Success
+                && runner.ClassifyFailure(agentResult).Kind == AgentFailureKind.TransientNetwork;
             await FinalizeInvolvementAsync(conflictInvolvementId,
                 semanticIncompatible is not null ? "failure:semantic-incompatible"
+                : transientFailure ? "failure:transient"
                 : !agentResult.Success ? "failure:agent"
                 : "success");
             if (semanticIncompatible is not null)
@@ -11824,6 +11839,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
             if (!agentResult.Success)
             {
+                ThrowIfTransientAgentFailure(runner, agentResult, ConflictReworkPhaseKey);
                 return new ConflictReworkAgentOutcome(
                     AgentSucceeded: false,
                     NewTip: null,
@@ -13149,6 +13165,12 @@ Original merge-phase failure (for context):
 
     private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
     {
+        if (string.Equals(failureKind, "transient", StringComparison.OrdinalIgnoreCase))
+        {
+            await TransitionWaitingForTransientRetryAsync(item, error, project, phase: null, agent: item.Agent);
+            return;
+        }
+
         await RunBoundedPostAgentAsync(item.Id, "transition-failed", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
@@ -13190,11 +13212,6 @@ Original merge-phase failure (for context):
             {
                 await _retryScheduler.NotifyQuotaFailureAsync(next);
             }
-            else if (failureKind == "transient" && _retryScheduler is not null)
-            {
-                await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
-            }
-
             _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
             AuditLog.WorkItemFailed(item.Id, error);
             var effectiveProject = project ?? new Project
@@ -13432,6 +13449,66 @@ Original merge-phase failure (for context):
             pausedAgent,
             CancellationToken.None);
 
+    private Task TransitionWaitingForTransientRetryAsync(
+        WorkItem item,
+        TerminalTransientNetworkError ex,
+        Project? project)
+        => TransitionWaitingForTransientRetryAsync(item, ex.Message, project, ex.Phase, ex.Agent);
+
+    private async Task TransitionWaitingForTransientRetryAsync(
+        WorkItem item,
+        string error,
+        Project? project,
+        string? phase,
+        AgentKind? agent)
+    {
+        var ct = CancellationToken.None;
+        await RunBoundedPostAgentAsync(item.Id, "transition-waiting-for-transient-retry", ct, async transitionCt =>
+        {
+            var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
+            var next = current.With(
+                WorkItemState.WaitingForTransientRetry,
+                error,
+                failureKind: "transient");
+
+            var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
+            if (!updated)
+            {
+                _log.LogInformation(
+                    "Work item {Id} state changed concurrently; skipping WaitingForTransientRetry transition",
+                    item.Id);
+                return;
+            }
+
+            if (_retryScheduler is not null)
+                await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
+
+            var scheduled = await _store.GetAsync(item.Id, transitionCt) ?? next;
+            AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForTransientRetry.ToString());
+            var effectiveProject = project ?? new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = item.ProjectId.Value,
+                RepositoryUrl = string.Empty,
+            };
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.waiting_for_transient_retry",
+                WorkItem = scheduled,
+                Project = effectiveProject,
+                Details = new
+                {
+                    workItemId = item.Id.ToString(),
+                    phase,
+                    agent = agent?.Value,
+                    reason = error,
+                    nextRetryAt = scheduled.NextTransientRetryAt,
+                    attempts = scheduled.TransientRetryAttempts,
+                },
+            }, CancellationToken.None);
+        });
+    }
+
     private async Task TransitionWaitingForQuotaResetAsync(
         WorkItem item,
         string error,
@@ -13560,6 +13637,7 @@ Original merge-phase failure (for context):
         WorkItemState.Cancelled => "work_item.cancelled",
         WorkItemState.NeedsOperatorInput => "work_item.needs_operator_input",
         WorkItemState.WaitingForQuotaReset => "work_item.waiting_for_quota_reset",
+        WorkItemState.WaitingForTransientRetry => "work_item.waiting_for_transient_retry",
         _ => $"work_item.{state.ToString().ToLowerInvariant()}",
     };
 

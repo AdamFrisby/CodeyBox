@@ -273,6 +273,36 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkPhaseTransientAgentFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-transport");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task WorkBranchEqualsBaseBranch_FailsBeforeSandbox()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -361,6 +391,17 @@ public sealed class PipelineIntegrationTests : IDisposable
         var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
         return stdout.Trim();
     }
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
 
     private static WorkItem NewItem(string workBranch) => new()
     {
