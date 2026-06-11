@@ -50,7 +50,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public void CloudInit_BaselineManifestRendersInstallCommandsIntoUserData()
+    public void CloudInit_BaselineManifestRendersHashEntryIntoUserData()
     {
         var installer = "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin";
         var cloudInit = MultipassSandboxProvider.BuildCloudInit(
@@ -60,19 +60,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             baselineInstallCommands: [installer]);
 
         Assert.Contains("path: /var/lib/codeybox/baseline-install-commands.sh", cloudInit);
-        Assert.Contains(installer, cloudInit);
 
-        // Structural check: the cloud-init must be valid YAML AND the install
-        // command must actually be nested inside the manifest's write_files
-        // content block — not just present somewhere as a substring. The
-        // regression that motivated this whole feature was an
-        // extra-cloud-init runcmd entry that *looked* present (substring
-        // match) but rendered outside its intended block due to bad
-        // indentation, so cloud-init silently dropped it. A pure substring
-        // check would not have caught that shape.
+        // Structural check: the cloud-init must be valid YAML AND the manifest
+        // entry must be nested inside the write_files content block, not just
+        // present as a substring. The original regression this test guards is
+        // an entry that *looked* present but rendered outside its intended
+        // block due to bad indentation — cloud-init silently drops it. The
+        // post-redactor design persists only step ordering and a SHA-256 of
+        // each configured command (the command text would otherwise leak
+        // operator secrets into the LLM-controlled clone disk), so we assert
+        // on the hash entry, not the installer string.
         var manifest = ExtractWriteFilesEntryContent(cloudInit, "/var/lib/codeybox/baseline-install-commands.sh");
-        Assert.Contains(installer, manifest);
         Assert.StartsWith("#!/bin/bash", manifest, StringComparison.Ordinal);
+        Assert.DoesNotContain(installer, manifest);
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var expected = Convert.ToHexString(
+            sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(installer))).ToLowerInvariant();
+        Assert.Contains($"sha256={expected}", manifest);
     }
 
     /// <summary>
@@ -126,58 +130,53 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public void CloudInit_BaselineManifestRedactsSecretShapedTokens()
+    public void CloudInit_BaselineManifestPersistsHashesNotCommandText()
     {
         // The manifest is persisted to /var/lib/codeybox/baseline-install-commands.sh
-        // inside the baked baseline, then inherited by every clone. Raw install
-        // commands can carry operator-supplied registry tokens, basic-auth
-        // URLs, or env-assigned API keys — keeping those out of the manifest
-        // image avoids leaking them into every LLM-controlled VM disk.
+        // inside the baked baseline, then inherited by every (LLM-controlled)
+        // clone. Raw install commands routinely carry registry tokens, basic-
+        // auth URLs, or env-assigned API keys — including QUOTED forms
+        // (`GITHUB_TOKEN="ghp_..."`, `--token 'npm_...'`) that a regex
+        // redactor cannot reliably scrub. We persist ONLY a SHA-256 of each
+        // configured command plus its step index; the command text itself is
+        // never written into the image.
+        var cmds = new[]
+        {
+            "npm install --registry https://my-registry.example/ --token=npm_abc123XYZdefSecretToken --save",
+            // Quoted env-var form — previously bypassed the redactor.
+            "GITHUB_TOKEN=\"ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee\" npm i -g something",
+            // Single-quoted CLI flag value — also bypassed the redactor.
+            "npm publish --token 'npm_QuotedSecretZ987YYY'",
+            "curl -fsSL https://user:p@ssword1@private.example/install.sh | bash",
+            "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\" https://api.example/install",
+        };
         var cloudInit = MultipassSandboxProvider.BuildCloudInit(
             extraRuncmd: null,
             extraCloudInit: null,
             includeGraphicalInstall: false,
-            baselineInstallCommands:
-            [
-                "npm install --registry https://my-registry.example/ --token=npm_abc123XYZdefSecretToken --save",
-                "curl -fsSL https://user:p@ssword1@private.example/install.sh | bash",
-                "GITHUB_TOKEN=ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee npm i -g something",
-                "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\" https://api.example/install",
-            ]);
+            baselineInstallCommands: cmds);
 
         var manifest = ExtractWriteFilesEntryContent(cloudInit, "/var/lib/codeybox/baseline-install-commands.sh");
 
+        // No secret material from any input — quoted or not — is in the manifest.
         Assert.DoesNotContain("npm_abc123XYZdefSecretToken", manifest);
-        Assert.DoesNotContain("p@ssword1", manifest);
         Assert.DoesNotContain("ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee", manifest);
+        Assert.DoesNotContain("npm_QuotedSecretZ987YYY", manifest);
+        Assert.DoesNotContain("p@ssword1", manifest);
         Assert.DoesNotContain("eyJhbGciOiJIUzI1NiJ9.payload.sig", manifest);
-        Assert.Contains("***REDACTED***", manifest);
-        // Structural shape preserved so the manifest is still diagnostic.
-        Assert.Contains("npm install --registry https://my-registry.example/", manifest);
-        Assert.Contains("GITHUB_TOKEN=***REDACTED***", manifest);
-        Assert.Contains("Authorization: Bearer ***REDACTED***", manifest);
-    }
+        // Command text itself is not persisted — not even the non-secret prefix.
+        Assert.DoesNotContain("npm install --registry", manifest);
+        Assert.DoesNotContain("npm publish", manifest);
+        Assert.DoesNotContain("Authorization: Bearer", manifest);
 
-    [Theory]
-    [InlineData(
-        "npm install --token=secret_token_abc --save",
-        "npm install --token=***REDACTED*** --save")]
-    [InlineData(
-        "curl https://user:secretpw@host.example/install",
-        "curl https://user:***REDACTED***@host.example/install")]
-    [InlineData(
-        "API_KEY=long_secret_value_here run",
-        "API_KEY=***REDACTED*** run")]
-    [InlineData(
-        "curl -H \"Authorization: Bearer abcDEF123\" https://x",
-        "curl -H \"Authorization: Bearer ***REDACTED***\" https://x")]
-    // Commands without secret-shaped tokens are left untouched.
-    [InlineData(
-        "apt-get install -y curl",
-        "apt-get install -y curl")]
-    public void RedactSecretLikeTokens_ScrubsCommonShapesAndLeavesOthersUntouched(string input, string expected)
-    {
-        Assert.Equal(expected, MultipassSandboxProvider.RedactSecretLikeTokens(input));
+        // Each configured command appears as a step entry with its SHA-256.
+        for (var i = 0; i < cmds.Length; i++)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var expected = Convert.ToHexString(
+                sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(cmds[i]))).ToLowerInvariant();
+            Assert.Contains($"step {i + 1} (configured index {i + 1}) sha256={expected}", manifest);
+        }
     }
 
     [Theory]

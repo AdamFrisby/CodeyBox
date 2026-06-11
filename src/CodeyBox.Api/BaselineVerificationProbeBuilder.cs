@@ -7,28 +7,40 @@ namespace CodeyBox.Api;
 
 /// <summary>
 /// Derives the post-bake binary-verification commands handed to the Multipass
-/// sandbox provider from the configured agent catalog. The set of agents that
-/// gets verified is taken from the same inputs the in-VM smoke coverage policy
-/// (<see cref="IInVmSmokeCoveragePolicy"/>) uses so the bake gate matches the
-/// router's exclusion/exemption decisions instead of installing a second,
-/// divergent rule. Concretely:
+/// sandbox provider from the configured agent catalog. The bake gate is the
+/// durable contract that a freshly cloned VM has every configured agent CLI
+/// on PATH; it MUST run regardless of runtime dispatch-smoke gating, because
+/// disabling smoke at runtime is a routing decision, not a permission to ship
+/// an incomplete baseline.
+///
+/// <para>Rule (each rule below is independent and intentionally simple — the
+/// audit history on this builder is a sequence of regressions caused by
+/// coupling bake to runtime gates):</para>
 ///
 /// <list type="bullet">
-/// <item>An agent on <see cref="InVmSmokeOptions.ExemptAgentsWithoutProbe"/> is
-/// skipped — the policy already lets it route past coverage; failing the bake
-/// on its absence would contradict the policy.</item>
-/// <item>An agent with no registered <see cref="IInVmSmokeProbe"/> is skipped —
-/// the coverage policy already benches it under the missing-probe source so the
-/// router does not dispatch to it. Hard-failing the bake on the same input
-/// would short-circuit that policy before it can warn or route around it.</item>
-/// <item>When smoke is globally disabled (<c>CodeyBox:Smoke:Enabled=false</c>)
-/// or in-VM smoke is off / has no probes, no verification commands are
-/// derived — the bake stays out of the dispatch gate's way.</item>
+/// <item>For every configured agent with a registered
+/// <see cref="IInVmSmokeProbe"/>, emit its credential-independent step. A
+/// registered probe ALWAYS supersedes any exemption list — that is what makes
+/// the bake check load-bearing for agents like Copilot whose default
+/// exemption is back-compat for operators who haven't installed the CLI yet
+/// but where a registered probe means the CLI <em>is</em> expected.</item>
+/// <item>For a configured agent with NO registered probe, fall back to the
+/// operator-controlled exemption list. An agent on that list is the
+/// explicit "no first-party sandbox CLI to verify" escape hatch and is
+/// skipped silently. An agent not on that list and with no probe is also
+/// skipped — there is no command we could run to verify it, and failing the
+/// bake on its absence would prevent every Multipass launch for a custom
+/// runner.</item>
 /// </list>
 ///
 /// <para>The builder still surfaces a hard error when a registered probe has
 /// no credential-independent step: that is a probe-shape bug, not a coverage
 /// decision.</para>
+///
+/// <para>Smoke options (<c>CodeyBox:Smoke:Enabled</c>,
+/// <c>CodeyBox:Smoke:InVm:Enabled</c>) are <em>intentionally</em> not consulted
+/// here. They gate runtime dispatch decisions; the bake-image integrity check
+/// is a separate concern and must hold even when those switches are off.</para>
 /// </summary>
 internal static class BaselineVerificationProbeBuilder
 {
@@ -36,63 +48,57 @@ internal static class BaselineVerificationProbeBuilder
         CodeyBoxOptions codeyBoxOptions,
         ProjectsOptions projectsOptions,
         IEnumerable<IInVmSmokeProbe> probes,
-        InVmSmokeOptions? inVmSmokeOptions = null,
-        SmokeOptionsSnapshot? smokeOptions = null)
+        InVmSmokeOptions? inVmSmokeOptions = null)
     {
-        // Master smoke switch off → don't build any verification commands. The
-        // dispatch gate is the canonical owner of "no smoke means we're not
-        // verifying anything"; mirroring it here keeps bakes coherent with
-        // dispatch.
-        if (smokeOptions is not null && !smokeOptions.Enabled)
-            return [];
-
         var probeList = probes.ToList();
-        var inVm = inVmSmokeOptions ?? new InVmSmokeOptions();
-
-        // In-VM smoke disabled or no probes registered → the coverage policy
-        // does not bench uncovered agents, so we should not fail the bake on
-        // them either.
-        if (!inVm.Enabled || probeList.Count == 0)
-            return [];
-
         var configuredAgents = CollectConfiguredAgents(codeyBoxOptions, projectsOptions);
         if (configuredAgents.Count == 0)
             return [];
 
         var probesByKind = probeList.ToDictionary(p => p.Kind.Value, StringComparer.OrdinalIgnoreCase);
-        var exempt = new HashSet<string>(inVm.ExemptAgentsWithoutProbe, StringComparer.OrdinalIgnoreCase);
+        // The exempt list is the operator's "this agent has no first-party CLI
+        // to verify" hatch. We read it from InVmSmokeOptions because that is
+        // where it is already configured, but we do NOT honour the in-VM
+        // Enabled flag — that flag governs runtime dispatch, not bake-image
+        // integrity. When no InVmSmokeOptions is supplied we fall back to its
+        // built-in defaults (currently exempts copilot for back-compat) rather
+        // than treating no-options as "exempt nothing".
+        var exempt = new HashSet<string>(
+            (inVmSmokeOptions ?? new InVmSmokeOptions()).ExemptAgentsWithoutProbe,
+            StringComparer.OrdinalIgnoreCase);
 
         var result = new List<MultipassBaselineVerificationCommand>(configuredAgents.Count);
         foreach (var agent in configuredAgents)
         {
-            // The exempt list is the policy's escape hatch for agents with no
-            // first-party sandbox CLI. Skip them so the bake does not require a
-            // binary the coverage policy says we don't need.
+            // A registered probe always wins. Checking probe registration BEFORE
+            // the exempt list is what makes a configured agent (e.g. Copilot)
+            // with a registered IInVmSmokeProbe actually get verified — the
+            // exemption is only the escape hatch for agents WITHOUT a probe.
+            if (probesByKind.TryGetValue(agent, out var probe))
+            {
+                var step = probe.BuildSteps(credential: null)
+                    .FirstOrDefault(s => s.Argv.Count > 0 && s.Stdin is null);
+                if (step is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Baseline verification cannot cover configured agent '{agent}': " +
+                        "its IInVmSmokeProbe has no credential-independent command.");
+                }
+
+                // The agent name is used as the verification command's diagnostic label.
+                // The sandbox layer does not interpret the label — it is surfaced in log
+                // lines and error messages so an operator can map a bake failure back to
+                // the agent that contributed the command.
+                result.Add(new MultipassBaselineVerificationCommand(agent, step.Argv, step.FailureHint));
+                continue;
+            }
+
+            // No probe registered for this agent. The exempt list expresses
+            // "the operator confirms no CLI to verify for this agent" — skip
+            // without failing the bake. Without the exemption we still skip,
+            // because there is no command we could run.
             if (exempt.Contains(agent))
                 continue;
-
-            if (!probesByKind.TryGetValue(agent, out var probe))
-            {
-                // Coverage policy already benches missing-probe agents under the
-                // dedicated source so the router routes past them. Failing the
-                // bake here would pre-empt that policy and prevent every
-                // Multipass launch — exactly the regression the audit flagged.
-                continue;
-            }
-
-            var step = probe.BuildSteps(credential: null).FirstOrDefault(s => s.Argv.Count > 0 && s.Stdin is null);
-            if (step is null)
-            {
-                throw new InvalidOperationException(
-                    $"Baseline verification cannot cover configured agent '{agent}': " +
-                    "its IInVmSmokeProbe has no credential-independent command.");
-            }
-
-            // The agent name is used as the verification command's diagnostic label.
-            // The sandbox layer does not interpret the label — it is surfaced in log
-            // lines and error messages so an operator can map a bake failure back to
-            // the agent that contributed the command.
-            result.Add(new MultipassBaselineVerificationCommand(agent, step.Argv, step.FailureHint));
         }
 
         return result;

@@ -422,13 +422,20 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             // entirely — both to avoid unnecessary work and to keep ordinary
             // Multipass provisioning insulated from any future bake-only fault
             // in the builder.
+            //
+            // Smoke options are intentionally NOT passed here: the bake gate
+            // verifies durable image integrity and must run regardless of the
+            // runtime smoke toggles (CodeyBox:Smoke:Enabled,
+            // CodeyBox:Smoke:InVm:Enabled), which only govern dispatch-time
+            // routing. The exempt-list flows through InVmSmokeOptions because
+            // that is its existing configuration home; the builder reads only
+            // ExemptAgentsWithoutProbe from it.
             var baselineVerificationCommands = live.MultipassUseBaselineImages
                 ? BaselineVerificationProbeBuilder.Build(
                     live,
                     projects,
                     sp.GetServices<IInVmSmokeProbe>(),
-                    sp.GetService<InVmSmokeOptions>(),
-                    sp.GetService<SmokeOptionsSnapshot>())
+                    sp.GetService<InVmSmokeOptions>())
                 : Array.Empty<MultipassBaselineVerificationCommand>();
             return new MultipassSandboxOptions
             {

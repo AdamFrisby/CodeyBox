@@ -66,9 +66,7 @@ public sealed class BaselineVerificationProbeBuilderTests
         var probes = BaselineVerificationProbeBuilder.Build(
             opts,
             projects,
-            AllProbes(),
-            // Opt copilot back in for this assertion — by default it is exempt.
-            new InVmSmokeOptions { ExemptAgentsWithoutProbe = [] });
+            AllProbes());
 
         var byAgent = probes.ToDictionary(p => p.Label, StringComparer.OrdinalIgnoreCase);
         Assert.Equal(
@@ -94,9 +92,10 @@ public sealed class BaselineVerificationProbeBuilderTests
     [Fact]
     public void Build_SkipsConfiguredAgentWithNoProbe_RatherThanThrowing()
     {
-        // Coverage policy already benches missing-probe agents under the
-        // dedicated source so the router routes past them. The builder must
-        // match that decision (skip), not pre-empt it by failing the bake.
+        // A configured custom agent with no IInVmSmokeProbe (e.g. "aider") has
+        // no first-party verification command we can run. Skip it — failing the
+        // bake on its absence would prevent every Multipass launch for that
+        // configuration.
         var opts = new CodeyBoxOptions
         {
             AgentClasses =
@@ -120,12 +119,15 @@ public sealed class BaselineVerificationProbeBuilderTests
     }
 
     [Fact]
-    public void Build_SkipsExemptAgentsWithoutProbe()
+    public void Build_RegisteredProbeWins_OverDefaultCopilotExemption()
     {
-        // Default ExemptAgentsWithoutProbe includes copilot. The exempt agent
-        // must not appear in the verification list even when it is configured
-        // — failing the bake on an exempt agent would directly contradict the
-        // coverage policy. Other configured agents are still verified.
+        // Regression: the default InVmSmokeOptions.ExemptAgentsWithoutProbe
+        // still names copilot for back-compat with operators who haven't
+        // installed the Copilot CLI. CopilotInVmSmokeProbe IS registered, so
+        // the bake gate must still cover Copilot — failing the bake when the
+        // copilot binary is missing is exactly what the audit asked for. The
+        // exempt list is the escape hatch for agents WITHOUT a probe, not a
+        // permission to drop verification when one is registered.
         var opts = new CodeyBoxOptions
         {
             AgentClasses =
@@ -146,16 +148,21 @@ public sealed class BaselineVerificationProbeBuilderTests
             opts,
             new ProjectsOptions(),
             AllProbes(),
-            new InVmSmokeOptions { ExemptAgentsWithoutProbe = [AgentKind.Copilot.Value] });
+            // Defaults: ExemptAgentsWithoutProbe contains "copilot".
+            new InVmSmokeOptions());
 
         var labels = probes.Select(p => p.Label).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        Assert.DoesNotContain(AgentKind.Copilot.Value, labels);
+        Assert.Contains(AgentKind.Copilot.Value, labels);
         Assert.Contains(AgentKind.Claude.Value, labels);
     }
 
     [Fact]
-    public void Build_ReturnsEmpty_WhenMasterSmokeSwitchOff()
+    public void Build_ExemptList_OnlyAppliesWhenNoProbeIsRegistered()
     {
+        // A configured agent with NO registered probe AND on the exempt list
+        // is skipped silently — the operator's explicit "no first-party CLI"
+        // hatch. A configured agent that IS on the exempt list but ALSO has a
+        // registered probe is still verified (registered probe wins).
         var opts = new CodeyBoxOptions
         {
             AgentClasses =
@@ -163,7 +170,12 @@ public sealed class BaselineVerificationProbeBuilderTests
                 new AgentClassOptions
                 {
                     Id = "x",
-                    Members = [new AgentMembershipOptions { Agent = AgentKind.Claude.Value }],
+                    Members =
+                    [
+                        new AgentMembershipOptions { Agent = "aider" },
+                        new AgentMembershipOptions { Agent = AgentKind.Copilot.Value },
+                        new AgentMembershipOptions { Agent = AgentKind.Claude.Value },
+                    ],
                 },
             ],
         };
@@ -172,15 +184,32 @@ public sealed class BaselineVerificationProbeBuilderTests
             opts,
             new ProjectsOptions(),
             AllProbes(),
-            new InVmSmokeOptions(),
-            new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false }));
+            new InVmSmokeOptions
+            {
+                // Both an agent with NO probe (aider) and one WITH a probe (copilot).
+                ExemptAgentsWithoutProbe = ["aider", AgentKind.Copilot.Value],
+            });
 
-        Assert.Empty(probes);
+        var labels = probes.Select(p => p.Label).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // aider has no probe AND is exempt → skipped silently.
+        Assert.DoesNotContain("aider", labels);
+        // copilot has a registered probe → verified despite being exempt.
+        Assert.Contains(AgentKind.Copilot.Value, labels);
+        Assert.Contains(AgentKind.Claude.Value, labels);
     }
 
     [Fact]
-    public void Build_ReturnsEmpty_WhenInVmSmokeDisabled()
+    public void Build_RunsRegardlessOfSmokeSettings()
     {
+        // The bake gate is the durable contract that a freshly cloned VM has
+        // every configured agent CLI on PATH. Runtime smoke toggles
+        // (CodeyBox:Smoke:Enabled, CodeyBox:Smoke:InVm:Enabled) only govern
+        // dispatch-time routing — they MUST NOT remove configured agents from
+        // the post-bake check. Pre-regression, disabling smoke produced an
+        // empty verification list and the bake reported "ready to clone" with
+        // a missing antigravity binary, reintroducing the exit-127 failure
+        // mode this work exists to prevent. The current builder ignores smoke
+        // options entirely; this test pins that contract.
         var opts = new CodeyBoxOptions
         {
             AgentClasses =
@@ -188,18 +217,26 @@ public sealed class BaselineVerificationProbeBuilderTests
                 new AgentClassOptions
                 {
                     Id = "x",
-                    Members = [new AgentMembershipOptions { Agent = AgentKind.Claude.Value }],
+                    Members =
+                    [
+                        new AgentMembershipOptions { Agent = AgentKind.Antigravity.Value },
+                        new AgentMembershipOptions { Agent = AgentKind.Claude.Value },
+                    ],
                 },
             ],
         };
 
+        // Even with the in-VM probe option flagged disabled (back when it was
+        // wired) the gate must still surface verification commands.
         var probes = BaselineVerificationProbeBuilder.Build(
             opts,
             new ProjectsOptions(),
             AllProbes(),
             new InVmSmokeOptions { Enabled = false });
 
-        Assert.Empty(probes);
+        var labels = probes.Select(p => p.Label).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.Contains(AgentKind.Antigravity.Value, labels);
+        Assert.Contains(AgentKind.Claude.Value, labels);
     }
 
     [Fact]

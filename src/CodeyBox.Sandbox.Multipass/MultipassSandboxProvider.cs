@@ -3151,13 +3151,35 @@ test "$work" = present && test "$exec_wrapper" = present
         return key.Length > 0;
     }
 
+    /// <summary>
+    /// Build the baseline-bake diagnostic manifest written into the baked
+    /// baseline image at <c>/var/lib/codeybox/baseline-install-commands.sh</c>.
+    /// <para>
+    /// The manifest carries ONLY step ordering and a SHA-256 fingerprint of
+    /// each configured command — it does NOT persist the command text. Raw
+    /// <see cref="MultipassSandboxOptions.ExtraRuncmd"/> entries routinely
+    /// carry operator-supplied registry tokens, basic-auth URLs, and
+    /// env-assigned API keys (including quoted forms like
+    /// <c>GITHUB_TOKEN="ghp_…"</c> or <c>--token 'npm_…'</c> that a regex
+    /// redactor cannot reliably scrub). The baked image is inherited by every
+    /// LLM-controlled clone, which has shell / tool access; a secret in the
+    /// manifest is recoverable from inside the VM. Persisting only hashes
+    /// removes the leak surface entirely while preserving the diagnostic value
+    /// — operators can hash their configured <c>MultipassExtraRuncmd</c>
+    /// entries with <c>sha256sum</c> and confirm step ordering by index.
+    /// </para>
+    /// </summary>
     private static string BuildBaselineInstallManifest(IReadOnlyList<string> commands)
     {
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("# Rendered by CodeyBox for baseline-bake diagnostics.");
-        sb.AppendLine("# The provider executes these commands once via multipass exec after cloud-init.");
-        sb.AppendLine("# Secret-shaped tokens have been redacted (***REDACTED***); see CodeyBox config for originals.");
+        sb.AppendLine("# Install commands run via cloud-init runcmd, not from this file.");
+        sb.AppendLine("# Command text is intentionally NOT persisted: install commands can");
+        sb.AppendLine("# carry registry tokens / basic-auth URLs / API keys, and this file is");
+        sb.AppendLine("# inherited by every cloned (LLM-controlled) agent VM. Each step lists");
+        sb.AppendLine("# only the SHA-256 of the configured command; cross-check against");
+        sb.AppendLine("# `sha256sum` of MultipassExtraRuncmd entries in your CodeyBox config.");
         var rendered = 0;
         for (var i = 0; i < commands.Count; i++)
         {
@@ -3166,51 +3188,16 @@ test "$work" = present && test "$exec_wrapper" = present
                 continue;
             rendered++;
             sb.AppendLine();
-            sb.AppendLine($"# step {rendered} (configured index {i + 1})");
-            sb.AppendLine(RedactSecretLikeTokens(cmd));
+            sb.AppendLine($"# step {rendered} (configured index {i + 1}) sha256={ComputeSha256Hex(cmd)}");
         }
         return sb.ToString();
     }
 
-    // Patterns that scrub the most common secret shapes seen in install
-    // commands: URL userinfo, common credential CLI flags / env var
-    // assignments, and Authorization-style headers. Conservative by design —
-    // it only redacts the *value*, leaving the surrounding command shape
-    // intact so a diagnostic-only manifest stays readable while not
-    // persisting raw tokens into every cloned VM image.
-    private static readonly System.Text.RegularExpressions.Regex[] SecretRedactionPatterns =
-    [
-        // URL userinfo: scheme://USER:SECRET@host -> scheme://USER:***REDACTED***@host
-        new(@"(?<prefix>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:@/]+:)[^\s@/]+(?<suffix>@)",
-            System.Text.RegularExpressions.RegexOptions.Compiled),
-        // CLI flag: --token=VALUE / --password=... / --api-key=... / --secret=... / --bearer=... / --auth=...
-        new(@"(?<prefix>--(?:[a-z0-9-]*-)?(?:token|password|passwd|secret|api[-_]?key|bearer|auth|access[-_]?key)\s*[=\s]\s*)(?<value>[^\s'""]+)",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase
-                | System.Text.RegularExpressions.RegexOptions.Compiled),
-        // Env-style: KEY=value where KEY ends in TOKEN/PASSWORD/SECRET/KEY/CREDS/AUTH/APIKEY
-        new(@"(?<prefix>\b[A-Z][A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|KEY|CREDS|CREDENTIALS?|AUTH|APIKEY)\s*=\s*)(?<value>[^\s'""]+)",
-            System.Text.RegularExpressions.RegexOptions.Compiled),
-        // Header: Authorization: Bearer XXXX or -H "X-Api-Key: YYY"
-        new(@"(?<prefix>(?:Authorization|X-[A-Za-z-]*(?:Token|Key|Auth)[A-Za-z-]*)\s*:\s*(?:Bearer\s+|Basic\s+|Token\s+)?)(?<value>[A-Za-z0-9._\-+/=]+)",
-            System.Text.RegularExpressions.RegexOptions.Compiled),
-    ];
-
-    internal static string RedactSecretLikeTokens(string command)
+    private static string ComputeSha256Hex(string value)
     {
-        if (string.IsNullOrEmpty(command))
-            return command;
-
-        var redacted = command;
-        foreach (var pattern in SecretRedactionPatterns)
-        {
-            redacted = pattern.Replace(redacted, match =>
-            {
-                var prefix = match.Groups["prefix"].Value;
-                var suffix = match.Groups["suffix"].Success ? match.Groups["suffix"].Value : string.Empty;
-                return $"{prefix}***REDACTED***{suffix}";
-            });
-        }
-        return redacted;
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     private static void AppendRuncmdCommand(StringBuilder sb, string cmd)
