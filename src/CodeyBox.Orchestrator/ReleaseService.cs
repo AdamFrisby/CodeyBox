@@ -584,7 +584,11 @@ public sealed class ReleaseService
                 var canCaptureStructuredStream = runner is not null
                     && auditor.Kind == "llm"
                     && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
-                var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
+                // Capture only for LLM-style auditors. Tool auditors don't run an
+                // agent through this codepath, so opening a capture file would
+                // leave an empty .jsonl on disk plus an empty
+                // agent_stream_summaries row.
+                var streamCapture = (auditor.Kind == "llm" && _agentStreams is not null && _agentStreams.Options.Enabled)
                     ? await BeginAgentStreamCaptureAsync(new WorkItemId(release.Id.Value), auditPhase, iteration, ct)
                     : null;
                 var ctx = new DeepAuditContext(

@@ -12,42 +12,19 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
     }
 
     /// <summary>
-    /// Google Antigravity CLI emits Claude-shaped or Gemini-shaped NDJSON events depending on
-    /// the gateway model (Gemini-backed vs. Claude-backed gateway model).
+    /// Antigravity (agy) emits NDJSON events shape-compatible with the
+    /// gateway model selected — claude-* gateway models produce literal
+    /// Anthropic stream-json, and gemini-* gateway models produce Gemini
+    /// stream-json. No antigravity-only marker exists in the on-wire shape
+    /// we can use to distinguish a real Claude run from an agy-via-claude
+    /// run, so this parser deliberately does not claim by shape. The
+    /// authoritative "this run was dispatched as agy" signal lives on the
+    /// cost row and the work item's <see cref="WorkItem.Agent"/>;
+    /// <see cref="AgentStreamParserSelection.ResolveKind"/> uses those for
+    /// kind attribution. Claiming shared shapes here would mis-attribute
+    /// real Claude streams as agent_kind=antigravity.
     /// </summary>
-    public override bool TryClaim(JsonElement line)
-    {
-        if (line.ValueKind != JsonValueKind.Object) return false;
-
-        // Both shapes carry a top-level "type" string
-        if (!line.TryGetProperty("type", out var typeProp)
-            || typeProp.ValueKind != JsonValueKind.String)
-            return false;
-
-        var type = typeProp.GetString();
-        if (type is not ("assistant" or "user" or "result" or "tool_use" or "tool_result"))
-            return false;
-
-        // Antigravity-specific indicators: presence of "model" at the top level or inside "message"
-        if (line.TryGetProperty("model", out _))
-            return true;
-
-        if (line.TryGetProperty("message", out var msg)
-            && msg.ValueKind == JsonValueKind.Object
-            && msg.TryGetProperty("model", out _))
-            return true;
-
-        // Or specific usage fields
-        if (line.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
-        {
-            if (usage.TryGetProperty("cache_creation_input_tokens", out _)
-                || usage.TryGetProperty("cache_read_input_tokens", out _)
-                || usage.TryGetProperty("cached_input_tokens", out _))
-                return true;
-        }
-
-        return false;
-    }
+    public override bool TryClaim(JsonElement line) => false;
 
     protected override ParsedEvent ParseEvent(JsonElement root)
     {

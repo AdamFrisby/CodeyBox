@@ -111,7 +111,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sandbox,
+            workingDirectory,
+            invocation,
+            stdoutChunkCallback,
+            captureStructuredStream,
+            ct,
             sessionResumeContext: CreateSessionResumeContext(
                 prompt,
                 credential,
@@ -171,7 +176,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             reasoningMode,
             captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sandbox,
+            workingDirectory,
+            invocation,
+            stdoutChunkCallback,
+            captureStructuredStream,
+            ct,
             sessionResumeContext: CreateSessionResumeContext(
                 prompt,
                 credential,
@@ -185,6 +195,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
         CancellationToken ct,
         SessionResumeRebuildContext? sessionResumeContext = null)
     {
@@ -199,7 +210,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         while (true)
         {
             last = await ExecuteInvocationOnceAsync(
-                sandbox, workingDirectory, current, stdoutChunkCallback, ct);
+                sandbox,
+                workingDirectory,
+                current,
+                stdoutChunkCallback,
+                captureStructuredStream,
+                ct);
             if (last.Success)
                 return last;
 
@@ -451,11 +467,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
         CancellationToken ct)
     {
         var runKey = AgentRunKey(sandbox, workingDirectory);
         var runId = Guid.NewGuid().ToString("N");
         ActiveAgentRunIds[runKey] = runId;
+        // Tee stderr into the stdout chunk channel only for plaintext-fallback
+        // runs. When the runner is emitting structured stream-json, mixing
+        // stderr lines into the same channel would interleave non-JSON noise
+        // into the JSONL capture file and break per-line JSON framing when
+        // chunks arrive split at non-newline boundaries from arbitrary
+        // sandbox threads (see SandboxExec docs). Plaintext runs benefit
+        // from stderr capture (agy / opencode emit diagnostics there) and
+        // there is no JSON framing to corrupt.
+        var stderrChunkCallback = captureStructuredStream ? null : stdoutChunkCallback;
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,
@@ -463,7 +489,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
-            StderrChunkCallback = stdoutChunkCallback,
+            StderrChunkCallback = stderrChunkCallback,
         };
 
         SandboxExecResult result;

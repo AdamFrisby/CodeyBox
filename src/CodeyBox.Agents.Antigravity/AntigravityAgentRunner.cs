@@ -19,7 +19,7 @@ namespace CodeyBox.Agents.Antigravity;
 /// per-model exhaustion key keeps failover scoped to the exhausted bucket
 /// without needing a separate "sub-subscription pool" subsystem.</para>
 /// </summary>
-public sealed class AntigravityAgentRunner : CliAgentRunnerBase
+public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
     public override AgentKind Kind => AgentKind.Antigravity;
 
@@ -30,6 +30,33 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
     /// <summary>Path to the agy binary inside the sandbox. Override only if
     /// the sandbox image installs it elsewhere.</summary>
     public string Binary { get; init; } = DefaultBinary;
+
+    /// <summary>
+    /// Probes <c>agy --help</c> for structured-stream support. The agy CLI is
+    /// shape-compatible with Claude Code (see <see cref="AntigravityCostExtractor"/>'s
+    /// comment about the terminal <c>type:result</c> NDJSON envelope), so when
+    /// the help text advertises <c>--output-format</c> with <c>stream-json</c>,
+    /// the runner asks for it on the next dispatch. If the flag is absent
+    /// (older agy build, or a release that pivots to a different schema), the
+    /// orchestrator falls back to plaintext capture via the runner's normal
+    /// stdout/stderr stream — captured all the same by AgentStreamStore — and
+    /// <see cref="AntigravityStreamParser"/> defers to the plaintext-fallback
+    /// summary path.
+    /// </summary>
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        var help = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = [Binary, "--help"],
+        }, ct).ConfigureAwait(false);
+
+        if (!help.Success)
+            return false;
+
+        var output = string.Concat(help.Stdout, "\n", help.Stderr);
+        return output.Contains("--output-format", StringComparison.Ordinal)
+            && output.Contains("stream-json", StringComparison.Ordinal);
+    }
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories =>
         // The agy binary stashes session state under ~/.gemini/antigravity-cli
@@ -89,7 +116,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildAgyInvocation(prompt, modelId, reasoningMode, resumeConversationId: null, useContinue: false);
+        => BuildAgyInvocation(prompt, modelId, reasoningMode, resumeConversationId: null, useContinue: false, captureStructuredStream);
 
     protected override AgentInvocation BuildResumeInvocation(
         string prompt,
@@ -110,7 +137,8 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
             modelId,
             reasoningMode,
             resumeConversationId: id,
-            useContinue: id is null);
+            useContinue: id is null,
+            captureStructuredStream: false);
     }
 
     private AgentInvocation BuildAgyInvocation(
@@ -118,7 +146,8 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
         string? modelId,
         string? reasoningMode,
         string? resumeConversationId,
-        bool useContinue)
+        bool useContinue,
+        bool captureStructuredStream)
     {
         // agy --print --dangerously-skip-permissions [...]: one-shot prompt
         // that auto-approves tool calls. The sandbox boundary is the real
@@ -139,6 +168,19 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
         {
             argv.Add("--model");
             argv.Add(modelId);
+        }
+
+        // captureStructuredStream is set by PipelineRunner when
+        // CanCaptureStructuredStreamAsync returned true — i.e.
+        // SupportsStructuredStreamAsync confirmed `agy --help` advertises
+        // the flag. Pass it through so the captured stream file is NDJSON
+        // (AntigravityCostExtractor / AntigravityStreamParser then extract
+        // the structured token usage). When false, agy emits its human-
+        // readable footer and the plaintext-fallback summariser takes over.
+        if (captureStructuredStream)
+        {
+            argv.Add("--output-format");
+            argv.Add("stream-json");
         }
 
         // Reasoning level is encoded in the model id for Antigravity (each

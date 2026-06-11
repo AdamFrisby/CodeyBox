@@ -8,6 +8,7 @@ using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
@@ -449,19 +450,18 @@ public sealed class AntigravityStreamParserTests
     ];
 
     [Fact]
-    public async Task SniffKindAsync_RecognizesAntigravityWithModelAndUsage()
+    public async Task SniffKindAsync_DoesNotClaimClaudeShape()
     {
-        await using var stream1 = StreamOf("""
-            {"type":"assistant","message":{"model":"claude-opus-4-6-thinking"}}
+        // Antigravity emits literal Claude shape for claude-* gateway models —
+        // there is no on-wire marker to disambiguate. The parser must NOT claim
+        // here; ResolveKind reaches Antigravity via cost rows / item.Agent.
+        await using var stream = StreamOf("""
+            {"type":"assistant","message":{"model":"claude-opus-4-6-thinking","usage":{"input_tokens":100,"cache_read_input_tokens":20}}}
             """);
-        var kind1 = await AgentStreamParserSelection.SniffKindAsync(stream1, TestParsers());
-        Assert.Equal(AgentKind.Antigravity, kind1);
-
-        await using var stream2 = StreamOf("""
-            {"type":"result","model":"gemini-3.5-flash-high","usage":{"prompt_tokens":5000,"cached_input_tokens":1000,"completion_tokens":420}}
-            """);
-        var kind2 = await AgentStreamParserSelection.SniffKindAsync(stream2, TestParsers());
-        Assert.Equal(AgentKind.Antigravity, kind2);
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
+        // With production registration order Claude wins the sniff race. The
+        // anti-regression is that the sniff result is NOT Antigravity.
+        Assert.NotEqual(AgentKind.Antigravity, kind);
     }
 
     [Fact]
@@ -512,20 +512,30 @@ public sealed class AntigravityStreamParserTests
 
 public sealed class CursorStreamParserTests
 {
-    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    private static IReadOnlyList<IAgentStreamParser> ProductionOrderParsers() =>
     [
+        new AntigravityStreamParser(),
+        new ClaudeStreamParser(),
         new CursorStreamParser(),
         new UnknownAgentStreamParser(),
     ];
 
     [Fact]
-    public async Task SniffKindAsync_RecognizesCursorEvents()
+    public async Task SniffKindAsync_DoesNotMisattributeCursorToClaude()
     {
+        // Cursor emits literal Claude shape. There is no on-wire marker to
+        // disambiguate, so CursorStreamParser deliberately doesn't claim by
+        // shape. Sniff returns Claude here (whichever provider parser claims
+        // first); ResolveKind then uses item.Agent / cost rows to land
+        // cursor work items in kind=cursor.
         await using var stream = StreamOf("""
             {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
             """);
-        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
-        Assert.Equal(AgentKind.Cursor, kind);
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrderParsers());
+        // Anti-regression: Cursor parser must NOT win on Claude-shape sniffing
+        // (was a bug pre-fix when its TryClaim was identical to Claude's, and
+        // would have flipped depending on registration order).
+        Assert.NotEqual(AgentKind.Cursor, kind);
     }
 
     [Fact]
@@ -558,7 +568,6 @@ public sealed class CursorStreamParserTests
 }
 
 public sealed class StallDetectionTests
-
 {
     [Fact]
     public async Task ParseAsync_RecordsToolExecutionStalls()
@@ -947,8 +956,13 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AnalyzeRecentTerminalWorkItemsAsync_TreatsKnownAgentFileWithoutRecognizedEventsAsUnsupported()
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_PreservesAgentKindAndCapturesTail()
     {
+        // A known agent kind (Claude) whose stream contains no recognised
+        // structured events should still produce a usable plaintext-fallback
+        // summary: the row keeps kind=claude (so dashboards still attribute
+        // the run) and carries a tail summary with line/byte counts. The
+        // observability black hole this rework was written to close.
         var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Claude };
         await _workItems.CreateAsync(item);
         WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
@@ -963,9 +977,50 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
-        Assert.Equal(new AgentKind("unknown"), row.AgentKind);
+        // Plaintext fallback preserves the originally-resolved kind so
+        // agent_kind=claude / antigravity / opencode rows still aggregate
+        // correctly under their dashboard buckets.
+        Assert.Equal(AgentKind.Claude, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        Assert.Contains("plaintext-fallback", row.Summary.FinalAssistantMessage);
+        Assert.Contains("lines=", row.Summary.FinalAssistantMessage);
         Assert.Empty(row.Summary.ToolCalls);
-        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_RawNonJsonStreamForOpencode()
+    {
+        // The keystone scenario: an agent whose CLI emits NO structured
+        // stream-json (opencode) writes plaintext stdout. Without the
+        // fallback, opencode rows would disappear (kind=unknown +
+        // IsUnsupported). Now they land with kind=opencode and a tail.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Opencode };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            "starting opencode run\n"
+            + "applying patch to /work/foo.ts\n"
+            + "ERROR: compile failed\n"
+            + "  Traceback: src/foo.ts:12\n"
+            + "done after 14.2s\n");
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new OpencodeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Opencode, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        // line/byte/error accounting surfaces in the summary header.
+        Assert.Contains("lines=5", row.Summary.FinalAssistantMessage);
+        Assert.Contains("errors=2", row.Summary.FinalAssistantMessage); // ERROR + Traceback
+        // Tail is preserved so an operator can see the final-output context.
+        Assert.Contains("done after 14.2s", row.Summary.FinalAssistantMessage);
     }
 
     [Fact]
@@ -1015,6 +1070,37 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         _workItems.Dispose();
         try { File.Delete(_dbPath); } catch { }
         try { Directory.Delete(_streamRoot, recursive: true); } catch { }
+    }
+}
+
+public sealed class AgentStreamParserProductionRegistrationTests
+{
+    /// <summary>
+    /// Mirrors the production order from Program.cs so the test sees the same
+    /// sniff outcome real dispatches do.
+    /// </summary>
+    private static IReadOnlyList<IAgentStreamParser> ProductionOrder() =>
+    [
+        new AntigravityStreamParser(),
+        new ClaudeStreamParser(),
+        new CodexStreamParser(),
+        new CursorStreamParser(),
+        new GeminiStreamParser(),
+        new OpencodeStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_ClaudeShape_AttributesToClaudeNotAntigravityOrCursor()
+    {
+        // Real Claude stream-json includes message.model = "claude-..." and
+        // usage.cache_read_input_tokens. Pre-fix this routed to Antigravity
+        // (registered first). It must now route to Claude.
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"assistant","message":{"id":"msg_01","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20}}}
+            """));
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrder());
+        Assert.Equal(AgentKind.Claude, kind);
     }
 }
 

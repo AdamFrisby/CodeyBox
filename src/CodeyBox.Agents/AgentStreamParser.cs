@@ -96,6 +96,7 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
 
         long lineCount = 0;
         long byteCount = 0;
+        var errorLineCount = 0;
         var lastLines = new System.Collections.Generic.List<string>();
 
         try
@@ -109,20 +110,31 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
 
                 if (!string.IsNullOrWhiteSpace(line))
                 {
+                    if (LooksLikeError(line))
+                        errorLineCount++;
                     lastLines.Add(line);
                     if (lastLines.Count > 10)
                         lastLines.RemoveAt(0);
                 }
             }
         }
-        catch
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Ignore stream errors during fallback reading
+            // Caller asked us to stop — propagate so cancellation is observable
+            // rather than silently returning a partial summary.
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Best-effort plaintext read; persist whatever we already collected
+            // rather than failing the analysis sweep on a stream-IO hiccup.
         }
 
+        // Prefer the caller-supplied accounting (which sees the full on-disk
+        // file size) over what we managed to read before any swallowed error.
         var finalLineCount = context?.LineCount ?? lineCount;
         var finalByteCount = context?.SizeBytes ?? byteCount;
-        var tail = lastLines.Count > 0 ? string.Join("\n", lastLines) : string.Empty;
+        var summary = BuildSummary(finalLineCount, finalByteCount, errorLineCount, lastLines);
 
         return new AgentStreamSummary(
             TotalDuration: duration,
@@ -133,10 +145,27 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
             EstimatedUsd: null,
             ToolCalls: Array.Empty<ToolCallInvocation>(),
             Stalls: Array.Empty<StallEvent>(),
-            FinalAssistantMessage: tail)
+            FinalAssistantMessage: summary)
         {
             IsUnsupported = false
         };
+    }
+
+    private static bool LooksLikeError(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        return line.Contains("error", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("fatal", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("panic", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("exception", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("traceback", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildSummary(long lineCount, long byteCount, int errorLineCount, IReadOnlyList<string> tail)
+    {
+        var header = $"[plaintext-fallback lines={lineCount} bytes={byteCount} errors={errorLineCount}]";
+        if (tail.Count == 0) return header;
+        return header + "\n" + string.Join("\n", tail);
     }
 }
 

@@ -4942,10 +4942,17 @@ public sealed class PipelineRunner : IPipelineRunner
         var auditPhase = $"audit-llm-{auditor.Name}";
         var canCaptureStructuredStream = auditor.Kind == "llm"
             && await CanCaptureStructuredStreamAsync(runner, sandbox, auditPhase, ct);
-        var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
+        // Capture only for LLM-style auditors. Tool auditors don't run an
+        // agent through this codepath (see IAuditor docs — tool auditors
+        // ignore AuditContext.StdoutChunkCallback), so opening a capture
+        // file would leave an empty .jsonl on disk plus an empty
+        // agent_stream_summaries row.
+        var streamCapture = (auditor.Kind == "llm" && _agentStreams is not null && _agentStreams.Options.Enabled)
             ? await BeginAgentStreamCaptureAsync(ctx.WorkItemId, auditPhase, ctx.Iteration, ct)
             : null;
-        var stdoutCallback = BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture);
+        var stdoutCallback = auditor.Kind == "llm"
+            ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
+            : null;
         // Force id-bearing structured output for resumable LLM auditors only
         // when the runner's session-resume contract requires it (see work-phase
         // comment).
