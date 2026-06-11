@@ -129,6 +129,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(source);
             if (result.Ok)
             {
                 entry.LastSmokePassedAt = now;
@@ -146,7 +147,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 return new AvailabilityTransition(
                     PreviouslyExcluded: wasExcluded,
                     NowExcluded: stillExcluded,
-                    Reason: entry.CombinedReason());
+                    Reason: entry.CombinedReason(),
+                    SourceChanged: hadSourceExclusion);
             }
 
             entry.LastSmokeFailedAt = now;
@@ -186,7 +188,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             return new AvailabilityTransition(
                 PreviouslyExcluded: wasExcluded,
                 NowExcluded: true,
-                Reason: entry.CombinedReason());
+                Reason: entry.CombinedReason(),
+                SourceChanged: !hadSourceExclusion);
         }
     }
 
@@ -228,7 +231,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 _log.LogWarning(
                     "Agent {Agent} excluded by fast-fail circuit breaker after {Count} consecutive sub-{Threshold}s failures",
                     kind.Value, entry.ConsecutiveFastFails, _opts.FastFailThresholdSeconds);
-                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+                return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason(), SourceChanged: true);
             }
 
             return new AvailabilityTransition(wasExcluded, wasExcluded, entry.CombinedReason());
@@ -314,10 +317,11 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.MissingProbe);
             entry.Exclusions[SmokeExclusionSource.MissingProbe] = reason;
             if (!wasExcluded)
                 _log.LogWarning("Agent {Agent} benched: {Reason}", kind.Value, reason);
-            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason());
+            return new AvailabilityTransition(wasExcluded, true, entry.CombinedReason(), SourceChanged: !hadSourceExclusion);
         }
     }
 

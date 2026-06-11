@@ -85,10 +85,20 @@ public sealed class AgentFailureClassifierTests
     [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
     [InlineData("not logged into agy; run `agy login`")]
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    [InlineData("http://localhost:3000/oauth-callback")]
-    public void LoginPromptPatterns_Classified_AsAuthRequired(string snippet)
+    public void LoginPromptPatterns_InStderr_Classified_AsAuthRequired(string snippet)
     {
-        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Fact]
+    public async Task LoginPromptTranscript_InStdout_Classified_AsAuthRequired()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: transcript);
+
         Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
@@ -100,6 +110,8 @@ public sealed class AgentFailureClassifierTests
     [InlineData("The endpoint requires Authentication required for users in role admin.")]
     [InlineData("If the user is not logged in we should redirect to /signin.")]
     [InlineData("Waiting for authentication to complete before issuing the JWT.")]
+    [InlineData("The OAuth callback endpoint is http://localhost:3000/oauth-callback.")]
+    [InlineData("Use https://accounts.google.com/o/oauth2/auth when implementing Google sign-in.")]
     public void GenericTaskResponse_NotClassified_AsAuthRequired(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);

@@ -2402,7 +2402,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     terminalRevisionBuilder: sp.GetRequiredService<IWorkItemTerminalRevisionBuilder>(),
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
-    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>()));
+    authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
+    authExclusionAvailability: sp.GetRequiredService<ISmokeAvailabilityRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

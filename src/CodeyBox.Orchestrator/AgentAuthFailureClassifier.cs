@@ -43,21 +43,27 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
-        foreach (var pattern in PatternsFor(kind))
+        var patterns = PatternsFor(kind).ToArray();
+
+        foreach (var pattern in patterns)
         {
             if (string.IsNullOrWhiteSpace(pattern.Pattern))
                 continue;
 
-            var inStderr = !string.IsNullOrEmpty(stderr)
-                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase);
-            var inStdout = !string.IsNullOrEmpty(stdout)
-                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase);
-            if (inStderr || inStdout)
+            if (!string.IsNullOrEmpty(stderr)
+                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
                 return new AgentFailureClassification(
                     AgentFailureKind.AuthRequired,
                     Reason: "auth/login prompt pattern matched");
             }
+        }
+
+        if (ContainsTrustedStdoutLoginTranscript(stdout))
+        {
+            return new AgentFailureClassification(
+                AgentFailureKind.AuthRequired,
+                Reason: "auth/login prompt pattern matched");
         }
 
         return null;
@@ -73,6 +79,20 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             foreach (var pattern in exact)
                 yield return pattern;
         }
+    }
+
+    private static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+
+        var hasLoginPrompt =
+            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
+        var hasWaitOrTimeout =
+            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
+        return hasLoginPrompt && hasWaitOrTimeout;
     }
 }
 

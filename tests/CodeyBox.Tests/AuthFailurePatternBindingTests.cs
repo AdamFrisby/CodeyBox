@@ -30,14 +30,14 @@ public sealed class AuthFailurePatternBindingTests
         });
 
         // Operator-supplied pattern fires under the configured agent kind only.
-        var hit = classifier.Detect(AgentKind.Antigravity, stderr: null, stdout: "agy says: needs login");
+        var hit = classifier.Detect(AgentKind.Antigravity, stderr: "agy says: needs login", stdout: null);
         Assert.NotNull(hit);
         Assert.Equal(AgentFailureKind.AuthRequired, hit.Kind);
 
         // …but the same string against another agent kind does NOT trip the
         // per-agent override (defaults still apply, so a default match would
         // still hit — but this string is not in the defaults).
-        Assert.Null(classifier.Detect(AgentKind.Codex, stderr: null, stdout: "agy says: needs login"));
+        Assert.Null(classifier.Detect(AgentKind.Codex, stderr: "agy says: needs login", stdout: null));
     }
 
     [Fact]
@@ -50,7 +50,7 @@ public sealed class AuthFailurePatternBindingTests
         var classifier = BindAndBuild([]);
 
         var hit = classifier.Detect(AgentKind.Antigravity, stderr: null,
-            stdout: "Authentication required. Please visit the URL to log in:");
+            stdout: "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...");
         Assert.NotNull(hit);
         Assert.Equal(AgentFailureKind.AuthRequired, hit.Kind);
     }
@@ -69,7 +69,7 @@ public sealed class AuthFailurePatternBindingTests
             ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "real-entry",
         });
 
-        Assert.NotNull(classifier.Detect(AgentKind.Antigravity, stderr: null, stdout: "real-entry"));
+        Assert.NotNull(classifier.Detect(AgentKind.Antigravity, stderr: "real-entry", stdout: null));
     }
 
     private static AgentAuthFailureClassifier BindAndBuild(Dictionary<string, string?> values)

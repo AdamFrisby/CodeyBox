@@ -528,6 +528,41 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthLoginPrompt_PublishesAlertEvenWhenAgentAlreadyExcludedByOtherSource()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        fix.Registry.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(false, "host probe already failed", TimeSpan.Zero, SmokeFailureCategory.Persistent),
+            SmokeExclusionSource.HostSmoke);
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("auth required from agent output", details.Reason);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("host probe already failed", availability.Reason);
+        Assert.Contains("auth required from agent output", availability.Reason);
+    }
+
+    [Fact]
     public async Task MergePhaseDirectAgentRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         // The merge-phase fix call site is decoupled from the work-phase call
@@ -844,6 +879,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
+            authExclusionAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, prober),
             terminalTransitions: terminalTransitions,
@@ -971,6 +1007,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
+            authExclusionAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions),
             terminalTransitions: terminalTransitions,
@@ -1086,6 +1123,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
+            authExclusionAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,

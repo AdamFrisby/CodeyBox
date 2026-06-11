@@ -124,12 +124,79 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         Assert.Contains(auditStore.Reports, r => r.AuditorName == "merge-security-review");
     }
 
+    [Fact]
+    public async Task PrimaryExit0AuthPromptThenFallbackSucceeds_PrimaryIsBenchedAndAlerted()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var codexAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+
+        // Exit-0 auth prompt with no tree changes: verification fails, then
+        // the resolver should advance to the fallback candidate.
+        claudeAgent.AgenticConflictResults.Enqueue(new AgentResult(true, "ok", transcript, null));
+        codexAgent.ConflictResolutionPlan.Enqueue(files =>
+        {
+            Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main branch change\nwork branch change\n",
+            };
+        });
+
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(), TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var webhooks = new CapturingWebhookDispatcher();
+        using var fix = BuildFixture(
+            seed,
+            [claudeAgent, codexAgent],
+            new CapturingAuditReportStore(),
+            webhooks,
+            availability,
+            new AgenticConflictResolver(
+                new AgenticConflictResolverOptionsSnapshot(
+                    new AgenticConflictResolverOptions
+                    {
+                        MaxIterations = 2,
+                        MaxAttemptsPerAgent = 1,
+                    })));
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(claudeAgent.AgenticConflictInvocations);
+        Assert.Single(codexAgent.AgenticConflictInvocations);
+
+        var availabilityVerdict = availability.GetAvailability(AgentKind.Claude);
+        Assert.False(availabilityVerdict.Available);
+        Assert.Contains("auth required from agent output", availabilityVerdict.Reason);
+        Assert.True(availability.GetAvailability(AgentKind.Codex).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("rebase-resolver", details.Reason);
+    }
+
     // ── Harness ────────────────────────────────────────────────────────────
 
     private CascadeFixture BuildFixture(
         string seedRepoUrl,
         IReadOnlyList<IAgentRunner> agents,
-        IAuditReportStore auditReportStore)
+        IAuditReportStore auditReportStore,
+        IWebhookDispatcher? webhooks = null,
+        AgentAvailabilityRegistry? availability = null,
+        AgenticConflictResolver? agenticConflictResolver = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -176,8 +243,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             Audit = new ProjectAudit { MaxIterations = 1 },
         };
         var projects = new InMemoryProjectRepository(project);
-        var webhooks = new NullWebhookDispatcher();
-        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
+        var webhookDispatcher = webhooks ?? new NullWebhookDispatcher();
+        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhookDispatcher, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes,
@@ -189,12 +256,15 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new TestUpstreamFactory(),
             new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
             store,
-            webhooks,
+            webhookDispatcher,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             auditQuotaOptions: quotaOptions,
             classRouter: router,
             auditReports: auditReportStore,
+            availability: availability,
+            authExclusionAvailability: availability,
+            agenticConflictResolver: agenticConflictResolver,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);

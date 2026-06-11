@@ -87,8 +87,15 @@ public interface IAgentAvailabilityReset
 /// <c>!PreviouslyExcluded &amp;&amp; NowExcluded</c> to fire "agent newly
 /// excluded" webhook events and <c>PreviouslyExcluded &amp;&amp; !NowExcluded</c>
 /// to fire "agent recovered" events without duplicates on steady state.
+/// <see cref="SourceChanged"/> is true when the specific mutator source
+/// changed state, even if the whole agent was already excluded by another
+/// source.
 /// </summary>
-public sealed record AvailabilityTransition(bool PreviouslyExcluded, bool NowExcluded, string? Reason);
+public sealed record AvailabilityTransition(
+    bool PreviouslyExcluded,
+    bool NowExcluded,
+    string? Reason,
+    bool SourceChanged = false);
 
 /// <summary>Per-agent state surfaced via the admin / concurrency endpoints.</summary>
 public sealed record AgentAvailabilitySnapshot(

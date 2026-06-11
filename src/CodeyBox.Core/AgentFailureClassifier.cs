@@ -122,9 +122,7 @@ public static class AgentFailureClassifier
         "Please visit the URL to log in",
         "Waiting for authentication (timeout",
         "authentication timed out",
-        "not logged into",
         "accounts.google.com/o/oauth2",
-        "/oauth-callback",
         "run `agy login`",
         "run `gemini auth login`",
         "run `agent login`",
@@ -278,7 +276,7 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAny(stderr, AuthRequiredPatterns) || ContainsAny(stdout, AuthRequiredPatterns))
+        if (ContainsAny(stderr, AuthRequiredPatterns) || ContainsTrustedStdoutAuthRequired(stdout))
             return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
@@ -434,5 +432,19 @@ public static class AgentFailureClassifier
 
         return ContainsAny(message, TransientNetworkPatterns)
             || ContainsAny(message, StructuredTurnFailedTimeoutPatterns);
+    }
+
+    private static bool ContainsTrustedStdoutAuthRequired(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+
+        var hasLoginPrompt =
+            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
+        var hasWaitOrTimeout =
+            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
+        return hasLoginPrompt && hasWaitOrTimeout;
     }
 }

@@ -106,8 +106,17 @@ public enum AgenticConflictResolverOperation
 /// one candidate ran so older/custom callers can still bench the specific
 /// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>
 /// (e.g. when a fallback candidate, not the original work runner, emitted a
-/// login prompt).
+/// login prompt). <see cref="AttemptOutputs"/> carries every candidate output
+/// so callers can attribute auth prompts to a losing fallback candidate without
+/// discarding a later successful resolution.
 /// </summary>
+public sealed record AgenticConflictResolverAttemptOutput(
+    IAgentRunner Runner,
+    string? Stdout,
+    string? Stderr,
+    bool AgentSucceeded,
+    bool ResolutionSucceeded);
+
 public sealed record AgenticConflictResolverResult(
     bool Success,
     string Summary,
@@ -117,7 +126,8 @@ public sealed record AgenticConflictResolverResult(
     int IterationsUsed,
     string? Stdout,
     string? Stderr,
-    IAgentRunner? LastAttemptedRunner = null)
+    IAgentRunner? LastAttemptedRunner = null,
+    IReadOnlyList<AgenticConflictResolverAttemptOutput>? AttemptOutputs = null)
 {
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
@@ -227,7 +237,8 @@ public sealed class AgenticConflictResolver
                 ConflictFiles: [],
                 IterationsUsed: 0,
                 Stdout: null,
-                Stderr: null);
+                Stderr: null,
+                AttemptOutputs: []);
         }
 
         foreach (var file in conflictFiles)
@@ -240,6 +251,7 @@ public sealed class AgenticConflictResolver
         var triedStrongest = false;
 
         var attemptTrail = new List<string>();
+        var attemptOutputs = new List<AgenticConflictResolverAttemptOutput>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
         IAgentRunner? lastAttemptedRunner = null;
@@ -410,6 +422,12 @@ public sealed class AgenticConflictResolver
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
+                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
+                        runner,
+                        ex.LastResult.Stdout,
+                        ex.LastResult.Stderr,
+                        AgentSucceeded: false,
+                        ResolutionSucceeded: false));
                     lastAgentResult = ex.LastResult;
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
@@ -425,6 +443,12 @@ public sealed class AgenticConflictResolver
                         $"threw {ex.GetType().Name}: {RedactText(ex.Message)}",
                         stdoutTail: null,
                         stderrTail: RedactAuditTail(ex.ToString()));
+                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
+                        runner,
+                        Stdout: null,
+                        Stderr: ex.ToString(),
+                        AgentSucceeded: false,
+                        ResolutionSucceeded: false));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {RedactAndTruncate(ex.Message, 200)})");
                     RecordFailureForClassification(
                         runner,
@@ -473,6 +497,12 @@ public sealed class AgenticConflictResolver
                         redactedSummary,
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
                         stderrTail: RedactAuditTail(agentResult.Stderr));
+                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
+                        runner,
+                        agentResult.Stdout,
+                        agentResult.Stderr,
+                        AgentSucceeded: false,
+                        ResolutionSucceeded: false));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {RedactAndTruncate(agentResult.Summary, 120)}; stderr: {RedactAndTruncate(agentResult.Stderr, 200)})");
                     RecordFailureForClassification(runner, candidate.Credential, agentResult, allowTransientBackoff: true);
@@ -483,6 +513,12 @@ public sealed class AgenticConflictResolver
                     sandbox, workingDirectory, conflictFiles, options, ct);
                 if (verification.Success)
                 {
+                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
+                        runner,
+                        agentResult.Stdout,
+                        agentResult.Stderr,
+                        AgentSucceeded: true,
+                        ResolutionSucceeded: true));
                     return new AgenticConflictResolverResult(
                         Success: true,
                         Summary: $"resolved by '{runner.Kind.Value}' on attempt {attempt}/{maxAttemptsPerAgent}",
@@ -492,20 +528,27 @@ public sealed class AgenticConflictResolver
                         IterationsUsed: totalIterations,
                         Stdout: agentResult.Stdout,
                         Stderr: agentResult.Stderr,
-                        LastAttemptedRunner: runner);
+                        LastAttemptedRunner: runner,
+                        AttemptOutputs: attemptOutputs.ToArray());
                 }
 
                 lastVerificationError = verification.Reason;
                 var redactedVerificationReason = RedactText(verification.Reason);
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(redactedVerificationReason, 200)})");
+                attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
+                    runner,
+                    agentResult.Stdout,
+                    agentResult.Stderr,
+                    AgentSucceeded: true,
+                    ResolutionSucceeded: false));
                 RecordFailureForClassification(
                     runner,
                     candidate.Credential,
                     new AgentResult(
                         false,
                         verification.Reason,
-                        Stdout: null,
-                        Stderr: null),
+                        Stdout: agentResult.Stdout,
+                        Stderr: agentResult.Stderr),
                     allowTransientBackoff: false);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
@@ -532,7 +575,8 @@ public sealed class AgenticConflictResolver
             IterationsUsed: totalIterations,
             Stdout: lastAgentResult?.Stdout,
             Stderr: lastAgentResult?.Stderr,
-            LastAttemptedRunner: lastAttemptedRunner)
+            LastAttemptedRunner: lastAttemptedRunner,
+            AttemptOutputs: attemptOutputs.ToArray())
         {
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,

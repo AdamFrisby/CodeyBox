@@ -416,6 +416,54 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthPromptDuringCheck_BenchesAgentAndFailsAsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var registry = NewAvailabilityRegistry();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: registry);
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        tp.Agent.CheckPlan.Enqueue(transcript);
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Auth check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-auth",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is the code vulnerable?",
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("check", final.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("check", details.Reason);
+    }
+
+    [Fact]
     public async Task YesVerdict_PublishesCheckFollowupEnqueuedWebhook()
     {
         // The orchestrator publishes work_item.check_followup_enqueued whenever
@@ -1046,6 +1094,63 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthPromptDuringPostActRecheck_BenchesAgentAndFailsAsInfrastructure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var registry = NewAvailabilityRegistry();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            availabilityRegistry: registry);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "issue remains", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check for issue",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-post-auth",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Is remediation required?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "attempted"));
+        tp.Agent.CheckPlan.Enqueue(transcript);
+
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Failed, finalFollowup!.State);
+        Assert.Equal("infrastructure", finalFollowup.FailureKind);
+        Assert.Contains("auth required from agent output", finalFollowup.LastError);
+        Assert.Contains("post-act-recheck", finalFollowup.LastError);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("post-act-recheck", details.Reason);
+    }
+
+    [Fact]
     public async Task PostActReValidation_AgentPausedAfterWork_ParksWithoutDispatchingRecheck()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1555,6 +1660,10 @@ public sealed class CheckAndActPipelineTests : IDisposable
             return Task.FromResult(_results.Dequeue());
         }
     }
+
+    private static AgentAvailabilityRegistry NewAvailabilityRegistry() =>
+        new(new AvailabilityOptions(), TimeProvider.System,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance);
 
     private sealed class RacingFollowupCreateStore : IWorkItemStore
     {

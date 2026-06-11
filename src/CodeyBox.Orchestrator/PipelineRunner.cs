@@ -84,6 +84,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly IAgentAvailabilityRegistry? _availability;
+    private readonly ISmokeAvailabilityRegistry? _authExclusionAvailability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentPauseController? _agentPauses;
     private readonly IAgentSupervisionService? _agentSupervision;
@@ -281,7 +282,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IWorkItemTerminalRevisionBuilder? terminalRevisionBuilder = null,
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
         IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
-        IAgentAuthFailureClassifier? authFailureClassifier = null)
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        ISmokeAvailabilityRegistry? authExclusionAvailability = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -355,6 +357,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
+        _authExclusionAvailability = authExclusionAvailability;
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
@@ -2436,6 +2439,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
                 foreach (var path in resolveResult.ConflictFiles)
                     conflictFiles.Add(path);
+
+                await HandleAgenticResolverAuthRequiredOutputAsync(
+                    item, project, "rebase-resolver", resolveResult);
 
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
                 {
@@ -5226,17 +5232,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
             RequiresStructuredStreamForSessionId: true,
         };
 
-    private async Task ThrowIfAuthRequiredOutputAsync(
+    private async Task<bool> HandleAuthRequiredOutputAsync(
         WorkItem item,
         Project project,
         AgentKind agent,
         string phase,
         string? stdout,
-        string? stderr)
+        string? stderr,
+        bool throwOnMatch)
     {
         var classification = _authFailureClassifier.Detect(agent, stderr, stdout);
         if (classification is null || classification.Kind != AgentFailureKind.AuthRequired)
-            return;
+            return false;
 
         var reason = SingleLineSummary(
             $"auth required from agent output during {phase}: {classification.Reason ?? "login prompt matched"}");
@@ -5248,24 +5255,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
 
-        AvailabilityTransition? transition = null;
-        if (_availability is ISmokeAvailabilityRegistry smokeRegistry)
-        {
-            // SmokeExclusionSource.AuthRequired is intentionally outside the
-            // smoke-gate taxonomy: if the operator disables the master smoke
-            // switch (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/
-            // MissingProbe exclusions are ignored at dispatch — but a real
-            // login prompt is authoritative evidence the binary is broken, not
-            // a probe verdict to second-guess, so AuthRequired survives the
-            // smoke-disabled gate via AgentAvailabilityRegistry.IsNonSmokeExclusion.
-            transition = smokeRegistry.MarkSmokeResult(
-                agent,
-                smokeResult,
-                SmokeExclusionSource.AuthRequired,
-                clearsFastFail: false);
-        }
+        // SmokeExclusionSource.AuthRequired is intentionally outside the
+        // smoke-gate taxonomy: if the operator disables the master smoke
+        // switch (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/
+        // MissingProbe exclusions are ignored at dispatch — but a real
+        // login prompt is authoritative evidence the binary is broken, not
+        // a probe verdict to second-guess, so AuthRequired survives the
+        // smoke-disabled gate via AgentAvailabilityRegistry.IsNonSmokeExclusion.
+        var transition = _authExclusionAvailability?.MarkSmokeResult(
+            agent,
+            smokeResult,
+            SmokeExclusionSource.AuthRequired,
+            clearsFastFail: false);
 
-        if (transition is null || (!transition.PreviouslyExcluded && transition.NowExcluded))
+        if (transition is null || transition.SourceChanged)
         {
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -5281,7 +5284,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }, CancellationToken.None);
         }
 
-        throw new AgentAuthRequiredException(agent, phase, reason);
+        if (throwOnMatch)
+            throw new AgentAuthRequiredException(agent, phase, reason);
+
+        return true;
+    }
+
+    private Task ThrowIfAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        string? stdout,
+        string? stderr)
+    {
+        return HandleAuthRequiredOutputAsync(
+            item, project, agent, phase, stdout, stderr, throwOnMatch: true);
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -5291,6 +5309,39 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         AgentResult result)
         => ThrowIfAuthRequiredOutputAsync(item, project, agent, phase, result.Stdout, result.Stderr);
+
+    private async Task HandleAgenticResolverAuthRequiredOutputAsync(
+        WorkItem item,
+        Project project,
+        string phase,
+        AgenticConflictResolverResult result)
+    {
+        var attempts = result.AttemptOutputs ?? [];
+        if (attempts.Count == 0)
+        {
+            var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
+            await ThrowIfAuthRequiredOutputAsync(item, project, emittingAgent, phase, result.Stdout, result.Stderr);
+            return;
+        }
+
+        foreach (var attempt in attempts)
+        {
+            // If the resolver ultimately succeeded, a failed earlier candidate's
+            // login prompt should bench that candidate and alert the operator,
+            // but it should not discard the fallback's valid resolution. A login
+            // prompt from the winning attempt, or any auth prompt in an overall
+            // failed resolver, remains a hard infrastructure failure.
+            var throwOnMatch = !result.Success || attempt.ResolutionSucceeded;
+            await HandleAuthRequiredOutputAsync(
+                item,
+                project,
+                attempt.Runner.Kind,
+                phase,
+                attempt.Stdout,
+                attempt.Stderr,
+                throwOnMatch);
+        }
+    }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
@@ -7230,11 +7281,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     if (IsLlmAgentExecutionFailure(run.Result))
                     {
                         await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                        await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
                         ThrowIfTransientAgentFailure(
                             run.Runner,
                             ToAgentResultForAuditFailureClassification(run.Result),
                             "audit");
-
                         _log.LogWarning(
                             "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
                             run.Auditor.Name);
@@ -7242,6 +7293,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     }
 
                     await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                    await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
 
                     // HARD INVARIANT: an auditor that could not RUN must surface as
                     // a transient execution failure, never as a code-quality finding
@@ -10581,6 +10633,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         },
                         candidates,
                         ct);
+                    await HandleAgenticResolverAuthRequiredOutputAsync(
+                        item, project, "merge-resolver", resolverResult);
                     agentResult = new AgentResult(
                         resolverResult.Success,
                         resolverResult.Summary,
@@ -12257,7 +12311,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
-            && ex is not AgentPausedException)
+            && ex is not AgentPausedException
+            && ex is not AgentAuthRequiredException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",
