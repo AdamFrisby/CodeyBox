@@ -1186,6 +1186,69 @@ public static class AuditLog
                 "Session-resume liveness probe failed unexpectedly for {Agent}: {ExceptionType}: {Message}",
                 agent.Value, exceptionType, message);
 
+    // ── Live agent supervision ───────────────────────────────────────────────
+
+    public static void AgentSupervisionInjectionQueued(
+        WorkItemId workItemId,
+        string sessionId,
+        string phase,
+        AgentKind agent,
+        string actor,
+        string injectionId,
+        string message)
+    {
+        Audit("agent.supervision_injection_queued")
+            .ForContext("InjectionText", TruncateAuditTail(RawChunkRedactor.Redact(message)))
+            .Information(
+                "Live supervision injection {InjectionId} queued by {Actor} for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent}",
+                injectionId,
+                actor,
+                workItemId.ToString(),
+                sessionId,
+                phase,
+                agent.Value);
+    }
+
+    public static void AgentSupervisionInjectionStarted(
+        WorkItemId workItemId,
+        string sessionId,
+        string phase,
+        AgentKind agent,
+        string actor,
+        string injectionId) =>
+        Audit("agent.supervision_injection_started")
+            .Information(
+                "Live supervision injection {InjectionId} started for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor}",
+                injectionId,
+                workItemId.ToString(),
+                sessionId,
+                phase,
+                agent.Value,
+                actor);
+
+    public static void AgentSupervisionInjectionCompleted(
+        WorkItemId workItemId,
+        string sessionId,
+        string phase,
+        AgentKind agent,
+        string actor,
+        string injectionId,
+        bool success,
+        string summary)
+    {
+        Audit("agent.supervision_injection_completed")
+            .ForContext("Summary", TruncateAuditTail(RawChunkRedactor.Redact(summary)))
+            .Information(
+                "Live supervision injection {InjectionId} completed for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor} success={Success}",
+                injectionId,
+                workItemId.ToString(),
+                sessionId,
+                phase,
+                agent.Value,
+                actor,
+                success);
+    }
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>

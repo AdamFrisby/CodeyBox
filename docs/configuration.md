@@ -568,6 +568,36 @@ and API endpoints.
 
 ---
 
+## `AgentSupervision`
+
+Config-gated live human supervision and injection for all active agent
+invocations. See [docs/agent-supervision.md](agent-supervision.md) for the
+SignalR protocol and injection semantics.
+
+```json
+"AgentSupervision": {
+  "Enabled": false,
+  "MaxPromptChars": 16384,
+  "MaxOutputBufferChars": 131072,
+  "MaxInjectionChars": 8192,
+  "InjectionQueueCapacity": 16,
+  "CompletedSessionRetentionSeconds": 300,
+  "MaxSessions": 512
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `false` | Master switch. When false, no supervision sessions or injection queues are opened. |
+| `MaxPromptChars` | `16384` | Redacted prompt/turn text cap sent to clients. Must be >= 1024. |
+| `MaxOutputBufferChars` | `131072` | Per-session redacted stdout tail kept for late joiners. Must be >= 4096. |
+| `MaxInjectionChars` | `8192` | Maximum human instruction length. Must be >= 128. |
+| `InjectionQueueCapacity` | `16` | Pending human instructions accepted per live session. |
+| `CompletedSessionRetentionSeconds` | `300` | How long completed session snapshots remain listable. `0` prunes immediately. |
+| `MaxSessions` | `512` | Maximum active/recent sessions tracked in memory. |
+
+---
+
 ## `AgentStreamAnalysis`
 
 Read-only parser settings for agent stream analytics.

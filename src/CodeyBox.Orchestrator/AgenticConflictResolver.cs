@@ -81,7 +81,10 @@ public sealed class AgenticConflictResolverOptionsSnapshot
 public sealed record AgenticConflictResolverContext(
     string BaseBranch,
     string WorkBranch,
-    AgenticConflictResolverOperation Operation);
+    AgenticConflictResolverOperation Operation)
+{
+    public ProjectId? ProjectId { get; init; }
+}
 
 public enum AgenticConflictResolverOperation
 {
@@ -162,11 +165,13 @@ public sealed class AgenticConflictResolver
     private readonly AgenticConflictResolverOptionsSnapshot _options;
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
+    private readonly IAgentSupervisionService? _agentSupervision;
 
     public AgenticConflictResolver(
         AgenticConflictResolverOptionsSnapshot? options = null,
         ILogger<AgenticConflictResolver>? log = null,
-        Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null)
+        Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null,
+        IAgentSupervisionService? agentSupervision = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
@@ -178,6 +183,7 @@ public sealed class AgenticConflictResolver
         // was originally provisioned for; this hook covers file-based auth
         // which most agent CLIs also accept.
         _credentialFileMaterialiser = credentialFileMaterialiser;
+        _agentSupervision = agentSupervision;
     }
 
     /// <summary>
@@ -296,8 +302,21 @@ public sealed class AgenticConflictResolver
                     lastVerificationError);
 
                 AgentResult agentResult;
+                var supervision = await StartSupervisionSessionAsync(
+                    workItemId,
+                    context,
+                    runner,
+                    candidate,
+                    sandbox,
+                    workingDirectory,
+                    attempt,
+                    ct);
+                var stdoutCallback = supervision?.WrapStdoutCallback(null);
+                var captureStructuredStream = NeedsStructuredStreamForResume(runner);
                 try
                 {
+                    if (supervision is not null)
+                        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, ct);
                     agentResult = await runner.RunAsync(
                         sandbox,
                         workingDirectory,
@@ -306,7 +325,22 @@ public sealed class AgenticConflictResolver
                         candidate.ModelId,
                         candidate.ReasoningMode,
                         ct,
-                        captureStructuredStream: NeedsStructuredStreamForResume(runner));
+                        stdoutChunkCallback: stdoutCallback,
+                        captureStructuredStream: captureStructuredStream);
+                    agentResult = await RunPendingSupervisionInjectionsAsync(
+                        supervision,
+                        agentResult,
+                        (injectionPrompt, injectionCt) => runner.RunAsync(
+                            sandbox,
+                            workingDirectory,
+                            injectionPrompt,
+                            candidate.Credential,
+                            candidate.ModelId,
+                            candidate.ReasoningMode,
+                            injectionCt,
+                            stdoutChunkCallback: stdoutCallback,
+                            captureStructuredStream: captureStructuredStream),
+                        ct);
                 }
                 catch (OperationCanceledException)
                 {
@@ -332,6 +366,11 @@ public sealed class AgenticConflictResolver
                         Stdout: null,
                         Stderr: ex.ToString());
                     break;
+                }
+                finally
+                {
+                    if (supervision is not null)
+                        await supervision.DisposeAsync();
                 }
 
                 if (isStrongest)
@@ -423,6 +462,81 @@ public sealed class AgenticConflictResolver
             FailureCredential = lastFailureCredential,
             FailureClassificationResult = lastFailureClassificationResult,
         };
+    }
+
+    private Task<AgentSupervisionSessionScope?> StartSupervisionSessionAsync(
+        WorkItemId workItemId,
+        AgenticConflictResolverContext context,
+        IAgentRunner runner,
+        AgenticConflictResolverCandidate candidate,
+        ISandbox sandbox,
+        string workingDirectory,
+        int attempt,
+        CancellationToken ct)
+    {
+        if (_agentSupervision is null || !_agentSupervision.Enabled)
+            return Task.FromResult<AgentSupervisionSessionScope?>(null);
+
+        var phase = context.Operation == AgenticConflictResolverOperation.Rebase
+            ? "conflict-rebase"
+            : "conflict-merge";
+        return _agentSupervision.TryStartSessionAsync(
+            new AgentSupervisionSessionStart(
+                workItemId,
+                context.ProjectId?.Value ?? "unknown",
+                phase,
+                attempt,
+                runner.Kind,
+                candidate.AgentInstanceId,
+                candidate.ModelId,
+                candidate.ReasoningMode,
+                sandbox.Id,
+                workingDirectory,
+                Source: "agentic-conflict-resolver"),
+            ct);
+    }
+
+    private static async Task<AgentResult> RunPendingSupervisionInjectionsAsync(
+        AgentSupervisionSessionScope? supervision,
+        AgentResult current,
+        Func<string, CancellationToken, Task<AgentResult>> runTurnAsync,
+        CancellationToken ct)
+    {
+        if (supervision is null)
+            return current;
+
+        var result = current;
+        while (supervision.TryBeginNextInjection(out var injection))
+        {
+            ct.ThrowIfCancellationRequested();
+            var prompt = AgentSupervisionService.BuildHumanInjectionPrompt(injection);
+            await supervision.MarkInjectionStartedAsync(injection, ct).ConfigureAwait(false);
+            await supervision.PublishCodeyBoxCommandAsync("human-injection", prompt, injection.InjectionId, ct)
+                .ConfigureAwait(false);
+            var turn = await runTurnAsync(prompt, ct).ConfigureAwait(false);
+            await supervision.MarkInjectionCompletedAsync(injection, turn, ct).ConfigureAwait(false);
+            result = MergeSupervisionTurnResult(result, turn);
+            if (!turn.Success)
+                break;
+        }
+
+        return result;
+    }
+
+    private static AgentResult MergeSupervisionTurnResult(AgentResult previous, AgentResult latest) =>
+        latest with
+        {
+            Stdout = CombineAgentText(previous.Stdout, latest.Stdout),
+            Stderr = CombineAgentText(previous.Stderr, latest.Stderr),
+        };
+
+    private static string? CombineAgentText(string? first, string? second)
+    {
+        if (string.IsNullOrEmpty(first))
+            return second;
+        if (string.IsNullOrEmpty(second))
+            return first;
+        return first.EndsWith('\n') ? first + second : first + "\n" + second;
     }
 
     internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(

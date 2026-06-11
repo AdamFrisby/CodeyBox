@@ -1,0 +1,252 @@
+@page "/supervision"
+@using CodeyBox.Admin.Web.Models
+@using Microsoft.AspNetCore.SignalR.Client
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<Supervision> Logger
+@inject OrchestratorHubSettings HubSettings
+@implements IAsyncDisposable
+
+<PageTitle>Supervision — CodeyBox Admin</PageTitle>
+
+<h1>Supervision</h1>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+
+@if (!_loaded)
+{
+    <p>Loading…</p>
+}
+else if (!_enabled)
+{
+    <p>Agent supervision is disabled.</p>
+}
+else
+{
+    <div class="supervision-layout">
+        <section class="supervision-sessions">
+            <div class="supervision-toolbar">
+                <button class="btn" @onclick="LoadAsync">Refresh</button>
+                <span>@_sessions.Count session@(_sessions.Count == 1 ? "" : "s")</span>
+            </div>
+            <table class="queue-table supervision-table">
+                <thead>
+                    <tr>
+                        <th>Session</th>
+                        <th>Phase</th>
+                        <th>Agent</th>
+                        <th>State</th>
+                        <th>Queue</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var session in _sessions.Values.OrderByDescending(s => s.StartedAt))
+                    {
+                        <tr class="@(session.SessionId == _selectedSessionId ? "selected-row" : "")" @onclick="() => SelectSession(session.SessionId)">
+                            <td>
+                                <code>@Short(session.SessionId)</code><br />
+                                <a href="/work-items/@session.WorkItemId">@Short(session.WorkItemId)</a>
+                            </td>
+                            <td><code>@session.Phase</code> @session.Iteration</td>
+                            <td>@session.Agent</td>
+                            <td>@session.State</td>
+                            <td>@session.PendingInjections</td>
+                        </tr>
+                    }
+                    @if (_sessions.Count == 0)
+                    {
+                        <tr><td colspan="5">No live sessions.</td></tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+
+        <section class="supervision-detail">
+            @if (SelectedSession is null)
+            {
+                <p>Select a session.</p>
+            }
+            else
+            {
+                <div class="supervision-detail-head">
+                    <div>
+                        <strong>@SelectedSession.Phase</strong>
+                        <span>@SelectedSession.Agent</span>
+                        <span>@SelectedSession.SandboxId</span>
+                    </div>
+                    <span>@(SelectedSession.AcceptingInjections ? "open" : "closed")</span>
+                </div>
+
+                <pre class="stdout-stream supervision-output">@DisplayOutput(SelectedSession)</pre>
+
+                <div class="supervision-inject">
+                    <textarea rows="4" @bind="_message" placeholder="Instruction"></textarea>
+                    <div>
+                        <input @bind="_actor" placeholder="Actor" />
+                        <button class="btn btn-primary" disabled="@(!CanInject)" @onclick="InjectAsync">Inject</button>
+                    </div>
+                </div>
+                @if (_injectStatus is not null)
+                {
+                    <p class="stdout-done">@_injectStatus</p>
+                }
+            }
+        </section>
+    </div>
+}
+
+@code {
+    private readonly Dictionary<string, AgentSupervisionSessionDto> _sessions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _outputs = new(StringComparer.Ordinal);
+    private HubConnection? _hub;
+    private bool _enabled;
+    private bool _loaded;
+    private string? _error;
+    private string? _selectedSessionId;
+    private string _message = "";
+    private string _actor = "admin-dashboard";
+    private string? _injectStatus;
+
+    private AgentSupervisionSessionDto? SelectedSession =>
+        _selectedSessionId is not null && _sessions.TryGetValue(_selectedSessionId, out var session)
+            ? session
+            : null;
+
+    private bool CanInject =>
+        SelectedSession is { AcceptingInjections: true } && !string.IsNullOrWhiteSpace(_message);
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        await ConnectHubAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            var response = await ApiClient.GetAgentSupervisionSessionsAsync();
+            _enabled = response?.Enabled == true;
+            _sessions.Clear();
+            if (response is not null)
+            {
+                foreach (var session in response.Sessions)
+                    _sessions[session.SessionId] = session;
+            }
+            if (_selectedSessionId is null || !_sessions.ContainsKey(_selectedSessionId))
+                _selectedSessionId = _sessions.Values.OrderByDescending(s => s.StartedAt).FirstOrDefault()?.SessionId;
+            _loaded = true;
+            _error = null;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to load agent supervision sessions");
+            _error = "Failed to load supervision sessions.";
+            _loaded = true;
+        }
+    }
+
+    private async Task ConnectHubAsync()
+    {
+        if (string.IsNullOrEmpty(HubSettings.HubUrl))
+            return;
+
+        _hub = new HubConnectionBuilder()
+            .WithUrl(HubSettings.HubUrl, opts =>
+            {
+                if (!string.IsNullOrEmpty(HubSettings.ApiKey))
+                    opts.Headers.Add("Authorization", $"Bearer {HubSettings.ApiKey}");
+            })
+            .WithAutomaticReconnect()
+            .Build();
+
+        _hub.On<AgentSupervisionSessionDto>("supervisionSessionStarted", session => ApplySession(session));
+        _hub.On<AgentSupervisionSessionDto>("supervisionSessionUpdated", session => ApplySession(session));
+        _hub.On<AgentSupervisionSessionDto>("supervisionSessionCompleted", session => ApplySession(session));
+        _hub.On<AgentSupervisionCommandEventDto>("supervisionCommand", command =>
+        {
+            Append(command.SessionId, $"\n[codeybox:{command.Kind}]\n{command.Prompt}\n");
+            return InvokeAsync(StateHasChanged);
+        });
+        _hub.On<AgentSupervisionStdoutEventDto>("supervisionStdoutChunk", chunk =>
+        {
+            Append(chunk.SessionId, chunk.Chunk);
+            return InvokeAsync(StateHasChanged);
+        });
+        _hub.On<AgentSupervisionInjectionCompletedEventDto>("supervisionInjectionCompleted", injection =>
+        {
+            Append(injection.SessionId, $"\n[injection:{injection.InjectionId}:{(injection.Success ? "ok" : "failed")}]\n{injection.Summary}\n");
+            return InvokeAsync(StateHasChanged);
+        });
+
+        try
+        {
+            await _hub.StartAsync();
+            await _hub.InvokeAsync("SubscribeAllSupervisionAsync");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to connect to supervision hub");
+            _error = "Failed to connect to supervision hub.";
+        }
+    }
+
+    private Task ApplySession(AgentSupervisionSessionDto session)
+    {
+        _sessions[session.SessionId] = session;
+        if (_selectedSessionId is null)
+            _selectedSessionId = session.SessionId;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    private void SelectSession(string sessionId)
+    {
+        _selectedSessionId = sessionId;
+        _injectStatus = null;
+    }
+
+    private async Task InjectAsync()
+    {
+        if (SelectedSession is null || string.IsNullOrWhiteSpace(_message))
+            return;
+
+        var receipt = await ApiClient.InjectAgentSupervisionAsync(
+            SelectedSession.SessionId,
+            new AgentSupervisionInjectionRequestDto
+            {
+                Actor = string.IsNullOrWhiteSpace(_actor) ? "admin-dashboard" : _actor.Trim(),
+                Message = _message.Trim(),
+            });
+        _injectStatus = receipt?.Accepted == true
+            ? $"queued {receipt.InjectionId}"
+            : receipt?.Error ?? "injection rejected";
+        if (receipt?.Accepted == true)
+            _message = "";
+    }
+
+    private string DisplayOutput(AgentSupervisionSessionDto session) =>
+        _outputs.TryGetValue(session.SessionId, out var output) && !string.IsNullOrEmpty(output)
+            ? output
+            : session.OutputTail;
+
+    private void Append(string sessionId, string text)
+    {
+        _outputs.TryGetValue(sessionId, out var current);
+        current = string.Concat(current, text);
+        const int MaxChars = 128 * 1024;
+        if (current.Length > MaxChars)
+            current = current[^MaxChars..];
+        _outputs[sessionId] = current;
+    }
+
+    private static string Short(string value) =>
+        value.Length <= 12 ? value : value[..12];
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hub is not null)
+            await _hub.DisposeAsync();
+    }
+}

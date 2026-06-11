@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.SignalR;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -156,6 +157,37 @@ public sealed class AgentStdoutHubTests
         Assert.DoesNotContain(sent, m => m.Method == "stdoutChunk");
         Assert.Contains(sent, m => m.Method == "streamComplete");
     }
+
+    [Fact]
+    public async Task SupervisionNotifications_RouteToFleetAndSessionGroups()
+    {
+        var (svc, hub) = MakeSvc();
+        var snapshot = new AgentSupervisionSessionSnapshot(
+            SessionId: "ags-session",
+            WorkItemId: WorkItemId.New().ToString(),
+            ProjectId: "project",
+            Phase: "work",
+            Iteration: 1,
+            Agent: "claude",
+            AgentInstanceId: null,
+            ModelId: null,
+            ReasoningMode: null,
+            SandboxId: "sandbox",
+            WorkingDirectory: "/work",
+            Source: "test",
+            StartedAt: DateTimeOffset.UtcNow,
+            CompletedAt: null,
+            State: "running",
+            AcceptingInjections: true,
+            PendingInjections: 0,
+            OutputTail: "");
+
+        await svc.SessionStartedAsync(snapshot);
+
+        var sent = Assert.Single(hub.Clients.Sent, m => m.Method == "supervisionSessionStarted");
+        Assert.Contains("supervision:all", sent.Group);
+        Assert.Contains("supervision:session:ags-session", sent.Group);
+    }
 }
 
 // ── Fake SignalR infrastructure ───────────────────────────────────────────────
@@ -190,7 +222,7 @@ internal sealed class CapturingHubClients : IHubClients
     IClientProxy IHubClients<IClientProxy>.Clients(IReadOnlyList<string> connectionIds) => Proxy("*clients*");
     IClientProxy IHubClients<IClientProxy>.Group(string groupName) => Proxy(groupName);
     IClientProxy IHubClients<IClientProxy>.GroupExcept(string groupName, IReadOnlyList<string> excluded) => Proxy(groupName);
-    IClientProxy IHubClients<IClientProxy>.Groups(IReadOnlyList<string> groupNames) => Proxy("*groups*");
+    IClientProxy IHubClients<IClientProxy>.Groups(IReadOnlyList<string> groupNames) => Proxy(string.Join(",", groupNames));
     IClientProxy IHubClients<IClientProxy>.User(string userId) => Proxy($"user:{userId}");
     IClientProxy IHubClients<IClientProxy>.Users(IReadOnlyList<string> userIds) => Proxy("*users*");
 }

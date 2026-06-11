@@ -143,6 +143,15 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
         }
 
+        try
+        {
+            options.AgentSupervision.Validate();
+        }
+        catch (InvalidOperationException ex)
+        {
+            failures.Add(ex.Message);
+        }
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0

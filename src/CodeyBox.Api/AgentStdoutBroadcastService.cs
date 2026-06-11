@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.AspNetCore.SignalR;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Api;
 
@@ -15,7 +16,7 @@ namespace CodeyBox.Api;
 ///   <item>Redaction via <see cref="RawChunkRedactor"/> before any broadcast.</item>
 /// </list>
 /// </summary>
-public sealed class AgentStdoutBroadcastService : IStdoutBroadcaster, IDisposable
+public sealed class AgentStdoutBroadcastService : IStdoutBroadcaster, IAgentSupervisionNotifier, IDisposable
 {
     private readonly IHubContext<AgentStdoutHub> _hub;
     private readonly ConcurrentDictionary<WorkItemId, StdoutRingBuffer> _buffers = new();
@@ -41,6 +42,47 @@ public sealed class AgentStdoutBroadcastService : IStdoutBroadcaster, IDisposabl
 
     public string? GetTail(WorkItemId workItemId)
         => _buffers.TryGetValue(workItemId, out var buf) ? buf.GetContents() : null;
+
+    public Task SessionStartedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionSessionStarted", session, session.SessionId, ct);
+
+    public Task SessionUpdatedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionSessionUpdated", session, session.SessionId, ct);
+
+    public Task SessionCompletedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionSessionCompleted", session, session.SessionId, ct);
+
+    public Task CodeyBoxCommandAsync(AgentSupervisionCommandEvent command, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionCommand", command, command.SessionId, ct);
+
+    public Task StdoutChunkAsync(AgentSupervisionStdoutEvent chunk, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionStdoutChunk", chunk, chunk.SessionId, ct);
+
+    public Task InjectionQueuedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionInjectionQueued", injection, injection.SessionId, ct);
+
+    public Task InjectionStartedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionInjectionStarted", injection, injection.SessionId, ct);
+
+    public Task InjectionCompletedAsync(AgentSupervisionInjectionCompletedEvent injection, CancellationToken ct = default) =>
+        SendSupervisionAsync("supervisionInjectionCompleted", injection, injection.SessionId, ct);
+
+    private async Task SendSupervisionAsync(string method, object payload, string sessionId, CancellationToken ct)
+    {
+        try
+        {
+            await _hub.Clients.Groups([
+                    AgentStdoutHub.SupervisionAllGroup,
+                    AgentStdoutHub.SupervisionSessionGroup(sessionId),
+                ])
+                .SendAsync(method, payload, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best-effort: supervision clients are allowed to disconnect at any time.
+        }
+    }
 
     public void Dispose()
     {
