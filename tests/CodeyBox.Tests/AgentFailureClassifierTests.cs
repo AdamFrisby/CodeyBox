@@ -143,6 +143,29 @@ public sealed class AgentFailureClassifierTests
         Assert.Null(classifier.Detect(AgentKind.Codex, "custom auth ceremony required", null));
     }
 
+    [Fact]
+    public void AgentAuthFailureClassifier_HonorsPerAgentConfiguredPatternsInStdout()
+    {
+        var classifier = new AgentAuthFailureClassifier(
+            new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["custom"] = [new AuthFailurePattern("stdout-only login ceremony required")],
+            });
+
+        var hit = classifier.DetectDetailed(
+            new AgentKind("custom"),
+            stderr: null,
+            stdout: "stdout-only login ceremony required");
+
+        Assert.NotNull(hit);
+        Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
+        Assert.True(hit.IsStdoutOnly);
+        Assert.Null(classifier.Detect(
+            AgentKind.Codex,
+            stderr: null,
+            stdout: "stdout-only login ceremony required"));
+    }
+
     [Theory]
     [InlineData("ECONNRESET while contacting api.anthropic.com")]
     [InlineData("Temporary failure in name resolution")]

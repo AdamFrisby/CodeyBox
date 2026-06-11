@@ -1585,6 +1585,8 @@ builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
 builder.Services.AddSingleton<ISmokeAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -2403,7 +2405,10 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
-    authExclusionAvailability: sp.GetRequiredService<ISmokeAvailabilityRegistry>()));
+    authExclusionAvailability: sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
+    authCorroborationHostSmoke: sp.GetService<IHostSmokeProbeRunner>(),
+    authCorroborationInVmSmoke: sp.GetService<IInVmSmokeGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

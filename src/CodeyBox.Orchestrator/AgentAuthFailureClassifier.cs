@@ -15,6 +15,23 @@ public interface IAgentAuthFailureClassifier
     /// when stderr/stdout contains a configured login-prompt signature.
     /// </summary>
     AgentFailureClassification? Detect(AgentKind kind, string? stderr, string? stdout);
+
+    /// <summary>
+    /// Returns the auth-required classification plus the stream that supplied
+    /// the evidence. Runtime breaker policy uses this to avoid mutating global
+    /// availability from stdout-only, model-controlled text unless a separate
+    /// non-model-controlled check corroborates it.
+    /// </summary>
+    AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
+}
+
+public sealed record AgentAuthFailureDetection(
+    AgentFailureClassification Classification,
+    bool MatchedStderr,
+    bool MatchedStdout,
+    bool MatchedTrustedStdoutTranscript)
+{
+    public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -39,11 +56,16 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
     }
 
     public AgentFailureClassification? Detect(AgentKind kind, string? stderr, string? stdout)
+        => DetectDetailed(kind, stderr, stdout)?.Classification;
+
+    public AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout)
     {
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
         var patterns = PatternsFor(kind).ToArray();
+        var matchedStderr = false;
+        var matchedStdout = false;
 
         foreach (var pattern in patterns)
         {
@@ -53,17 +75,31 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             if (!string.IsNullOrEmpty(stderr)
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
-                return new AgentFailureClassification(
-                    AgentFailureKind.AuthRequired,
-                    Reason: "auth/login prompt pattern matched");
+                matchedStderr = true;
+            }
+
+            if (!string.IsNullOrEmpty(stdout)
+                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedStdout = true;
             }
         }
 
-        if (ContainsTrustedStdoutLoginTranscript(stdout))
+        var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
+        matchedStdout |= matchedTrustedStdoutTranscript;
+
+        if (matchedStderr || matchedStdout)
         {
-            return new AgentFailureClassification(
-                AgentFailureKind.AuthRequired,
-                Reason: "auth/login prompt pattern matched");
+            var source = matchedStderr && matchedStdout
+                ? "stderr/stdout"
+                : matchedStderr ? "stderr" : "stdout";
+            return new AgentAuthFailureDetection(
+                new AgentFailureClassification(
+                    AgentFailureKind.AuthRequired,
+                    Reason: $"auth/login prompt pattern matched in {source}"),
+                matchedStderr,
+                matchedStdout,
+                matchedTrustedStdoutTranscript);
         }
 
         return null;

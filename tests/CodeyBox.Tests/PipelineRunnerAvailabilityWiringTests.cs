@@ -423,7 +423,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task SuccessfulNoDiffRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -504,7 +504,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // re-classifies AuthRequired as a smoke source fails this test.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
-        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, authCorroborationHostSmoke: PersistentAuthSmoke());
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -532,7 +532,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
-        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, authCorroborationHostSmoke: PersistentAuthSmoke());
         fix.Registry.MarkSmokeResult(
             AgentKind.Codex,
             new AgentSmokeResult(false, "host probe already failed", TimeSpan.Zero, SmokeFailureCategory.Persistent),
@@ -571,7 +571,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // phase-name detector call there can't pass off the work-phase test
         // as full coverage.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -610,6 +610,50 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task MergePhaseAgenticResolver_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.AuditPassed,
+            WorkBranch = "feature/merge-resolver-auth-" + Guid.NewGuid().ToString("N")[..8],
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitWorkBranchAsync(barePath, item.WorkBranch!, "README.md", "work side\n", "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main side\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("merge-resolver", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.Contains("merge-resolver", details.Reason);
+    }
+
+    [Fact]
     public async Task SuccessfulNoDiffRun_WithoutAuthLoginPrompt_RemainsNormalNoChangesFailure()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -628,6 +672,33 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("Agent produced no changes to commit", final.LastError);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_FailsItemButDoesNotExcludeAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: transcript,
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
@@ -1063,7 +1134,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        IHostSmokeProbeRunner? authCorroborationHostSmoke = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1124,6 +1196,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             }),
             availability: availability,
             authExclusionAvailability: availability,
+            authCorroborationHostSmoke: authCorroborationHostSmoke,
+            authCorroborationInVmSmoke: inVmSmokeGate,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
@@ -1210,6 +1284,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
     }
 
+    private static StaticHostSmokeProbeRunner PersistentAuthSmoke() =>
+        new(new AgentSmokeResult(false, "auth", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
     {
         public int EnsureCalls { get; private set; }
@@ -1293,7 +1370,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         await TestSupport.RunGit(repoPath, "commit", "-m", message);
     }
 
-    private static async Task CommitWorkBranchAsync(string bareRepoPath, string workBranch)
+    private static async Task CommitWorkBranchAsync(
+        string bareRepoPath,
+        string workBranch,
+        string path = "merge-phase.txt",
+        string contents = "ready\n",
+        string subject = "work already audited")
     {
         var clone = Path.Combine(Path.GetTempPath(), "codeybox-merge-pause-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(clone);
@@ -1303,9 +1385,9 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(clone, "config", "user.name", "Test");
             await TestSupport.RunGit(clone, "checkout", "-b", workBranch, "origin/main");
-            await File.WriteAllTextAsync(Path.Combine(clone, "merge-phase.txt"), "ready\n");
-            await TestSupport.RunGit(clone, "add", "merge-phase.txt");
-            await TestSupport.RunGit(clone, "commit", "-m", "work already audited");
+            await File.WriteAllTextAsync(Path.Combine(clone, path), contents);
+            await TestSupport.RunGit(clone, "add", path);
+            await TestSupport.RunGit(clone, "commit", "-m", subject);
             await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{workBranch}");
         }
         finally

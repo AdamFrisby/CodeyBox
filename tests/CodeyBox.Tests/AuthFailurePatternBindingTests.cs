@@ -41,6 +41,25 @@ public sealed class AuthFailurePatternBindingTests
     }
 
     [Fact]
+    public void Build_AppliesAdditionalPerAgentPattern_ToStdout()
+    {
+        var classifier = BindAndBuild(new Dictionary<string, string?>
+        {
+            ["CodeyBox:AuthFailurePatterns:antigravity:0:Pattern"] = "stdout says: needs login",
+        });
+
+        var hit = classifier.DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: "stdout says: needs login");
+
+        Assert.NotNull(hit);
+        Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
+        Assert.True(hit.IsStdoutOnly);
+        Assert.Null(classifier.Detect(AgentKind.Codex, stderr: null, stdout: "stdout says: needs login"));
+    }
+
+    [Fact]
     public void Build_PreservesBuiltInPatterns_AcrossAllAgents_EvenWithNoConfigEntries()
     {
         // No CodeyBox:AuthFailurePatterns section at all — the defaults must

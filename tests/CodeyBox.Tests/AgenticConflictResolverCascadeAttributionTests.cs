@@ -161,7 +161,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
                     {
                         MaxIterations = 2,
                         MaxAttemptsPerAgent = 1,
-                    })));
+                    })),
+            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
 
         var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
         var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -196,7 +197,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         IAuditReportStore auditReportStore,
         IWebhookDispatcher? webhooks = null,
         AgentAvailabilityRegistry? availability = null,
-        AgenticConflictResolver? agenticConflictResolver = null)
+        AgenticConflictResolver? agenticConflictResolver = null,
+        IHostSmokeProbeRunner? authCorroborationHostSmoke = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -264,6 +266,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             auditReports: auditReportStore,
             availability: availability,
             authExclusionAvailability: availability,
+            authCorroborationHostSmoke: authCorroborationHostSmoke,
             agenticConflictResolver: agenticConflictResolver,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,

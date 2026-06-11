@@ -52,7 +52,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -326,6 +326,37 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     }
 
     /// <summary>
+    /// Benches <paramref name="kind"/> because a real runtime invocation was
+    /// corroborated as blocked on interactive authentication. This is not a
+    /// smoke probe result: it is stored under its own non-smoke source so
+    /// dispatch still honors it when the operator disables smoke gating.
+    /// </summary>
+    public AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason)
+    {
+        var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
+        var now = _time.GetUtcNow();
+
+        lock (entry.Sync)
+        {
+            var wasExcluded = entry.IsExcluded;
+            var hadSourceExclusion = entry.Exclusions.ContainsKey(SmokeExclusionSource.AuthRequired);
+            entry.Exclusions[SmokeExclusionSource.AuthRequired] = $"auth required: {reason}";
+            if (!wasExcluded)
+            {
+                _log.LogError(
+                    "Agent {Agent} requires interactive authentication at {At}; operator action required: {Reason}",
+                    kind.Value, now, reason);
+            }
+
+            return new AvailabilityTransition(
+                PreviouslyExcluded: wasExcluded,
+                NowExcluded: true,
+                Reason: entry.CombinedReason(),
+                SourceChanged: !hadSourceExclusion);
+        }
+    }
+
+    /// <summary>
     /// Clears the exclusion state, fast-fail counter, and prior probe
     /// timestamps for <paramref name="kind"/>. Called by the
     /// <c>/admin/agent/{name}/reset</c> endpoint after the operator has
@@ -529,6 +560,20 @@ public interface ISmokeAvailabilityRegistry : IAgentEffectiveAvailabilityReader
     /// cannot clear the registry without also dropping the cache.
     /// </summary>
     void Reset(AgentKind kind);
+}
+
+/// <summary>
+/// Source-neutral mutator for runtime auth failures. Pipeline code depends on
+/// this instead of the smoke registry because the signal is not a probe verdict
+/// and should not manufacture <see cref="AgentSmokeResult"/> values.
+/// </summary>
+public interface IAgentAuthAvailabilityRegistry
+{
+    /// <summary>
+    /// Excludes <paramref name="kind"/> until an operator reset because a
+    /// runtime invocation was corroborated as needing interactive auth.
+    /// </summary>
+    AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason);
 }
 
 /// <summary>

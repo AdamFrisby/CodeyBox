@@ -425,7 +425,8 @@ public sealed class CheckAndActPipelineTests : IDisposable
             _workspace,
             seed,
             webhookDispatcher: webhooks,
-            availabilityRegistry: registry);
+            availabilityRegistry: registry,
+            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
 
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
@@ -1103,7 +1104,8 @@ public sealed class CheckAndActPipelineTests : IDisposable
             _workspace,
             seed,
             webhookDispatcher: webhooks,
-            availabilityRegistry: registry);
+            availabilityRegistry: registry,
+            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
 
         tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "issue remains", "high"));
         var check = new WorkItem
