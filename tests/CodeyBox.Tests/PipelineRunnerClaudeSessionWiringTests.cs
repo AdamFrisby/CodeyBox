@@ -109,70 +109,129 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         // restart resumes its worker VM+session at the correct phase, or
         // degrades to the one-shot path for the remainder — never strands."
         //
-        // This test pins the degrade-to-one-shot half of that contract.
-        // Sequence:
-        //   1. A session-enabled item is dispatched and reaches Done via
-        //      the legacy path in the first "process" (session worker
-        //      unregistered, so the work-rework-merge arc all runs on
-        //      fresh per-phase sandboxes).
-        //   2. The orchestrator "restarts" by reusing the on-disk SQLite
-        //      state. Now session-mode is enabled, but the prior worker
-        //      VM/session is gone.
-        //   3. The pipeline picks the item up. The item is already Done,
-        //      so the terminal-state guard short-circuits dispatch and the
-        //      session lifecycle is never opened. No stranding, no crash.
+        // The session lifecycle in production is only opened when
+        // RunAsync sees a fresh-pickup item (entry state is Queued, so
+        // both skipWork AND skipAudit are false). A restart-resumed item
+        // picked up at WorkComplete/AuditPassed/Merged/etc. takes the
+        // legacy independent-phase path because there is no live worker
+        // VM/session left from the prior process to attach to. This test
+        // pins that degrade contract by directly driving RunAsync on a
+        // seeded WorkComplete item and asserting:
+        //   (a) the session lifecycle is NEVER opened (no OpenSessionAsync
+        //       call on the runner), so we don't try to attach to a
+        //       phantom VM that no longer exists.
+        //   (b) the item still advances (does not strand) — the audit +
+        //       merge phases run via the legacy fresh-sandbox path and
+        //       the item reaches a terminal state instead of remaining
+        //       at WorkComplete.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var project = ProjectWithSessionEnabled(seed);
 
-        // Single shared SQLite state file across the two TestPipeline
-        // instances, mimicking the orchestrator's process restart.
-        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
-        var item = NewItem();
+        // The session runner gets one turn-file for the seed run (so the
+        // first item walks through work→audit→merge cleanly), and zero
+        // for the resume run (so any unexpected SendTurnAsync would throw
+        // for lack of a queued file write — the real assertion is that
+        // SendTurnAsync is never called on the WorkComplete pickup).
+        var sessionRunner = new RecordingSessionRunner(turnFiles:
+        [
+            new RecordingFileWrite("seed.txt", "v1"),
+        ]);
 
-        // ── First "process": run through to Done via the legacy path (no
-        // auditors → audit phase is a no-op; the work agent commits one
-        // file and the merge phase auto-runs the real git merge).
-        using (var firstRunTp = TestSupport.BuildPipeline(
+        using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             projectRepository: new InMemoryProjectRepository(project),
-            stateDbPathOverride: stateDb))
-        {
-            firstRunTp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
-            await firstRunTp.Store.CreateAsync(item);
-            await firstRunTp.Pipeline.RunAsync(item, CancellationToken.None);
-
-            var after = await firstRunTp.Store.GetAsync(item.Id);
-            Assert.Equal(WorkItemState.Done, after!.State);
-        }
-
-        // ── Second "process": same SQLite file (same item state), but the
-        // session-mode is now enabled. The pipeline must NOT strand because
-        // the prior session is unrecoverable from a fresh process — the
-        // item is already in a terminal state, so any further pickup is a
-        // no-op via the existing terminal-state guards.
-        var sessionRunner = new RecordingSessionRunner(turnFiles: []);
-        using (var secondRunTp = TestSupport.BuildPipeline(
-            _workspace,
-            seed,
-            projectRepository: new InMemoryProjectRepository(project),
-            stateDbPathOverride: stateDb,
             claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
-            sessionAgentRunnerOverride: sessionRunner))
-        {
-            // Item is already Done; the contract under test is that
-            // session-mode dispatch does NOT crash, strand, or rewind state
-            // when picking up an item whose prior session is gone.
-            var stored = await secondRunTp.Store.GetAsync(item.Id);
-            Assert.Equal(WorkItemState.Done, stored!.State);
-        }
+            sessionAgentRunnerOverride: sessionRunner);
 
-        // The session runner was never engaged on the second pass: no
-        // process re-ran RunAsync, but the pipeline construction +
-        // session-mode wiring stayed safe across the restart.
-        Assert.Equal(0, sessionRunner.OpenedSessions);
-        Assert.Equal(0, sessionRunner.SendTurns);
-        Assert.Equal(0, sessionRunner.CloseCalls);
+        // Seed: a fresh item walks the full session-mode arc so the
+        // work-branch carries a real commit in the bare repo. This gives
+        // the resume-from-WorkComplete pickup a real branch to operate
+        // on without us having to handcraft git refs.
+        var seedItem = NewItem();
+        await tp.Store.CreateAsync(seedItem);
+        await tp.Pipeline.RunAsync(seedItem, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, (await tp.Store.GetAsync(seedItem.Id))!.State);
+        var openedAfterSeed = sessionRunner.OpenedSessions;
+        var sendsAfterSeed = sessionRunner.SendTurns;
+        var closedAfterSeed = sessionRunner.CloseCalls;
+        Assert.True(openedAfterSeed >= 1, "the seed run should have opened a session");
+
+        // Now the WorkComplete-seeded item: same project (session-enabled)
+        // but the prior process crashed mid-arc — work was committed and
+        // the state stored as WorkComplete before the crash. The pickup
+        // gate (`!skipWork && !skipAudit`) must short-circuit lifecycle
+        // open, because the prior worker VM/session is gone and a brand-
+        // new session against a brand-new VM would not have the prior
+        // conversation context.
+        var resumeItem = NewItem() with
+        {
+            State = WorkItemState.WorkComplete,
+            WorkBranch = seedItem.WorkBranch,
+        };
+        await tp.Store.CreateAsync(resumeItem);
+        await tp.Pipeline.RunAsync(resumeItem, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(resumeItem.Id);
+        Assert.NotNull(final);
+        // No stranding: the item progressed past WorkComplete via the
+        // legacy fresh-sandbox audit/merge path.
+        Assert.NotEqual(WorkItemState.WorkComplete, final!.State);
+
+        // Lifecycle was NEVER touched after the WorkComplete pickup:
+        // neither OpenSessionAsync nor SendTurnAsync. Production opens
+        // the lifecycle at the top of RunAsync under `!skipWork &&
+        // !skipAudit`, so a WorkComplete pickup never reaches it.
+        Assert.Equal(openedAfterSeed, sessionRunner.OpenedSessions);
+        Assert.Equal(sendsAfterSeed, sessionRunner.SendTurns);
+        // CloseCalls did NOT increment either: no lifecycle was opened
+        // for the resume pickup, so there's no lifecycle to dispose.
+        Assert.Equal(closedAfterSeed, sessionRunner.CloseCalls);
+    }
+
+    [Fact]
+    public async Task SessionGate_RefusesWhenWorkAndReworkNetworkProfilesDiffer()
+    {
+        // Operators may configure distinct Work and Rework network
+        // profiles as a containment boundary (e.g. broader egress during
+        // initial work, restricted rework after auditor-controlled
+        // findings are fed back). The session worker opens ONE VM with
+        // the work-phase target and reuses it across every rework turn;
+        // keeping the work-phase policy on rework would silently weaken
+        // the operator's boundary. The gate must refuse session mode in
+        // that configuration and fall back to the legacy per-phase path.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var divergentProject = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            ClaudeSession = new ProjectClaudeSessionConfig { Enabled = true },
+            NetworkProfiles = new ProjectNetworkProfiles
+            {
+                Work = "open-egress",
+                Rework = "restricted-egress",
+            },
+            Audit = new ProjectAudit(),
+        };
+        var worker = BuildClaudeSessionWorker();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(divergentProject),
+            claudeSessionWorker: worker,
+            claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true });
+
+        var claudeItem = NewItem() with { Agent = AgentKind.Claude };
+        var runner = new StubAgentRunner(AgentKind.Claude);
+
+        // Every other gate condition is satisfied (worker registered,
+        // global flag on, project flag on, Claude agent, Normal job).
+        // The mismatched profiles are the sole reason to refuse — pin
+        // that here so a regression that drops the check would fail.
+        Assert.False(tp.Pipeline.ShouldEnterClaudeSessionMode(claudeItem, divergentProject, runner));
     }
 
     [Fact]

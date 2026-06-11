@@ -116,7 +116,12 @@ internal static class TestSupport
         CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
         CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
         ISessionAgentRunner? sessionAgentRunnerOverride = null,
-        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null)
+        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null,
+        // New orchestrator-owned dispatch options. When the test already
+        // passes claudeSessionOptions (legacy shape), its Enabled flag is
+        // projected into AgentSessionDispatchOptions at the seam below so
+        // existing test signatures keep working.
+        AgentSessionDispatchOptions? sessionDispatchOptions = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -210,10 +215,22 @@ internal static class TestSupport
             auditProgress: auditProgressOverride ?? store,
             checkCompletionRunner: checkCompletionRunner,
             agentSupervision: agentSupervision,
-            claudeSessionWorker: claudeSessionWorker,
-            claudeSessionOptions: claudeSessionOptions,
-            sessionAgentRunnerOverride: sessionAgentRunnerOverride,
-            sessionHandleSnapshotOverride: sessionHandleSnapshotOverride);
+            // Tests can supply either:
+            //   (a) the concrete ClaudeSessionWorker (legacy shape — its
+            //       SnapshotPersistedHandle gets auto-wired), or
+            //   (b) an ISessionAgentRunner override directly.
+            // The PipelineRunner constructor now takes a single seam, so
+            // resolve the effective runner / snapshot here.
+            sessionAgentRunner: sessionAgentRunnerOverride ?? (ISessionAgentRunner?)claudeSessionWorker,
+            sessionDispatchOptions: sessionDispatchOptions
+                ?? (claudeSessionOptions is null
+                    ? null
+                    : new AgentSessionDispatchOptions { Enabled = claudeSessionOptions.Enabled }),
+            sessionHandleSnapshot: sessionAgentRunnerOverride is not null
+                ? sessionHandleSnapshotOverride
+                : (claudeSessionWorker is null
+                    ? null
+                    : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle)));
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

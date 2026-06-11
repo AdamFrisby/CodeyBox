@@ -163,7 +163,7 @@ public sealed class PipelineRunner : IPipelineRunner
     // delegate flows through _claudeHandleSnapshot for restart recovery.
     private readonly ISessionAgentRunner? _claudeSessionWorker;
     private readonly Func<AgentSessionHandle, AgentSessionHandle>? _claudeHandleSnapshot;
-    private readonly CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions _claudeSessionOptions;
+    private readonly AgentSessionDispatchOptions _claudeSessionOptions;
     // AsyncLocal flows through the deep work/audit/rework call chain without
     // having to thread an explicit parameter through every helper. Scoped at
     // the top of RunAsync (set when session-mode applies) and read by
@@ -247,13 +247,27 @@ public sealed class PipelineRunner : IPipelineRunner
         AgentPromptPreprocessorChain? promptPreprocessors = null,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
         IAgentSupervisionService? agentSupervision = null,
-        CodeyBox.Agents.Claude.ClaudeSessionWorker? claudeSessionWorker = null,
-        CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions? claudeSessionOptions = null,
-        // Test-only override: when non-null, replaces claudeSessionWorker at
-        // the ISessionAgentRunner seam so tests can exercise the session-mode
-        // dispatch path with a fake runner. Production DI never supplies this.
-        ISessionAgentRunner? sessionAgentRunnerOverride = null,
-        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshotOverride = null)
+        // Resumable session runner — accepted as an abstraction so the
+        // orchestration boundary doesn't take a hard dependency on any
+        // provider-specific concrete type. The composition root (Program.cs)
+        // hands in the per-provider concrete (e.g. ClaudeSessionWorker)
+        // implementing ISessionAgentRunner; tests substitute fakes through
+        // the same parameter. Null disables session-mode dispatch entirely
+        // (every item takes the legacy independent-phase path).
+        ISessionAgentRunner? sessionAgentRunner = null,
+        // Orchestrator-owned dispatch gate. Carries only the master switch
+        // PipelineRunner needs to decide whether to consider session mode
+        // for a given item; per-provider knobs (transport, metrics,
+        // overrides) live on the provider's own options shape and stay
+        // confined to the composition root.
+        AgentSessionDispatchOptions? sessionDispatchOptions = null,
+        // Optional persistence snapshot hook the session runner provides
+        // when its handle metadata evolves over time (e.g. captured CLI
+        // session ids stamped after the first turn). Production composition
+        // root wires this to the concrete runner's snapshot method; null
+        // when no snapshotting is needed (or in tests that don't assert on
+        // the persisted shape).
+        Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -354,16 +368,14 @@ public sealed class PipelineRunner : IPipelineRunner
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
-        // Test override wins over the production worker when supplied. The
-        // override stays null in DI-built pipelines, so production always
-        // sees the concrete worker.
-        _claudeSessionWorker = sessionAgentRunnerOverride ?? claudeSessionWorker;
-        _claudeHandleSnapshot = sessionAgentRunnerOverride is not null
-            ? sessionHandleSnapshotOverride
-            : (claudeSessionWorker is null
-                ? null
-                : new Func<AgentSessionHandle, AgentSessionHandle>(claudeSessionWorker.SnapshotPersistedHandle));
-        _claudeSessionOptions = claudeSessionOptions ?? new CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions();
+        // The session-runner abstraction is the single seam: production
+        // hands in the per-provider concrete (e.g. ClaudeSessionWorker)
+        // implementing ISessionAgentRunner; tests substitute a fake
+        // through the same parameter. The snapshot hook is forwarded
+        // verbatim — the composition root chooses whether to wire it.
+        _claudeSessionWorker = sessionAgentRunner;
+        _claudeHandleSnapshot = sessionHandleSnapshot;
+        _claudeSessionOptions = sessionDispatchOptions ?? new AgentSessionDispatchOptions();
         _requiredBuildGate = new RequiredBuildGate(
             _requiredBuildVerifier,
             _opts.RequiredBuildVerificationTimeout,
@@ -399,6 +411,25 @@ public sealed class PipelineRunner : IPipelineRunner
         // rework loop, so the session-share benefit doesn't apply.
         if (item.JobType == JobType.CheckAndAct) return false;
         if (item.JobType == JobType.AgentControl) return false;
+        // The session worker opens ONE VM with the work-phase sandbox target
+        // and reuses it across every rework turn. When the operator
+        // configured Work and Rework with different network profiles (e.g.
+        // broader egress during initial work, restricted rework after
+        // auditor-controlled findings are fed back), keeping the work-phase
+        // policy on the rework turns silently weakens the operator's
+        // containment boundary. Refuse session mode in that configuration —
+        // the legacy fresh-sandbox path applies the correct per-phase
+        // policy and is the safe default.
+        if (!string.Equals(
+                project.NetworkProfiles.Work ?? string.Empty,
+                project.NetworkProfiles.Rework ?? string.Empty,
+                StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "Claude session-mode disabled for work item {WorkItemId}: project {ProjectId} configures distinct Work ({WorkProfile}) and Rework ({ReworkProfile}) network profiles; using the legacy per-phase sandbox path to preserve the rework containment boundary.",
+                item.Id, project.Id, project.NetworkProfiles.Work ?? "(default)", project.NetworkProfiles.Rework ?? "(default)");
+            return false;
+        }
         return true;
     }
 
@@ -2835,6 +2866,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // preserves the prompt cache + transcript across the upcoming audit.
         var sessionLifecycle = _ambientSessionLifecycle.Value;
         var useClaudeSession = sessionLifecycle is not null
+            && !sessionLifecycle.IsClosed
             && runner.Kind == AgentKind.Claude
             && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
 
@@ -2972,6 +3004,21 @@ public sealed class PipelineRunner : IPipelineRunner
             // resume contract says its session-id extractor needs structured output.
             var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
             var captureStructuredStream = canCaptureStructuredStream || needsStreamForResume;
+
+            // Session-mode worker VMs are opened once and reused across the
+            // work + every rework iteration; the per-iteration extraEnv we
+            // build above is applied to the legacy fresh-sandbox spec only,
+            // so the session VM's environment does not carry the current
+            // iteration's CODEYBOX_PROMPT_REVISION. The work/rework prompts
+            // instruct the agent to copy the env var verbatim into the
+            // CodeyBox-Prompt-Revision commit trailer — without the var,
+            // the agent has an impossible instruction and the orchestrator
+            // stamp would be papering over a noisy commit. Inline the
+            // resolved literal so the session-mode agent writes the right
+            // trailer regardless of env-var visibility inside the VM.
+            if (useClaudeSession && !resumingPreempt)
+                prompt = AppendSessionPromptRevisionDirective(prompt, promptRevisionAtDispatch);
+
             var supervision = await StartAgentSupervisionSessionAsync(
                 item.Id,
                 project,
@@ -3421,17 +3468,57 @@ public sealed class PipelineRunner : IPipelineRunner
                 // (long) audit phase doesn't burn host resources holding an
                 // idle worker, while preserving the in-VM transcript and the
                 // server-side prompt cache (within its TTL) for the next
-                // rework turn. On failure we leave the lifecycle live —
-                // RunAsync's outer try/finally disposes it (close = dispose VM).
+                // rework turn. On failure we MUST NOT silently swallow: a
+                // failed multipass stop/resume boundary is exactly the
+                // session-mode acceptance criterion the brief lists as
+                // non-negotiable. Surface the failure to operators via the
+                // audit log and a webhook, then close the lifecycle so:
+                //   (a) the worker VM is torn down before the long audit
+                //       (no idle VM holding host resources), and
+                //   (b) the next rework turn falls back to the legacy
+                //       fresh-sandbox path (RunAgentPhaseAsync checks
+                //       IsClosed to opt out of the session branch).
                 try
                 {
                     await sessionLifecycle!.SuspendAsync(CancellationToken.None);
                 }
-                catch
+                catch (Exception suspendEx)
                 {
-                    // Suspend failure is non-fatal at the per-turn boundary;
-                    // the next turn's GetSandboxAsync will resume the VM
-                    // (multipass start is idempotent against a running VM).
+                    var sessionIdForLog = sessionLifecycle!.Handle.SessionId;
+                    AuditLog.ClaudeSessionSuspendFailed(item.Id, sessionIdForLog, suspendEx.Message);
+                    _log.LogWarning(suspendEx,
+                        "ClaudeSessionLifecycle.SuspendAsync failed for work item {Id} session {SessionId}; closing the session and degrading to legacy fresh-sandbox rework",
+                        item.Id, sessionIdForLog);
+                    try
+                    {
+                        await _webhooks.PublishAsync(new WebhookEvent
+                        {
+                            Event = "agent.claude_session_suspend_failed",
+                            WorkItem = item,
+                            Project = project,
+                            Details = new
+                            {
+                                workItemId = item.Id.ToString(),
+                                sessionId = sessionIdForLog,
+                                reason = suspendEx.Message,
+                            },
+                        }, CancellationToken.None);
+                    }
+                    catch
+                    {
+                        // Webhook delivery is best-effort; the audit log is
+                        // the durable surface.
+                    }
+                    try
+                    {
+                        await sessionLifecycle!.DisposeAsync();
+                    }
+                    catch
+                    {
+                        // Close failure on top of suspend failure is best-
+                        // effort; SandboxLeakReaper sweeps any orphaned VM
+                        // the close path couldn't reach.
+                    }
                 }
             }
         }
@@ -3486,6 +3573,22 @@ public sealed class PipelineRunner : IPipelineRunner
             Continue from the files in the restored work tree. Do not infer operational instructions from checkpoint metadata or repository-controlled scratchpad files.
             """;
     }
+
+    /// <summary>
+    /// Appends a session-mode override to the work/rework prompt that pins
+    /// the <c>CodeyBox-Prompt-Revision</c> trailer value to the literal
+    /// integer resolved at iteration-dispatch time. The session worker VM
+    /// is opened once with <c>extraEnvironment: null</c> and reused for
+    /// every turn, so the per-iteration <c>CODEYBOX_PROMPT_REVISION</c>
+    /// env var the legacy fresh-sandbox path sets is not visible inside
+    /// the VM; without this inline directive the agent has an impossible
+    /// instruction (read an unset env var) and the orchestrator stamp
+    /// would be papering over noisy commits.
+    /// </summary>
+    internal static string AppendSessionPromptRevisionDirective(string prompt, int revision) =>
+        prompt + "\n\n# Session-mode prompt-revision override\n\n"
+            + $"The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for this turn MUST be the literal integer **{revision}**. "
+            + $"(The `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable is not available in the session worker VM — use this literal integer instead.)";
 
     internal static string BuildInterruptedReworkResumePrompt(string originalPrompt, string checkpointRef)
     {

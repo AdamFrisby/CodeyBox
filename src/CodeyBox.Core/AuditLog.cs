@@ -1186,6 +1186,22 @@ public static class AuditLog
                 "Session-resume liveness probe failed unexpectedly for {Agent}: {ExceptionType}: {Message}",
                 agent.Value, exceptionType, message);
 
+    /// <summary>
+    /// Emitted by <c>PipelineRunner</c> when <c>ClaudeSessionLifecycle.SuspendAsync</c>
+    /// throws between a worker turn and the audit phase. The session is then
+    /// closed so the long audit does not run with an idle worker VM still
+    /// holding host resources, and the next rework turn degrades to the
+    /// legacy fresh-sandbox path. Surfacing this is a session-mode acceptance
+    /// criterion: a silent swallow would hide the multipass stop/resume
+    /// boundary failure from operators.
+    /// </summary>
+    public static void ClaudeSessionSuspendFailed(WorkItemId itemId, string sessionId, string reason) =>
+        Audit("agent.claude_session_suspend_failed")
+            .Warning(
+                "Claude session suspend failed for work item {WorkItemId} session {SessionId}: {Reason}. " +
+                "Closing the session and degrading to the legacy fresh-sandbox rework path.",
+                itemId, sessionId, reason);
+
     // ── Live agent supervision ───────────────────────────────────────────────
 
     public static void AgentSupervisionInjectionQueued(

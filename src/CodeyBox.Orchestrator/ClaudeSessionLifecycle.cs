@@ -1,5 +1,4 @@
 using CodeyBox.Agents;
-using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -88,19 +87,23 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     public int TurnsCompleted { get; private set; }
 
     /// <summary>
-    /// CLI session id captured from the first turn's stream-json
-    /// <c>system/init</c> event, or null when the worker has fallen back to
-    /// fresh-one-shot mode. Exposed for tests that assert session-id
-    /// continuity across work/rework turns.
+    /// Provider-specific session identifier captured after the first turn,
+    /// looked up from <see cref="AgentSessionHandle.Metadata"/> using the
+    /// well-known metadata key the provider stamps under (e.g. Claude's
+    /// CLI <c>--resume</c> id). Returns null when the runner has not yet
+    /// (or has stopped) populating the key. The metadata key string is a
+    /// provider contract: the orchestration boundary does not own which
+    /// key a given runner uses, so callers pass the key they expect their
+    /// runner to stamp under. Tests use this to assert session-id
+    /// continuity across work/rework turns without the lifecycle taking
+    /// a hard reference to any provider-specific metadata-key constant.
     /// </summary>
-    public string? CliSessionId
+    public string? GetSessionIdFromMetadata(string metadataKey)
     {
-        get
-        {
-            if (Handle.Metadata is null)
-                return null;
-            return Handle.Metadata.TryGetValue(ClaudeSessionWorker.CliSessionIdMetadataKey, out var v) ? v : null;
-        }
+        ArgumentException.ThrowIfNullOrWhiteSpace(metadataKey);
+        if (Handle.Metadata is null)
+            return null;
+        return Handle.Metadata.TryGetValue(metadataKey, out var v) ? v : null;
     }
 
     /// <summary>
@@ -114,37 +117,13 @@ internal sealed class ClaudeSessionLifecycle : IAsyncDisposable
     /// Opens the resumable session against a freshly-provisioned worker
     /// sandbox. The sandbox is owned by the returned lifecycle: callers
     /// must NOT separately dispose the sandbox — <see cref="DisposeAsync"/>
-    /// disposes it via <see cref="ClaudeSessionWorker.CloseSessionAsync"/>.
+    /// disposes it via the runner's <c>CloseSessionAsync</c>.
+    /// <paramref name="handleSnapshot"/> is an optional persistence hook
+    /// the production composition root wires to the concrete runner's
+    /// snapshot method (e.g. <c>ClaudeSessionWorker.SnapshotPersistedHandle</c>);
+    /// tests pass null when they don't exercise the persistence shape.
     /// </summary>
-    public static Task<ClaudeSessionLifecycle> OpenAsync(
-        ClaudeSessionWorker worker,
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        string? modelId,
-        string? reasoningMode,
-        CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(worker);
-        return OpenAsync(
-            (ISessionAgentRunner)worker,
-            worker.SnapshotPersistedHandle,
-            sandbox,
-            workingDirectory,
-            credential,
-            modelId,
-            reasoningMode,
-            ct);
-    }
-
-    /// <summary>
-    /// Test-facing overload taking the worker as <see cref="ISessionAgentRunner"/>
-    /// so unit tests can supply a fake without spinning up the real Claude CLI
-    /// machinery. <paramref name="handleSnapshot"/> is the production
-    /// <c>SnapshotPersistedHandle</c> hook (null in tests that don't exercise
-    /// the persistence shape).
-    /// </summary>
-    internal static async Task<ClaudeSessionLifecycle> OpenAsync(
+    public static async Task<ClaudeSessionLifecycle> OpenAsync(
         ISessionAgentRunner worker,
         Func<AgentSessionHandle, AgentSessionHandle>? handleSnapshot,
         ISandbox sandbox,

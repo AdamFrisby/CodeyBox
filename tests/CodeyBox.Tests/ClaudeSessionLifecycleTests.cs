@@ -198,9 +198,14 @@ public sealed class ClaudeSessionLifecycleTests
         await using var lifecycle = await ClaudeSessionLifecycle.OpenAsync(
             worker, handleSnapshot: Snapshot, sandbox, "/work", credential: null, modelId: null, reasoningMode: null, CancellationToken.None);
 
-        Assert.Null(lifecycle.CliSessionId);
+        // The lifecycle no longer hardcodes the Claude-specific metadata
+        // key — callers pass the key their runner stamps under. Provider
+        // coupling stays at the call site (here, the Claude test), not on
+        // the orchestration boundary.
+        var claudeKey = CodeyBox.Agents.Claude.ClaudeSessionWorker.CliSessionIdMetadataKey;
+        Assert.Null(lifecycle.GetSessionIdFromMetadata(claudeKey));
         await lifecycle.SendTurnAsync("first", CancellationToken.None, stdoutChunkCallback: null);
-        Assert.Equal("cli-sess-fake-1", lifecycle.CliSessionId);
+        Assert.Equal("cli-sess-fake-1", lifecycle.GetSessionIdFromMetadata(claudeKey));
     }
 
     // ─── test doubles ─────────────────────────────────────────────────────

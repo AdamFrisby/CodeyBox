@@ -567,6 +567,19 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>
     monitor.OnChange(opts => ClaudeSessionOptionsBinder.Apply(live, opts.ClaudeSession));
     return live;
 });
+// Orchestration-side dispatch gate. PipelineRunner takes a provider-agnostic
+// AgentSessionDispatchOptions so the orchestration boundary doesn't depend on
+// any per-provider options shape; the composition root maps the per-provider
+// Enabled flag into the orchestrator-owned options and forwards hot-reload
+// changes through the same OnChange handler that drives the worker options.
+builder.Services.AddSingleton<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(sp =>
+{
+    var workerOptions = sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>();
+    var dispatch = new CodeyBox.Orchestrator.AgentSessionDispatchOptions { Enabled = workerOptions.Enabled };
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    monitor.OnChange(opts => dispatch.Enabled = opts.ClaudeSession?.Enabled ?? false);
+    return dispatch;
+});
 // Default metrics sink is the no-op; operators wire a logging/metrics-backed
 // sink by registering their own IClaudeSessionMetricsSink before this line.
 builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(
@@ -2219,12 +2232,18 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
     checkCompletionRunner: sp.GetService<ICheckAndActCompletionRunner>(),
     agentSupervision: sp.GetService<IAgentSupervisionService>(),
-    // Resumable Claude session worker (item 3 of the rollout). Composed
-    // with Project.ClaudeSession.Enabled and the global Enabled flag — the
+    // Resumable session worker (item 3 of the rollout). PipelineRunner
+    // sees only the ISessionAgentRunner abstraction and the orchestrator-
+    // owned dispatch options; the concrete Claude worker is wired into
+    // the abstraction here at the composition root. Composed with
+    // Project.ClaudeSession.Enabled and the global Enabled flag — the
     // pipeline keeps the legacy independent-phase path for any item that
     // doesn't opt in to all three.
-    claudeSessionWorker: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>(),
-    claudeSessionOptions: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>()));
+    sessionAgentRunner: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>(),
+    sessionDispatchOptions: sp.GetService<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(),
+    sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
+        ? worker.SnapshotPersistedHandle
+        : null));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
