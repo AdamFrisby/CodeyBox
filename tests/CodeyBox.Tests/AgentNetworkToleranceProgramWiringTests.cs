@@ -76,7 +76,14 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         var openRequest = new ClaudeTransportOpenRequest(
             Sandbox: sandbox,
             WorkingDirectory: "/work",
-            Credential: null,
+            Credential: new AgentCredential(
+                AgentKind.Claude,
+                new Dictionary<string, string>
+                {
+                    ["ANTHROPIC_API_KEY"] = "sk-test",
+                    ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-test",
+                },
+                new Dictionary<string, string>()),
             ModelId: null,
             ReasoningMode: null,
             LocalSessionId: "program-wiring");
@@ -96,6 +103,8 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         using var hello = ReadFirstStdinEnvelope(bridgeExec);
         var claudeEnv = hello.RootElement.GetProperty("claudeEnv");
         Assert.Equal("64000", claudeEnv.GetProperty("API_TIMEOUT_MS").GetString());
+        Assert.Equal("sk-test", claudeEnv.GetProperty("ANTHROPIC_API_KEY").GetString());
+        Assert.Equal("oauth-test", claudeEnv.GetProperty("CLAUDE_CODE_OAUTH_TOKEN").GetString());
     }
 
     private static T Field<T>(object instance, string name)

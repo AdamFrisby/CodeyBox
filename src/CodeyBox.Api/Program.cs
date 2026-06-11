@@ -3099,7 +3099,8 @@ namespace CodeyBox.Api
         /// <see cref="Core.AgentNetworkToleranceSnapshot"/> and take effect on the
         /// next dispatched agent run. Defaults: Codex request retries = 8,
         /// Codex stream retries = 15, Codex stream idle timeout unset, Claude
-        /// API timeout unset.
+        /// API timeout unset. Timeout values are capped at the API's maximum
+        /// work-attempt window (480 minutes).
         /// </summary>
         public Dictionary<string, AgentNetworkToleranceOptions?> AgentNetworkTolerance { get; set; } =
             AgentNetworkToleranceOptions.DefaultByAgent();

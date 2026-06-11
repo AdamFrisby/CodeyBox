@@ -46,20 +46,29 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 {
                     failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and 100");
                 }
-                if (tolerance.StreamIdleTimeoutMs is < 0)
+                if (tolerance.StreamIdleTimeoutMs is < 0 or > AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs)
                 {
-                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
+                    failures.Add(
+                        $"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs}");
                 }
-                if (tolerance.Provider is not null && string.IsNullOrWhiteSpace(tolerance.Provider))
+                if (tolerance.Provider is not null)
                 {
-                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
+                    if (string.IsNullOrWhiteSpace(tolerance.Provider))
+                    {
+                        failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
+                    }
+                    else if (!AgentNetworkToleranceOptions.IsValidCodexProviderId(tolerance.Provider))
+                    {
+                        failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must match [A-Za-z0-9_-]+");
+                    }
                 }
             }
             else if (string.Equals(agent, AgentNetworkToleranceOptions.ClaudeAgentKind, StringComparison.OrdinalIgnoreCase))
             {
-                if (tolerance.ApiTimeoutMs is < 0)
+                if (tolerance.ApiTimeoutMs is < 0 or > AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs)
                 {
-                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
+                    failures.Add(
+                        $"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be between 0 and {AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs}");
                 }
             }
         }

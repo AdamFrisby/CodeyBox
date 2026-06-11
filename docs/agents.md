@@ -311,7 +311,8 @@ verbatim; if it's unset the flag is omitted and the CLI's own default applies.
 maps to Claude Code's `API_TIMEOUT_MS` environment variable. CodeyBox leaves
 it unset by default because raising the timeout helps slow large-context calls
 but also lengthens hangs on dead connections. Set it only when the operator
-chooses that tradeoff.
+chooses that tradeoff. Values are capped at 28,800,000 ms (480 minutes), the
+maximum work-attempt window accepted by the API.
 
 ### GitHub Copilot CLI
 Reads `GH_TOKEN` from the environment. **Important**: a generic
@@ -339,9 +340,11 @@ tolerant than the vendor defaults:
 
 `RequestMaxRetries` maps to `request_max_retries` and `StreamMaxRetries` maps
 to `stream_max_retries`; both are capped at 100. `StreamIdleTimeoutMs` is
-optional and maps to `stream_idle_timeout_ms` when configured. `Provider` is
-optional; when unset, CodeyBox derives the provider id from the effective
-model id and falls back to `openai`.
+optional, maps to `stream_idle_timeout_ms` when configured, and is capped at
+28,800,000 ms (480 minutes), the maximum work-attempt window accepted by the
+API. `Provider` is optional and must match `[A-Za-z0-9_-]+`; when unset,
+CodeyBox derives the provider id from the effective model id and falls back to
+`openai`.
 
 ### Opencode CLI (`sst/opencode`)
 

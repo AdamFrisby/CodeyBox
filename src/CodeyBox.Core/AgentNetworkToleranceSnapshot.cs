@@ -63,6 +63,7 @@ public sealed class AgentNetworkToleranceOptions
 {
     public const string CodexAgentKind = "codex";
     public const string ClaudeAgentKind = "claude";
+    public const int MaximumCliNetworkTimeoutMs = 480 * 60 * 1000;
 
     /// <summary>
     /// CodeyBox default for Codex HTTP request retries. Vendor default is 4.
@@ -73,6 +74,19 @@ public sealed class AgentNetworkToleranceOptions
     /// CodeyBox default for Codex streaming reconnect retries. Vendor default is 5.
     /// </summary>
     public const int CodexDefaultStreamMaxRetries = 15;
+
+    /// <summary>
+    /// Maximum Codex stream-idle timeout. Matches the maximum work-attempt
+    /// timeout accepted by the API so one CLI wait cannot outlive the dispatch
+    /// window.
+    /// </summary>
+    public const int CodexMaximumStreamIdleTimeoutMs = MaximumCliNetworkTimeoutMs;
+
+    /// <summary>
+    /// Maximum Claude API timeout. Matches the maximum work-attempt timeout
+    /// accepted by the API so one CLI request cannot outlive the dispatch window.
+    /// </summary>
+    public const int ClaudeMaximumApiTimeoutMs = MaximumCliNetworkTimeoutMs;
 
     /// <summary>HTTP request retry count. Used by Codex as request_max_retries.</summary>
     public int? RequestMaxRetries { get; set; }
@@ -115,6 +129,20 @@ public sealed class AgentNetworkToleranceOptions
         {
             [CodexAgentKind] = CodexDefaults(),
         };
+
+    public static bool IsValidCodexProviderId(string providerId)
+    {
+        if (string.IsNullOrEmpty(providerId))
+            return false;
+
+        foreach (var ch in providerId)
+        {
+            if (!char.IsAsciiLetterOrDigit(ch) && ch != '_' && ch != '-')
+                return false;
+        }
+
+        return true;
+    }
 
     internal static void ApplyDocumentedDefaults(Dictionary<string, AgentNetworkToleranceOptions> tolerance)
     {

@@ -348,7 +348,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     {
         if (!string.IsNullOrWhiteSpace(configuredProvider))
         {
-            return configuredProvider;
+            return ResolveSafeProviderId(configuredProvider);
         }
 
         var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
@@ -357,11 +357,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             var slashIdx = effectiveModel.IndexOf('/');
             if (slashIdx > 0)
             {
-                return effectiveModel.Substring(0, slashIdx);
+                return ResolveSafeProviderId(effectiveModel.Substring(0, slashIdx));
             }
         }
 
         return "openai";
     }
+
+    private static string ResolveSafeProviderId(string providerId) =>
+        AgentNetworkToleranceOptions.IsValidCodexProviderId(providerId) ? providerId : "openai";
 
 }

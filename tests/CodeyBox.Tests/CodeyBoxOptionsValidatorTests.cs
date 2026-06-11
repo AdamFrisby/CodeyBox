@@ -317,7 +317,8 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData(-1, "must be non-negative")]
+    [InlineData(-1, "must be between 0 and")]
+    [InlineData(AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs + 1, "must be between 0 and")]
     public void Validate_RejectsInvalidCodexStreamIdleTimeoutMs(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
@@ -333,7 +334,8 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData(-1, "must be non-negative")]
+    [InlineData(-1, "must be between 0 and")]
+    [InlineData(AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs + 1, "must be between 0 and")]
     public void Validate_RejectsInvalidClaudeApiTimeoutMs(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
@@ -406,6 +408,44 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("CodeyBox:AgentNetworkTolerance:codex:Provider must not be empty", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("open.ai")]
+    [InlineData("openai=evil")]
+    [InlineData("open ai")]
+    [InlineData("openai\nnext")]
+    public void Validate_RejectsInvalidCodexProviderId(string provider)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            Provider = provider,
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex:Provider must match [A-Za-z0-9_-]+", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsNetworkToleranceTimeoutBoundaries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            StreamIdleTimeoutMs = AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs,
+            Provider = "azure_openai-1",
+        };
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
+        {
+            ApiTimeoutMs = AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs,
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
     }
 
     [Fact]
