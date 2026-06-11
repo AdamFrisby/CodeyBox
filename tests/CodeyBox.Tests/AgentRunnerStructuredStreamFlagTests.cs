@@ -1,6 +1,8 @@
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Copilot;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 
@@ -146,5 +148,57 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     {
         IAgentRunner runner = new CopilotAgentRunner();
         Assert.False(runner is IStructuredStreamAgentRunner);
+    }
+
+    [Fact]
+    public async Task Cursor_WhenHelpAdvertisesStreamJson_ReportsSupport()
+    {
+        var sandbox = new CapturingSandbox(stderr: "Usage: agent --output-format stream-json");
+        var runner = new CursorAgentRunner { Binary = "/opt/cursor/agent" };
+
+        var supported = await runner.SupportsStructuredStreamAsync(sandbox);
+
+        Assert.True(supported);
+        Assert.Equal(["/opt/cursor/agent", "--help"], sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Cursor_WhenHelpCommandFails_ReturnsFalse()
+    {
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stdout: "--output-format stream-json",
+            stderr: "agent: auth failed");
+
+        var supported = await new CursorAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+        Assert.Equal(["agent", "--help"], sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Antigravity_WhenHelpAdvertisesStreamJson_ReportsSupport()
+    {
+        var sandbox = new CapturingSandbox(stderr: "Usage: agy --output-format stream-json");
+        var runner = new AntigravityAgentRunner { Binary = "/opt/agy" };
+
+        var supported = await runner.SupportsStructuredStreamAsync(sandbox);
+
+        Assert.True(supported);
+        Assert.Equal(["/opt/agy", "--help"], sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Antigravity_WhenHelpCommandFails_ReturnsFalse()
+    {
+        var sandbox = new CapturingSandbox(
+            exitCode: 1,
+            stdout: "--output-format stream-json",
+            stderr: "agy: auth failed");
+
+        var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+        Assert.Equal(["agy", "--help"], sandbox.CapturedExec!.Argv);
     }
 }

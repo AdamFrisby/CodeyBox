@@ -91,21 +91,19 @@ public static class AgentStreamParserSelection
     /// <summary>
     /// Resolves the canonical <see cref="AgentKind"/> for a stream file using
     /// (in priority order):
-    ///   1. the phase-matched cost row (authoritative dispatch metadata),
-    ///   2. <see cref="WorkItem.Agent"/> when <paramref name="file"/> is a
-    ///      work/rework/merge phase that was dispatched to that agent,
-    ///   3. the sniffed parser kind,
-    ///   4. <see cref="WorkItem.Agent"/> as the last-resort fallback.
-    /// Authoritative dispatch metadata wins over a shape-based sniff because
-    /// several agent CLIs (cursor, antigravity) emit NDJSON byte-identical
-    /// to Claude / Gemini stream-json — their parsers deliberately do not
-    /// claim by shape, so a cursor or antigravity stream would otherwise be
-    /// sniffed as claude/gemini and persisted under the wrong
-    /// <c>agent_kind</c>. The work-phase override only applies when
-    /// <see cref="WorkItem.Agent"/> matches the dispatched work runner
-    /// (work/rework/merge phases); audit phases run a different auditor
-    /// agent and must continue to defer to the cost row or, in its absence,
-    /// the sniffed kind. Only kinds present in <paramref name="knownKinds"/>
+    ///   1. a conclusive sniffed parser kind,
+    ///   2. a capture-window-correlated cost row when the sniffed shape is
+    ///      shared by wrapper agents (cursor/antigravity),
+    ///   3. <see cref="WorkItem.Agent"/> for shared-shape work/rework/merge
+    ///      captures when no cost metadata exists,
+    ///   4. phase-matched cost metadata when sniffing failed,
+    ///   5. <see cref="WorkItem.Agent"/> as the last-resort fallback.
+    /// Cost rows are phase/iteration-level metadata; they are not tied to a
+    /// specific random capture filename. A conclusive stream sniff therefore
+    /// stays authoritative. Cost metadata is only allowed to override sniffing
+    /// for known shared shapes, and only when the capture creation timestamp
+    /// falls inside one distinct cost window. Only kinds present in
+    /// <paramref name="knownKinds"/>
     /// are canonicalised — anything else falls through to "unknown".
     /// Callers should pass the kinds of their registered
     /// <see cref="IAgentStreamParser"/>s so adding a new provider library
@@ -121,26 +119,31 @@ public static class AgentStreamParserSelection
         ArgumentNullException.ThrowIfNull(knownKinds);
         var known = knownKinds as IReadOnlyCollection<AgentKind> ?? knownKinds.ToList();
 
-        foreach (var cost in costs
-                     .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
-                     .Where(c => PhaseMatches(file.Phase, c.Phase))
-                     .Where(c => c.Iteration is null || c.Iteration == file.Iteration)
-                     .OrderByDescending(c => string.Equals(c.Phase, file.Phase, StringComparison.OrdinalIgnoreCase))
-                     .ThenByDescending(c => c.StartedAt))
+        var matchingCosts = MatchingCosts(item, file, costs).ToList();
+        var workItemKind = item.Agent.HasValue ? Canonicalize(item.Agent.Value, known) : null;
+
+        if (sniffedKind is not null)
+        {
+            var sniffed = Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
+            if (TryResolveSharedShapeCostOverride(sniffed, matchingCosts, file, known) is { } costOverride)
+                return costOverride;
+
+            if (matchingCosts.Count == 0
+                && workItemKind is { } itemKindForDispatchedPhase
+                && IsDispatchedWorkPhase(file.Phase)
+                && CanEmitSniffedShape(itemKindForDispatchedPhase, sniffed))
+            {
+                return itemKindForDispatchedPhase;
+            }
+
+            return sniffed;
+        }
+
+        foreach (var cost in matchingCosts)
         {
             if (Canonicalize(cost.AgentKind, known) is { } costKind)
                 return costKind;
         }
-
-        var workItemKind = item.Agent.HasValue ? Canonicalize(item.Agent.Value, known) : null;
-        if (workItemKind is { } itemKindForDispatchedPhase
-            && IsDispatchedWorkPhase(file.Phase))
-        {
-            return itemKindForDispatchedPhase;
-        }
-
-        if (sniffedKind is not null)
-            return Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
 
         if (workItemKind is { } itemKind)
             return itemKind;
@@ -148,10 +151,71 @@ public static class AgentStreamParserSelection
         return new AgentKind("unknown");
     }
 
+    private static IEnumerable<WorkItemCost> MatchingCosts(
+        WorkItem item,
+        AgentStreamFile file,
+        IReadOnlyList<WorkItemCost> costs) =>
+        costs
+            .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
+            .Where(c => c.EndedAt >= c.StartedAt)
+            .Where(c => PhaseMatches(file.Phase, c.Phase))
+            .Where(c => c.Iteration is null || c.Iteration == file.Iteration)
+            .OrderByDescending(c => string.Equals(c.Phase, file.Phase, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(c => c.Iteration == file.Iteration)
+            .ThenByDescending(c => c.StartedAt);
+
     private static bool IsDispatchedWorkPhase(string phase) =>
         string.Equals(phase, "work", StringComparison.OrdinalIgnoreCase)
         || string.Equals(phase, "rework", StringComparison.OrdinalIgnoreCase)
         || string.Equals(phase, "merge", StringComparison.OrdinalIgnoreCase);
+
+    private static AgentKind? TryResolveSharedShapeCostOverride(
+        AgentKind sniffed,
+        IReadOnlyList<WorkItemCost> matchingCosts,
+        AgentStreamFile file,
+        IReadOnlyCollection<AgentKind> known)
+    {
+        if (!IsSharedShapeSniff(sniffed))
+            return null;
+
+        var correlatedKinds = matchingCosts
+            .Where(c => CaptureTimestampFallsInCostWindow(file, c))
+            .Select(c => Canonicalize(c.AgentKind, known))
+            .Where(k => k.HasValue)
+            .Select(k => k!.Value)
+            .Distinct()
+            .ToList();
+
+        return correlatedKinds.Count == 1 && CanEmitSniffedShape(correlatedKinds[0], sniffed)
+            ? correlatedKinds[0]
+            : null;
+    }
+
+    private static bool CaptureTimestampFallsInCostWindow(AgentStreamFile file, WorkItemCost cost)
+    {
+        var tolerance = TimeSpan.FromSeconds(5);
+        return file.CapturedAt >= cost.StartedAt - tolerance
+            && file.CapturedAt <= cost.EndedAt + tolerance;
+    }
+
+    private static bool IsSharedShapeSniff(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase);
+
+    private static bool CanEmitSniffedShape(AgentKind candidate, AgentKind sniffed)
+    {
+        if (string.Equals(candidate.Value, sniffed.Value, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Equals(candidate.Value, AgentKind.Cursor.Value, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(candidate.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(candidate.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase);
+    }
 
     public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
     {

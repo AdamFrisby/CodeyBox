@@ -164,6 +164,36 @@ public sealed class ClaudeStreamParserTests
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
 }
 
+public sealed class UnknownAgentStreamParserTests
+{
+    [Fact]
+    public async Task ParseAsync_WithContext_UsesDurationAndCallerCounts()
+    {
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = StreamOf("""
+            starting plaintext run
+            ERROR: compile failed
+            final line
+            """);
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(45),
+            LineCount: 99,
+            SizeBytes: 1234));
+
+        Assert.Equal(TimeSpan.FromSeconds(45), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("lines=99", summary.FinalAssistantMessage);
+        Assert.Contains("bytes=1234", summary.FinalAssistantMessage);
+        Assert.Contains("errors=1", summary.FinalAssistantMessage);
+        Assert.Contains("final line", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
 public sealed class CodexStreamParserTests
 {
     private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
@@ -504,6 +534,27 @@ public sealed class AntigravityStreamParserTests
         Assert.Equal(1000, summary.CachedInputTokens);
         Assert.Equal(420, summary.OutputTokens);
         Assert.Equal(0.07m, summary.EstimatedUsd);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_GeminiStreamJsonShape_ParsesCandidatesToolsAndUsageMetadata()
+    {
+        var parser = new AntigravityStreamParser();
+        await using var stream = StreamOf("""
+            {"type":"response","timestamp":"2026-01-01T00:00:00Z","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"g1","name":"read_file","args":{"path":"a.txt"}}}]}}]}
+            {"type":"response","timestamp":"2026-01-01T00:00:03Z","candidates":[{"content":{"role":"model","parts":[{"functionResponse":{"id":"g1","name":"read_file","response":{"content":"ok"}}}]}}]}
+            {"type":"response","timestamp":"2026-01-01T00:00:05Z","candidates":[{"content":{"role":"model","parts":[{"text":"done"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"cachedContentTokenCount":1}}
+            """);
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("read_file", tool.ToolName);
+        Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
+        Assert.Equal(9, summary.InputTokens);
+        Assert.Equal(3, summary.OutputTokens);
+        Assert.Equal(1, summary.CachedInputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);
     }
 
@@ -1226,9 +1277,10 @@ public sealed class AgentStreamParserSelectionTests
     {
         // Same shape, different vehicle: antigravity gateway runs through a
         // claude-* model emit literal claude stream-json, but the work_item_costs
-        // row records the dispatched agy run. The cost-row branch lands the
-        // summary under agent_kind=antigravity regardless of what the sniffer
-        // claimed by shape.
+        // row records the dispatched agy run and its invocation window contains
+        // this capture file. The cost-row branch lands the summary under
+        // agent_kind=antigravity regardless of what the sniffer claimed by shape.
+        var capturedAt = DateTimeOffset.UtcNow;
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -1244,7 +1296,7 @@ public sealed class AgentStreamParserSelectionTests
             1,
             12,
             null,
-            DateTimeOffset.UtcNow);
+            capturedAt);
         var costs = new[]
         {
             new WorkItemCost
@@ -1256,8 +1308,8 @@ public sealed class AgentStreamParserSelectionTests
                 AgentKind = "antigravity",
                 InputTokens = 0,
                 OutputTokens = 0,
-                StartedAt = DateTimeOffset.UtcNow,
-                EndedAt = DateTimeOffset.UtcNow,
+                StartedAt = capturedAt.AddSeconds(-1),
+                EndedAt = capturedAt.AddSeconds(1),
             },
         };
 
@@ -1269,6 +1321,110 @@ public sealed class AgentStreamParserSelectionTests
             knownKinds: new[] { AgentKind.Claude, AgentKind.Cursor, AgentKind.Antigravity });
 
         Assert.Equal(AgentKind.Antigravity, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_ConclusiveSniffBeatsUnrelatedPhaseCostRow()
+    {
+        var capturedAt = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "fallback work",
+            Prompt = "fallback work",
+            Agent = AgentKind.Antigravity,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            capturedAt);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "work",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddMinutes(10),
+                EndedAt = capturedAt.AddMinutes(11),
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs,
+            knownKinds: new[] { AgentKind.Antigravity, AgentKind.Claude, AgentKind.Codex });
+
+        Assert.Equal(AgentKind.Codex, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AuditPhase_ConclusiveSniffBeatsGenericAuditCostRows()
+    {
+        var capturedAt = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "audit streams",
+            Prompt = "audit streams",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "audit-llm-security:llm-review-1-abcdef.jsonl",
+            "audit-llm-security:llm-review",
+            1,
+            12,
+            null,
+            capturedAt);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "audit",
+                Iteration = 1,
+                AgentKind = "claude",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddSeconds(-1),
+                EndedAt = capturedAt.AddSeconds(1),
+            },
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "audit",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddSeconds(2),
+                EndedAt = capturedAt.AddSeconds(4),
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs,
+            knownKinds: new[] { AgentKind.Antigravity, AgentKind.Claude, AgentKind.Codex });
+
+        Assert.Equal(AgentKind.Codex, kind);
     }
 
     [Fact]
@@ -1571,8 +1727,10 @@ public sealed class OnDemandAnalysisEndpointTests
         // captures, defeating the post-mortem inspection path even though
         // the background summariser was fixed.
         using var factory = new AgentStreamAnalysisApiFactory();
-        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done)
-            with { Agent = AgentKind.Opencode };
+        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done) with
+        {
+            Agent = AgentKind.Opencode,
+        };
         await factory.Store.CreateAsync(item);
         const string fileName = "work-1-abcdef.jsonl";
         factory.WriteStreamFile(item.Id, fileName,

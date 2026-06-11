@@ -33,11 +33,15 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
         var starts = new List<ToolBuilder>();
         var results = new List<ToolResultBuilder>();
         var isAssistant = string.Equals(type, "assistant", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
+            || string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(FirstString(root, "role"), "model", StringComparison.OrdinalIgnoreCase);
 
-        // Parse content using base ParseContent, checking if message property is present
         string? finalText = null;
-        if (TryGet(root, out var message, "message"))
+        if (IsGeminiPayload(root))
+        {
+            ParseGeminiPayload(root, starts, results, ref finalText, ref isAssistant, timestamp);
+        }
+        else if (TryGet(root, out var message, "message"))
         {
             isAssistant |= string.Equals(FirstString(message, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
             ParseContent(message, starts, results, ref finalText);
@@ -51,7 +55,7 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
         int? output = null;
         int? cached = null;
 
-        if (type == "result" && root.TryGetProperty("usage", out var usage))
+        if (TryGet(root, out var usage, "usage"))
         {
             var freshInput = ReadInt(usage, "input_tokens");
             var cacheCreation = ReadInt(usage, "cache_creation_input_tokens");
@@ -69,6 +73,15 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
             cached = cacheRead;
         }
 
+        if (TryGet(root, out var usageMetadata, "usageMetadata", "usage_metadata"))
+        {
+            var promptTotal = ReadInt(usageMetadata, "promptTokenCount", "prompt_token_count", "input_tokens", "prompt_tokens");
+            var cacheRead = ReadInt(usageMetadata, "cachedContentTokenCount", "cached_content_token_count", "cached_input_tokens");
+            input = TokenUsageAccounting.FreshInputTokens(promptTotal, cacheRead);
+            output = ReadInt(usageMetadata, "candidatesTokenCount", "candidates_token_count", "output_tokens", "completion_tokens");
+            cached = cacheRead;
+        }
+
         var parsed = ParseScalars(root, type, timestamp, starts, results, isAssistant, finalText);
         return parsed with
         {
@@ -76,6 +89,55 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
             OutputTokens = output ?? parsed.OutputTokens,
             CachedInputTokens = cached ?? parsed.CachedInputTokens,
         };
+    }
+
+    private static bool IsGeminiPayload(JsonElement root) =>
+        TryGet(root, out _, "usageMetadata", "usage_metadata", "candidates", "functionCall", "function_call", "toolCall", "tool_call");
+
+    private static void ParseGeminiPayload(
+        JsonElement root,
+        List<ToolBuilder> starts,
+        List<ToolResultBuilder> results,
+        ref string? text,
+        ref bool isAssistant,
+        DateTimeOffset? timestamp)
+    {
+        if (TryGet(root, out var functionCall, "functionCall", "function_call", "toolCall", "tool_call"))
+        {
+            isAssistant = true;
+            var id = FirstString(functionCall, "id", "call_id", "name") ?? Guid.NewGuid().ToString("N");
+            var name = FirstString(functionCall, "name", "tool_name") ?? "unknown";
+            starts.Add(new ToolBuilder(id, name, InputSummary(functionCall), timestamp));
+        }
+
+        if (TryGet(root, out var functionResponse, "functionResponse", "function_response", "toolResult", "tool_result"))
+        {
+            var id = FirstString(functionResponse, "id", "call_id", "name") ?? "unknown";
+            results.Add(new ToolResultBuilder(id, !Bool(functionResponse, "is_error", "error"), OutputBytes(functionResponse), timestamp, FirstDuration(functionResponse)));
+        }
+
+        if (TryGet(root, out var candidates, "candidates") && candidates.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var candidate in candidates.EnumerateArray())
+            {
+                isAssistant = true;
+                if (TryGet(candidate, out var content, "content"))
+                    ParseGeminiPayload(content, starts, results, ref text, ref isAssistant, timestamp);
+            }
+        }
+
+        if (TryGet(root, out var parts, "parts") && parts.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var part in parts.EnumerateArray())
+            {
+                ParseGeminiPayload(part, starts, results, ref text, ref isAssistant, timestamp);
+                var partText = FirstString(part, "text", "content");
+                if (!string.IsNullOrEmpty(partText))
+                    text = text is null ? partText : text + partText;
+            }
+        }
+
+        ParseContent(root, starts, results, ref text);
     }
 
     private static int ReadInt(JsonElement parent, params string[] names)
