@@ -107,6 +107,43 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         Assert.Equal("oauth-test", claudeEnv.GetProperty("CLAUDE_CODE_OAUTH_TOKEN").GetString());
     }
 
+    [Fact]
+    public async Task ProgramHotReloadInjectsSameSnapshotIntoRegisteredCoordinator()
+    {
+        using var factory = new AgentNetworkToleranceWiringFactory();
+
+        var snapshot = factory.Services.GetRequiredService<AgentNetworkToleranceSnapshot>();
+        var coordinator = factory.Services.GetRequiredService<AgentConfigHotReload>();
+
+        Assert.Same(snapshot, Field<AgentNetworkToleranceSnapshot>(coordinator, "_networkTolerance"));
+
+        await coordinator.StartAsync(CancellationToken.None);
+        try
+        {
+            factory.ReloadNetworkTolerance(
+                requestMaxRetries: 31,
+                streamMaxRetries: 32,
+                streamIdleTimeoutMs: 330000,
+                provider: "openai",
+                claudeApiTimeoutMs: 75000);
+
+            await WaitUntilAsync(() =>
+            {
+                var codex = snapshot.GetTolerance("codex");
+                var claude = snapshot.GetTolerance("claude");
+                return codex?.RequestMaxRetries == 31
+                    && codex.StreamMaxRetries == 32
+                    && codex.StreamIdleTimeoutMs == 330000
+                    && codex.Provider == "openai"
+                    && claude?.ApiTimeoutMs == 75000;
+            });
+        }
+        finally
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+        }
+    }
+
     private static T Field<T>(object instance, string name)
     {
         var field = instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
@@ -123,10 +160,62 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         return JsonDocument.Parse(firstLine);
     }
 
+    private static async Task WaitUntilAsync(Func<bool> predicate)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (predicate())
+                return;
+
+            await Task.Delay(20);
+        }
+
+        Assert.True(predicate(), "Timed out waiting for AgentNetworkTolerance hot reload to update the shared snapshot.");
+    }
+
     private sealed class AgentNetworkToleranceWiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-network-tolerance-wiring-{Guid.NewGuid():N}.db");
+        private readonly ReloadableMemorySource _config = new();
+
+        public AgentNetworkToleranceWiringFactory()
+        {
+            var tmp = Path.GetTempPath();
+            _config.Data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                ["CodeyBox:StateDatabasePath"] = _dbPath,
+                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:AgentNetworkTolerance:codex:RequestMaxRetries"] = "21",
+                ["CodeyBox:AgentNetworkTolerance:codex:StreamMaxRetries"] = "22",
+                ["CodeyBox:AgentNetworkTolerance:codex:StreamIdleTimeoutMs"] = "230000",
+                ["CodeyBox:AgentNetworkTolerance:codex:Provider"] = "azure",
+                ["CodeyBox:AgentNetworkTolerance:claude:ApiTimeoutMs"] = "64000",
+            };
+        }
+
+        public void ReloadNetworkTolerance(
+            int requestMaxRetries,
+            int streamMaxRetries,
+            int streamIdleTimeoutMs,
+            string provider,
+            int claudeApiTimeoutMs)
+        {
+            var next = new Dictionary<string, string?>(_config.Data, StringComparer.OrdinalIgnoreCase)
+            {
+                ["CodeyBox:AgentNetworkTolerance:codex:RequestMaxRetries"] = requestMaxRetries.ToString(),
+                ["CodeyBox:AgentNetworkTolerance:codex:StreamMaxRetries"] = streamMaxRetries.ToString(),
+                ["CodeyBox:AgentNetworkTolerance:codex:StreamIdleTimeoutMs"] = streamIdleTimeoutMs.ToString(),
+                ["CodeyBox:AgentNetworkTolerance:codex:Provider"] = provider,
+                ["CodeyBox:AgentNetworkTolerance:claude:ApiTimeoutMs"] = claudeApiTimeoutMs.ToString(),
+            };
+            _config.TriggerReload(next);
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -134,21 +223,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
-                cfg.AddInMemoryCollection(new Dictionary<string, string?>
-                {
-                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
-                    ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AgentNetworkTolerance:codex:RequestMaxRetries"] = "21",
-                    ["CodeyBox:AgentNetworkTolerance:codex:StreamMaxRetries"] = "22",
-                    ["CodeyBox:AgentNetworkTolerance:codex:StreamIdleTimeoutMs"] = "230000",
-                    ["CodeyBox:AgentNetworkTolerance:codex:Provider"] = "azure",
-                    ["CodeyBox:AgentNetworkTolerance:claude:ApiTimeoutMs"] = "64000",
-                });
+                cfg.Add(_config);
             });
             builder.ConfigureTestServices(services =>
             {
@@ -194,5 +269,44 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class ReloadableMemorySource : IConfigurationSource
+    {
+        public Dictionary<string, string?> Data { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public ReloadableMemoryProvider? Provider { get; private set; }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            Provider = new ReloadableMemoryProvider(this);
+            return Provider;
+        }
+
+        public void TriggerReload(Dictionary<string, string?> next)
+        {
+            Data = new Dictionary<string, string?>(next, StringComparer.OrdinalIgnoreCase);
+            Provider!.ReloadFromSource();
+        }
+    }
+
+    private sealed class ReloadableMemoryProvider : ConfigurationProvider
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public ReloadableMemoryProvider(ReloadableMemorySource source)
+        {
+            _source = source;
+            ReloadFromSource();
+        }
+
+        public override void Load() { }
+
+        public void ReloadFromSource()
+        {
+            Data = new Dictionary<string, string?>(_source.Data, StringComparer.OrdinalIgnoreCase);
+            OnReload();
+        }
     }
 }
