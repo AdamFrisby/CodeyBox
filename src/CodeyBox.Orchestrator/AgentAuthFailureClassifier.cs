@@ -18,9 +18,9 @@ public interface IAgentAuthFailureClassifier
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
-    /// the evidence. Runtime breaker policy uses this to distinguish stderr,
-    /// trusted stdout transcripts, and operator-configured stdout patterns from
-    /// untrusted model-controlled stdout text.
+    /// the evidence. Runtime breaker policy uses this to distinguish stderr
+    /// from stdout-only text, which can be model-controlled and must be
+    /// corroborated before it benches an agent globally.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -30,11 +30,10 @@ public sealed record AgentAuthFailureDetection(
     bool MatchedStderr,
     bool MatchedStdout,
     bool MatchedTrustedStdoutTranscript,
-    bool MatchedConfiguredStdoutPattern = false)
+    bool MatchedConfiguredStdoutPattern = false,
+    bool MatchedDefaultStdoutPattern = false)
 {
     public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
-    public bool HasAuthoritativeStdoutEvidence =>
-        MatchedTrustedStdoutTranscript || MatchedConfiguredStdoutPattern;
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -66,20 +65,9 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
-        var matchedStderr = false;
+        var matchedStderr = AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr);
+        var matchedDefaultStdout = AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout);
         var matchedConfiguredStdout = false;
-
-        foreach (var pattern in DefaultPatterns)
-        {
-            if (string.IsNullOrWhiteSpace(pattern.Pattern))
-                continue;
-
-            if (!string.IsNullOrEmpty(stderr)
-                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
-            {
-                matchedStderr = true;
-            }
-        }
 
         foreach (var pattern in AdditionalPatternsFor(kind))
         {
@@ -100,7 +88,7 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         }
 
         var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
-        var matchedStdout = matchedConfiguredStdout || matchedTrustedStdoutTranscript;
+        var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout || matchedTrustedStdoutTranscript;
 
         if (matchedStderr || matchedStdout)
         {
@@ -114,7 +102,8 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
                 matchedStderr,
                 matchedStdout,
                 matchedTrustedStdoutTranscript,
-                matchedConfiguredStdout);
+                matchedConfiguredStdout,
+                matchedDefaultStdout);
         }
 
         return null;

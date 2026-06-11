@@ -362,7 +362,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _cancellations = cancellationRegistry;
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
-        _authAvailability = authAvailability ?? authExclusionAvailability as IAgentAuthAvailabilityRegistry;
+        _authAvailability = authAvailability
+            ?? authExclusionAvailability as IAgentAuthAvailabilityRegistry
+            ?? availability as IAgentAuthAvailabilityRegistry;
         _dispatchAvailability = dispatchAvailability;
         _authCorroborationHostSmoke = authCorroborationHostSmoke;
         _authCorroborationInVmSmoke = authCorroborationInVmSmoke;
@@ -5305,9 +5307,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (!detection.IsStdoutOnly)
-            return true;
-
-        if (detection.HasAuthoritativeStdoutEvidence)
             return true;
 
         if (_authCorroborationHostSmoke is not null)

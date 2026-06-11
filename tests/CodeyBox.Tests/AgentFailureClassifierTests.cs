@@ -85,6 +85,7 @@ public sealed class AgentFailureClassifierTests
     [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
     [InlineData("not logged into agy; run `agy login`")]
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     public void LoginPromptPatterns_InStderr_Classified_AsAuthRequired(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
@@ -99,6 +100,18 @@ public sealed class AgentFailureClassifierTests
 
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: transcript);
 
+        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
+    [InlineData("Error: authentication timed out.")]
+    public void LoginPromptPatterns_InStdout_Classified_AsAuthRequired(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
         Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
     }
 
@@ -133,6 +146,24 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
         Assert.True(detection.IsStdoutOnly);
         Assert.True(detection.MatchedTrustedStdoutTranscript);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
+    }
+
+    [Theory]
+    [InlineData("not logged into opencode; run `opencode auth login`")]
+    [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
+    public void AgentAuthFailureClassifier_DetectsDefaultStdoutPatterns_AsNonAuthoritative(string snippet)
+    {
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Opencode,
+            stderr: null,
+            stdout: snippet);
+
+        Assert.NotNull(detection);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedDefaultStdoutPattern);
+        Assert.False(detection.MatchedTrustedStdoutTranscript);
+        Assert.False(detection.MatchedConfiguredStdoutPattern);
     }
 
     [Theory]

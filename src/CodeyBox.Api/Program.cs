@@ -4777,7 +4777,7 @@ namespace CodeyBox.Api
     /// <summary>
     /// Pure conversion from operator-supplied
     /// <see cref="CodeyBoxOptions.AuthFailurePatterns"/> to a wired
-    /// <see cref="AgentAuthFailureClassifier"/>. Extracted from the DI factory
+    /// <see cref="IAgentAuthFailureClassifier"/>. Extracted from the DI factory
     /// so the binding shape (config section name, per-agent dictionary,
     /// pattern filtering, conversion to <see cref="AuthFailurePattern"/>) is
     /// reachable from unit tests without booting the full host — a bug in
@@ -4786,7 +4786,7 @@ namespace CodeyBox.Api
     /// </summary>
     public static class AuthFailurePatternBinder
     {
-        public static AgentAuthFailureClassifier Build(CodeyBoxOptions options)
+        public static IAgentAuthFailureClassifier Build(CodeyBoxOptions options)
         {
             ArgumentNullException.ThrowIfNull(options);
             var extras = options.AuthFailurePatterns is null

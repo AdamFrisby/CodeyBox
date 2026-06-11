@@ -276,7 +276,7 @@ public static class AgentFailureClassifier
                 Reason: SoftRateLimitReason,
                 QuotaFailure: AgentQuotaFailureKind.SoftRateLimit);
 
-        if (ContainsAny(stderr, AuthRequiredPatterns) || ContainsTrustedStdoutAuthRequired(stdout))
+        if (ContainsAuthRequiredPatternInStderr(stderr) || ContainsAuthRequiredPatternInStdout(stdout))
             return new AgentFailureClassification(AgentFailureKind.AuthRequired, Reason: "auth-required pattern matched");
 
         if (ContainsAny(stderr, AuthPatterns) || ContainsAny(stdout, AuthPatterns))
@@ -434,17 +434,44 @@ public static class AgentFailureClassifier
             || ContainsAny(message, StructuredTurnFailedTimeoutPatterns);
     }
 
-    private static bool ContainsTrustedStdoutAuthRequired(string? stdout)
+    public static bool ContainsAuthRequiredPatternInStderr(string? stderr) =>
+        ContainsAny(stderr, AuthRequiredPatterns) || ContainsStandaloneOAuthLoginUrlLine(stderr);
+
+    public static bool ContainsAuthRequiredPatternInStdout(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout))
             return false;
 
-        var hasLoginPrompt =
-            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
-        var hasWaitOrTimeout =
-            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
-        return hasLoginPrompt && hasWaitOrTimeout;
+        if (stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `gemini auth login`", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `agent login`", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `opencode auth login`", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `codex login`", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return ContainsStandaloneOAuthLoginUrlLine(stdout)
+            || stdout.Split('\n').Any(static line =>
+            {
+                var trimmed = line.Trim();
+                return trimmed.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
+                    || trimmed.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase);
+            });
     }
+
+    private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>
+        !string.IsNullOrWhiteSpace(text)
+        && text.Split('\n').Any(static line => IsStandaloneOAuthLoginUrl(line.Trim()));
+
+    private static bool IsStandaloneOAuthLoginUrl(string line) =>
+        line.StartsWith("https://accounts.google.com/o/oauth2", StringComparison.OrdinalIgnoreCase)
+        || line.StartsWith("http://accounts.google.com/o/oauth2", StringComparison.OrdinalIgnoreCase)
+        || ((line.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            && line.Contains("/oauth-callback", StringComparison.OrdinalIgnoreCase));
 }

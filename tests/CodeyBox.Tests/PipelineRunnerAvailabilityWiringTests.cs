@@ -420,17 +420,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task SuccessfulNoDiffRun_WithHostCorroboratedStdoutAuthPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
-        var transcript = await File.ReadAllTextAsync(
-            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var hostSmoke = HostSmokeProbeRunners.PersistentAuth();
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: hostSmoke);
 
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
+            Stdout: "not logged into opencode; run `opencode auth login`",
             Stderr: null));
 
         var item = NewItem(AgentKind.Codex);
@@ -441,6 +440,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Equal(1, hostSmoke.CallCount);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -511,8 +511,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
-            Stderr: null));
+            Stdout: null,
+            Stderr: transcript));
 
         var item = NewItem(AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -543,8 +543,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
-            Stderr: null));
+            Stdout: null,
+            Stderr: transcript));
 
         var item = NewItem(AgentKind.Codex);
         await fix.Store.CreateAsync(item);
@@ -571,7 +571,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // phase-name detector call there can't pass off the work-phase test
         // as full coverage.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -613,7 +613,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task MergePhaseAgenticResolver_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed);
+        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -677,17 +677,15 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_FailsItemWithoutGlobalExclusion()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
-        var transcript = await File.ReadAllTextAsync(
-            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: transcript,
+            Stdout: "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted",
             Stderr: null));
 
         var item = NewItem(AgentKind.Codex);
@@ -698,6 +696,35 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
+
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.True(availability.Available);
+
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task StdoutOnlyAuthPrompt_WithInVmAuthCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new AuthCorroboratingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted",
+            Stderr: null));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("infrastructure", final.FailureKind);
+        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -1312,6 +1339,32 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
             Task.FromResult<AgentAvailability?>(new AgentAvailability(false, "transient: try later", null));
+    }
+
+    private sealed class AuthCorroboratingInVmSmokeGate : IInVmSmokeGate
+    {
+        public int EnsureCalls { get; private set; }
+        public int ForceProbeCalls { get; private set; }
+        public bool Enabled => true;
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            EnsureCalls++;
+            return Task.FromResult(new AgentAvailability(true, null, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+        {
+            ForceProbeCalls++;
+            return Task.FromResult<AgentAvailability?>(
+                new AgentAvailability(false, "credential login required", null));
+        }
     }
 
     private static WorkItem NewItem(AgentKind initialAgent) => new()

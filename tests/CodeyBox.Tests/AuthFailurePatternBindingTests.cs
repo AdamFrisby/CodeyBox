@@ -91,7 +91,7 @@ public sealed class AuthFailurePatternBindingTests
         Assert.NotNull(classifier.Detect(AgentKind.Antigravity, stderr: "real-entry", stdout: null));
     }
 
-    private static AgentAuthFailureClassifier BindAndBuild(Dictionary<string, string?> values)
+    private static IAgentAuthFailureClassifier BindAndBuild(Dictionary<string, string?> values)
     {
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(values)
