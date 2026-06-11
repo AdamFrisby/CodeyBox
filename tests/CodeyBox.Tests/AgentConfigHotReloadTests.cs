@@ -2269,14 +2269,14 @@ public sealed class AgentConfigHotReloadTests
     [Fact]
     public async Task AgentNetworkTolerance_HotReload_ChangesCommandArgsOnNextRun_Codex()
     {
-        var initialTolerance = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        var initialTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["codex"] = new Dictionary<string, string>
+            ["codex"] = new AgentNetworkToleranceOptions
             {
-                ["RequestMaxRetries"] = "5",
-                ["StreamMaxRetries"] = "6",
-                ["StreamIdleTimeoutMs"] = "120000",
-                ["Provider"] = "openai"
+                RequestMaxRetries = 5,
+                StreamMaxRetries = 6,
+                StreamIdleTimeoutMs = 120000,
+                Provider = "openai"
             }
         };
         var snapshot = new AgentNetworkToleranceSnapshot(initialTolerance);
@@ -2293,14 +2293,14 @@ public sealed class AgentConfigHotReloadTests
         Assert.Contains("model_providers.openai.stream_idle_timeout_ms=120000", argv);
 
         // Hot-reload: swap to different tolerance values.
-        var updatedTolerance = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        var updatedTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["codex"] = new Dictionary<string, string>
+            ["codex"] = new AgentNetworkToleranceOptions
             {
-                ["RequestMaxRetries"] = "10",
-                ["StreamMaxRetries"] = "12",
-                ["StreamIdleTimeoutMs"] = "240000",
-                ["Provider"] = "openai"
+                RequestMaxRetries = 10,
+                StreamMaxRetries = 12,
+                StreamIdleTimeoutMs = 240000,
+                Provider = "openai"
             }
         };
         snapshot.Replace(updatedTolerance);
@@ -2314,13 +2314,13 @@ public sealed class AgentConfigHotReloadTests
         Assert.Contains("model_providers.openai.stream_idle_timeout_ms=240000", argv2);
 
         // Verify custom provider works
-        var providerTolerance = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        var providerTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["codex"] = new Dictionary<string, string>
+            ["codex"] = new AgentNetworkToleranceOptions
             {
-                ["RequestMaxRetries"] = "5",
-                ["StreamMaxRetries"] = "6",
-                ["Provider"] = "azure"
+                RequestMaxRetries = 5,
+                StreamMaxRetries = 6,
+                Provider = "azure"
             }
         };
         snapshot.Replace(providerTolerance);
@@ -2334,11 +2334,25 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task AgentNetworkTolerance_Codex_DefaultsApplyWithoutConfig()
+    {
+        var runner = new CodexAgentRunner(defaults: null, networkTolerance: null);
+        var sandbox = new CapturingSandbox();
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("model_providers.openai.request_max_retries=8", argv);
+        Assert.Contains("model_providers.openai.stream_max_retries=15", argv);
+        Assert.DoesNotContain(argv, arg => arg.Contains("stream_idle_timeout_ms", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task AgentNetworkTolerance_Claude_ApiTimeoutMs_EnvVar()
     {
         // Unset case (should not have API_TIMEOUT_MS)
         {
-            var snapshot = new AgentNetworkToleranceSnapshot(new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase));
+            var snapshot = new AgentNetworkToleranceSnapshot(new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
             var runner = new ClaudeAgentRunner(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: snapshot);
             var sandbox = new CapturingSandbox();
             await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
@@ -2352,9 +2366,9 @@ public sealed class AgentConfigHotReloadTests
 
         // Configured case (should have API_TIMEOUT_MS)
         {
-            var tolerance = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+            var tolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["claude"] = new Dictionary<string, string> { ["ApiTimeoutMs"] = "45000" },
+                ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 45000 },
             };
             var snapshot = new AgentNetworkToleranceSnapshot(tolerance);
             var runner = new ClaudeAgentRunner(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: snapshot);
@@ -2371,19 +2385,24 @@ public sealed class AgentConfigHotReloadTests
     [Fact]
     public async Task AgentNetworkTolerance_AcpClaudeTransport_ApiTimeoutMs_EnvVar()
     {
-        var tolerance = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        var tolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["claude"] = new Dictionary<string, string> { ["ApiTimeoutMs"] = "45000" },
+            ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 45000 },
         };
         var snapshot = new AgentNetworkToleranceSnapshot(tolerance);
-        var transport = new AcpClaudeTransport(snapshot);
+        var transport = new AcpClaudeTransport(snapshot)
+        {
+            ClaudeBinary = "/opt/claude-test/claude",
+        };
 
         var sandbox = new CapturingSandbox();
         var openRequest = new ClaudeTransportOpenRequest(
             Sandbox: sandbox,
             WorkingDirectory: "/work",
-            CliResumeSessionId: "session-id",
-            SessionOptions: new ClaudeSessionWorkerOptions());
+            Credential: null,
+            ModelId: null,
+            ReasoningMode: null,
+            LocalSessionId: "local-session-id");
 
         var session = await transport.OpenAsync(openRequest, CancellationToken.None);
 
@@ -2401,26 +2420,65 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task AgentNetworkTolerance_AcpClaudeTransport_ApiTimeoutMs_UnsetAndHotReloadsPerTurn()
+    {
+        var snapshot = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
+        var transport = new AcpClaudeTransport(snapshot);
+        var sandbox = new CapturingSandbox();
+        var openRequest = new ClaudeTransportOpenRequest(
+            Sandbox: sandbox,
+            WorkingDirectory: "/work",
+            Credential: null,
+            ModelId: null,
+            ReasoningMode: null,
+            LocalSessionId: "local-session-id");
+
+        var session = await transport.OpenAsync(openRequest, CancellationToken.None);
+
+        await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest(
+                Prompt: "hello",
+                CliResumeSessionId: null,
+                StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        var initialEnv = sandbox.CapturedExec!.ExtraEnvironment;
+        Assert.True(initialEnv is null || !initialEnv.ContainsKey("API_TIMEOUT_MS"));
+
+        snapshot.Replace(new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 90000 },
+        });
+
+        await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest(
+                Prompt: "again",
+                CliResumeSessionId: null,
+                StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        var reloadedEnv = sandbox.CapturedExec!.ExtraEnvironment;
+        Assert.NotNull(reloadedEnv);
+        Assert.Equal("90000", reloadedEnv["API_TIMEOUT_MS"]);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_AgentNetworkTolerancePushesToSnapshot()
     {
         var initial = new CodeyBoxOptions
         {
-            AgentNetworkTolerance = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+            AgentNetworkTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["codex"] = new Dictionary<string, string>
+                ["codex"] = new AgentNetworkToleranceOptions
                 {
-                    ["RequestMaxRetries"] = "2",
-                    ["StreamMaxRetries"] = "3"
+                    RequestMaxRetries = 2,
+                    StreamMaxRetries = 3
                 },
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
-        var initialTol = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kvp in initial.AgentNetworkTolerance)
-        {
-            initialTol[kvp.Key] = kvp.Value;
-        }
-        var snapshot = new AgentNetworkToleranceSnapshot(initialTol);
+        var snapshot = new AgentNetworkToleranceSnapshot(initial.AgentNetworkTolerance);
 
         var router = new AgentClassRouter(
             Array.Empty<AgentClass>(),
@@ -2440,25 +2498,25 @@ public sealed class AgentConfigHotReloadTests
 
         var codexTol = snapshot.GetTolerance("codex");
         Assert.NotNull(codexTol);
-        Assert.Equal("2", codexTol["RequestMaxRetries"]);
-        Assert.Equal("3", codexTol["StreamMaxRetries"]);
+        Assert.Equal(2, codexTol.RequestMaxRetries);
+        Assert.Equal(3, codexTol.StreamMaxRetries);
 
         monitor.Fire(new CodeyBoxOptions
         {
-            AgentNetworkTolerance = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+            AgentNetworkTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["codex"] = new Dictionary<string, string>
+                ["codex"] = new AgentNetworkToleranceOptions
                 {
-                    ["RequestMaxRetries"] = "7",
-                    ["StreamMaxRetries"] = "9"
+                    RequestMaxRetries = 7,
+                    StreamMaxRetries = 9
                 },
             },
         });
 
         var codexTol2 = snapshot.GetTolerance("codex");
         Assert.NotNull(codexTol2);
-        Assert.Equal("7", codexTol2["RequestMaxRetries"]);
-        Assert.Equal("9", codexTol2["StreamMaxRetries"]);
+        Assert.Equal(7, codexTol2.RequestMaxRetries);
+        Assert.Equal(9, codexTol2.StreamMaxRetries);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

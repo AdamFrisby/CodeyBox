@@ -1187,12 +1187,7 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
 builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    var dict = new Dictionary<string, IReadOnlyDictionary<string, string>>(opts.AgentNetworkTolerance.Comparer);
-    foreach (var kvp in opts.AgentNetworkTolerance)
-    {
-        dict[kvp.Key] = kvp.Value;
-    }
-    return new CodeyBox.Core.AgentNetworkToleranceSnapshot(dict);
+    return new CodeyBox.Core.AgentNetworkToleranceSnapshot(opts.AgentNetworkTolerance);
 });
 
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
@@ -3102,10 +3097,12 @@ namespace CodeyBox.Api
         /// (case-insensitive). The runner uses these values to override the CLI
         /// network tolerance settings (e.g. retries, timeouts). Edits hot-reload via
         /// <see cref="Core.AgentNetworkToleranceSnapshot"/> and take effect on the
-        /// next dispatched agent run.
+        /// next dispatched agent run. Defaults: Codex request retries = 8,
+        /// Codex stream retries = 15, Codex stream idle timeout unset, Claude
+        /// API timeout unset.
         /// </summary>
-        public Dictionary<string, Dictionary<string, string>> AgentNetworkTolerance { get; set; } =
-            new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, AgentNetworkToleranceOptions?> AgentNetworkTolerance { get; set; } =
+            AgentNetworkToleranceOptions.DefaultByAgent();
 
         /// <summary>
         /// Operator-configured per-agent pauses. Keyed by agent kind value.

@@ -30,6 +30,7 @@ namespace CodeyBox.Api;
 ///   snapshot cache — it recomputes from the live usage store on every call —
 ///   so the new windows take effect on the next gate/visibility read).</item>
 /// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
+/// <item><c>CodeyBox:AgentNetworkTolerance</c> → <see cref="AgentNetworkToleranceSnapshot.Replace"/>.</item>
 /// <item><c>CodeyBox:AgentPauses</c> → <see cref="IAgentPauseController"/> config-owned
 ///   pause/resume reconciliation.</item>
 /// <item><c>CodeyBox:Smoke</c> → <see cref="SmokeOptionsSnapshot.Replace"/>
@@ -626,12 +627,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastNetworkTolerance;
         try
         {
-            var dict = new Dictionary<string, IReadOnlyDictionary<string, string>>(opts.AgentNetworkTolerance.Comparer);
-            foreach (var kvp in opts.AgentNetworkTolerance)
-            {
-                dict[kvp.Key] = kvp.Value;
-            }
-            _networkTolerance.Replace(dict);
+            _networkTolerance.Replace(opts.AgentNetworkTolerance);
             _lastNetworkTolerance = next;
             AuditLog.ConfigReloaded("AgentNetworkTolerance", prev, next);
             _log.LogInformation("Hot-reloaded AgentNetworkTolerance: {OldValue} → {NewValue}", prev, next);
@@ -793,15 +789,26 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             },
             JsonOpts);
 
-    private static string SerializeNetworkTolerance(Dictionary<string, Dictionary<string, string>> tolerance) =>
+    private static string SerializeNetworkTolerance(Dictionary<string, AgentNetworkToleranceOptions?> tolerance) =>
         JsonSerializer.Serialize(
             tolerance.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(
                     kv => kv.Key,
-                    kv => kv.Value.OrderBy(ikv => ikv.Key, StringComparer.OrdinalIgnoreCase)
-                        .ToDictionary(ikv => ikv.Key, ikv => ikv.Value, StringComparer.OrdinalIgnoreCase),
+                    kv => SerializeNetworkToleranceValue(kv.Value),
                     StringComparer.OrdinalIgnoreCase),
             JsonOpts);
+
+    private static object? SerializeNetworkToleranceValue(AgentNetworkToleranceOptions? value) =>
+        value is null
+            ? null
+            : new
+            {
+                value.RequestMaxRetries,
+                value.StreamMaxRetries,
+                value.StreamIdleTimeoutMs,
+                value.Provider,
+                value.ApiTimeoutMs,
+            };
 
     private static string SerializeDefaults(Dictionary<string, string?> defaults) =>
         JsonSerializer.Serialize(

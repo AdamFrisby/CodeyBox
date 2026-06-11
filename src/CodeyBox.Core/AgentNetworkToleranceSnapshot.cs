@@ -12,23 +12,23 @@ namespace CodeyBox.Core;
 /// </summary>
 public sealed class AgentNetworkToleranceSnapshot
 {
-    private IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> _current;
+    private IReadOnlyDictionary<string, AgentNetworkToleranceOptions> _current;
 
-    public AgentNetworkToleranceSnapshot(IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> initial)
+    public AgentNetworkToleranceSnapshot(IReadOnlyDictionary<string, AgentNetworkToleranceOptions?> initial)
     {
         ArgumentNullException.ThrowIfNull(initial);
         _current = CopyTolerance(initial);
     }
 
-    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> Current => Volatile.Read(ref _current);
+    public IReadOnlyDictionary<string, AgentNetworkToleranceOptions> Current => Volatile.Read(ref _current);
 
-    public void Replace(IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> next)
+    public void Replace(IReadOnlyDictionary<string, AgentNetworkToleranceOptions?> next)
     {
         ArgumentNullException.ThrowIfNull(next);
         Volatile.Write(ref _current, CopyTolerance(next));
     }
 
-    public IReadOnlyDictionary<string, string>? GetTolerance(string agentKind)
+    public AgentNetworkToleranceOptions? GetTolerance(string agentKind)
     {
         if (Current.TryGetValue(agentKind, out var dict))
         {
@@ -37,17 +37,97 @@ public sealed class AgentNetworkToleranceSnapshot
         return null;
     }
 
-    private static Dictionary<string, IReadOnlyDictionary<string, string>> CopyTolerance(
-        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> source)
+    private static Dictionary<string, AgentNetworkToleranceOptions> CopyTolerance(
+        IReadOnlyDictionary<string, AgentNetworkToleranceOptions?> source)
     {
-        var copy = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var copy = new Dictionary<string, AgentNetworkToleranceOptions>(StringComparer.OrdinalIgnoreCase);
         foreach (var kvp in source)
         {
             if (kvp.Value != null)
             {
-                copy[kvp.Key] = new Dictionary<string, string>(kvp.Value, StringComparer.OrdinalIgnoreCase);
+                copy[kvp.Key] = kvp.Value.Clone();
             }
         }
+        AgentNetworkToleranceOptions.ApplyDocumentedDefaults(copy);
         return copy;
     }
+}
+
+/// <summary>
+/// Typed per-agent network tolerance settings surfaced at
+/// <c>CodeyBox:AgentNetworkTolerance:&lt;agent&gt;</c>. Null properties mean
+/// "leave the vendor default alone" unless a documented CodeyBox default is
+/// applied for that agent.
+/// </summary>
+public sealed class AgentNetworkToleranceOptions
+{
+    public const string CodexAgentKind = "codex";
+    public const string ClaudeAgentKind = "claude";
+
+    /// <summary>
+    /// CodeyBox default for Codex HTTP request retries. Vendor default is 4.
+    /// </summary>
+    public const int CodexDefaultRequestMaxRetries = 8;
+
+    /// <summary>
+    /// CodeyBox default for Codex streaming reconnect retries. Vendor default is 5.
+    /// </summary>
+    public const int CodexDefaultStreamMaxRetries = 15;
+
+    /// <summary>HTTP request retry count. Used by Codex as request_max_retries.</summary>
+    public int? RequestMaxRetries { get; set; }
+
+    /// <summary>Streaming reconnect retry count. Used by Codex as stream_max_retries.</summary>
+    public int? StreamMaxRetries { get; set; }
+
+    /// <summary>Stream idle timeout in milliseconds. Used by Codex as stream_idle_timeout_ms when configured.</summary>
+    public int? StreamIdleTimeoutMs { get; set; }
+
+    /// <summary>
+    /// Optional Codex model provider id for the injected provider overrides.
+    /// When unset, the runner derives the provider from the effective model id,
+    /// falling back to <c>openai</c>.
+    /// </summary>
+    public string? Provider { get; set; }
+
+    /// <summary>
+    /// Optional Claude Code API timeout in milliseconds. Null deliberately
+    /// leaves Claude's own API_TIMEOUT_MS default untouched.
+    /// </summary>
+    public int? ApiTimeoutMs { get; set; }
+
+    public static AgentNetworkToleranceOptions CodexDefaults() => new()
+    {
+        RequestMaxRetries = CodexDefaultRequestMaxRetries,
+        StreamMaxRetries = CodexDefaultStreamMaxRetries,
+    };
+
+    public static AgentNetworkToleranceOptions WithCodexDefaults(AgentNetworkToleranceOptions? configured)
+    {
+        var resolved = configured?.Clone() ?? new AgentNetworkToleranceOptions();
+        resolved.RequestMaxRetries ??= CodexDefaultRequestMaxRetries;
+        resolved.StreamMaxRetries ??= CodexDefaultStreamMaxRetries;
+        return resolved;
+    }
+
+    public static Dictionary<string, AgentNetworkToleranceOptions?> DefaultByAgent() =>
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            [CodexAgentKind] = CodexDefaults(),
+        };
+
+    internal static void ApplyDocumentedDefaults(Dictionary<string, AgentNetworkToleranceOptions> tolerance)
+    {
+        tolerance[CodexAgentKind] = WithCodexDefaults(
+            tolerance.TryGetValue(CodexAgentKind, out var codex) ? codex : null);
+    }
+
+    public AgentNetworkToleranceOptions Clone() => new()
+    {
+        RequestMaxRetries = RequestMaxRetries,
+        StreamMaxRetries = StreamMaxRetries,
+        StreamIdleTimeoutMs = StreamIdleTimeoutMs,
+        Provider = Provider,
+        ApiTimeoutMs = ApiTimeoutMs,
+    };
 }

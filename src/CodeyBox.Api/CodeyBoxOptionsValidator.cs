@@ -36,51 +36,30 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 continue;
             }
 
-            if (string.Equals(agent, "codex", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(agent, AgentNetworkToleranceOptions.CodexAgentKind, StringComparison.OrdinalIgnoreCase))
             {
-                foreach (var (key, val) in tolerance)
+                if (tolerance.RequestMaxRetries is < 0 or > 100)
                 {
-                    if (string.Equals(key, "RequestMaxRetries", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (!int.TryParse(val, out var req) || req < 0 || req > 100)
-                        {
-                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and 100");
-                        }
-                    }
-                    else if (string.Equals(key, "StreamMaxRetries", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (!int.TryParse(val, out var str) || str < 0 || str > 100)
-                        {
-                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and 100");
-                        }
-                    }
-                    else if (string.Equals(key, "StreamIdleTimeoutMs", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (!int.TryParse(val, out var idle) || idle < 0)
-                        {
-                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
-                        }
-                    }
-                    else if (string.Equals(key, "Provider", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (string.IsNullOrWhiteSpace(val))
-                        {
-                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
-                        }
-                    }
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and 100");
+                }
+                if (tolerance.StreamMaxRetries is < 0 or > 100)
+                {
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and 100");
+                }
+                if (tolerance.StreamIdleTimeoutMs is < 0)
+                {
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be non-negative");
+                }
+                if (tolerance.Provider is not null && string.IsNullOrWhiteSpace(tolerance.Provider))
+                {
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
                 }
             }
-            else if (string.Equals(agent, "claude", StringComparison.OrdinalIgnoreCase))
+            else if (string.Equals(agent, AgentNetworkToleranceOptions.ClaudeAgentKind, StringComparison.OrdinalIgnoreCase))
             {
-                foreach (var (key, val) in tolerance)
+                if (tolerance.ApiTimeoutMs is < 0)
                 {
-                    if (string.Equals(key, "ApiTimeoutMs", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (!int.TryParse(val, out var api) || api < 0)
-                        {
-                            failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
-                        }
-                    }
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be non-negative");
                 }
             }
         }

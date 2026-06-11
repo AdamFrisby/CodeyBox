@@ -733,11 +733,6 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private int? BindApiTimeout()
     {
         if (_networkTolerance == null) return null;
-        var dict = _networkTolerance.GetTolerance(Kind.Value);
-        if (dict != null && dict.TryGetValue("ApiTimeoutMs", out var val) && int.TryParse(val, out var apiTimeoutMs))
-        {
-            return apiTimeoutMs;
-        }
-        return null;
+        return _networkTolerance.GetTolerance(Kind.Value)?.ApiTimeoutMs;
     }
 }

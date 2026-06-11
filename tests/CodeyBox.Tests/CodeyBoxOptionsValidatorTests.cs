@@ -283,15 +283,14 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData("-1", "must be between 0 and 100")]
-    [InlineData("101", "must be between 0 and 100")]
-    [InlineData("not-an-integer", "must be between 0 and 100")]
-    public void Validate_RejectsInvalidCodexRequestMaxRetries(string value, string expectedMessage)
+    [InlineData(-1, "must be between 0 and 100")]
+    [InlineData(101, "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexRequestMaxRetries(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
-        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
         {
-            ["RequestMaxRetries"] = value
+            RequestMaxRetries = value
         };
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
@@ -301,15 +300,14 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData("-1", "must be between 0 and 100")]
-    [InlineData("101", "must be between 0 and 100")]
-    [InlineData("not-an-integer", "must be between 0 and 100")]
-    public void Validate_RejectsInvalidCodexStreamMaxRetries(string value, string expectedMessage)
+    [InlineData(-1, "must be between 0 and 100")]
+    [InlineData(101, "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexStreamMaxRetries(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
-        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
         {
-            ["StreamMaxRetries"] = value
+            StreamMaxRetries = value
         };
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
@@ -319,14 +317,13 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData("-1", "must be non-negative")]
-    [InlineData("not-an-integer", "must be non-negative")]
-    public void Validate_RejectsInvalidCodexStreamIdleTimeoutMs(string value, string expectedMessage)
+    [InlineData(-1, "must be non-negative")]
+    public void Validate_RejectsInvalidCodexStreamIdleTimeoutMs(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
-        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
         {
-            ["StreamIdleTimeoutMs"] = value
+            StreamIdleTimeoutMs = value
         };
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
@@ -336,14 +333,13 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Theory]
-    [InlineData("-1", "must be non-negative")]
-    [InlineData("not-an-integer", "must be non-negative")]
-    public void Validate_RejectsInvalidClaudeApiTimeoutMs(string value, string expectedMessage)
+    [InlineData(-1, "must be non-negative")]
+    public void Validate_RejectsInvalidClaudeApiTimeoutMs(int value, string expectedMessage)
     {
         var options = ValidCodeyBoxOptions();
-        options.AgentNetworkTolerance["claude"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
         {
-            ["ApiTimeoutMs"] = value
+            ApiTimeoutMs = value
         };
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
@@ -356,21 +352,60 @@ public sealed class CodeyBoxOptionsValidatorTests
     public void Validate_AcceptsValidAgentNetworkTolerance()
     {
         var options = ValidCodeyBoxOptions();
-        options.AgentNetworkTolerance["codex"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
         {
-            ["RequestMaxRetries"] = "5",
-            ["StreamMaxRetries"] = "10",
-            ["StreamIdleTimeoutMs"] = "120000",
-            ["Provider"] = "azure"
+            RequestMaxRetries = 5,
+            StreamMaxRetries = 10,
+            StreamIdleTimeoutMs = 120000,
+            Provider = "azure"
         };
-        options.AgentNetworkTolerance["claude"] = new Dictionary<string, string>
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
         {
-            ["ApiTimeoutMs"] = "30000"
+            ApiTimeoutMs = 30000
         };
 
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
 
         Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEmptyAgentNetworkToleranceKey()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance[" "] = new AgentNetworkToleranceOptions();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance keys must not be empty", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsNullAgentNetworkToleranceBlock()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = null;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex must not be null", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsBlankCodexProvider()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            Provider = " ",
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex:Provider must not be empty", result.FailureMessage);
     }
 
     [Fact]

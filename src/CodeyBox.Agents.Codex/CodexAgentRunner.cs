@@ -239,34 +239,15 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             argv.Add($"model_reasoning_effort={reasoningMode}");
         }
 
-        // Network tolerance overrides
-        var toleranceDict = _networkTolerance?.GetTolerance(Kind.Value);
-        var reqRetries = CodexNetworkTolerance.DefaultRequestMaxRetries;
-        var streamRetries = CodexNetworkTolerance.DefaultStreamMaxRetries;
-        int? idleTimeout = null;
-        string? configProvider = null;
+        // Network tolerance overrides. The snapshot owns the documented
+        // CodeyBox defaults; this runner only maps the typed options onto the
+        // Codex CLI's provider-scoped config keys.
+        var tolerance = AgentNetworkToleranceOptions.WithCodexDefaults(
+            _networkTolerance?.GetTolerance(Kind.Value));
+        var reqRetries = tolerance.RequestMaxRetries!.Value;
+        var streamRetries = tolerance.StreamMaxRetries!.Value;
 
-        if (toleranceDict != null)
-        {
-            if (toleranceDict.TryGetValue("RequestMaxRetries", out var reqVal) && int.TryParse(reqVal, out var parsedReq))
-            {
-                reqRetries = parsedReq;
-            }
-            if (toleranceDict.TryGetValue("StreamMaxRetries", out var strVal) && int.TryParse(strVal, out var parsedStr))
-            {
-                streamRetries = parsedStr;
-            }
-            if (toleranceDict.TryGetValue("StreamIdleTimeoutMs", out var idleVal) && int.TryParse(idleVal, out var parsedIdle))
-            {
-                idleTimeout = parsedIdle;
-            }
-            if (toleranceDict.TryGetValue("Provider", out var provVal))
-            {
-                configProvider = provVal;
-            }
-        }
-
-        var providerId = ResolveProviderId(modelId, configProvider);
+        var providerId = ResolveProviderId(modelId, tolerance.Provider);
 
         argv.Add("-c");
         argv.Add($"model_providers.{providerId}.request_max_retries={reqRetries}");
@@ -274,10 +255,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         argv.Add("-c");
         argv.Add($"model_providers.{providerId}.stream_max_retries={streamRetries}");
 
-        if (idleTimeout.HasValue)
+        if (tolerance.StreamIdleTimeoutMs.HasValue)
         {
             argv.Add("-c");
-            argv.Add($"model_providers.{providerId}.stream_idle_timeout_ms={idleTimeout.Value}");
+            argv.Add($"model_providers.{providerId}.stream_idle_timeout_ms={tolerance.StreamIdleTimeoutMs.Value}");
         }
 
         // Pass the prompt via stdin rather than as a positional argv. Linux's
@@ -383,14 +364,4 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         return "openai";
     }
 
-    private sealed class CodexNetworkTolerance
-    {
-        public const int DefaultRequestMaxRetries = 8;
-        public const int DefaultStreamMaxRetries = 15;
-
-        public int RequestMaxRetries { get; set; } = DefaultRequestMaxRetries;
-        public int StreamMaxRetries { get; set; } = DefaultStreamMaxRetries;
-        public int? StreamIdleTimeoutMs { get; set; }
-        public string? Provider { get; set; }
-    }
 }
