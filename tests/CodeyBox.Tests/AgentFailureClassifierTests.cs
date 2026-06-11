@@ -68,7 +68,16 @@ public sealed class AgentFailureClassifierTests
     [InlineData("exit 127", "command not found")]
     public void Exit127BinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
     {
-        var c = AgentFailureClassifier.Classify(stderr: stderr, summary: summary);
+        var c = AgentFailureClassifier.Classify(stderr: stderr, stdout: null, summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("agent exited 1", "bwrap: execvp agy: No such file or directory")]
+    [InlineData("agent exited 1", "bwrap: execv codex: No such file or directory")]
+    public void SandboxWrapperBinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: stderr, stdout: null, summary: summary);
         Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
     }
 
@@ -110,6 +119,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(
             stderr: stderr,
+            stdout: null,
             summary: "agent exited 127");
 
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
@@ -126,6 +136,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(
             stderr: stderr,
+            stdout: null,
             summary: "agent exited 127");
 
         Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
@@ -136,8 +147,19 @@ public sealed class AgentFailureClassifierTests
     [InlineData("failed to materialize cursor auth: exit 7")]
     public void MaterialisationFailures_Classified_AsInfrastructure(string summary)
     {
-        var c = AgentFailureClassifier.Classify(stderr: "permission denied", summary: summary);
+        var c = AgentFailureClassifier.Classify(stderr: "permission denied", stdout: null, summary: summary);
         Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void PublicEnumValues_AreStable_ForPluginSdkCompatibility()
+    {
+        Assert.Equal(0, (int)AgentFailureKind.Normal);
+        Assert.Equal(1, (int)AgentFailureKind.QuotaExhausted);
+        Assert.Equal(2, (int)AgentFailureKind.TransientNetwork);
+        Assert.Equal(3, (int)AgentFailureKind.AuthError);
+        Assert.Equal(4, (int)AgentFailureKind.Unknown);
+        Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
     }
 
     [Fact]

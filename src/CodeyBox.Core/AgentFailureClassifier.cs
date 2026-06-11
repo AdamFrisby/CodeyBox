@@ -115,6 +115,19 @@ public static class AgentFailureClassifier
     };
 
     /// <summary>
+    /// Provider-level launch failures where the sandbox wrapper, not the
+    /// invoked shell, reports that the agent executable could not be exec'd.
+    /// These can surface as exit 1 (for example bubblewrap's own exit code)
+    /// rather than a shell-level 127, so they are intentionally checked
+    /// outside <see cref="IsExit127"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> BinaryLaunchFailurePatterns = new[]
+    {
+        "bwrap: execvp ",
+        "bwrap: execv ",
+    };
+
+    /// <summary>
     /// Classifies an agent failure. Returns <see cref="AgentFailureKind.Normal"/>
     /// when no exceptional shape was detected — i.e. the agent ran and reported
     /// a work-related failure (failed tests, refused task, malformed output).
@@ -126,15 +139,15 @@ public static class AgentFailureClassifier
     /// payload), then auth, then network. Never throws.
     /// </para>
     /// </summary>
-    public static AgentFailureClassification Classify(string? stderr, string? stdout = null, string? summary = null)
+    public static AgentFailureClassification Classify(string? stderr, string? stdout = null) =>
+        Classify(stderr, stdout, summary: null);
+
+    public static AgentFailureClassification Classify(string? stderr, string? stdout, string? summary)
     {
         if (IsMaterialisationFailure(summary))
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent prerequisite materialisation failed");
 
-        if (IsExit127(summary)
-            && (ContainsAny(stderr, BinaryNotFoundPatterns)
-                || ContainsAny(stdout, BinaryNotFoundPatterns)
-                || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
+        if (IsBinaryNotFoundFailure(summary, stderr, stdout))
         {
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
         }
@@ -152,6 +165,20 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "network pattern matched");
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
+    }
+
+    private static bool IsBinaryNotFoundFailure(string? summary, string? stderr, string? stdout)
+    {
+        if (IsExit127(summary)
+            && (ContainsAny(stderr, BinaryNotFoundPatterns)
+                || ContainsAny(stdout, BinaryNotFoundPatterns)
+                || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
+        {
+            return true;
+        }
+
+        return IsSandboxWrapperBinaryLaunchFailure(stderr)
+            || IsSandboxWrapperBinaryLaunchFailure(stdout);
     }
 
     private static bool IsMaterialisationFailure(string? summary) =>
@@ -177,6 +204,10 @@ public static class AgentFailureClassifier
         var after = needle.Length;
         return after >= haystack.Length || !char.IsLetterOrDigit(haystack[after]);
     }
+
+    private static bool IsSandboxWrapperBinaryLaunchFailure(string? text) =>
+        ContainsAny(text, BinaryLaunchFailurePatterns)
+        && ContainsAny(text, ["No such file or directory"]);
 
     private static bool ContainsAny(string? haystack, IReadOnlyList<string> needles)
     {

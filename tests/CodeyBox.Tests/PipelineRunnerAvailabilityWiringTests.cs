@@ -40,6 +40,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
     [Theory]
     [InlineData("agent exited 127", "env: 'codex': No such file or directory")]
+    [InlineData("agent exited 1", "bwrap: execvp codex: No such file or directory")]
     [InlineData("failed to materialise codex auth: exit 1", "permission denied")]
     public async Task InfrastructureWorkFailures_DoNotFeedFastFailBreaker(string summary, string stderr)
     {
@@ -337,6 +338,62 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var snap = fix.Registry.Snapshot().Single(s => s.Agent == AgentKind.Codex);
         Assert.Equal(0, snap.ConsecutiveFastFails);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task ConflictMergeResolverInfrastructureFailure_UsesLastAttemptClassification_NotAggregateSummary()
+    {
+        // Host-conflict merges run through AgenticConflictResolver, whose
+        // public Summary is an aggregate trail. Availability classification
+        // must use the raw last failed attempt: the aggregate summary does not
+        // start with "agent exited 127", so classifying it directly would turn
+        // this missing-binary failure into a normal fast fail and bench an
+        // otherwise healthy agent.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var codex = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+
+        codex.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 2",
+            Stdout: null,
+            Stderr: "panic: ordinary resolver crash"));
+        claude.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'claude': No such file or directory"));
+
+        using var fix = BuildConflictMergePipeline(seed, [codex, claude], maxConsecutiveFastFails: 1);
+
+        var item = NewConflictMergeItem(AgentKind.Codex) with
+        {
+            State = WorkItemState.WorkComplete,
+            // Skip the third-line conflict-rework fallback so this test only
+            // observes the merge resolver's availability classification.
+            ConflictReworkAttempts = 1,
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        await CommitToBareBranchAsync(
+            fix.GitHost.GetRepoPath(repoId),
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Single(codex.AgenticConflictInvocations);
+        Assert.Single(claude.AgenticConflictInvocations);
+
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        Assert.True(fix.Registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        Assert.DoesNotContain(fix.Registry.Snapshot(), s => s.ConsecutiveFastFails != 0);
     }
 
     [Fact]
@@ -654,6 +711,81 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
     }
 
+    private ConflictMergeFixture BuildConflictMergePipeline(
+        string seedRepoUrl,
+        IReadOnlyList<IAgentRunner> agents,
+        int maxConsecutiveFastFails)
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+
+        var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        var prs = new InMemoryPullRequestService();
+        var webhooks = new CapturingWebhookDispatcher();
+        var registry = new AgentRegistry(agents);
+
+        var memberships = agents
+            .Select((agent, index) => new AgentMembership
+            {
+                Agent = agent.Kind,
+                Billing = AgentBilling.Subscription,
+                QualityScore = 100 - index,
+            })
+            .ToList();
+        var agentClass = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = memberships,
+        };
+        var router = new AgentClassRouter(
+            [agentClass],
+            memberships.Select(m => new RecordingProbe(m.Agent)).ToArray(),
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = seedRepoUrl,
+            DefaultBaseBranch = "main",
+            DefaultAgent = agents[0].Kind,
+            DefaultAgentClass = "frontier",
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions
+            {
+                FastFailThresholdSeconds = 10,
+                MaxConsecutiveFastFails = maxConsecutiveFastFails,
+            },
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+
+        var pipeline = new PipelineRunner(
+            sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
+            projects, new TestUpstreamFactory(), composer,
+            store, webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            classRouter: router,
+            quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[]
+            {
+                new ClaudeQuotaFailureDetector(),
+                new CodexQuotaFailureDetector(),
+                new GeminiQuotaFailureDetector(),
+            }),
+            availability: availability,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable);
+
+        return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
+    }
+
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
     {
         public int EnsureCalls { get; private set; }
@@ -685,6 +817,57 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Agent = initialAgent,
         PushUpstream = false,
     };
+
+    private static WorkItem NewConflictMergeItem(AgentKind initialAgent)
+    {
+        var id = WorkItemId.New();
+        return new WorkItem
+        {
+            Id = id,
+            ProjectId = new ProjectId("test-project"),
+            Title = "availability wiring conflict merge",
+            Prompt = "do thing",
+            BaseBranch = "main",
+            WorkBranch = $"codeybox/{id.ToString()[..8]}",
+            Agent = initialAgent,
+            AgentClassId = "frontier",
+            PushUpstream = false,
+        };
+    }
+
+    private async Task CommitToBareBranchAsync(
+        string barePath,
+        string branch,
+        string fileName,
+        string contents,
+        string subject)
+    {
+        var clone = Path.Combine(_workspace, "clone-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        try
+        {
+            await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+            await TestSupport.RunGit(clone, "config", "user.name", "Test");
+            await TestSupport.RunGit(clone, "checkout", "-B", branch, "origin/main");
+            await File.WriteAllTextAsync(Path.Combine(clone, fileName), contents);
+            await TestSupport.RunGit(clone, "add", fileName);
+            await TestSupport.RunGit(clone, "commit", "-m", $"{subject}\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+            await TestSupport.RunGit(clone, "push", "origin", $"HEAD:{branch}");
+        }
+        finally
+        {
+            try { Directory.Delete(clone, recursive: true); } catch { }
+        }
+    }
+
+    private static async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
 
     private static async Task CommitWorkBranchAsync(string bareRepoPath, string workBranch)
     {
@@ -732,6 +915,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             GitHost = gitHost;
         }
 
+        public void Dispose() => Store.Dispose();
+    }
+
+    private sealed record ConflictMergeFixture(
+        PipelineRunner Pipeline,
+        SqliteWorkItemStore Store,
+        LocalGitHost GitHost,
+        CapturingWebhookDispatcher Webhooks,
+        AgentAvailabilityRegistry Registry) : IDisposable
+    {
         public void Dispose() => Store.Dispose();
     }
 }

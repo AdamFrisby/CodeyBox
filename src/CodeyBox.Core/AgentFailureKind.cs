@@ -20,7 +20,7 @@ namespace CodeyBox.Core;
 public enum AgentFailureKind
 {
     /// <summary>Genuine work-related failure (the agent ran but reported failure).</summary>
-    Normal,
+    Normal = 0,
 
     /// <summary>
     /// Mid-flight quota exhaustion — the in-iteration fallback wrapper marks
@@ -28,23 +28,23 @@ public enum AgentFailureKind
     /// against the next class member. Applies to work, rework (audit-loop),
     /// and merge phases.
     /// </summary>
-    QuotaExhausted,
+    QuotaExhausted = 1,
 
     /// <summary>Transient network/connectivity failure that may benefit from a retry.</summary>
-    TransientNetwork,
+    TransientNetwork = 2,
 
     /// <summary>Authentication or authorisation failure (revoked token, expired creds).</summary>
-    AuthError,
+    AuthError = 3,
+
+    /// <summary>Failure shape the classifier didn't recognise.</summary>
+    Unknown = 4,
 
     /// <summary>
     /// Sandbox/provisioning failure rather than an agent-health failure: the
     /// agent binary could not be launched, or runner prerequisite
     /// materialisation failed before the CLI meaningfully started.
     /// </summary>
-    Infrastructure,
-
-    /// <summary>Failure shape the classifier didn't recognise.</summary>
-    Unknown,
+    Infrastructure = 5,
 }
 
 /// <summary>
