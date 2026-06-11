@@ -3,6 +3,13 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
+public enum WorkItemAutoRetryKind
+{
+    None,
+    Quota,
+    Transient,
+}
+
 /// <summary>
 /// Consolidates retry logic for terminal and operator-parked work items,
 /// ensuring consistent state transitions, audit logs, and side effects (e.g.
@@ -48,6 +55,7 @@ public sealed class WorkItemRetrier
         WorkItem item,
         string? from = null,
         string trigger = "manual",
+        WorkItemAutoRetryKind autoRetryKind = WorkItemAutoRetryKind.None,
         CancellationToken ct = default)
     {
         if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
@@ -130,20 +138,23 @@ public sealed class WorkItemRetrier
             }
         }
 
-        // Reset RecoveryAttempts and increment QuotaRetryAttempts if this is a
-        // quota-scheduler auto-retry. Terminal-failure-recovery and manual
-        // retries do NOT bump QuotaRetryAttempts — those use their own
-        // counters (TerminalRetryAttempts; n/a respectively). On any retry
-        // we clear NextTerminalRetryAt so a stale backoff schedule does not
-        // gate the next sweep. A manual retry also clears
-        // TerminalRetryAttempts — operator-forgiveness lets the cap reset.
-        var bumpsQuotaCounter = trigger != "manual" && trigger != "terminal-failure-recovery";
+        // Reset RecoveryAttempts and increment only the counter owned by the
+        // auto-retry path that invoked us. Terminal-failure-recovery and manual
+        // retries do not bump quota/transient counters. On any retry we clear
+        // NextTerminalRetryAt so a stale backoff schedule does not gate the
+        // next sweep. A manual retry also clears TerminalRetryAttempts:
+        // operator-forgiveness lets the cap reset.
         var resetsTerminalRetries = trigger == "manual";
         var resumed = item.With(resumeState.Value, error: null) with
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
-            QuotaRetryAttempts = bumpsQuotaCounter ? item.QuotaRetryAttempts + 1 : item.QuotaRetryAttempts,
+            QuotaRetryAttempts = autoRetryKind == WorkItemAutoRetryKind.Quota
+                ? item.QuotaRetryAttempts + 1
+                : item.QuotaRetryAttempts,
+            TransientRetryAttempts = autoRetryKind == WorkItemAutoRetryKind.Transient
+                ? item.TransientRetryAttempts + 1
+                : item.TransientRetryAttempts,
             TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
             StartedAt = null
@@ -206,6 +217,13 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         return (true, null, resumeState, actualFrom, null);
     }
+
+    public Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct)
+        => RetryAsync(item, from, trigger, WorkItemAutoRetryKind.None, ct);
 
     /// <summary>
     /// Picks a sensible default <c>from</c> phase for retries when the operator
@@ -329,6 +347,8 @@ public sealed class WorkItemRetrier
             NextQuotaRetryAt = null,
             QuotaRetryFrom = null,
             QuotaRetryPhase = null,
+            NextTransientRetryAt = null,
+            TransientRetryFirstFailedAt = null,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         };
@@ -520,6 +540,8 @@ public sealed class WorkItemRetrier
             CancellationReason = null,
             CancellationSource = null,
             FailureKind = null,
+            NextTransientRetryAt = null,
+            TransientRetryFirstFailedAt = null,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             StartedAt = null,

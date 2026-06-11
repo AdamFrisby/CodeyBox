@@ -244,7 +244,11 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 // provider's view, and re-runs on every IOptionsMonitor reload.
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
-    .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
+    .PostConfigure(opts =>
+    {
+        AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration);
+        AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns);
+    });
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
@@ -2336,6 +2340,19 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.ClockDriftSafetyMargin,
             current.MaxAutoRetriesPerWorkItem);
     },
+    transientRetryOptionsAccessor: () =>
+    {
+        var current = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRetryOnTransientFailure;
+        return OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            current.Enabled,
+            current.PeriodicCheckInterval,
+            current.BaseDelay,
+            current.Multiplier,
+            current.MaxDelay,
+            current.MaxAutoRetriesPerWorkItem,
+            current.MaxElapsedTime,
+            current.JitterMode);
+    },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
@@ -2384,6 +2401,15 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
         startupLog) with
     {
+        AutoRetryOnTransientFailure = OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            cbOpts.AutoRetryOnTransientFailure.Enabled,
+            cbOpts.AutoRetryOnTransientFailure.PeriodicCheckInterval,
+            cbOpts.AutoRetryOnTransientFailure.BaseDelay,
+            cbOpts.AutoRetryOnTransientFailure.Multiplier,
+            cbOpts.AutoRetryOnTransientFailure.MaxDelay,
+            cbOpts.AutoRetryOnTransientFailure.MaxAutoRetriesPerWorkItem,
+            cbOpts.AutoRetryOnTransientFailure.MaxElapsedTime,
+            cbOpts.AutoRetryOnTransientFailure.JitterMode),
         ShutdownDrainTimeout = Program.ComputeOrchestratorShutdownDrainTimeout(cbOpts.Shutdown.GraceSeconds),
         TerminalFailureRecovery = OrchestratorOptionsFactory.BuildTerminalFailureRecoveryOptions(
             cbOpts.TerminalFailureRecovery.Enabled,
@@ -3616,6 +3642,16 @@ namespace CodeyBox.Api
         /// <summary>Automatic retry for quota-failed items.</summary>
         public AutoRetryOnQuotaFailureConfig AutoRetryOnQuotaFailure { get; set; } = new();
 
+        /// <summary>Automatic retry for transient transport/network failed items.</summary>
+        public AutoRetryOnTransientFailureConfig AutoRetryOnTransientFailure { get; set; } = new();
+
+        /// <summary>
+        /// Operator-extensible transient transport/network stderr/stdout
+        /// patterns appended to <see cref="AgentFailureClassifier"/>'s built-in
+        /// conservative defaults.
+        /// </summary>
+        public List<string> TransientNetworkFailurePatterns { get; set; } = [];
+
         /// <summary>
         /// Failure-class recovery policy. Classifies every terminal failure
         /// (Failed, AuditFailed, MergeConflictResolutionFailed) and routes by
@@ -3814,6 +3850,18 @@ namespace CodeyBox.Api
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    public sealed class AutoRetryOnTransientFailureConfig
+    {
+        public bool Enabled { get; set; } = true;
+        public string PeriodicCheckInterval { get; set; } = "00:01:00";
+        public string BaseDelay { get; set; } = "00:00:30";
+        public double Multiplier { get; set; } = 2.0;
+        public string MaxDelay { get; set; } = "00:15:00";
+        public int MaxAutoRetriesPerWorkItem { get; set; } = 5;
+        public string MaxElapsedTime { get; set; } = "01:00:00";
+        public string JitterMode { get; set; } = "Full";
     }
 
     /// <summary>

@@ -193,6 +193,12 @@ absence as "unknown". See [`webhooks.md`](webhooks.md#payload-shape) for the
 field schema; the API surface uses the same shape and the same absent-on-null
 semantics.
 
+Failed items also expose retry bookkeeping fields when applicable:
+`failureKind`, quota retry fields (`quotaResetAt`, `nextQuotaRetryAt`,
+`quotaRetryAttempts`, `quotaRetryFrom`), and transient transport retry fields
+(`nextTransientRetryAt`, `transientRetryAttempts`,
+`transientRetryFirstFailedAt`).
+
 ### `GET /workitems/{id}`
 
 Fetch a single work item. The `{id}` path segment accepts either:

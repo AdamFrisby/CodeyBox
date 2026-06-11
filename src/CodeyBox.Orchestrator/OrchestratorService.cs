@@ -3050,6 +3050,7 @@ public sealed record OrchestratorOptions
     public int MaxTransientCancelRetries { get; init; } = 3;
 
     public AutoRetryOnQuotaFailureOptions AutoRetryOnQuotaFailure { get; init; } = new();
+    public AutoRetryOnTransientFailureOptions AutoRetryOnTransientFailure { get; init; } = new();
 
     /// <summary>
     /// Failure-class recovery policy: classifies every terminal failure
@@ -3092,6 +3093,25 @@ public sealed record AutoRetryOnQuotaFailureOptions
     public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromMinutes(5);
     public TimeSpan ClockDriftSafetyMargin { get; init; } = TimeSpan.FromMinutes(2);
     public int MaxAutoRetriesPerWorkItem { get; init; } = 3;
+}
+
+public enum TransientRetryJitterMode
+{
+    None,
+    Full,
+    Decorrelated,
+}
+
+public sealed record AutoRetryOnTransientFailureOptions
+{
+    public bool Enabled { get; init; } = true;
+    public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromMinutes(1);
+    public TimeSpan BaseDelay { get; init; } = TimeSpan.FromSeconds(30);
+    public double Multiplier { get; init; } = 2.0;
+    public TimeSpan MaxDelay { get; init; } = TimeSpan.FromMinutes(15);
+    public int MaxAutoRetriesPerWorkItem { get; init; } = 5;
+    public TimeSpan MaxElapsedTime { get; init; } = TimeSpan.FromHours(1);
+    public TransientRetryJitterMode JitterMode { get; init; } = TransientRetryJitterMode.Full;
 }
 
 /// <summary>Snapshot of worker pool state for the /workers/status endpoint.</summary>

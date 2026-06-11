@@ -189,4 +189,67 @@ public static class OrchestratorOptionsFactory
             MaxAutoRetriesPerWorkItem = maxRetriesPerWorkItem,
         };
     }
+
+    public static AutoRetryOnTransientFailureOptions BuildTransientRetryOptions(
+        bool enabled,
+        string periodicCheckInterval,
+        string baseDelay,
+        double multiplier,
+        string maxDelay,
+        int maxRetriesPerWorkItem,
+        string maxElapsedTime,
+        string jitterMode)
+    {
+        if (!enabled)
+            return new AutoRetryOnTransientFailureOptions { Enabled = false };
+
+        var periodic = ParseTimeSpan(
+            periodicCheckInterval,
+            "CodeyBox:AutoRetryOnTransientFailure:PeriodicCheckInterval",
+            requirePositive: true);
+        var parsedBaseDelay = ParseTimeSpan(
+            baseDelay,
+            "CodeyBox:AutoRetryOnTransientFailure:BaseDelay",
+            requirePositive: true);
+        var parsedMaxDelay = ParseTimeSpan(
+            maxDelay,
+            "CodeyBox:AutoRetryOnTransientFailure:MaxDelay",
+            requirePositive: true);
+        var parsedMaxElapsed = ParseTimeSpan(
+            maxElapsedTime,
+            "CodeyBox:AutoRetryOnTransientFailure:MaxElapsedTime",
+            requirePositive: true);
+
+        if (multiplier < 1.0 || double.IsNaN(multiplier) || double.IsInfinity(multiplier))
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnTransientFailure:Multiplier must be >= 1");
+        if (parsedMaxDelay < parsedBaseDelay)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnTransientFailure:MaxDelay must be >= BaseDelay");
+        if (maxRetriesPerWorkItem < 0)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnTransientFailure:MaxAutoRetriesPerWorkItem must be non-negative");
+        if (!Enum.TryParse<TransientRetryJitterMode>(jitterMode, ignoreCase: true, out var parsedJitter))
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnTransientFailure:JitterMode must be one of: None, Full, Decorrelated");
+
+        return new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            PeriodicCheckInterval = periodic,
+            BaseDelay = parsedBaseDelay,
+            Multiplier = multiplier,
+            MaxDelay = parsedMaxDelay,
+            MaxAutoRetriesPerWorkItem = maxRetriesPerWorkItem,
+            MaxElapsedTime = parsedMaxElapsed,
+            JitterMode = parsedJitter,
+        };
+    }
+
+    private static TimeSpan ParseTimeSpan(string value, string key, bool requirePositive)
+    {
+        if (!TimeSpan.TryParse(value, out var parsed))
+            throw new InvalidOperationException($"{key} must be a valid TimeSpan (e.g. '00:00:30')");
+        if (requirePositive && parsed <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{key} must be positive");
+        if (!requirePositive && parsed < TimeSpan.Zero)
+            throw new InvalidOperationException($"{key} must be non-negative");
+        return parsed;
+    }
 }

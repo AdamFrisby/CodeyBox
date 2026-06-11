@@ -50,13 +50,51 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             .GetField("_quotaAvailabilitySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(scheduler);
         Assert.Same(factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(), wiredSignal);
+
+        var transientAccessor = Assert.IsType<Func<AutoRetryOnTransientFailureOptions>>(
+            typeof(QuotaRetryScheduler)
+                .GetField("_transientRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(scheduler));
+        var transient = transientAccessor();
+        Assert.True(transient.Enabled);
+        Assert.Equal(TimeSpan.FromSeconds(45), transient.BaseDelay);
+        Assert.Equal(2.5, transient.Multiplier);
+        Assert.Equal(TimeSpan.FromMinutes(10), transient.MaxDelay);
+        Assert.Equal(6, transient.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(TimeSpan.FromMinutes(40), transient.MaxElapsedTime);
+        Assert.Equal(TransientRetryJitterMode.Decorrelated, transient.JitterMode);
+
+        monitor.Set(OptionsWithQuotaRetry(
+            enabled: true,
+            interval: "00:00:13",
+            margin: "00:00:05",
+            maxRetries: 4,
+            transientBaseDelay: "00:01:10",
+            transientMultiplier: 3.0,
+            transientMaxDelay: "00:12:00",
+            transientMaxRetries: 8,
+            transientMaxElapsed: "00:50:00",
+            transientJitterMode: "Full"));
+        var reloadedTransient = transientAccessor();
+        Assert.Equal(TimeSpan.FromSeconds(70), reloadedTransient.BaseDelay);
+        Assert.Equal(3.0, reloadedTransient.Multiplier);
+        Assert.Equal(TimeSpan.FromMinutes(12), reloadedTransient.MaxDelay);
+        Assert.Equal(8, reloadedTransient.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(TimeSpan.FromMinutes(50), reloadedTransient.MaxElapsedTime);
+        Assert.Equal(TransientRetryJitterMode.Full, reloadedTransient.JitterMode);
     }
 
     private static CodeyBoxOptions OptionsWithQuotaRetry(
         bool enabled,
         string interval,
         string margin,
-        int maxRetries)
+        int maxRetries,
+        string transientBaseDelay = "00:00:45",
+        double transientMultiplier = 2.5,
+        string transientMaxDelay = "00:10:00",
+        int transientMaxRetries = 6,
+        string transientMaxElapsed = "00:40:00",
+        string transientJitterMode = "Decorrelated")
         => new()
         {
             AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureConfig
@@ -65,6 +103,17 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                 PeriodicCheckInterval = interval,
                 ClockDriftSafetyMargin = margin,
                 MaxAutoRetriesPerWorkItem = maxRetries,
+            },
+            AutoRetryOnTransientFailure = new AutoRetryOnTransientFailureConfig
+            {
+                Enabled = true,
+                PeriodicCheckInterval = "00:00:11",
+                BaseDelay = transientBaseDelay,
+                Multiplier = transientMultiplier,
+                MaxDelay = transientMaxDelay,
+                MaxAutoRetriesPerWorkItem = transientMaxRetries,
+                MaxElapsedTime = transientMaxElapsed,
+                JitterMode = transientJitterMode,
             },
         };
 

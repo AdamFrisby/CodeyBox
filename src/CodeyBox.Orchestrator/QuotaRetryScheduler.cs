@@ -25,9 +25,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly IWebhookDispatcher? _webhooks;
     private readonly OrchestratorOptions _opts;
     private readonly Func<AutoRetryOnQuotaFailureOptions> _autoRetryOptionsAccessor;
+    private readonly Func<AutoRetryOnTransientFailureOptions> _transientRetryOptionsAccessor;
     private readonly IAgentQuotaAvailabilitySignal? _quotaAvailabilitySignal;
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
+    private readonly Func<double> _jitterRandom;
     private readonly ILogger<QuotaRetryScheduler> _log;
     private readonly CancellationTokenSource _quotaUsableSweepCts = new();
     private readonly object _quotaUsableSweepLock = new();
@@ -38,6 +40,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     // Active timers for targeted wakeups. Key = WorkItemId.
     private readonly ConcurrentDictionary<WorkItemId, ITimer> _targetedTimers = new();
     private readonly record struct QuotaRetryAttemptResult(string Outcome, string? Reason = null);
+    private readonly record struct TransientRetryAttemptResult(string Outcome, string? Reason = null);
     private AutoRetryOnQuotaFailureOptions CurrentRetryOptions
     {
         get
@@ -54,6 +57,22 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
     }
 
+    private AutoRetryOnTransientFailureOptions CurrentTransientRetryOptions
+    {
+        get
+        {
+            try
+            {
+                return _transientRetryOptionsAccessor();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to read live transient auto-retry options; using startup options");
+                return _opts.AutoRetryOnTransientFailure;
+            }
+        }
+    }
+
     public QuotaRetryScheduler(
         IWorkItemStore store,
         WorkItemRetrier retrier,
@@ -66,12 +85,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         TimeProvider? timeProvider = null,
         IBaselineImageResolver? baselineResolver = null,
         Func<AutoRetryOnQuotaFailureOptions>? autoRetryOptionsAccessor = null,
-        IAgentQuotaAvailabilitySignal? quotaAvailabilitySignal = null)
+        IAgentQuotaAvailabilitySignal? quotaAvailabilitySignal = null,
+        Func<AutoRetryOnTransientFailureOptions>? transientRetryOptionsAccessor = null,
+        Func<double>? jitterRandom = null)
     {
         _store = store;
         _retrier = retrier;
         _opts = opts;
         _autoRetryOptionsAccessor = autoRetryOptionsAccessor ?? (() => _opts.AutoRetryOnQuotaFailure);
+        _transientRetryOptionsAccessor = transientRetryOptionsAccessor ?? (() => _opts.AutoRetryOnTransientFailure);
         _log = log;
         _router = router;
         _projects = projects;
@@ -79,6 +101,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
+        _jitterRandom = jitterRandom ?? Random.Shared.NextDouble;
         _quotaAvailabilitySignal = quotaAvailabilitySignal;
         if (_quotaAvailabilitySignal is not null)
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed += OnQuotaUsableThresholdCrossed;
@@ -86,30 +109,34 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var wasEnabled = false;
+        var wasQuotaEnabled = false;
+        var wasTransientEnabled = false;
         var loggedDisabled = false;
-        var lastSweepAt = _time.GetUtcNow();
+        var lastQuotaSweepAt = _time.GetUtcNow();
+        var lastTransientSweepAt = lastQuotaSweepAt;
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
                 var retryOptions = CurrentRetryOptions;
-                if (!retryOptions.Enabled)
+                var transientOptions = CurrentTransientRetryOptions;
+                if (!retryOptions.Enabled && !transientOptions.Enabled)
                 {
                     if (!loggedDisabled)
                     {
-                        _log.LogInformation("Quota auto-retry is disabled");
+                        _log.LogInformation("Quota and transient auto-retry are disabled");
                         loggedDisabled = true;
                     }
 
-                    wasEnabled = false;
+                    wasQuotaEnabled = false;
+                    wasTransientEnabled = false;
                     await Task.Delay(OptionsReloadPollInterval, stoppingToken);
                     continue;
                 }
 
                 loggedDisabled = false;
-                if (!wasEnabled)
+                if (retryOptions.Enabled && !wasQuotaEnabled)
                 {
                     _log.LogInformation("Quota auto-retry is enabled. Periodic interval: {Interval}, Drift margin: {Margin}",
                         retryOptions.PeriodicCheckInterval,
@@ -118,34 +145,70 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     // Re-arm timers and re-evaluate parked items each time the
                     // feature transitions from disabled to enabled.
                     await RearmTimersAsync(stoppingToken);
-                    lastSweepAt = _time.GetUtcNow();
-                    wasEnabled = true;
-                    continue;
+                    lastQuotaSweepAt = _time.GetUtcNow();
+                    wasQuotaEnabled = true;
+                }
+                else if (!retryOptions.Enabled)
+                {
+                    wasQuotaEnabled = false;
                 }
 
-                var interval = retryOptions.PeriodicCheckInterval;
-                if (interval <= TimeSpan.Zero)
+                if (transientOptions.Enabled && !wasTransientEnabled)
                 {
-                    _log.LogWarning(
-                        "Quota auto-retry periodic interval {Interval} is invalid; using {Fallback}",
-                        interval,
-                        OptionsReloadPollInterval);
-                    interval = OptionsReloadPollInterval;
+                    _log.LogInformation(
+                        "Transient auto-retry is enabled. Periodic interval: {Interval}, base={BaseDelay}, multiplier={Multiplier}, cap={MaxDelay}, maxAttempts={MaxAttempts}, maxElapsed={MaxElapsed}, jitter={Jitter}",
+                        transientOptions.PeriodicCheckInterval,
+                        transientOptions.BaseDelay,
+                        transientOptions.Multiplier,
+                        transientOptions.MaxDelay,
+                        transientOptions.MaxAutoRetriesPerWorkItem,
+                        transientOptions.MaxElapsedTime,
+                        transientOptions.JitterMode);
+
+                    await RearmTransientRetryTimersAsync(stoppingToken);
+                    lastTransientSweepAt = _time.GetUtcNow();
+                    wasTransientEnabled = true;
+                }
+                else if (!transientOptions.Enabled)
+                {
+                    wasTransientEnabled = false;
                 }
 
                 var now = _time.GetUtcNow();
-                var nextSweepAt = lastSweepAt + interval;
-                if (now < nextSweepAt)
+                var quotaInterval = NormalizeInterval("Quota", retryOptions.PeriodicCheckInterval);
+                var transientInterval = NormalizeInterval("Transient", transientOptions.PeriodicCheckInterval);
+                var nextQuotaSweepAt = retryOptions.Enabled
+                    ? lastQuotaSweepAt + quotaInterval
+                    : DateTimeOffset.MaxValue;
+                var nextTransientSweepAt = transientOptions.Enabled
+                    ? lastTransientSweepAt + transientInterval
+                    : DateTimeOffset.MaxValue;
+
+                var ranSweep = false;
+                if (retryOptions.Enabled && now >= nextQuotaSweepAt)
                 {
-                    var delay = nextSweepAt - now;
-                    if (delay > OptionsReloadPollInterval)
-                        delay = OptionsReloadPollInterval;
-                    await Task.Delay(delay, stoppingToken);
-                    continue;
+                    lastQuotaSweepAt = now;
+                    await RunPeriodicSweepAsync(stoppingToken);
+                    ranSweep = true;
                 }
 
-                lastSweepAt = now;
-                await RunPeriodicSweepAsync(stoppingToken);
+                if (transientOptions.Enabled && now >= nextTransientSweepAt)
+                {
+                    lastTransientSweepAt = now;
+                    await RunTransientPeriodicSweepAsync(stoppingToken);
+                    ranSweep = true;
+                }
+
+                if (ranSweep)
+                    continue;
+
+                var nextSweepAt = nextQuotaSweepAt < nextTransientSweepAt
+                    ? nextQuotaSweepAt
+                    : nextTransientSweepAt;
+                var delay = nextSweepAt - now;
+                if (delay < TimeSpan.Zero || delay > OptionsReloadPollInterval)
+                    delay = OptionsReloadPollInterval;
+                await Task.Delay(delay, stoppingToken);
             }
             catch (OperationCanceledException)
             {
@@ -156,6 +219,19 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 _log.LogError(ex, "Error during periodic quota retry sweep");
             }
         }
+    }
+
+    private TimeSpan NormalizeInterval(string label, TimeSpan interval)
+    {
+        if (interval > TimeSpan.Zero)
+            return interval;
+
+        _log.LogWarning(
+            "{RetryKind} auto-retry periodic interval {Interval} is invalid; using {Fallback}",
+            label,
+            interval,
+            OptionsReloadPollInterval);
+        return OptionsReloadPollInterval;
     }
 
     private async Task RearmTimersAsync(CancellationToken ct)
@@ -176,6 +252,65 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 count++;
         }
         _log.LogInformation("Re-armed or re-evaluated {Count} quota retry item(s)", count);
+    }
+
+    private async Task RearmTransientRetryTimersAsync(CancellationToken ct)
+    {
+        _log.LogInformation("Re-arming transient retry timers from database...");
+        var count = 0;
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
+        {
+            if (item.FailureKind == "transient")
+            {
+                if (await TryRearmTransientTimerAsync(item, ct))
+                    count++;
+            }
+        }
+        _log.LogInformation("Re-armed or re-evaluated {Count} transient retry item(s)", count);
+    }
+
+    private async Task<bool> TryRearmTransientTimerAsync(WorkItem item, CancellationToken ct)
+    {
+        try
+        {
+            await RearmTransientTimerAsync(item, ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error re-arming transient retry timer for work item {Id}; continuing startup sweep", item.Id);
+            return false;
+        }
+    }
+
+    private async Task RearmTransientTimerAsync(WorkItem item, CancellationToken ct)
+    {
+        if (item.NextTransientRetryAt is null)
+        {
+            await NotifyTransientFailureAsync(item, ct);
+            return;
+        }
+
+        var nextRetryAt = item.NextTransientRetryAt.Value;
+        var now = _time.GetUtcNow();
+        var isOverdue = nextRetryAt < now;
+        var delay = ScheduleTargetedRetry(item.Id, nextRetryAt);
+
+        _log.LogInformation(
+            "Re-armed transient retry timer for work item {Id}: state={State} nextRetryAt={NextRetryAt} delay={Delay} overdue={Overdue}",
+            item.Id, item.State, nextRetryAt, delay, isOverdue);
+
+        if (!isOverdue)
+            return;
+
+        var outcome = await TryTransientRetryAsync(item, "rearm-overdue", ct);
+        _log.LogInformation(
+            "Transient retry startup re-arm walked overdue work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
+            item.Id, item.State, outcome.Outcome, outcome.Reason);
     }
 
     private async Task<bool> TryRearmTimerAsync(WorkItem item, CancellationToken ct)
@@ -345,6 +480,16 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
     }
 
+    private async Task RunTransientPeriodicSweepAsync(CancellationToken ct)
+    {
+        _log.LogDebug("Starting periodic transient retry sweep");
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.Failed, ct))
+        {
+            if (item.FailureKind == "transient")
+                await TryTransientPeriodicRetryAsync(item, ct);
+        }
+    }
+
     public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
     {
         _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
@@ -370,6 +515,40 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         catch (Exception ex)
         {
             _log.LogError(ex, "Error during periodic quota retry for work item {Id}; continuing sweep", item.Id);
+        }
+    }
+
+    private async Task TryTransientPeriodicRetryAsync(WorkItem item, CancellationToken ct)
+    {
+        try
+        {
+            if (item.NextTransientRetryAt is null)
+            {
+                await NotifyTransientFailureAsync(item, ct);
+                return;
+            }
+
+            if (item.NextTransientRetryAt > _time.GetUtcNow())
+            {
+                _log.LogDebug(
+                    "Transient retry periodic sweep skipped work item {Id}: nextRetryAt={NextRetryAt}",
+                    item.Id,
+                    item.NextTransientRetryAt);
+                return;
+            }
+
+            var outcome = await TryTransientRetryAsync(item, "periodic", ct);
+            _log.LogInformation(
+                "Transient retry periodic sweep walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
+                item.Id, item.State, outcome.Outcome, outcome.Reason);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error during periodic transient retry for work item {Id}; continuing sweep", item.Id);
         }
     }
 
@@ -472,10 +651,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 {
                     await TryRetryAsync(item, "targeted", CancellationToken.None);
                 }
+                else if (item is { State: WorkItemState.Failed, FailureKind: "transient" })
+                {
+                    await TryTransientRetryAsync(item, "targeted", CancellationToken.None);
+                }
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Error during targeted quota retry for work item {Id}", id);
+                _log.LogError(ex, "Error during targeted auto-retry for work item {Id}", id);
             }
         });
     }
@@ -722,7 +905,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
         // audit logs, and conditional state updates (prevents race conditions).
-        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(item, from: retryFrom, trigger, ct);
+        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+            item,
+            from: retryFrom,
+            trigger: trigger,
+            autoRetryKind: WorkItemAutoRetryKind.Quota,
+            ct: ct);
 
         if (!success)
         {
@@ -764,6 +952,169 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         return new QuotaRetryAttemptResult("retried", actualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={actualFrom}");
     }
 
+    private async Task<TransientRetryAttemptResult> TryTransientRetryAsync(
+        WorkItem item,
+        string source,
+        CancellationToken ct)
+    {
+        try
+        {
+            var outcome = await TryTransientRetryCoreAsync(item, source, ct);
+            AuditLog.TransientRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason);
+            return outcome;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AuditLog.TransientRetryAttempted(item.Id, source, "error", item.State.ToString(), ex.Message);
+            throw;
+        }
+    }
+
+    private async Task<TransientRetryAttemptResult> TryTransientRetryCoreAsync(
+        WorkItem item,
+        string trigger,
+        CancellationToken ct)
+    {
+        var retryOptions = CurrentTransientRetryOptions;
+        if (!retryOptions.Enabled)
+        {
+            _log.LogInformation("Transient auto-retry is disabled; skipping retry for work item {Id}", item.Id);
+            return new TransientRetryAttemptResult("skipped:auto-retry-disabled");
+        }
+
+        if (item.State != WorkItemState.Failed || item.FailureKind != "transient")
+            return new TransientRetryAttemptResult("skipped:not-transient");
+
+        if (item.NextTransientRetryAt is { } dueAt && dueAt > _time.GetUtcNow())
+            return new TransientRetryAttemptResult("skipped:not-due", $"nextRetryAt={dueAt:O}");
+
+        // Respect operator queue pauses before consuming the retry budget.
+        if (_queueController is not null)
+        {
+            if (_queueController.State == QueueState.Paused)
+            {
+                _log.LogInformation("Global queue is paused; skipping transient auto-retry for work item {Id}", item.Id);
+                return new TransientRetryAttemptResult("skipped:global-queue-paused");
+            }
+
+            var projectState = await _queueController.GetProjectStateAsync(item.ProjectId, ct);
+            if (projectState is { Paused: true })
+            {
+                _log.LogInformation("Project {ProjectId} queue is paused; skipping transient auto-retry for work item {Id}",
+                    item.ProjectId, item.Id);
+                return new TransientRetryAttemptResult("skipped:project-queue-paused", $"projectId={item.ProjectId.Value}");
+            }
+        }
+
+        if (_projects is null)
+        {
+            _log.LogInformation("Project repository unavailable; skipping transient auto-retry for work item {Id}", item.Id);
+            return new TransientRetryAttemptResult("skipped:project-repository-unavailable");
+        }
+
+        var project = await _projects.GetAsync(item.ProjectId, ct);
+        if (project is null)
+        {
+            _log.LogInformation("Project {ProjectId} not found; skipping transient auto-retry for work item {Id}",
+                item.ProjectId, item.Id);
+            return new TransientRetryAttemptResult("skipped:project-not-found", $"projectId={item.ProjectId.Value}");
+        }
+
+        if (ShouldExhaustTransientRetry(item, retryOptions, _time.GetUtcNow(), out var capReason))
+            return await TransitionTransientItemAtRetryCapAsync(item, capReason, ct);
+
+        return await PerformTransientRetryAsync(item, trigger, ct);
+    }
+
+    private async Task<TransientRetryAttemptResult> TransitionTransientItemAtRetryCapAsync(
+        WorkItem item,
+        string reason,
+        CancellationToken ct)
+    {
+        var failed = item.With(
+            WorkItemState.Failed,
+            $"transient network auto-retry exhausted ({reason}); operator retry required",
+            failureKind: "transient-exhausted") with
+        {
+            NextTransientRetryAt = null,
+            TransientRetryFirstFailedAt = item.TransientRetryFirstFailedAt,
+        };
+
+        var updated = await _store.TryUpdateIfStateAsync(failed, WorkItemState.Failed, ct);
+        if (updated)
+        {
+            CancelTargetedRetry(item.Id);
+            _log.LogWarning(
+                "Work item {Id} exhausted transient auto-retry budget: {Reason}",
+                item.Id,
+                reason);
+        }
+
+        return new TransientRetryAttemptResult("skipped:max-retries", reason);
+    }
+
+    private async Task<TransientRetryAttemptResult> PerformTransientRetryAsync(
+        WorkItem item,
+        string trigger,
+        CancellationToken ct)
+    {
+        _log.LogInformation(
+            "Triggering transient auto-retry ({Trigger}) for work item {Id} (attempt {Attempt})",
+            trigger,
+            item.Id,
+            item.TransientRetryAttempts + 1);
+
+        var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+            item,
+            from: null,
+            trigger: $"transient-{trigger}",
+            autoRetryKind: WorkItemAutoRetryKind.Transient,
+            ct: ct);
+
+        if (!success)
+        {
+            _log.LogWarning("Failed to trigger transient auto-retry for work item {Id}: {Error}", item.Id, error);
+            return new TransientRetryAttemptResult("retry-failed", error);
+        }
+
+        if (_webhooks is not null)
+        {
+            try
+            {
+                var project = _projects is null ? null : await _projects.GetAsync(item.ProjectId, CancellationToken.None);
+                var updated = await _store.GetAsync(item.Id, CancellationToken.None);
+                await _webhooks.PublishAsync(new WebhookEvent
+                {
+                    Event = "work_item.auto_retry",
+                    WorkItem = updated ?? item,
+                    Project = project,
+                    Details = new
+                    {
+                        workItemId = item.Id.ToString(),
+                        reason = "transient",
+                        attemptNumber = updated?.TransientRetryAttempts ?? item.TransientRetryAttempts + 1,
+                        triggeredBy = trigger,
+                        from = "auto",
+                        actualFrom
+                    }
+                }, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Transient auto-retry for work item {Id} succeeded, but auto-retry webhook delivery failed",
+                    item.Id);
+            }
+        }
+
+        return new TransientRetryAttemptResult("retried", actualFrom is null ? null : $"actualFrom={actualFrom}");
+    }
+
     private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
     {
         "audit" => "audit",
@@ -786,6 +1137,132 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         string.Equals(phase?.Trim(), "audit", StringComparison.OrdinalIgnoreCase)
             ? WellKnownCapabilities.Audit
             : null;
+
+    public async Task NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default)
+    {
+        var retryOptions = CurrentTransientRetryOptions;
+        if (!retryOptions.Enabled) return;
+        if (item.State != WorkItemState.Failed || item.FailureKind != "transient") return;
+
+        var now = _time.GetUtcNow();
+        if (ShouldExhaustTransientRetry(item, retryOptions, now, out var capReason))
+        {
+            await TransitionTransientItemAtRetryCapAsync(item, capReason, ct);
+            return;
+        }
+
+        var firstFailedAt = item.TransientRetryFirstFailedAt ?? now;
+        var delay = ComputeTransientRetryDelay(item.TransientRetryAttempts + 1, retryOptions);
+        var nextRetryAt = now + delay;
+        if (retryOptions.MaxElapsedTime > TimeSpan.Zero
+            && nextRetryAt > firstFailedAt + retryOptions.MaxElapsedTime)
+        {
+            await TransitionTransientItemAtRetryCapAsync(
+                item with { TransientRetryFirstFailedAt = firstFailedAt },
+                $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
+                ct);
+            return;
+        }
+
+        try
+        {
+            var updated = await _store.TryUpdateIfStateAsync(
+                item with
+                {
+                    NextTransientRetryAt = nextRetryAt,
+                    TransientRetryFirstFailedAt = firstFailedAt,
+                },
+                item.State,
+                ct);
+            if (updated)
+            {
+                ScheduleTargetedRetry(item.Id, nextRetryAt);
+                _log.LogInformation(
+                    "Scheduled transient auto-retry for work item {Id}: attempt={Attempt} nextRetryAt={NextRetryAt} delay={Delay}",
+                    item.Id,
+                    item.TransientRetryAttempts + 1,
+                    nextRetryAt,
+                    delay);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogError(ex, "Error updating NextTransientRetryAt for work item {Id}", item.Id);
+        }
+    }
+
+    private bool ShouldExhaustTransientRetry(
+        WorkItem item,
+        AutoRetryOnTransientFailureOptions retryOptions,
+        DateTimeOffset now,
+        out string reason)
+    {
+        if (item.TransientRetryAttempts >= retryOptions.MaxAutoRetriesPerWorkItem)
+        {
+            reason = $"attempts={item.TransientRetryAttempts}; max={retryOptions.MaxAutoRetriesPerWorkItem}";
+            return true;
+        }
+
+        if (retryOptions.MaxElapsedTime > TimeSpan.Zero
+            && item.TransientRetryFirstFailedAt is { } firstFailedAt
+            && now - firstFailedAt >= retryOptions.MaxElapsedTime)
+        {
+            reason = $"elapsed={now - firstFailedAt}; max={retryOptions.MaxElapsedTime}";
+            return true;
+        }
+
+        reason = "";
+        return false;
+    }
+
+    private TimeSpan ComputeTransientRetryDelay(
+        int attemptOrdinal,
+        AutoRetryOnTransientFailureOptions retryOptions)
+    {
+        var exponential = ComputeExponentialDelay(attemptOrdinal, retryOptions);
+        var random = Math.Clamp(_jitterRandom(), 0d, 1d);
+
+        return retryOptions.JitterMode switch
+        {
+            TransientRetryJitterMode.None => exponential,
+            TransientRetryJitterMode.Decorrelated => ComputeDecorrelatedDelay(attemptOrdinal, retryOptions, random),
+            _ => TimeSpan.FromMilliseconds(exponential.TotalMilliseconds * random),
+        };
+    }
+
+    private static TimeSpan ComputeExponentialDelay(
+        int attemptOrdinal,
+        AutoRetryOnTransientFailureOptions retryOptions)
+    {
+        if (attemptOrdinal <= 1 || retryOptions.Multiplier <= 1.0)
+            return retryOptions.BaseDelay <= retryOptions.MaxDelay ? retryOptions.BaseDelay : retryOptions.MaxDelay;
+
+        var delayMs = retryOptions.BaseDelay.TotalMilliseconds;
+        var maxMs = retryOptions.MaxDelay.TotalMilliseconds;
+        for (var i = 1; i < attemptOrdinal; i++)
+        {
+            delayMs *= retryOptions.Multiplier;
+            if (double.IsInfinity(delayMs) || delayMs >= maxMs)
+                return retryOptions.MaxDelay;
+        }
+
+        return TimeSpan.FromMilliseconds(Math.Min(delayMs, maxMs));
+    }
+
+    private static TimeSpan ComputeDecorrelatedDelay(
+        int attemptOrdinal,
+        AutoRetryOnTransientFailureOptions retryOptions,
+        double random)
+    {
+        var previous = attemptOrdinal <= 1
+            ? retryOptions.BaseDelay
+            : ComputeExponentialDelay(attemptOrdinal - 1, retryOptions);
+        var lowerMs = retryOptions.BaseDelay.TotalMilliseconds;
+        var upperMs = Math.Min(retryOptions.MaxDelay.TotalMilliseconds, previous.TotalMilliseconds * 3.0);
+        if (upperMs <= lowerMs)
+            return retryOptions.BaseDelay <= retryOptions.MaxDelay ? retryOptions.BaseDelay : retryOptions.MaxDelay;
+        return TimeSpan.FromMilliseconds(lowerMs + ((upperMs - lowerMs) * random));
+    }
 
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,

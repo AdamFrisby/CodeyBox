@@ -146,6 +146,25 @@ public sealed record WorkItem
     public string? QuotaRetryPhase { get; init; }
 
     /// <summary>
+    /// UTC timestamp for the next scheduled auto-retry attempt after a
+    /// transient transport/network failure. Null when no transient retry is
+    /// scheduled or the item exhausted its transient retry budget.
+    /// </summary>
+    public DateTimeOffset? NextTransientRetryAt { get; init; }
+
+    /// <summary>
+    /// Number of times this work item has been automatically retried after a
+    /// transient transport/network failure.
+    /// </summary>
+    public int TransientRetryAttempts { get; init; }
+
+    /// <summary>
+    /// First failure timestamp in the current transient transport retry series.
+    /// Used to cap total elapsed retry time across orchestrator restarts.
+    /// </summary>
+    public DateTimeOffset? TransientRetryFirstFailedAt { get; init; }
+
+    /// <summary>
     /// Agent kind whose operator pause parked this item in
     /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
     /// <see cref="Agent"/> because later phases can be blocked by an audit,
@@ -564,6 +583,19 @@ public sealed record WorkItem
             && PreserveWorkBranchOnQueuedPickup
             && !string.IsNullOrWhiteSpace(WorkBranch);
 
+        var nextFailureKind = IsFailureKindCarryingState(state)
+            ? (failureKind ?? FailureKind)
+            : null;
+        var carriesQuotaRetry = IsQuotaShapedState(state);
+        var carriesTransientRetry =
+            state == WorkItemState.Failed
+            && string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase);
+        var carriesTransientHistory =
+            state == WorkItemState.Failed
+            && (string.Equals(nextFailureKind, "transient", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
+        var preservesTransientHistory = carriesTransientHistory || ShouldPreserveTransientRetryHistory(state);
+
         return this with
         {
             State = state,
@@ -572,11 +604,13 @@ public sealed record WorkItem
             // states that must preserve FailureKind / QuotaResetAt /
             // NextQuotaRetryAt so the retry scheduler can re-arm timers
             // across host restarts.
-            FailureKind = IsQuotaShapedState(state) ? (failureKind ?? FailureKind) : null,
-            QuotaResetAt = IsQuotaShapedState(state) ? (quotaResetAt ?? QuotaResetAt) : null,
-            NextQuotaRetryAt = IsQuotaShapedState(state) ? NextQuotaRetryAt : null,
-            QuotaRetryFrom = IsQuotaShapedState(state) ? QuotaRetryFrom : null,
-            QuotaRetryPhase = IsQuotaShapedState(state) ? QuotaRetryPhase : null,
+            FailureKind = nextFailureKind,
+            QuotaResetAt = carriesQuotaRetry ? (quotaResetAt ?? QuotaResetAt) : null,
+            NextQuotaRetryAt = carriesQuotaRetry ? NextQuotaRetryAt : null,
+            QuotaRetryFrom = carriesQuotaRetry ? QuotaRetryFrom : null,
+            QuotaRetryPhase = carriesQuotaRetry ? QuotaRetryPhase : null,
+            NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
+            TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.
@@ -603,6 +637,22 @@ public sealed record WorkItem
     private static bool IsQuotaShapedState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
 
+    private static bool IsFailureKindCarryingState(WorkItemState state) =>
+        state is WorkItemState.Failed or WorkItemState.WaitingForQuotaReset;
+
     private static bool IsCancellationSourceCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed or WorkItemState.Cancelled;
+
+    private static bool ShouldPreserveTransientRetryHistory(WorkItemState state) =>
+        state is WorkItemState.Queued
+            or WorkItemState.Working
+            or WorkItemState.WorkComplete
+            or WorkItemState.Auditing
+            or WorkItemState.Reworking
+            or WorkItemState.AuditPassed
+            or WorkItemState.Merging
+            or WorkItemState.Merged
+            or WorkItemState.UpstreamPushing
+            or WorkItemState.ReworkingForConflict
+            or WorkItemState.NeedsOperatorInput;
 }

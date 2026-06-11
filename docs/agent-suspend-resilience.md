@@ -16,7 +16,7 @@ keep work-phase LLM calls dependable without operator intervention.
 |-------|-----------|
 | R8-core | `CODEYBOX_AGENT_LOG_FILE` + `.exit` sidecar so `SandboxResumeOnStartupService` can re-tail and adopt the in-VM agent after `multipass start`. |
 | R8-resilience (shim) | `CliAgentRunnerBase` re-invokes the agent **once** when stderr matches `AgentFailureClassifier.TransientNetworkPatterns` (or a small set of generic exit codes). See `AgentSuspendResilience` in `CodeyBox.Agents`. |
-| Orchestrator | Stranded-item recovery + transient-cancellation auto-retry when adoption times out or the agent exits with a recoverable classification. |
+| Orchestrator | Stranded-item recovery, transient-cancellation auto-retry, and durable transient-network auto-retry when adoption times out or the agent exits with a recoverable classification. |
 
 The shim retry is the preferred single point of intervention: it covers all
 five built-in CLIs (`claude`, `codex`, `gemini`, `cursor`, `opencode`) without
@@ -97,7 +97,7 @@ workflow runs the same filter on a **self-hosted runner labeled `multipass`**
 
 If an agent shows **Failed** at **N ≤ 60 s** even after the shim retry:
 
-1. Confirm the failure stderr — extend `AgentFailureClassifier.TransientNetworkPatterns` if it is a novel transient shape.
+1. Confirm the failure stderr — add the novel transient shape to `CodeyBox:TransientNetworkFailurePatterns` if it should be treated as retryable.
 2. If the CLI supports an internal `--retry` flag, add it in that agent's `BuildInvocation` for the work phase only.
 3. As a last resort, bundle a per-CLI wrapper in the baseline image or use `LD_PRELOAD` to tune `TCP_USER_TIMEOUT` for that process only.
 

@@ -442,6 +442,8 @@ internal static class WorkItemRecoveryPolicy
         NextQuotaRetryAt = null,
         QuotaRetryFrom = null,
         QuotaRetryPhase = null,
+        NextTransientRetryAt = null,
+        TransientRetryFirstFailedAt = null,
         CancellationReason = null,
         CancellationSource = null,
         UpdatedAt = now,

@@ -74,6 +74,13 @@ public sealed class AgentFailureClassifierTests
     [InlineData("503 Service Unavailable")]
     [InlineData("socket hang up")]
     [InlineData("fetch failed")]
+    [InlineData("request timed out while reading agent stream")]
+    [InlineData("request_timeout")]
+    [InlineData("Reconnecting... attempt 4")]
+    [InlineData("Transport channel closed")]
+    [InlineData("timeout waiting for child process to exit")]
+    [InlineData("Connection timed out")]
+    [InlineData("i/o timeout")]
     public void NetworkPatterns_Classified_AsTransient(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
@@ -180,6 +187,44 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(3, (int)AgentFailureKind.AuthError);
         Assert.Equal(4, (int)AgentFailureKind.Unknown);
         Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
+    }
+
+    [Fact]
+    public void TurnFailed_WithConservativeTimeoutMessage_Classified_AsTransient()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: """{"type":"turn.failed","error":{"message":"request timed out while reading stream"}}""");
+
+        Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("timeout")]
+    [InlineData("Timeout")]
+    [InlineData("build timeout after 10 minutes")]
+    [InlineData("""{"type":"turn.failed","error":{"message":"timeout"}}""")]
+    public void BareTimeout_NotClassified_AsTransient(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    [Fact]
+    public void AdditionalTransientNetworkPatterns_AreOperatorTunable()
+    {
+        try
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(["vendor transport marker"]);
+
+            var c = AgentFailureClassifier.Classify(stderr: "fatal: vendor transport marker");
+
+            Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+        }
+        finally
+        {
+            AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
+        }
     }
 
     [Fact]

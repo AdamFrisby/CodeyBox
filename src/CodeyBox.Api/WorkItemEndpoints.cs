@@ -386,7 +386,11 @@ internal static class WorkItemEndpoints
         var requestedFrom = string.IsNullOrWhiteSpace(body?.From)
             ? null
             : body!.From!.Trim().ToLowerInvariant();
-        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(item, requestedFrom, trigger: "manual", ct);
+        var (success, error, resumeState, actualFrom, openQuestions) = await retrier.RetryAsync(
+            item,
+            requestedFrom,
+            trigger: "manual",
+            ct: ct);
 
         if (!success)
         {
@@ -1938,6 +1942,9 @@ internal static class WorkItemEndpoints
             QuotaRetryAttempts: item.QuotaRetryAttempts,
             QuotaRetryFrom: item.QuotaRetryFrom,
             QuotaRetryPhase: item.QuotaRetryPhase,
+            NextTransientRetryAt: item.NextTransientRetryAt,
+            TransientRetryAttempts: item.TransientRetryAttempts,
+            TransientRetryFirstFailedAt: item.TransientRetryFirstFailedAt,
             AgentPauseTarget: item.AgentPauseTarget?.Value,
             AgentPauseRetryFrom: item.AgentPauseRetryFrom,
             Usage: usage?.Iteration,
@@ -2334,6 +2341,9 @@ public sealed record WorkItemDto(
     int QuotaRetryAttempts = 0,
     string? QuotaRetryFrom = null,
     string? QuotaRetryPhase = null,
+    DateTimeOffset? NextTransientRetryAt = null,
+    int TransientRetryAttempts = 0,
+    DateTimeOffset? TransientRetryFirstFailedAt = null,
     string? AgentPauseTarget = null,
     string? AgentPauseRetryFrom = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

@@ -409,9 +409,9 @@ When `event` is `work_item.auto_retry`, the `details` field is populated:
 | Field | Type | Description |
 |---|---|---|
 | `workItemId` | string | UUID of the work item that was auto-retried |
-| `reason` | string | Why the retry was scheduled. Currently always `"quota"`. |
-| `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped at `AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem`. |
-| `triggeredBy` | string | `"targeted"` if fired by the per-item timer at `QuotaResetAt + ClockDriftSafetyMargin`; `"periodic"` if fired by the safety-net sweep; `"rearm-overdue"` if fired immediately during startup re-arm because `nextQuotaRetryAt` was already in the past. |
+| `reason` | string | Why the retry was scheduled: `"quota"` or `"transient"`. |
+| `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped by the matching `AutoRetryOnQuotaFailure` or `AutoRetryOnTransientFailure` max-attempt setting. |
+| `triggeredBy` | string | `"targeted"` if fired by a per-item timer, `"periodic"` if fired by the safety-net sweep, `"rearm-overdue"` if fired immediately during startup re-arm because the persisted retry timestamp was already in the past, or `"startup"` for quota waiting rows requeued during startup. |
 
 ### `cancelled` details
 

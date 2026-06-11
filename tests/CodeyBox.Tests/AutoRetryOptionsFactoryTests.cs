@@ -73,4 +73,75 @@ public sealed class AutoRetryOptionsFactoryTests
 
         Assert.Contains(expectedMessage, ex.Message);
     }
+
+    [Fact]
+    public void BuildTransientRetryOptions_Disabled_IgnoresMalformedValues()
+    {
+        var opts = OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            enabled: false,
+            periodicCheckInterval: "bad",
+            baseDelay: "bad",
+            multiplier: -1,
+            maxDelay: "bad",
+            maxRetriesPerWorkItem: -1,
+            maxElapsedTime: "bad",
+            jitterMode: "bad");
+
+        Assert.False(opts.Enabled);
+    }
+
+    [Fact]
+    public void BuildTransientRetryOptions_Enabled_ParsesConfiguredValues()
+    {
+        var opts = OrchestratorOptionsFactory.BuildTransientRetryOptions(
+            enabled: true,
+            periodicCheckInterval: "00:00:10",
+            baseDelay: "00:00:30",
+            multiplier: 2.5,
+            maxDelay: "00:05:00",
+            maxRetriesPerWorkItem: 6,
+            maxElapsedTime: "00:45:00",
+            jitterMode: "Decorrelated");
+
+        Assert.True(opts.Enabled);
+        Assert.Equal(TimeSpan.FromSeconds(10), opts.PeriodicCheckInterval);
+        Assert.Equal(TimeSpan.FromSeconds(30), opts.BaseDelay);
+        Assert.Equal(2.5, opts.Multiplier);
+        Assert.Equal(TimeSpan.FromMinutes(5), opts.MaxDelay);
+        Assert.Equal(6, opts.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(TimeSpan.FromMinutes(45), opts.MaxElapsedTime);
+        Assert.Equal(TransientRetryJitterMode.Decorrelated, opts.JitterMode);
+    }
+
+    [Theory]
+    [InlineData("bad", "00:00:01", 2, "00:00:02", 1, "00:01:00", "Full", "PeriodicCheckInterval")]
+    [InlineData("00:00:01", "00:00:00", 2, "00:00:02", 1, "00:01:00", "Full", "BaseDelay")]
+    [InlineData("00:00:01", "00:00:01", 0.5, "00:00:02", 1, "00:01:00", "Full", "Multiplier")]
+    [InlineData("00:00:01", "00:00:05", 2, "00:00:02", 1, "00:01:00", "Full", "MaxDelay")]
+    [InlineData("00:00:01", "00:00:01", 2, "00:00:02", -1, "00:01:00", "Full", "MaxAutoRetriesPerWorkItem")]
+    [InlineData("00:00:01", "00:00:01", 2, "00:00:02", 1, "00:00:00", "Full", "MaxElapsedTime")]
+    [InlineData("00:00:01", "00:00:01", 2, "00:00:02", 1, "00:01:00", "bad", "JitterMode")]
+    public void BuildTransientRetryOptions_Enabled_RejectsInvalidValues(
+        string periodic,
+        string baseDelay,
+        double multiplier,
+        string maxDelay,
+        int maxRetries,
+        string maxElapsed,
+        string jitterMode,
+        string expectedMessage)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            OrchestratorOptionsFactory.BuildTransientRetryOptions(
+                enabled: true,
+                periodicCheckInterval: periodic,
+                baseDelay: baseDelay,
+                multiplier: multiplier,
+                maxDelay: maxDelay,
+                maxRetriesPerWorkItem: maxRetries,
+                maxElapsedTime: maxElapsed,
+                jitterMode: jitterMode));
+
+        Assert.Contains(expectedMessage, ex.Message);
+    }
 }

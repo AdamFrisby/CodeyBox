@@ -1569,6 +1569,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 project: project,
                 iteration: null);
         }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} hit transient transport failure: phase={Phase} agent={Agent} error={Error}",
+                item.Id,
+                ex.Phase ?? "(unknown)",
+                ex.Agent.Value,
+                ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "transient");
+        }
         catch (SandboxDiskDeferredException)
         {
             // Disk-guard preflight refused a sandbox launch. Re-throw so
@@ -3403,6 +3413,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         detection?.ResetAt);
                 }
 
+                ThrowIfTransientAgentFailure(runner, agentResult, agentPhase);
+
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
                     runner.Kind,
@@ -3872,6 +3884,11 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             throw;
         }
+        catch (TerminalTransientNetworkError ex)
+        {
+            _log.LogWarning("Work item {Id} check-and-act hit transient transport failure: {Error}", item.Id, ex.Message);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "transient");
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Work item {Id} check-and-act failed", item.Id);
@@ -4233,11 +4250,31 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (!result.Success)
         {
+            ThrowIfTransientAgentFailure(agentRunner, result, "check");
             var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
             throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
         }
 
         return aggregatedStdout;
+    }
+
+    private static void ThrowIfTransientAgentFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string phase)
+    {
+        var classification = runner.ClassifyFailure(result);
+        if (classification.Kind != AgentFailureKind.TransientNetwork)
+            return;
+
+        var reason = string.IsNullOrWhiteSpace(classification.Reason)
+            ? "transient transport/network failure"
+            : classification.Reason;
+        throw new TerminalTransientNetworkError(
+            runner.Kind,
+            phase,
+            classification,
+            $"Agent {runner.Kind} reported transient transport failure during {phase}: {result.Summary} ({reason})");
     }
 
     /// <summary>
@@ -7510,6 +7547,15 @@ public sealed class PipelineRunner : IPipelineRunner
                 $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
                 quotaDetection.ResetAt);
         }
+
+        ThrowIfTransientAgentFailure(
+            run.Runner,
+            new AgentResult(
+                Success: false,
+                Summary: run.Result.AgentSummary ?? "agent failed",
+                Stdout: run.Result.AgentStdout,
+                Stderr: run.Result.AgentStderr),
+            "audit");
     }
 
     private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
@@ -10001,6 +10047,8 @@ public sealed class PipelineRunner : IPipelineRunner
                         stdout: agentResult.Stdout);
                     throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {agentResult.Summary}", detection.ResetAt);
                 }
+
+                ThrowIfTransientAgentFailure(chosenMergeRunner, agentResult, "merge");
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
@@ -13141,6 +13189,10 @@ Original merge-phase failure (for context):
             if (failureKind == "quota" && _retryScheduler is not null)
             {
                 await _retryScheduler.NotifyQuotaFailureAsync(next);
+            }
+            else if (failureKind == "transient" && _retryScheduler is not null)
+            {
+                await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
             }
 
             _log.LogWarning("Work item {Id} → Failed: {Error}", item.Id, error);
