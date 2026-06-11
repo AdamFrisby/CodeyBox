@@ -98,7 +98,12 @@ public sealed record AgenticConflictResolverResult(
     IReadOnlyList<string> ConflictFiles,
     int IterationsUsed,
     string? Stdout,
-    string? Stderr);
+    string? Stderr)
+{
+    public IAgentRunner? FailureRunner { get; init; }
+    public AgentCredential? FailureCredential { get; init; }
+    public AgentResult? FailureClassificationResult { get; init; }
+}
 
 /// <summary>
 /// A single agent candidate the resolver may invoke. The orchestrator builds
@@ -198,6 +203,9 @@ public sealed class AgenticConflictResolver
         var attemptTrail = new List<string>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
+        IAgentRunner? lastFailureRunner = null;
+        AgentCredential? lastFailureCredential = null;
+        AgentResult? lastFailureClassificationResult = null;
         string? lastVerificationError = null;
 
         foreach (var candidate in candidates)
@@ -269,6 +277,13 @@ public sealed class AgenticConflictResolver
                         stdoutTail: null,
                         stderrTail: Truncate(ex.ToString(), 4096));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {ex.Message})");
+                    lastFailureRunner = runner;
+                    lastFailureCredential = candidate.Credential;
+                    lastFailureClassificationResult = new AgentResult(
+                        false,
+                        $"threw {ex.GetType().Name}: {ex.Message}",
+                        Stdout: null,
+                        Stderr: ex.ToString());
                     break;
                 }
 
@@ -296,6 +311,9 @@ public sealed class AgenticConflictResolver
                         stderrTail: agentResult.Stderr);
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {Truncate(agentResult.Summary, 120)}; stderr: {Truncate(agentResult.Stderr, 200)})");
+                    lastFailureRunner = runner;
+                    lastFailureCredential = candidate.Credential;
+                    lastFailureClassificationResult = agentResult;
                     break;
                 }
 
@@ -316,6 +334,13 @@ public sealed class AgenticConflictResolver
 
                 lastVerificationError = verification.Reason;
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(verification.Reason, 200)})");
+                lastFailureRunner = runner;
+                lastFailureCredential = candidate.Credential;
+                lastFailureClassificationResult = new AgentResult(
+                    false,
+                    verification.Reason,
+                    agentResult.Stdout,
+                    agentResult.Stderr);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
                     attempt, maxIterations,
@@ -340,7 +365,12 @@ public sealed class AgenticConflictResolver
             ConflictFiles: conflictFiles,
             IterationsUsed: totalIterations,
             Stdout: lastAgentResult?.Stdout,
-            Stderr: lastAgentResult?.Stderr);
+            Stderr: lastAgentResult?.Stderr)
+        {
+            FailureRunner = lastFailureRunner,
+            FailureCredential = lastFailureCredential,
+            FailureClassificationResult = lastFailureClassificationResult,
+        };
     }
 
     internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(

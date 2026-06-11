@@ -165,26 +165,17 @@ public static class AgentFailureClassifier
             return false;
 
         var trimmed = summary.Trim();
-        return ContainsExit127Shape(trimmed, "agent exited 127")
-            || ContainsExit127Shape(trimmed, "exit 127");
+        return StartsWithExit127Shape(trimmed, "agent exited 127")
+            || StartsWithExit127Shape(trimmed, "exit 127");
     }
 
-    private static bool ContainsExit127Shape(string haystack, string needle)
+    private static bool StartsWithExit127Shape(string haystack, string needle)
     {
-        var index = -1;
-        while ((index = haystack.IndexOf(needle, index + 1, StringComparison.OrdinalIgnoreCase)) >= 0)
-        {
-            if (index > 0 && char.IsLetterOrDigit(haystack[index - 1]))
-                continue;
+        if (!haystack.StartsWith(needle, StringComparison.OrdinalIgnoreCase))
+            return false;
 
-            var after = index + needle.Length;
-            if (after < haystack.Length && char.IsLetterOrDigit(haystack[after]))
-                continue;
-
-            return true;
-        }
-
-        return false;
+        var after = needle.Length;
+        return after >= haystack.Length || !char.IsLetterOrDigit(haystack[after]);
     }
 
     private static bool ContainsAny(string? haystack, IReadOnlyList<string> needles)

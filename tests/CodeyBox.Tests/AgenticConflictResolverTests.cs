@@ -188,6 +188,43 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_UsesLastFailedCandidate_NotAggregateTrail()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var first = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "agent exited 127", null, "env: 'codex': No such file or directory"))
+        { Kind = new AgentKind("codex") };
+        var second = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "agent exited 2", null, null))
+        { Kind = new AgentKind("claude") };
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [
+                new AgenticConflictResolverCandidate(first, Credential: null),
+                new AgenticConflictResolverCandidate(second, Credential: null),
+            ],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("agent exited 127", result.Summary, StringComparison.Ordinal);
+        Assert.Same(second, result.FailureRunner);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.Equal("agent exited 2", classificationResult.Summary);
+
+        var classification = ((IAgentRunner)second).ClassifyFailure(classificationResult);
+        Assert.NotEqual(AgentFailureKind.Infrastructure, classification.Kind);
+    }
+
+    [Fact]
     public async Task ResolveAsync_NoConflicts_ReturnsTriviallySuccessful()
     {
         var sandbox = new ConflictSandbox();

@@ -95,7 +95,7 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         fix.Codex.WorkPlan.Enqueue(new FileWrite("ok.txt", "v1"));
         fix.Codex.MergeScriptedFailures.Enqueue(new AgentResult(
             Success: false,
-            Summary: "agentic conflict resolution failed: agent exited 127 (attempts: codex#1(agent exited 127))",
+            Summary: "agent exited 127",
             Stdout: null,
             Stderr: "env: 'codex': No such file or directory"));
 

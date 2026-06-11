@@ -3777,11 +3777,12 @@ public sealed class PipelineRunner : IPipelineRunner
         WorkItem item,
         Project project,
         string sandboxId,
-        string phase)
+        string phase,
+        AgentResult? classificationResult = null)
     {
         if (!result.Success)
         {
-            var classification = runner.ClassifyFailure(result);
+            var classification = runner.ClassifyFailure(classificationResult ?? result);
             if (classification.Kind == AgentFailureKind.Infrastructure)
             {
                 AuditLog.SandboxAgentInfrastructureFailure(
@@ -6770,6 +6771,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // per-attempt prompt inside AgenticConflictResolver.
             var mergeSw = Stopwatch.StartNew();
             AgentResult agentResult;
+            AgentResult? agentResultForAvailabilityClassification = null;
             long mergeExecElapsedMs;
             DateTimeOffset mergeEndedAt;
             var mergeStructuredStreamCaptured = false;
@@ -6814,6 +6816,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         chosenMergeRunner = resolverResult.ChosenRunner;
                         chosenMergeCredential = resolverResult.ChosenCredential;
+                    }
+                    else if (!resolverResult.Success && resolverResult.FailureRunner is not null)
+                    {
+                        chosenMergeRunner = resolverResult.FailureRunner;
+                        chosenMergeCredential = resolverResult.FailureCredential;
+                        agentResultForAvailabilityClassification = resolverResult.FailureClassificationResult;
                     }
                 }
                 mergeExecElapsedMs = mergeExecScope.ElapsedMs;
@@ -6901,7 +6909,8 @@ public sealed class PipelineRunner : IPipelineRunner
                     item,
                     project,
                     sandbox.Id,
-                    "merge");
+                    "merge",
+                    agentResultForAvailabilityClassification);
             }
             AuditLog.AgentFinished(chosenMergeRunner.Kind, sandbox.Id, agentResult.Success, null, mergeSw.Elapsed,
                 stdoutTail: Tail(agentResult.Stdout), stderrTail: Tail(agentResult.Stderr));
