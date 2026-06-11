@@ -86,10 +86,9 @@ internal static class AgentStreamEndpoints
             if (sniffStream is null) return Results.NotFound();
             var sniffedKind = await AgentStreamParserSelection.SniffKindAsync(sniffStream, parsers, analysisCt);
             var costRows = await costs.GetByWorkItemAsync(item.Id.ToString(), analysisCt);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows, parsers.Select(p => p.Kind));
-            var parser = parsers.FirstOrDefault(p => p.Kind == kind)
-                ?? parsers.FirstOrDefault(p => p.Kind.Value == "unknown")
-                ?? new UnknownAgentStreamParser();
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costRows, parsers);
+            var parser = (IAgentStreamParser?)parsers.FirstOrDefault(p => p.Kind == kind)
+                ?? AgentStreamParserSelection.ResolveFallbackParser(parsers);
 
             await using var stream = await streams.OpenReadAsync(item.Id, fileName, analysisCt);
             if (stream is null) return Results.NotFound();
@@ -99,7 +98,7 @@ internal static class AgentStreamEndpoints
                 ? await contextParser.ParseAsync(stream, context, analysisCt)
                 : await parser.ParseAsync(stream, analysisCt);
             var rowKind = parser.Kind;
-            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
+            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(summary))
             {
                 // Mirror StreamAnalysisService: re-open the capture file and
                 // run it through the plaintext-fallback parser so the
@@ -170,12 +169,7 @@ internal static class AgentStreamEndpoints
         if (stream is null)
             return null;
 
-        // Reuse the registered unknown parser so the plaintext fallback path
-        // exercises the same code path the orchestrator does (and stays
-        // replaceable via DI rather than coupling to a concrete construction).
-        var fallback = parsers.OfType<IAgentStreamParserWithContext>()
-            .FirstOrDefault(p => p.Kind.Value == "unknown")
-            ?? (IAgentStreamParserWithContext)new UnknownAgentStreamParser();
+        var fallback = AgentStreamParserSelection.ResolveFallbackParser(parsers);
         return await fallback.ParseAsync(stream, context, ct);
     }
 

@@ -23,4 +23,15 @@ public sealed class CursorStreamParser : FlexibleAgentStreamParser
     /// cursor signal at orchestration time.
     /// </summary>
     public override bool TryClaim(JsonElement line) => false;
+
+    /// <summary>
+    /// Cursor's CLI emits the literal Claude shape when stream-json is
+    /// enabled, so a Claude-sniffed stream may have been produced by a
+    /// dispatched Cursor run. Declaring this here keeps the parser-shape
+    /// compatibility matrix on the parser itself rather than the
+    /// orchestrator's resolver.
+    /// </summary>
+    public override bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, AgentKind.Cursor.Value, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase);
 }

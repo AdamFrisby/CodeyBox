@@ -18,6 +18,17 @@ public interface IAgentStreamParser
     /// claim arbitrary lines.
     /// </summary>
     bool TryClaim(System.Text.Json.JsonElement line) => false;
+
+    /// <summary>
+    /// Returns true when this parser's agent is known to emit the on-wire NDJSON
+    /// shape of <paramref name="sniffed"/>. Wrapper agents (cursor proxies
+    /// claude; antigravity proxies claude/gemini) override this so the
+    /// orchestrator can attribute a sniffed-by-shape stream to the dispatched
+    /// agent kind without itself encoding the provider compatibility matrix.
+    /// Default: a parser only claims its own kind.
+    /// </summary>
+    bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, Kind.Value, StringComparison.OrdinalIgnoreCase);
 }
 
 public interface IAgentStreamParserWithContext : IAgentStreamParser
@@ -254,6 +265,15 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
     /// to know each provider's JSON vocabulary.
     /// </summary>
     public virtual bool TryClaim(JsonElement line) => false;
+
+    /// <summary>
+    /// Provider-specific shape compatibility. Wrapper agents
+    /// (cursor proxies claude; antigravity proxies claude/gemini) override
+    /// this so the orchestrator's resolver does not encode the cross-provider
+    /// compatibility matrix. Default: only the parser's own kind.
+    /// </summary>
+    public virtual bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, Kind.Value, StringComparison.OrdinalIgnoreCase);
 
     public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
         ParseAsync(jsonlFile, context: null, ct);

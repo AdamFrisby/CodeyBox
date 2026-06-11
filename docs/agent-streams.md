@@ -84,9 +84,11 @@ Verified in this sandbox:
 Not locally verifiable here:
 
 - Gemini: the `gemini` binary was not installed in this sandbox. CodeyBox probes
-  `gemini --help` inside the invocation sandbox and only adds `--json` when that
-  help output advertises the flag. If unavailable, the run falls back to normal
-  text output and the plaintext-fallback summariser still produces a row.
+  `gemini --help` inside the invocation sandbox and only adds
+  `--output-format stream-json` when that help output advertises BOTH
+  `--output-format` and `stream-json` (gemini-cli ≥ 0.40; the older `--json`
+  flag was removed). If unavailable, the run falls back to normal text output
+  and the plaintext-fallback summariser still produces a row.
 - Antigravity: the `agy` binary is shape-compatible with Claude (Anthropic
   stream-json for claude-* gateway models, Gemini stream-json for gemini-*).
   CodeyBox probes `agy --help` for `--output-format stream-json` and adds the
@@ -123,7 +125,7 @@ The stream-capture system supports two paths per agent:
 | `claude`    | Yes (Anthropic NDJSON) | Yes                | `--output-format stream-json --verbose`                            |
 | `codex`     | Yes (`codex exec --json`) | Yes             | Codex stream-json shape.                                           |
 | `cursor`    | Yes (Claude-shape)     | Yes                | `--output-format stream-json --stream-partial-output`              |
-| `gemini`    | Conditional            | Yes                | `gemini --help` probed for `--json`.                               |
+| `gemini`    | Conditional            | Yes                | `gemini --help` probed for `--output-format stream-json`.          |
 | `antigravity` | Conditional          | Yes                | `agy --help` probed for `--output-format stream-json`.             |
 | `opencode`  | No                     | Yes                | Plaintext stdout only.                                             |
 | `copilot`   | No                     | Yes                | Plaintext stdout only.                                             |

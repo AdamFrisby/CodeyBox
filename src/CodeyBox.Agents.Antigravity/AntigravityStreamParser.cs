@@ -26,6 +26,19 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
     /// </summary>
     public override bool TryClaim(JsonElement line) => false;
 
+    /// <summary>
+    /// Antigravity is a multi-model gateway: claude-* gateway models emit
+    /// literal Anthropic stream-json and gemini-* gateway models emit literal
+    /// Gemini stream-json. A Claude- or Gemini-sniffed stream may therefore
+    /// have been produced by a dispatched agy run; declare both shapes here
+    /// so <see cref="AgentStreamParserSelection.ResolveKind"/> can attribute
+    /// such streams to antigravity when the work item / cost row says so.
+    /// </summary>
+    public override bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase);
+
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
         var type = FirstString(root, "type", "event", "name") ?? "unknown";

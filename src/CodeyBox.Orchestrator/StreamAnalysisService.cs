@@ -69,7 +69,7 @@ public sealed class StreamAnalysisService : BackgroundService
             }
 
             var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Keys);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Values);
             if (!_parsers.TryGetValue(kind, out var parser))
                 parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
 
@@ -82,7 +82,7 @@ public sealed class StreamAnalysisService : BackgroundService
                 ? await contextParser.ParseAsync(stream, context, ct).ConfigureAwait(false)
                 : await parser.ParseAsync(stream, ct).ConfigureAwait(false);
             var rowKind = parser.Kind;
-            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
+            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(summary))
             {
                 // The kind-specific parser did not recognise any events
                 // (plaintext output from an agent whose CLI does not emit
@@ -133,16 +133,7 @@ public sealed class StreamAnalysisService : BackgroundService
         if (stream is null)
             return null;
 
-        // Reuse the registered unknown parser so the fallback path stays
-        // replaceable via DI (an operator can swap in a richer plaintext
-        // summariser without touching this service). Fall back to the
-        // in-process implementation only when the unknown parser was not
-        // registered — keeps the test wiring (which constructs a minimal
-        // parser list) working without forcing every caller to add the
-        // unknown parser.
-        var fallback = _parsers.Values.OfType<IAgentStreamParserWithContext>()
-            .FirstOrDefault(p => p.Kind.Value == "unknown")
-            ?? (IAgentStreamParserWithContext)new UnknownAgentStreamParser();
+        var fallback = AgentStreamParserSelection.ResolveFallbackParser(_parsers.Values);
         return await fallback.ParseAsync(stream, context, ct).ConfigureAwait(false);
     }
 

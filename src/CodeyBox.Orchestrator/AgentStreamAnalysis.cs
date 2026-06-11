@@ -102,22 +102,23 @@ public static class AgentStreamParserSelection
     /// specific random capture filename. A conclusive stream sniff therefore
     /// stays authoritative. Cost metadata is only allowed to override sniffing
     /// for known shared shapes, and only when the capture creation timestamp
-    /// falls inside one distinct cost window. Only kinds present in
-    /// <paramref name="knownKinds"/>
-    /// are canonicalised — anything else falls through to "unknown".
-    /// Callers should pass the kinds of their registered
-    /// <see cref="IAgentStreamParser"/>s so adding a new provider library
-    /// is purely additive.
+    /// falls inside one distinct cost window. The shape-compatibility matrix
+    /// (which agents emit which on-wire shape) lives on the parsers themselves
+    /// via <see cref="IAgentStreamParser.CanEmitShapeOf"/>; the resolver only
+    /// asks the registered parsers, so adding a new wrapper agent is a parser-
+    /// side change. Only kinds present in <paramref name="parsers"/> are
+    /// canonicalised — anything else falls through to "unknown".
     /// </summary>
     public static AgentKind ResolveKind(
         WorkItem item,
         AgentStreamFile file,
         AgentKind? sniffedKind,
         IReadOnlyList<WorkItemCost> costs,
-        IEnumerable<AgentKind> knownKinds)
+        IEnumerable<IAgentStreamParser> parsers)
     {
-        ArgumentNullException.ThrowIfNull(knownKinds);
-        var known = knownKinds as IReadOnlyCollection<AgentKind> ?? knownKinds.ToList();
+        ArgumentNullException.ThrowIfNull(parsers);
+        var parserList = parsers as IReadOnlyList<IAgentStreamParser> ?? parsers.ToList();
+        var known = parserList.Select(p => p.Kind).ToList();
 
         var matchingCosts = MatchingCosts(item, file, costs).ToList();
         var workItemKind = item.Agent.HasValue ? Canonicalize(item.Agent.Value, known) : null;
@@ -125,13 +126,13 @@ public static class AgentStreamParserSelection
         if (sniffedKind is not null)
         {
             var sniffed = Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
-            if (TryResolveSharedShapeCostOverride(sniffed, matchingCosts, file, known) is { } costOverride)
+            if (TryResolveSharedShapeCostOverride(sniffed, matchingCosts, file, parserList, known) is { } costOverride)
                 return costOverride;
 
             if (matchingCosts.Count == 0
                 && workItemKind is { } itemKindForDispatchedPhase
                 && IsDispatchedWorkPhase(file.Phase)
-                && CanEmitSniffedShape(itemKindForDispatchedPhase, sniffed))
+                && CanEmitSniffedShape(parserList, itemKindForDispatchedPhase, sniffed))
             {
                 return itemKindForDispatchedPhase;
             }
@@ -149,6 +150,32 @@ public static class AgentStreamParserSelection
             return itemKind;
 
         return new AgentKind("unknown");
+    }
+
+    /// <summary>
+    /// Backwards-compatible overload that takes only the kinds. Callers that
+    /// don't have the parser instances handy still get the resolver logic, but
+    /// the shape-compatibility matrix collapses to "an agent only matches its
+    /// own kind" — the wrapper-agent override (cursor/antigravity proxying
+    /// claude) requires the parser overload above.
+    /// </summary>
+    public static AgentKind ResolveKind(
+        WorkItem item,
+        AgentStreamFile file,
+        AgentKind? sniffedKind,
+        IReadOnlyList<WorkItemCost> costs,
+        IEnumerable<AgentKind> knownKinds)
+    {
+        ArgumentNullException.ThrowIfNull(knownKinds);
+        return ResolveKind(item, file, sniffedKind, costs, knownKinds.Select(k => (IAgentStreamParser)new KindOnlyParser(k)));
+    }
+
+    private sealed class KindOnlyParser : IAgentStreamParser
+    {
+        public KindOnlyParser(AgentKind kind) { Kind = kind; }
+        public AgentKind Kind { get; }
+        public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
+            Task.FromResult(AgentStreamSummary.Unsupported());
     }
 
     private static IEnumerable<WorkItemCost> MatchingCosts(
@@ -173,9 +200,10 @@ public static class AgentStreamParserSelection
         AgentKind sniffed,
         IReadOnlyList<WorkItemCost> matchingCosts,
         AgentStreamFile file,
+        IReadOnlyList<IAgentStreamParser> parsers,
         IReadOnlyCollection<AgentKind> known)
     {
-        if (!IsSharedShapeSniff(sniffed))
+        if (!IsSharedShapeSniff(parsers, sniffed))
             return null;
 
         var correlatedKinds = matchingCosts
@@ -186,7 +214,7 @@ public static class AgentStreamParserSelection
             .Distinct()
             .ToList();
 
-        return correlatedKinds.Count == 1 && CanEmitSniffedShape(correlatedKinds[0], sniffed)
+        return correlatedKinds.Count == 1 && CanEmitSniffedShape(parsers, correlatedKinds[0], sniffed)
             ? correlatedKinds[0]
             : null;
     }
@@ -198,31 +226,52 @@ public static class AgentStreamParserSelection
             && file.CapturedAt <= cost.EndedAt + tolerance;
     }
 
-    private static bool IsSharedShapeSniff(AgentKind sniffed) =>
-        string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase)
-        || string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// A sniff is "shared shape" when at least one registered parser whose
+    /// own <see cref="IAgentStreamParser.Kind"/> differs from the sniffed
+    /// kind nonetheless declares (via <see cref="IAgentStreamParser.CanEmitShapeOf"/>)
+    /// that its agent can emit that on-wire shape. The orchestrator does
+    /// not need to know which kinds those are — that knowledge lives on the
+    /// parsers themselves.
+    /// </summary>
+    private static bool IsSharedShapeSniff(IReadOnlyList<IAgentStreamParser> parsers, AgentKind sniffed) =>
+        parsers.Any(p =>
+            !string.Equals(p.Kind.Value, sniffed.Value, StringComparison.OrdinalIgnoreCase)
+            && p.CanEmitShapeOf(sniffed));
 
-    private static bool CanEmitSniffedShape(AgentKind candidate, AgentKind sniffed)
+    private static bool CanEmitSniffedShape(
+        IReadOnlyList<IAgentStreamParser> parsers,
+        AgentKind candidate,
+        AgentKind sniffed)
     {
         if (string.Equals(candidate.Value, sniffed.Value, StringComparison.OrdinalIgnoreCase))
             return true;
 
-        if (string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase))
-        {
-            return string.Equals(candidate.Value, AgentKind.Cursor.Value, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(candidate.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase);
-        }
-
-        return string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(candidate.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase);
+        var parser = parsers.FirstOrDefault(p =>
+            string.Equals(p.Kind.Value, candidate.Value, StringComparison.OrdinalIgnoreCase));
+        return parser?.CanEmitShapeOf(sniffed) ?? false;
     }
 
-    public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
-    {
-        if (summary.IsUnsupported)
-            return true;
+    public static bool ShouldTreatAsUnsupported(AgentStreamSummary summary) =>
+        summary.IsUnsupported;
 
-        return false;
+    /// <summary>
+    /// Returns the plaintext-fallback parser to run when the kind-specific
+    /// parser fails to recognise any structured events. Centralised so both
+    /// orchestration call sites (background sweep, on-demand endpoint) share
+    /// the same selection rule: prefer the DI-registered <c>unknown</c>
+    /// parser (operators can swap in a richer plaintext summariser) and only
+    /// construct an in-process default when none was registered. The default
+    /// keeps test wiring with minimal parser lists working without forcing
+    /// every caller to register the unknown parser.
+    /// </summary>
+    public static IAgentStreamParserWithContext ResolveFallbackParser(
+        IEnumerable<IAgentStreamParser> parsers)
+    {
+        ArgumentNullException.ThrowIfNull(parsers);
+        return parsers.OfType<IAgentStreamParserWithContext>()
+            .FirstOrDefault(p => string.Equals(p.Kind.Value, "unknown", StringComparison.OrdinalIgnoreCase))
+            ?? new UnknownAgentStreamParser();
     }
 
     public static AgentStreamParserContext? ResolveTimingContext(

@@ -191,7 +191,160 @@ public sealed class UnknownAgentStreamParserTests
         Assert.Contains("final line", summary.FinalAssistantMessage);
     }
 
+    [Fact]
+    public async Task ParseAsync_StreamThrowsIOExceptionMidRead_PreservesPartialTailAndCounts()
+    {
+        // The IOException recovery branch in UnknownAgentStreamParser is
+        // load-bearing: an in-flight capture file can be truncated, rotated,
+        // or briefly contended, and we still want a non-blank summary out the
+        // other side. Pin: we get the partial tail that WAS read, the
+        // caller-supplied accounting takes over from the read-counters we
+        // never finished tallying, and the parse does NOT propagate the
+        // IOException out (which would re-create the "summary row went
+        // missing" black hole this rework closed).
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var prefix = "first plaintext line\nsecond plaintext line\n";
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes(prefix)),
+            new IOException("simulated rotation mid-read"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(12),
+            LineCount: 77,
+            SizeBytes: 8_888));
+
+        Assert.False(summary.IsUnsupported);
+        Assert.Equal(TimeSpan.FromSeconds(12), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // Caller-supplied accounting wins over the swallowed read counters.
+        Assert.Contains("lines=77", summary.FinalAssistantMessage);
+        Assert.Contains("bytes=8888", summary.FinalAssistantMessage);
+        // The partial tail collected before the throw is still there.
+        Assert.Contains("first plaintext line", summary.FinalAssistantMessage);
+        Assert.Contains("second plaintext line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamThrowsDecoderFallbackOnMalformedUtf8_PreservesPartialTail()
+    {
+        // The DecoderFallbackException branch exists because agy / opencode
+        // can spit terminal escapes or partial bytes when the CLI is killed
+        // mid-write. A throwing decoder must not blank the summary — pin the
+        // partial tail and that the malformed bytes don't surface.
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var prefix = "first plaintext line\nsecond plaintext line\n";
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes(prefix)),
+            new DecoderFallbackException("simulated malformed UTF-8"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(7),
+            LineCount: 5,
+            SizeBytes: 64));
+
+        Assert.False(summary.IsUnsupported);
+        Assert.Equal(TimeSpan.FromSeconds(7), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("lines=5", summary.FinalAssistantMessage);
+        Assert.Contains("first plaintext line", summary.FinalAssistantMessage);
+        Assert.Contains("second plaintext line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamThrowsUnauthorizedAccess_DoesNotSwallow()
+    {
+        // The flip side of the recovery branches: only IOException /
+        // DecoderFallbackException are swallowed. Any other read failure
+        // must surface so the sweep retries instead of writing a "successful"
+        // summary that hides a real bug (this was called out explicitly in
+        // the parser's comment block).
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes("partial\n")),
+            new UnauthorizedAccessException("not for the sweep to swallow"));
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            parser.ParseAsync(stream, new AgentStreamParserContext(
+                started, started.AddSeconds(1), LineCount: 1, SizeBytes: 8)));
+    }
+
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+
+    /// <summary>
+    /// Reads the wrapped stream until it's drained, then throws the
+    /// configured exception on the next read — simulates a real read
+    /// failure that fires mid-parse rather than on first byte.
+    /// </summary>
+    private sealed class ThrowAfterStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly Exception _toThrow;
+        private bool _drained;
+
+        public ThrowAfterStream(Stream inner, Exception toThrow)
+        {
+            _inner = inner;
+            _toThrow = toThrow;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_drained)
+                throw _toThrow;
+            var read = _inner.Read(buffer, offset, count);
+            if (read == 0)
+            {
+                _drained = true;
+                throw _toThrow;
+            }
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_drained)
+                throw _toThrow;
+            var read = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                _drained = true;
+                throw _toThrow;
+            }
+            return read;
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _inner.Dispose();
+            base.Dispose(disposing);
+        }
+    }
 }
 
 public sealed class CodexStreamParserTests
@@ -1267,7 +1420,12 @@ public sealed class AgentStreamParserSelectionTests
             file,
             sniffedKind: AgentKind.Claude,
             costs: [],
-            knownKinds: new[] { AgentKind.Claude, AgentKind.Cursor, AgentKind.Antigravity });
+            parsers: new IAgentStreamParser[]
+            {
+                new ClaudeStreamParser(),
+                new CursorStreamParser(),
+                new AntigravityStreamParser(),
+            });
 
         Assert.Equal(AgentKind.Cursor, kind);
     }
@@ -1318,7 +1476,12 @@ public sealed class AgentStreamParserSelectionTests
             file,
             sniffedKind: AgentKind.Claude,
             costs,
-            knownKinds: new[] { AgentKind.Claude, AgentKind.Cursor, AgentKind.Antigravity });
+            parsers: new IAgentStreamParser[]
+            {
+                new ClaudeStreamParser(),
+                new CursorStreamParser(),
+                new AntigravityStreamParser(),
+            });
 
         Assert.Equal(AgentKind.Antigravity, kind);
     }

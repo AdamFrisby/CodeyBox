@@ -645,6 +645,61 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
         Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 
+    [Fact]
+    public async Task ReleaseService_DeepAudit_PlaintextRunner_StillOpensCaptureFile()
+    {
+        // Anti-regression: the deep-audit capture condition was widened so a
+        // capture file is opened whenever LLM audit streams are enabled — NOT
+        // only when SupportsStructuredStreamAsync returned true. If that
+        // condition regresses to `canCaptureStructuredStream ? Begin : null`,
+        // a plaintext-only auditor agent (opencode-style) silently stops
+        // producing a release-level capture and the existing structured-only
+        // test would still pass. Pin both: capture file opens, and the agent
+        // is asked NOT to emit structured stream-json.
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Path = Path.Combine(_workspace, "streams-plaintext-release") },
+            NullLogger<AgentStreamStore>.Instance);
+        var agent = new PlaintextDeepAuditAgent();
+        var service = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            new InMemoryProjectRepository(ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1)),
+            new NullWebhookDispatcher(),
+            deepAuditors: [new AgentBackedDeepAuditor(AuditorName)],
+            sandboxes: new AlwaysSucceedSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost(),
+            agents: new SingleAgentRegistry(agent),
+            agentStreams: streamStore);
+        var release = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0-plain");
+        await _releaseStore.CreateAsync(release);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = release.ProjectId,
+            Title = "done",
+            Prompt = "done",
+            Agent = AgentKind.Claude,
+            ReleaseId = release.Id,
+        };
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await service.OnWorkItemTerminalAsync(release.Id, CancellationToken.None);
+
+        var files = await PollForFilesAsync(streamStore, new WorkItemId(release.Id.Value));
+        var file = Assert.Single(files);
+        Assert.Equal($"audit-llm-{AuditorName}", file.Phase);
+        // The auditor said it does NOT support structured stream-json…
+        Assert.Equal([false], agent.CaptureStructuredStreamCalls);
+        // …yet the capture file MUST exist and carry the plaintext tee. A
+        // regression to canCaptureStructuredStream ? Begin : null would
+        // leave SizeBytes at 0 here.
+        Assert.True(file.SizeBytes > 0);
+        var contents = await File.ReadAllTextAsync(
+            Path.Combine(streamStore.Options.Path, release.Id.ToString(), file.FileName));
+        Assert.Contains("plaintext deep audit chunk", contents);
+    }
+
     private static async Task<IReadOnlyList<AgentStreamFile>> PollForFilesAsync(
         AgentStreamStore streamStore,
         WorkItemId id)
@@ -709,6 +764,31 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
             CaptureStructuredStreamCalls.Add(captureStructuredStream);
             stdoutChunkCallback?.Invoke("{\"type\":\"result\",\"auditor\":\"deep\"}\n");
             return Task.FromResult(new AgentResult(true, "ok", "{\"type\":\"result\",\"auditor\":\"deep\"}\n", null));
+        }
+    }
+
+    private sealed class PlaintextDeepAuditAgent : IStructuredStreamAgentRunner
+    {
+        public List<bool> CaptureStructuredStreamCalls { get; } = new();
+        public AgentKind Kind => AgentKind.Claude;
+
+        public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
+            Task.FromResult(false);
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            CaptureStructuredStreamCalls.Add(captureStructuredStream);
+            stdoutChunkCallback?.Invoke("plaintext deep audit chunk\n");
+            return Task.FromResult(new AgentResult(true, "ok", "plaintext deep audit chunk\n", null));
         }
     }
 

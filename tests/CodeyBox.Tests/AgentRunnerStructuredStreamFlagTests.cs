@@ -177,6 +177,34 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     }
 
     [Fact]
+    public async Task Cursor_WhenHelpOnlyAdvertisesOutputFormatWithoutStreamJson_ReturnsFalse()
+    {
+        // Plausible bug guard: if the marker check became `--output-format` OR
+        // `stream-json` (instead of AND), an older Cursor CLI that exposes
+        // `--output-format text` but not `stream-json` would falsely report
+        // support and the dispatch would crash with "unknown value" on the
+        // stream-json flag. Pin: BOTH markers must be present.
+        var sandbox = new CapturingSandbox(
+            stdout: "  --output-format <text|json>   Output format");
+        var supported = await new CursorAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+    }
+
+    [Fact]
+    public async Task Cursor_WhenHelpOnlyMentionsStreamJsonWithoutFlag_ReturnsFalse()
+    {
+        // Symmetric partial-marker case: help text that mentions "stream-json"
+        // in prose without exposing the `--output-format` flag must NOT be
+        // treated as supporting structured stream capture.
+        var sandbox = new CapturingSandbox(
+            stdout: "Cursor CLI supports stream-json experimentally; not yet exposed.");
+        var supported = await new CursorAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+    }
+
+    [Fact]
     public async Task Antigravity_WhenHelpAdvertisesStreamJson_ReportsSupport()
     {
         var sandbox = new CapturingSandbox(stderr: "Usage: agy --output-format stream-json");
@@ -200,5 +228,27 @@ public sealed class AgentRunnerStructuredStreamFlagTests
 
         Assert.False(supported);
         Assert.Equal(["agy", "--help"], sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Antigravity_WhenHelpOnlyAdvertisesOutputFormatWithoutStreamJson_ReturnsFalse()
+    {
+        // Same regression target as the Cursor partial-marker test: BOTH
+        // `--output-format` AND `stream-json` must be present, not either.
+        var sandbox = new CapturingSandbox(
+            stdout: "  --output-format <text|json>   Output format");
+        var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
+    }
+
+    [Fact]
+    public async Task Antigravity_WhenHelpOnlyMentionsStreamJsonWithoutFlag_ReturnsFalse()
+    {
+        var sandbox = new CapturingSandbox(
+            stdout: "agy ships stream-json in a future preview channel.");
+        var supported = await new AntigravityAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
     }
 }
