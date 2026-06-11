@@ -15,6 +15,15 @@ public sealed class QuotaGatePolicy
     public QuotaGatePolicy(QuotaRouterOptions options) =>
         _options = options ?? throw new ArgumentNullException(nameof(options));
 
+    /// <summary>
+    /// The unknown-quota policy the gate applies. Exposed so callers that wrap
+    /// the policy (e.g. <see cref="QuotaGateAvailability"/>) can mirror the
+    /// router's dispatch semantics for consulting <see cref="IQuotaFailureStore"/>:
+    /// dispatch only checks observed failures when quota is unknown and the
+    /// policy is <see cref="QuotaUnknownPolicy.UseObservedFailures"/>.
+    /// </summary>
+    public QuotaUnknownPolicy UnknownPolicy => _options.UnknownPolicy;
+
     public QuotaGateDecision Evaluate(
         AgentMembership member,
         EffectiveQuota quota,
@@ -279,18 +288,27 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     {
         var recentObservedFailure = false;
         string? observedFailureReason = null;
-        if (_failureStore is not null && _observedFailureWindow > TimeSpan.Zero)
+
+        // Mirror AgentClassRouter.EvaluateGateAsync: observed failures only
+        // gate when quota is unknown AND the policy is UseObservedFailures.
+        // Without this branch, a stale recent failure would deny a member that
+        // a fresh probe shows as healthy — diverging from the dispatch path.
+        var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+        if (_failureStore is not null
+            && _observedFailureWindow > TimeSpan.Zero
+            && !quota.IsKnown
+            && _policy.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures)
         {
             var observedAt = await _failureStore.GetMostRecentAsync(
                 member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct);
             if (observedAt is { } seenAt)
             {
                 recentObservedFailure = true;
-                observedFailureReason = $"observed quota failure at {seenAt:O}";
+                observedFailureReason = $"quota unknown; observed quota failure at {seenAt:O}";
             }
         }
 
-        return Allows(member, snapshot, nowUtc, recentObservedFailure, observedFailureReason);
+        return _policy.Evaluate(member, quota, nowUtc, recentObservedFailure, observedFailureReason).Allow;
     }
 }
 

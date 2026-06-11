@@ -1673,7 +1673,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             foreach (var w in windows)
             {
                 if (w.AvailablePct < 0) continue;
-                if (w.AvailablePct < ResolveWindowFloorPct(w.Name))
+                if (w.AvailablePct < ResolveWindowFloorPct(member.Agent, w.Name))
                     return false;
             }
         }
