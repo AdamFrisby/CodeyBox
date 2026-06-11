@@ -419,6 +419,10 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
                 ExtraRuncmd = live.MultipassExtraRuncmd,
+                BaselineVerificationProbes = BuildBaselineVerificationProbes(
+                    live,
+                    sp.GetServices<IInVmSmokeProbe>(),
+                    startupLog),
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
@@ -442,6 +446,61 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
     }
 
     return provider;
+}
+
+static IReadOnlyList<MultipassBaselineBinaryProbe> BuildBaselineVerificationProbes(
+    CodeyBoxOptions opts,
+    IEnumerable<IInVmSmokeProbe> probes,
+    ILogger log)
+{
+    var configuredAgents = new List<string>();
+    var seenAgents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var agent in opts.AgentClasses
+        .SelectMany(c => c.Members)
+        .Select(m => m.Agent.Trim())
+        .Where(a => !string.IsNullOrWhiteSpace(a)))
+    {
+        if (seenAgents.Add(agent))
+            configuredAgents.Add(agent);
+    }
+
+    if (configuredAgents.Count == 0)
+        return [];
+
+    var probesByKind = probes.ToDictionary(p => p.Kind.Value, StringComparer.OrdinalIgnoreCase);
+    var result = new List<MultipassBaselineBinaryProbe>(configuredAgents.Count);
+    foreach (var agent in configuredAgents)
+    {
+        if (probesByKind.TryGetValue(agent, out var probe))
+        {
+            var step = probe.BuildSteps(credential: null).FirstOrDefault(s => s.Argv.Count > 0 && s.Stdin is null);
+            if (step is null)
+            {
+                log.LogWarning(
+                    "Baseline verification skipped for configured agent {Agent}: its in-VM smoke probe has no credential-independent command",
+                    agent);
+                continue;
+            }
+
+            result.Add(new MultipassBaselineBinaryProbe(agent, step.Argv, step.FailureHint));
+            continue;
+        }
+
+        if (string.Equals(agent, AgentKind.Copilot.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            result.Add(new MultipassBaselineBinaryProbe(
+                AgentKind.Copilot.Value,
+                ["copilot", "--version"],
+                "copilot binary not runnable on sandbox PATH"));
+            continue;
+        }
+
+        log.LogWarning(
+            "Baseline verification skipped for configured agent {Agent}: no IInVmSmokeProbe or known binary fallback is registered",
+            agent);
+    }
+
+    return result;
 }
 
 static void LogDiskGuardBanner(IDiskGuardedSandboxProvider provider, ILogger startupLog)
@@ -3205,9 +3264,11 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Extra cloud-init YAML appended to the auto-generated network policy
-        /// when SandboxProvider=multipass. Use to install agent CLIs in the
-        /// VM at first boot (e.g. apt-installing nodejs and npm-installing
-        /// the agent CLI).
+        /// when SandboxProvider=multipass. Use only for top-level cloud-init
+        /// directives CodeyBox does not generate (e.g. <c>packages:</c> or
+        /// <c>apt:</c>). Use <see cref="MultipassExtraRuncmd"/> for install
+        /// commands; duplicate generated blocks such as <c>runcmd:</c> and
+        /// <c>write_files:</c> are rejected by the Multipass provider.
         /// </summary>
         public string? MultipassExtraCloudInit { get; set; }
 

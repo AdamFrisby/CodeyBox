@@ -50,6 +50,34 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void CloudInit_BaselineManifestRendersInstallCommandsIntoUserData()
+    {
+        var installer = "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin";
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: null,
+            includeGraphicalInstall: false,
+            baselineInstallCommands: [installer]);
+
+        Assert.Contains("path: /var/lib/codeybox/baseline-install-commands.sh", cloudInit);
+        Assert.Contains(installer, cloudInit);
+    }
+
+    [Theory]
+    [InlineData("runcmd")]
+    [InlineData("write_files")]
+    public void CloudInit_RejectsExtraCloudInitThatClobbersGeneratedTopLevelBlocks(string key)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            MultipassSandboxProvider.BuildCloudInit(
+                extraRuncmd: [],
+                extraCloudInit: $"{key}:\n  - echo bad\n"));
+
+        Assert.Contains($"top-level '{key}'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MultipassExtraRuncmd", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CloudInit_InstallsTcpKeepaliveSysctlForSuspendResumeRecovery()
     {
         // R8-core: after a multipass suspend/start cycle the in-VM agent's
@@ -2022,6 +2050,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(3, "", "schema validation failed: bad runcmd"));
             }
 
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
+                return Task.FromResult(new ProcessRunResult(0, "status: error\nschema validation failed: bad runcmd", ""));
+
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deletedName = deleteName;
@@ -2052,6 +2083,62 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.False(
             Directory.Exists(Path.Combine(staging, launchedName!)),
             "staging directory for failed sandbox must be removed during cleanup");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ThrowsAndCleansUpWhenCloudInitReportsDegraded()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-degraded");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
+                return Task.FromResult(new ProcessRunResult(0, "status: degraded\ncloud-config failed schema validation", ""));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(stagingDirectory: staging, runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("cloud-config failed schema validation", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(launchedName, deletedName);
     }
 
     [Fact]

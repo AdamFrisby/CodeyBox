@@ -197,8 +197,11 @@ is bare — no agent CLI, no language toolchain, no auditor binaries.
 Three ways to install what your project needs:
 
 1. **`CodeyBox.MultipassExtraRuncmd` (recommended)** — a list of shell
-   commands run via `multipass exec` after first boot. Use this for
-   anything that needs a runcmd-style invocation. Example for a project
+   commands spliced into the generated cloud-init `runcmd` on ordinary
+   launches, and rendered into the baseline user-data as a diagnostic
+   install-command manifest before being run once via `multipass exec` during
+   baseline bakes. Use this for anything that needs a runcmd-style invocation.
+   Example for a project
    whose work agent is Claude Code and whose audit policy uses gitleaks:
    ```json
    "CodeyBox": {
@@ -207,15 +210,16 @@ Three ways to install what your project needs:
      ]
    }
    ```
-   Each entry is one shell command; the orchestrator splices them into
-   its own runcmd block in order. Package downloads go out via the
-   profile's host bridge, so their destinations need to be on the
-   bridge's allowlist (or use a profile in `internet` mode).
+   Each entry is one shell command; the orchestrator preserves their order.
+   Package downloads go out via the profile's host bridge, so their
+   destinations need to be on the bridge's allowlist (or use a profile in
+   `internet` mode).
 2. **`CodeyBox.MultipassExtraCloudInit`** — extra cloud-init YAML for
-   non-runcmd directives (`packages:`, `write_files:`, `apt:`, etc.).
-   Don't use this to add a `runcmd:` block — cloud-init's PyYAML parser
-   keeps only the last occurrence of duplicated top-level keys, so a
-   second runcmd would clobber the orchestrator's route swap.
+   directives CodeyBox does not generate (`packages:`, `apt:`, etc.).
+   Don't use this to add `runcmd:` or `write_files:` blocks — cloud-init's
+   PyYAML parser keeps only one duplicate top-level key, so the provider
+   rejects those fragments before launch rather than letting user-data get
+   partially dropped.
 3. **Custom multipass image** — pre-bake everything (`multipass launch`
    + customise + snapshot) and reference via `SandboxSpec.ImageReference`.
    Faster startup, no bring-up reachability requirements. Useful when

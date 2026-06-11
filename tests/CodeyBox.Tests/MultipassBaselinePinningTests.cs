@@ -284,6 +284,88 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerifiesConfiguredAgentBinaries()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var verificationArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            baselineVerificationArgv: verificationArgv);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity"],
+                baselineVerificationProbes:
+                [
+                    new MultipassBaselineBinaryProbe(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "claude",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None);
+
+        var argv = Assert.Single(verificationArgv);
+        Assert.Equal(["agy", "--version"], argv);
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerificationFailure_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineVerification: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity-fail"],
+                baselineVerificationProbes:
+                [
+                    new MultipassBaselineBinaryProbe(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification for agent 'antigravity' failed", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
     public async Task CreateAsync_WithPinnedBaselineForDifferentProfile_FailsClosedBeforeClone()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -357,13 +439,16 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         Assert.Empty(launchNames);
     }
 
-    private MultipassSandboxOptions MakeOptions(IReadOnlyList<string> extraRuncmd) => new()
+    private MultipassSandboxOptions MakeOptions(
+        IReadOnlyList<string> extraRuncmd,
+        IReadOnlyList<MultipassBaselineBinaryProbe>? baselineVerificationProbes = null) => new()
     {
         MultipassBinary = "/bin/false",
         StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
         NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
         UseBaselineImages = true,
         ExtraRuncmd = extraRuncmd,
+        BaselineVerificationProbes = baselineVerificationProbes ?? [],
     };
 
     /// <summary>
@@ -378,6 +463,8 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         ConcurrentQueue<string> cloneSources,
         ConcurrentQueue<string>? deleteNames = null,
         bool failBaselineInstall = false,
+        ConcurrentQueue<IReadOnlyList<string>>? baselineVerificationArgv = null,
+        bool failBaselineVerification = false,
         bool failDeletePurge = false,
         bool dropStateOnDeleteAttempt = false)
     {
@@ -412,6 +499,16 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(failBaselineInstall
                     ? new ProcessRunResult(42, "", "install failed")
                     : new ProcessRunResult(0, "", ""));
+            }
+            if (argv.Count > 4
+                && argv[1] == "exec"
+                && argv[2].StartsWith("cb-baseline-", StringComparison.Ordinal)
+                && argv[3] == "--")
+            {
+                baselineVerificationArgv?.Enqueue(argv.Skip(4).ToArray());
+                return Task.FromResult(failBaselineVerification
+                    ? new ProcessRunResult(127, "", "agy: command not found")
+                    : new ProcessRunResult(0, "agy version 1.0.7", ""));
             }
             if (argv is [_, "stop", var stopName])
             {
