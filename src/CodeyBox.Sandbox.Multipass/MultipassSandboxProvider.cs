@@ -1364,19 +1364,19 @@ git push origin HEAD:{refName}";
             flavor.ToString(),
             cloudInit,
             string.Join("\n", firstBootRuncmd),
-            string.Join("\n", opts.BaselineVerificationProbes.Select(RenderBaselineProbeForHash)),
+            string.Join("\n", opts.BaselineVerificationCommands.Select(RenderBaselineVerificationCommandForHash)),
             opts.ExtraCloudInit ?? string.Empty,
         });
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
 
-    private static string RenderBaselineProbeForHash(MultipassBaselineBinaryProbe probe) =>
+    private static string RenderBaselineVerificationCommandForHash(MultipassBaselineVerificationCommand cmd) =>
         string.Join("\u001f", new[]
         {
-            probe.AgentKind,
-            string.Join("\u001e", probe.Argv),
-            probe.FailureHint ?? string.Empty,
+            cmd.Label,
+            string.Join("\u001e", cmd.Argv),
+            cmd.FailureHint ?? string.Empty,
         });
 
     /// <inheritdoc/>
@@ -1617,35 +1617,35 @@ git push origin HEAD:{refName}";
         WorkItemId? workItemId,
         CancellationToken ct)
     {
-        if (opts.BaselineVerificationProbes.Count == 0)
+        if (opts.BaselineVerificationCommands.Count == 0)
             return;
 
-        for (var i = 0; i < opts.BaselineVerificationProbes.Count; i++)
+        for (var i = 0; i < opts.BaselineVerificationCommands.Count; i++)
         {
-            var probe = opts.BaselineVerificationProbes[i];
-            if (probe.Argv.Count == 0)
+            var check = opts.BaselineVerificationCommands[i];
+            if (check.Argv.Count == 0)
                 throw new InvalidOperationException(
-                    $"baseline verification probe {i + 1} for agent '{probe.AgentKind}' has empty argv");
+                    $"baseline verification command {i + 1} (label '{check.Label}') has empty argv");
 
             var argv = new List<string> { opts.MultipassBinary, "exec", baselineName, "--" };
-            argv.AddRange(probe.Argv);
+            argv.AddRange(check.Argv);
             _log.LogInformation(
-                "Baseline verification step {N}/{Total}: {Agent} ({Command})",
+                "Baseline verification step {N}/{Total}: {Label} ({Command})",
                 i + 1,
-                opts.BaselineVerificationProbes.Count,
-                probe.AgentKind,
-                string.Join(" ", probe.Argv));
+                opts.BaselineVerificationCommands.Count,
+                check.Label,
+                string.Join(" ", check.Argv));
 
             var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
             if (run.ExitCode != 0)
             {
                 ThrowIfProvisioningRetryExhausted("exec", run);
-                var hint = string.IsNullOrWhiteSpace(probe.FailureHint)
-                    ? "required agent binary not runnable on sandbox PATH"
-                    : probe.FailureHint;
+                var hint = string.IsNullOrWhiteSpace(check.FailureHint)
+                    ? "required baseline binary not runnable on sandbox PATH"
+                    : check.FailureHint;
                 throw new InvalidOperationException(
-                    $"baseline verification for agent '{probe.AgentKind}' failed (exit {run.ExitCode}): {hint}; " +
-                    $"argv: {string.Join(" ", probe.Argv)}; stderr: {DiagnosticText(run.Stderr)}; " +
+                    $"baseline verification command (label '{check.Label}') failed (exit {run.ExitCode}): {hint}; " +
+                    $"argv: {string.Join(" ", check.Argv)}; stderr: {DiagnosticText(run.Stderr)}; " +
                     $"stdout-tail: {DiagnosticText(Tail(run.Stdout, 1000))}");
             }
         }
@@ -3102,11 +3102,9 @@ test "$work" = present && test "$exec_wrapper" = present
             if (trimmed.StartsWith('#') || trimmed is "---" or "...")
                 continue;
 
-            var colon = trimmed.IndexOf(':', StringComparison.Ordinal);
-            if (colon <= 0)
+            if (!TryExtractTopLevelKey(trimmed, out var key))
                 continue;
 
-            var key = trimmed[..colon].Trim();
             if (key is "runcmd" or "write_files")
             {
                 throw new InvalidOperationException(
@@ -3115,6 +3113,42 @@ test "$work" = present && test "$exec_wrapper" = present
                     "MultipassExtraRuncmd instead.");
             }
         }
+    }
+
+    /// <summary>
+    /// Pulls the top-level YAML mapping key from <paramref name="trimmed"/> (a left-trimmed
+    /// line). Strips a single layer of double or single quotes so that the bare,
+    /// double-quoted (<c>"runcmd":</c>), and single-quoted (<c>'runcmd':</c>) spellings
+    /// all reduce to the same plain key before duplicate-block detection compares them.
+    /// Lines whose first quoted segment is not closed before the colon, or that have no
+    /// colon at all, are ignored (the duplicate check intentionally only flags plain
+    /// scalar keys — every cloud-init top-level block CodeyBox generates is one).
+    /// </summary>
+    private static bool TryExtractTopLevelKey(string trimmed, out string key)
+    {
+        key = string.Empty;
+        if (trimmed.Length == 0)
+            return false;
+
+        var first = trimmed[0];
+        if (first is '"' or '\'')
+        {
+            var close = trimmed.IndexOf(first, 1);
+            if (close <= 1)
+                return false;
+            var afterQuote = trimmed.AsSpan(close + 1).TrimStart();
+            if (afterQuote.Length == 0 || afterQuote[0] != ':')
+                return false;
+            key = trimmed.Substring(1, close - 1);
+            return true;
+        }
+
+        var colon = trimmed.IndexOf(':', StringComparison.Ordinal);
+        if (colon <= 0)
+            return false;
+
+        key = trimmed[..colon].Trim();
+        return key.Length > 0;
     }
 
     private static string BuildBaselineInstallManifest(IReadOnlyList<string> commands)
@@ -3852,8 +3886,16 @@ internal static class MultipassRetry
     }
 }
 
-public sealed record MultipassBaselineBinaryProbe(
-    string AgentKind,
+/// <summary>
+/// A provider-neutral baseline-bake validation command: a one-shot in-VM command the
+/// provider runs against a freshly-baked baseline before it is stopped and reused as a
+/// clone source. <see cref="Label"/> is a human-readable identifier used only in log lines
+/// and error messages; the provider does not interpret it. Mapping from agent (or any
+/// other producer) to validation command lives in the composition layer — this record
+/// keeps the sandbox infrastructure layer free of agent-catalog semantics.
+/// </summary>
+public sealed record MultipassBaselineVerificationCommand(
+    string Label,
     IReadOnlyList<string> Argv,
     string? FailureHint = null);
 
@@ -3890,11 +3932,14 @@ public sealed record MultipassSandboxOptions
 
     /// <summary>
     /// Commands that must pass inside a freshly baked baseline before it is
-    /// stopped and reused as a clone source. The API layer derives this from
-    /// configured AgentClass members, so enabling a CLI-backed agent fails the
-    /// bake immediately if its binary is missing from PATH.
+    /// stopped and reused as a clone source. The composition layer (e.g. the API)
+    /// is responsible for deciding what to validate; for the agent-CLI use case it
+    /// derives this list from configured AgentClass members so enabling a CLI-backed
+    /// agent fails the bake immediately if its binary is missing from PATH. The
+    /// sandbox layer itself only executes the commands and surfaces failures by
+    /// <see cref="MultipassBaselineVerificationCommand.Label"/>.
     /// </summary>
-    public IReadOnlyList<MultipassBaselineBinaryProbe> BaselineVerificationProbes { get; init; } = [];
+    public IReadOnlyList<MultipassBaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
 
     /// <summary>
     /// Extra cloud-init YAML appended after the orchestrator's own

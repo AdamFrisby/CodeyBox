@@ -6,7 +6,7 @@ namespace CodeyBox.Api;
 
 internal static class BaselineVerificationProbeBuilder
 {
-    public static IReadOnlyList<MultipassBaselineBinaryProbe> Build(
+    public static IReadOnlyList<MultipassBaselineVerificationCommand> Build(
         CodeyBoxOptions codeyBoxOptions,
         ProjectsOptions projectsOptions,
         IEnumerable<IInVmSmokeProbe> probes)
@@ -16,7 +16,7 @@ internal static class BaselineVerificationProbeBuilder
             return [];
 
         var probesByKind = probes.ToDictionary(p => p.Kind.Value, StringComparer.OrdinalIgnoreCase);
-        var result = new List<MultipassBaselineBinaryProbe>(configuredAgents.Count);
+        var result = new List<MultipassBaselineVerificationCommand>(configuredAgents.Count);
         foreach (var agent in configuredAgents)
         {
             if (!probesByKind.TryGetValue(agent, out var probe))
@@ -35,7 +35,11 @@ internal static class BaselineVerificationProbeBuilder
                     "its IInVmSmokeProbe has no credential-independent command.");
             }
 
-            result.Add(new MultipassBaselineBinaryProbe(agent, step.Argv, step.FailureHint));
+            // The agent name is used as the verification command's diagnostic label.
+            // The sandbox layer does not interpret the label — it is surfaced in log
+            // lines and error messages so an operator can map a bake failure back to
+            // the agent that contributed the command.
+            result.Add(new MultipassBaselineVerificationCommand(agent, step.Argv, step.FailureHint));
         }
 
         return result;

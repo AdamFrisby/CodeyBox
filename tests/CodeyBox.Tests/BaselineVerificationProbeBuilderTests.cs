@@ -64,7 +64,7 @@ public sealed class BaselineVerificationProbeBuilderTests
 
         var probes = BaselineVerificationProbeBuilder.Build(opts, projects, AllProbes());
 
-        var byAgent = probes.ToDictionary(p => p.AgentKind, StringComparer.OrdinalIgnoreCase);
+        var byAgent = probes.ToDictionary(p => p.Label, StringComparer.OrdinalIgnoreCase);
         Assert.Equal(
             [
                 AgentKind.Claude.Value,
@@ -75,7 +75,7 @@ public sealed class BaselineVerificationProbeBuilderTests
                 AgentKind.Antigravity.Value,
                 AgentKind.Copilot.Value,
             ],
-            probes.Select(p => p.AgentKind));
+            probes.Select(p => p.Label));
         Assert.Equal([AntigravityAgentRunner.DefaultBinary, "--version"], byAgent[AgentKind.Antigravity.Value].Argv);
         Assert.Equal([CodexAgentRunner.DefaultBinary, "--version"], byAgent[AgentKind.Codex.Value].Argv);
         Assert.Equal([GeminiAgentRunner.DefaultBinary, "--version"], byAgent[AgentKind.Gemini.Value].Argv);

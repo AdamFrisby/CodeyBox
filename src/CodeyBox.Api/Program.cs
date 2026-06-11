@@ -416,7 +416,7 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
             var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
             var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
-            var baselineVerificationProbes = BaselineVerificationProbeBuilder.Build(
+            var baselineVerificationCommands = BaselineVerificationProbeBuilder.Build(
                 live,
                 projects,
                 sp.GetServices<IInVmSmokeProbe>());
@@ -424,7 +424,7 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
                 ExtraRuncmd = live.MultipassExtraRuncmd,
-                BaselineVerificationProbes = baselineVerificationProbes,
+                BaselineVerificationCommands = baselineVerificationCommands,
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
