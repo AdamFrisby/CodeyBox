@@ -18,9 +18,9 @@ public interface IAgentAuthFailureClassifier
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
-    /// the evidence. Runtime breaker policy uses this to avoid mutating global
-    /// availability from stdout-only, model-controlled text unless a separate
-    /// non-model-controlled check corroborates it.
+    /// the evidence. Runtime breaker policy uses this to distinguish stderr,
+    /// trusted stdout transcripts, and operator-configured stdout patterns from
+    /// untrusted model-controlled stdout text.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -29,9 +29,12 @@ public sealed record AgentAuthFailureDetection(
     AgentFailureClassification Classification,
     bool MatchedStderr,
     bool MatchedStdout,
-    bool MatchedTrustedStdoutTranscript)
+    bool MatchedTrustedStdoutTranscript,
+    bool MatchedConfiguredStdoutPattern = false)
 {
     public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
+    public bool HasAuthoritativeStdoutEvidence =>
+        MatchedTrustedStdoutTranscript || MatchedConfiguredStdoutPattern;
 }
 
 public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
@@ -63,11 +66,22 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return null;
 
-        var patterns = PatternsFor(kind).ToArray();
         var matchedStderr = false;
-        var matchedStdout = false;
+        var matchedConfiguredStdout = false;
 
-        foreach (var pattern in patterns)
+        foreach (var pattern in DefaultPatterns)
+        {
+            if (string.IsNullOrWhiteSpace(pattern.Pattern))
+                continue;
+
+            if (!string.IsNullOrEmpty(stderr)
+                && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedStderr = true;
+            }
+        }
+
+        foreach (var pattern in AdditionalPatternsFor(kind))
         {
             if (string.IsNullOrWhiteSpace(pattern.Pattern))
                 continue;
@@ -81,12 +95,12 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             if (!string.IsNullOrEmpty(stdout)
                 && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
-                matchedStdout = true;
+                matchedConfiguredStdout = true;
             }
         }
 
         var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
-        matchedStdout |= matchedTrustedStdoutTranscript;
+        var matchedStdout = matchedConfiguredStdout || matchedTrustedStdoutTranscript;
 
         if (matchedStderr || matchedStdout)
         {
@@ -99,17 +113,15 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
                     Reason: $"auth/login prompt pattern matched in {source}"),
                 matchedStderr,
                 matchedStdout,
-                matchedTrustedStdoutTranscript);
+                matchedTrustedStdoutTranscript,
+                matchedConfiguredStdout);
         }
 
         return null;
     }
 
-    private IEnumerable<AuthFailurePattern> PatternsFor(AgentKind kind)
+    private IEnumerable<AuthFailurePattern> AdditionalPatternsFor(AgentKind kind)
     {
-        foreach (var pattern in DefaultPatterns)
-            yield return pattern;
-
         if (_additionalPatternsByAgent.TryGetValue(kind.Value, out var exact))
         {
             foreach (var pattern in exact)

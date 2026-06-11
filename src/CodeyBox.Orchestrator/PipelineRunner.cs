@@ -5263,8 +5263,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // AuthRequired is intentionally outside the smoke-gate taxonomy:
             // if the operator disables the master smoke switch
             // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
-            // exclusions are ignored at dispatch — but a corroborated runtime
-            // login prompt is authoritative evidence the binary is broken, so
+            // exclusions are ignored at dispatch — but authoritative runtime
+            // login-prompt evidence means the binary is broken, so
             // AuthRequired survives the smoke-disabled gate via
             // AgentAvailabilityRegistry.IsNonSmokeExclusion.
             var transition = _authAvailability?.MarkAuthRequired(agent, reason);
@@ -5305,6 +5305,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (!detection.IsStdoutOnly)
+            return true;
+
+        if (detection.HasAuthoritativeStdoutEvidence)
             return true;
 
         if (_authCorroborationHostSmoke is not null)

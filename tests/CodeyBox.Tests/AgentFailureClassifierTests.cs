@@ -124,10 +124,30 @@ public sealed class AgentFailureClassifierTests
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
-        var c = new AgentAuthFailureClassifier().Detect(AgentKind.Antigravity, stderr: null, stdout: transcript);
+        var detection = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: transcript);
 
-        Assert.NotNull(c);
-        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.NotNull(detection);
+        Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
+        Assert.True(detection.IsStdoutOnly);
+        Assert.True(detection.MatchedTrustedStdoutTranscript);
+    }
+
+    [Theory]
+    [InlineData("Use https://accounts.google.com/o/oauth2/auth when implementing Google sign-in.")]
+    [InlineData("The OAuth callback endpoint is http://localhost:3000/oauth-callback.")]
+    [InlineData("Waiting for authentication to complete before issuing the JWT.")]
+    [InlineData("The login test should assert that authentication timed out is shown to the user.")]
+    public void AgentAuthFailureClassifier_DefaultPatterns_DoNotMatchGenericStdout(string snippet)
+    {
+        var hit = new AgentAuthFailureClassifier().DetectDetailed(
+            AgentKind.Antigravity,
+            stderr: null,
+            stdout: snippet);
+
+        Assert.Null(hit);
     }
 
     [Fact]
@@ -160,6 +180,7 @@ public sealed class AgentFailureClassifierTests
         Assert.NotNull(hit);
         Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
         Assert.True(hit.IsStdoutOnly);
+        Assert.True(hit.MatchedConfiguredStdoutPattern);
         Assert.Null(classifier.Detect(
             AgentKind.Codex,
             stderr: null,

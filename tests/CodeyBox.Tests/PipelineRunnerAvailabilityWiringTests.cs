@@ -423,7 +423,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task SuccessfulNoDiffRun_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
+        using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -504,7 +504,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // re-classifies AuthRequired as a smoke source fails this test.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
-        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, authCorroborationHostSmoke: PersistentAuthSmoke());
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -532,7 +532,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
-        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions, authCorroborationHostSmoke: PersistentAuthSmoke());
+        using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
         fix.Registry.MarkSmokeResult(
             AgentKind.Codex,
             new AgentSmokeResult(false, "host probe already failed", TimeSpan.Zero, SmokeFailureCategory.Persistent),
@@ -571,7 +571,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // phase-name detector call there can't pass off the work-phase test
         // as full coverage.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
+        using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -613,7 +613,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task MergePhaseAgenticResolver_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: PersistentAuthSmoke());
+        using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -677,7 +677,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_FailsItemButDoesNotExcludeAgent()
+    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -699,8 +699,14 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
 
-        Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var availability = fix.Registry.GetAvailability(AgentKind.Codex);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
