@@ -258,7 +258,7 @@ public sealed class CodexAgentRunnerTests
             });
         var handler = new CapturingCodexHandler(HttpStatusCode.Unauthorized,
             """{"error":{"message":"placeholder rejected"}}""");
-        var runner = new CodexAgentRunner(defaults, new HttpClient(handler));
+        var runner = new CodexAgentRunner(defaults, networkTolerance: null, textOnlyHttp: new HttpClient(handler));
         var cred = new AgentCredential(AgentKind.Codex,
             new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
             new Dictionary<string, string>());
