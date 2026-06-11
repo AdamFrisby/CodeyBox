@@ -133,7 +133,16 @@ public sealed class StreamAnalysisService : BackgroundService
         if (stream is null)
             return null;
 
-        var fallback = new UnknownAgentStreamParser();
+        // Reuse the registered unknown parser so the fallback path stays
+        // replaceable via DI (an operator can swap in a richer plaintext
+        // summariser without touching this service). Fall back to the
+        // in-process implementation only when the unknown parser was not
+        // registered — keeps the test wiring (which constructs a minimal
+        // parser list) working without forcing every caller to add the
+        // unknown parser.
+        var fallback = _parsers.Values.OfType<IAgentStreamParserWithContext>()
+            .FirstOrDefault(p => p.Kind.Value == "unknown")
+            ?? (IAgentStreamParserWithContext)new UnknownAgentStreamParser();
         return await fallback.ParseAsync(stream, context, ct).ConfigureAwait(false);
     }
 

@@ -1074,32 +1074,64 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 }
 
 public sealed class AgentStreamParserProductionRegistrationTests
+    : IClassFixture<AgentStreamAnalysisApiFactory>
 {
+    private readonly AgentStreamAnalysisApiFactory _factory;
+
+    public AgentStreamParserProductionRegistrationTests(AgentStreamAnalysisApiFactory factory)
+        => _factory = factory;
+
     /// <summary>
-    /// Mirrors the production order from Program.cs so the test sees the same
-    /// sniff outcome real dispatches do.
+    /// Resolve the IAgentStreamParser collection from the running production
+    /// DI container. The whole point of the rework was the DI registration
+    /// itself — if Program.cs forgot to register
+    /// AntigravityStreamParser/CursorStreamParser/OpencodeStreamParser the
+    /// real service container would not surface them, and the runtime
+    /// fallback to UnknownAgentStreamParser would still apply. Building a
+    /// hand-rolled list "that mirrors Program.cs" cannot catch that
+    /// regression; resolving from the real container does.
     /// </summary>
-    private static IReadOnlyList<IAgentStreamParser> ProductionOrder() =>
-    [
-        new AntigravityStreamParser(),
-        new ClaudeStreamParser(),
-        new CodexStreamParser(),
-        new CursorStreamParser(),
-        new GeminiStreamParser(),
-        new OpencodeStreamParser(),
-        new UnknownAgentStreamParser(),
-    ];
+    private IReadOnlyList<IAgentStreamParser> ResolvedFromProductionContainer()
+    {
+        using var scope = _factory.Services.CreateScope();
+        return scope.ServiceProvider
+            .GetServices<IAgentStreamParser>()
+            .ToList();
+    }
+
+    [Fact]
+    public void DiContainer_RegistersParserForEveryProductionAgentKind()
+    {
+        // Anti-regression: the rework's acceptance criterion was that every
+        // dispatched agent kind has a parser registered in DI. A missing
+        // registration is the failure mode that put antigravity/cursor/
+        // opencode in the unknown bucket pre-fix.
+        var resolved = ResolvedFromProductionContainer();
+        var resolvedKinds = resolved.Select(p => p.Kind).ToHashSet();
+        Assert.Contains(AgentKind.Antigravity, resolvedKinds);
+        Assert.Contains(AgentKind.Claude, resolvedKinds);
+        Assert.Contains(AgentKind.Codex, resolvedKinds);
+        Assert.Contains(AgentKind.Cursor, resolvedKinds);
+        Assert.Contains(AgentKind.Gemini, resolvedKinds);
+        Assert.Contains(AgentKind.Opencode, resolvedKinds);
+        // Unknown fallback is the residual catch-all for kinds we don't
+        // register — must stay present so plaintext-fallback continues to
+        // operate.
+        Assert.Contains(resolved, p => p.Kind.Value == "unknown");
+    }
 
     [Fact]
     public async Task SniffKindAsync_ClaudeShape_AttributesToClaudeNotAntigravityOrCursor()
     {
         // Real Claude stream-json includes message.model = "claude-..." and
         // usage.cache_read_input_tokens. Pre-fix this routed to Antigravity
-        // (registered first). It must now route to Claude.
+        // (registered first). It must now route to Claude even when the
+        // parser list comes from the real DI container.
         await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
             {"type":"assistant","message":{"id":"msg_01","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20}}}
             """));
-        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrder());
+        var kind = await AgentStreamParserSelection.SniffKindAsync(
+            stream, ResolvedFromProductionContainer());
         Assert.Equal(AgentKind.Claude, kind);
     }
 }
@@ -1149,6 +1181,129 @@ public sealed class AgentStreamParserSelectionTests
             new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Claude, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_CursorWorkPhase_OverridesSharedShapeSniffWithItemAgent()
+    {
+        // Anti-regression for the core finding: a cursor work item whose
+        // structured stream-json is byte-identical to Claude (cursor's CLI
+        // emits the literal Claude shape) must NOT be attributed to claude
+        // just because ClaudeStreamParser claimed the shape. WorkItem.Agent
+        // is the authoritative work-phase dispatch record, so it overrides
+        // the shape-based sniff. Pre-fix, ResolveKind returned the sniffed
+        // kind first and persisted these runs under agent_kind=claude —
+        // exactly the bug the rework was meant to close.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "cursor work",
+            Prompt = "cursor work",
+            Agent = AgentKind.Cursor,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Claude,
+            costs: [],
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Cursor, AgentKind.Antigravity });
+
+        Assert.Equal(AgentKind.Cursor, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AntigravityCostRow_OverridesSharedShapeSniff()
+    {
+        // Same shape, different vehicle: antigravity gateway runs through a
+        // claude-* model emit literal claude stream-json, but the work_item_costs
+        // row records the dispatched agy run. The cost-row branch lands the
+        // summary under agent_kind=antigravity regardless of what the sniffer
+        // claimed by shape.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "agy work",
+            Prompt = "agy work",
+            Agent = AgentKind.Antigravity,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "work",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = DateTimeOffset.UtcNow,
+                EndedAt = DateTimeOffset.UtcNow,
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Claude,
+            costs,
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Cursor, AgentKind.Antigravity });
+
+        Assert.Equal(AgentKind.Antigravity, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AuditPhase_PrefersSniffOverWorkItemAgent()
+    {
+        // Audit phases run a different auditor agent than the work phase,
+        // so WorkItem.Agent is NOT authoritative for the audit-* phase. The
+        // sniff catches the auditor's parser shape (codex/claude/gemini),
+        // overriding the work agent — keeps the existing
+        // "audit was dispatched to codex" attribution path working.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "claude work, codex audit",
+            Prompt = "claude work, codex audit",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "audit-llm-security:llm-review-1-abcdef.jsonl",
+            "audit-llm-security:llm-review",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs: [],
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Cursor });
+
+        Assert.Equal(AgentKind.Codex, kind);
     }
 
     [Fact]
@@ -1403,6 +1558,41 @@ public sealed class OnDemandAnalysisEndpointTests
 
         Assert.Equal(0, factory.Streams.ListRequestCount);
         Assert.DoesNotContain(true, factory.Streams.IncludeLineCountRequests);
+    }
+
+    [Fact]
+    public async Task AnalyzeFile_PlaintextCapture_ReturnsFallbackTailInsteadOfUnsupported()
+    {
+        // Anti-regression: the on-demand endpoint must run the plaintext
+        // fallback when the dispatched-kind parser fails to recognise any
+        // events — same shape StreamAnalysisService does for the persisted
+        // summary path. Pre-fix, the endpoint returned kind=unknown with an
+        // Unsupported summary for plaintext opencode/cursor/antigravity
+        // captures, defeating the post-mortem inspection path even though
+        // the background summariser was fixed.
+        using var factory = new AgentStreamAnalysisApiFactory();
+        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done)
+            with { Agent = AgentKind.Opencode };
+        await factory.Store.CreateAsync(item);
+        const string fileName = "work-1-abcdef.jsonl";
+        factory.WriteStreamFile(item.Id, fileName,
+            "starting opencode run\n"
+            + "applying patch to plaintext.txt\n"
+            + "ERROR: compile failed\n"
+            + "done after 9.1s\n");
+
+        var client = factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
+        resp.EnsureSuccessStatusCode();
+
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("opencode", body.GetProperty("agentKind").GetString());
+        var final = body.GetProperty("finalAssistantMessage").GetString();
+        Assert.NotNull(final);
+        Assert.Contains("plaintext-fallback", final);
+        Assert.Contains("lines=4", final);
+        Assert.Contains("errors=1", final);
+        Assert.Contains("done after 9.1s", final);
     }
 }
 

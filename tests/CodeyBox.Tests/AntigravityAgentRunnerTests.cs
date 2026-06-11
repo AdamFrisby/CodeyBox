@@ -192,6 +192,70 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_WhenCaptureStructuredStreamTrue_AppendsOutputFormatStreamJson()
+    {
+        // PipelineRunner only sets captureStructuredStream=true after
+        // SupportsStructuredStreamAsync confirmed `agy --help` advertises the
+        // flag. The runner must then ask for stream-json so the captured
+        // .jsonl is structured (and AntigravityStreamParser /
+        // AntigravityCostExtractor can decode it). A regression that dropped
+        // --output-format / stream-json would silently downgrade the run to
+        // plaintext-fallback capture — invisible to the new parser tests,
+        // which hand-write the NDJSON themselves.
+        var sandbox = new CapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: true);
+
+        var argv = sandbox.CapturedExec!.Argv;
+        var formatIdx = IndexOf(argv, "--output-format");
+        Assert.True(formatIdx >= 0, "expected --output-format in argv when captureStructuredStream=true");
+        Assert.Equal("stream-json", argv[formatIdx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenCaptureStructuredStreamFalse_OmitsOutputFormatStreamJson()
+    {
+        // Plaintext-capture path: SupportsStructuredStreamAsync said no (older
+        // agy without the flag, or help-text probe failed), so the runner must
+        // NOT pass --output-format. Passing it on a CLI that doesn't recognise
+        // it bombs the run with "unknown option" — exactly the cascade the
+        // gated capability check was added to prevent.
+        var sandbox = new CapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: false);
+
+        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("stream-json", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_DoesNotRequestStructuredStream()
+    {
+        // Resume turns deliberately drop captureStructuredStream — see
+        // CliAgentRunnerBase.RunResumedAsync wiring. Verify the resume argv
+        // never carries the flag even when SupportsStructuredStreamAsync would
+        // have said yes, so a resumed agy run doesn't introduce a
+        // capture-format change mid-conversation.
+        var sandbox = new CapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        var resume = new AgentResumeContext(
+            CheckpointRef: "agy-conversation:conv-7",
+            ScratchpadArchivePath: "/nonexistent/.codeybox/preempt-scratchpad.tgz");
+
+        await runner.RunResumedAsync(sandbox, "/work", "next turn", credential: null, resume);
+
+        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("stream-json", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
     public async Task RunAsync_PrepHookFails_PropagatesAsAgentFailure()
     {
         // If the sandbox can't write the creds file (chmod / quota / read-only

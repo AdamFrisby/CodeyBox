@@ -101,8 +101,26 @@ internal static class AgentStreamEndpoints
             var rowKind = parser.Kind;
             if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
             {
-                rowKind = new AgentKind("unknown");
-                summary = AgentStreamParserSelection.UnsupportedSummary();
+                // Mirror StreamAnalysisService: re-open the capture file and
+                // run it through the plaintext-fallback parser so the
+                // on-demand inspector returns the same tail/error-line tail
+                // the persisted summary would. Without this, plaintext
+                // opencode/cursor/antigravity captures requested through this
+                // endpoint show no context at all — re-creating the
+                // observability black hole the rework was meant to close.
+                var fallback = await RunPlaintextFallbackAsync(
+                    streams, item.Id, fileName, context, parsers, analysisCt);
+                if (fallback is not null)
+                {
+                    summary = fallback;
+                    // Keep the originally-resolved kind so dashboards still
+                    // attribute the run to the right agent.
+                }
+                else
+                {
+                    rowKind = new AgentKind("unknown");
+                    summary = AgentStreamParserSelection.UnsupportedSummary();
+                }
             }
             return Results.Ok(ToSummaryDto(summary, fileName, file.Phase, file.Iteration, rowKind));
         }
@@ -138,6 +156,27 @@ internal static class AgentStreamEndpoints
         await foreach (var row in summaries.StreamRecentCompletedAsync(Math.Clamp(n ?? 50, 1, 500), ct))
             rows.Add(row);
         return Results.Ok(ToAggregateDto(AgentStreamAnalytics.Aggregate(null, rows), rows, includeInvocations: false));
+    }
+
+    private static async Task<AgentStreamSummary?> RunPlaintextFallbackAsync(
+        IAgentStreamStore streams,
+        WorkItemId id,
+        string fileName,
+        AgentStreamParserContext? context,
+        IEnumerable<IAgentStreamParser> parsers,
+        CancellationToken ct)
+    {
+        await using var stream = await streams.OpenReadAsync(id, fileName, ct);
+        if (stream is null)
+            return null;
+
+        // Reuse the registered unknown parser so the plaintext fallback path
+        // exercises the same code path the orchestrator does (and stays
+        // replaceable via DI rather than coupling to a concrete construction).
+        var fallback = parsers.OfType<IAgentStreamParserWithContext>()
+            .FirstOrDefault(p => p.Kind.Value == "unknown")
+            ?? (IAgentStreamParserWithContext)new UnknownAgentStreamParser();
+        return await fallback.ParseAsync(stream, context, ct);
     }
 
     private static async Task<(WorkItem? item, IResult? error)> ResolveWorkItemAsync(

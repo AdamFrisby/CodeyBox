@@ -210,6 +210,57 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
     }
 
     [Fact]
+    public async Task PipelineRunner_WhenStructuredStreamUnsupported_StillOpensCaptureFileForPlaintextFallback()
+    {
+        // Anti-regression: a previous condition only opened the
+        // AgentStreamStore capture file when CanCaptureStructuredStreamAsync
+        // returned true, which left plaintext agents (opencode, agy without
+        // --output-format stream-json) with zero captured files and therefore
+        // zero summary rows. The fix lifted the capture open to "agent
+        // streams enabled" — verify it here so a regressing edit (restoring
+        // `streamCapture = canCaptureStructuredStream ? Begin... : null`) is
+        // caught at the production code path, not just via the
+        // StreamAnalysisService parser-fallback tests.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Path = Path.Combine(_workspace, "streams-plaintext") },
+            NullLogger<AgentStreamStore>.Instance);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, agentStreams: streamStore);
+        tp.Agent.StructuredStreamSupportResult = false;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("plaintext.txt", "plaintext\n"));
+        // Plaintext stdout — no JSON framing, like a real opencode/agy run.
+        tp.Agent.StdoutChunks.Enqueue("starting opencode run\n");
+        tp.Agent.StdoutChunks.Enqueue("applied patch to plaintext.txt\n");
+        tp.Agent.StdoutChunks.Enqueue("done after 12.7s\n");
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "plaintext capture",
+            Prompt = "write a file",
+            WorkBranch = "feature/plaintext-capture",
+            State = WorkItemState.Queued,
+            WorkTimeout = TimeSpan.FromMinutes(5),
+            MergeTimeout = TimeSpan.FromMinutes(5),
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // The agent was not asked to emit structured stream-json on any
+        // dispatch (work + merge both go through the same agent in this
+        // pipeline), but the capture files must still exist with the
+        // plaintext stdout teed in.
+        Assert.NotEmpty(tp.Agent.CaptureStructuredStreamCalls);
+        Assert.All(tp.Agent.CaptureStructuredStreamCalls, Assert.False);
+        var workFile = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "work");
+        var contents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
+        Assert.Contains("starting opencode run", contents);
+        Assert.Contains("done after 12.7s", contents);
+    }
+
+    [Fact]
     public async Task PipelineRunner_WhenAgentStreamsDisabled_DoesNotProbeStructuredCapture()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

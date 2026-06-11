@@ -118,16 +118,22 @@ public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
                 }
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (IOException)
         {
-            // Caller asked us to stop — propagate so cancellation is observable
-            // rather than silently returning a partial summary.
-            throw;
+            // Narrow, explicitly-recoverable read failure: an in-flight capture
+            // file may have been truncated, rotated, or briefly contended.
+            // Persist the partial tail we already collected so the
+            // observability path is never blind — but do NOT swallow
+            // arbitrary exceptions (OperationCanceledException flows up,
+            // UnauthorizedAccessException / OutOfMemoryException / etc. must
+            // surface and let the sweep fail/retry rather than silently
+            // producing a "successful" summary from a real bug.
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (System.Text.DecoderFallbackException)
         {
-            // Best-effort plaintext read; persist whatever we already collected
-            // rather than failing the analysis sweep on a stream-IO hiccup.
+            // Malformed UTF-8 in a plaintext agent stream — agy / opencode may
+            // emit terminal escapes or partial bytes when killed mid-write.
+            // Same recovery shape as the IO branch above.
         }
 
         // Prefer the caller-supplied accounting (which sees the full on-disk

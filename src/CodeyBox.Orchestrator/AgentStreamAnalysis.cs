@@ -90,11 +90,26 @@ public static class AgentStreamParserSelection
 
     /// <summary>
     /// Resolves the canonical <see cref="AgentKind"/> for a stream file using
-    /// (in order) the sniffed kind, recorded cost rows, and the work item's
-    /// declared agent. Only kinds present in <paramref name="knownKinds"/> are
-    /// canonicalised — anything else falls through to "unknown". Callers should
-    /// pass the kinds of their registered <see cref="IAgentStreamParser"/>s so
-    /// adding a new provider library is purely additive.
+    /// (in priority order):
+    ///   1. the phase-matched cost row (authoritative dispatch metadata),
+    ///   2. <see cref="WorkItem.Agent"/> when <paramref name="file"/> is a
+    ///      work/rework/merge phase that was dispatched to that agent,
+    ///   3. the sniffed parser kind,
+    ///   4. <see cref="WorkItem.Agent"/> as the last-resort fallback.
+    /// Authoritative dispatch metadata wins over a shape-based sniff because
+    /// several agent CLIs (cursor, antigravity) emit NDJSON byte-identical
+    /// to Claude / Gemini stream-json — their parsers deliberately do not
+    /// claim by shape, so a cursor or antigravity stream would otherwise be
+    /// sniffed as claude/gemini and persisted under the wrong
+    /// <c>agent_kind</c>. The work-phase override only applies when
+    /// <see cref="WorkItem.Agent"/> matches the dispatched work runner
+    /// (work/rework/merge phases); audit phases run a different auditor
+    /// agent and must continue to defer to the cost row or, in its absence,
+    /// the sniffed kind. Only kinds present in <paramref name="knownKinds"/>
+    /// are canonicalised — anything else falls through to "unknown".
+    /// Callers should pass the kinds of their registered
+    /// <see cref="IAgentStreamParser"/>s so adding a new provider library
+    /// is purely additive.
     /// </summary>
     public static AgentKind ResolveKind(
         WorkItem item,
@@ -105,9 +120,6 @@ public static class AgentStreamParserSelection
     {
         ArgumentNullException.ThrowIfNull(knownKinds);
         var known = knownKinds as IReadOnlyCollection<AgentKind> ?? knownKinds.ToList();
-
-        if (sniffedKind is not null)
-            return Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
 
         foreach (var cost in costs
                      .Where(c => string.Equals(c.WorkItemId, item.Id.ToString(), StringComparison.OrdinalIgnoreCase))
@@ -120,11 +132,26 @@ public static class AgentStreamParserSelection
                 return costKind;
         }
 
-        if (item.Agent.HasValue && Canonicalize(item.Agent.Value, known) is { } itemKind)
+        var workItemKind = item.Agent.HasValue ? Canonicalize(item.Agent.Value, known) : null;
+        if (workItemKind is { } itemKindForDispatchedPhase
+            && IsDispatchedWorkPhase(file.Phase))
+        {
+            return itemKindForDispatchedPhase;
+        }
+
+        if (sniffedKind is not null)
+            return Canonicalize(sniffedKind.Value, known) ?? sniffedKind.Value;
+
+        if (workItemKind is { } itemKind)
             return itemKind;
 
         return new AgentKind("unknown");
     }
+
+    private static bool IsDispatchedWorkPhase(string phase) =>
+        string.Equals(phase, "work", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(phase, "rework", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(phase, "merge", StringComparison.OrdinalIgnoreCase);
 
     public static bool ShouldTreatAsUnsupported(AgentKind kind, AgentStreamSummary summary)
     {
