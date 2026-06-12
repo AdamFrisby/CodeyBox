@@ -225,6 +225,75 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_RunnerThrows_AssignsMetadata()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var exception = new InvalidOperationException("agent CLI exploded");
+        var runner = new FakeAgentResolverRunner(_ =>
+            throw exception)
+        { Kind = new AgentKind("throwing-agent") };
+        var cred = new AgentCredential(new AgentKind("throwing-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, cred)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(cred, result.FailureCredential);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.False(classificationResult.Success);
+        Assert.Contains("threw InvalidOperationException", classificationResult.Summary);
+        Assert.Contains("agent CLI exploded", classificationResult.Summary);
+        Assert.Equal(exception.ToString(), classificationResult.Stderr);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_FailureClassificationResult_VerificationFails_AssignsMetadata()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            // Agent claims success, but leaves conflict markers in the file so verification fails.
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "agent thought it resolved", "stdout text", "stderr text");
+        })
+        { Kind = new AgentKind("lying-agent") };
+        var cred = new AgentCredential(new AgentKind("lying-agent"), new Dictionary<string, string>(), new Dictionary<string, string>());
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, cred)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(cred, result.FailureCredential);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.False(classificationResult.Success);
+        Assert.Contains("conflict markers remain", classificationResult.Summary);
+        Assert.Equal("stdout text", classificationResult.Stdout);
+        Assert.Equal("stderr text", classificationResult.Stderr);
+    }
+
+    [Fact]
     public async Task ResolveAsync_NoConflicts_ReturnsTriviallySuccessful()
     {
         var sandbox = new ConflictSandbox();
