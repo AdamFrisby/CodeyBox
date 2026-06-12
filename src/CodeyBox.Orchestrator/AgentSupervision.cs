@@ -15,6 +15,21 @@ public sealed class AgentSupervisionOptions
     public int CompletedSessionRetentionSeconds { get; set; } = 300;
     public int MaxSessions { get; set; } = 512;
 
+    /// <summary>
+    /// Hard upper bound enforced regardless of operator config so a permissive
+    /// MaxSessions can't turn a listing call into an unbounded memory hog.
+    /// </summary>
+    public const int MaxSessionsCeiling = 4096;
+
+    /// <summary>How many recent CodeyBox commands to retain on each session for late-join review.</summary>
+    public int RetainedCommandsPerSession { get; set; } = 32;
+
+    /// <summary>Default page size for /agent-supervision/sessions.</summary>
+    public int DefaultListPageSize { get; set; } = 64;
+
+    /// <summary>Hard cap on the per-request page size (operator overrides clamp to this).</summary>
+    public int MaxListPageSize { get; set; } = 256;
+
     public void Validate()
     {
         if (MaxPromptChars < 1024)
@@ -29,6 +44,14 @@ public sealed class AgentSupervisionOptions
             throw new InvalidOperationException("CodeyBox:AgentSupervision:CompletedSessionRetentionSeconds must be >= 0");
         if (MaxSessions < 1)
             throw new InvalidOperationException("CodeyBox:AgentSupervision:MaxSessions must be >= 1");
+        if (MaxSessions > MaxSessionsCeiling)
+            throw new InvalidOperationException($"CodeyBox:AgentSupervision:MaxSessions must be <= {MaxSessionsCeiling}");
+        if (RetainedCommandsPerSession < 0)
+            throw new InvalidOperationException("CodeyBox:AgentSupervision:RetainedCommandsPerSession must be >= 0");
+        if (DefaultListPageSize < 1)
+            throw new InvalidOperationException("CodeyBox:AgentSupervision:DefaultListPageSize must be >= 1");
+        if (MaxListPageSize < DefaultListPageSize)
+            throw new InvalidOperationException("CodeyBox:AgentSupervision:MaxListPageSize must be >= DefaultListPageSize");
     }
 }
 
@@ -36,15 +59,45 @@ public interface IAgentSupervisionService
 {
     bool Enabled { get; }
 
-    Task<AgentSupervisionSessionScope?> TryStartSessionAsync(
+    Task<IAgentSupervisionSession?> TryStartSessionAsync(
         AgentSupervisionSessionStart start,
         CancellationToken ct = default);
 
-    Task<IReadOnlyList<AgentSupervisionSessionSnapshot>> ListSessionsAsync(CancellationToken ct = default);
+    Task<AgentSupervisionSessionPage> ListSessionsAsync(
+        AgentSupervisionListQuery query,
+        CancellationToken ct = default);
 
     Task<AgentSupervisionInjectionReceipt> EnqueueInjectionAsync(
         string sessionId,
         AgentSupervisionInjectionRequest request,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// Caller-facing supervision-session contract. Hides the queue-drain internals
+/// of <see cref="AgentSupervisionService"/>; callers depend on the behaviour
+/// (running pending injections through their own runner-dispatch delegate) not
+/// the underlying state machine.
+/// </summary>
+public interface IAgentSupervisionSession : IAsyncDisposable
+{
+    string SessionId { get; }
+    Action<string>? WrapStdoutCallback(Action<string>? inner);
+    Task PublishCodeyBoxCommandAsync(string kind, string prompt, string? injectionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Drains queued human injections by formatting each as a follow-up
+    /// agent prompt and delegating dispatch to <paramref name="runTurnAsync"/>.
+    /// The delegate is responsible for any prompt preprocessing AND for
+    /// routing through the session-capable runner abstraction
+    /// (<see cref="ISessionAgentRunner"/>) so injections preserve
+    /// resumable-session and thinking-block invariants. The session lifecycle
+    /// events (started/completed, audit-log entries, notifier callbacks) are
+    /// managed inside this method.
+    /// </summary>
+    Task<AgentResult> RunPendingInjectionsAsync(
+        AgentResult current,
+        Func<AgentSupervisionInjectionTurn, CancellationToken, Task<AgentResult>> runTurnAsync,
         CancellationToken ct = default);
 }
 
@@ -106,7 +159,29 @@ public sealed record AgentSupervisionSessionSnapshot(
     string State,
     bool AcceptingInjections,
     int PendingInjections,
-    string OutputTail);
+    string OutputTail,
+    IReadOnlyList<AgentSupervisionCommandRecord> RecentCommands);
+
+/// <summary>Persisted CodeyBox command record exposed to late-joining supervisors.</summary>
+public sealed record AgentSupervisionCommandRecord(
+    string Kind,
+    string? InjectionId,
+    DateTimeOffset SentAt,
+    string Prompt);
+
+public sealed record AgentSupervisionListQuery(
+    int? Skip = null,
+    int? Take = null,
+    bool IncludeOutputTail = true,
+    int? OutputTailMaxChars = null,
+    int? RecentCommandsLimit = null);
+
+public sealed record AgentSupervisionSessionPage(
+    bool Enabled,
+    int Total,
+    int Skip,
+    int Take,
+    IReadOnlyList<AgentSupervisionSessionSnapshot> Sessions);
 
 public sealed record AgentSupervisionCommandEvent(
     string SessionId,
@@ -164,6 +239,15 @@ public sealed record AgentSupervisionInjectionCompletedEvent(
     bool Success,
     string Summary);
 
+/// <summary>
+/// Payload supplied to the injection-turn delegate. Carries both the queued
+/// injection record and the pre-formatted prompt so callers can apply their
+/// own prompt-preprocessor chain before dispatching the turn.
+/// </summary>
+public sealed record AgentSupervisionInjectionTurn(
+    AgentSupervisionInjection Injection,
+    string Prompt);
+
 public sealed class AgentSupervisionService : IAgentSupervisionService
 {
     private readonly Func<AgentSupervisionOptions> _optionsAccessor;
@@ -183,7 +267,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
 
     public bool Enabled => CurrentOptions().Enabled;
 
-    public async Task<AgentSupervisionSessionScope?> TryStartSessionAsync(
+    public async Task<IAgentSupervisionSession?> TryStartSessionAsync(
         AgentSupervisionSessionStart start,
         CancellationToken ct = default)
     {
@@ -204,24 +288,43 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
         }
 
         var sessionId = "ags-" + Guid.NewGuid().ToString("N");
-        var state = new AgentSupervisionSessionState(sessionId, start, options.MaxOutputBufferChars);
+        var state = new AgentSupervisionSessionState(sessionId, start, options.MaxOutputBufferChars, options.RetainedCommandsPerSession);
         _sessions[sessionId] = state;
-        await SafeNotifyAsync(n => n.SessionStartedAsync(BuildSnapshot(state), ct)).ConfigureAwait(false);
+        await SafeNotifyAsync(n => n.SessionStartedAsync(BuildSnapshot(state, options), ct)).ConfigureAwait(false);
         return new AgentSupervisionSessionScope(this, state);
     }
 
-    public Task<IReadOnlyList<AgentSupervisionSessionSnapshot>> ListSessionsAsync(CancellationToken ct = default)
+    public Task<AgentSupervisionSessionPage> ListSessionsAsync(
+        AgentSupervisionListQuery query,
+        CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(query);
         var options = CurrentOptions();
         if (!options.Enabled)
-            return Task.FromResult<IReadOnlyList<AgentSupervisionSessionSnapshot>>([]);
+            return Task.FromResult(new AgentSupervisionSessionPage(false, 0, 0, 0, []));
 
         PruneCompleted(options);
-        var sessions = _sessions.Values
+
+        var defaultTake = Math.Max(1, options.DefaultListPageSize);
+        var maxTake = Math.Max(defaultTake, options.MaxListPageSize);
+        var skip = Math.Max(0, query.Skip ?? 0);
+        var take = query.Take is int t && t > 0 ? Math.Min(t, maxTake) : defaultTake;
+        var tailLimit = query.IncludeOutputTail
+            ? (query.OutputTailMaxChars is int max && max >= 0 ? Math.Min(max, options.MaxOutputBufferChars) : options.MaxOutputBufferChars)
+            : 0;
+        var commandsLimit = query.RecentCommandsLimit is int rc && rc >= 0
+            ? Math.Min(rc, options.RetainedCommandsPerSession)
+            : options.RetainedCommandsPerSession;
+
+        var ordered = _sessions.Values
             .OrderByDescending(s => s.StartedAt)
-            .Select(BuildSnapshot)
             .ToList();
-        return Task.FromResult<IReadOnlyList<AgentSupervisionSessionSnapshot>>(sessions);
+        var page = ordered
+            .Skip(skip)
+            .Take(take)
+            .Select(s => BuildSnapshot(s, options, tailLimit, commandsLimit))
+            .ToList();
+        return Task.FromResult(new AgentSupervisionSessionPage(true, ordered.Count, skip, page.Count, page));
     }
 
     public async Task<AgentSupervisionInjectionReceipt> EnqueueInjectionAsync(
@@ -280,7 +383,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             message);
 
         await SafeNotifyAsync(n => n.InjectionQueuedAsync(BuildInjectionEvent(state, injection, options), ct)).ConfigureAwait(false);
-        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state), ct)).ConfigureAwait(false);
+        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state, options), ct)).ConfigureAwait(false);
         return new AgentSupervisionInjectionReceipt(true, "accepted", injection.InjectionId);
     }
 
@@ -293,6 +396,8 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
     {
         var options = CurrentOptions();
         var redacted = Truncate(RawChunkRedactor.Redact(prompt), options.MaxPromptChars);
+        var sentAt = DateTimeOffset.UtcNow;
+        state.AppendCommand(new AgentSupervisionCommandRecord(kind, injectionId, sentAt, redacted));
         var evt = new AgentSupervisionCommandEvent(
             state.SessionId,
             state.Start.WorkItemId.ToString(),
@@ -302,7 +407,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             state.Start.Agent.Value,
             kind,
             injectionId,
-            DateTimeOffset.UtcNow,
+            sentAt,
             redacted);
         await SafeNotifyAsync(n => n.CodeyBoxCommandAsync(evt, ct)).ConfigureAwait(false);
     }
@@ -324,7 +429,37 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
         _ = SafeNotifyAsync(n => n.StdoutChunkAsync(evt, CancellationToken.None));
     }
 
-    internal bool TryBeginNextInjection(
+    /// <summary>
+    /// Drain queued injections, format the prompt, and delegate dispatch to
+    /// <paramref name="runTurnAsync"/>. Stops on the first failed turn or
+    /// cancellation. The caller's delegate is the integration point for prompt
+    /// preprocessing and session-aware runner routing.
+    /// </summary>
+    internal async Task<AgentResult> RunPendingInjectionsAsync(
+        AgentSupervisionSessionState state,
+        AgentResult current,
+        Func<AgentSupervisionInjectionTurn, CancellationToken, Task<AgentResult>> runTurnAsync,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(runTurnAsync);
+        var result = current;
+        while (TryBeginNextInjection(state, out var injection))
+        {
+            ct.ThrowIfCancellationRequested();
+            var prompt = BuildHumanInjectionPrompt(injection);
+            await MarkInjectionStartedAsync(state, injection, ct).ConfigureAwait(false);
+            await PublishCommandAsync(state, "human-injection", prompt, injection.InjectionId, ct).ConfigureAwait(false);
+            var turn = await runTurnAsync(new AgentSupervisionInjectionTurn(injection, prompt), ct).ConfigureAwait(false);
+            await MarkInjectionCompletedAsync(state, injection, turn, ct).ConfigureAwait(false);
+            result = MergeTurnResult(result, turn);
+            if (!turn.Success)
+                break;
+        }
+
+        return result;
+    }
+
+    private bool TryBeginNextInjection(
         AgentSupervisionSessionState state,
         out AgentSupervisionInjection injection)
     {
@@ -342,7 +477,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
         }
     }
 
-    internal async Task MarkInjectionStartedAsync(
+    private async Task MarkInjectionStartedAsync(
         AgentSupervisionSessionState state,
         AgentSupervisionInjection injection,
         CancellationToken ct)
@@ -354,12 +489,13 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             state.Start.Agent,
             injection.Actor,
             injection.InjectionId);
-        await SafeNotifyAsync(n => n.InjectionStartedAsync(BuildInjectionEvent(state, injection, CurrentOptions()), ct))
+        var options = CurrentOptions();
+        await SafeNotifyAsync(n => n.InjectionStartedAsync(BuildInjectionEvent(state, injection, options), ct))
             .ConfigureAwait(false);
-        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state), ct)).ConfigureAwait(false);
+        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state, options), ct)).ConfigureAwait(false);
     }
 
-    internal async Task MarkInjectionCompletedAsync(
+    private async Task MarkInjectionCompletedAsync(
         AgentSupervisionSessionState state,
         AgentSupervisionInjection injection,
         AgentResult result,
@@ -390,7 +526,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             result.Success,
             summary);
         await SafeNotifyAsync(n => n.InjectionCompletedAsync(evt, ct)).ConfigureAwait(false);
-        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state), ct)).ConfigureAwait(false);
+        await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state, options), ct)).ConfigureAwait(false);
     }
 
     internal async ValueTask CompleteSessionAsync(AgentSupervisionSessionState state)
@@ -403,7 +539,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             state.CompletedAt = DateTimeOffset.UtcNow;
         }
 
-        await SafeNotifyAsync(n => n.SessionCompletedAsync(BuildSnapshot(state), CancellationToken.None))
+        await SafeNotifyAsync(n => n.SessionCompletedAsync(BuildSnapshot(state, CurrentOptions()), CancellationToken.None))
             .ConfigureAwait(false);
     }
 
@@ -414,6 +550,22 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
         $"<codeybox-human-instruction id=\"{injection.InjectionId}\" actor=\"{EscapeAttribute(injection.Actor)}\" sentAt=\"{injection.SentAt:O}\">\n" +
         injection.Message +
         "\n</codeybox-human-instruction>\n";
+
+    internal static AgentResult MergeTurnResult(AgentResult previous, AgentResult latest) =>
+        latest with
+        {
+            Stdout = CombineAgentText(previous.Stdout, latest.Stdout),
+            Stderr = CombineAgentText(previous.Stderr, latest.Stderr),
+        };
+
+    private static string? CombineAgentText(string? first, string? second)
+    {
+        if (string.IsNullOrEmpty(first))
+            return second;
+        if (string.IsNullOrEmpty(second))
+            return first;
+        return first.EndsWith('\n') ? first + second : first + "\n" + second;
+    }
 
     private AgentSupervisionOptions CurrentOptions()
     {
@@ -442,10 +594,23 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
         }
     }
 
-    private AgentSupervisionSessionSnapshot BuildSnapshot(AgentSupervisionSessionState state)
+    private AgentSupervisionSessionSnapshot BuildSnapshot(
+        AgentSupervisionSessionState state,
+        AgentSupervisionOptions options,
+        int? outputTailMaxChars = null,
+        int? recentCommandsLimit = null)
     {
         lock (state.Sync)
         {
+            var tail = state.GetOutputTail();
+            if (outputTailMaxChars is int limit && tail.Length > limit)
+                tail = limit == 0 ? string.Empty : tail[^limit..];
+
+            var commands = state.GetRecentCommandsSnapshot();
+            var cmdLimit = recentCommandsLimit ?? options.RetainedCommandsPerSession;
+            if (commands.Count > cmdLimit)
+                commands = commands.GetRange(commands.Count - cmdLimit, cmdLimit);
+
             return new AgentSupervisionSessionSnapshot(
                 state.SessionId,
                 state.Start.WorkItemId.ToString(),
@@ -464,7 +629,8 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
                 state.CompletedAt is null ? "running" : "completed",
                 state.AcceptingInjections,
                 state.PendingCount,
-                state.GetOutputTail());
+                tail,
+                commands);
         }
     }
 
@@ -516,7 +682,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             .Replace("<", "&lt;", StringComparison.Ordinal);
 }
 
-public sealed class AgentSupervisionSessionScope : IAsyncDisposable
+internal sealed class AgentSupervisionSessionScope : IAgentSupervisionSession
 {
     private readonly AgentSupervisionService _owner;
     private readonly AgentSupervisionSessionState _state;
@@ -542,14 +708,11 @@ public sealed class AgentSupervisionSessionScope : IAsyncDisposable
     public Task PublishCodeyBoxCommandAsync(string kind, string prompt, string? injectionId, CancellationToken ct = default) =>
         _owner.PublishCommandAsync(_state, kind, prompt, injectionId, ct);
 
-    public bool TryBeginNextInjection(out AgentSupervisionInjection injection) =>
-        _owner.TryBeginNextInjection(_state, out injection);
-
-    public Task MarkInjectionStartedAsync(AgentSupervisionInjection injection, CancellationToken ct = default) =>
-        _owner.MarkInjectionStartedAsync(_state, injection, ct);
-
-    public Task MarkInjectionCompletedAsync(AgentSupervisionInjection injection, AgentResult result, CancellationToken ct = default) =>
-        _owner.MarkInjectionCompletedAsync(_state, injection, result, ct);
+    public Task<AgentResult> RunPendingInjectionsAsync(
+        AgentResult current,
+        Func<AgentSupervisionInjectionTurn, CancellationToken, Task<AgentResult>> runTurnAsync,
+        CancellationToken ct = default) =>
+        _owner.RunPendingInjectionsAsync(_state, current, runTurnAsync, ct);
 
     public ValueTask DisposeAsync()
     {
@@ -569,14 +732,21 @@ public sealed record AgentSupervisionInjection(
 internal sealed class AgentSupervisionSessionState
 {
     private readonly int _maxOutputChars;
+    private readonly int _retainedCommands;
     private readonly string _sessionId;
     private readonly StringBuilder _output = new();
+    private readonly Queue<AgentSupervisionCommandRecord> _commands = new();
 
-    public AgentSupervisionSessionState(string sessionId, AgentSupervisionSessionStart start, int maxOutputChars)
+    public AgentSupervisionSessionState(
+        string sessionId,
+        AgentSupervisionSessionStart start,
+        int maxOutputChars,
+        int retainedCommands)
     {
         _sessionId = sessionId;
         Start = start;
         _maxOutputChars = maxOutputChars;
+        _retainedCommands = retainedCommands;
     }
 
     public object Sync { get; } = new();
@@ -604,6 +774,26 @@ internal sealed class AgentSupervisionSessionState
         lock (Sync)
         {
             return _output.ToString();
+        }
+    }
+
+    public void AppendCommand(AgentSupervisionCommandRecord record)
+    {
+        lock (Sync)
+        {
+            if (_retainedCommands == 0)
+                return;
+            _commands.Enqueue(record);
+            while (_commands.Count > _retainedCommands)
+                _commands.Dequeue();
+        }
+    }
+
+    public List<AgentSupervisionCommandRecord> GetRecentCommandsSnapshot()
+    {
+        lock (Sync)
+        {
+            return _commands.ToList();
         }
     }
 }

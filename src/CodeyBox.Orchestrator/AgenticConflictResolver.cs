@@ -327,20 +327,16 @@ public sealed class AgenticConflictResolver
                         ct,
                         stdoutChunkCallback: stdoutCallback,
                         captureStructuredStream: captureStructuredStream);
-                    agentResult = await RunPendingSupervisionInjectionsAsync(
-                        supervision,
-                        agentResult,
-                        (injectionPrompt, injectionCt) => runner.RunAsync(
-                            sandbox,
-                            workingDirectory,
-                            injectionPrompt,
-                            candidate.Credential,
-                            candidate.ModelId,
-                            candidate.ReasoningMode,
-                            injectionCt,
-                            stdoutChunkCallback: stdoutCallback,
-                            captureStructuredStream: captureStructuredStream),
-                        ct);
+                    if (supervision is not null)
+                    {
+                        var dispatcher = new SupervisedTurnDispatcher(
+                            runner, sandbox, workingDirectory, candidate.Credential,
+                            candidate.ModelId, candidate.ReasoningMode, stdoutCallback,
+                            captureStructuredStream: captureStructuredStream,
+                            promptPreprocessor: null);
+                        agentResult = await supervision.RunPendingInjectionsAsync(
+                            agentResult, dispatcher.RunInjectionTurnAsync, ct);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -464,7 +460,7 @@ public sealed class AgenticConflictResolver
         };
     }
 
-    private Task<AgentSupervisionSessionScope?> StartSupervisionSessionAsync(
+    private Task<IAgentSupervisionSession?> StartSupervisionSessionAsync(
         WorkItemId workItemId,
         AgenticConflictResolverContext context,
         IAgentRunner runner,
@@ -475,7 +471,7 @@ public sealed class AgenticConflictResolver
         CancellationToken ct)
     {
         if (_agentSupervision is null || !_agentSupervision.Enabled)
-            return Task.FromResult<AgentSupervisionSessionScope?>(null);
+            return Task.FromResult<IAgentSupervisionSession?>(null);
 
         var phase = context.Operation == AgenticConflictResolverOperation.Rebase
             ? "conflict-rebase"
@@ -494,49 +490,6 @@ public sealed class AgenticConflictResolver
                 workingDirectory,
                 Source: "agentic-conflict-resolver"),
             ct);
-    }
-
-    private static async Task<AgentResult> RunPendingSupervisionInjectionsAsync(
-        AgentSupervisionSessionScope? supervision,
-        AgentResult current,
-        Func<string, CancellationToken, Task<AgentResult>> runTurnAsync,
-        CancellationToken ct)
-    {
-        if (supervision is null)
-            return current;
-
-        var result = current;
-        while (supervision.TryBeginNextInjection(out var injection))
-        {
-            ct.ThrowIfCancellationRequested();
-            var prompt = AgentSupervisionService.BuildHumanInjectionPrompt(injection);
-            await supervision.MarkInjectionStartedAsync(injection, ct).ConfigureAwait(false);
-            await supervision.PublishCodeyBoxCommandAsync("human-injection", prompt, injection.InjectionId, ct)
-                .ConfigureAwait(false);
-            var turn = await runTurnAsync(prompt, ct).ConfigureAwait(false);
-            await supervision.MarkInjectionCompletedAsync(injection, turn, ct).ConfigureAwait(false);
-            result = MergeSupervisionTurnResult(result, turn);
-            if (!turn.Success)
-                break;
-        }
-
-        return result;
-    }
-
-    private static AgentResult MergeSupervisionTurnResult(AgentResult previous, AgentResult latest) =>
-        latest with
-        {
-            Stdout = CombineAgentText(previous.Stdout, latest.Stdout),
-            Stderr = CombineAgentText(previous.Stderr, latest.Stderr),
-        };
-
-    private static string? CombineAgentText(string? first, string? second)
-    {
-        if (string.IsNullOrEmpty(first))
-            return second;
-        if (string.IsNullOrEmpty(second))
-            return first;
-        return first.EndsWith('\n') ? first + second : first + "\n" + second;
     }
 
     internal static async Task<IReadOnlyList<string>> ListUnmergedPathsAsync(

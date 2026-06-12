@@ -41,18 +41,33 @@ public sealed class AgentStdoutHub : Hub
     public Task UnsubscribeSupervisionSessionAsync(string sessionId)
         => Groups.RemoveFromGroupAsync(Context.ConnectionId, SupervisionSessionGroup(sessionId));
 
-    public Task<IReadOnlyList<AgentSupervisionSessionSnapshot>> ListSupervisionSessionsAsync(
+    public Task<AgentSupervisionSessionPage> ListSupervisionSessionsAsync(
+        int? skip = null,
+        int? take = null,
+        int? outputTailMaxChars = null,
+        int? recentCommandsLimit = null,
         CancellationToken ct = default)
-        => _supervision.ListSessionsAsync(ct);
+        => _supervision.ListSessionsAsync(
+            new AgentSupervisionListQuery(
+                Skip: skip,
+                Take: take,
+                IncludeOutputTail: true,
+                OutputTailMaxChars: outputTailMaxChars,
+                RecentCommandsLimit: recentCommandsLimit),
+            ct);
 
     public Task<AgentSupervisionInjectionReceipt> InjectSupervisionAsync(
         string sessionId,
         AgentSupervisionInjectionRequest request,
         CancellationToken ct = default)
     {
-        var actor = string.IsNullOrWhiteSpace(request.Actor)
-            ? $"signalr:{Context.ConnectionId}"
-            : request.Actor;
+        // Display label only — the authoritative principal for the audit
+        // trail is derived from the SignalR connection identity below. Client-
+        // supplied actor strings cannot be trusted because the bearer-token
+        // auth layer does not bind a user identity to the connection.
+        var clientLabel = string.IsNullOrWhiteSpace(request.Actor) ? null : request.Actor!.Trim();
+        var authoritative = $"signalr:{Context.ConnectionId}";
+        var actor = clientLabel is null ? authoritative : $"{authoritative} ({clientLabel})";
         return _supervision.EnqueueInjectionAsync(
             sessionId,
             request with { Actor = actor },

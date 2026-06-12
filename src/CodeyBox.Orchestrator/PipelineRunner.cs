@@ -2785,20 +2785,19 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (preemptRequested)
                     throw new OperationCanceledException(hostShutdownToken);
 
-                agentResult = await RunPendingSupervisionInjectionsAsync(
-                    supervision,
-                    agentResult,
-                    (injectionPrompt, injectionCt) => runner.RunAsync(
-                        sandbox,
-                        SandboxConventions.WorkDir,
-                        injectionPrompt,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        injectionCt,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: captureStructuredStream),
-                    runnerCts.Token);
+                if (supervision is not null)
+                {
+                    var dispatcher = new SupervisedTurnDispatcher(
+                        runner, sandbox, SandboxConventions.WorkDir, credential,
+                        item.ModelId, item.ReasoningMode, stdoutCallback,
+                        captureStructuredStream: captureStructuredStream,
+                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                            item.Id, runner.Kind,
+                            isInitial ? AgentPromptPhase.Work : AgentPromptPhase.Rework,
+                            iteration ?? 1, project, sandbox, raw, pct));
+                    agentResult = await supervision.RunPendingInjectionsAsync(
+                        agentResult, dispatcher.RunInjectionTurnAsync, runnerCts.Token);
+                }
             }
         }
         catch (OperationCanceledException) when (hostShutdownToken.IsCancellationRequested)
@@ -3574,20 +3573,18 @@ public sealed class PipelineRunner : IPipelineRunner
             item.ModelId, item.ReasoningMode, ct,
             stdoutChunkCallback: chunkCallback,
             captureStructuredStream: false);
-        result = await RunPendingSupervisionInjectionsAsync(
-            supervision,
-            result,
-            (injectionPrompt, injectionCt) => agentRunner.RunAsync(
-                sandbox,
-                SandboxConventions.WorkDir,
-                injectionPrompt,
-                credential,
-                item.ModelId,
-                item.ReasoningMode,
-                injectionCt,
-                stdoutChunkCallback: chunkCallback,
-                captureStructuredStream: false),
-            ct);
+        if (supervision is not null)
+        {
+            var checkDispatcher = new SupervisedTurnDispatcher(
+                agentRunner, sandbox, SandboxConventions.WorkDir, credential,
+                item.ModelId, item.ReasoningMode, chunkCallback,
+                captureStructuredStream: false,
+                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                    1, project, sandbox, raw, pct));
+            result = await supervision.RunPendingInjectionsAsync(
+                result, checkDispatcher.RunInjectionTurnAsync, ct);
+        }
         var endedAt = DateTimeOffset.UtcNow;
 
         var aggregatedStdout = aggregator.ToString();
@@ -4009,20 +4006,18 @@ public sealed class PipelineRunner : IPipelineRunner
             item.ModelId, item.ReasoningMode, ct,
             stdoutChunkCallback: chunkCallback,
             captureStructuredStream: false);
-        result = await RunPendingSupervisionInjectionsAsync(
-            supervision,
-            result,
-            (injectionPrompt, injectionCt) => agentRunner.RunAsync(
-                sandbox,
-                SandboxConventions.WorkDir,
-                injectionPrompt,
-                credential,
-                item.ModelId,
-                item.ReasoningMode,
-                injectionCt,
-                stdoutChunkCallback: chunkCallback,
-                captureStructuredStream: false),
-            ct);
+        if (supervision is not null)
+        {
+            var recheckDispatcher = new SupervisedTurnDispatcher(
+                agentRunner, sandbox, SandboxConventions.WorkDir, credential,
+                item.ModelId, item.ReasoningMode, chunkCallback,
+                captureStructuredStream: false,
+                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                    1, project, sandbox, raw, pct));
+            result = await supervision.RunPendingInjectionsAsync(
+                result, recheckDispatcher.RunInjectionTurnAsync, ct);
+        }
         var endedAt = DateTimeOffset.UtcNow;
 
         var aggregatedStdout = aggregator.ToString();
@@ -4399,7 +4394,7 @@ public sealed class PipelineRunner : IPipelineRunner
         };
     }
 
-    private Task<AgentSupervisionSessionScope?> StartAgentSupervisionSessionAsync(
+    private Task<IAgentSupervisionSession?> StartAgentSupervisionSessionAsync(
         WorkItemId workItemId,
         Project project,
         string phase,
@@ -4414,7 +4409,7 @@ public sealed class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (_agentSupervision is null || !_agentSupervision.Enabled)
-            return Task.FromResult<AgentSupervisionSessionScope?>(null);
+            return Task.FromResult<IAgentSupervisionSession?>(null);
 
         return _agentSupervision.TryStartSessionAsync(
             new AgentSupervisionSessionStart(
@@ -4433,59 +4428,16 @@ public sealed class PipelineRunner : IPipelineRunner
     }
 
     private static Action<string>? WrapSupervisionStdout(
-        AgentSupervisionSessionScope? supervision,
+        IAgentSupervisionSession? supervision,
         Action<string>? stdoutCallback) =>
         supervision is null ? stdoutCallback : supervision.WrapStdoutCallback(stdoutCallback);
-
-    private static async Task<AgentResult> RunPendingSupervisionInjectionsAsync(
-        AgentSupervisionSessionScope? supervision,
-        AgentResult current,
-        Func<string, CancellationToken, Task<AgentResult>> runTurnAsync,
-        CancellationToken ct)
-    {
-        if (supervision is null)
-            return current;
-
-        var result = current;
-        while (supervision.TryBeginNextInjection(out var injection))
-        {
-            ct.ThrowIfCancellationRequested();
-            var prompt = AgentSupervisionService.BuildHumanInjectionPrompt(injection);
-            await supervision.MarkInjectionStartedAsync(injection, ct).ConfigureAwait(false);
-            await supervision.PublishCodeyBoxCommandAsync("human-injection", prompt, injection.InjectionId, ct)
-                .ConfigureAwait(false);
-            var turn = await runTurnAsync(prompt, ct).ConfigureAwait(false);
-            await supervision.MarkInjectionCompletedAsync(injection, turn, ct).ConfigureAwait(false);
-            result = MergeSupervisionTurnResult(result, turn);
-            if (!turn.Success)
-                break;
-        }
-
-        return result;
-    }
-
-    private static AgentResult MergeSupervisionTurnResult(AgentResult previous, AgentResult latest) =>
-        latest with
-        {
-            Stdout = CombineAgentText(previous.Stdout, latest.Stdout),
-            Stderr = CombineAgentText(previous.Stderr, latest.Stderr),
-        };
-
-    private static string? CombineAgentText(string? first, string? second)
-    {
-        if (string.IsNullOrEmpty(first))
-            return second;
-        if (string.IsNullOrEmpty(second))
-            return first;
-        return first.EndsWith('\n') ? first + second : first + "\n" + second;
-    }
 
     private sealed class SupervisedAgentRunner : IAgentRunner
     {
         private readonly IAgentRunner _inner;
-        private readonly AgentSupervisionSessionScope _supervision;
+        private readonly IAgentSupervisionSession _supervision;
 
-        public SupervisedAgentRunner(IAgentRunner inner, AgentSupervisionSessionScope supervision)
+        public SupervisedAgentRunner(IAgentRunner inner, IAgentSupervisionSession supervision)
         {
             _inner = inner;
             _supervision = supervision;
@@ -4518,20 +4470,12 @@ public sealed class PipelineRunner : IPipelineRunner
                     stdoutChunkCallback: supervisedStdout,
                     captureStructuredStream)
                 .ConfigureAwait(false);
-            return await RunPendingSupervisionInjectionsAsync(
-                    _supervision,
-                    result,
-                    (injectionPrompt, injectionCt) => _inner.RunAsync(
-                        sandbox,
-                        workingDirectory,
-                        injectionPrompt,
-                        credential,
-                        modelId,
-                        reasoningMode,
-                        injectionCt,
-                        stdoutChunkCallback: supervisedStdout,
-                        captureStructuredStream),
-                    ct)
+            var dispatcher = new SupervisedTurnDispatcher(
+                _inner, sandbox, workingDirectory, credential,
+                modelId, reasoningMode, supervisedStdout,
+                captureStructuredStream);
+            return await _supervision.RunPendingInjectionsAsync(
+                    result, dispatcher.RunInjectionTurnAsync, ct)
                 .ConfigureAwait(false);
         }
 
@@ -7781,20 +7725,18 @@ public sealed class PipelineRunner : IPipelineRunner
                         agentResult = await runTask;
                         if (hostShutdownToken.IsCancellationRequested)
                             throw new OperationCanceledException(hostShutdownToken);
-                        agentResult = await RunPendingSupervisionInjectionsAsync(
-                            supervision,
-                            agentResult,
-                            (injectionPrompt, injectionCt) => runner.RunAsync(
-                                sandbox,
-                                SandboxConventions.WorkDir,
-                                injectionPrompt,
-                                mergeCredential,
-                                item.ModelId,
-                                item.ReasoningMode,
-                                injectionCt,
-                                stdoutChunkCallback: mergeStdoutCallback,
-                                captureStructuredStream: mergeStreamCapture is not null || mergeNeedsStreamForResume),
-                            runnerCts.Token);
+                        if (supervision is not null)
+                        {
+                            var mergeDispatcher = new SupervisedTurnDispatcher(
+                                runner, sandbox, SandboxConventions.WorkDir, mergeCredential,
+                                item.ModelId, item.ReasoningMode, mergeStdoutCallback,
+                                captureStructuredStream: mergeStreamCapture is not null || mergeNeedsStreamForResume,
+                                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                                    item.Id, runner.Kind, AgentPromptPhase.Merge,
+                                    1, project, sandbox, raw, pct));
+                            agentResult = await supervision.RunPendingInjectionsAsync(
+                                agentResult, mergeDispatcher.RunInjectionTurnAsync, runnerCts.Token);
+                        }
                     }
                 }
                 finally
@@ -9563,20 +9505,18 @@ public sealed class PipelineRunner : IPipelineRunner
                     item.ModelId, item.ReasoningMode, phase.Token,
                     stdoutChunkCallback: stdoutCallback,
                     captureStructuredStream: captureStructuredStream);
-                agentResult = await RunPendingSupervisionInjectionsAsync(
-                    supervision,
-                    agentResult,
-                    (injectionPrompt, injectionCt) => runner.RunAsync(
-                        sandbox,
-                        SandboxConventions.WorkDir,
-                        injectionPrompt,
-                        credential,
-                        item.ModelId,
-                        item.ReasoningMode,
-                        injectionCt,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: captureStructuredStream),
-                    phase.Token);
+                if (supervision is not null)
+                {
+                    var conflictDispatcher = new SupervisedTurnDispatcher(
+                        runner, sandbox, SandboxConventions.WorkDir, credential,
+                        item.ModelId, item.ReasoningMode, stdoutCallback,
+                        captureStructuredStream: captureStructuredStream,
+                        promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                            item.Id, runner.Kind, AgentPromptPhase.Rework,
+                            item.ConflictReworkAttempts, project, sandbox, raw, pct));
+                    agentResult = await supervision.RunPendingInjectionsAsync(
+                        agentResult, conflictDispatcher.RunInjectionTurnAsync, phase.Token);
+                }
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {

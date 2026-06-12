@@ -180,7 +180,8 @@ public sealed class AgentStdoutHubTests
             State: "running",
             AcceptingInjections: true,
             PendingInjections: 0,
-            OutputTail: "");
+            OutputTail: "",
+            RecentCommands: []);
 
         await svc.SessionStartedAsync(snapshot);
 

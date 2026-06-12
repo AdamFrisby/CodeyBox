@@ -68,14 +68,35 @@ Server-to-client events:
 
 ## REST Helpers
 
-`GET /agent-supervision/sessions` returns:
+`GET /agent-supervision/sessions` accepts paging query parameters and returns:
 
 ```json
 {
   "enabled": true,
-  "sessions": []
+  "total": 12,
+  "skip": 0,
+  "take": 2,
+  "sessions": [ /* AgentSupervisionSessionSnapshot[] */ ]
 }
 ```
+
+Query parameters:
+
+| Name | Default | Description |
+|---|---|---|
+| `skip` | `0` | Number of sessions to skip from the start of the most-recently-started ordering. |
+| `take` | `CodeyBox:AgentSupervision:DefaultListPageSize` (64) | Page size, clamped to `MaxListPageSize` (256). |
+| `includeOutputTail` | `true` | When `false`, returned sessions carry an empty `outputTail`. |
+| `outputTailMaxChars` | (full buffer) | Hard limit on the per-session output-tail length. |
+| `recentCommandsLimit` | `RetainedCommandsPerSession` | Cap on the number of recent CodeyBox commands returned per session. |
+
+Each session snapshot also carries a `recentCommands` array — the recent
+CodeyBox prompts that drove this session (autonomous + human-injection),
+each with `kind`, `injectionId` (when applicable), `sentAt`, and the
+redacted/truncated `prompt`. A supervisor that joins after a session has
+already started can review these to understand what CodeyBox has been
+saying to the agent without having to be subscribed to the live SignalR
+stream.
 
 `POST /agent-supervision/sessions/{sessionId}/injections` accepts:
 
@@ -85,6 +106,13 @@ Server-to-client events:
   "message": "Before you finish, add the regression test for the parser case."
 }
 ```
+
+`actor` is a display label only. The audit trail records a server-derived
+authoritative principal (`apikey:<fingerprint>@<remote-ip>` for the bearer-
+token path; `user:<name>` once an authenticated-user scheme is wired) and
+the client-supplied label is appended for human context. Client-supplied
+actor strings are not trusted as identity because the bearer-token auth
+layer does not bind a per-user identity to the request.
 
 REST injection is useful for scripts; SignalR is the live stream.
 
