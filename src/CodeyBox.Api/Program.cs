@@ -1809,7 +1809,7 @@ builder.Services.AddSingleton<ITimingStore>(sp =>
 builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemCostStore(opts.StateDatabasePath);
+    return new SqliteWorkItemCostStore(opts.StateDatabasePath, sp.GetRequiredService<AgentCostCalculator>());
 });
 builder.Services.AddSingleton<IAgentUsageStore>(sp =>
 {
@@ -1987,7 +1987,10 @@ builder.Services.AddSingleton<AgentCostCalculator>(sp =>
     var extractors = sp.GetRequiredService<IReadOnlyDictionary<AgentKind, IAgentCostExtractor>>();
     AgentCostCalculator.ValidateAtStartup(merged.Options,
         sp.GetRequiredService<IAgentRegistry>().Available, extractors, startupLog);
-    var calculator = new AgentCostCalculator(new AgentPricingOptions(), extractors);
+    var calculator = new AgentCostCalculator(
+        new AgentPricingOptions(),
+        extractors,
+        sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>());
     pricingState.ApplySuccessfulMerge(merged, calculator);
     return calculator;
 });

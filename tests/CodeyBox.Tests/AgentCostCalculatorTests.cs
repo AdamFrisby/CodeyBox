@@ -63,6 +63,69 @@ public sealed class AgentCostCalculatorTests
     }
 
     [Fact]
+    public void CodexKnownModel_CalculatesNonZeroUsdFromConfiguredRate()
+    {
+        var calculator = new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        });
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000,
+            CachedInputTokens: 100,
+            OutputTokens: 200,
+            ModelId: "gpt-5.5");
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(0.01105m, result);
+    }
+
+    [Fact]
+    public void NullModel_FallsBackToAgentDefaultModelRate()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+        var calculator = new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        }, defaultModels: defaults);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000,
+            CachedInputTokens: 100,
+            OutputTokens: 200,
+            ModelId: null);
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(0.01105m, result);
+    }
+
+    [Fact]
     public void CodexCachedInput_ChargesFreshRemainderAndCachedAtSeparateRates()
     {
         var calculator = new AgentCostCalculator(MakeOpts());

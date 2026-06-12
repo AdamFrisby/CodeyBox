@@ -10505,7 +10505,7 @@ Original merge-phase failure (for context):
             CachedInputTokens: 0,
             OutputTokens: 0,
             ModelId: dispatchModelId);
-        snapshot = ClampCostSnapshot(snapshot);
+        snapshot = NormalizeCostSnapshot(snapshot, dispatchModelId);
 
         var usd = 0m;
         if (!usedElapsedFallback && _costCalculator is not null)
@@ -10581,11 +10581,19 @@ Original merge-phase failure (for context):
         }
     }
 
-    private static AgentCostSnapshot ClampCostSnapshot(AgentCostSnapshot snapshot) => new(
+    private static AgentCostSnapshot NormalizeCostSnapshot(AgentCostSnapshot snapshot, string? dispatchModelId) => new(
         InputTokens: Math.Max(0, snapshot.InputTokens),
         CachedInputTokens: Math.Max(0, snapshot.CachedInputTokens),
         OutputTokens: Math.Max(0, snapshot.OutputTokens),
-        ModelId: snapshot.ModelId);
+        ModelId: ResolveCostRowModelId(snapshot.ModelId, dispatchModelId));
+
+    internal static string? ResolveCostRowModelId(string? extractedModelId, string? dispatchModelId)
+    {
+        if (!string.IsNullOrWhiteSpace(extractedModelId))
+            return extractedModelId;
+
+        return string.IsNullOrWhiteSpace(dispatchModelId) ? null : dispatchModelId;
+    }
 
     /// <summary>
     /// Builds the durable usage-accounting row for one agent invocation.

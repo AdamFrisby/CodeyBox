@@ -25,7 +25,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             );
             """;
         setupCmd.ExecuteNonQuery();
-        _store = new SqliteWorkItemCostStore(_dbPath);
+        _store = new SqliteWorkItemCostStore(_dbPath, MakeCostCalculator());
     }
 
     public void Dispose()
@@ -234,6 +234,93 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         var (avg, samples) = await _store.GetAvgTokensPerItemAsync("gemini", 10);
         Assert.Equal(1, samples);
         Assert.Equal(375, avg);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlySummaryPricesExistingModel()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "work") with
+        {
+            AgentKind = "codex",
+            ModelId = "gpt-5.5",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                1000,
+                200,
+                100,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var row = Assert.Single(await _store.GetByWorkItemAsync(itemId));
+
+        Assert.Equal("gpt-5.5", row.ModelId);
+        Assert.Equal(1000, row.InputTokens);
+        Assert.Equal(100, row.CachedInputTokens);
+        Assert.Equal(200, row.OutputTokens);
+        Assert.Equal(0.01105, row.EstimatedUsd, precision: 6);
+        Assert.True(row.HasExtractedTokenUsage);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlyNullModelUsesAgentDefaultRate()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "work") with
+        {
+            AgentKind = "codex",
+            ModelId = null,
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                1000,
+                200,
+                100,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var row = Assert.Single(await _store.GetByWorkItemAsync(itemId));
+
+        Assert.Null(row.ModelId);
+        Assert.Equal(0.01105, row.EstimatedUsd, precision: 6);
+        Assert.True(row.HasExtractedTokenUsage);
     }
 
     [Fact]
@@ -708,5 +795,30 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 $"row {id} has usage_contract_version={version}, expected {expectedVersion}");
         }
         Assert.True(count > 0, "expected at least one row to verify");
+    }
+
+    private static AgentCostCalculator MakeCostCalculator()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+
+        return new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        }, defaultModels: defaults);
     }
 }

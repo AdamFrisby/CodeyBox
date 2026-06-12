@@ -78,9 +78,11 @@ At startup (and on hot-reload of `CodeyBox:AgentPricing`):
 3. Merge by (agentKind, modelId). **Operator config wins per key.**
 4. `DefaultRates` (agent-level fallback) is operator-only; the bundled
    file does not carry it.
-5. Per-provider `IAgentCostExtractor.DefaultPricing` remains the
-   final-fallback when neither the merged map nor `DefaultRates` covers a
-   model.
+5. When an invocation has tokens but no model id, `AgentDefaults[agentKind]`
+   is used to find that agent's default model in the merged `Rates` map.
+6. Per-provider `IAgentCostExtractor.DefaultPricing` remains the
+   final fallback when neither the merged map, `DefaultRates`, nor the
+   `AgentDefaults` model covers a row.
 
 The merge produces an `INFO` startup log of the form:
 

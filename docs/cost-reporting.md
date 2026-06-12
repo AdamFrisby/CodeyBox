@@ -90,7 +90,8 @@ Rates live in `appsettings.json` under `CodeyBox.AgentPricing`:
       "claude-sonnet-4-6": { "inputPerMillion": 3.0,  "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
     },
     "codex": {
-      "codex-5.5": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 25.0 }
+      "gpt-5.5":   { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 30.0 },
+      "codex-5.5": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 30.0 }
     },
     "gemini": {
       "gemini-3.0-pro": { "inputPerMillion": 7.0, "cachedInputPerMillion": 0.70, "outputPerMillion": 21.0 }
@@ -102,8 +103,8 @@ Rates live in `appsettings.json` under `CodeyBox.AgentPricing`:
 }
 ```
 
-Rate lookup is three-level: **model-specific** → **agent default** →
-**built-in fallback constants** (Claude Opus rates).
+Rate lookup is four-level: **model-specific** → **operator DefaultRates** →
+**AgentDefaults model rate** → **provider built-in fallback**.
 
 Rules:
 - Negative rates cause a startup error (`InvalidOperationException`);
@@ -196,8 +197,10 @@ Total tokens: input=1234 output=567
 - **Subscription plan variance**: actual billing under a subscription plan
   may differ from the computed `estimated_usd` figure.
 - **Missing model in fallback mode**: the fallback regex paths do not emit
-  a model string; `model_id` will be `null` for those rows, and rate
-  lookup falls back to the agent's `DefaultRate`.
+  a model string. Cost capture fills `model_id` from the dispatched/default
+  model when known; otherwise rate lookup falls back through
+  `DefaultRates`, the agent's `AgentDefaults` model rate, and finally the
+  provider built-in fallback.
 - **Copilot**: GitHub Copilot does not emit token counts in its CLI output.
   `CopilotCostExtractor` returns `null`, so completed Copilot-backed phases
   write the standard elapsed-time fallback rows.

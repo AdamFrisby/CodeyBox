@@ -79,6 +79,23 @@ public sealed class AgentPricingStartupTests : IClassFixture<AgentPricingStartup
     }
 
     [Fact]
+    public void AgentCostCalculator_NullCodexModel_UsesAgentDefaultsRate()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var calculator = scope.ServiceProvider.GetRequiredService<AgentCostCalculator>();
+
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1_000_000,
+            CachedInputTokens: 0,
+            OutputTokens: 0,
+            ModelId: null);
+
+        var cost = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(5.0m, cost);
+    }
+
+    [Fact]
     public void ProductionCostExtractorMap_IncludesCopilotElapsedFallbackExtractor()
     {
         using var scope = _factory.Services.CreateScope();
