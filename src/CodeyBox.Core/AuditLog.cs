@@ -899,6 +899,11 @@ public static class AuditLog
             .Information("Work item {WorkItemId} for project {ProjectId} deferred by budget cap: {Reason}",
                 id.ToString(), projectId.Value, reason);
 
+    public static void RefactorExclusivityDeferred(WorkItemId id, ProjectId projectId, string reason) =>
+        Audit("refactor.exclusivity_deferred")
+            .Information("Work item {WorkItemId} for project {ProjectId} deferred by refactor exclusivity gate: {Reason}",
+                id.ToString(), projectId.Value, reason);
+
     public static void DiskDeferred(WorkItemId id, string mountPath, long freeBytes, long thresholdBytes) =>
         Audit("disk.deferred")
             .Warning(

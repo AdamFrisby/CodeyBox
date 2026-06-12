@@ -2125,7 +2125,14 @@ public sealed record CreateWorkItemRequest(
     CheckAndActRequest? Check = null,
     // When present, creates a JobType.AgentControl item that performs a
     // control-plane pause/resume for one agent kind without launching an agent.
-    AgentControlRequest? AgentControl = null);
+    AgentControlRequest? AgentControl = null,
+    // When true, creates a JobType.Refactor item. Refactors run the same
+    // work → audit → merge → upstream pipeline as Normal items, but the
+    // dispatcher treats them as project-exclusive: a refactor only starts
+    // once the project has zero other in-flight items, and while it runs no
+    // other item for the same project may start. Mutually exclusive with
+    // <c>Check</c> and <c>AgentControl</c>.
+    bool? IsRefactor = null);
 
 /// <summary>
 /// Request payload for the optional <c>check</c> block on

@@ -210,6 +210,39 @@ public interface IWorkItemStore
     Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default);
 
     /// <summary>
+    /// Per-project in-flight counts split by whether the row is a
+    /// <see cref="JobType.Refactor"/> or any other job type. Uses the same
+    /// "in-flight" predicate as <see cref="CountInFlightAsync"/>. Used by the
+    /// refactor project-exclusive gate: a <see cref="JobType.Refactor"/> item
+    /// may only start when both counters are zero, and while one is in flight
+    /// every other item for the same project must defer. When
+    /// <paramref name="excludeId"/> is provided, that row is omitted from the
+    /// split so recovered pass-through pickups do not count themselves as
+    /// already in flight.
+    /// </summary>
+    async Task<(int Refactor, int Other)> CountInFlightSplitByRefactorAsync(
+        ProjectId projectId,
+        CancellationToken ct = default,
+        WorkItemId? excludeId = null)
+    {
+        // Default implementation streams all items and partitions in-process so
+        // existing IWorkItemStore implementations (in-memory test stubs) work
+        // without modification. The Sqlite production implementation overrides
+        // with a single COUNT() per partition.
+        var refactor = 0;
+        var other = 0;
+        await foreach (var item in ListAsync(ct).ConfigureAwait(false))
+        {
+            if (item.ProjectId != projectId) continue;
+            if (excludeId is { } excluded && item.Id == excluded) continue;
+            if (!WorkItemInFlight.IsInFlight(item)) continue;
+            if (item.JobType == JobType.Refactor) refactor++;
+            else other++;
+        }
+        return (refactor, other);
+    }
+
+    /// <summary>
     /// Look up a work item by a bare external-ID value within a project. Matches
     /// across every namespace in <see cref="WorkItem.ExternalIds"/>. Returns
     /// null when no matching item exists. Throws

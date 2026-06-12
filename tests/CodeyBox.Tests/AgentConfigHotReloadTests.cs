@@ -1825,6 +1825,7 @@ public sealed class AgentConfigHotReloadTests
                 HourlyLimitRecheck = TimeSpan.FromMinutes(5),
                 DailyLimitRecheck = TimeSpan.FromHours(1),
                 ConcurrentLimitRecheck = TimeSpan.FromMinutes(1),
+                RefactorExclusivityRecheck = TimeSpan.FromMinutes(1),
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -1835,6 +1836,7 @@ public sealed class AgentConfigHotReloadTests
                 HourlyLimitRecheck = initial.BudgetDeferralRecheck.HourlyLimitRecheck,
                 DailyLimitRecheck = initial.BudgetDeferralRecheck.DailyLimitRecheck,
                 ConcurrentLimitRecheck = initial.BudgetDeferralRecheck.ConcurrentLimitRecheck,
+                RefactorExclusivityRecheck = initial.BudgetDeferralRecheck.RefactorExclusivityRecheck,
             });
 
         var router = new AgentClassRouter(
@@ -1855,18 +1857,39 @@ public sealed class AgentConfigHotReloadTests
 
         Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.HourlyLimitRecheck);
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.RefactorExclusivityRecheck);
 
-        // Hot-reload: shorten the hourly recheck and lengthen the paused recheck.
+        // Hot-reload: change only the refactor recheck. This pins
+        // SerializeBudgetDeferralRecheck's refactor field; changing an unrelated
+        // interval must not be required for the snapshot to refresh.
+        monitor.Fire(new CodeyBoxOptions
+        {
+            BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
+            {
+                PausedProjectRecheck = TimeSpan.FromMinutes(1),
+                HourlyLimitRecheck = TimeSpan.FromMinutes(5),
+                DailyLimitRecheck = TimeSpan.FromHours(1),
+                ConcurrentLimitRecheck = TimeSpan.FromMinutes(1),
+                RefactorExclusivityRecheck = TimeSpan.FromMinutes(12),
+            },
+        });
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.PausedProjectRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(12), snapshot.Current.RefactorExclusivityRecheck);
+
+        // Hot-reload: shorten the hourly recheck and lengthen the paused/refactor rechecks.
         monitor.Fire(new CodeyBoxOptions
         {
             BudgetDeferralRecheck = new BudgetDeferralRecheckOptions
             {
                 HourlyLimitRecheck = TimeSpan.FromMinutes(2),
                 PausedProjectRecheck = TimeSpan.FromMinutes(15),
+                RefactorExclusivityRecheck = TimeSpan.FromMinutes(20),
             },
         });
         Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
         Assert.Equal(TimeSpan.FromMinutes(15), snapshot.Current.PausedProjectRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(20), snapshot.Current.RefactorExclusivityRecheck);
 
         // Same-value fire should be a no-op.
         monitor.Fire(new CodeyBoxOptions
@@ -1875,9 +1898,11 @@ public sealed class AgentConfigHotReloadTests
             {
                 HourlyLimitRecheck = TimeSpan.FromMinutes(2),
                 PausedProjectRecheck = TimeSpan.FromMinutes(15),
+                RefactorExclusivityRecheck = TimeSpan.FromMinutes(20),
             },
         });
         Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.HourlyLimitRecheck);
+        Assert.Equal(TimeSpan.FromMinutes(20), snapshot.Current.RefactorExclusivityRecheck);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

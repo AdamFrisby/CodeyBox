@@ -9,10 +9,16 @@ namespace CodeyBox.Core;
 /// a follow-up <see cref="Normal"/> work item against the same project.
 /// <see cref="AgentControl"/> items are operator control-plane work items that
 /// pause or resume one agent kind without launching an agent sandbox.
+/// <see cref="Refactor"/> items run the same work → audit → merge → upstream
+/// pipeline as <see cref="Normal"/>, but the dispatcher treats them as
+/// project-exclusive: a refactor only starts when its project has zero other
+/// in-flight items, and while it runs no other item for the same project may
+/// start. Different projects are unaffected.
 /// </summary>
 public enum JobType
 {
     Normal = 0,
     CheckAndAct = 1,
     AgentControl = 2,
+    Refactor = 3,
 }

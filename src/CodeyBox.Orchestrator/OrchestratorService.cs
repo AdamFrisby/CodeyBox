@@ -1572,6 +1572,23 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
             }
 
+            // Run the refactor project lock before project/release/router gates so
+            // blocked same-project items do not mutate release state, consume quota,
+            // park for paused agents, or fail for routing while a refactor already
+            // owns the project. The locked check below remains the final race guard
+            // immediately before StartedAt is written.
+            var refactorGateLock = GetBudgetLock(item.ProjectId);
+            await refactorGateLock.WaitAsync(ct);
+            try
+            {
+                if (await TryDeferForRefactorExclusivityAsync(item, ct))
+                    return;
+            }
+            finally
+            {
+                refactorGateLock.Release();
+            }
+
             // Load the project once for quota routing and budget caps.
             Project? project = null;
             if (_projects is not null)
@@ -1784,11 +1801,19 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             // TOCTOU: without the lock, concurrent workers for the same project can all
             // pass the budget check before any of them has committed StartedAt, allowing
             // the per-project caps to be exceeded by up to MaxConcurrentWorkers−1 items.
-            if (project is not null)
+            var budgetLock = GetBudgetLock(item.ProjectId);
+            await budgetLock.WaitAsync(ct);
+            try
             {
-                var budgetLock = GetBudgetLock(item.ProjectId);
-                await budgetLock.WaitAsync(ct);
-                try
+                // Final refactor exclusivity check stays inside the
+                // per-project budget lock, adjacent to the StartedAt write,
+                // so a concurrent same-project pickup cannot slip between
+                // the split-read and the in-flight marker. This does not
+                // depend on project metadata being available.
+                if (await TryDeferForRefactorExclusivityAsync(item, ct))
+                    return;
+
+                if (project is not null)
                 {
                     var deferReason = await CheckBudgetAsync(item, project.Budget, ct);
                     if (deferReason is not null)
@@ -1807,33 +1832,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
                         return;
                     }
-                    // Record first pickup time inside the lock so the count is visible
-                    // to the next worker before it runs its own budget check.
-                    if (item.StartedAt is null)
-                    {
-                        var pipelineItem = item;
-                        var baselineRef = ResolveBaselineRefForPickup(item, project);
-                        item = item with
-                        {
-                            StartedAt = DateTimeOffset.UtcNow,
-                            BaselineImageRef = item.BaselineImageRef ?? baselineRef,
-                        };
-                        await _store.UpdateAsync(item, ct);
-                        item = pipelineItem with { StartedAt = item.StartedAt, BaselineImageRef = item.BaselineImageRef };
-                    }
                 }
-                finally
-                {
-                    budgetLock.Release();
-                }
-            }
-            else
-            {
-                // No project → no budget check; still record first pickup time.
+
+                // Record first pickup time inside the lock so the count is visible
+                // to the next worker before it runs its own budget/refactor check.
                 if (item.StartedAt is null)
                 {
                     var pipelineItem = item;
-                    var baselineRef = ResolveBaselineRefForPickup(item, project: null);
+                    var baselineRef = ResolveBaselineRefForPickup(item, project);
                     item = item with
                     {
                         StartedAt = DateTimeOffset.UtcNow,
@@ -1842,6 +1848,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     await _store.UpdateAsync(item, ct);
                     item = pipelineItem with { StartedAt = item.StartedAt, BaselineImageRef = item.BaselineImageRef };
                 }
+            }
+            finally
+            {
+                budgetLock.Release();
             }
 
             using var registration = _cancellations.Register(item.Id);
@@ -2197,6 +2207,42 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </summary>
     public void ScheduleInfrastructureDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken = default)
         => ScheduleDeferredRequeue(id, delay, stoppingToken);
+
+    private async Task<bool> TryDeferForRefactorExclusivityAsync(WorkItem item, CancellationToken ct)
+    {
+        // Reads the same in-flight population CountInFlightAsync sees, split by
+        // JobType, while excluding the candidate itself. The exclusion matters
+        // for recovered pass-through states (WorkComplete, AuditPassed, Merged):
+        // they keep StartedAt and are dispatch-eligible continuations, so a
+        // resumed Refactor must not mistake its own row for a competing refactor.
+        var (refactorInFlight, otherInFlight) =
+            await _store.CountInFlightSplitByRefactorAsync(item.ProjectId, ct, item.Id);
+        var refactorRecheck =
+            _budgetDeferralRecheck?.Current.RefactorExclusivityRecheck
+            ?? TimeSpan.FromMinutes(1);
+
+        if (item.JobType == JobType.Refactor)
+        {
+            if (refactorInFlight == 0 && otherInFlight == 0)
+                return false;
+
+            var reason = refactorInFlight > 0
+                ? $"refactor exclusivity: another refactor is in flight for project '{item.ProjectId.Value}' (refactor={refactorInFlight}, other={otherInFlight})"
+                : $"refactor exclusivity: project '{item.ProjectId.Value}' has {otherInFlight} in-flight non-refactor item(s); refactor waits for the project to drain";
+            AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, reason);
+            ScheduleDeferredRequeue(item.Id, refactorRecheck, ct);
+            return true;
+        }
+
+        if (refactorInFlight == 0)
+            return false;
+
+        var nonRefactorReason =
+            $"refactor exclusivity: a refactor is in flight for project '{item.ProjectId.Value}'; non-refactor items wait until it completes";
+        AuditLog.RefactorExclusivityDeferred(item.Id, item.ProjectId, nonRefactorReason);
+        ScheduleDeferredRequeue(item.Id, refactorRecheck, ct);
+        return true;
+    }
 
     private void ScheduleDeferredRequeue(WorkItemId id, TimeSpan delay, CancellationToken stoppingToken)
     {
