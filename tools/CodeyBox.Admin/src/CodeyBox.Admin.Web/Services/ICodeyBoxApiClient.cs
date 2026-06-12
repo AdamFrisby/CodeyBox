@@ -59,6 +59,14 @@ public interface ICodeyBoxApiClient
     Task<WorkItemCostsDto?> GetWorkItemCostsAsync(string id, CancellationToken ct = default);
     Task<ProjectCostsDto?> GetProjectCostsAsync(string projectId, string? from = null, string? to = null, CancellationToken ct = default);
 
+    // ── Statistics ────────────────────────────────────────────────────────────
+    Task<QuotaReportDto?> GetQuotaAsync(CancellationToken ct = default)
+        => Task.FromResult<QuotaReportDto?>(null);
+    Task<WorkersStatusDto?> GetWorkersStatusAsync(CancellationToken ct = default)
+        => Task.FromResult<WorkersStatusDto?>(null);
+    Task<ConcurrencyDto?> GetConcurrencyAsync(CancellationToken ct = default)
+        => Task.FromResult<ConcurrencyDto?>(null);
+
     // ── Agent questions ───────────────────────────────────────────────────────
     Task<List<QuestionDto>> GetQuestionsAsync(string workItemId, CancellationToken ct = default);
     Task<bool> AnswerQuestionAsync(string workItemId, string questionId, string answer, CancellationToken ct = default);

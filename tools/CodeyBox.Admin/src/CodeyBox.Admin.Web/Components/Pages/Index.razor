@@ -115,6 +115,28 @@
     <p class="error-banner">Error loading queue: @_error</p>
 }
 
+@* ── Tabs: Active | Done | Pending | All ─────────────────────────────────── *@
+@if (_items is not null)
+{
+    <div class="timeline-filters" role="tablist" aria-label="Queue filters">
+        @foreach (var tab in _tabs)
+        {
+            var count = CountForTab(tab);
+            <button type="button"
+                    role="tab"
+                    aria-selected="@(_activeTab == tab)"
+                    class="filter-chip @(_activeTab == tab ? "filter-chip--active" : "")"
+                    @onclick="@(() => SelectTab(tab))">
+                @tab <span class="timeline-group-count">(@count)</span>
+            </button>
+        }
+    </div>
+}
+
+@{
+    var visibleItems = _items is null ? null : ItemsForTab(_activeTab);
+}
+
 @if (_items is null)
 {
     <p>Loading…</p>
@@ -122,6 +144,10 @@
 else if (_items.Count == 0)
 {
     <p>No work items.</p>
+}
+else if (visibleItems!.Count == 0)
+{
+    <p>No @(_activeTab.ToLowerInvariant()) work items.</p>
 }
 else
 {
@@ -138,7 +164,7 @@ else
             </tr>
         </thead>
         <tbody>
-            @foreach (var item in _items)
+            @foreach (var item in visibleItems!)
             {
                 var projPaused = _costBudgets.TryGetValue(item.ProjectId, out var cb) && cb?.ProjectQueue?.Paused == true;
                 <tr class="state-@item.State.ToLowerInvariant()">
@@ -158,7 +184,16 @@ else
                         }
                     </td>
                     <td>@item.Title</td>
-                    <td>@item.Agent</td>
+                    <td>
+                        @if (_activeTab == "Active" && !string.IsNullOrWhiteSpace(item.Agent))
+                        {
+                            <strong title="Agent currently working this item">@item.Agent</strong>
+                        }
+                        else
+                        {
+                            @(string.IsNullOrWhiteSpace(item.Agent) ? "—" : item.Agent)
+                        }
+                    </td>
                     <td class="col-state">@item.State</td>
                     <td class="col-age">@item.Age</td>
                     <td class="col-actions">
@@ -198,16 +233,69 @@ else
     private string? _error;
     private string? _resumeError;
     private CancellationTokenSource? _cts;
+    private Task? _refreshLoop;
 
     private bool _showPauseModal;
     private string _pauseReason = "";
     private string? _pauseError;
 
+    // ── Tabs ─────────────────────────────────────────────────────────────────
+    private static readonly string[] _tabs = ["Active", "Done", "Pending", "All"];
+    private string _activeTab = "Active";
+
+    // "Active" = an agent is actively doing something with the item right now.
+    private static readonly HashSet<string> _activeStates = new(StringComparer.Ordinal)
+    {
+        "Working", "Reworking", "ReworkingForConflict",
+        "Auditing", "AuditPassed", "Merging", "UpstreamPushing",
+    };
+
+    // "Pending" = waiting for something (queue slot, operator, quota).
+    private static readonly HashSet<string> _pendingStates = new(StringComparer.Ordinal)
+    {
+        "Queued", "WorkComplete", "NeedsOperatorInput", "WaitingForQuotaReset",
+    };
+
+    private List<WorkItemDto> ItemsForTab(string tab) => tab switch
+    {
+        // Active and Done are sorted by last-updated descending.
+        "Active" => (_items ?? [])
+            .Where(i => _activeStates.Contains(i.State))
+            .OrderByDescending(i => i.UpdatedAt).ToList(),
+        "Done" => (_items ?? [])
+            .Where(i => i.State == "Done")
+            .OrderByDescending(i => i.UpdatedAt).ToList(),
+        // Pending sorted by true priority (highest first), NOT separated by state,
+        // so the real priority of any waiting task is visible across Queued/WorkComplete/etc.
+        "Pending" => (_items ?? [])
+            .Where(i => _pendingStates.Contains(i.State))
+            .OrderByDescending(i => i.Priority).ToList(),
+        // "All" preserves the default ordering (queued-by-position, then others).
+        _ => _items ?? [],
+    };
+
+    private int CountForTab(string tab) => ItemsForTab(tab).Count;
+
+    // Switching tabs is pure client-side state; the @{ visibleItems } block and the
+    // table re-derive from _activeTab on the next render, so just set the field.
+    private void SelectTab(string tab) => _activeTab = tab;
+
     protected override async Task OnInitializedAsync()
     {
         _cts = new CancellationTokenSource();
         await LoadAsync();
-        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        // Start the auto-refresh loop only once the interactive circuit is live.
+        // Starting it from OnInitializedAsync runs it during prerender too and can
+        // overlap with the live circuit; gating on firstRender keeps a single loop
+        // tied to the interactive component instance.
+        if (firstRender && _refreshLoop is null && _cts is not null)
+        {
+            _refreshLoop = RefreshLoopAsync(_cts.Token);
+        }
     }
 
     private async Task RefreshLoopAsync(CancellationToken ct)
@@ -217,6 +305,10 @@ else
         {
             while (await timer.WaitForNextTickAsync(ct))
             {
+                // Awaited inline so a slow LoadAsync (many sequential per-project
+                // budget calls) can never overlap itself and flood the single
+                // circuit dispatcher — overlapping refreshes were starving click
+                // events from reaching the UI.
                 await LoadAsync();
                 await InvokeAsync(StateHasChanged);
             }

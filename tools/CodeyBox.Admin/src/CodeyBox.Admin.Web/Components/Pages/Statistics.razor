@@ -1,0 +1,447 @@
+@page "/statistics"
+@implements IDisposable
+@inject ICodeyBoxApiClient ApiClient
+@inject ILogger<Statistics> Logger
+
+<PageTitle>Statistics — CodeyBox Admin</PageTitle>
+
+<h1>
+    Statistics
+    @if (_loading)
+    {
+        <span class="timeline-live-badge" style="margin-left:0.6rem;">refreshing…</span>
+    }
+    else
+    {
+        <span class="timeline-live-badge" style="margin-left:0.6rem;">● live (every 12s)</span>
+    }
+</h1>
+
+@if (_error is not null)
+{
+    <p class="error-banner">@_error</p>
+}
+
+@* ── Active agents ───────────────────────────────────────────────────────── *@
+<section style="margin-bottom:1.75rem;">
+    <h2>Active agents</h2>
+    @if (_concurrency is null)
+    {
+        <p style="color:#666;">No concurrency data.</p>
+    }
+    else
+    {
+        <p style="font-size:0.85rem;color:#555;margin-bottom:0.6rem;">
+            Running <strong>@_concurrency.CurrentlyRunningTotal</strong> /
+            @_concurrency.GlobalMaxConcurrent global slots@(_workers is not null ? $" · {_workers.QueuedCount} queued" : "").
+        </p>
+        @if (RunningAgents().Count == 0)
+        {
+            <p style="color:#666;">No agents are currently running work.</p>
+        }
+        else
+        {
+            <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+                @foreach (var kv in RunningAgents())
+                {
+                    var cap = _concurrency.PerAgentCaps.TryGetValue(kv.Key, out var c) ? c : 0;
+                    <span class="filter-chip filter-chip--active" title="@kv.Value running / cap @cap">
+                        <strong>@kv.Key</strong>&nbsp;@kv.Value@(cap > 0 ? $" / {cap}" : "")
+                    </span>
+                }
+            </div>
+        }
+    }
+</section>
+
+@* ── Per-agent quota profiles ────────────────────────────────────────────── *@
+<section style="margin-bottom:1.75rem;">
+    <h2>Agent quota</h2>
+    @if (_quota is null || _quota.Probes.Count == 0)
+    {
+        <p style="color:#666;">No quota data.</p>
+    }
+    else
+    {
+        <table class="queue-table">
+            <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>Class</th>
+                    <th>Model</th>
+                    <th>Billing</th>
+                    <th>Available</th>
+                    <th>Resets</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var p in _quota.Probes)
+                {
+                    var snap = p.LatestSnapshot;
+                    var known = snap?.IsKnown ?? false;
+                    var pct = snap?.AvailablePct ?? -1;
+                    <tr>
+                        <td><strong>@p.Agent</strong>@(string.IsNullOrEmpty(p.AgentInstanceId) || p.AgentInstanceId == p.Agent ? "" : $" ({p.AgentInstanceId})")</td>
+                        <td>@(p.ClassId ?? "—")</td>
+                        <td><code>@(p.ModelId ?? "—")</code></td>
+                        <td>@(p.Billing ?? "—")</td>
+                        <td>
+                            @if (!known || pct < 0)
+                            {
+                                <span style="color:#999">unknown</span>
+                            }
+                            else
+                            {
+                                <span style="display:inline-flex;align-items:center;gap:0.4rem;">
+                                    <span class="budget-bar-wrap" style="width:5rem;">
+                                        <span class="budget-bar @QuotaCss(pct)" style="width:@pct%"></span>
+                                    </span>
+                                    <span>@pct%</span>
+                                </span>
+                            }
+                        </td>
+                        <td>@FormatReset(snap?.ResetAt)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@* ── Token usage & cost windows ──────────────────────────────────────────── *@
+<section style="margin-bottom:1.75rem;">
+    <h2>Token usage &amp; cost</h2>
+    @if (_costsLoaded)
+    {
+        <p style="font-size:0.8rem;color:#777;margin-bottom:0.6rem;">
+            Aggregated from per-work-item cost records, bucketed by each item's last-updated time
+            (approximate: the full item cost is attributed to its completion time). Covers items
+            updated within the last 7 days.
+        </p>
+        <table class="detail-table" style="max-width:760px;">
+            <thead>
+                <tr>
+                    <th style="width:auto;">Window</th>
+                    <th>Input tokens</th>
+                    <th>Cached</th>
+                    <th>Output tokens</th>
+                    <th>Cost (USD)</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var w in _windows)
+                {
+                    <tr>
+                        <td><strong>@w.Label</strong></td>
+                        <td>@w.InputTokens.ToString("N0")</td>
+                        <td>@w.CachedInputTokens.ToString("N0")</td>
+                        <td>@w.OutputTokens.ToString("N0")</td>
+                        <td>$@w.Usd.ToString("N2")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+
+        <h3 style="font-size:1rem;margin:1rem 0 0.5rem;">Per-agent (last 7 days)</h3>
+        @if (_agentTotals.Count == 0)
+        {
+            <p style="color:#666;">No cost records in the last 7 days.</p>
+        }
+        else
+        {
+            <table class="queue-table">
+                <thead>
+                    <tr>
+                        <th>Agent</th>
+                        <th>Model</th>
+                        <th>Items</th>
+                        <th>Input</th>
+                        <th>Cached</th>
+                        <th>Output</th>
+                        <th>Cost (USD)</th>
+                        <th title="Done items / total items with cost in window">Success</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var a in _agentTotals.OrderByDescending(a => a.Usd))
+                    {
+                        <tr>
+                            <td><strong>@a.Agent</strong></td>
+                            <td><code>@(a.ModelId ?? "—")</code></td>
+                            <td>@a.ItemCount</td>
+                            <td>@a.InputTokens.ToString("N0")</td>
+                            <td>@a.CachedInputTokens.ToString("N0")</td>
+                            <td>@a.OutputTokens.ToString("N0")</td>
+                            <td>$@a.Usd.ToString("N2")</td>
+                            <td>
+                                @if (a.ItemCount > 0)
+                                {
+                                    var rate = 100.0 * a.DoneCount / a.ItemCount;
+                                    <span title="@a.DoneCount done / @a.ItemCount with cost">@rate.ToString("F0")%</span>
+                                }
+                                else
+                                {
+                                    <span style="color:#999">—</span>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    }
+    else
+    {
+        <p style="color:#666;">Loading cost data…</p>
+    }
+</section>
+
+@* ── Last 5 completed items ──────────────────────────────────────────────── *@
+<section style="margin-bottom:1rem;">
+    <h2>Last 5 completed</h2>
+    @if (_recentDone.Count == 0)
+    {
+        <p style="color:#666;">No completed items yet.</p>
+    }
+    else
+    {
+        <table class="queue-table">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Project</th>
+                    <th>Title</th>
+                    <th>Agent</th>
+                    <th>Duration</th>
+                    <th title="Audit iterations">Iter</th>
+                    <th>Tokens (in/out)</th>
+                    <th>Cost (USD)</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var d in _recentDone)
+                {
+                    <tr>
+                        <td class="col-id"><a href="/work-items/@d.Item.Id">@d.Item.ShortId</a></td>
+                        <td>@d.Item.ProjectId</td>
+                        <td>@d.Item.Title</td>
+                        <td>@(string.IsNullOrWhiteSpace(d.Item.Agent) ? "—" : d.Item.Agent)</td>
+                        <td>@FormatDuration(d.Item.UpdatedAt - d.Item.CreatedAt)</td>
+                        <td>@(d.Item.AuditIterations?.ToString() ?? "—")</td>
+                        <td>
+                            @if (d.Costs is not null)
+                            {
+                                @($"{d.Costs.Totals.InputTokens:N0} / {d.Costs.Totals.OutputTokens:N0}")
+                            }
+                            else
+                            {
+                                <span style="color:#999">—</span>
+                            }
+                        </td>
+                        <td>@(d.Costs is not null ? $"${d.Costs.Totals.EstimatedUsd:N2}" : "—")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private QuotaReportDto? _quota;
+    private WorkersStatusDto? _workers;
+    private ConcurrencyDto? _concurrency;
+    private List<WindowTotals> _windows = [];
+    private List<AgentTotals> _agentTotals = [];
+    private List<RecentDone> _recentDone = [];
+    private bool _costsLoaded;
+    private bool _loading;
+    private string? _error;
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        await LoadAsync();
+        _ = RefreshLoopAsync(_cts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(12));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                await LoadAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task LoadAsync()
+    {
+        var ct = _cts?.Token ?? default;
+        _loading = true;
+        try
+        {
+            _quota = await ApiClient.GetQuotaAsync(ct);
+            _workers = await ApiClient.GetWorkersStatusAsync(ct);
+            _concurrency = await ApiClient.GetConcurrencyAsync(ct);
+            await LoadCostsAsync(ct);
+            _error = null;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Statistics: failed to load");
+            _error = "Failed to load statistics. Check server logs for details.";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task LoadCostsAsync(CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var sevenDaysAgo = now.AddDays(-7);
+
+        var items = await ApiClient.GetWorkItemsAsync(ct);
+
+        // Last 5 completed (Done) by recency.
+        var recentDoneItems = items
+            .Where(i => i.State == "Done")
+            .OrderByDescending(i => i.UpdatedAt)
+            .Take(5)
+            .ToList();
+
+        // Cost windows + per-agent: consider every item touched within 7 days that
+        // could carry cost records (terminal or in-flight — Queued items have none).
+        var costCandidates = items
+            .Where(i => i.UpdatedAt >= sevenDaysAgo && i.State != "Queued")
+            .OrderByDescending(i => i.UpdatedAt)
+            .ToList();
+
+        var windows = new[]
+        {
+            new WindowTotals("Last 3 hours", now.AddHours(-3)),
+            new WindowTotals("Last 24 hours", now.AddHours(-24)),
+            new WindowTotals("Total (last 7 days)", sevenDaysAgo),
+        };
+        var agentTotals = new Dictionary<string, AgentTotals>();
+        var recentDone = new List<RecentDone>();
+
+        var costByItem = new Dictionary<string, WorkItemCostsDto?>();
+        foreach (var item in costCandidates)
+        {
+            WorkItemCostsDto? costs = null;
+            try { costs = await ApiClient.GetWorkItemCostsAsync(item.Id, ct); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { Logger.LogDebug(ex, "Statistics: costs unavailable for {Id}", item.Id); }
+            costByItem[item.Id] = costs;
+
+            if (costs is null) continue;
+            var t = costs.Totals;
+
+            // Bucket into time windows by the item's last-updated time.
+            foreach (var w in windows)
+            {
+                if (item.UpdatedAt >= w.Since)
+                {
+                    w.InputTokens += t.InputTokens;
+                    w.CachedInputTokens += t.CachedInputTokens;
+                    w.OutputTokens += t.OutputTokens;
+                    w.Usd += t.EstimatedUsd;
+                }
+            }
+
+            // Per-agent breakdown (uses the item's own per-agent cost rows).
+            var isDone = item.State == "Done";
+            foreach (var ba in costs.ByAgent)
+            {
+                var key = ba.Agent + "|" + (ba.ModelId ?? "");
+                if (!agentTotals.TryGetValue(key, out var at))
+                {
+                    at = new AgentTotals { Agent = ba.Agent, ModelId = ba.ModelId };
+                    agentTotals[key] = at;
+                }
+                at.InputTokens += ba.InputTokens;
+                at.CachedInputTokens += ba.CachedInputTokens;
+                at.OutputTokens += ba.OutputTokens;
+                at.Usd += ba.EstimatedUsd;
+                at.ItemCount++;
+                if (isDone) at.DoneCount++;
+            }
+        }
+
+        foreach (var item in recentDoneItems)
+            recentDone.Add(new RecentDone(item, costByItem.GetValueOrDefault(item.Id)));
+
+        _windows = windows.ToList();
+        _agentTotals = agentTotals.Values.ToList();
+        _recentDone = recentDone;
+        _costsLoaded = true;
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private List<KeyValuePair<string, int>> RunningAgents() =>
+        _concurrency is null
+            ? []
+            : _concurrency.CurrentlyRunningPerAgent
+                .Where(kv => kv.Value > 0)
+                .OrderByDescending(kv => kv.Value)
+                .ToList();
+
+    private static string QuotaCss(int pct) =>
+        pct <= 10 ? "budget-full" : pct <= 30 ? "budget-warn" : "";
+
+    private static string FormatReset(DateTimeOffset? at)
+    {
+        if (at is null) return "—";
+        var delta = at.Value - DateTimeOffset.UtcNow;
+        if (delta <= TimeSpan.Zero) return "now";
+        if (delta.TotalHours < 1) return $"{(int)delta.TotalMinutes}m";
+        if (delta.TotalDays < 1) return $"{(int)delta.TotalHours}h {(int)(delta.Minutes)}m";
+        return $"{(int)delta.TotalDays}d {(int)(delta.Hours)}h";
+    }
+
+    private static string FormatDuration(TimeSpan ts)
+    {
+        if (ts < TimeSpan.Zero) return "—";
+        if (ts.TotalSeconds < 60) return $"{(int)ts.TotalSeconds}s";
+        if (ts.TotalMinutes < 60) return $"{(int)ts.TotalMinutes}m {ts.Seconds}s";
+        if (ts.TotalHours < 24) return $"{(int)ts.TotalHours}h {ts.Minutes}m";
+        return $"{(int)ts.TotalDays}d {ts.Hours}h";
+    }
+
+    private sealed class WindowTotals(string label, DateTimeOffset since)
+    {
+        public string Label { get; } = label;
+        public DateTimeOffset Since { get; } = since;
+        public long InputTokens { get; set; }
+        public long CachedInputTokens { get; set; }
+        public long OutputTokens { get; set; }
+        public double Usd { get; set; }
+    }
+
+    private sealed class AgentTotals
+    {
+        public string Agent { get; set; } = "";
+        public string? ModelId { get; set; }
+        public long InputTokens { get; set; }
+        public long CachedInputTokens { get; set; }
+        public long OutputTokens { get; set; }
+        public double Usd { get; set; }
+        public int ItemCount { get; set; }
+        public int DoneCount { get; set; }
+    }
+
+    private sealed record RecentDone(WorkItemDto Item, WorkItemCostsDto? Costs);
+}

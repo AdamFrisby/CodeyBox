@@ -9,14 +9,17 @@
         <NavLink href="/work-items/new">+ New Item</NavLink>
         <NavLink href="/fleet">Fleet</NavLink>
         <NavLink href="/suggestions">
-            Suggestions@if (_openCount > 0)
+            <span>Suggestions</span>
+            @if (_openCount > 0)
             {
                 <span class="nav-badge">@_openCount</span>
             }
         </NavLink>
         <NavLink href="/plugins">Plugins</NavLink>
+        <NavLink href="/statistics">Statistics</NavLink>
         <NavLink href="/releases">
-            Releases@if (_openReleasesCount > 0)
+            <span>Releases</span>
+            @if (_openReleasesCount > 0)
             {
                 <span class="nav-badge">@_openReleasesCount</span>
             }

@@ -401,10 +401,87 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
         return await resp.Content.ReadFromJsonAsync<WorkItemCostsDto>(JsonOptions, ct);
     }
 
+    public async Task<QuotaReportDto?> GetQuotaAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/quota", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<QuotaReportDto>(JsonOptions, ct);
+    }
+
+    public async Task<WorkersStatusDto?> GetWorkersStatusAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/workers/status", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<WorkersStatusDto>(JsonOptions, ct);
+    }
+
+    public async Task<ConcurrencyDto?> GetConcurrencyAsync(CancellationToken ct = default)
+    {
+        var resp = await _http.GetAsync("/concurrency", ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadFromJsonAsync<ConcurrencyDto>(JsonOptions, ct);
+    }
+
     public async Task<List<FleetSummaryDto>> GetFleetSummaryAsync(CancellationToken ct = default)
     {
-        var result = await _http.GetFromJsonAsync<List<FleetSummaryDto>>("/fleet/summary", JsonOptions, ct);
-        return result ?? [];
+        // NOTE: the orchestrator's GET /fleet/summary currently 500s on this DB
+        // (its GetFleetPauseStatesAsync references a column — is_paused — that the
+        // live schema doesn't have). Rather than depend on that broken endpoint,
+        // we reconstruct the same summary shape admin-side from /projects,
+        // /workitems and /queue/status. Per-project pause is not exposed, so we
+        // reflect the GLOBAL queue pause state for every project — consistent with
+        // the Fleet page's existing "pause/resume affects the entire queue" banner.
+        var projects = await GetProjectsAsync(ct);
+        var items = await GetWorkItemsAsync(ct);
+
+        QueueStatusDto? queueStatus = null;
+        try { queueStatus = await GetQueueStatusAsync(ct); }
+        catch (HttpRequestException) { /* non-critical: treat as not-paused */ }
+        catch (TaskCanceledException) { /* non-critical */ }
+        var globallyPaused = queueStatus?.IsPaused ?? false;
+
+        var byProject = items.ToLookup(i => i.ProjectId);
+        var summaries = new List<FleetSummaryDto>(projects.Count);
+        foreach (var project in projects)
+        {
+            var projectItems = byProject[project.Id].ToList();
+
+            var queuedCount = projectItems.Count(i => i.IsQueued);
+            var inFlight = projectItems.Where(i => i.IsInFlight).ToList();
+
+            // Most recently updated in-flight item names the "current phase".
+            var currentPhase = inFlight
+                .OrderByDescending(i => i.UpdatedAt)
+                .Select(i => i.State)
+                .FirstOrDefault();
+
+            // Last 5 terminal outcomes by recency (Done / Failed / Cancelled / …).
+            var recentOutcomes = projectItems
+                .Where(i => i.IsTerminal)
+                .OrderByDescending(i => i.UpdatedAt)
+                .Take(5)
+                .Select(i => i.State)
+                .ToList();
+
+            var hasRecentFailures = recentOutcomes
+                .Count(o => o is "Failed" or "AuditFailed" or "MergeConflictResolutionFailed") >= 3;
+
+            summaries.Add(new FleetSummaryDto
+            {
+                ProjectId = project.Id,
+                DisplayName = project.DisplayName,
+                QueuedCount = queuedCount,
+                InFlightCount = inFlight.Count,
+                CurrentPhase = currentPhase,
+                RecentOutcomes = recentOutcomes,
+                IsPaused = globallyPaused,
+                HasRecentFailures = hasRecentFailures,
+                PausedReason = globallyPaused ? queueStatus?.PausedReason : null,
+                BudgetThresholdState = "unknown",
+            });
+        }
+
+        return summaries;
     }
 
     public async Task<bool> PauseProjectAsync(string projectId, string? reason = null, CancellationToken ct = default)
