@@ -90,12 +90,12 @@ public sealed class BaselineVerificationProbeBuilderTests
     }
 
     [Fact]
-    public void Build_SkipsConfiguredAgentWithNoProbe_RatherThanThrowing()
+    public void Build_ThrowsForConfiguredAgentWithNoProbe_WhenNotExempt()
     {
         // A configured custom agent with no IInVmSmokeProbe (e.g. "aider") has
-        // no first-party verification command we can run. Skip it — failing the
-        // bake on its absence would prevent every Multipass launch for that
-        // configuration.
+        // no first-party verification command we can run. Unless the operator
+        // explicitly exempts it as "no sandbox CLI", fail loudly before a
+        // baseline is baked without any check for that configured runner.
         var opts = new CodeyBoxOptions
         {
             AgentClasses =
@@ -112,10 +112,12 @@ public sealed class BaselineVerificationProbeBuilderTests
             ],
         };
 
-        var probes = BaselineVerificationProbeBuilder.Build(opts, new ProjectsOptions(), AllProbes());
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(opts, new ProjectsOptions(), AllProbes()));
 
-        Assert.Contains(probes, p => p.Label == AgentKind.Claude.Value);
-        Assert.DoesNotContain(probes, p => p.Label == "aider");
+        Assert.Contains("configured agent 'aider'", ex.Message);
+        Assert.Contains("no registered IInVmSmokeProbe", ex.Message);
+        Assert.Contains("ExemptAgentsWithoutProbe", ex.Message);
     }
 
     [Fact]

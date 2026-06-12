@@ -367,6 +367,70 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerificationRunsEveryCommandAndSecondFailurePurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+        var verificationArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+        var multipassArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            baselineVerificationArgv: verificationArgv,
+            failBaselineVerificationWhen: argv => argv.SequenceEqual(["codex", "--version"]),
+            multipassArgv: multipassArgv);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-multiple-verification"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                    new MultipassBaselineVerificationCommand(
+                        "codex",
+                        ["codex", "--version"],
+                        "codex binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command (label 'codex') failed", ex.Message);
+        var recordedVerification = verificationArgv.ToArray();
+        Assert.Equal(2, recordedVerification.Length);
+        Assert.Equal(new[] { "agy", "--version" }, recordedVerification[0]);
+        Assert.Equal(new[] { "codex", "--version" }, recordedVerification[1]);
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+
+        var calls = multipassArgv.ToArray();
+        Assert.Contains(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "agy", "--version"]));
+        Assert.Contains(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "codex", "--version"]));
+        Assert.DoesNotContain(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "stop", baselineName]));
+    }
+
+    [Fact]
     public async Task EnsureBaselineImageAsync_PostBakeVerificationFailure_PurgesPartialBaseline()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -591,6 +655,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         bool failBaselineInstall = false,
         ConcurrentQueue<IReadOnlyList<string>>? baselineVerificationArgv = null,
         bool failBaselineVerification = false,
+        Func<IReadOnlyList<string>, bool>? failBaselineVerificationWhen = null,
         bool failDeletePurge = false,
         bool dropStateOnDeleteAttempt = false,
         ConcurrentQueue<IReadOnlyList<string>>? multipassArgv = null)
@@ -633,9 +698,13 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 && argv[2].StartsWith("cb-baseline-", StringComparison.Ordinal)
                 && argv[3] == "--")
             {
-                baselineVerificationArgv?.Enqueue(argv.Skip(4).ToArray());
-                return Task.FromResult(failBaselineVerification
-                    ? new ProcessRunResult(127, "", "agy: command not found")
+                var commandArgv = argv.Skip(4).ToArray();
+                baselineVerificationArgv?.Enqueue(commandArgv);
+                var verificationFailed =
+                    failBaselineVerification
+                    || (failBaselineVerificationWhen?.Invoke(commandArgv) ?? false);
+                return Task.FromResult(verificationFailed
+                    ? new ProcessRunResult(127, "", commandArgv[0] + ": command not found")
                     : new ProcessRunResult(0, "agy version 1.0.7", ""));
             }
             if (argv is [_, "stop", var stopName])

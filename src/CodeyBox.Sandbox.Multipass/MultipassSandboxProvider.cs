@@ -3174,7 +3174,7 @@ test "$work" = present && test "$exec_wrapper" = present
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("# Rendered by CodeyBox for baseline-bake diagnostics.");
-        sb.AppendLine("# Install commands run via cloud-init runcmd, not from this file.");
+        sb.AppendLine("# Install commands run later via `multipass exec`, not from this file.");
         sb.AppendLine("# Command text is intentionally NOT persisted: install commands can");
         sb.AppendLine("# carry registry tokens / basic-auth URLs / API keys, and this file is");
         sb.AppendLine("# inherited by every cloned (LLM-controlled) agent VM. Each step lists");

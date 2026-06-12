@@ -101,9 +101,9 @@ tool and re-run audit to get enforcement.
 
 Every `AgentKind` registered in an agent class needs its CLI baked into the
 sandbox image. The orchestrator does not install agent binaries; missing
-binaries surface as exit-127 dispatch failures only after the work item
-starts (today's smoke probes verify credentials, not binary presence).
-Bake them at baseline time so the first dispatch can actually run.
+binaries fail the baseline bake during the post-install in-VM verification
+(`--version`) checks for configured agents. Bake them at baseline time so the
+first dispatch can actually run.
 
 ```json
 {

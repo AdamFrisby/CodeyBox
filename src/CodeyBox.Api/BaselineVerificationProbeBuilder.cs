@@ -27,10 +27,9 @@ namespace CodeyBox.Api;
 /// <item>For a configured agent with NO registered probe, fall back to the
 /// operator-controlled exemption list. An agent on that list is the
 /// explicit "no first-party sandbox CLI to verify" escape hatch and is
-/// skipped silently. An agent not on that list and with no probe is also
-/// skipped — there is no command we could run to verify it, and failing the
-/// bake on its absence would prevent every Multipass launch for a custom
-/// runner.</item>
+/// skipped silently. An agent not on that list fails loudly: a configured
+/// CLI-backed runner that cannot be verified must not produce a baseline
+/// that looks ready to clone.</item>
 /// </list>
 ///
 /// <para>The builder still surfaces a hard error when a registered probe has
@@ -95,10 +94,16 @@ internal static class BaselineVerificationProbeBuilder
 
             // No probe registered for this agent. The exempt list expresses
             // "the operator confirms no CLI to verify for this agent" — skip
-            // without failing the bake. Without the exemption we still skip,
-            // because there is no command we could run.
+            // without failing the bake. Without the exemption, fail before
+            // Multipass launches a baseline that would otherwise bypass the
+            // post-bake binary gate entirely.
             if (exempt.Contains(agent))
                 continue;
+
+            throw new InvalidOperationException(
+                $"Baseline verification cannot cover configured agent '{agent}': no registered IInVmSmokeProbe. " +
+                $"Register an IInVmSmokeProbe for '{agent}', or add it to " +
+                "CodeyBox:Smoke:InVm:ExemptAgentsWithoutProbe if it has no sandbox CLI to verify.");
         }
 
         return result;
