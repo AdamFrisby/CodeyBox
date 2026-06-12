@@ -113,8 +113,8 @@ public static class AgentFailureClassifier
     /// response shape, or coding an auth flow — does NOT trip the breaker on
     /// an otherwise healthy agent. Generic substrings like "not logged in"
     /// were intentionally rejected after the auditor flagged them as too
-    /// broad; operators can re-add them per-agent via
-    /// <c>CodeyBox:AuthFailurePatterns</c> if they want a looser default.</para>
+    /// broad. Operator-supplied <c>CodeyBox:AuthFailurePatterns</c> entries are
+    /// matched against stderr, not untrusted model stdout.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> AuthRequiredPatterns = new[]
     {
@@ -442,27 +442,40 @@ public static class AgentFailureClassifier
         if (string.IsNullOrWhiteSpace(stdout))
             return false;
 
-        if (stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `agy login`", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `gemini auth login`", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `agent login`", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `opencode auth login`", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `codex login`", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("run `claude login`", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        return ContainsStandaloneOAuthLoginUrlLine(stdout)
-            || stdout.Split('\n').Any(static line =>
-            {
-                var trimmed = line.Trim();
-                return trimmed.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
-                    || trimmed.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase);
-            });
+        return ContainsTrustedStdoutLoginTranscript(stdout);
     }
+
+    public static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout))
+            return false;
+        if (stdout.Length > 8192)
+            return false;
+
+        var lines = stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+        if (lines.Length == 0 || lines.Length > 8)
+            return false;
+        if (lines.Any(static line => !IsTrustedStdoutLoginTranscriptLine(line)))
+            return false;
+
+        var hasLoginPrompt =
+            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
+        var hasWaitOrTimeout =
+            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
+        return hasLoginPrompt && hasWaitOrTimeout;
+    }
+
+    private static bool IsTrustedStdoutLoginTranscriptLine(string line) =>
+        line.StartsWith("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
+        || line.StartsWith("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase)
+        || line.StartsWith("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
+        || line.StartsWith("Error: authentication timed out", StringComparison.OrdinalIgnoreCase)
+        || line.Equals("authentication timed out", StringComparison.OrdinalIgnoreCase)
+        || IsStandaloneOAuthLoginUrl(line);
 
     private static bool ContainsStandaloneOAuthLoginUrlLine(string? text) =>
         !string.IsNullOrWhiteSpace(text)

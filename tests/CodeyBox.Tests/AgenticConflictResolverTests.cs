@@ -584,6 +584,37 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_Exit0AuthPrompt_DoesNotRetrySameCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 5 }));
+        var runner = new FakeAgentResolverRunner(_ => new AgentResult(
+            true,
+            "ok",
+            "Authentication required. Please visit the URL to log in:\nWaiting for authentication (timeout 30s)...\nError: authentication timed out.",
+            null));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(1, runner.InvocationCount);
+        var authFailure = Assert.Single(result.AuthFailures ?? []);
+        Assert.Same(runner, authFailure.Runner);
+        Assert.True(authFailure.AgentSucceeded);
+        Assert.False(authFailure.ResolutionSucceeded);
+        Assert.Equal(AgentFailureKind.AuthRequired, authFailure.Classification.Kind);
+    }
+
+    [Fact]
     public void PromptShape_NamesEveryConflictFileAndRebaseOperation()
     {
         var prompt = AgenticConflictResolver.BuildAgenticConflictResolverPrompt(

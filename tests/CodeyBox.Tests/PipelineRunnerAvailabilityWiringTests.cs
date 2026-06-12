@@ -677,7 +677,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task StdoutOnlyAuthFragment_WithoutTrustedTranscript_RemainsNormalNoChangesFailure()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -694,17 +694,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Contains("auth required from agent output", final.LastError);
+        Assert.Contains("Agent produced no changes to commit", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.True(availability.Available);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -717,7 +712,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: "Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                https://accounts.google.com/o/oauth2/auth?client_id=redacted
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
             Stderr: null));
 
         var item = NewItem(AgentKind.Codex);
@@ -987,7 +987,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            authExclusionAvailability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, prober),
             terminalTransitions: terminalTransitions,
@@ -1115,7 +1115,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             NullLogger<PipelineRunner>.Instance,
             availability: availability,
-            authExclusionAvailability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, gate, smokeOptions),
             terminalTransitions: terminalTransitions,
@@ -1231,7 +1231,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
                 new GeminiQuotaFailureDetector(),
             }),
             availability: availability,
-            authExclusionAvailability: availability,
+            authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,

@@ -104,18 +104,16 @@ public enum AgenticConflictResolverOperation
 /// carry the candidate and concrete output that caused the terminal resolver
 /// failure. <see cref="LastAttemptedRunner"/> is also populated when at least
 /// one candidate ran so older/custom callers can still bench the specific
-/// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>
-/// (e.g. when a fallback candidate, not the original work runner, emitted a
-/// login prompt). <see cref="AttemptOutputs"/> carries every candidate output
-/// so callers can attribute auth prompts to a losing fallback candidate without
-/// discarding a later successful resolution.
+/// agent whose output is captured in <see cref="Stdout"/>/<see cref="Stderr"/>.
+/// <see cref="AuthFailures"/> carries narrow auth/login-prompt evidence so
+/// callers can bench the exact failed candidate without exposing every
+/// candidate's raw output through the public result API.
 /// </summary>
-public sealed record AgenticConflictResolverAttemptOutput(
+public sealed record AgenticConflictResolverAuthFailureEvidence(
     IAgentRunner Runner,
-    string? Stdout,
-    string? Stderr,
     bool AgentSucceeded,
-    bool ResolutionSucceeded);
+    bool ResolutionSucceeded,
+    AgentFailureClassification Classification);
 
 public sealed record AgenticConflictResolverResult(
     bool Success,
@@ -127,7 +125,7 @@ public sealed record AgenticConflictResolverResult(
     string? Stdout,
     string? Stderr,
     IAgentRunner? LastAttemptedRunner = null,
-    IReadOnlyList<AgenticConflictResolverAttemptOutput>? AttemptOutputs = null)
+    IReadOnlyList<AgenticConflictResolverAuthFailureEvidence>? AuthFailures = null)
 {
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
@@ -185,12 +183,14 @@ public sealed class AgenticConflictResolver
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
     private readonly IAgentSupervisionService? _agentSupervision;
+    private readonly IAgentAuthFailureClassifier _authFailureClassifier;
 
     public AgenticConflictResolver(
         AgenticConflictResolverOptionsSnapshot? options = null,
         ILogger<AgenticConflictResolver>? log = null,
         Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null,
-        IAgentSupervisionService? agentSupervision = null)
+        IAgentSupervisionService? agentSupervision = null,
+        IAgentAuthFailureClassifier? authFailureClassifier = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
@@ -203,6 +203,7 @@ public sealed class AgenticConflictResolver
         // which most agent CLIs also accept.
         _credentialFileMaterialiser = credentialFileMaterialiser;
         _agentSupervision = agentSupervision;
+        _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
     }
 
     /// <summary>
@@ -218,7 +219,8 @@ public sealed class AgenticConflictResolver
         WorkItemId workItemId,
         AgenticConflictResolverContext context,
         IReadOnlyList<AgenticConflictResolverCandidate> candidates,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback = null)
     {
         if (sandbox is null) throw new ArgumentNullException(nameof(sandbox));
         if (string.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory must be non-empty", nameof(workingDirectory));
@@ -238,7 +240,7 @@ public sealed class AgenticConflictResolver
                 IterationsUsed: 0,
                 Stdout: null,
                 Stderr: null,
-                AttemptOutputs: []);
+                AuthFailures: []);
         }
 
         foreach (var file in conflictFiles)
@@ -251,7 +253,7 @@ public sealed class AgenticConflictResolver
         var triedStrongest = false;
 
         var attemptTrail = new List<string>();
-        var attemptOutputs = new List<AgenticConflictResolverAttemptOutput>();
+        var authFailures = new List<AgenticConflictResolverAuthFailureEvidence>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
         IAgentRunner? lastAttemptedRunner = null;
@@ -422,12 +424,6 @@ public sealed class AgenticConflictResolver
                         stderrTail: RedactAuditTail(ex.LastResult.Stderr));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
-                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
-                        runner,
-                        ex.LastResult.Stdout,
-                        ex.LastResult.Stderr,
-                        AgentSucceeded: false,
-                        ResolutionSucceeded: false));
                     lastAgentResult = ex.LastResult;
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
                     break;
@@ -443,12 +439,6 @@ public sealed class AgenticConflictResolver
                         $"threw {ex.GetType().Name}: {RedactText(ex.Message)}",
                         stdoutTail: null,
                         stderrTail: RedactAuditTail(ex.ToString()));
-                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
-                        runner,
-                        Stdout: null,
-                        Stderr: ex.ToString(),
-                        AgentSucceeded: false,
-                        ResolutionSucceeded: false));
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {RedactAndTruncate(ex.Message, 200)})");
                     RecordFailureForClassification(
                         runner,
@@ -473,6 +463,43 @@ public sealed class AgenticConflictResolver
                 }
 
                 lastAgentResult = agentResult;
+                var authEvidence = await TryRecordAuthFailureAsync(
+                    runner,
+                    agentResult,
+                    agentSucceeded: agentResult.Success,
+                    resolutionSucceeded: false,
+                    authFailures,
+                    authFailureCallback,
+                    ct);
+                if (authEvidence is not null)
+                {
+                    var authReason = authEvidence.Classification.Reason ?? "auth/login prompt matched";
+                    _log.LogWarning(
+                        "Agentic conflict resolver: agent '{Agent}' emitted auth/login prompt on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}); skipping remaining attempts for this candidate",
+                        runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                    AuditLog.AgenticConflictResolverAttemptFailed(
+                        workItemId, runner.Kind, sandbox.Id, workingDirectory,
+                        attempt, maxIterations,
+                        $"auth required: {authReason}",
+                        stdoutTail: RedactAuditTail(agentResult.Stdout),
+                        stderrTail: RedactAuditTail(agentResult.Stderr));
+                    attemptTrail.Add($"{runner.Kind.Value}#{attempt}(auth required: {Truncate(authReason, 120)})");
+                    lastFailureRunner = runner;
+                    lastFailureCredential = candidate.Credential;
+                    lastFailureClassificationResult = new AgentResult(
+                        false,
+                        $"auth required: {authReason}",
+                        agentResult.Stdout,
+                        agentResult.Stderr);
+                    lastVerificationError = $"auth required: {authReason}";
+                    // Auth/login prompts are infrastructure evidence, not a
+                    // failed merge edit. Do not let one unauthenticated candidate
+                    // consume the global resolution-attempt budget before a
+                    // fallback candidate can try the conflicted tree.
+                    totalIterations = Math.Max(0, totalIterations - 1);
+                    break;
+                }
+
                 if (!agentResult.Success)
                 {
                     // Bumped to Warning + full stdout/stderr capture: the prior
@@ -497,12 +524,6 @@ public sealed class AgenticConflictResolver
                         redactedSummary,
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
                         stderrTail: RedactAuditTail(agentResult.Stderr));
-                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
-                        runner,
-                        agentResult.Stdout,
-                        agentResult.Stderr,
-                        AgentSucceeded: false,
-                        ResolutionSucceeded: false));
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {RedactAndTruncate(agentResult.Summary, 120)}; stderr: {RedactAndTruncate(agentResult.Stderr, 200)})");
                     RecordFailureForClassification(runner, candidate.Credential, agentResult, allowTransientBackoff: true);
@@ -513,12 +534,6 @@ public sealed class AgenticConflictResolver
                     sandbox, workingDirectory, conflictFiles, options, ct);
                 if (verification.Success)
                 {
-                    attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
-                        runner,
-                        agentResult.Stdout,
-                        agentResult.Stderr,
-                        AgentSucceeded: true,
-                        ResolutionSucceeded: true));
                     return new AgenticConflictResolverResult(
                         Success: true,
                         Summary: $"resolved by '{runner.Kind.Value}' on attempt {attempt}/{maxAttemptsPerAgent}",
@@ -529,26 +544,20 @@ public sealed class AgenticConflictResolver
                         Stdout: agentResult.Stdout,
                         Stderr: agentResult.Stderr,
                         LastAttemptedRunner: runner,
-                        AttemptOutputs: attemptOutputs.ToArray());
+                        AuthFailures: authFailures.ToArray());
                 }
 
                 lastVerificationError = verification.Reason;
                 var redactedVerificationReason = RedactText(verification.Reason);
                 attemptTrail.Add($"{runner.Kind.Value}#{attempt}({Truncate(redactedVerificationReason, 200)})");
-                attemptOutputs.Add(new AgenticConflictResolverAttemptOutput(
-                    runner,
-                    agentResult.Stdout,
-                    agentResult.Stderr,
-                    AgentSucceeded: true,
-                    ResolutionSucceeded: false));
                 RecordFailureForClassification(
                     runner,
                     candidate.Credential,
                     new AgentResult(
                         false,
                         verification.Reason,
-                        Stdout: agentResult.Stdout,
-                        Stderr: agentResult.Stderr),
+                        Stdout: null,
+                        Stderr: null),
                     allowTransientBackoff: false);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
@@ -576,7 +585,7 @@ public sealed class AgenticConflictResolver
             Stdout: lastAgentResult?.Stdout,
             Stderr: lastAgentResult?.Stderr,
             LastAttemptedRunner: lastAttemptedRunner,
-            AttemptOutputs: attemptOutputs.ToArray())
+            AuthFailures: authFailures.ToArray())
         {
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,
@@ -615,6 +624,33 @@ public sealed class AgenticConflictResolver
                 Source: "agentic-conflict-resolver"),
             ct);
     }
+
+    private async Task<AgenticConflictResolverAuthFailureEvidence?> TryRecordAuthFailureAsync(
+        IAgentRunner runner,
+        AgentResult agentResult,
+        bool agentSucceeded,
+        bool resolutionSucceeded,
+        List<AgenticConflictResolverAuthFailureEvidence> authFailures,
+        Func<AgenticConflictResolverAuthFailureEvidence, CancellationToken, Task>? authFailureCallback,
+        CancellationToken ct)
+    {
+        var classification = _authFailureClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
+        if (classification is null || classification.Kind != AgentFailureKind.AuthRequired)
+            return null;
+
+        var evidence = new AgenticConflictResolverAuthFailureEvidence(
+            runner,
+            agentSucceeded,
+            resolutionSucceeded,
+            classification);
+        authFailures.Add(evidence);
+
+        if (authFailureCallback is not null)
+            await authFailureCallback(evidence, ct);
+
+        return evidence;
+    }
+
 
     internal sealed record VerificationOutcome(bool Success, string Reason);
 

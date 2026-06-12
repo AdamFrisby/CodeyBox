@@ -12,15 +12,16 @@ public interface IAgentAuthFailureClassifier
 {
     /// <summary>
     /// Returns an <see cref="AgentFailureKind.AuthRequired"/> classification
-    /// when stderr/stdout contains a configured login-prompt signature.
+    /// when stderr contains a configured/default login-prompt signature, or
+    /// stdout contains a trusted CLI login transcript shape.
     /// </summary>
     AgentFailureClassification? Detect(AgentKind kind, string? stderr, string? stdout);
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
-    /// the evidence. Runtime breaker policy treats a configured/default auth
-    /// signature on either stream as authoritative, but the detailed shape
-    /// remains useful for tests and diagnostics.
+    /// the evidence. Stderr is treated as CLI diagnostics and matched by
+    /// substring; stdout is model-controlled for many agents, so only compact
+    /// trusted login transcripts are authoritative there.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }
@@ -66,7 +67,7 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             return null;
 
         var matchedStderr = AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr);
-        var matchedDefaultStdout = AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout);
+        var matchedDefaultStdout = false;
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalPatternsFor(kind))
@@ -80,14 +81,13 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
                 matchedStderr = true;
             }
 
-            if (!string.IsNullOrEmpty(stdout)
-                && stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
-            {
-                matchedConfiguredStdout = true;
-            }
+            // Operator-supplied substrings are intentionally stderr-only.
+            // Agent stdout can be model-produced task text, so a malicious work
+            // item could otherwise make a healthy agent print the configured
+            // phrase and trip the global auth breaker.
         }
 
-        var matchedTrustedStdoutTranscript = ContainsTrustedStdoutLoginTranscript(stdout);
+        var matchedTrustedStdoutTranscript = AgentFailureClassifier.ContainsTrustedStdoutLoginTranscript(stdout);
         var matchedStdout = matchedDefaultStdout || matchedConfiguredStdout || matchedTrustedStdoutTranscript;
 
         if (matchedStderr || matchedStdout)
@@ -116,20 +116,6 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             foreach (var pattern in exact)
                 yield return pattern;
         }
-    }
-
-    private static bool ContainsTrustedStdoutLoginTranscript(string? stdout)
-    {
-        if (string.IsNullOrWhiteSpace(stdout))
-            return false;
-
-        var hasLoginPrompt =
-            stdout.Contains("Authentication required. Please visit", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("Please visit the URL to log in", StringComparison.OrdinalIgnoreCase);
-        var hasWaitOrTimeout =
-            stdout.Contains("Waiting for authentication (timeout", StringComparison.OrdinalIgnoreCase)
-            || stdout.Contains("authentication timed out", StringComparison.OrdinalIgnoreCase);
-        return hasLoginPrompt && hasWaitOrTimeout;
     }
 }
 

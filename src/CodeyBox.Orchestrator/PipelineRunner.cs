@@ -283,7 +283,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         ProjectMechanicalFixerComposer? mechanicalFixerComposer = null,
         IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        ISmokeAvailabilityRegistry? authExclusionAvailability = null,
         IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         _sandboxes = sandboxes;
@@ -359,7 +358,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _availability = availability;
         _authAvailability = authAvailability
-            ?? authExclusionAvailability as IAgentAuthAvailabilityRegistry
             ?? availability as IAgentAuthAvailabilityRegistry;
         _dispatchAvailability = dispatchAvailability;
         _agentPauses = agentPauseController;
@@ -396,7 +394,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _agenticConflictResolver = agenticConflictResolver
             ?? new AgenticConflictResolver(
                 credentialFileMaterialiser: MaterialiseCredentialFilesAsync,
-                agentSupervision: _agentSupervision);
+                agentSupervision: _agentSupervision,
+                authFailureClassifier: _authFailureClassifier);
         _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
@@ -2438,7 +2437,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ProjectId = project.Id,
                     },
                     candidates,
-                    ct);
+                    ct,
+                    (evidence, callbackCt) => HandleAgenticResolverAuthRequiredEvidenceAsync(
+                        item, project, "rebase-resolver", evidence, callbackCt));
 
                 foreach (var path in resolveResult.ConflictFiles)
                     conflictFiles.Add(path);
@@ -2508,9 +2509,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
                 }, CancellationToken.None);
-                // Routing, pause, quota, and transient failures are not merge
-                // conflict failures — let them propagate so the catch in
-                // RunAsync preserves the classified work-item outcome.
+                // Routing, auth, pause, quota, and transient failures are not
+                // merge conflict failures — let them propagate so RunAsync
+                // preserves the classified work-item outcome instead of
+                // overwriting them as MergeConflictResolutionFailed.
                 if (ex is MergeConflictResolutionFailedException
                     or AgentUnavailableException
                     or AgentPausedException
@@ -5248,8 +5250,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
             return false;
 
+        return await HandleAuthRequiredDetectionAsync(
+            item,
+            project,
+            agent,
+            phase,
+            detection.Classification,
+            throwOnMatch);
+    }
+
+    private async Task<bool> HandleAuthRequiredDetectionAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentFailureClassification classification,
+        bool throwOnMatch)
+    {
+        if (classification.Kind != AgentFailureKind.AuthRequired)
+            return false;
+
         var reason = SingleLineSummary(
-            $"auth required from agent output during {phase}: {detection.Classification.Reason ?? "login prompt matched"}");
+            $"auth required from agent output during {phase}: {classification.Reason ?? "login prompt matched"}");
         AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
 
         // AuthRequired is intentionally outside the smoke-gate taxonomy:
@@ -5309,31 +5331,47 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string phase,
         AgenticConflictResolverResult result)
     {
-        var attempts = result.AttemptOutputs ?? [];
-        if (attempts.Count == 0)
+        var authFailures = result.AuthFailures ?? [];
+        if (authFailures.Count == 0)
         {
             var emittingAgent = result.LastAttemptedRunner?.Kind ?? result.ChosenRunner?.Kind ?? item.Agent ?? project.DefaultAgent;
             await ThrowIfAuthRequiredOutputAsync(item, project, emittingAgent, phase, result.Stdout, result.Stderr);
             return;
         }
 
-        foreach (var attempt in attempts)
+        foreach (var failure in authFailures)
         {
             // If the resolver ultimately succeeded, a failed earlier candidate's
             // login prompt should bench that candidate and alert the operator,
             // but it should not discard the fallback's valid resolution. A login
             // prompt from the winning attempt, or any auth prompt in an overall
             // failed resolver, remains a hard infrastructure failure.
-            var throwOnMatch = !result.Success || attempt.ResolutionSucceeded;
-            await HandleAuthRequiredOutputAsync(
+            var throwOnMatch = !result.Success || failure.ResolutionSucceeded;
+            await HandleAuthRequiredDetectionAsync(
                 item,
                 project,
-                attempt.Runner.Kind,
+                failure.Runner.Kind,
                 phase,
-                attempt.Stdout,
-                attempt.Stderr,
+                failure.Classification,
                 throwOnMatch);
         }
+    }
+
+    private Task HandleAgenticResolverAuthRequiredEvidenceAsync(
+        WorkItem item,
+        Project project,
+        string phase,
+        AgenticConflictResolverAuthFailureEvidence evidence,
+        CancellationToken ct)
+    {
+        _ = ct;
+        return HandleAuthRequiredDetectionAsync(
+            item,
+            project,
+            evidence.Runner.Kind,
+            phase,
+            evidence.Classification,
+            throwOnMatch: false);
     }
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
@@ -10625,7 +10663,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             ProjectId = project.Id,
                         },
                         candidates,
-                        ct);
+                        ct,
+                        (evidence, callbackCt) => HandleAgenticResolverAuthRequiredEvidenceAsync(
+                            item, project, "merge-resolver", evidence, callbackCt));
                     await HandleAgenticResolverAuthRequiredOutputAsync(
                         item, project, "merge-resolver", resolverResult);
                     agentResult = new AgentResult(

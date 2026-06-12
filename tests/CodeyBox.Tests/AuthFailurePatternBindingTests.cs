@@ -41,7 +41,7 @@ public sealed class AuthFailurePatternBindingTests
     }
 
     [Fact]
-    public void Build_AppliesAdditionalPerAgentPattern_ToStdout()
+    public void Build_DoesNotApplyAdditionalPerAgentPattern_ToStdout()
     {
         var classifier = BindAndBuild(new Dictionary<string, string?>
         {
@@ -53,9 +53,7 @@ public sealed class AuthFailurePatternBindingTests
             stderr: null,
             stdout: "stdout says: needs login");
 
-        Assert.NotNull(hit);
-        Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
-        Assert.True(hit.IsStdoutOnly);
+        Assert.Null(hit);
         Assert.Null(classifier.Detect(AgentKind.Codex, stderr: null, stdout: "stdout says: needs login"));
     }
 

@@ -593,6 +593,54 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task DefaultActivitySource_RunnableProcessOnInitialConfirmation_CountsAsProgress()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var itemId = WorkItemId.New();
+        var source = new DefaultWorkerProgressActivitySource(ScriptedCpuSamples(
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1)));
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+
+        var activity = await source.ObserveAsync(
+            WorkerForItem("runnable-initial-test", itemId),
+            itemId,
+            probe,
+            CancellationToken.None);
+
+        Assert.NotNull(activity);
+        Assert.Equal("process-cpu", activity!.Reason);
+    }
+
+    [Fact]
+    public async Task DefaultActivitySource_RunnableProcessWithoutCpuDelta_CountsAsProgress()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var itemId = WorkItemId.New();
+        var source = new DefaultWorkerProgressActivitySource(ScriptedCpuSamples(
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 0),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 0),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(10, "pid:1", 1)));
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+        var worker = WorkerForItem("runnable-later-test", itemId);
+
+        var baseline = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        var runnable = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+
+        Assert.Null(baseline);
+        Assert.NotNull(runnable);
+        Assert.Equal("process-cpu", runnable!.Reason);
+    }
+
+    [Fact]
     public async Task DefaultActivitySource_IdleWorkItemProcess_DoesNotReportCpuDelta()
     {
         if (!OperatingSystem.IsLinux())
@@ -1524,6 +1572,23 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         LastHeartbeatAt = DateTimeOffset.UtcNow,
         CurrentWorkItemId = itemId.ToString(),
     };
+
+    private static DefaultWorkerProgressActivitySource.TryReadProcessCpuSample ScriptedCpuSamples(
+        params DefaultWorkerProgressActivitySource.ProcessCpuSample[] samples)
+    {
+        var queue = new Queue<DefaultWorkerProgressActivitySource.ProcessCpuSample>(samples);
+        return (WorkItemId _, out DefaultWorkerProgressActivitySource.ProcessCpuSample sample) =>
+        {
+            if (queue.Count == 0)
+            {
+                sample = default;
+                return false;
+            }
+
+            sample = queue.Dequeue();
+            return true;
+        };
+    }
 
     private static async Task<WorkerProgressActivity?> WaitForActivityAsync(
         IWorkerProgressActivitySource source,

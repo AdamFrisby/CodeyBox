@@ -2405,7 +2405,6 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mechanicalFixerComposer: sp.GetRequiredService<ProjectMechanicalFixerComposer>(),
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
-    authExclusionAvailability: sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
@@ -3741,9 +3740,11 @@ namespace CodeyBox.Api
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
-        /// Operator-extensible per-agent auth/login-prompt stdout/stderr patterns.
+        /// Operator-extensible per-agent auth/login-prompt stderr patterns.
         /// Keys are agent kind values (e.g. <c>antigravity</c>); each entry adds
-        /// a case-insensitive substring to the built-in login-prompt detector.
+        /// a case-insensitive stderr substring to the built-in login-prompt
+        /// detector. Stdout remains restricted to trusted transcript shapes
+        /// because it can contain model-produced task text.
         /// </summary>
         public Dictionary<string, List<AuthFailurePatternOptions>> AuthFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -4762,13 +4763,12 @@ namespace CodeyBox.Api
 
     /// <summary>
     /// One operator-supplied auth/login-prompt pattern entry. Appended to the
-    /// built-in defaults and matched against stderr and stdout substring
-    /// case-insensitively. Bound from
+    /// built-in defaults and matched against stderr case-insensitively. Bound from
     /// <c>CodeyBox:AuthFailurePatterns:&lt;agent-kind&gt;</c>.
     /// </summary>
     public sealed class AuthFailurePatternOptions
     {
-        /// <summary>The substring to search for in stderr/stdout.</summary>
+        /// <summary>The substring to search for in stderr.</summary>
         public string Pattern { get; set; } = string.Empty;
     }
 

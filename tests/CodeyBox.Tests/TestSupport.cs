@@ -275,7 +275,7 @@ internal static class TestSupport
             pipelineTuning: pipelineTuning,
             taskQueue: queue,
             availability: availabilityRegistry,
-            authExclusionAvailability: availabilityRegistry,
+            authAvailability: availabilityRegistry,
             involvement: involvement,
             requiredBuildVerifier: requiredBuildVerifier ?? new SandboxRequiredBuildVerifier(
                 sandboxes,

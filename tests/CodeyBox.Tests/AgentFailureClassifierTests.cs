@@ -109,10 +109,10 @@ public sealed class AgentFailureClassifierTests
     [InlineData("https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
     [InlineData("http://localhost:3000/oauth-callback?code=redacted")]
     [InlineData("Error: authentication timed out.")]
-    public void LoginPromptPatterns_InStdout_Classified_AsAuthRequired(string snippet)
+    public void LoginPromptFragments_InStdout_NotClassified_AsAuthRequired(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
-        Assert.Equal(AgentFailureKind.AuthRequired, c.Kind);
+        Assert.NotEqual(AgentFailureKind.AuthRequired, c.Kind);
     }
 
     [Theory]
@@ -146,24 +146,20 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.AuthRequired, detection.Classification.Kind);
         Assert.True(detection.IsStdoutOnly);
         Assert.True(detection.MatchedTrustedStdoutTranscript);
-        Assert.True(detection.MatchedDefaultStdoutPattern);
+        Assert.False(detection.MatchedDefaultStdoutPattern);
     }
 
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    public void AgentAuthFailureClassifier_DetectsDefaultStdoutPatterns_InStdout(string snippet)
+    public void AgentAuthFailureClassifier_DoesNotDetectDefaultFragments_InStdout(string snippet)
     {
         var detection = new AgentAuthFailureClassifier().DetectDetailed(
             AgentKind.Opencode,
             stderr: null,
             stdout: snippet);
 
-        Assert.NotNull(detection);
-        Assert.True(detection.IsStdoutOnly);
-        Assert.True(detection.MatchedDefaultStdoutPattern);
-        Assert.False(detection.MatchedTrustedStdoutTranscript);
-        Assert.False(detection.MatchedConfiguredStdoutPattern);
+        Assert.Null(detection);
     }
 
     [Theory]
@@ -195,7 +191,7 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public void AgentAuthFailureClassifier_HonorsPerAgentConfiguredPatternsInStdout()
+    public void AgentAuthFailureClassifier_DoesNotMatchPerAgentConfiguredPatternsInStdout()
     {
         var classifier = new AgentAuthFailureClassifier(
             new Dictionary<string, IReadOnlyList<AuthFailurePattern>>(StringComparer.OrdinalIgnoreCase)
@@ -208,10 +204,7 @@ public sealed class AgentFailureClassifierTests
             stderr: null,
             stdout: "stdout-only login ceremony required");
 
-        Assert.NotNull(hit);
-        Assert.Equal(AgentFailureKind.AuthRequired, hit.Classification.Kind);
-        Assert.True(hit.IsStdoutOnly);
-        Assert.True(hit.MatchedConfiguredStdoutPattern);
+        Assert.Null(hit);
         Assert.Null(classifier.Detect(
             AgentKind.Codex,
             stderr: null,
@@ -352,6 +345,7 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(3, (int)AgentFailureKind.AuthError);
         Assert.Equal(4, (int)AgentFailureKind.Unknown);
         Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
+        Assert.Equal(6, (int)AgentFailureKind.AuthRequired);
     }
 
     [Theory]
