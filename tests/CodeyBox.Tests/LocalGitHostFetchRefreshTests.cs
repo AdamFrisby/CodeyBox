@@ -590,12 +590,12 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
 
         var id = WorkItemId.New();
         var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
-        
+
         var access = gitHost.GetSandboxAccess(repoId);
-        
+
         // There should be two mounts: one writable for repo itself, and one read-only for mirror
         Assert.Equal(2, access.Mounts.Count);
-        
+
         var writableRepoMount = access.Mounts.Single(m => !m.ReadOnly);
         Assert.Equal("/repo", writableRepoMount.SandboxPath);
         Assert.Equal(gitHost.GetRepoPath(repoId), writableRepoMount.HostPath);
@@ -635,6 +635,78 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         await gitHost.FetchUpstreamBranchAsync(repoId, seed, "main", new Dictionary<string, string>());
 
         // Verify that the untrusted path was removed
+        var lines = await File.ReadAllLinesAsync(alternatesPath);
+        Assert.Single(lines);
+        Assert.Equal(validPath, lines[0].Trim());
+    }
+
+    [Fact]
+    public async Task GetSandboxAccess_IgnoresModifiedAlternatesFile()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var alternatesPath = Path.Combine(barePath, "objects", "info", "alternates");
+
+        var validPath = (await File.ReadAllLinesAsync(alternatesPath))[0].Trim();
+        var otherMirrorPath = Path.GetFullPath(Path.Combine(mirrorDir, "other-mirror.git", "objects"));
+
+        // Overwrite alternates file with the other mirror path
+        await File.WriteAllLinesAsync(alternatesPath, [otherMirrorPath]);
+
+        // Request sandbox access
+        var access = gitHost.GetSandboxAccess(repoId);
+
+        // Verify that only the original valid mirror path is mounted, not otherMirrorPath!
+        var roMirrorMount = access.Mounts.Single(m => m.ReadOnly);
+        Assert.Equal(validPath, roMirrorMount.HostPath);
+        Assert.NotEqual(otherMirrorPath, roMirrorMount.HostPath);
+    }
+
+    [Fact]
+    public async Task SanitizeAlternates_DiscardsPathsNotInMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var alternatesPath = Path.Combine(barePath, "objects", "info", "alternates");
+
+        var validPath = (await File.ReadAllLinesAsync(alternatesPath))[0].Trim();
+        var otherMirrorPath = Path.GetFullPath(Path.Combine(mirrorDir, "other-mirror.git", "objects"));
+
+        // Overwrite alternates file with both valid path and other mirror path (which starts with mirrorDir but is not in metadata)
+        await File.WriteAllLinesAsync(alternatesPath, [validPath, otherMirrorPath]);
+
+        // Run any git command to trigger SanitizeAlternates
+        await gitHost.FetchUpstreamBranchAsync(repoId, seed, "main", new Dictionary<string, string>());
+
+        // Verify that otherMirrorPath was removed because it's not in metadata
         var lines = await File.ReadAllLinesAsync(alternatesPath);
         Assert.Single(lines);
         Assert.Equal(validPath, lines[0].Trim());
