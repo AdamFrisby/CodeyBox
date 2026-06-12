@@ -25,6 +25,12 @@ public sealed class IndexPageTests : TestContext
         QueuePosition = 1,
     };
 
+    // The Index page defaults to the "Active" tab (Working/Auditing/…). Single-item
+    // tests use Queued/Failed/etc. which live under other tabs, so select "All"
+    // (which shows every item regardless of state) before asserting on the table.
+    private static void SelectAllTab(IRenderedComponent<IndexPage> cut) =>
+        cut.FindAll("button[role='tab']").Single(b => b.TextContent.Contains("All")).Click();
+
     [Fact]
     public void Index_RendersTableWhenItemsExist()
     {
@@ -32,6 +38,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         Assert.Contains("Task A", cut.Markup);
         Assert.Contains("queue-table", cut.Markup);
@@ -45,6 +52,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         // Short ID is first 8 chars
         Assert.Contains("aabbccdd", cut.Markup);
@@ -74,6 +82,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         Assert.Contains("Alpha", cut.Markup);
         Assert.Contains("Beta", cut.Markup);
@@ -87,6 +96,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         // Edit link present for queued items
         Assert.Contains("edit", cut.Markup);
@@ -114,6 +124,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         Assert.Contains("retry", cut.Markup);
     }

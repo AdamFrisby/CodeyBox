@@ -2420,9 +2420,9 @@ public sealed class AgentConfigHotReloadTests
         var argv = sandbox.CapturedExec!.Argv.ToList();
         var reqIdx = argv.IndexOf("-c");
         Assert.True(reqIdx >= 0);
-        AssertCodexConfigOverride(argv, "model_providers.openai.request_max_retries=5");
-        AssertCodexConfigOverride(argv, "model_providers.openai.stream_max_retries=6");
-        AssertCodexConfigOverride(argv, "model_providers.openai.stream_idle_timeout_ms=120000");
+        AssertCodexConfigOverride(argv, "request_max_retries=5");
+        AssertCodexConfigOverride(argv, "stream_max_retries=6");
+        AssertCodexConfigOverride(argv, "stream_idle_timeout_ms=120000");
 
         // Hot-reload: swap to different tolerance values.
         var updatedTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2441,9 +2441,9 @@ public sealed class AgentConfigHotReloadTests
         await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
 
         var argv2 = sandbox2.CapturedExec!.Argv.ToList();
-        AssertCodexConfigOverride(argv2, "model_providers.openai.request_max_retries=10");
-        AssertCodexConfigOverride(argv2, "model_providers.openai.stream_max_retries=12");
-        AssertCodexConfigOverride(argv2, "model_providers.openai.stream_idle_timeout_ms=240000");
+        AssertCodexConfigOverride(argv2, "request_max_retries=10");
+        AssertCodexConfigOverride(argv2, "stream_max_retries=12");
+        AssertCodexConfigOverride(argv2, "stream_idle_timeout_ms=240000");
 
         // Verify custom provider works
         var providerTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2474,8 +2474,8 @@ public sealed class AgentConfigHotReloadTests
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
         var argv = sandbox.CapturedExec!.Argv.ToList();
-        AssertCodexConfigOverride(argv, "model_providers.openai.request_max_retries=8");
-        AssertCodexConfigOverride(argv, "model_providers.openai.stream_max_retries=15");
+        AssertCodexConfigOverride(argv, "request_max_retries=8");
+        AssertCodexConfigOverride(argv, "stream_max_retries=15");
         Assert.DoesNotContain(argv, arg => arg.Contains("stream_idle_timeout_ms", StringComparison.Ordinal));
     }
 
@@ -2493,8 +2493,8 @@ public sealed class AgentConfigHotReloadTests
         await requestOnlyRunner.RunAsync(requestOnlySandbox, "/work", "prompt", credential: null);
 
         var requestOnlyArgv = requestOnlySandbox.CapturedExec!.Argv.ToList();
-        AssertCodexConfigOverride(requestOnlyArgv, "model_providers.openai.request_max_retries=11");
-        AssertCodexConfigOverride(requestOnlyArgv, "model_providers.openai.stream_max_retries=15");
+        AssertCodexConfigOverride(requestOnlyArgv, "request_max_retries=11");
+        AssertCodexConfigOverride(requestOnlyArgv, "stream_max_retries=15");
 
         var streamOnlySnapshot = new AgentNetworkToleranceSnapshot(
             new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2507,8 +2507,8 @@ public sealed class AgentConfigHotReloadTests
         await streamOnlyRunner.RunAsync(streamOnlySandbox, "/work", "prompt", credential: null);
 
         var streamOnlyArgv = streamOnlySandbox.CapturedExec!.Argv.ToList();
-        AssertCodexConfigOverride(streamOnlyArgv, "model_providers.openai.request_max_retries=8");
-        AssertCodexConfigOverride(streamOnlyArgv, "model_providers.openai.stream_max_retries=12");
+        AssertCodexConfigOverride(streamOnlyArgv, "request_max_retries=8");
+        AssertCodexConfigOverride(streamOnlyArgv, "stream_max_retries=12");
     }
 
     [Fact]
