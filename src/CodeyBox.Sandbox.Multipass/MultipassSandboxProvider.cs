@@ -373,6 +373,22 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 await StartAndWaitForRunningAsync(opts, name, workItemId, ct);
             }
 
+            // Native (virtiofs) mounts are registered while the VM is
+            // Stopped, but multipass returns from `start` as soon as
+            // QEMU is Running — the guest-side mount attach can lag by
+            // seconds under audit-parallelism load. Without this gate
+            // the first in-VM mount consumer (typically
+            // `git clone /repo /work` on the work-item pickup path)
+            // races the attach and exits 128 with
+            // "fatal: repository '/repo' does not exist". Poll each
+            // declared bind mount inside the VM before handing the
+            // sandbox back to the pipeline.
+            await using (var readinessScope = await TimingScope.BeginAsync(
+                timingStore, timingItemId, timingPhase, "vm.mount-readiness", log: _log))
+            {
+                await WaitForMountsVisibleAsync(opts, name, bindMounts, workItemId, ct);
+            }
+
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
             // The exec wrapper is installed by cloud-init at boot
@@ -2428,6 +2444,112 @@ test "$work" = present && test "$exec_wrapper" = present
             }
         }
         await WaitForRunningAsync(opts, name, workItemId, ct);
+    }
+
+    // Mount-readiness retry budget. Up to 10 attempts with linear backoff
+    // (500ms * attempt) bounds the wait at ~22s per mount — comfortably
+    // longer than the observed virtiofs attach lag under audit-parallelism
+    // load, short enough that a genuinely broken mount surfaces as a
+    // retryable deferred long before the work item's outer time budget.
+    internal const int MountReadinessMaxAttempts = 10;
+    internal static TimeSpan MountReadinessAttemptBackoff(int attempt) =>
+        TimeSpan.FromMilliseconds(500 * attempt);
+
+    /// <summary>
+    /// Verifies that every declared bind mount on <paramref name="binds"/>
+    /// is actually visible inside the just-started VM. Multipass returns
+    /// from <c>start</c> as soon as the VM is in Running state, but a
+    /// native (virtiofs) mount registered while the VM was Stopped can
+    /// take additional seconds to attach to the guest filesystem under
+    /// audit-parallelism load — same class of attach-lag race that
+    /// motivates the <see cref="TransferEnvAsync"/> SCP/SFTP retry budget.
+    /// Without this gate the first consumer of the mount (most commonly
+    /// <c>git clone /repo /work</c>) sees a missing <c>/repo</c> and the
+    /// work item fails terminally with exit 128.
+    ///
+    /// <para>The probe is <c>multipass exec &lt;vm&gt; -- test -e
+    /// &lt;path&gt;</c>. For the bare-repo mount specifically
+    /// (<c>/repo</c>), a content probe (<c>test -e /repo/HEAD</c>) is used
+    /// rather than the mountpoint itself: a stale mountpoint directory can
+    /// exist on the guest filesystem even when the virtiofs mount has not
+    /// yet attached, so requiring <c>HEAD</c> is a strictly stronger
+    /// liveness signal.</para>
+    ///
+    /// <para>On persistent absence the call throws a retryable
+    /// <see cref="SandboxProvisioningDeferredException"/> via
+    /// <see cref="ThrowProvisioningDeferred"/> so the orchestrator
+    /// re-queues the work item rather than letting the first clone fail
+    /// terminally — and the half-built sandbox is cleaned up by the
+    /// existing <see cref="CreateAsync"/> catch block.</para>
+    ///
+    /// Exposed as <c>internal</c> so unit tests driving a fake
+    /// <see cref="IProcessRunner"/> can exercise both the transient-
+    /// self-heal path and the persistent-deferred path without launching
+    /// a real VM.
+    /// </summary>
+    internal async Task WaitForMountsVisibleAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        IReadOnlyList<(string Host, string Sandbox)> binds,
+        WorkItemId? workItemId,
+        CancellationToken ct,
+        int? maxAttempts = null,
+        Func<int, TimeSpan>? backoff = null,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+    {
+        if (binds.Count == 0) return;
+
+        var attempts = maxAttempts ?? MountReadinessMaxAttempts;
+        if (attempts < 1) throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        var computeBackoff = backoff ?? MountReadinessAttemptBackoff;
+        var delayFn = delay ?? Task.Delay;
+
+        foreach (var (_, sandbox) in binds)
+        {
+            var probePath = string.Equals(sandbox, "/repo", StringComparison.Ordinal)
+                ? "/repo/HEAD"
+                : sandbox;
+
+            ProcessRunResult lastProbe = default;
+            var attemptsRun = 0;
+            var visible = false;
+            for (var attempt = 1; attempt <= attempts; attempt++)
+            {
+                attemptsRun = attempt;
+                ct.ThrowIfCancellationRequested();
+                lastProbe = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "exec", name, "--", "test", "-e", probePath],
+                    stdin: null,
+                    ct: ct,
+                    workItemId: workItemId);
+                if (lastProbe.ExitCode == 0)
+                {
+                    visible = true;
+                    break;
+                }
+
+                if (attempt == attempts)
+                    break;
+
+                var wait = computeBackoff(attempt);
+                _log.LogInformation(
+                    "multipass mount target {Sandbox} not yet visible inside VM {Name} (attempt {Attempt}/{Max}, probe={Probe}); retrying in {DelayMs}ms",
+                    sandbox, name, attempt, attempts, probePath, wait.TotalMilliseconds);
+                await delayFn(wait, ct);
+            }
+
+            if (visible) continue;
+
+            _log.LogWarning(
+                "multipass mount target {Sandbox} did not become visible inside VM {Name} after {Attempts} attempt(s); deferring (probe={Probe}, last exit={Exit}, stderr={Stderr})",
+                sandbox, name, attemptsRun, probePath, lastProbe.ExitCode, SingleLine(lastProbe.Stderr));
+            ThrowProvisioningDeferred(
+                "mount-readiness",
+                "multipass-mount-not-visible",
+                $"mount {sandbox} on VM {name} did not become visible after {attemptsRun} attempt(s); " +
+                $"probe `test -e {probePath}` exited {lastProbe.ExitCode}: {SingleLine(lastProbe.Stderr)}");
+        }
     }
 
     /// <summary>
