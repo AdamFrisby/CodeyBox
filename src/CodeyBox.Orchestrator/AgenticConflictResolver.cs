@@ -131,7 +131,13 @@ public sealed record AgenticConflictCandidatesResult(
     IReadOnlyList<AgenticConflictResolverCandidate> Candidates,
     bool HasTransientlyUnavailableStrongerAgent = false,
     string? DeferReason = null,
-    DateTimeOffset? EarliestResetAt = null);
+    DateTimeOffset? EarliestResetAt = null) : IReadOnlyList<AgenticConflictResolverCandidate>
+{
+    public int Count => Candidates.Count;
+    public AgenticConflictResolverCandidate this[int index] => Candidates[index];
+    public IEnumerator<AgenticConflictResolverCandidate> GetEnumerator() => Candidates.GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
 
 /// <summary>
 /// Resolves an in-sandbox mid-rebase/merge conflict by invoking the

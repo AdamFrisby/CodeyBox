@@ -2133,7 +2133,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// report the real cause, such as quota exhaustion, rather than a generic
     /// credential failure.
     /// </summary>
-    internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
+    internal async Task<AgenticConflictCandidatesResult> BuildAgenticConflictCandidatesAsync(
         WorkItem item,
         Project project,
         IAgentRunner primaryRunner,
@@ -2144,6 +2144,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var seenMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
+        var transientUnavailableList = new List<(int QualityScore, string Reason, DateTimeOffset? ResetAt)>();
         (AgentKind Agent, string Reason)? pausedCandidate = null;
         var quotaRejectedCount = 0;
         var resolverSmokePhase = operation == AgenticConflictResolverOperation.Merge ? "merge" : "rebase";
@@ -2263,7 +2264,35 @@ public sealed class PipelineRunner : IPipelineRunner
                     ? GetCapSafe(firstMemberForCap)
                     : GetCapSafe(first.Runner.Kind));
         }
-        return ordered;
+
+        var maxCollectedScore = collected.Count > 0 ? collected.Max(c => c.QualityScore) : -1;
+        var strongerTransientAgents = transientUnavailableList
+            .Where(t => t.QualityScore > maxCollectedScore)
+            .ToList();
+
+        string? deferReason = null;
+        DateTimeOffset? earliestResetAt = null;
+        if (strongerTransientAgents.Count > 0)
+        {
+            var bestStronger = strongerTransientAgents.OrderByDescending(t => t.QualityScore).First();
+            deferReason = bestStronger.Reason;
+
+            var resetTimes = strongerTransientAgents
+                .Select(t => t.ResetAt)
+                .Where(r => r.HasValue)
+                .Select(r => r!.Value)
+                .ToList();
+            if (resetTimes.Count > 0)
+            {
+                earliestResetAt = resetTimes.Min();
+            }
+        }
+
+        return new AgenticConflictCandidatesResult(
+            ordered,
+            HasTransientlyUnavailableStrongerAgent: strongerTransientAgents.Count > 0,
+            DeferReason: deferReason,
+            EarliestResetAt: earliestResetAt);
 
         async Task<string?> TryAddAsync(
             IAgentRunner candidate,
@@ -2291,6 +2320,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 var reason = $"{candidate.Kind.Value}: smoke gate: {availabilityReason}";
                 skipReasons.Add(reason);
+                transientUnavailableList.Add((quotaMember.QualityScore, reason, null));
                 return reason;
             }
 
@@ -2300,6 +2330,20 @@ public sealed class PipelineRunner : IPipelineRunner
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
                 skipReasons.Add(reason);
                 quotaRejectedCount++;
+
+                DateTimeOffset? resetAt = null;
+                if (_quotaProbesByKind is not null && _quotaProbesByKind.TryGetValue(candidate.Kind, out var probe))
+                {
+                    try
+                    {
+                        var snapshot = await probe.GetAvailabilityAsync(quotaMember, token);
+                        var probeQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, quotaMember);
+                        resetAt = probeQuota.ResetAt;
+                    }
+                    catch { }
+                }
+
+                transientUnavailableList.Add((quotaMember.QualityScore, reason, resetAt));
                 return reason;
             }
 
@@ -2309,7 +2353,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 credential,
                 modelId,
                 reasoningMode,
-                quotaMember.RouteKey));
+                quotaMember.RouteKey,
+                quotaMember.QualityScore));
             return null;
         }
 
@@ -6934,9 +6979,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                    var candidateResult = await BuildAgenticConflictCandidatesAsync(
+                        item, project, runner, ct, AgenticConflictResolverOperation.Merge);
                     var candidates = WrapPromptPreprocessedCandidates(
-                        await BuildAgenticConflictCandidatesAsync(
-                            item, project, runner, ct, AgenticConflictResolverOperation.Merge),
+                        candidateResult.Candidates,
                         item.Id,
                         AgentPromptPhase.Merge,
                         iteration: 1,
