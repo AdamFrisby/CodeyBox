@@ -626,6 +626,77 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
+    public async Task<bool> TryUpdateIfStateAndUpdatedAtAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            // Same full-row field set as UpdateAsync / TryUpdateIfStateAsync,
+            // guarded by the exact snapshot stamp the recovery path inspected.
+            cmd.CommandText = """
+                UPDATE work_items SET
+                    project_id = $project_id, title = $title,
+                    base_branch = $base, work_branch = $work, agent = $agent,
+                    agent_instance_id = $agent_instance_id,
+                    work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                    state = $state, updated_at = $ua, last_error = $err,
+                    upstream_push_attempts = $att, depends_on_json = $deps,
+                    agent_class_id = $class_id, queue_position = $qpos,
+                    stuck_retries = $sretries, started_at = $started_at,
+                    replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                    min_model_score = $min_model_score,
+                    cancellation_reason = $cancellation_reason,
+                    recovery_attempts = $recovery_attempts,
+                    release_id = $release_id,
+                    preempted_at = $preempted_at,
+                    preempt_checkpoint = $preempt_checkpoint,
+                    suspended_vm_name = $suspended_vm_name,
+                    suspended_at = $suspended_at,
+                    agent_log_path = $agent_log_path,
+                    failure_kind = $failure_kind,
+                    quota_reset_at = $quota_reset_at,
+                    next_quota_retry_at = $next_quota_retry_at,
+                    quota_retry_attempts = $quota_retry_attempts,
+                    quota_retry_from = $quota_retry_from,
+                    agent_pause_target = $agent_pause_target,
+                    agent_pause_retry_from = $agent_pause_retry_from,
+                    auditor_profile = $auditor_profile,
+                    cancellation_source = $cancellation_source,
+                    transient_cancel_retries = $transient_cancel_retries,
+                    conflict_rework_attempts = $conflict_rework_attempts,
+                    baseline_image_ref = $baseline_image_ref,
+                    required_capabilities_json = $required_capabilities,
+                    job_type = $job_type,
+                    check_spec_json = $check_spec,
+                    agent_control_json = $agent_control,
+                    check_verdict_json = $check_verdict,
+                    origin_check_work_item_id = $origin_check,
+                    re_check_verdicts_json = $re_check_verdicts,
+                    template_name = $template_name,
+                    template_entry_index = $template_entry_index,
+                    preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup
+                WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
+                """;
+            Bind(cmd, item);
+            cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            cmd.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryUpdateIfStateAndUpdatedAtAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     /// <summary>
     /// Translates a <c>SQLITE_FULL</c> error into a typed exception the
     /// orchestrator can recognise. Emits an audit event at Fatal level so

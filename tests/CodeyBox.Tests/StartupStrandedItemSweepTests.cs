@@ -481,9 +481,11 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
 
         Assert.NotNull(final);
         Assert.NotEqual(WorkItemState.Working, final.State);
-        // The item is reclaimed (requeued or already advanced through the
-        // immediate-Done pipeline). The orphaned mid-flight Working state
-        // must never have been handed back to the dispatcher as-is.
+        Assert.Equal(1, final.RecoveryAttempts);
+        if (pipeline.EntryStates.TryGetValue(item.Id, out var entryState))
+            Assert.Equal(WorkItemState.Queued, entryState);
+        // The recovery attempt count and observed pipeline entry state prove
+        // the orphaned mid-flight Working state was reclaimed before dispatch.
     }
 
     [Fact]

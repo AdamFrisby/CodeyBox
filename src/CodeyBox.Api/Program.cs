@@ -2273,7 +2273,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sessionDispatchOptions: sp.GetService<CodeyBox.Orchestrator.AgentSessionDispatchOptions>(),
     sessionHandleSnapshot: sp.GetService<CodeyBox.Agents.Claude.ClaudeSessionWorker>() is { } worker
         ? worker.SnapshotPersistedHandle
-        : null));
+        : null,
+    cancellationRegistry: sp.GetRequiredService<CancellationRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

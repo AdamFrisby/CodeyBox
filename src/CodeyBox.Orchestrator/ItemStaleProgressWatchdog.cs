@@ -233,15 +233,17 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     /// endpoint <c>POST /workitems/{id}/recover</c>. Steps:
     /// <list type="number">
     ///   <item>Refuse non-watched states (operator endpoint surfaces a 409).</item>
-    ///   <item>Claim the worker registry row for this item (if any) so the
-    ///         per-worker watchdog and reaper cannot race the recovery.</item>
+    ///   <item>Re-read the row and require the same active state / UpdatedAt
+    ///         stamp the caller inspected.</item>
     ///   <item>Build the next state via <see cref="WorkItemRecoveryPolicy.BuildStaleItemRecovery"/>:
     ///         preserve-branch requeue for Working/Reworking without
     ///         checkpoint, NeedsOperatorInput when MaxRecoveryAttempts is
-    ///         exceeded.</item>
-    ///   <item>Release the pool slot so the dispatcher can pick the next
+    ///         exceeded, then write it through a guarded update.</item>
+    ///   <item>Claim and recovery-cancel the worker registry row for this item
+    ///         (if any), then release the pool slot so the dispatcher can pick the next
     ///         eligible item up immediately.</item>
-    ///   <item>Emit audit log + webhook + enqueue.</item>
+    ///   <item>Restore cascade-cancelled dependents, emit audit log + webhook,
+    ///         and enqueue the recovered parent.</item>
     /// </list>
     /// Operator-triggered recovery is bounded by the same
     /// <see cref="WorkerProgressWatchdogOptions.ItemStaleMaxRecoveryAttempts"/>
@@ -269,28 +271,35 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                 Error: $"item is in state {item.State}, not an active in-flight state");
         }
 
-        // Claim any worker row pointing at this item. Per-id (not cutoff-based)
-        // so we never wipe a healthy peer worker — same shape as the
-        // per-worker watchdog's claim. Prevents the per-worker watchdog from
-        // racing this recovery.
-        var workerId = await TryClaimBoundWorkerAsync(item.Id, ct);
-
-        // Signal the running pipeline (if any) to abort BEFORE we mutate the
-        // durable row. CancellationRegistry.Cancel(itemId) fires the token
-        // RunItemAsync registered for this item, propagating into all phase
-        // tokens; the pipeline's existing finally blocks dispose the active
-        // sandbox/VM and the worker task exits. Without this, the incident-B
-        // transport-reconnect-loop worker would keep running on the same item
-        // while a fresh pickup races it — exactly the duplicate-ownership
-        // shape the rework finding called out. No-op when the pipeline has
-        // not registered (orphaned post-restart, no live worker).
-        _cancellations?.Cancel(item.Id);
-
         var opts = _opts;
-        var attempts = item.RecoveryAttempts + 1;
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null)
+        {
+            return new RecoveryResult(
+                Recovered: false,
+                FromState: item.State,
+                NewState: null,
+                Attempt: item.RecoveryAttempts,
+                BranchPreserved: false,
+                Error: "work item no longer exists");
+        }
+
+        if (current.State != item.State || current.UpdatedAt != item.UpdatedAt)
+        {
+            return new RecoveryResult(
+                Recovered: false,
+                FromState: current.State,
+                NewState: null,
+                Attempt: current.RecoveryAttempts,
+                BranchPreserved: false,
+                Error:
+                    $"work item advanced from {item.State}@{item.UpdatedAt:O} to {current.State}@{current.UpdatedAt:O}; recovery skipped");
+        }
+
+        var attempts = current.RecoveryAttempts + 1;
         var now = _time.GetUtcNow();
         var recovered = WorkItemRecoveryPolicy.BuildStaleItemRecovery(
-            item,
+            current,
             attempts,
             opts.ItemStaleMaxRecoveryAttempts,
             reason,
@@ -302,14 +311,14 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             // states, which we filtered above. Surface the situation cleanly.
             return new RecoveryResult(
                 Recovered: false,
-                FromState: item.State,
+                FromState: current.State,
                 NewState: null,
-                Attempt: item.RecoveryAttempts,
+                Attempt: current.RecoveryAttempts,
                 BranchPreserved: false,
-                Error: $"no recovery transition defined for state {item.State}");
+                Error: $"no recovery transition defined for state {current.State}");
         }
 
-        var fromState = item.State;
+        var fromState = current.State;
         var toState = recovered.State;
         var branchPreserved =
             toState == WorkItemState.Queued
@@ -318,7 +327,21 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
 
         try
         {
-            await _store.UpdateAsync(recovered, ct);
+            var wrote = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                recovered,
+                current.State,
+                current.UpdatedAt,
+                ct);
+            if (!wrote)
+            {
+                return new RecoveryResult(
+                    Recovered: false,
+                    FromState: current.State,
+                    NewState: null,
+                    Attempt: current.RecoveryAttempts,
+                    BranchPreserved: false,
+                    Error: "work item advanced before recovery write; recovery skipped");
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
@@ -330,12 +353,22 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                 Recovered: false,
                 FromState: fromState,
                 NewState: null,
-                Attempt: item.RecoveryAttempts,
+                Attempt: current.RecoveryAttempts,
                 BranchPreserved: false,
                 Error: $"failed to update store: {ex.Message}");
         }
 
         MarkRecoveredItem(item.Id, recovered.UpdatedAt);
+
+        // Claim any worker row pointing at this item only after the guarded
+        // recovery write wins. If the row advanced concurrently, recovery is a
+        // no-op and must not abort a worker that made progress.
+        var workerId = await TryClaimBoundWorkerAsync(item.Id, ct);
+
+        // Signal the running pipeline (if any) with recovery intent so it exits
+        // and tears down its sandbox without routing the cancellation as
+        // DELETE/operator cancellation.
+        _cancellations?.CancelForRecovery(item.Id);
 
         // Release the worker pool slot regardless of whether the underlying
         // worker task ever exits — the durable row is already updated, so the
@@ -352,7 +385,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             item.Id,
             workerId ?? "<no-live-worker>",
             fromState,
-            (long)(now - item.UpdatedAt).TotalSeconds,
+            (long)(now - current.UpdatedAt).TotalSeconds,
             trigger);
 
         AuditLog.WorkItemStaleRecovered(
@@ -367,6 +400,10 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         _log.LogWarning(
             "Item-stale ({Trigger}) recovered work item {ItemId} (worker {WorkerId}) from {FromState} → {ToState} (attempt {Attempt}/{Max}); branchPreserved={BranchPreserved}",
             trigger, item.Id, workerId ?? "<no-live-worker>", fromState, toState, attempts, opts.ItemStaleMaxRecoveryAttempts, branchPreserved);
+
+        var restoredDependents = 0;
+        if (toState != WorkItemState.NeedsOperatorInput && toState is not WorkItemState.Failed)
+            restoredDependents = await RestoreCascadedDependentsAsync(item.Id, ct);
 
         if (_webhooks is not null)
         {
@@ -388,6 +425,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                         maxRecoveryAttempts = opts.ItemStaleMaxRecoveryAttempts,
                         branchPreserved,
                         workerId,
+                        dependentsRestored = restoredDependents,
                     },
                 }, CancellationToken.None);
             }
@@ -408,6 +446,38 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             Attempt: attempts,
             BranchPreserved: branchPreserved,
             Error: null);
+    }
+
+    private async Task<int> RestoreCascadedDependentsAsync(WorkItemId recoveredId, CancellationToken ct)
+    {
+        var all = new List<WorkItem>();
+        await foreach (var existing in _store.ListAsync(ct))
+            all.Add(existing);
+
+        var toRestore = WorkItemDependencies.FindDescendantsToRestore(recoveredId, all);
+        if (toRestore.Count == 0) return 0;
+
+        var restored = 0;
+        foreach (var descendant in toRestore)
+        {
+            var requeued = descendant with
+            {
+                State = WorkItemState.Queued,
+                CancellationReason = null,
+                LastError = null,
+                StartedAt = null,
+                WorkBranch = null,
+                UpdatedAt = _time.GetUtcNow(),
+            };
+
+            var wrote = await _store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);
+            if (!wrote) continue;
+
+            AuditLog.WorkItemDependentRestored(descendant.Id, recoveredId);
+            restored++;
+        }
+
+        return restored;
     }
 
     private void MarkRecoveredItem(WorkItemId itemId, DateTimeOffset recoveredUpdatedAt)

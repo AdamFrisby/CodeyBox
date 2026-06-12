@@ -33,6 +33,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
     private readonly CapturingWebhookDispatcher _webhooks;
     private readonly WorkerProgressWatchdogOptions _opts;
     private readonly RecordingSlotReleaser _slotReleaser;
+    private readonly CancellationRegistry _cancellations;
     private readonly FakeTimeProvider _time;
     private readonly ItemStaleProgressWatchdog _watchdog;
 
@@ -52,6 +53,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         };
         _opts.Validate();
         _slotReleaser = new RecordingSlotReleaser();
+        _cancellations = new CancellationRegistry(CancellationToken.None);
         _time = new FakeTimeProvider(new DateTimeOffset(2026, 06, 12, 12, 00, 00, TimeSpan.Zero));
         _watchdog = new ItemStaleProgressWatchdog(
             _store, _queue, _registry,
@@ -59,6 +61,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
             NullLogger<ItemStaleProgressWatchdog>.Instance,
             _webhooks,
             _slotReleaser,
+            cancellations: _cancellations,
             timeProvider: _time);
     }
 
@@ -66,6 +69,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
+        _cancellations.Dispose();
         try { File.Delete(_dbPath); } catch { }
     }
 
@@ -112,6 +116,9 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
             CurrentWorkItemId = item.Id.ToString(),
         });
 
+        using var registration = _cancellations.Register(item.Id);
+        Assert.False(registration.Token.IsCancellationRequested);
+
         await _watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
@@ -127,6 +134,8 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         // Bound worker registry row claimed: pool slot released.
         Assert.Single(_slotReleaser.Releases);
         Assert.Equal("wedged-codex-worker", _slotReleaser.Releases[0].WorkerId);
+        Assert.True(registration.Token.IsCancellationRequested);
+        Assert.Equal(CancellationRequestKind.Recovery, _cancellations.GetRequestKind(item.Id));
 
         // Item enqueued for re-dispatch.
         Assert.Equal(1, _queue.Count);
@@ -165,6 +174,34 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_RecoveredParent_RestoresParentCascadedDependents()
+    {
+        var parent = MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-95),
+            workBranch: "codeybox/auto/work-parent");
+        var child = MakeItem(WorkItemState.Cancelled, updatedAt: _time.GetUtcNow().AddMinutes(-90)) with
+        {
+            DependsOn = [parent.Id],
+            CancellationReason = WorkItemCancellationReason.ParentCascaded,
+            LastError = "parent dependency cancelled",
+            StartedAt = null,
+        };
+        await _store.CreateAsync(parent);
+        await _store.CreateAsync(child);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var recoveredParent = await _store.GetAsync(parent.Id);
+        var restoredChild = await _store.GetAsync(child.Id);
+        Assert.Equal(WorkItemState.Queued, recoveredParent!.State);
+        Assert.Equal(WorkItemState.Queued, restoredChild!.State);
+        Assert.Null(restoredChild.CancellationReason);
+        Assert.Null(restoredChild.LastError);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
     public async Task Sweep_FreshItemUpdatedAt_NotRecovered()
     {
         // Item updated recently — must not trip even if the configured
@@ -179,6 +216,40 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(0, after.RecoveryAttempts);
         Assert.Equal(0, _queue.Count);
         Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_RowAdvancedSinceSnapshot_SkipsRecoveryAndDoesNotCancelWorker()
+    {
+        var staleSnapshot = MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/auto/work-progress-race");
+        await _store.CreateAsync(staleSnapshot);
+
+        var advanced = staleSnapshot with
+        {
+            UpdatedAt = _time.GetUtcNow(),
+            StartedAt = _time.GetUtcNow().AddMinutes(-1),
+        };
+        await _store.UpdateAsync(advanced);
+
+        using var registration = _cancellations.Register(staleSnapshot.Id);
+
+        var result = await _watchdog.RecoverItemAsync(
+            staleSnapshot,
+            "operator: stale snapshot",
+            CancellationToken.None);
+
+        Assert.False(result.Recovered);
+        Assert.Contains("advanced", result.Error);
+        Assert.False(registration.Token.IsCancellationRequested);
+
+        var after = await _store.GetAsync(staleSnapshot.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(advanced.UpdatedAt, after.UpdatedAt);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
     }
 
     [Fact]

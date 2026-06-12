@@ -193,7 +193,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
 
         // Item is currently Working with two prior work-branch commits the
         // pipeline produced on top of the original main tip.
-        var item = NewItem("feature/recovery-preserved-rides") with
+        var item = NewItem() with
         {
             State = WorkItemState.Working,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-100),
@@ -203,6 +203,7 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var barePath = tp.GitHost.GetRepoPath(repoId);
         var originalMain = await RevParseAsync(barePath, "main");
         await CommitTwoWorkBranchCommitsAsync(barePath, item.WorkBranch!);
+        var preRecoveryWorkTip = await RevParseAsync(barePath, item.WorkBranch!);
         await tp.Store.CreateAsync(item);
 
         // Recover via ItemStaleProgressWatchdog — same surface the operator
@@ -236,6 +237,40 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
         var advancedMain = await RevParseAsync(seed, "main");
         Assert.NotEqual(originalMain, advancedMain);
 
+        string? pickupHead = null;
+        string? pickupOriginMain = null;
+        bool pickupOriginMainIsAncestor = false;
+        string? pickupB = null;
+        string? pickupC = null;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var head = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "HEAD"],
+            }, ct);
+            pickupHead = head.Stdout.Trim();
+
+            var originMain = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "rev-parse", "origin/main"],
+            }, ct);
+            pickupOriginMain = originMain.Stdout.Trim();
+
+            var ancestor = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "merge-base", "--is-ancestor", "origin/main", "HEAD"],
+            }, ct);
+            pickupOriginMainIsAncestor = ancestor.Success;
+
+            pickupB = (await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/b.txt"],
+            }, ct)).Stdout;
+            pickupC = (await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{workingDirectory}/c.txt"],
+            }, ct)).Stdout;
+        };
         tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "post-recovery work\n"));
         var recovered = await tp.Store.GetAsync(item.Id);
         await tp.Pipeline.RunAsync(recovered!, CancellationToken.None);
@@ -245,6 +280,12 @@ public sealed class WorkBranchRebaseOnPickupTests : IDisposable
 
         // Preserved work commits and the new post-recovery commit must all
         // be reachable on the work branch — the pickup did not discard them.
+        Assert.NotEqual(preRecoveryWorkTip, pickupHead);
+        Assert.Equal(advancedMain, pickupOriginMain);
+        Assert.True(pickupOriginMainIsAncestor,
+            "recovered work phase must start after pickup-time rebase, with origin/main already an ancestor of HEAD");
+        Assert.Equal("work B\n", pickupB);
+        Assert.Equal("work C\n", pickupC);
         Assert.Equal("work B\n", await ShowAsync(barePath, $"{item.WorkBranch}:b.txt"));
         Assert.Equal("work C\n", await ShowAsync(barePath, $"{item.WorkBranch}:c.txt"));
         Assert.Equal("post-recovery work\n", await ShowAsync(barePath, $"{item.WorkBranch}:agent.txt"));

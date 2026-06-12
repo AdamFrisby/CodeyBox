@@ -102,15 +102,15 @@ public sealed class WorkerProgressWatchdogOptions
     ///
     /// <para>
     /// Set this comfortably above a normal phase duration so a long but
-    /// legitimately-running phase is not interrupted. Default 120 min — well
-    /// above the default 60 min <see cref="ProgressTimeout"/> so the
-    /// worker-progress path catches recoverable cases first, but tight enough
-    /// to free a wedged slot well before the ~90 min cases observed in
-    /// production. Set to <see cref="TimeSpan.Zero"/> to disable the item-stale
+    /// legitimately-running phase is not interrupted. Default 75 min — above
+    /// the default 60 min <see cref="ProgressTimeout"/> so the worker-progress
+    /// path catches recoverable cases first, but tight enough to free a wedged
+    /// slot before the ~90 min cases observed in production. Set to
+    /// <see cref="TimeSpan.Zero"/> to disable the item-stale
     /// detector while keeping the worker-progress watchdog. Hot-reloadable.
     /// </para>
     /// </summary>
-    public TimeSpan ItemStaleTimeout { get; set; } = TimeSpan.FromMinutes(120);
+    public TimeSpan ItemStaleTimeout { get; set; } = TimeSpan.FromMinutes(75);
 
     /// <summary>
     /// How often the per-item stale-updatedAt sweep runs. The sweep walks

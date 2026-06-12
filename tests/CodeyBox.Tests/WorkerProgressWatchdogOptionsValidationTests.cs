@@ -203,7 +203,7 @@ public sealed class WorkerProgressWatchdogOptionsValidationTests
         // are comfortably above a normal phase duration but tighter than the
         // ~90-minute production incident window.
         var opts = new WorkerProgressWatchdogOptions();
-        Assert.Equal(TimeSpan.FromMinutes(120), opts.ItemStaleTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(75), opts.ItemStaleTimeout);
         Assert.Equal(TimeSpan.FromMinutes(5), opts.ItemStaleCheckInterval);
         Assert.Equal(3, opts.ItemStaleMaxRecoveryAttempts);
         opts.Validate();

@@ -3,6 +3,12 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
+public enum CancellationRequestKind
+{
+    Operator,
+    Recovery,
+}
+
 /// <summary>
 /// Per-work-item cancellation tokens. The pipeline registers a CTS when it
 /// starts work; the API DELETE endpoint cancels it.
@@ -14,6 +20,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class CancellationRegistry : IDisposable
 {
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _ctsById = new();
+    private readonly ConcurrentDictionary<Guid, CancellationRequestKind> _requestKindById = new();
     private bool _disposed;
 
     public CancellationRegistry(CancellationToken root = default)
@@ -37,11 +44,17 @@ public sealed class CancellationRegistry : IDisposable
         return new Registration(this, id, cts);
     }
 
-    /// <summary>Returns true if a token was found and cancelled.</summary>
-    public bool Cancel(WorkItemId id)
+    /// <summary>Returns true if a token was found and cancelled for operator-requested cancellation.</summary>
+    public bool Cancel(WorkItemId id) => Cancel(id, CancellationRequestKind.Operator);
+
+    /// <summary>Returns true if a token was found and cancelled for recovery-owned worker abort.</summary>
+    public bool CancelForRecovery(WorkItemId id) => Cancel(id, CancellationRequestKind.Recovery);
+
+    private bool Cancel(WorkItemId id, CancellationRequestKind kind)
     {
         if (_ctsById.TryGetValue(id.Value, out var cts))
         {
+            _requestKindById[id.Value] = kind;
             try { cts.Cancel(); } catch (ObjectDisposedException) { /* races with completion */ }
             return true;
         }
@@ -49,6 +62,9 @@ public sealed class CancellationRegistry : IDisposable
     }
 
     public bool IsActive(WorkItemId id) => _ctsById.ContainsKey(id.Value);
+
+    public CancellationRequestKind? GetRequestKind(WorkItemId id) =>
+        _requestKindById.TryGetValue(id.Value, out var kind) ? kind : null;
 
     public void Dispose()
     {
@@ -59,6 +75,7 @@ public sealed class CancellationRegistry : IDisposable
             try { cts.Dispose(); } catch { /* best-effort */ }
         }
         _ctsById.Clear();
+        _requestKindById.Clear();
     }
 
     public sealed class Registration : IDisposable
@@ -78,6 +95,7 @@ public sealed class CancellationRegistry : IDisposable
         public void Dispose()
         {
             _registry._ctsById.TryRemove(_id.Value, out _);
+            _registry._requestKindById.TryRemove(_id.Value, out _);
             Source.Dispose();
         }
     }
