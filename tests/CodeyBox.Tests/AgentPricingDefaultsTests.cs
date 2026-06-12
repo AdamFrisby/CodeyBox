@@ -348,6 +348,8 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         Assert.True(snapshot.Baseline.Rates.ContainsKey("claude"), "shipped defaults must include claude pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("codex"), "shipped defaults must include codex pricing");
         Assert.True(snapshot.Baseline.Rates.ContainsKey("gemini"), "shipped defaults must include gemini pricing");
+        Assert.True(snapshot.Baseline.Rates["codex"].ContainsKey("gpt-5.5"),
+            "shipped codex defaults must include the routed default gpt-5.5 model id");
         Assert.True(snapshot.Baseline.Rates["codex"].ContainsKey("codex-5.5"),
             "shipped codex defaults must alias codex-5.5 for CLI attribution");
         Assert.True(snapshot.Baseline.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),

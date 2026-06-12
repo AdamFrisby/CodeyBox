@@ -74,9 +74,10 @@ public sealed class AgentPricingOptions
 /// Lookup order:
 ///   1. <c>Rates[agentKind][modelId]</c> from configuration.
 ///   2. <c>DefaultRates[agentKind]</c> from configuration.
-///   3. <see cref="IAgentCostExtractor.DefaultPricing"/> owned by the per-provider library
+///   3. <c>Rates[agentKind][AgentDefaults[agentKind]]</c> from configuration.
+///   4. <see cref="IAgentCostExtractor.DefaultPricing"/> owned by the per-provider library
 ///      (conservative built-in fallback the provider declares for itself).
-///   4. Returns null (→ zero cost) when no source supplies a rate.
+///   5. Returns null (→ zero cost) when no source supplies a rate.
 ///
 /// The orchestrator no longer hardcodes provider-specific rates — adding a new provider
 /// only requires that provider's cost extractor to expose its own <c>DefaultPricing</c>.
@@ -92,13 +93,16 @@ public sealed class AgentCostCalculator
     // ResolveRate lookup is consistent for that single call.
     private volatile AgentPricingOptions _opts;
     private readonly IReadOnlyDictionary<AgentKind, IAgentCostExtractor> _extractors;
+    private readonly AgentDefaultsSnapshot? _defaultModels;
 
     public AgentCostCalculator(
         AgentPricingOptions opts,
-        IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null)
+        IReadOnlyDictionary<AgentKind, IAgentCostExtractor>? extractors = null,
+        AgentDefaultsSnapshot? defaultModels = null)
     {
         _opts = AgentPricingOptions.CloneSnapshot(opts);
         _extractors = extractors ?? new Dictionary<AgentKind, IAgentCostExtractor>();
+        _defaultModels = defaultModels;
     }
 
     /// <summary>
@@ -149,6 +153,12 @@ public sealed class AgentCostCalculator
         return decimal.Round(cost, 6);
     }
 
+    public string? ResolveDefaultModelId(AgentKind kind)
+    {
+        var defaultModelId = _defaultModels?.GetDefault(kind.Value);
+        return string.IsNullOrWhiteSpace(defaultModelId) ? null : defaultModelId;
+    }
+
     private ModelRateConfig? ResolveRate(AgentPricingOptions opts, AgentKind kind, string? modelId)
     {
         var agentKey = kind.Value;
@@ -156,20 +166,64 @@ public sealed class AgentCostCalculator
         // 1. Model-specific rate from config.
         if (!string.IsNullOrEmpty(modelId)
             && opts.Rates.TryGetValue(agentKey, out var modelMap)
-            && modelMap.TryGetValue(modelId, out var modelRate))
+            && TryGetConfiguredModelRate(modelMap, modelId, out var modelRate))
         {
             return modelRate;
         }
 
-        // 2. Agent-level default from config.
+        // 2. Operator-supplied agent-level default from config.
         if (opts.DefaultRates.TryGetValue(agentKey, out var defaultRate))
             return defaultRate;
 
-        // 3. Per-provider built-in fallback (owned by the provider's cost extractor).
+        // 3. AgentDefaults-derived model rate from config. This covers
+        // structured streams or human-readable footers that carry token counts
+        // but omit the model id, while keeping the fallback generic per agent.
+        var defaultModelId = ResolveDefaultModelId(kind);
+        if (!string.IsNullOrEmpty(defaultModelId)
+            && opts.Rates.TryGetValue(agentKey, out var defaultModelMap)
+            && TryGetConfiguredModelRate(defaultModelMap, defaultModelId, out var defaultModelRate))
+        {
+            return defaultModelRate;
+        }
+
+        // 4. Per-provider built-in fallback (owned by the provider's cost extractor).
         if (_extractors.TryGetValue(kind, out var extractor) && extractor.DefaultPricing is { } providerDefault)
             return providerDefault;
 
         return null;
+    }
+
+    private static bool TryGetConfiguredModelRate(
+        IReadOnlyDictionary<string, ModelRateConfig> modelMap,
+        string modelId,
+        out ModelRateConfig rate)
+    {
+        if (modelMap.TryGetValue(modelId, out var exactRate))
+        {
+            rate = exactRate;
+            return true;
+        }
+
+        foreach (var (configuredModelId, configuredRate) in modelMap)
+        {
+            if (string.Equals(configuredModelId, modelId, StringComparison.OrdinalIgnoreCase))
+            {
+                rate = configuredRate;
+                return true;
+            }
+
+            var slash = configuredModelId.LastIndexOf('/');
+            if (slash >= 0
+                && slash < configuredModelId.Length - 1
+                && string.Equals(configuredModelId[(slash + 1)..], modelId, StringComparison.OrdinalIgnoreCase))
+            {
+                rate = configuredRate;
+                return true;
+            }
+        }
+
+        rate = null!;
+        return false;
     }
 
     /// <summary>

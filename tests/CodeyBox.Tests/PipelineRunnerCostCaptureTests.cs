@@ -200,6 +200,52 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         Assert.Equal(costRow.EndedAt, ev.TimeUtc);
     }
 
+    [Fact]
+    public async Task SuccessfulRun_CostRowUsesDispatchModelWhenExtractorOmitsModel()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var costStore = new RecordingCostStore();
+        var usageStore = new RecordingUsageStore();
+        using var tp = BuildPipelineWithCosts(
+            _workspace,
+            seed,
+            costStore,
+            usageStore: usageStore,
+            agentKind: AgentKind.Codex,
+            extractorSnapshot: new AgentCostSnapshot(
+                InputTokens: 1000,
+                CachedInputTokens: 100,
+                OutputTokens: 200,
+                ModelId: null),
+            pricingOptions: CodexGpt55Pricing());
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("codex-dispatch-model.txt", "usage\n"));
+
+        var item = NewItem("feature/codex-dispatch-model") with
+        {
+            Agent = AgentKind.Codex,
+            ModelId = "gpt-5.5",
+        };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var workRow = Assert.Single(costStore.Recorded, r => r.Phase == "work");
+        Assert.Equal("codex", workRow.AgentKind);
+        Assert.Equal("gpt-5.5", workRow.ModelId);
+        Assert.Equal(1000, workRow.InputTokens);
+        Assert.Equal(100, workRow.CachedInputTokens);
+        Assert.Equal(200, workRow.OutputTokens);
+        Assert.True(workRow.HasExtractedTokenUsage);
+        Assert.Equal(0.01105, workRow.EstimatedUsd, precision: 6);
+
+        var usage = Assert.Single(usageStore.Recorded, e => e.TimeUtc == workRow.EndedAt);
+        Assert.Equal("gpt-5.5", usage.ModelId);
+        Assert.Equal(AgentUsageEvent.UsdToMicroCents((decimal)workRow.EstimatedUsd), usage.CostMicroCents);
+    }
+
     [Theory]
     [MemberData(nameof(BuiltInAgentKinds))]
     public async Task SuccessfulRun_WritesCostAndUsageRows_ForEachAgentKind(string agentKindValue)
@@ -721,6 +767,22 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
         var ans = answer ? "true" : "false";
         return $"preamble\n{CheckAndActPipeline.StartSentinel}\n{{\"answer\": {ans}, \"evidence\": \"{evidence}\", \"confidence\": \"{confidence}\"}}\n{CheckAndActPipeline.EndSentinel}\n";
     }
+
+    private static AgentPricingOptions CodexGpt55Pricing() => new()
+    {
+        Rates = new()
+        {
+            ["codex"] = new()
+            {
+                ["gpt-5.5"] = new()
+                {
+                    InputPerMillion = 5.0,
+                    CachedInputPerMillion = 0.5,
+                    OutputPerMillion = 30.0,
+                },
+            },
+        },
+    };
 
     public static TheoryData<string> BuiltInAgentKinds() => new()
     {

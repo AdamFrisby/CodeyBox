@@ -25,7 +25,7 @@ public sealed class CodexCostExtractor : IAgentCostExtractor
     {
         InputPerMillion = 5.0,
         CachedInputPerMillion = 0.50,
-        OutputPerMillion = 25.0,
+        OutputPerMillion = 30.0,
     };
 
     private static readonly Regex UsagePromptPattern = new(

@@ -25,7 +25,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
             );
             """;
         setupCmd.ExecuteNonQuery();
-        _store = new SqliteWorkItemCostStore(_dbPath);
+        _store = new SqliteWorkItemCostStore(_dbPath, MakeCostCalculator());
     }
 
     public void Dispose()
@@ -234,6 +234,128 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         var (avg, samples) = await _store.GetAvgTokensPerItemAsync("gemini", 10);
         Assert.Equal(1, samples);
         Assert.Equal(375, avg);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlySummaryPricesExistingModel()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "work") with
+        {
+            AgentKind = "codex",
+            ModelId = "gpt-5.5",
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                1000,
+                200,
+                100,
+                0m,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var row = Assert.Single(await _store.GetByWorkItemAsync(itemId));
+
+        Assert.Equal("gpt-5.5", row.ModelId);
+        Assert.Equal(1000, row.InputTokens);
+        Assert.Equal(100, row.CachedInputTokens);
+        Assert.Equal(200, row.OutputTokens);
+        Assert.Equal(0.01105, row.EstimatedUsd, precision: 6);
+        Assert.True(row.HasExtractedTokenUsage);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_TokenOnlyNullModelUsesAgentDefaultRate()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+        await _store.RecordAsync(MakeCost(itemId, "work") with
+        {
+            AgentKind = "codex",
+            ModelId = null,
+            InputTokens = 0,
+            CachedInputTokens = 0,
+            OutputTokens = 0,
+            EstimatedUsd = 0,
+            RawMetadataJson = """{"source":"elapsed_fallback"}""",
+            HasExtractedTokenUsage = false,
+        });
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                1000,
+                200,
+                100,
+                null,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var row = Assert.Single(await _store.GetByWorkItemAsync(itemId));
+
+        Assert.Equal("gpt-5.5", row.ModelId);
+        Assert.Equal(0.01105, row.EstimatedUsd, precision: 6);
+        Assert.True(row.HasExtractedTokenUsage);
+    }
+
+    [Fact]
+    public async Task ReconcileFromAgentStreamSummaryAsync_InsertsPricedDefaultModelRowWhenNoCostExists()
+    {
+        var itemId = Guid.NewGuid().ToString("N");
+        SeedWorkItem(itemId, state: WorkItemState.Done);
+
+        await _store.ReconcileFromAgentStreamSummaryAsync(new AgentStreamSummaryRow(
+            new WorkItemId(Guid.Parse(itemId)),
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            AgentKind.Codex,
+            new AgentStreamSummary(
+                TimeSpan.FromSeconds(5),
+                TimeSpan.Zero,
+                1000,
+                200,
+                100,
+                0m,
+                [],
+                [],
+                null),
+            DateTimeOffset.UtcNow));
+
+        var row = Assert.Single(await _store.GetByWorkItemAsync(itemId));
+
+        Assert.Equal("stream-" + itemId + "-work-1-abcdef.jsonl", row.Id);
+        Assert.Equal("gpt-5.5", row.ModelId);
+        Assert.Equal(1000, row.InputTokens);
+        Assert.Equal(100, row.CachedInputTokens);
+        Assert.Equal(200, row.OutputTokens);
+        Assert.Equal(0.01105, row.EstimatedUsd, precision: 6);
+        Assert.True(row.HasExtractedTokenUsage);
     }
 
     [Fact]
@@ -679,6 +801,102 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Constructor_RepairsLegacyTokenRows_ModelAttributionAndZeroUsd()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-cost-repair-{Guid.NewGuid():N}.db");
+        try
+        {
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await using var setup = conn.CreateCommand();
+                setup.CommandText = $$"""
+                    CREATE TABLE work_items (
+                        id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        state INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO work_items (id, project_id, state, updated_at)
+                    VALUES ('legacy-null-model', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('legacy-zero-usd', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('legacy-default-model', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z'),
+                           ('legacy-zero-token', 'test-project', {{(int)WorkItemState.Done}}, '2026-06-01T00:00:00Z');
+
+                    CREATE TABLE agent_usage_events (
+                        id TEXT PRIMARY KEY,
+                        time_utc TEXT NOT NULL,
+                        agent_kind TEXT NOT NULL,
+                        model_id TEXT,
+                        phase TEXT,
+                        work_item_id TEXT
+                    );
+                    INSERT INTO agent_usage_events (id, time_utc, agent_kind, model_id, phase, work_item_id)
+                    VALUES ('usage-null-model', '2026-06-01T00:00:06Z', 'codex', 'gpt-5.5', 'work', 'legacy-null-model');
+
+                    CREATE TABLE work_item_costs (
+                        id                  TEXT PRIMARY KEY,
+                        work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        phase               TEXT NOT NULL,
+                        iteration           INTEGER,
+                        agent_kind          TEXT NOT NULL,
+                        model_id            TEXT,
+                        input_tokens        INTEGER NOT NULL,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens       INTEGER NOT NULL,
+                        estimated_usd       REAL NOT NULL DEFAULT 0,
+                        started_at          TEXT NOT NULL,
+                        ended_at            TEXT NOT NULL,
+                        raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+                    );
+
+                    INSERT INTO work_item_costs
+                        (id, work_item_id, phase, iteration, agent_kind, model_id,
+                         input_tokens, cached_input_tokens, output_tokens, estimated_usd,
+                         started_at, ended_at, raw_metadata_json)
+                    VALUES
+                        ('row-null-model', 'legacy-null-model', 'work', 1, 'codex', NULL,
+                         1000, 0, 200, 58.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}'),
+                        ('row-zero-usd', 'legacy-zero-usd', 'work', 1, 'codex', 'gpt-5.5',
+                         1000, 0, 200, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}'),
+                        ('row-default-model', 'legacy-default-model', 'work', 1, 'codex', NULL,
+                         1000, 0, 200, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z', '{}'),
+                        ('row-zero-token', 'legacy-zero-token', 'work', 1, 'codex', 'gpt-5.5',
+                         0, 0, 0, 0.0,
+                         '2026-06-01T00:00:00Z', '2026-06-01T00:00:05Z',
+                         '{"source":"extractor_null_elapsed_fallback"}');
+                    """;
+                await setup.ExecuteNonQueryAsync();
+            }
+
+            using var migrated = new SqliteWorkItemCostStore(dbPath, MakeCostCalculator());
+
+            var attributed = Assert.Single(await migrated.GetByWorkItemAsync("legacy-null-model"));
+            Assert.Equal("gpt-5.5", attributed.ModelId);
+            Assert.Equal(58.0, attributed.EstimatedUsd, precision: 6);
+
+            var repriced = Assert.Single(await migrated.GetByWorkItemAsync("legacy-zero-usd"));
+            Assert.Equal("gpt-5.5", repriced.ModelId);
+            Assert.Equal(0.011, repriced.EstimatedUsd, precision: 6);
+
+            var defaulted = Assert.Single(await migrated.GetByWorkItemAsync("legacy-default-model"));
+            Assert.Equal("gpt-5.5", defaulted.ModelId);
+            Assert.Equal(0.011, defaulted.EstimatedUsd, precision: 6);
+
+            var failed = Assert.Single(await migrated.GetByWorkItemAsync("legacy-zero-token"));
+            Assert.Equal("gpt-5.5", failed.ModelId);
+            Assert.Equal(0.0, failed.EstimatedUsd);
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
     public async Task Constructor_NewInsertsAreFlaggedAtCurrentContractVersion()
     {
         // Defends the migration's idempotency contract: every RecordAsync insert
@@ -708,5 +926,30 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
                 $"row {id} has usage_contract_version={version}, expected {expectedVersion}");
         }
         Assert.True(count > 0, "expected at least one row to verify");
+    }
+
+    private static AgentCostCalculator MakeCostCalculator()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+
+        return new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        }, defaultModels: defaults);
     }
 }

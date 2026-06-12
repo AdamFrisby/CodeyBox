@@ -3,6 +3,7 @@ using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -16,6 +17,7 @@ public sealed class AgentCostCalculatorTests
             [AgentKind.Claude] = new ClaudeCostExtractor(),
             [AgentKind.Codex] = new CodexCostExtractor(),
             [AgentKind.Gemini] = new GeminiCostExtractor(),
+            [AgentKind.Opencode] = new OpencodeCostExtractor(),
         };
 
     private static AgentPricingOptions MakeOpts() => new()
@@ -60,6 +62,105 @@ public sealed class AgentCostCalculatorTests
         // output: 500 * 25.0 / 1_000_000 = 0.0125
         // total = 0.0175
         Assert.Equal(0.0175m, result);
+    }
+
+    [Fact]
+    public void CodexKnownModel_CalculatesNonZeroUsdFromConfiguredRate()
+    {
+        var calculator = new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        });
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000,
+            CachedInputTokens: 100,
+            OutputTokens: 200,
+            ModelId: "gpt-5.5");
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(0.01105m, result);
+    }
+
+    [Fact]
+    public void NullModel_FallsBackToAgentDefaultModelRate()
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "gpt-5.5",
+            });
+        var calculator = new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["codex"] = new()
+                {
+                    ["gpt-5.5"] = new()
+                    {
+                        InputPerMillion = 5.0,
+                        CachedInputPerMillion = 0.5,
+                        OutputPerMillion = 30.0,
+                    },
+                },
+            },
+        }, defaultModels: defaults);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1000,
+            CachedInputTokens: 100,
+            OutputTokens: 200,
+            ModelId: null);
+
+        var result = calculator.Calculate(snapshot, AgentKind.Codex);
+
+        Assert.Equal(0.01105m, result);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("deepseek-v4-flash")]
+    public void OpencodeDefaultModel_UsesProviderPrefixedConfiguredRate(string? modelId)
+    {
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["opencode"] = "deepseek-v4-flash",
+            });
+        var calculator = new AgentCostCalculator(new AgentPricingOptions
+        {
+            Rates = new()
+            {
+                ["opencode"] = new()
+                {
+                    ["opencode-go/deepseek-v4-flash"] = new()
+                    {
+                        InputPerMillion = 0.0055,
+                        CachedInputPerMillion = 0.0055,
+                        OutputPerMillion = 0.0055,
+                    },
+                },
+            },
+        }, defaultModels: defaults);
+        var snapshot = new AgentCostSnapshot(
+            InputTokens: 1_000_000,
+            CachedInputTokens: 1_000_000,
+            OutputTokens: 1_000_000,
+            ModelId: modelId);
+
+        var result = calculator.Calculate(snapshot, AgentKind.Opencode);
+
+        Assert.Equal(0.0165m, result);
     }
 
     [Fact]
