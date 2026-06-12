@@ -2566,7 +2566,9 @@ public sealed class PipelineRunner : IPipelineRunner
                 item.BaselineImageRef));
 
         var sandboxStartSw = Stopwatch.StartNew();
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        await using var sandbox = WorkSandboxContext.Current != null
+            ? await WorkSandboxContext.Current.GetOrCreateSandboxAsync(spec, ct)
+            : await _sandboxes.CreateAsync(spec, ct);
         sandboxStartSw.Stop();
         CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
