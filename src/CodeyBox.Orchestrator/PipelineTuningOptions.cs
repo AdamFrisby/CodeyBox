@@ -90,12 +90,30 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public TimeSpan MaxSandboxLifetime { get; set; } = TimeSpan.FromHours(1);
 
-    /// <summary>
     /// Utilization threshold (CurrentAdmittedSandboxes / MaxConcurrentSandboxes) above which
     /// a reused sandbox is disposed to free capacity for other runs.
     /// Default 0.85 (85%).
     /// </summary>
     public double SandboxPressureThreshold { get; set; } = 0.85;
+
+    public void Validate()
+    {
+        if (MaxSandboxReuses < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
+        }
+        if (MaxSandboxLifetime <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(MaxSandboxLifetime), "MaxSandboxLifetime must be positive");
+        }
+        if (double.IsNaN(SandboxPressureThreshold)
+            || double.IsInfinity(SandboxPressureThreshold)
+            || SandboxPressureThreshold < 0.0
+            || SandboxPressureThreshold > 1.0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(SandboxPressureThreshold), "SandboxPressureThreshold must be between 0.0 and 1.0 inclusive");
+        }
+    }
 }
 
 /// <summary>
@@ -111,6 +129,7 @@ public sealed class PipelineTuningSnapshot
     public PipelineTuningSnapshot(PipelineTuningOptions initial)
     {
         ArgumentNullException.ThrowIfNull(initial);
+        initial.Validate();
         _current = initial;
     }
 
@@ -129,6 +148,7 @@ public sealed class PipelineTuningSnapshot
     public void Replace(PipelineTuningOptions next)
     {
         ArgumentNullException.ThrowIfNull(next);
+        next.Validate();
         Volatile.Write(ref _current, next);
     }
 }

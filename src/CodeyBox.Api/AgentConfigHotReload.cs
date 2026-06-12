@@ -940,6 +940,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.AgentSuspendMaxRetries,
                 opts.AgentSessionResumeMaxAttempts,
                 opts.AutoMergeRaceRecoveryMaxAttempts,
+                opts.EnableSandboxReuse,
+                opts.MaxSandboxReuses,
+                MaxSandboxLifetimeSeconds = opts.MaxSandboxLifetime.TotalSeconds,
+                opts.SandboxPressureThreshold,
             },
             JsonOpts);
 

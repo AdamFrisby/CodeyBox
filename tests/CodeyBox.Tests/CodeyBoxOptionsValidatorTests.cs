@@ -464,6 +464,39 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.False(result.Failed, result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsInvalidSandboxReuseOptions()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.MaxSandboxReuses = 0;
+        options.PipelineTuning.MaxSandboxLifetime = TimeSpan.Zero;
+        options.PipelineTuning.SandboxPressureThreshold = -0.5;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1", result.FailureMessage);
+        Assert.Contains("CodeyBox:PipelineTuning:MaxSandboxLifetime must be a positive TimeSpan", result.FailureMessage);
+        Assert.Contains("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsNaNOrInfinitySandboxPressureThreshold()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.SandboxPressureThreshold = double.NaN;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive", result.FailureMessage);
+
+        options.PipelineTuning.SandboxPressureThreshold = double.PositiveInfinity;
+        result = new CodeyBoxOptionsValidator().Validate(null, options);
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:SandboxPressureThreshold must be between 0.0 and 1.0 inclusive", result.FailureMessage);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 

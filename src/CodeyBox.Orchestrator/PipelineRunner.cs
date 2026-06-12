@@ -739,6 +739,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         try
         {
+            await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
             var repoId = await _gitHost.EnsureRepositoryAsync(item.Id, project.RepositoryUrl, configuredBaseBranch, ct);
             var baseBranch = configuredBaseBranch ?? await _gitHost.GetDefaultBranchAsync(repoId, ct);
