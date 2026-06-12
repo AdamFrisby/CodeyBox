@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 
@@ -111,7 +113,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sandbox,
+            workingDirectory,
+            invocation,
+            stdoutChunkCallback,
+            captureStructuredStream,
+            ct,
             sessionResumeContext: CreateSessionResumeContext(
                 prompt,
                 credential,
@@ -171,7 +178,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             reasoningMode,
             captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sandbox,
+            workingDirectory,
+            invocation,
+            stdoutChunkCallback,
+            captureStructuredStream,
+            ct,
             sessionResumeContext: CreateSessionResumeContext(
                 prompt,
                 credential,
@@ -185,6 +197,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
         CancellationToken ct,
         SessionResumeRebuildContext? sessionResumeContext = null)
     {
@@ -199,7 +212,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         while (true)
         {
             last = await ExecuteInvocationOnceAsync(
-                sandbox, workingDirectory, current, stdoutChunkCallback, ct);
+                sandbox,
+                workingDirectory,
+                current,
+                stdoutChunkCallback,
+                captureStructuredStream,
+                ct);
             if (last.Success)
                 return last;
 
@@ -451,11 +469,37 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream,
         CancellationToken ct)
     {
         var runKey = AgentRunKey(sandbox, workingDirectory);
         var runId = Guid.NewGuid().ToString("N");
         ActiveAgentRunIds[runKey] = runId;
+        // Plaintext-fallback runs tee stderr into the stdout chunk channel
+        // directly: the captured .jsonl has no JSON framing to corrupt and
+        // agy / opencode emit useful diagnostics there. Structured runs
+        // (stream-json) cannot interleave raw stderr — chunks arrive split
+        // at non-newline boundaries from arbitrary sandbox threads
+        // (see SandboxExec docs) and would break per-line JSON framing.
+        // Instead the runner wraps each complete stderr line in a single-
+        // line JSON envelope and forwards it through the same callback, so
+        // the .jsonl carries a recoverable record of stderr (auth/usage
+        // diagnostics that fire before any structured event is emitted)
+        // without any framing risk.
+        StderrEnvelopeForwarder? envelopeForwarder = null;
+        Action<string>? stderrChunkCallback;
+        if (captureStructuredStream)
+        {
+            envelopeForwarder = stdoutChunkCallback is null
+                ? null
+                : new StderrEnvelopeForwarder(stdoutChunkCallback);
+            stderrChunkCallback = envelopeForwarder is null ? null : envelopeForwarder.Append;
+        }
+        else
+        {
+            stderrChunkCallback = stdoutChunkCallback;
+        }
+
         var exec = new SandboxExec
         {
             Argv = invocation.Argv,
@@ -463,6 +507,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
+            StderrChunkCallback = stderrChunkCallback,
         };
 
         SandboxExecResult result;
@@ -472,6 +517,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
         finally
         {
+            envelopeForwarder?.FlushTrailing();
             RemoveActiveAgentRunId(runKey, runId);
         }
 
@@ -480,6 +526,106 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
             Stdout: result.Stdout,
             Stderr: result.Stderr);
+    }
+
+    /// <summary>
+    /// Buffers stderr chunks up to the next newline and forwards each complete
+    /// line as a single-line JSON envelope through the supplied callback. Used
+    /// by structured-stream runs so stderr diagnostics still land in the
+    /// captured .jsonl without interleaving non-JSON noise into the file.
+    /// </summary>
+    internal sealed class StderrEnvelopeForwarder
+    {
+        public const string EnvelopeType = "codeybox.stderr";
+
+        // A misbehaving CLI / tool can emit a single very long stderr line
+        // without a newline (terminal control sequences, JSON dumps, stack
+        // traces concatenated by a broken logger). The forwarder buffers
+        // stderr until newline so each emitted JSON envelope is one
+        // recoverable line — but without a cap that buffer grows unbounded
+        // in host process memory before the per-stream-file size cap can
+        // engage. Cap the buffered line; once exceeded we emit the buffered
+        // prefix with a truncation marker and discard the overflow until
+        // the next newline.
+        internal const int MaxBufferedLineChars = 64 * 1024;
+        internal const string LineTruncationMarker = "[...stderr line truncated]";
+
+        private readonly Action<string> _downstream;
+        private readonly StringBuilder _buffer = new();
+        private readonly object _gate = new();
+        private bool _lineOverflowed;
+
+        public StderrEnvelopeForwarder(Action<string> downstream)
+        {
+            _downstream = downstream;
+        }
+
+        public void Append(string chunk)
+        {
+            if (string.IsNullOrEmpty(chunk))
+                return;
+
+            lock (_gate)
+            {
+                foreach (var ch in chunk)
+                {
+                    if (ch == '\n')
+                    {
+                        FlushLocked();
+                        continue;
+                    }
+
+                    if (ch == '\r')
+                        continue;
+
+                    if (_lineOverflowed)
+                        continue;
+
+                    if (_buffer.Length >= MaxBufferedLineChars)
+                    {
+                        _buffer.Append(LineTruncationMarker);
+                        _lineOverflowed = true;
+                        continue;
+                    }
+
+                    _buffer.Append(ch);
+                }
+            }
+        }
+
+        public void FlushTrailing()
+        {
+            lock (_gate)
+            {
+                if (_buffer.Length > 0)
+                    FlushLocked();
+            }
+        }
+
+        private void FlushLocked()
+        {
+            var text = _buffer.ToString();
+            _buffer.Clear();
+            _lineOverflowed = false;
+            string envelope;
+            try
+            {
+                envelope = JsonSerializer.Serialize(new { type = EnvelopeType, text }) + "\n";
+            }
+            catch (NotSupportedException)
+            {
+                return;
+            }
+
+            try
+            {
+                _downstream(envelope);
+            }
+            catch
+            {
+                // Downstream sink failures are observability-only; never block the agent run.
+            }
+        }
     }
 
     /// <summary>

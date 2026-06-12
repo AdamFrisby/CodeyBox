@@ -83,6 +83,51 @@ public sealed class CursorAgentRunnerTests
         Assert.DoesNotContain("high", agentExec.Argv);
     }
 
+    // ── Structured-stream capture flag ────────────────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_WhenCaptureStructuredStreamTrue_AppendsStreamJsonAndPartialOutput()
+    {
+        // Cursor CLI emits NDJSON in the same shape as Claude when
+        // `--output-format stream-json --stream-partial-output` are set.
+        // PipelineRunner only sets captureStructuredStream=true once
+        // SupportsStructuredStreamAsync confirmed `agent --help` advertises
+        // the flag. A regression dropping either flag silently downgrades
+        // the capture file from real-time NDJSON to a single end-of-run
+        // blob, defeating the live tail / structured-summary path — and
+        // the parser tests (which hand-write NDJSON) would not catch it.
+        var sandbox = new RecordingSandbox();
+        var runner = new CursorAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "p", credential: null, captureStructuredStream: true);
+
+        var agentExec = Assert.Single(sandbox.Execs, e => e.Argv.Count > 0 && e.Argv[0] == "agent");
+        var argv = agentExec.Argv;
+        var formatIdx = -1;
+        for (var i = 0; i < argv.Count; i++)
+            if (argv[i] == "--output-format") { formatIdx = i; break; }
+        Assert.True(formatIdx >= 0, "expected --output-format when captureStructuredStream=true");
+        Assert.Equal("stream-json", argv[formatIdx + 1]);
+        Assert.Contains("--stream-partial-output", argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenCaptureStructuredStreamFalse_OmitsStreamJsonAndPartialOutput()
+    {
+        // Plaintext-capture path: the help-text probe rejected --output-format
+        // (older Cursor build). The runner must NOT pass it; an unknown-option
+        // exit 1 here would mask itself as a stream-classified failure.
+        var sandbox = new RecordingSandbox();
+        var runner = new CursorAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work", "p", credential: null, captureStructuredStream: false);
+
+        var agentExec = Assert.Single(sandbox.Execs, e => e.Argv.Count > 0 && e.Argv[0] == "agent");
+        Assert.DoesNotContain("--output-format", agentExec.Argv);
+        Assert.DoesNotContain("stream-json", agentExec.Argv);
+        Assert.DoesNotContain("--stream-partial-output", agentExec.Argv);
+    }
+
     // ── Auth materialisation ──────────────────────────────────────────────────
 
     [Fact]

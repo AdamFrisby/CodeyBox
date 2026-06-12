@@ -32,6 +32,7 @@
 
   <ItemGroup>
     <Content Include="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\**\*.jsonl" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.txt" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="Fixtures\**\*.cs" />
   </ItemGroup>
@@ -57,6 +58,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Codex\CodeyBox.Agents.Codex.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Gemini\CodeyBox.Agents.Gemini.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Agents.Copilot\CodeyBox.Agents.Copilot.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Cursor\CodeyBox.Agents.Cursor.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Opencode\CodeyBox.Agents.Opencode.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Agents.Antigravity\CodeyBox.Agents.Antigravity.csproj" />

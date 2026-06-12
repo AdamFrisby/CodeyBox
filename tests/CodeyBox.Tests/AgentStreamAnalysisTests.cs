@@ -3,9 +3,13 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Copilot;
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.AspNetCore.Hosting;
@@ -18,6 +22,15 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
+
+internal static class AgentStreamFixture
+{
+    public static string Read(string relativePath) =>
+        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "AgentStreams", relativePath));
+
+    public static MemoryStream Open(string relativePath) =>
+        new(Encoding.UTF8.GetBytes(Read(relativePath)));
+}
 
 public sealed class ClaudeStreamParserTests
 {
@@ -159,6 +172,214 @@ public sealed class ClaudeStreamParserTests
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class UnknownAgentStreamParserTests
+{
+    [Fact]
+    public async Task ParseAsync_WithContext_UsesDurationAndCallerCounts()
+    {
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = StreamOf("""
+            starting plaintext run
+            ERROR: compile failed
+            final line
+            """);
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(45),
+            LineCount: 99,
+            SizeBytes: 1234));
+
+        Assert.Equal(TimeSpan.FromSeconds(45), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("lines=99", summary.FinalAssistantMessage);
+        Assert.Contains("bytes=1234", summary.FinalAssistantMessage);
+        Assert.Contains("errors=1", summary.FinalAssistantMessage);
+        Assert.Contains("final line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamThrowsIOExceptionMidRead_PreservesPartialTailAndCounts()
+    {
+        // The IOException recovery branch in UnknownAgentStreamParser is
+        // load-bearing: an in-flight capture file can be truncated, rotated,
+        // or briefly contended, and we still want a non-blank summary out the
+        // other side. Pin: we get the partial tail that WAS read, the
+        // caller-supplied accounting takes over from the read-counters we
+        // never finished tallying, and the parse does NOT propagate the
+        // IOException out (which would re-create the "summary row went
+        // missing" black hole this rework closed).
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var prefix = "first plaintext line\nsecond plaintext line\n";
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes(prefix)),
+            new IOException("simulated rotation mid-read"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(12),
+            LineCount: 77,
+            SizeBytes: 8_888));
+
+        Assert.False(summary.IsUnsupported);
+        Assert.Equal(TimeSpan.FromSeconds(12), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // Caller-supplied accounting wins over the swallowed read counters.
+        Assert.Contains("lines=77", summary.FinalAssistantMessage);
+        Assert.Contains("bytes=8888", summary.FinalAssistantMessage);
+        // The partial tail collected before the throw is still there.
+        Assert.Contains("first plaintext line", summary.FinalAssistantMessage);
+        Assert.Contains("second plaintext line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamThrowsDecoderFallbackOnMalformedUtf8_PreservesPartialTail()
+    {
+        // The DecoderFallbackException branch exists because agy / opencode
+        // can spit terminal escapes or partial bytes when the CLI is killed
+        // mid-write. A throwing decoder must not blank the summary — pin the
+        // partial tail and that the malformed bytes don't surface.
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var prefix = "first plaintext line\nsecond plaintext line\n";
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes(prefix)),
+            new DecoderFallbackException("simulated malformed UTF-8"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started,
+            started.AddSeconds(7),
+            LineCount: 5,
+            SizeBytes: 64));
+
+        Assert.False(summary.IsUnsupported);
+        Assert.Equal(TimeSpan.FromSeconds(7), summary.TotalDuration);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("lines=5", summary.FinalAssistantMessage);
+        Assert.Contains("first plaintext line", summary.FinalAssistantMessage);
+        Assert.Contains("second plaintext line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_PlaintextTailLineIsBoundedAgainstHugeLine()
+    {
+        // Agent output (including stderr that the runner tees verbatim
+        // through the plaintext path) is attacker-influenceable. A single
+        // very long line — terminal escapes, a JSON dump, a stack trace
+        // concatenated by a broken logger — must not balloon the persisted
+        // summary row. The per-line cap clamps each kept tail line.
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var hugeLine = new string('x', 16_000);
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(hugeLine + "\nfinal short line\n"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started, started.AddSeconds(1), LineCount: null, SizeBytes: null));
+
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // Cap is 16 KiB joined tail + 2 KiB per line + truncation markers.
+        // Pre-cap the whole 16k line would have been concatenated verbatim.
+        Assert.True(summary.FinalAssistantMessage.Length < 20_000,
+            $"FinalAssistantMessage was {summary.FinalAssistantMessage.Length} chars; expected bounded");
+        Assert.Contains("[...truncated]", summary.FinalAssistantMessage);
+        Assert.Contains("final short line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamThrowsUnauthorizedAccess_DoesNotSwallow()
+    {
+        // The flip side of the recovery branches: only IOException /
+        // DecoderFallbackException are swallowed. Any other read failure
+        // must surface so the sweep retries instead of writing a "successful"
+        // summary that hides a real bug (this was called out explicitly in
+        // the parser's comment block).
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        await using var stream = new ThrowAfterStream(
+            new MemoryStream(Encoding.UTF8.GetBytes("partial\n")),
+            new UnauthorizedAccessException("not for the sweep to swallow"));
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            parser.ParseAsync(stream, new AgentStreamParserContext(
+                started, started.AddSeconds(1), LineCount: 1, SizeBytes: 8)));
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+
+    /// <summary>
+    /// Reads the wrapped stream until it's drained, then throws the
+    /// configured exception on the next read — simulates a real read
+    /// failure that fires mid-parse rather than on first byte.
+    /// </summary>
+    private sealed class ThrowAfterStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly Exception _toThrow;
+        private bool _drained;
+
+        public ThrowAfterStream(Stream inner, Exception toThrow)
+        {
+            _inner = inner;
+            _toThrow = toThrow;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_drained)
+                throw _toThrow;
+            var read = _inner.Read(buffer, offset, count);
+            if (read == 0)
+            {
+                _drained = true;
+                throw _toThrow;
+            }
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_drained)
+                throw _toThrow;
+            var read = await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                _drained = true;
+                throw _toThrow;
+            }
+            return read;
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _inner.Dispose();
+            base.Dispose(disposing);
+        }
+    }
 }
 
 public sealed class CodexStreamParserTests
@@ -432,6 +653,238 @@ public sealed class GeminiStreamParserTests
         Assert.Equal(3, summary.OutputTokens);
         Assert.Equal(1, summary.CachedInputTokens);
         Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class AntigravityStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> TestParsers() =>
+    [
+        new AntigravityStreamParser(),
+        new ClaudeStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_DoesNotClaimClaudeShape()
+    {
+        // Antigravity emits literal Claude shape for claude-* gateway models —
+        // there is no on-wire marker to disambiguate. The parser must NOT claim
+        // here; ResolveKind reaches Antigravity via cost rows / item.Agent.
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-success.redacted.jsonl");
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
+        // With production registration order Claude wins the sniff race. The
+        // anti-regression is that the sniff result is NOT Antigravity.
+        Assert.NotEqual(AgentKind.Antigravity, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RedactedCapturedClaudeGateway_ParsesToolUsageAndFinalMessage()
+    {
+        var parser = new AntigravityStreamParser();
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-success.redacted.jsonl");
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.True(tool.Succeeded);
+        Assert.Null(tool.Duration);
+        Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
+        Assert.Equal(12000 + 300, summary.InputTokens);
+        Assert.Equal(650, summary.OutputTokens);
+        Assert.Equal(4000, summary.CachedInputTokens);
+        Assert.Equal(0.42m, summary.EstimatedUsd);
+        Assert.Equal("done", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RedactedCapturedAuthFailure_PreservesStderrTailAfterInit()
+    {
+        var parser = new AntigravityStreamParser();
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-auth-failure.redacted.jsonl");
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("AGY_AUTH_ERROR", summary.FinalAssistantMessage);
+        Assert.Contains("reauthenticate", summary.FinalAssistantMessage);
+        Assert.Empty(summary.ToolCalls);
+    }
+
+    private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class StderrEnvelopeFoldingTests
+{
+    [Fact]
+    public async Task ParseAsync_StreamWithSystemInitThenStderr_PreservesStderrTailInFinalMessage()
+    {
+        // Anti-regression for the completeness gap: a structured stream that
+        // recognises at least one event (system/init) but contains no
+        // provider final message must still surface the codeybox.stderr
+        // envelope diagnostics. Pre-fix, recognizedEventCount>0 short-
+        // circuited the plaintext fallback, so stderr was silently dropped
+        // from agent_stream_summaries — exactly the auth/usage-failure
+        // shape the rework was supposed to make visible.
+        var parser = new ClaudeStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"system","subtype":"init","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"codeybox.stderr","text":"Error: invalid_api_key"}
+            {"type":"codeybox.stderr","text":"Please reauthenticate with `claude auth login`."}
+            """));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("invalid_api_key", summary.FinalAssistantMessage);
+        Assert.Contains("reauthenticate", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamWithResultAndStderr_PreservesBothInFinalMessage()
+    {
+        // When the provider DID emit a final-result message (the happy
+        // path), the stderr tail must not clobber it: surface both so the
+        // operator still sees the provider's own message and any
+        // accompanying stderr diagnostics.
+        var parser = new ClaudeStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"result","timestamp":"2026-01-01T00:00:00Z","result":"all done","usage":{"input_tokens":1,"output_tokens":1}}
+            {"type":"codeybox.stderr","text":"warning: deprecated flag --foo"}
+            """));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("all done", summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("deprecated flag", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StderrTailIsBoundedAgainstHugeEnvelope()
+    {
+        // An attacker-influenceable stderr line (long output from a
+        // compromised tool the agent invoked) must not balloon the
+        // persisted summary row. The stderr tail is capped independently
+        // of the raw capture file size.
+        var parser = new ClaudeStreamParser();
+        var hugeLine = new string('x', 32_000);
+        var envelope = JsonSerializer.Serialize(new { type = "codeybox.stderr", text = hugeLine });
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
+            + envelope + "\n"));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // The persisted final message must remain bounded (cap is 8KB +
+        // header). 24KB would be the pre-cap size.
+        Assert.True(summary.FinalAssistantMessage.Length < 12_000,
+            $"FinalAssistantMessage was {summary.FinalAssistantMessage.Length} chars; expected bounded");
+        Assert.Contains("[...stderr truncated]", summary.FinalAssistantMessage);
+    }
+}
+
+public sealed class CopilotStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> ProductionOrderParsers() =>
+    [
+        new ClaudeStreamParser(),
+        new CopilotStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_DoesNotClaimAnyShape()
+    {
+        // Copilot CLI is plaintext-only — it never emits NDJSON shapes the
+        // sniffer could recognise. The parser is registered so ResolveKind
+        // canonicalises Copilot kind labels, but its TryClaim must stay
+        // permanently false: if it ever claimed something it would
+        // misattribute Claude/Cursor/etc. runs to Copilot.
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"assistant","message":{"role":"assistant","content":"hi"}}
+            """));
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrderParsers());
+        Assert.NotEqual(AgentKind.Copilot, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_PlaintextStream_ReturnsUnsupportedSoFallbackEngages()
+    {
+        // CopilotStreamParser deliberately inherits FlexibleAgentStreamParser
+        // without recognising any plaintext shape: a plain stdout capture
+        // contains zero recognised events, so ParseAsync returns
+        // IsUnsupported and the orchestrator's plaintext-fallback path
+        // re-runs the file. Without this parser registered at all, that
+        // same plaintext file would end up attributed to "unknown" — the
+        // failure mode this slot guards against.
+        var parser = new CopilotStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+            "copilot session start\n"
+            + "applying patch to foo.go\n"
+            + "session ended\n"));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.True(summary.IsUnsupported);
+        Assert.Equal(AgentKind.Copilot, parser.Kind);
+    }
+}
+
+public sealed class CursorStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> ProductionOrderParsers() =>
+    [
+        new AntigravityStreamParser(),
+        new ClaudeStreamParser(),
+        new CursorStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_DoesNotMisattributeCursorToClaude()
+    {
+        // Cursor emits literal Claude shape. There is no on-wire marker to
+        // disambiguate, so CursorStreamParser deliberately doesn't claim by
+        // shape. Sniff returns Claude here (whichever provider parser claims
+        // first); ResolveKind then uses item.Agent / cost rows to land
+        // cursor work items in kind=cursor.
+        await using var stream = AgentStreamFixture.Open("cursor-stream-json.redacted.jsonl");
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrderParsers());
+        // Anti-regression: Cursor parser must NOT win on Claude-shape sniffing
+        // (was a bug pre-fix when its TryClaim was identical to Claude's, and
+        // would have flipped depending on registration order).
+        Assert.NotEqual(AgentKind.Cursor, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_RedactedCapturedCursorStream_ParsesToolAndUsage()
+    {
+        var parser = new CursorStreamParser();
+        await using var stream = AgentStreamFixture.Open("cursor-stream-json.redacted.jsonl");
+
+        var summary = await parser.ParseAsync(stream);
+
+        var tool = Assert.Single(summary.ToolCalls);
+        Assert.Equal("Read", tool.ToolName);
+        Assert.True(tool.Succeeded);
+        Assert.Equal(TimeSpan.FromMilliseconds(2234), summary.TotalDuration);
+        Assert.Equal(231, summary.InputTokens);
+        Assert.Equal(19, summary.OutputTokens);
+        Assert.Equal(32, summary.CachedInputTokens);
+        Assert.Equal(0.0007m, summary.EstimatedUsd);
+        Assert.Equal("Patched Program.cs.", summary.FinalAssistantMessage);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -826,8 +1279,13 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task AnalyzeRecentTerminalWorkItemsAsync_TreatsKnownAgentFileWithoutRecognizedEventsAsUnsupported()
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_PreservesAgentKindAndCapturesTail()
     {
+        // A known agent kind (Claude) whose stream contains no recognised
+        // structured events should still produce a usable plaintext-fallback
+        // summary: the row keeps kind=claude (so dashboards still attribute
+        // the run) and carries a tail summary with line/byte counts. The
+        // observability black hole this rework was written to close.
         var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Claude };
         await _workItems.CreateAsync(item);
         WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
@@ -842,9 +1300,169 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 
         Assert.Equal(1, count);
         var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
-        Assert.Equal(new AgentKind("unknown"), row.AgentKind);
+        // Plaintext fallback preserves the originally-resolved kind so
+        // agent_kind=claude / antigravity / opencode rows still aggregate
+        // correctly under their dashboard buckets.
+        Assert.Equal(AgentKind.Claude, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        Assert.Contains("plaintext-fallback", row.Summary.FinalAssistantMessage);
+        Assert.Contains("lines=", row.Summary.FinalAssistantMessage);
         Assert.Empty(row.Summary.ToolCalls);
-        Assert.Equal(TimeSpan.Zero, row.Summary.TotalDuration);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_RawNonJsonStreamForOpencode()
+    {
+        // The keystone scenario: an agent whose CLI emits NO structured
+        // stream-json (opencode) writes plaintext stdout. Without the
+        // fallback, opencode rows would disappear (kind=unknown +
+        // IsUnsupported). Now they land with kind=opencode and a tail.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Opencode };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            AgentStreamFixture.Read("opencode-subscription-limit.redacted.txt"));
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new OpencodeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Opencode, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        // line/byte/error accounting surfaces in the summary header.
+        Assert.Contains("lines=2", row.Summary.FinalAssistantMessage);
+        // Tail is preserved so an operator can see the final-output context.
+        Assert.Contains("usage limit reached", row.Summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_RawNonJsonStreamForCopilot()
+    {
+        // Copilot is the second plaintext-only CLI in the matrix: its
+        // non-interactive mode emits plain stdout with no structured
+        // stream-json. The DI registration in Program.cs wires
+        // CopilotStreamParser specifically to keep these runs attributed
+        // to AgentKind.Copilot (instead of falling to "unknown") while
+        // letting StreamAnalysisService re-run the file through the
+        // plaintext-fallback summariser. Anti-regression: deleting the
+        // CopilotStreamParser registration or removing the parser class
+        // entirely would put the row back under "unknown".
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Copilot };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            "copilot session start\n"
+            + "executing tool: read_file foo.go\n"
+            + "ERROR: token quota exceeded\n"
+            + "stack trace:\n"
+            + "session ended\n");
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new CopilotStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Copilot, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        Assert.Contains("plaintext-fallback", row.Summary.FinalAssistantMessage);
+        Assert.Contains("lines=5", row.Summary.FinalAssistantMessage);
+        Assert.Contains("session ended", row.Summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ClaudeShapedCursorRun_PersistsRowAsCursor()
+    {
+        // End-to-end persistence test for shared-shape attribution.
+        // Cursor CLI emits literal Claude-shape NDJSON when --output-format
+        // stream-json is set. The sniffer therefore returns AgentKind.Claude
+        // for a Cursor-dispatched run; AgentStreamParserSelection.ResolveKind
+        // is responsible for re-attributing the run to AgentKind.Cursor using
+        // the work item's declared agent (and/or a cost-row override). This
+        // test runs the full AnalyzeRecentTerminalWorkItemsAsync path on a
+        // realistic Cursor-dispatched, Claude-shaped capture and asserts the
+        // persisted agent_stream_summaries row carries AgentKind.Cursor with
+        // a real parsed summary (tool calls + final assistant message),
+        // catching regressions to either ResolveKind or the parser selection
+        // that would put the row back under AgentKind.Claude.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Cursor };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            AgentStreamFixture.Read("cursor-stream-json.redacted.jsonl"));
+
+        var service = new StreamAnalysisService(
+            _workItems,
+            _streams,
+            _summaries,
+            [new ClaudeStreamParser(), new CursorStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        // Attribution: the row MUST carry AgentKind.Cursor even though the
+        // on-wire shape is Claude. A regression that drops the shared-shape
+        // override would land this as AgentKind.Claude.
+        Assert.Equal(AgentKind.Cursor, row.AgentKind);
+        // Parsed summary content: the resolver picks the Claude parser to
+        // actually read the events (since Cursor parses through the same
+        // shape); verify a real round-tripped summary, not an Unsupported
+        // shell or a plaintext-fallback header.
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.Equal("Patched Program.cs.", row.Summary.FinalAssistantMessage);
+        var tool = Assert.Single(row.Summary.ToolCalls);
+        Assert.Equal("Read", tool.ToolName);
+        Assert.Equal(231, row.Summary.InputTokens);
+        Assert.Equal(19, row.Summary.OutputTokens);
+    }
+
+    [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_ClaudeShapedAntigravityRun_PersistsRowAsAntigravity()
+    {
+        // Companion to the Cursor case above: agy (Antigravity) is a
+        // multi-model gateway whose claude-* gateway models emit literal
+        // Anthropic stream-json. A Claude-sniffed run dispatched to
+        // Antigravity must persist as AgentKind.Antigravity, not Claude.
+        // This is the original observability failure mode (an empty agy
+        // rework looked like Claude in the summary table), so a fresh
+        // regression here would be the highest-impact symptom we can
+        // protect against.
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Antigravity };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "rework-2-abcdef.jsonl",
+            AgentStreamFixture.Read("antigravity-claude-gateway-success.redacted.jsonl"));
+
+        var service = new StreamAnalysisService(
+            _workItems,
+            _streams,
+            _summaries,
+            [new AntigravityStreamParser(), new ClaudeStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        // Attribution: the row MUST carry AgentKind.Antigravity, not Claude.
+        Assert.Equal(AgentKind.Antigravity, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.Equal("done", row.Summary.FinalAssistantMessage);
+        var tool = Assert.Single(row.Summary.ToolCalls);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Equal(12000 + 300, row.Summary.InputTokens);
+        Assert.Equal(650, row.Summary.OutputTokens);
     }
 
     [Fact]
@@ -897,6 +1515,70 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 }
 
+public sealed class AgentStreamParserProductionRegistrationTests
+    : IClassFixture<AgentStreamAnalysisApiFactory>
+{
+    private readonly AgentStreamAnalysisApiFactory _factory;
+
+    public AgentStreamParserProductionRegistrationTests(AgentStreamAnalysisApiFactory factory)
+        => _factory = factory;
+
+    /// <summary>
+    /// Resolve the IAgentStreamParser collection from the running production
+    /// DI container. The whole point of the rework was the DI registration
+    /// itself — if Program.cs forgot to register
+    /// AntigravityStreamParser/CursorStreamParser/OpencodeStreamParser the
+    /// real service container would not surface them, and the runtime
+    /// fallback to UnknownAgentStreamParser would still apply. Building a
+    /// hand-rolled list "that mirrors Program.cs" cannot catch that
+    /// regression; resolving from the real container does.
+    /// </summary>
+    private IReadOnlyList<IAgentStreamParser> ResolvedFromProductionContainer()
+    {
+        using var scope = _factory.Services.CreateScope();
+        return scope.ServiceProvider
+            .GetServices<IAgentStreamParser>()
+            .ToList();
+    }
+
+    [Fact]
+    public void DiContainer_RegistersParserForEveryProductionAgentKind()
+    {
+        // Anti-regression: the rework's acceptance criterion was that every
+        // dispatched agent kind has a parser registered in DI. A missing
+        // registration is the failure mode that put antigravity/cursor/
+        // opencode in the unknown bucket pre-fix.
+        var resolved = ResolvedFromProductionContainer();
+        var resolvedKinds = resolved.Select(p => p.Kind).ToHashSet();
+        Assert.Contains(AgentKind.Antigravity, resolvedKinds);
+        Assert.Contains(AgentKind.Claude, resolvedKinds);
+        Assert.Contains(AgentKind.Codex, resolvedKinds);
+        Assert.Contains(AgentKind.Copilot, resolvedKinds);
+        Assert.Contains(AgentKind.Cursor, resolvedKinds);
+        Assert.Contains(AgentKind.Gemini, resolvedKinds);
+        Assert.Contains(AgentKind.Opencode, resolvedKinds);
+        // Unknown fallback is the residual catch-all for kinds we don't
+        // register — must stay present so plaintext-fallback continues to
+        // operate.
+        Assert.Contains(resolved, p => p.Kind.Value == "unknown");
+    }
+
+    [Fact]
+    public async Task SniffKindAsync_ClaudeShape_AttributesToClaudeNotAntigravityOrCursor()
+    {
+        // Real Claude stream-json includes message.model = "claude-..." and
+        // usage.cache_read_input_tokens. Pre-fix this routed to Antigravity
+        // (registered first). It must now route to Claude even when the
+        // parser list comes from the real DI container.
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"assistant","message":{"id":"msg_01","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20}}}
+            """));
+        var kind = await AgentStreamParserSelection.SniffKindAsync(
+            stream, ResolvedFromProductionContainer());
+        Assert.Equal(AgentKind.Claude, kind);
+    }
+}
+
 public sealed class AgentStreamParserSelectionTests
 {
     [Fact]
@@ -942,6 +1624,244 @@ public sealed class AgentStreamParserSelectionTests
             new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Gemini });
 
         Assert.Equal(AgentKind.Claude, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_CursorWorkPhase_OverridesSharedShapeSniffWithItemAgent()
+    {
+        // Anti-regression for the core finding: a cursor work item whose
+        // structured stream-json is byte-identical to Claude (cursor's CLI
+        // emits the literal Claude shape) must NOT be attributed to claude
+        // just because ClaudeStreamParser claimed the shape. WorkItem.Agent
+        // is the authoritative work-phase dispatch record, so it overrides
+        // the shape-based sniff. Pre-fix, ResolveKind returned the sniffed
+        // kind first and persisted these runs under agent_kind=claude —
+        // exactly the bug the rework was meant to close.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "cursor work",
+            Prompt = "cursor work",
+            Agent = AgentKind.Cursor,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Claude,
+            costs: [],
+            parsers: new IAgentStreamParser[]
+            {
+                new ClaudeStreamParser(),
+                new CursorStreamParser(),
+                new AntigravityStreamParser(),
+            });
+
+        Assert.Equal(AgentKind.Cursor, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AntigravityCostRow_OverridesSharedShapeSniff()
+    {
+        // Same shape, different vehicle: antigravity gateway runs through a
+        // claude-* model emit literal claude stream-json, but the work_item_costs
+        // row records the dispatched agy run and its invocation window contains
+        // this capture file. The cost-row branch lands the summary under
+        // agent_kind=antigravity regardless of what the sniffer claimed by shape.
+        var capturedAt = DateTimeOffset.UtcNow;
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "agy work",
+            Prompt = "agy work",
+            Agent = AgentKind.Antigravity,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            capturedAt);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "work",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddSeconds(-1),
+                EndedAt = capturedAt.AddSeconds(1),
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Claude,
+            costs,
+            parsers: new IAgentStreamParser[]
+            {
+                new ClaudeStreamParser(),
+                new CursorStreamParser(),
+                new AntigravityStreamParser(),
+            });
+
+        Assert.Equal(AgentKind.Antigravity, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_ConclusiveSniffBeatsUnrelatedPhaseCostRow()
+    {
+        var capturedAt = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "fallback work",
+            Prompt = "fallback work",
+            Agent = AgentKind.Antigravity,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "work-1-abcdef.jsonl",
+            "work",
+            1,
+            12,
+            null,
+            capturedAt);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "work",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddMinutes(10),
+                EndedAt = capturedAt.AddMinutes(11),
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs,
+            knownKinds: new[] { AgentKind.Antigravity, AgentKind.Claude, AgentKind.Codex });
+
+        Assert.Equal(AgentKind.Codex, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AuditPhase_ConclusiveSniffBeatsGenericAuditCostRows()
+    {
+        var capturedAt = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "audit streams",
+            Prompt = "audit streams",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "audit-llm-security:llm-review-1-abcdef.jsonl",
+            "audit-llm-security:llm-review",
+            1,
+            12,
+            null,
+            capturedAt);
+        var costs = new[]
+        {
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "audit",
+                Iteration = 1,
+                AgentKind = "claude",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddSeconds(-1),
+                EndedAt = capturedAt.AddSeconds(1),
+            },
+            new WorkItemCost
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                WorkItemId = item.Id.ToString(),
+                Phase = "audit",
+                Iteration = 1,
+                AgentKind = "antigravity",
+                InputTokens = 0,
+                OutputTokens = 0,
+                StartedAt = capturedAt.AddSeconds(2),
+                EndedAt = capturedAt.AddSeconds(4),
+            },
+        };
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs,
+            knownKinds: new[] { AgentKind.Antigravity, AgentKind.Claude, AgentKind.Codex });
+
+        Assert.Equal(AgentKind.Codex, kind);
+    }
+
+    [Fact]
+    public void ResolveKind_AuditPhase_PrefersSniffOverWorkItemAgent()
+    {
+        // Audit phases run a different auditor agent than the work phase,
+        // so WorkItem.Agent is NOT authoritative for the audit-* phase. The
+        // sniff catches the auditor's parser shape (codex/claude/gemini),
+        // overriding the work agent — keeps the existing
+        // "audit was dispatched to codex" attribution path working.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "claude work, codex audit",
+            Prompt = "claude work, codex audit",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Done,
+        };
+        var file = new AgentStreamFile(
+            "audit-llm-security:llm-review-1-abcdef.jsonl",
+            "audit-llm-security:llm-review",
+            1,
+            12,
+            null,
+            DateTimeOffset.UtcNow);
+
+        var kind = AgentStreamParserSelection.ResolveKind(
+            item,
+            file,
+            sniffedKind: AgentKind.Codex,
+            costs: [],
+            knownKinds: new[] { AgentKind.Claude, AgentKind.Codex, AgentKind.Cursor });
+
+        Assert.Equal(AgentKind.Codex, kind);
     }
 
     [Fact]
@@ -1196,6 +2116,43 @@ public sealed class OnDemandAnalysisEndpointTests
 
         Assert.Equal(0, factory.Streams.ListRequestCount);
         Assert.DoesNotContain(true, factory.Streams.IncludeLineCountRequests);
+    }
+
+    [Fact]
+    public async Task AnalyzeFile_PlaintextCapture_ReturnsFallbackTailInsteadOfUnsupported()
+    {
+        // Anti-regression: the on-demand endpoint must run the plaintext
+        // fallback when the dispatched-kind parser fails to recognise any
+        // events — same shape StreamAnalysisService does for the persisted
+        // summary path. Pre-fix, the endpoint returned kind=unknown with an
+        // Unsupported summary for plaintext opencode/cursor/antigravity
+        // captures, defeating the post-mortem inspection path even though
+        // the background summariser was fixed.
+        using var factory = new AgentStreamAnalysisApiFactory();
+        var item = AgentStreamAnalysisApiFactory.CreateItem(WorkItemState.Done) with
+        {
+            Agent = AgentKind.Opencode,
+        };
+        await factory.Store.CreateAsync(item);
+        const string fileName = "work-1-abcdef.jsonl";
+        factory.WriteStreamFile(item.Id, fileName,
+            "starting opencode run\n"
+            + "applying patch to plaintext.txt\n"
+            + "ERROR: compile failed\n"
+            + "done after 9.1s\n");
+
+        var client = factory.CreateClient();
+        var resp = await client.GetAsync($"/workitems/{item.Id}/agent-streams/{fileName}/analysis");
+        resp.EnsureSuccessStatusCode();
+
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("opencode", body.GetProperty("agentKind").GetString());
+        var final = body.GetProperty("finalAssistantMessage").GetString();
+        Assert.NotNull(final);
+        Assert.Contains("plaintext-fallback", final);
+        Assert.Contains("lines=4", final);
+        Assert.Contains("errors=1", final);
+        Assert.Contains("done after 9.1s", final);
     }
 }
 

@@ -7,7 +7,17 @@ namespace CodeyBox.Tests;
 
 public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
 {
-    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(15);
+    // Per-wait timeout for dispatch-pipeline signals. The happy path lands in
+    // ~300 ms locally; the 30 s ceiling is CI-contention headroom only.
+    // The audit suite fans the full xUnit collection out in parallel, the
+    // [Theory] inline-data dispatches all four parameter combinations of
+    // the precedence test concurrently, and each combination spins up its
+    // own SqliteWorkItemStore + OrchestratorService BackgroundService —
+    // sqlite file-creation latency under load has produced 15 s timeouts
+    // for the leading WaitForEnteredAsync. We are not exercising a latency
+    // SLA here, only ordering, so a generous wall-clock cap is the right
+    // tool.
+    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(30);
 
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-finishing-precedence-{Guid.NewGuid():N}.db");

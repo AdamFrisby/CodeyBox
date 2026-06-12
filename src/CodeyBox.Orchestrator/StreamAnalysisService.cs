@@ -69,7 +69,7 @@ public sealed class StreamAnalysisService : BackgroundService
             }
 
             var sniffedKind = await SniffKindAsync(item.Id, file.FileName, ct).ConfigureAwait(false);
-            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Keys);
+            var kind = AgentStreamParserSelection.ResolveKind(item, file, sniffedKind, costs, _parsers.Values);
             if (!_parsers.TryGetValue(kind, out var parser))
                 parser = _parsers.Values.FirstOrDefault(p => p.Kind.Value == "unknown") ?? new UnknownAgentStreamParser();
 
@@ -82,10 +82,21 @@ public sealed class StreamAnalysisService : BackgroundService
                 ? await contextParser.ParseAsync(stream, context, ct).ConfigureAwait(false)
                 : await parser.ParseAsync(stream, ct).ConfigureAwait(false);
             var rowKind = parser.Kind;
-            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(rowKind, summary))
+            if (AgentStreamParserSelection.ShouldTreatAsUnsupported(summary))
             {
-                rowKind = new AgentKind("unknown");
-                summary = AgentStreamParserSelection.UnsupportedSummary();
+                // The kind-specific parser did not recognise any events
+                // (plaintext output from an agent whose CLI does not emit
+                // structured stream-json, or partial / truncated structured
+                // output). Re-open the capture file and run it through the
+                // plaintext-fallback parser so the row carries a non-empty
+                // tail summary instead of falling all the way back to
+                // Unsupported. The rowKind keeps the originally-resolved
+                // kind so agent_stream_summaries still attributes the run
+                // to the right agent.
+                var fallback = await RunPlaintextFallbackAsync(item.Id, file.FileName, context, ct).ConfigureAwait(false);
+                summary = fallback ?? AgentStreamParserSelection.UnsupportedSummary();
+                if (fallback is null)
+                    rowKind = new AgentKind("unknown");
             }
             var row = new AgentStreamSummaryRow(
                 item.Id,
@@ -110,6 +121,20 @@ public sealed class StreamAnalysisService : BackgroundService
         return stream is null
             ? null
             : await AgentStreamParserSelection.SniffKindAsync(stream, _parsers.Values, ct).ConfigureAwait(false);
+    }
+
+    private async Task<AgentStreamSummary?> RunPlaintextFallbackAsync(
+        WorkItemId id,
+        string fileName,
+        AgentStreamParserContext? context,
+        CancellationToken ct)
+    {
+        await using var stream = await _streams.OpenReadAsync(id, fileName, ct).ConfigureAwait(false);
+        if (stream is null)
+            return null;
+
+        var fallback = AgentStreamParserSelection.ResolveFallbackParser(_parsers.Values);
+        return await fallback.ParseAsync(stream, context, ct).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

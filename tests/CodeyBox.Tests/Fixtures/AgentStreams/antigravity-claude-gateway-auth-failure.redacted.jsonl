@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"agy-redacted-session","tools":["Bash","Read","Edit"],"model":"claude-opus-4-6-thinking","permissionMode":"bypassPermissions","apiKeySource":"oauth"}
+{"type":"codeybox.stderr","text":"AGY_AUTH_ERROR: request failed with status 401 Unauthorized while refreshing the Google gateway token."}
+{"type":"codeybox.stderr","text":"Run `agy auth login` on the orchestrator host, reauthenticate, and refresh CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON before retrying."}

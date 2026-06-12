@@ -2023,9 +2023,13 @@ builder.Services.AddSingleton(sp =>
         throw new InvalidOperationException("CodeyBox:AgentStreamAnalysis:MaxStalls must be non-negative");
     return opts;
 });
+builder.Services.AddSingleton<IAgentStreamParser, AntigravityStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, ClaudeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, CodexStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, CopilotStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, CursorStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, GeminiStreamParser>();
+builder.Services.AddSingleton<IAgentStreamParser, OpencodeStreamParser>();
 builder.Services.AddSingleton<IAgentStreamParser, UnknownAgentStreamParser>();
 
 // Per-provider buffered-stdout tool-call counters. Used by the orchestrator

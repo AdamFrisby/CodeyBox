@@ -18,6 +18,17 @@ public interface IAgentStreamParser
     /// claim arbitrary lines.
     /// </summary>
     bool TryClaim(System.Text.Json.JsonElement line) => false;
+
+    /// <summary>
+    /// Returns true when this parser's agent is known to emit the on-wire NDJSON
+    /// shape of <paramref name="sniffed"/>. Wrapper agents (cursor proxies
+    /// claude; antigravity proxies claude/gemini) override this so the
+    /// orchestrator can attribute a sniffed-by-shape stream to the dispatched
+    /// agent kind without itself encoding the provider compatibility matrix.
+    /// Default: a parser only claims its own kind.
+    /// </summary>
+    bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, Kind.Value, StringComparison.OrdinalIgnoreCase);
 }
 
 public interface IAgentStreamParserWithContext : IAgentStreamParser
@@ -78,12 +89,159 @@ public sealed class AgentStreamParserOptions
     public int MaxStalls { get; set; } = 2_000;
 }
 
-public sealed class UnknownAgentStreamParser : IAgentStreamParser
+public sealed class UnknownAgentStreamParser : IAgentStreamParserWithContext
 {
+    // The plaintext tail summary lands in a SQLite TEXT column on
+    // agent_stream_summaries and is returned verbatim by the
+    // agent-stream analysis HTTP endpoints. Agent output is
+    // attacker-influenceable (prompts, repo content, tool output), and the
+    // capture file itself can be up to 32 MiB on disk, so one pathological
+    // line cannot be allowed to balloon the persisted summary row. Cap
+    // each captured tail line and the joined tail block independently of
+    // the raw capture file size.
+    internal const int MaxFallbackTailLines = 10;
+    internal const int MaxFallbackLineChars = 2_000;
+    internal const int MaxFallbackTailChars = 16_000;
+    internal const string TailLineTruncationMarker = "[...truncated]";
+    internal const string TailJoinTruncationMarker = "[...tail truncated]";
+
     public AgentKind Kind { get; } = new("unknown");
 
-    public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
-        Task.FromResult(AgentStreamSummary.Unsupported());
+    public Task<AgentStreamSummary> ParseAsync(System.IO.Stream jsonlFile, CancellationToken ct = default) =>
+        ParseAsync(jsonlFile, context: null, ct);
+
+    public async Task<AgentStreamSummary> ParseAsync(
+        System.IO.Stream jsonlFile,
+        AgentStreamParserContext? context,
+        CancellationToken ct = default)
+    {
+        var duration = context is not null && context.InvocationEndedAt >= context.InvocationStartedAt
+            ? context.InvocationEndedAt - context.InvocationStartedAt
+            : TimeSpan.Zero;
+
+        long lineCount = 0;
+        long byteCount = 0;
+        var errorLineCount = 0;
+        var lastLines = new System.Collections.Generic.List<string>();
+
+        try
+        {
+            using var reader = new System.IO.StreamReader(jsonlFile, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) != null)
+            {
+                lineCount++;
+                byteCount += Encoding.UTF8.GetByteCount(line) + 1;
+
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    if (LooksLikeError(line))
+                        errorLineCount++;
+                    lastLines.Add(CapTailLine(line));
+                    if (lastLines.Count > MaxFallbackTailLines)
+                        lastLines.RemoveAt(0);
+                }
+            }
+        }
+        catch (IOException)
+        {
+            // Narrow, explicitly-recoverable read failure: an in-flight capture
+            // file may have been truncated, rotated, or briefly contended.
+            // Persist the partial tail we already collected so the
+            // observability path is never blind — but do NOT swallow
+            // arbitrary exceptions (OperationCanceledException flows up,
+            // UnauthorizedAccessException / OutOfMemoryException / etc. must
+            // surface and let the sweep fail/retry rather than silently
+            // producing a "successful" summary from a real bug.
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            // Malformed UTF-8 in a plaintext agent stream — agy / opencode may
+            // emit terminal escapes or partial bytes when killed mid-write.
+            // Same recovery shape as the IO branch above.
+        }
+
+        // Prefer the caller-supplied accounting (which sees the full on-disk
+        // file size) over what we managed to read before any swallowed error.
+        var finalLineCount = context?.LineCount ?? lineCount;
+        var finalByteCount = context?.SizeBytes ?? byteCount;
+        var summary = BuildSummary(finalLineCount, finalByteCount, errorLineCount, lastLines);
+
+        return new AgentStreamSummary(
+            TotalDuration: duration,
+            TimeToFirstToken: null,
+            InputTokens: 0,
+            OutputTokens: 0,
+            CachedInputTokens: 0,
+            EstimatedUsd: null,
+            ToolCalls: Array.Empty<ToolCallInvocation>(),
+            Stalls: Array.Empty<StallEvent>(),
+            FinalAssistantMessage: summary)
+        {
+            IsUnsupported = false
+        };
+    }
+
+    private static bool LooksLikeError(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        return line.Contains("error", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("fatal", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("panic", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("exception", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("traceback", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildSummary(long lineCount, long byteCount, int errorLineCount, IReadOnlyList<string> tail)
+    {
+        var header = $"[plaintext-fallback lines={lineCount} bytes={byteCount} errors={errorLineCount}]";
+        if (tail.Count == 0) return header;
+        var joined = JoinTail(tail);
+        return header + "\n" + joined;
+    }
+
+    internal static string CapTailLine(string line)
+    {
+        if (line.Length <= MaxFallbackLineChars)
+            return line;
+        return line[..MaxFallbackLineChars] + TailLineTruncationMarker;
+    }
+
+    private static string JoinTail(IReadOnlyList<string> tail)
+    {
+        var sb = new StringBuilder();
+        for (var i = 0; i < tail.Count; i++)
+        {
+            if (i > 0)
+                sb.Append('\n');
+            var line = tail[i];
+            var remaining = MaxFallbackTailChars - sb.Length;
+            if (remaining <= 0)
+            {
+                AppendOverflowMarker(sb);
+                return sb.ToString();
+            }
+
+            if (line.Length <= remaining)
+            {
+                sb.Append(line);
+                continue;
+            }
+
+            sb.Append(line, 0, remaining);
+            AppendOverflowMarker(sb);
+            return sb.ToString();
+        }
+
+        return sb.ToString();
+    }
+
+    private static void AppendOverflowMarker(StringBuilder sb)
+    {
+        if (sb.Length > 0 && sb[^1] != '\n')
+            sb.Append('\n');
+        sb.Append(TailJoinTruncationMarker);
+    }
 }
 
 public sealed record AgentStreamJsonLine(string Text, long LineNumber, long StartOffset, long EndOffset);
@@ -148,6 +306,28 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
 {
     private const int InputSummaryChars = 200;
     private const int InputSummaryUtf8Bytes = 4096;
+
+    /// <summary>
+    /// Type tag of the codeybox-internal stderr envelope written by
+    /// <c>CliAgentRunnerBase.StderrEnvelopeForwarder</c>. Surfacing these
+    /// envelopes in the summary keeps stderr diagnostics visible even when
+    /// the structured stream contains a few recognised events but no
+    /// provider final message (e.g. an auth/usage failure after a normal
+    /// <c>system/init</c>). Hardcoded here rather than referenced from
+    /// CliAgentRunnerBase because that class is internal-sealed and the
+    /// envelope shape is a tiny stable contract.
+    /// </summary>
+    internal const string StderrEnvelopeType = "codeybox.stderr";
+
+    /// <summary>
+    /// Maximum number of stderr-envelope characters folded into the parsed
+    /// summary's final-assistant message. The capture file itself can be
+    /// up to 32 MiB; the persisted summary row must not balloon with it.
+    /// </summary>
+    internal const int MaxStderrTailChars = 8_000;
+    internal const string StderrTailHeader = "[stderr-tail]";
+    internal const string StderrTailTruncationMarker = "[...stderr truncated]";
+
     private readonly AgentStreamParserOptions _options;
 
     protected FlexibleAgentStreamParser(AgentKind kind, AgentStreamParserOptions? options)
@@ -165,6 +345,15 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
     /// to know each provider's JSON vocabulary.
     /// </summary>
     public virtual bool TryClaim(JsonElement line) => false;
+
+    /// <summary>
+    /// Provider-specific shape compatibility. Wrapper agents
+    /// (cursor proxies claude; antigravity proxies claude/gemini) override
+    /// this so the orchestrator's resolver does not encode the cross-provider
+    /// compatibility matrix. Default: only the parser's own kind.
+    /// </summary>
+    public virtual bool CanEmitShapeOf(AgentKind sniffed) =>
+        string.Equals(sniffed.Value, Kind.Value, StringComparison.OrdinalIgnoreCase);
 
     public Task<AgentStreamSummary> ParseAsync(Stream jsonlFile, CancellationToken ct = default) =>
         ParseAsync(jsonlFile, context: null, ct);
@@ -191,6 +380,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         TimeSpan? observedTimeToFirstToken = null;
         var recognizedEventCount = 0;
         var projectedTimestampCount = 0;
+        var stderrTail = new StringBuilder();
+        var stderrLineCount = 0;
 
         await foreach (var jsonLine in AgentStreamJsonLineReader.ReadLinesAsync(jsonlFile, _options.MaxLineBytes, ct).ConfigureAwait(false))
         {
@@ -291,6 +482,13 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
             if (parsed.TotalDuration.HasValue) observedTotalDuration = parsed.TotalDuration.Value;
             if (parsed.TimeToFirstToken.HasValue) observedTimeToFirstToken = parsed.TimeToFirstToken.Value;
 
+            if (!string.IsNullOrEmpty(parsed.StderrText)
+                && stderrTail.Length < MaxStderrTailChars)
+            {
+                stderrLineCount++;
+                AppendStderrLine(stderrTail, parsed.StderrText);
+            }
+
             if (eventCount >= _options.MaxEvents)
                 break;
         }
@@ -322,6 +520,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 ? firstAssistantTimestamp.Value - firstTimestamp.Value
                 : (TimeSpan?)null);
 
+        var mergedFinalText = MergeFinalTextWithStderrTail(finalText, stderrTail, stderrLineCount);
+
         return new AgentStreamSummary(
             total < TimeSpan.Zero ? TimeSpan.Zero : total,
             ttft is { } t && t >= TimeSpan.Zero ? t : null,
@@ -334,7 +534,68 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
                 .ThenBy(t => t.StartedAt ?? DateTimeOffset.MaxValue)
                 .ToList(),
             stalls,
-            finalText);
+            mergedFinalText);
+    }
+
+    /// <summary>
+    /// Append a single stderr-envelope line into the bounded tail buffer.
+    /// Truncates the line if it would exceed the per-summary stderr cap and
+    /// stamps a terminal truncation marker so observers can tell the tail
+    /// was cut.
+    /// </summary>
+    private static void AppendStderrLine(StringBuilder tail, string line)
+    {
+        if (tail.Length > 0)
+        {
+            if (tail.Length + 1 >= MaxStderrTailChars)
+            {
+                AppendStderrTruncationMarker(tail);
+                return;
+            }
+            tail.Append('\n');
+        }
+
+        var remaining = MaxStderrTailChars - tail.Length;
+        if (remaining <= 0)
+        {
+            AppendStderrTruncationMarker(tail);
+            return;
+        }
+
+        if (line.Length <= remaining)
+        {
+            tail.Append(line);
+            return;
+        }
+
+        tail.Append(line, 0, remaining);
+        AppendStderrTruncationMarker(tail);
+    }
+
+    private static void AppendStderrTruncationMarker(StringBuilder tail)
+    {
+        if (tail.Length == 0 || tail[^1] != '\n')
+            tail.Append('\n');
+        tail.Append(StderrTailTruncationMarker);
+    }
+
+    /// <summary>
+    /// Fold the captured stderr-envelope tail into the parsed final
+    /// assistant message so a stream that contained provider events but no
+    /// final message (e.g. auth/usage failure after <c>system/init</c>)
+    /// still surfaces the stderr diagnostics on the persisted summary row.
+    /// When the parser already extracted a final message we keep it and
+    /// append the stderr tail below a delimiter so neither is lost.
+    /// </summary>
+    private static string? MergeFinalTextWithStderrTail(string? finalText, StringBuilder stderrTail, int stderrLineCount)
+    {
+        if (stderrTail.Length == 0)
+            return finalText;
+
+        var header = $"{StderrTailHeader} lines={stderrLineCount}";
+        if (string.IsNullOrEmpty(finalText))
+            return header + "\n" + stderrTail.ToString();
+        return finalText + "\n" + header + "\n" + stderrTail.ToString();
     }
 
     private static DateTimeOffset? ProjectTimestamp(AgentStreamParserContext? context, AgentStreamJsonLine line)
@@ -383,6 +644,26 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         var isAssistant = string.Equals(type, "assistant", StringComparison.OrdinalIgnoreCase)
             || string.Equals(FirstString(root, "role"), "assistant", StringComparison.OrdinalIgnoreCase);
         string? finalText = null;
+
+        if (string.Equals(type, StderrEnvelopeType, StringComparison.OrdinalIgnoreCase))
+        {
+            var stderrText = FirstString(root, "text") ?? string.Empty;
+            return new ParsedEvent(
+                EventType: StderrEnvelopeType,
+                Timestamp: timestamp,
+                IsAssistant: false,
+                ToolStarts: Array.Empty<ToolBuilder>(),
+                ToolResults: Array.Empty<ToolResultBuilder>(),
+                InputTokens: null,
+                OutputTokens: null,
+                CachedInputTokens: null,
+                EstimatedUsd: null,
+                TotalDuration: null,
+                TimeToFirstToken: null,
+                FinalText: null,
+                IsRecognized: false,
+                StderrText: stderrText);
+        }
 
         if (TryGet(root, out var message, "message"))
         {
@@ -890,7 +1171,8 @@ public abstract class FlexibleAgentStreamParser : IAgentStreamParserWithContext
         TimeSpan? TotalDuration,
         TimeSpan? TimeToFirstToken,
         string? FinalText,
-        bool IsRecognized);
+        bool IsRecognized,
+        string? StderrText = null);
 
     protected sealed record ToolBuilder(string Id, string Name, string InputSummary, DateTimeOffset? StartedAt);
     protected sealed record ToolResultBuilder(

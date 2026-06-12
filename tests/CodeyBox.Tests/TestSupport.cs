@@ -432,10 +432,21 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         _mergeStrategies = new Queue<MergeStrategy>(mergeStrategies);
     }
 
+    /// <summary>
+    /// Controls what <see cref="SupportsStructuredStreamAsync"/> returns —
+    /// defaults to <c>true</c> for backwards compat. Set to <c>false</c> to
+    /// simulate a plaintext-only agent (e.g. opencode) whose CLI does not
+    /// advertise <c>--output-format stream-json</c>; PipelineRunner must
+    /// still open the AgentStreamStore capture file in that case so the
+    /// agent's stdout/stderr is teed to disk for plaintext-fallback
+    /// summarisation.
+    /// </summary>
+    public bool StructuredStreamSupportResult { get; set; } = true;
+
     public Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         StructuredStreamSupportProbeCount++;
-        return Task.FromResult(true);
+        return Task.FromResult(StructuredStreamSupportResult);
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
