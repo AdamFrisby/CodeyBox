@@ -44,6 +44,19 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         Assert.Same(progressProvider, FieldValue(defaultSource, "_activeSandboxProvider"));
     }
 
+    [Fact]
+    public void ProgramWiresItemStaleProgressWatchdog()
+    {
+        // The per-item stale-updatedAt watchdog rides in alongside the
+        // per-worker watchdog. It must resolve from DI so the operator
+        // endpoint POST /workitems/{id}/recover can take a dependency on
+        // it without a separate factory.
+        using var factory = new WorkerProgressWatchdogWiringFactory(new PlainProvider());
+
+        var itemStale = factory.Services.GetRequiredService<ItemStaleProgressWatchdog>();
+        Assert.NotNull(itemStale);
+    }
+
     private static object? FieldValue(object instance, string name)
     {
         var field = instance.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);

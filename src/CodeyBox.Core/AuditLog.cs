@@ -914,6 +914,45 @@ public static class AuditLog
                 itemId.ToString(), workerId, fromState.ToString());
 
     /// <summary>
+    /// Emitted when the per-item stale-updatedAt detector observes an active
+    /// in-flight item whose <c>UpdatedAt</c> has not advanced for the
+    /// configured window. Distinct from <see cref="WorkItemWatchdogStuck"/>,
+    /// which watches per-worker progress and treats CPU / stream activity as
+    /// progress. This one watches the item only, so a worker stuck in a
+    /// transport reconnect loop (CPU active, item frozen) trips it.
+    /// </summary>
+    public static void WorkItemStaleDetected(
+        WorkItemId itemId,
+        string workerId,
+        WorkItemState state,
+        long sinceUpdatedSeconds,
+        string trigger) =>
+        Audit("work_item.item_stale_detected")
+            .Warning(
+                "Item-stale: work item {WorkItemId} (worker {WorkerId}, state {State}) has not advanced UpdatedAt for {SinceUpdatedSeconds}s; trigger={Trigger}",
+                itemId.ToString(), workerId, state.ToString(), sinceUpdatedSeconds, trigger);
+
+    /// <summary>
+    /// Emitted when the per-item stale-updatedAt detector recovers a wedged
+    /// item: any bound worker row is claimed, the pool slot is released, the
+    /// work branch is preserved for the next pickup, and the item is requeued
+    /// (or escalated to <see cref="WorkItemState.NeedsOperatorInput"/> when
+    /// the recovery-attempt bound is exceeded).
+    /// </summary>
+    public static void WorkItemStaleRecovered(
+        WorkItemId itemId,
+        string workerId,
+        WorkItemState fromState,
+        WorkItemState toState,
+        int attempt,
+        bool branchPreserved,
+        string trigger) =>
+        Audit("work_item.item_stale_recovered")
+            .Warning(
+                "Item-stale: recovered work item {WorkItemId} from worker {WorkerId} {FromState} → {ToState} (attempt {Attempt}, branchPreserved={BranchPreserved}, trigger={Trigger})",
+                itemId.ToString(), workerId, fromState.ToString(), toState.ToString(), attempt, branchPreserved, trigger);
+
+    /// <summary>
     /// Emitted when the watchdog restores a dependent that had been
     /// cascade-cancelled because <paramref name="parentId"/> was previously
     /// cancelled. Inverse of <see cref="WorkItemDependentCancelled"/>.

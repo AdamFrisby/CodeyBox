@@ -81,6 +81,57 @@ public sealed class WorkerProgressWatchdogOptions
     public int MaxRecoveryAttempts { get; set; } = 10;
 
     /// <summary>
+    /// Per-item stale-updatedAt window. An item parked in an active in-flight
+    /// state (Working / Reworking / Auditing / Merging / ReworkingForConflict /
+    /// UpstreamPushing) whose <c>UpdatedAt</c> has not advanced for this
+    /// duration is treated as wedged INDEPENDENT of pool-level spawn health
+    /// and INDEPENDENT of worker heartbeat / process CPU activity. The wedged
+    /// worker (if any) is aborted; the item is requeued preserving its work
+    /// branch so the next pickup re-rebases onto current upstream main.
+    ///
+    /// <para>
+    /// Distinct from <see cref="ProgressTimeout"/>: that detector walks the
+    /// worker registry and treats CPU / sandbox / stream activity as progress,
+    /// so a worker stuck in a transport reconnect loop (still burning CPU,
+    /// still heartbeating, but the item never transitions) appears healthy.
+    /// This detector walks items directly and watches <c>UpdatedAt</c> only —
+    /// the user-observable progress signal — so it catches the reconnect-loop
+    /// wedge and the orphaned-after-restart wedge that the worker-progress
+    /// path misses.
+    /// </para>
+    ///
+    /// <para>
+    /// Set this comfortably above a normal phase duration so a long but
+    /// legitimately-running phase is not interrupted. Default 120 min — well
+    /// above the default 60 min <see cref="ProgressTimeout"/> so the
+    /// worker-progress path catches recoverable cases first, but tight enough
+    /// to free a wedged slot well before the ~90 min cases observed in
+    /// production. Set to <see cref="TimeSpan.Zero"/> to disable the item-stale
+    /// detector while keeping the worker-progress watchdog. Hot-reloadable.
+    /// </para>
+    /// </summary>
+    public TimeSpan ItemStaleTimeout { get; set; } = TimeSpan.FromMinutes(120);
+
+    /// <summary>
+    /// How often the per-item stale-updatedAt sweep runs. The sweep walks
+    /// items by state (not by the worker registry) so the cost is bounded by
+    /// the small in-flight set; a low frequency is fine. Default 5 min.
+    /// </summary>
+    public TimeSpan ItemStaleCheckInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Cap on per-item stale-updatedAt auto-recoveries before the item is
+    /// parked at <see cref="CodeyBox.Core.WorkItemState.NeedsOperatorInput"/>
+    /// for operator triage. Shares the <c>RecoveryAttempts</c> budget with
+    /// the reaper / worker-progress watchdog so a chronically wedging item
+    /// cannot loop forever burning a slot per recovery. <c>0</c> means
+    /// unlimited (the item-stale path will keep recovering — typically only
+    /// useful in tests). Default 3: drastic intervention deserves a tighter
+    /// cap than the standard recovery loop. Hot-reloadable.
+    /// </summary>
+    public int ItemStaleMaxRecoveryAttempts { get; set; } = 3;
+
+    /// <summary>
     /// Validates the configured values. Throws
     /// <see cref="InvalidOperationException"/> on misconfiguration.
     /// </summary>
@@ -106,5 +157,22 @@ public sealed class WorkerProgressWatchdogOptions
         if (MaxRecoveryAttempts < 0)
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerProgressWatchdog:MaxRecoveryAttempts ({MaxRecoveryAttempts}) must be >= 0 (0 = unlimited).");
+
+        if (ItemStaleTimeout < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemStaleTimeout ({ItemStaleTimeout}) must be >= 0.");
+
+        if (ItemStaleCheckInterval <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemStaleCheckInterval ({ItemStaleCheckInterval}) must be > 0.");
+
+        if (ItemStaleTimeout > TimeSpan.Zero && ItemStaleTimeout < ItemStaleCheckInterval)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemStaleTimeout ({ItemStaleTimeout.TotalSeconds}s) must be >= ItemStaleCheckInterval ({ItemStaleCheckInterval.TotalSeconds}s) " +
+                "so a sweep can observe at least one full stale window before tripping.");
+
+        if (ItemStaleMaxRecoveryAttempts < 0)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerProgressWatchdog:ItemStaleMaxRecoveryAttempts ({ItemStaleMaxRecoveryAttempts}) must be >= 0 (0 = unlimited).");
     }
 }

@@ -137,4 +137,75 @@ public sealed class WorkerProgressWatchdogOptionsValidationTests
         };
         opts.Validate();
     }
+
+    [Fact]
+    public void ItemStaleTimeout_Negative_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleTimeout = TimeSpan.FromSeconds(-1),
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("ItemStaleTimeout", ex.Message);
+    }
+
+    [Fact]
+    public void ItemStaleTimeout_Zero_Allowed_DisablesDetector()
+    {
+        // Zero is the documented "disable item-stale path" sentinel — keeps
+        // the worker-progress watchdog while turning off the item-stale sweep.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleTimeout = TimeSpan.Zero,
+        };
+        opts.Validate();
+    }
+
+    [Fact]
+    public void ItemStaleCheckInterval_Zero_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleCheckInterval = TimeSpan.Zero,
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("ItemStaleCheckInterval", ex.Message);
+    }
+
+    [Fact]
+    public void ItemStaleTimeout_LessThanItemStaleCheckInterval_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleTimeout = TimeSpan.FromMinutes(1),
+            ItemStaleCheckInterval = TimeSpan.FromMinutes(5),
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("ItemStaleTimeout", ex.Message);
+        Assert.Contains("ItemStaleCheckInterval", ex.Message);
+    }
+
+    [Fact]
+    public void ItemStaleMaxRecoveryAttempts_Negative_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleMaxRecoveryAttempts = -1,
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("ItemStaleMaxRecoveryAttempts", ex.Message);
+    }
+
+    [Fact]
+    public void Defaults_IncludeItemStaleFields()
+    {
+        // Spec: detection threshold and recovery cap are config-driven; defaults
+        // are comfortably above a normal phase duration but tighter than the
+        // ~90-minute production incident window.
+        var opts = new WorkerProgressWatchdogOptions();
+        Assert.Equal(TimeSpan.FromMinutes(120), opts.ItemStaleTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(5), opts.ItemStaleCheckInterval);
+        Assert.Equal(3, opts.ItemStaleMaxRecoveryAttempts);
+        opts.Validate();
+    }
 }
