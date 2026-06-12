@@ -308,7 +308,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 
         try
         {
-            SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(_conn);
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(_conn);
         }
         finally
         {

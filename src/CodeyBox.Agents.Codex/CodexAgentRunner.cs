@@ -247,7 +247,7 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         var reqRetries = tolerance.RequestMaxRetries!.Value;
         var streamRetries = tolerance.StreamMaxRetries!.Value;
 
-        var providerId = ResolveProviderId(modelId, tolerance.Provider);
+        var providerId = ResolveProviderId(effectiveModel, tolerance.Provider);
 
         argv.Add("-c");
         argv.Add($"model_providers.{providerId}.request_max_retries={reqRetries}");
@@ -344,14 +344,13 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         return string.Concat(parts);
     }
 
-    private string ResolveProviderId(string? modelId, string? configuredProvider)
+    private static string ResolveProviderId(string? effectiveModel, string? configuredProvider)
     {
         if (!string.IsNullOrWhiteSpace(configuredProvider))
         {
             return ResolveSafeProviderId(configuredProvider);
         }
 
-        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
         {
             var slashIdx = effectiveModel.IndexOf('/');

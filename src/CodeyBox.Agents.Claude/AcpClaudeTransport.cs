@@ -31,6 +31,8 @@ namespace CodeyBox.Agents.Claude;
 /// </summary>
 public sealed class AcpClaudeTransport : IClaudeTransport
 {
+    internal const int ApiTimeoutBridgeMarginSeconds = 30;
+
     private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
 
     public AcpClaudeTransport(AgentNetworkToleranceSnapshot? networkTolerance = null)
@@ -56,6 +58,17 @@ public sealed class AcpClaudeTransport : IClaudeTransport
     {
         if (_networkTolerance == null) return null;
         return _networkTolerance.GetTolerance(AgentNetworkToleranceOptions.ClaudeAgentKind)?.ApiTimeoutMs;
+    }
+
+    internal static int ResolveTurnTimeoutSeconds(int? apiTimeoutMs)
+    {
+        if (!apiTimeoutMs.HasValue)
+            return AcpBridgeScript.TurnTimeoutSeconds;
+
+        var apiTimeoutSeconds = Math.Max(0, (int)Math.Ceiling(apiTimeoutMs.Value / 1000.0));
+        return Math.Max(
+            AcpBridgeScript.TurnTimeoutSeconds,
+            apiTimeoutSeconds + ApiTimeoutBridgeMarginSeconds);
     }
 
     public async Task<IClaudeTransportSession> OpenAsync(
@@ -132,7 +145,9 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 await ClaudeSessionSanitizer.SanitizeTranscriptsAsync(_open.Sandbox, ct).ConfigureAwait(false);
 
             var turnIndex = Interlocked.Increment(ref _turnIndex);
-            var stdin = BuildStdin(request.Prompt, request.CliResumeSessionId);
+            var apiTimeout = _transport.BindApiTimeout();
+            var turnTimeoutSeconds = AcpClaudeTransport.ResolveTurnTimeoutSeconds(apiTimeout);
+            var stdin = BuildStdin(request.Prompt, request.CliResumeSessionId, apiTimeout, turnTimeoutSeconds);
 
             var stdoutBuf = new StringBuilder(4096);
             Action<string> aggregator = chunk =>
@@ -145,7 +160,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             };
 
             var extraEnv = new Dictionary<string, string>();
-            var apiTimeout = _transport.BindApiTimeout();
             if (apiTimeout.HasValue)
             {
                 extraEnv["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();
@@ -200,7 +214,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 ? "ok"
                 : observed.TurnError is { } te
                     ? $"acp turn error: {te.Message ?? "unknown"}"
-                    : $"acp turn timed out (no stopReason within {AcpBridgeScript.TurnTimeoutSeconds}s)";
+                    : $"acp turn timed out (no stopReason within {turnTimeoutSeconds}s)";
 
             var stdoutForExtractor = observed.AssistantText.Length > 0
                 ? BuildStreamJsonShimForExtractor(observed)
@@ -268,7 +282,11 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             return ValueTask.CompletedTask;
         }
 
-        private string BuildStdin(string prompt, string? resumeSessionId)
+        private string BuildStdin(
+            string prompt,
+            string? resumeSessionId,
+            int? apiTimeout,
+            int turnTimeoutSeconds)
         {
             var sb = new StringBuilder();
             var hello = new
@@ -279,7 +297,8 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 claudeBinary = _transport.ClaudeBinary,
                 claudeArgs = BuildClaudeArgs(),
                 workingDirectory = _open.WorkingDirectory,
-                claudeEnv = BuildClaudeEnv(),
+                claudeEnv = BuildClaudeEnv(apiTimeout),
+                turnTimeoutSeconds,
             };
             sb.Append(JsonSerializer.Serialize(hello)).Append('\n');
             sb.Append(JsonSerializer.Serialize(new
@@ -373,7 +392,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             return args;
         }
 
-        private Dictionary<string, string> BuildClaudeEnv()
+        private Dictionary<string, string> BuildClaudeEnv(int? apiTimeout)
         {
             var env = new Dictionary<string, string>(StringComparer.Ordinal);
             // The credential pipeline already injects auth at sandbox boot; if the
@@ -384,7 +403,6 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 foreach (var (k, v) in extra)
                     env[k] = v;
             }
-            var apiTimeout = _transport.BindApiTimeout();
             if (apiTimeout.HasValue)
             {
                 env["API_TIMEOUT_MS"] = apiTimeout.Value.ToString();

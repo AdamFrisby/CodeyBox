@@ -4,30 +4,30 @@ using CodeyBox.Orchestrator;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins the dispose-time tolerance for the
-/// <see cref="Microsoft.Data.Sqlite.SqliteConnection"/> teardown race:
+/// Pins the dispose-time tolerance for the shared
+/// <see cref="Microsoft.Data.Sqlite.SqliteConnection"/> teardown helper:
 /// <c>SqliteConnection.Close()</c> has been observed to throw both
 /// <see cref="NullReferenceException"/> and the
 /// <see cref="InvalidOperationException"/> "Collection was modified" shape from
 /// <c>SqliteCommand.DisposePreparedStatements</c> when a still-in-flight async
-/// command races against connection disposal. The store swallows those two
-/// driver-internal cases so the rest of the dispose chain (notably the
-/// write-gate release) still runs. Any other exception type — including
-/// <see cref="InvalidOperationException"/> that does NOT originate inside the
-/// SQLite driver — must bubble: we must NOT mask unrelated bugs.
+/// command races against connection disposal. Stores swallow those two
+/// driver-internal cases so the rest of the dispose chain can still run.
+/// Any other exception type, including <see cref="InvalidOperationException"/>
+/// that does not originate inside the SQLite driver, must bubble so unrelated
+/// bugs stay visible.
 /// </summary>
-public sealed class SqliteWorkItemStoreDisposeToleranceTests
+public sealed class SqliteConnectionDisposalTests
 {
     [Fact]
-    public void DisposeSqliteConnectionTolerantOfTeardownNre_SwallowsNullReferenceException()
+    public void DisposeTolerantOfTeardownRace_SwallowsNullReferenceException()
     {
         var thrower = new ThrowingDisposable(new NullReferenceException("Object reference not set"));
-        SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(thrower);
+        SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower);
         Assert.True(thrower.DisposeCalled);
     }
 
     [Fact]
-    public void DisposeSqliteConnectionTolerantOfTeardownNre_SwallowsSqliteCollectionModifiedRace()
+    public void DisposeTolerantOfTeardownRace_SwallowsSqliteCollectionModifiedRace()
     {
         // The driver's SqliteCommand.DisposePreparedStatements iterates an
         // internal List<> of prepared statements; an in-flight finalize that
@@ -36,12 +36,12 @@ public sealed class SqliteWorkItemStoreDisposeToleranceTests
         // frame; same race shape as the NRE, same tolerance.
         var ioe = MakeInvalidOperationFromSqliteTeardown();
         var thrower = new ThrowingDisposable(ioe);
-        SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(thrower);
+        SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower);
         Assert.True(thrower.DisposeCalled);
     }
 
     [Fact]
-    public void DisposeSqliteConnectionTolerantOfTeardownNre_LetsOtherExceptionsBubble()
+    public void DisposeTolerantOfTeardownRace_LetsOtherExceptionsBubble()
     {
         // Anything that isn't a SQLite-driver teardown race points at a real
         // fault (corruption, IO, disposed-twice). Surfacing them keeps the
@@ -49,7 +49,7 @@ public sealed class SqliteWorkItemStoreDisposeToleranceTests
         // outside Microsoft.Data.Sqlite.
         var thrower = new ThrowingDisposable(new InvalidOperationException("not the race"));
         Assert.Throws<InvalidOperationException>(() =>
-            SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(thrower));
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower));
     }
 
     /// <summary>
@@ -105,10 +105,10 @@ public sealed class SqliteWorkItemStoreDisposeToleranceTests
     }
 
     [Fact]
-    public void DisposeSqliteConnectionTolerantOfTeardownNre_NormalDisposeRunsThrough()
+    public void DisposeTolerantOfTeardownRace_NormalDisposeRunsThrough()
     {
         var ok = new ThrowingDisposable(throwOnDispose: null);
-        SqliteWorkItemStore.DisposeSqliteConnectionTolerantOfTeardownNre(ok);
+        SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(ok);
         Assert.True(ok.DisposeCalled);
     }
 

@@ -2288,9 +2288,9 @@ public sealed class AgentConfigHotReloadTests
         var argv = sandbox.CapturedExec!.Argv.ToList();
         var reqIdx = argv.IndexOf("-c");
         Assert.True(reqIdx >= 0);
-        Assert.Contains("model_providers.openai.request_max_retries=5", argv);
-        Assert.Contains("model_providers.openai.stream_max_retries=6", argv);
-        Assert.Contains("model_providers.openai.stream_idle_timeout_ms=120000", argv);
+        AssertCodexConfigOverride(argv, "model_providers.openai.request_max_retries=5");
+        AssertCodexConfigOverride(argv, "model_providers.openai.stream_max_retries=6");
+        AssertCodexConfigOverride(argv, "model_providers.openai.stream_idle_timeout_ms=120000");
 
         // Hot-reload: swap to different tolerance values.
         var updatedTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2309,9 +2309,9 @@ public sealed class AgentConfigHotReloadTests
         await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
 
         var argv2 = sandbox2.CapturedExec!.Argv.ToList();
-        Assert.Contains("model_providers.openai.request_max_retries=10", argv2);
-        Assert.Contains("model_providers.openai.stream_max_retries=12", argv2);
-        Assert.Contains("model_providers.openai.stream_idle_timeout_ms=240000", argv2);
+        AssertCodexConfigOverride(argv2, "model_providers.openai.request_max_retries=10");
+        AssertCodexConfigOverride(argv2, "model_providers.openai.stream_max_retries=12");
+        AssertCodexConfigOverride(argv2, "model_providers.openai.stream_idle_timeout_ms=240000");
 
         // Verify custom provider works
         var providerTolerance = new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2329,8 +2329,8 @@ public sealed class AgentConfigHotReloadTests
         await runner.RunAsync(sandbox3, "/work", "prompt3", credential: null);
 
         var argv3 = sandbox3.CapturedExec!.Argv.ToList();
-        Assert.Contains("model_providers.azure.request_max_retries=5", argv3);
-        Assert.Contains("model_providers.azure.stream_max_retries=6", argv3);
+        AssertCodexConfigOverride(argv3, "model_providers.azure.request_max_retries=5");
+        AssertCodexConfigOverride(argv3, "model_providers.azure.stream_max_retries=6");
     }
 
     [Fact]
@@ -2342,8 +2342,8 @@ public sealed class AgentConfigHotReloadTests
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
 
         var argv = sandbox.CapturedExec!.Argv.ToList();
-        Assert.Contains("model_providers.openai.request_max_retries=8", argv);
-        Assert.Contains("model_providers.openai.stream_max_retries=15", argv);
+        AssertCodexConfigOverride(argv, "model_providers.openai.request_max_retries=8");
+        AssertCodexConfigOverride(argv, "model_providers.openai.stream_max_retries=15");
         Assert.DoesNotContain(argv, arg => arg.Contains("stream_idle_timeout_ms", StringComparison.Ordinal));
     }
 
@@ -2361,8 +2361,8 @@ public sealed class AgentConfigHotReloadTests
         await requestOnlyRunner.RunAsync(requestOnlySandbox, "/work", "prompt", credential: null);
 
         var requestOnlyArgv = requestOnlySandbox.CapturedExec!.Argv.ToList();
-        Assert.Contains("model_providers.openai.request_max_retries=11", requestOnlyArgv);
-        Assert.Contains("model_providers.openai.stream_max_retries=15", requestOnlyArgv);
+        AssertCodexConfigOverride(requestOnlyArgv, "model_providers.openai.request_max_retries=11");
+        AssertCodexConfigOverride(requestOnlyArgv, "model_providers.openai.stream_max_retries=15");
 
         var streamOnlySnapshot = new AgentNetworkToleranceSnapshot(
             new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
@@ -2375,8 +2375,8 @@ public sealed class AgentConfigHotReloadTests
         await streamOnlyRunner.RunAsync(streamOnlySandbox, "/work", "prompt", credential: null);
 
         var streamOnlyArgv = streamOnlySandbox.CapturedExec!.Argv.ToList();
-        Assert.Contains("model_providers.openai.request_max_retries=8", streamOnlyArgv);
-        Assert.Contains("model_providers.openai.stream_max_retries=12", streamOnlyArgv);
+        AssertCodexConfigOverride(streamOnlyArgv, "model_providers.openai.request_max_retries=8");
+        AssertCodexConfigOverride(streamOnlyArgv, "model_providers.openai.stream_max_retries=12");
     }
 
     [Fact]
@@ -2412,6 +2412,36 @@ public sealed class AgentConfigHotReloadTests
             Assert.True(extraEnv.ContainsKey("API_TIMEOUT_MS"));
             Assert.Equal("45000", extraEnv["API_TIMEOUT_MS"]);
         }
+    }
+
+    [Fact]
+    public async Task AgentNetworkTolerance_Claude_ApiTimeoutMs_OneShotHotReloadsOnNextRun()
+    {
+        var snapshot = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 45000 },
+            });
+        var runner = new ClaudeAgentRunner(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: snapshot);
+
+        var sandbox = new CapturingSandbox();
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        var initialEnv = sandbox.CapturedExec!.ExtraEnvironment;
+        Assert.NotNull(initialEnv);
+        Assert.Equal("45000", initialEnv!["API_TIMEOUT_MS"]);
+
+        snapshot.Replace(new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["claude"] = new AgentNetworkToleranceOptions { ApiTimeoutMs = 90000 },
+        });
+
+        var sandbox2 = new CapturingSandbox();
+        await runner.RunAsync(sandbox2, "/work", "prompt2", credential: null);
+
+        var reloadedEnv = sandbox2.CapturedExec!.ExtraEnvironment;
+        Assert.NotNull(reloadedEnv);
+        Assert.Equal("90000", reloadedEnv!["API_TIMEOUT_MS"]);
     }
 
     [Fact]
@@ -2551,6 +2581,22 @@ public sealed class AgentConfigHotReloadTests
         Assert.Equal(9, codexTol2.StreamMaxRetries);
 
         await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    private static void AssertCodexConfigOverride(IReadOnlyList<string> argv, string expected)
+    {
+        var index = -1;
+        for (var i = 0; i < argv.Count; i++)
+        {
+            if (argv[i] == expected)
+            {
+                index = i;
+                break;
+            }
+        }
+
+        Assert.True(index > 0, $"argv must contain '{expected}' after a -c flag");
+        Assert.Equal("-c", argv[index - 1]);
     }
 
     private sealed class ManualOptionsMonitor<T> : IOptionsMonitor<T>
