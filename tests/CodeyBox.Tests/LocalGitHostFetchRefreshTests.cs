@@ -542,6 +542,104 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         return stdout.Trim();
     }
 
+    [Fact]
+    public async Task EnsureRepositoryAsync_SharedMirror_OfflineCloneAndResetOrigin()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+
+        // Verify remote origin points back to seed
+        var (_, originUrl, _) = await TestSupport.RunGit(barePath, "remote", "get-url", "origin");
+        Assert.Equal(seed.Trim(), originUrl.Trim());
+
+        // Verify alternates points to mirror path
+        var alternatesPath = Path.Combine(barePath, "objects", "info", "alternates");
+        var alternatesContent = await File.ReadAllTextAsync(alternatesPath);
+        Assert.Contains(mirrorDir, alternatesContent);
+    }
+
+    [Fact]
+    public async Task GetSandboxAccess_MountsMirrorReadOnly()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        
+        var access = gitHost.GetSandboxAccess(repoId);
+        
+        // There should be two mounts: one writable for repo itself, and one read-only for mirror
+        Assert.Equal(2, access.Mounts.Count);
+        
+        var writableRepoMount = access.Mounts.Single(m => !m.ReadOnly);
+        Assert.Equal("/repo", writableRepoMount.SandboxPath);
+        Assert.Equal(gitHost.GetRepoPath(repoId), writableRepoMount.HostPath);
+
+        var roMirrorMount = access.Mounts.Single(m => m.ReadOnly);
+        Assert.Contains(mirrorDir, roMirrorMount.HostPath);
+        Assert.Equal(roMirrorMount.HostPath, roMirrorMount.SandboxPath);
+    }
+
+    [Fact]
+    public async Task SanitizeAlternates_RemovesUntrustedPaths()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        var alternatesPath = Path.Combine(barePath, "objects", "info", "alternates");
+
+        // Overwrite alternates file with a valid mirror path AND an untrusted path
+        var validPath = (await File.ReadAllLinesAsync(alternatesPath))[0].Trim();
+        var untrustedPath = Path.GetFullPath(Path.Combine(_workspace, "untrusted-folder"));
+        await File.WriteAllLinesAsync(alternatesPath, [validPath, untrustedPath]);
+
+        // Run any git command which will trigger SanitizeAlternates internally
+        await gitHost.FetchUpstreamBranchAsync(repoId, seed, "main", new Dictionary<string, string>());
+
+        // Verify that the untrusted path was removed
+        var lines = await File.ReadAllLinesAsync(alternatesPath);
+        Assert.Single(lines);
+        Assert.Equal(validPath, lines[0].Trim());
+    }
+
     private sealed class CapturingLogger<T> : ILogger<T>
     {
         public List<Entry> Entries { get; } = [];

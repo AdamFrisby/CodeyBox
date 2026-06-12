@@ -90,11 +90,15 @@ public sealed class LocalGitHost : IGitHost
                 (int ExitCode, string Stdout, string Stderr) rc;
                 if (mirrorPath is not null && Directory.Exists(mirrorPath))
                 {
-                    _log.LogInformation("Cloning bare repo from {Url} with reference mirror at {MirrorPath}", ScrubCredentialMaterial(seedFromUrl), mirrorPath);
-                    rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--reference", mirrorPath, "--", seedFromUrl, path);
-                    if (rc.ExitCode != 0)
+                    _log.LogInformation("Cloning bare repo from mirror at {MirrorPath} for {Url}", mirrorPath, ScrubCredentialMaterial(seedFromUrl));
+                    rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--reference", mirrorPath, "--", mirrorPath, path);
+                    if (rc.ExitCode == 0)
                     {
-                        _log.LogWarning("Clone with reference mirror failed (exit {Code}): {Error}. Falling back to direct clone.", rc.ExitCode, ScrubCredentialMaterial(rc.Stderr));
+                        await RunGitAsync(workdir: path, ct, "remote", "set-url", "origin", seedFromUrl);
+                    }
+                    else
+                    {
+                        _log.LogWarning("Clone from reference mirror failed (exit {Code}): {Error}. Falling back to direct clone from remote.", rc.ExitCode, ScrubCredentialMaterial(rc.Stderr));
                         rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
                     }
                 }
@@ -125,6 +129,62 @@ public sealed class LocalGitHost : IGitHost
         }
     }
 
+    private IReadOnlyList<SandboxMount> GetRepositoryMounts(string repoPath, bool readOnly)
+    {
+        var mounts = new List<SandboxMount>
+        {
+            new SandboxMount
+            {
+                SandboxPath = SandboxRepoMountPath,
+                HostPath = repoPath,
+                ReadOnly = readOnly,
+            }
+        };
+
+        var alternatesPath = Path.Combine(repoPath, "objects", "info", "alternates");
+        if (File.Exists(alternatesPath))
+        {
+            try
+            {
+                var lines = File.ReadAllLines(alternatesPath);
+                foreach (var line in lines)
+                {
+                    var trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed)) continue;
+
+                    var fullPath = Path.GetFullPath(trimmed);
+                    var mirrorDir = Path.IsPathRooted(_opts.SharedUpstreamMirrorDirectory)
+                        ? Path.GetFullPath(_opts.SharedUpstreamMirrorDirectory)
+                        : Path.GetFullPath(Path.Combine(_opts.RootDirectory, _opts.SharedUpstreamMirrorDirectory));
+                    
+                    var mirrorDirWithSlash = mirrorDir.EndsWith(Path.DirectorySeparatorChar)
+                        ? mirrorDir
+                        : mirrorDir + Path.DirectorySeparatorChar;
+
+                    if (fullPath.StartsWith(mirrorDirWithSlash, StringComparison.Ordinal))
+                    {
+                        mounts.Add(new SandboxMount
+                        {
+                            SandboxPath = fullPath,
+                            HostPath = fullPath,
+                            ReadOnly = true,
+                        });
+                    }
+                    else
+                    {
+                        _log.LogWarning("Skipping sandbox mount for untrusted git alternate path: {Path}", trimmed);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Failed to read alternates to mount for repo at {RepoPath}", repoPath);
+            }
+        }
+
+        return mounts;
+    }
+
     public SandboxRepositoryAccess GetSandboxAccess(string repositoryId)
     {
         // Bind-mount ONLY this work item's bare repo into the sandbox. A
@@ -134,13 +194,9 @@ public sealed class LocalGitHost : IGitHost
         //
         // VM-backed providers can substitute a git-daemon exposing the same
         // single repo over a unix socket — the per-item scoping is preserved.
-        var mount = new SandboxMount
-        {
-            SandboxPath = SandboxRepoMountPath,
-            HostPath = GetRepoPath(repositoryId),
-            ReadOnly = false,
-        };
-        return new SandboxRepositoryAccess(SandboxRepoMountPath, [mount], SandboxNetworkPolicy.Denied);
+        var repoPath = GetRepoPath(repositoryId);
+        var mounts = GetRepositoryMounts(repoPath, readOnly: false);
+        return new SandboxRepositoryAccess(SandboxRepoMountPath, mounts, SandboxNetworkPolicy.Denied);
     }
 
     /// <summary>Sandbox-side path the bare repo is mounted at. Per-item scoped.</summary>
@@ -154,13 +210,8 @@ public sealed class LocalGitHost : IGitHost
     /// </summary>
     public SandboxRepositoryAccess GetIsolatedRepoSandboxAccess(string isolatedRepoHostPath)
     {
-        var mount = new SandboxMount
-        {
-            SandboxPath = SandboxRepoMountPath,
-            HostPath = isolatedRepoHostPath,
-            ReadOnly = false,
-        };
-        return new SandboxRepositoryAccess(SandboxRepoMountPath, [mount], SandboxNetworkPolicy.Denied);
+        var mounts = GetRepositoryMounts(isolatedRepoHostPath, readOnly: false);
+        return new SandboxRepositoryAccess(SandboxRepoMountPath, mounts, SandboxNetworkPolicy.Denied);
     }
 
     public async Task<string> CreateIsolatedMergeCloneAsync(
@@ -1198,6 +1249,7 @@ public sealed class LocalGitHost : IGitHost
         IReadOnlyDictionary<string, string>? extraEnv,
         params string[] args)
     {
+        SanitizeAlternates(workdir);
         var psi = new ProcessStartInfo
         {
             FileName = _opts.GitExecutable,
@@ -1346,6 +1398,7 @@ public sealed class LocalGitHost : IGitHost
                 if (fetchRc.ExitCode != 0)
                 {
                     _log.LogWarning("Shared mirror fetch failed (exit {Code}): {Error}", fetchRc.ExitCode, ScrubCredentialMaterial(fetchRc.Stderr));
+                    return null;
                 }
             }
 
@@ -1406,6 +1459,107 @@ public sealed class LocalGitHost : IGitHost
             return parts[0].Trim();
 
         return null;
+    }
+
+    private string? FindGitDir(string path)
+    {
+        var current = Path.GetFullPath(path);
+        while (!string.IsNullOrEmpty(current))
+        {
+            if (File.Exists(Path.Combine(current, "HEAD")) && Directory.Exists(Path.Combine(current, "objects")))
+            {
+                return current;
+            }
+
+            var gitSubdir = Path.Combine(current, ".git");
+            if (Directory.Exists(gitSubdir))
+            {
+                return gitSubdir;
+            }
+            if (File.Exists(gitSubdir))
+            {
+                try
+                {
+                    var content = File.ReadAllText(gitSubdir).Trim();
+                    const string prefix = "gitdir:";
+                    if (content.StartsWith(prefix, StringComparison.Ordinal))
+                    {
+                        var gitdirPath = content[prefix.Length..].Trim();
+                        if (!Path.IsPathRooted(gitdirPath))
+                        {
+                            gitdirPath = Path.GetFullPath(Path.Combine(current, gitdirPath));
+                        }
+                        return gitdirPath;
+                    }
+                }
+                catch
+                {
+                    // Ignore and walk up
+                }
+            }
+
+            var parent = Path.GetDirectoryName(current);
+            if (parent == current || string.IsNullOrEmpty(parent))
+            {
+                break;
+            }
+            current = parent;
+        }
+        return null;
+    }
+
+    private void SanitizeAlternates(string workdir)
+    {
+        try
+        {
+            var gitDir = FindGitDir(workdir);
+            if (gitDir == null) return;
+
+            var alternatesPath = Path.Combine(gitDir, "objects", "info", "alternates");
+            if (!File.Exists(alternatesPath)) return;
+
+            var mirrorDir = Path.IsPathRooted(_opts.SharedUpstreamMirrorDirectory)
+                ? Path.GetFullPath(_opts.SharedUpstreamMirrorDirectory)
+                : Path.GetFullPath(Path.Combine(_opts.RootDirectory, _opts.SharedUpstreamMirrorDirectory));
+            
+            var mirrorDirWithSlash = mirrorDir.EndsWith(Path.DirectorySeparatorChar)
+                ? mirrorDir
+                : mirrorDir + Path.DirectorySeparatorChar;
+
+            var lines = File.ReadAllLines(alternatesPath);
+            var validLines = new List<string>();
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed)) continue;
+
+                var fullPath = Path.GetFullPath(trimmed);
+                if (fullPath.StartsWith(mirrorDirWithSlash, StringComparison.Ordinal))
+                {
+                    validLines.Add(trimmed);
+                }
+                else
+                {
+                    _log.LogWarning("Discarding untrusted git alternate path: {Path}", trimmed);
+                }
+            }
+
+            if (validLines.Count != lines.Length)
+            {
+                if (validLines.Count > 0)
+                {
+                    File.WriteAllLines(alternatesPath, validLines);
+                }
+                else
+                {
+                    File.Delete(alternatesPath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to sanitize alternates file for workdir {Workdir}", workdir);
+        }
     }
 
     private string GetMirrorPath(string upstreamUrl)
