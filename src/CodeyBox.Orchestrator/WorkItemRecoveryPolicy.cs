@@ -194,18 +194,13 @@ internal static class WorkItemRecoveryPolicy
         if (!IsItemStaleWatchedState(item.State))
             return null;
 
-        if (IsRerunnableCheckAndActWithoutPreempt(item))
-        {
-            var rerun = BuildCheckAndActRerun(item, attempts);
-            return rerun with { LastError = reason, UpdatedAt = now };
-        }
-
-        if (IsRerunnableAgentControlWithoutPreempt(item))
-        {
-            var rerun = BuildAgentControlRerun(item, attempts);
-            return rerun with { LastError = reason, UpdatedAt = now };
-        }
-
+        // Max-attempts cap is checked BEFORE the rerunnable CheckAndAct /
+        // AgentControl branches: an item that hits the cap on either of those
+        // job types must escalate to NeedsOperatorInput too, otherwise a
+        // chronically-wedging CheckAndAct/AgentControl item would be requeued
+        // forever by Build{CheckAndAct,AgentControl}Rerun and never hit the
+        // bounded-then-escalate contract the rest of the recovery surface
+        // honours.
         if (maxAttempts > 0 && attempts > maxAttempts)
         {
             return item with
@@ -219,6 +214,18 @@ internal static class WorkItemRecoveryPolicy
                 PreemptCheckpoint = null,
                 UpdatedAt = now,
             };
+        }
+
+        if (IsRerunnableCheckAndActWithoutPreempt(item))
+        {
+            var rerun = BuildCheckAndActRerun(item, attempts);
+            return rerun with { LastError = reason, UpdatedAt = now };
+        }
+
+        if (IsRerunnableAgentControlWithoutPreempt(item))
+        {
+            var rerun = BuildAgentControlRerun(item, attempts);
+            return rerun with { LastError = reason, UpdatedAt = now };
         }
 
         if (item.State is WorkItemState.Working or WorkItemState.Reworking

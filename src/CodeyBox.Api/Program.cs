@@ -2000,7 +2000,11 @@ builder.Services.AddSingleton<ItemStaleProgressWatchdog>(sp =>
         () => monitor.CurrentValue.WorkerProgressWatchdog,
         sp.GetRequiredService<ILogger<ItemStaleProgressWatchdog>>(),
         sp.GetService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
+        // Recovery cancels the running pipeline's CT so its finally blocks
+        // tear down the active sandbox / VM. Without this the wedged worker
+        // can keep running on a row that has been requeued to a fresh slot.
+        cancellations: sp.GetRequiredService<CancellationRegistry>());
 });
 
 // --- Worker pool health watchdog --------------------------------------------

@@ -51,12 +51,19 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     private readonly ILogger<ItemStaleProgressWatchdog> _log;
     private readonly TimeProvider _time;
     private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
+    private readonly CancellationRegistry? _cancellations;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
-    // In-process record of items already recovered by this sweep so a
-    // re-pickup that has not yet stamped UpdatedAt does not get re-recovered
-    // by the very next tick.
-    private readonly ConcurrentDictionary<WorkItemId, byte> _recoveredItemsThisProcess = new();
+    // In-process record of items already recovered, keyed on the UpdatedAt
+    // stamp the recovery wrote. The next sweep skips an item only while its
+    // current UpdatedAt still matches (or precedes) the recorded mark — once
+    // a re-pickup or any subsequent recovery advances UpdatedAt, the marker
+    // becomes stale, is cleared, and the watchdog can detect a fresh wedge.
+    // Without this expiry, a chronically-wedging item recovered once would
+    // be permanently invisible to the watchdog for the rest of the
+    // orchestrator process and the bounded-then-escalate contract would
+    // never fire on it.
+    private readonly ConcurrentDictionary<WorkItemId, DateTimeOffset> _recoveredItemsThisProcess = new();
 
     private WorkerProgressWatchdogOptions _opts => _optsAccessor();
 
@@ -69,6 +76,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        CancellationRegistry? cancellations = null,
         TimeProvider? timeProvider = null)
     {
         _store = store;
@@ -79,6 +87,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
+        _cancellations = cancellations;
         _time = timeProvider ?? TimeProvider.System;
     }
 
@@ -91,8 +100,9 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        CancellationRegistry? cancellations = null,
         TimeProvider? timeProvider = null)
-        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, timeProvider) { }
+        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, cancellations, timeProvider) { }
 
     /// <summary>
     /// Mirrors the per-worker watchdog's late-attach pattern: the DI graph
@@ -102,8 +112,29 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     public void AttachWorkerPoolSlotReleaser(IWorkerPoolRecoverySlotReleaser slotReleaser)
         => _slotReleaser = slotReleaser;
 
-    internal bool HasRecoveredItemInCurrentProcess(WorkItemId itemId)
-        => _recoveredItemsThisProcess.ContainsKey(itemId);
+    /// <summary>
+    /// True if this watchdog has already recovered <paramref name="itemId"/>
+    /// and the recovered <c>UpdatedAt</c> stamp still matches the current
+    /// row's stamp. Once the item's <c>UpdatedAt</c> advances past the
+    /// recorded mark (re-pickup or a later recovery) the marker is cleared
+    /// here so the next sweep evaluates the item fresh.
+    /// </summary>
+    internal bool HasRecoveredItemInCurrentProcess(WorkItemId itemId, DateTimeOffset currentUpdatedAt)
+    {
+        if (!_recoveredItemsThisProcess.TryGetValue(itemId, out var recoveredAt))
+            return false;
+
+        if (currentUpdatedAt > recoveredAt)
+        {
+            // Re-pickup (or any later state-mutating recovery) advanced the
+            // row past our recorded mark. Clear the marker — the item is
+            // back in play and a subsequent freeze must be detectable.
+            _recoveredItemsThisProcess.TryRemove(itemId, out _);
+            return false;
+        }
+
+        return true;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -152,7 +183,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
 
                 await foreach (var item in _store.ListByStateAsync(state, ct))
                 {
-                    if (HasRecoveredItemInCurrentProcess(item.Id))
+                    if (HasRecoveredItemInCurrentProcess(item.Id, item.UpdatedAt))
                         continue;
 
                     // Items being resumed from a suspended VM are owned by
@@ -240,10 +271,20 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
 
         // Claim any worker row pointing at this item. Per-id (not cutoff-based)
         // so we never wipe a healthy peer worker — same shape as the
-        // per-worker watchdog's claim. Used both to abort the wedged worker
-        // (slot releaser will signal cancellation downstream) and to prevent
-        // the per-worker watchdog from racing this recovery.
+        // per-worker watchdog's claim. Prevents the per-worker watchdog from
+        // racing this recovery.
         var workerId = await TryClaimBoundWorkerAsync(item.Id, ct);
+
+        // Signal the running pipeline (if any) to abort BEFORE we mutate the
+        // durable row. CancellationRegistry.Cancel(itemId) fires the token
+        // RunItemAsync registered for this item, propagating into all phase
+        // tokens; the pipeline's existing finally blocks dispose the active
+        // sandbox/VM and the worker task exits. Without this, the incident-B
+        // transport-reconnect-loop worker would keep running on the same item
+        // while a fresh pickup races it — exactly the duplicate-ownership
+        // shape the rework finding called out. No-op when the pipeline has
+        // not registered (orphaned post-restart, no live worker).
+        _cancellations?.Cancel(item.Id);
 
         var opts = _opts;
         var attempts = item.RecoveryAttempts + 1;
@@ -294,7 +335,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                 Error: $"failed to update store: {ex.Message}");
         }
 
-        MarkRecoveredItem(item.Id);
+        MarkRecoveredItem(item.Id, recovered.UpdatedAt);
 
         // Release the worker pool slot regardless of whether the underlying
         // worker task ever exits — the durable row is already updated, so the
@@ -369,8 +410,8 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             Error: null);
     }
 
-    private void MarkRecoveredItem(WorkItemId itemId)
-        => _recoveredItemsThisProcess[itemId] = 0;
+    private void MarkRecoveredItem(WorkItemId itemId, DateTimeOffset recoveredUpdatedAt)
+        => _recoveredItemsThisProcess[itemId] = recoveredUpdatedAt;
 
     private async Task<string?> TryClaimBoundWorkerAsync(WorkItemId itemId, CancellationToken ct)
     {

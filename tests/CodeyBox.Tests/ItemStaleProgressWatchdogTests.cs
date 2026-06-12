@@ -258,6 +258,100 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(1, second!.RecoveryAttempts);
     }
 
+    [Fact]
+    public async Task Sweep_AfterRecovery_RepickupAdvancesUpdatedAt_NextWedgeIsDetected()
+    {
+        // Regression: _recoveredItemsThisProcess must expire once the item is
+        // re-picked up and UpdatedAt advances past the recorded mark.
+        // Otherwise the same item can wedge again later in the same process
+        // and become permanently invisible to the detector, never hitting
+        // the bounded-then-escalate cap.
+        var item = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/auto/work-chronic");
+        await _store.CreateAsync(item);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+        var first = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, first!.State);
+        Assert.Equal(1, first.RecoveryAttempts);
+
+        // Simulate the re-pickup advancing UpdatedAt and the worker wedging
+        // again past the threshold. Advance the clock past the recorded
+        // recovery mark so the marker is stale.
+        _time.Advance(TimeSpan.FromMinutes(120));
+        var wedgedAgain = first with
+        {
+            State = WorkItemState.Working,
+            // UpdatedAt is now > the recorded recovery stamp but still > the
+            // 90 min stale window from "now".
+            UpdatedAt = _time.GetUtcNow().AddMinutes(-100),
+            StartedAt = _time.GetUtcNow().AddMinutes(-110),
+        };
+        await _store.UpdateAsync(wedgedAgain);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+        var second = await _store.GetAsync(item.Id);
+        // Marker must have expired, second recovery attempt fires.
+        Assert.Equal(WorkItemState.Queued, second!.State);
+        Assert.Equal(2, second.RecoveryAttempts);
+    }
+
+    // ── Acceptance (d) for rerunnable job types: cap escalates them too ──────
+
+    [Fact]
+    public async Task Sweep_CheckAndActAtCap_EscalatesToNeedsOperatorInput()
+    {
+        // CheckAndAct items without a preempt checkpoint go through the
+        // Build{CheckAndAct}Rerun branch of BuildStaleItemRecovery. That branch
+        // must NOT bypass the bounded-then-escalate cap — otherwise a chronic
+        // CheckAndAct wedge requeues forever and never escalates.
+        var item = MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-95),
+            recoveryAttempts: _opts.ItemStaleMaxRecoveryAttempts) with
+        {
+            JobType = JobType.CheckAndAct,
+        };
+        await _store.CreateAsync(item);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, after!.State);
+        Assert.Equal(_opts.ItemStaleMaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Sweep_AgentControlAtCap_EscalatesToNeedsOperatorInput()
+    {
+        // Same bounded-then-escalate semantics for AgentControl items.
+        var item = MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-95),
+            recoveryAttempts: _opts.ItemStaleMaxRecoveryAttempts) with
+        {
+            JobType = JobType.AgentControl,
+            AgentControl = new AgentControlSpec
+            {
+                Action = AgentControlAction.Pause,
+                Agent = AgentKind.Claude.Value,
+                Reason = "test",
+            },
+        };
+        await _store.CreateAsync(item);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, after!.State);
+        Assert.Equal(_opts.ItemStaleMaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Contains("MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(0, _queue.Count);
+    }
+
     // ── Watched-state coverage ──────────────────────────────────────────────
 
     [Theory]
