@@ -206,7 +206,7 @@ public sealed class AgenticConflictResolverTests
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
 
         var resolver = new AgenticConflictResolver(
-            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 2, MaxAttemptsPerAgent = 1 }));
 
         var first = new FakeAgentResolverRunner(_ =>
             new AgentResult(false, "rate limited", null, "429"))
@@ -243,7 +243,7 @@ public sealed class AgenticConflictResolverTests
         sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
 
         var resolver = new AgenticConflictResolver(
-            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 2, MaxAttemptsPerAgent = 1 }));
 
         var first = new FakeAgentResolverRunner(_ =>
             new AgentResult(false, "agent exited 127", null, "env: 'codex': No such file or directory"))
@@ -488,7 +488,7 @@ public sealed class AgenticConflictResolverTests
         Assert.Equal(1, firstRun.IterationsUsed);
         Assert.Equal(1, runner1.InvocationCount);
 
-        snapshot.Apply(new AgenticConflictResolverOptions { MaxIterations = 3 });
+        snapshot.Apply(new AgenticConflictResolverOptions { MaxIterations = 3, MaxAttemptsPerAgent = 3 });
         Assert.Equal(3, snapshot.Current.MaxIterations);
 
         var sandbox2 = new ConflictSandbox();
