@@ -71,6 +71,31 @@ public sealed class PipelineTuningOptions
     /// cost. Default 3 (separate from and narrower than <c>UpstreamPushMaxAttempts</c>).
     /// </summary>
     public int AutoMergeRaceRecoveryMaxAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// Whether to keep the same warm VM/sandbox alive across work<->rework cycles.
+    /// Default true.
+    /// </summary>
+    public bool EnableSandboxReuse { get; set; } = true;
+
+    /// <summary>
+    /// Maximum reuse cycles (invocations) for a single work sandbox before it is recreated.
+    /// Default 3.
+    /// </summary>
+    public int MaxSandboxReuses { get; set; } = 3;
+
+    /// <summary>
+    /// Maximum lifetime of a reused work sandbox before it is recreated.
+    /// Default 1 hour.
+    /// </summary>
+    public TimeSpan MaxSandboxLifetime { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// Utilization threshold (CurrentAdmittedSandboxes / MaxConcurrentSandboxes) above which
+    /// a reused sandbox is disposed to free capacity for other runs.
+    /// Default 0.85 (85%).
+    /// </summary>
+    public double SandboxPressureThreshold { get; set; } = 0.85;
 }
 
 /// <summary>
