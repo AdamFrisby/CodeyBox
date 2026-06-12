@@ -3112,7 +3112,10 @@ namespace CodeyBox.Api
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
     ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
-    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>. The retaining
+    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>,
+    ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
+    ///   <c>EnableSharedUpstreamMirror</c>, and
+    ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
     ///   options-monitor cache keeps the startup value visible to consumers
     ///   after a rejected reload.</item>
     /// <item><b>Startup-only by capture</b> — bound into a downstream

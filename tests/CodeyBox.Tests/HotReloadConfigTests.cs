@@ -300,6 +300,32 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsSharedMirrorEnabledChange()
+    {
+        var startup = new CodeyBoxOptions { EnableSharedUpstreamMirror = false };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+
+        var candidate = new CodeyBoxOptions { EnableSharedUpstreamMirror = true };
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("EnableSharedUpstreamMirror", result.FailureMessage);
+    }
+
+    [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsSharedMirrorDirectoryChange()
+    {
+        var startup = new CodeyBoxOptions { SharedUpstreamMirrorDirectory = "/var/lib/codeybox/mirrors" };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+
+        var candidate = new CodeyBoxOptions { SharedUpstreamMirrorDirectory = "/tmp/codeybox-mirrors" };
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("SharedUpstreamMirrorDirectory", result.FailureMessage);
+    }
+
+    [Fact]
     public void ImmutableCodeyBoxOptionsValidator_PassesWhenAllImmutableFieldsMatch()
     {
         var startup = new CodeyBoxOptions

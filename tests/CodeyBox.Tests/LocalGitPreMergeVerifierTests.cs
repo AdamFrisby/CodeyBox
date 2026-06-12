@@ -62,6 +62,48 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
         Assert.Equal(PreMergeVerifyFailureMode.None, result.FailureMode);
     }
 
+    [Fact]
+    public async Task RealVerifier_SanitizesAlternatesBeforeAddingWorktree()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+        var mergeSha = await gitHost.ResolveCommitAsync(repoId, "main", CancellationToken.None);
+        var alternatesPath = Path.Combine(gitHost.GetRepoPath(repoId), "objects", "info", "alternates");
+        var trustedAlternate = (await File.ReadAllLinesAsync(alternatesPath))[0].Trim();
+        var untrustedAlternate = Path.Combine(_workspace, "attacker-objects");
+        await File.WriteAllLinesAsync(alternatesPath, [trustedAlternate, untrustedAlternate]);
+
+        var verifier = new LocalGitPreMergeVerifier(
+            gitHost,
+            NullLogger<LocalGitPreMergeVerifier>.Instance);
+
+        var result = await verifier.VerifyAsync(new PreMergeVerifyRequest
+        {
+            WorkItemId = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            RepositoryId = repoId,
+            BaseBranch = "main",
+            WorkBranch = "feature/x",
+            MergeSha = mergeSha,
+            Argv = ["/usr/bin/true"],
+        }, CancellationToken.None);
+
+        Assert.True(result.Success);
+        var sanitizedLines = await File.ReadAllLinesAsync(alternatesPath);
+        var sanitized = Assert.Single(sanitizedLines);
+        Assert.Equal(trustedAlternate, sanitized.Trim());
+    }
+
     /// <summary>
     /// The whole point of the gate: a build-time check that exits non-zero
     /// MUST surface as <see cref="PreMergeVerifyResult.BuildOrTestFailed"/>

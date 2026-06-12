@@ -38,6 +38,16 @@ public interface IGitHost
         => throw new NotSupportedException("This git host does not expose a host repository path.");
 
     /// <summary>
+    /// Gives hosts that expose agent-writable repositories a chance to clean
+    /// or validate host-side git state before the orchestrator runs git
+    /// commands directly against <see cref="GetRepoPath"/>. Remote-only hosts
+    /// and simple test hosts can keep the default no-op.
+    /// </summary>
+    void PrepareRepositoryForHostGitOperations(string repositoryId)
+    {
+    }
+
+    /// <summary>
     /// Returns the host directory where the merge / conflict-rework phase
     /// should stage an isolated bare clone. The contract is provider-agnostic:
     /// the returned directory MUST be usable as a bind-mount source by

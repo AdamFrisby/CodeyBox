@@ -449,6 +449,31 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_RejectsEnabledSharedMirrorWithEmptyDirectory()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.EnableSharedUpstreamMirror = true;
+        options.SharedUpstreamMirrorDirectory = " ";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:SharedUpstreamMirrorDirectory", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AllowsEmptySharedMirrorDirectoryWhenMirrorDisabled()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.EnableSharedUpstreamMirror = false;
+        options.SharedUpstreamMirrorDirectory = " ";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
     public void Validate_AcceptsValidAgentPauseEntry()
     {
         var options = ValidCodeyBoxOptions();

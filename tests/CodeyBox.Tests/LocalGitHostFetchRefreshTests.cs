@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging;
@@ -450,6 +451,120 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task FetchUpstreamBranchAsync_SharedMirror_FetchesCurrentBranchFromMirrorNotUpstream()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        var invocations = new List<GitInvocation>();
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance,
+            psi => new RecordingLocalGitProcess(psi, invocations));
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+        invocations.Clear();
+
+        var resolvedTip = await gitHost.FetchUpstreamBranchAsync(
+            repoId,
+            seed,
+            "main",
+            new Dictionary<string, string>());
+
+        Assert.Equal(await RevParseAsync(seed, "main"), resolvedTip);
+        var repoFetch = Assert.Single(invocations, i =>
+            i.WorkingDirectory == barePath
+            && i.GitArgs.Count >= 4
+            && i.GitArgs[0] == "fetch"
+            && i.GitArgs[1] == "--no-tags");
+        Assert.NotEqual(seed, repoFetch.GitArgs[2]);
+        Assert.StartsWith(mirrorDir, repoFetch.GitArgs[2], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EnsureRepositoryAsync_SharedMirror_UsesSharedCloneForMirrorBorrowing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        var invocations = new List<GitInvocation>();
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance,
+            psi => new RecordingLocalGitProcess(psi, invocations));
+
+        await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+
+        var mirrorBackedClone = Assert.Single(invocations, i =>
+            i.GitArgs.Contains("clone", StringComparer.Ordinal)
+            && i.GitArgs.Contains("--shared", StringComparer.Ordinal)
+            && i.GitArgs.Any(a => a.StartsWith(mirrorDir, StringComparison.Ordinal)));
+        Assert.Contains("--shared", mirrorBackedClone.GitArgs);
+    }
+
+    [Fact]
+    public async Task EnsureRepositoryAsync_SharedMirror_InitialCloneFallbackClearsFailedDestination()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        var failedReferenceClone = false;
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance,
+            psi =>
+            {
+                var invocation = GitInvocation.From(psi);
+                if (!failedReferenceClone
+                    && invocation.GitArgs.Contains("clone", StringComparer.Ordinal)
+                    && invocation.GitArgs.Contains("--shared", StringComparer.Ordinal))
+                {
+                    failedReferenceClone = true;
+                    var targetPath = invocation.GitArgs[^1];
+                    return new FakeLocalGitProcess(
+                        exitCode: 1,
+                        stderr: "simulated mirror clone failure",
+                        onStart: () =>
+                        {
+                            Directory.CreateDirectory(targetPath);
+                            File.WriteAllText(Path.Combine(targetPath, "partial-residue"), "left by failed clone");
+                        });
+                }
+
+                return new RecordingLocalGitProcess(psi, new List<GitInvocation>());
+            });
+
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+
+        Assert.True(failedReferenceClone);
+        Assert.Equal(await RevParseAsync(seed, "main"), await RevParseAsync(barePath, "main"));
+        Assert.False(File.Exists(Path.Combine(barePath, "partial-residue")));
+        Assert.False(File.Exists(Path.Combine(barePath, "objects", "info", "alternates")));
+        Assert.False(File.Exists(barePath + ".mirror_metadata"));
+    }
+
+    [Fact]
     public async Task SharedMirror_FallbackOnCorruption()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -493,6 +608,101 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
             new Dictionary<string, string>());
 
         Assert.Equal(seedTip, resolvedTip);
+        var barePath = gitHost.GetRepoPath(repoId);
+        Assert.False(File.Exists(Path.Combine(barePath, "objects", "info", "alternates")));
+        Assert.False(File.Exists(barePath + ".mirror_metadata"));
+    }
+
+    [Fact]
+    public async Task SharedMirror_ConfiguresGcToProtectAlternatesDependents()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+
+        var mirrorRepoPath = MirrorRepoPath(mirrorDir, seed);
+        var (_, gcAuto, _) = await TestSupport.RunGit(mirrorRepoPath, "config", "--get", "gc.auto");
+        var (_, pruneExpire, _) = await TestSupport.RunGit(mirrorRepoPath, "config", "--get", "gc.pruneExpire");
+        Assert.Equal("0", gcAuto.Trim());
+        Assert.Equal("never", pruneExpire.Trim());
+    }
+
+    [Fact]
+    public async Task EnsureRepositoryAsync_SharedMirror_NullBaseBranchUsesUpstreamDefaultBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await TestSupport.RunGit(seed, "checkout", "-b", "develop");
+        await CommitToRepoAsync(seed, "develop.txt", "develop\n", "create develop");
+
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, baseBranch: null);
+
+        Assert.Equal(await RevParseAsync(seed, "develop"), await RevParseAsync(gitHost.GetRepoPath(repoId), "develop"));
+    }
+
+    [Fact]
+    public async Task IsolatedMergeClone_SharedMirror_CopiesMountsRestoresAndCleansMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+        var isolatedPath = await gitHost.CreateIsolatedMergeCloneAsync(repoId, WorkItemId.New());
+
+        try
+        {
+            Assert.True(File.Exists(isolatedPath + ".mirror_metadata"));
+            var access = gitHost.GetIsolatedRepoSandboxAccess(isolatedPath);
+            var mirrorMount = Assert.Single(access.Mounts, m => m.ReadOnly);
+            Assert.StartsWith(mirrorDir, mirrorMount.HostPath, StringComparison.Ordinal);
+
+            Directory.Delete(isolatedPath, recursive: true);
+            File.Delete(isolatedPath + ".mirror_metadata");
+            await gitHost.RestoreIsolatedMergeCloneAsync(repoId, isolatedPath);
+
+            Assert.True(File.Exists(isolatedPath + ".mirror_metadata"));
+            Assert.True(Directory.Exists(isolatedPath));
+
+            await gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedPath);
+
+            Assert.False(Directory.Exists(isolatedPath));
+            Assert.False(File.Exists(isolatedPath + ".mirror_metadata"));
+        }
+        finally
+        {
+            await gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedPath);
+        }
     }
 
     private LocalGitHost CreateGitHost(ILogger<LocalGitHost>? logger = null)
@@ -712,6 +922,41 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         Assert.Equal(validPath, lines[0].Trim());
     }
 
+    [Fact]
+    public async Task SanitizeAlternates_ReadFailureFailsClosed()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var repoId = await gitHost.EnsureRepositoryAsync(WorkItemId.New(), seed, "main");
+        var alternatesPath = Path.Combine(gitHost.GetRepoPath(repoId), "objects", "info", "alternates");
+        File.SetUnixFileMode(alternatesPath, UnixFileMode.None);
+
+        try
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() =>
+                gitHost.SanitizeRepositoryAlternates(repoId));
+            Assert.Contains("Failed to sanitize git alternates", ex.Message);
+        }
+        finally
+        {
+            File.SetUnixFileMode(alternatesPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
     private sealed class CapturingLogger<T> : ILogger<T>
     {
         public List<Entry> Entries { get; } = [];
@@ -737,4 +982,67 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
     }
 
     private sealed record Entry(LogLevel Level, string Message);
+
+    private static string MirrorRepoPath(string mirrorDir, string upstreamUrl)
+    {
+        var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(upstreamUrl));
+        var sb = new System.Text.StringBuilder();
+        foreach (var b in hashBytes) sb.Append(b.ToString("x2"));
+        return Path.Combine(mirrorDir, sb.ToString() + ".git");
+    }
+
+    private sealed record GitInvocation(string WorkingDirectory, IReadOnlyList<string> GitArgs)
+    {
+        public static GitInvocation From(ProcessStartInfo startInfo)
+            => new(
+                startInfo.WorkingDirectory,
+                startInfo.ArgumentList
+                    .Skip(2)
+                    .ToArray());
+    }
+
+    private sealed class RecordingLocalGitProcess : ILocalGitProcess
+    {
+        private readonly Process _process;
+
+        public RecordingLocalGitProcess(ProcessStartInfo startInfo, List<GitInvocation> invocations)
+        {
+            invocations.Add(GitInvocation.From(startInfo));
+            _process = new Process { StartInfo = startInfo };
+        }
+
+        public TextReader StandardOutput => _process.StandardOutput;
+        public TextReader StandardError => _process.StandardError;
+        public int ExitCode => _process.ExitCode;
+        public void Start() => _process.Start();
+        public Task WaitForExitAsync(CancellationToken ct) => _process.WaitForExitAsync(ct);
+        public void Kill(bool entireProcessTree) => _process.Kill(entireProcessTree);
+        public void Dispose() => _process.Dispose();
+    }
+
+    private sealed class FakeLocalGitProcess(
+        int exitCode = 0,
+        string stdout = "",
+        string stderr = "",
+        Action? onStart = null) : ILocalGitProcess
+    {
+        private readonly StringReader _stdout = new(stdout);
+        private readonly StringReader _stderr = new(stderr);
+
+        public TextReader StandardOutput => _stdout;
+        public TextReader StandardError => _stderr;
+        public int ExitCode { get; } = exitCode;
+
+        public void Start() => onStart?.Invoke();
+
+        public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public void Kill(bool entireProcessTree) { }
+
+        public void Dispose()
+        {
+            _stdout.Dispose();
+            _stderr.Dispose();
+        }
+    }
 }
