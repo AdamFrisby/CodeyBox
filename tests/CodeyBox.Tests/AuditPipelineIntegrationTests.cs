@@ -77,6 +77,33 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task SuccessfulAuditWithNoisyTransientOutput_DoesNotParkForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new LlmNoisySuccessAuditor()],
+            involvement: involvement,
+            maxAuditIterations: 1);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+
+        var auditRow = Assert.Single(
+            await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
+            r => r.Phase == "audit:llm-noisy-success");
+        Assert.Equal("success", auditRow.Outcome);
+    }
+
+    [Fact]
     public async Task AuditFailsThenPassesAfterRework_ReachesDone()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2306,6 +2333,30 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
                 ],
                 AgentSummary: "request timed out",
                 AgentStderr: "request timed out while reading audit stream"));
+        }
+    }
+
+    private sealed class LlmNoisySuccessAuditor : IAuditor
+    {
+        public string Name => "llm-noisy-success";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(
+                Passed: true,
+                Findings: [],
+                AgentSummary: "audit completed",
+                AgentStdout: "stream-json marker: Reconnecting... recovered"));
         }
     }
 

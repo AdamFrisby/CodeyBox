@@ -795,6 +795,25 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
     }
 
     [Fact]
+    public async Task WaitingForTransientRetryCandidate_WatchdogRecoveryDoesNotEnqueue()
+    {
+        var parked = Item() with { State = WorkItemState.WaitingForTransientRetry };
+        var source = new FakePoolHealthSource
+        {
+            Status = new WorkerPoolStatus(2, 0, 1, null),
+            Candidates = [Candidate(parked)],
+        };
+        var watchdog = BuildWatchdog(StandardOptions(), source);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, source.EnqueueCalls);
+        Assert.Contains(_webhooks.Events, e => e.Event == "worker_pool.stalled");
+    }
+
+    [Fact]
     public async Task HealthScanLimit_IsIndependentFromRecoveryEnqueueBatch()
     {
         var unroutable = Item() with { Agent = AgentKind.Codex, Priority = 100 };

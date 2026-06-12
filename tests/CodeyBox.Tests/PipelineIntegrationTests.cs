@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -277,9 +278,11 @@ public sealed class PipelineIntegrationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
+            webhookDispatcher: webhooks,
             transientRetryOptions: TransientRetryOptions(),
             retryTimeProvider: time);
         tp.Agent.WorkResults.Enqueue(new AgentResult(
@@ -301,6 +304,47 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
+
+        var waiting = Assert.Single(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
+        Assert.Equal(item.Id, waiting.WorkItem?.Id);
+        using var details = JsonDocument.Parse(JsonSerializer.Serialize(waiting.Details));
+        var root = details.RootElement;
+        Assert.Equal("work", root.GetProperty("phase").GetString());
+        Assert.Equal("claude", root.GetProperty("agent").GetString());
+        Assert.Equal(final.NextTransientRetryAt, root.GetProperty("nextRetryAt").GetDateTimeOffset());
+        Assert.Equal(final.TransientRetryAttempts, root.GetProperty("attempts").GetInt32());
+    }
+
+    [Fact]
+    public async Task WorkPhaseTransientAgentFailure_AtRetryCap_PublishesFailedNotWaiting()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            webhookDispatcher: webhooks,
+            transientRetryOptions: TransientRetryOptions() with { MaxAutoRetriesPerWorkItem = 0 },
+            retryTimeProvider: time);
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        var item = NewItem("feature/transient-cap");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal("transient-exhausted", final.FailureKind);
+        Assert.Null(final.NextTransientRetryAt);
+        Assert.Contains("attempts=0; max=0", final.LastError);
+        Assert.Contains(webhooks.Events, e => e.Event == "work_item.failed" && e.WorkItem?.Id == item.Id);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.waiting_for_transient_retry");
     }
 
     [Fact]

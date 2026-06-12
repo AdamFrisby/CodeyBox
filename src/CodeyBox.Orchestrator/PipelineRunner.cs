@@ -7056,7 +7056,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 await streamCapture.DisposeAsync();
         }
         sw.Stop();
-        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner.Kind, result));
+        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner, result));
         CodeyBoxMeters.AuditorDuration.Record(
             (long)sw.Elapsed.TotalMilliseconds,
             new KeyValuePair<string, object?>("auditor.name", auditor.Name),
@@ -7549,14 +7549,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 quotaDetection.ResetAt);
         }
 
-        ThrowIfTransientAgentFailure(
-            run.Runner,
-            new AgentResult(
-                Success: false,
-                Summary: run.Result.AgentSummary ?? "agent failed",
-                Stdout: run.Result.AgentStdout,
-                Stderr: run.Result.AgentStderr),
-            "audit");
+        if (IsLlmAgentExecutionFailure(run.Result))
+        {
+            ThrowIfTransientAgentFailure(
+                run.Runner,
+                ToAgentResultForAuditFailureClassification(run.Result),
+                "audit");
+        }
     }
 
     private static bool IsLlmAgentExecutionFailure(AuditResult result) =>
@@ -9590,16 +9589,27 @@ public sealed class PipelineRunner : IPipelineRunner
     /// that merely reported findings — is <c>success</c> (the agent ran fine; the
     /// findings are the work product, not a run failure).
     /// </summary>
-    private string AuditorRunOutcome(AgentKind kind, AuditResult result)
+    private string AuditorRunOutcome(IAgentRunner runner, AuditResult result)
     {
-        if (_quotaClassifier.Detect(kind, result.AgentStderr, result.AgentStdout) is not null)
+        if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
-        if (AgentFailureClassifier.Classify(result.AgentStderr, result.AgentStdout).Kind == AgentFailureKind.TransientNetwork)
+
+        var classification = runner.ClassifyFailure(ToAgentResultForAuditFailureClassification(result));
+        if (classification.Kind == AgentFailureKind.QuotaExhausted)
+            return "failure:quota";
+        if (classification.Kind == AgentFailureKind.TransientNetwork)
             return "failure:transient";
         if (IsLlmAgentExecutionFailure(result))
             return "failure:agent";
         return "success";
     }
+
+    private static AgentResult ToAgentResultForAuditFailureClassification(AuditResult result) =>
+        new(
+            Success: !IsLlmAgentExecutionFailure(result),
+            Summary: result.AgentSummary ?? "agent failed",
+            Stdout: result.AgentStdout,
+            Stderr: result.AgentStderr);
 
     private sealed class AgentAttemptTimeoutException : OperationCanceledException
     {
@@ -13490,6 +13500,15 @@ Original merge-phase failure (for context):
                 await _retryScheduler.NotifyTransientFailureAsync(next, transitionCt);
 
             var scheduled = await _store.GetAsync(item.Id, transitionCt) ?? next;
+            if (scheduled.State == WorkItemState.Failed
+                && string.Equals(scheduled.FailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogWarning(
+                    "Work item {Id} exhausted transient retry budget during WaitingForTransientRetry scheduling",
+                    item.Id);
+                return;
+            }
+
             AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForTransientRetry.ToString());
             var effectiveProject = project ?? new Project
             {

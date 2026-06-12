@@ -87,6 +87,18 @@ public sealed class FleetSummaryEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task GetFleetSummary_WaitingForTransientRetry_IsNotInFlight()
+    {
+        _factory.SeedWorkItem("proj-alpha", WorkItemState.WaitingForTransientRetry);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        var row = summaries!.Single(r => r.ProjectId == "proj-alpha");
+        Assert.Equal(0, row.InFlightCount);
+        Assert.Null(row.CurrentPhase);
+    }
+
+    [Fact]
     public async Task GetFleetSummary_RecentOutcomes_OrderedNewestFirst()
     {
         var now = DateTimeOffset.UtcNow;

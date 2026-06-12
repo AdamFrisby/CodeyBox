@@ -99,6 +99,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     [Fact]
     public async Task NotifyTransientFailure_AtAttemptCap_MarksTransientExhausted()
     {
+        var webhooks = new CapturingWebhookDispatcher();
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
         {
             Enabled = true,
@@ -108,7 +109,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             MaxAutoRetriesPerWorkItem = 5,
             MaxElapsedTime = TimeSpan.FromHours(1),
             JitterMode = TransientRetryJitterMode.None,
-        });
+        }, webhooks: webhooks);
         var item = NewTransientItem() with { TransientRetryAttempts = 5 };
         await fixture.Store.CreateAsync(item);
 
@@ -119,6 +120,8 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal("transient-exhausted", stored!.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
         Assert.Contains("attempts=5; max=5", stored.LastError);
+        var failed = Assert.Single(webhooks.Events, e => e.Event == "work_item.failed");
+        Assert.Equal(stored.Id, failed.WorkItem?.Id);
     }
 
     [Fact]
@@ -471,7 +474,8 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         IQueueController? queueController = null,
         Func<double>? jitterRandom = null,
         IProjectRepository? projects = null,
-        bool includeProjects = true)
+        bool includeProjects = true,
+        IWebhookDispatcher? webhooks = null)
     {
         var store = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
         var queue = new InMemoryTaskQueue();
@@ -496,6 +500,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             NullLogger<QuotaRetryScheduler>.Instance,
             projects: projects,
             queueController: queueController,
+            webhooks: webhooks,
             timeProvider: _time,
             transientRetryOptionsAccessor: () => transientOptions,
             jitterRandom: jitterRandom);

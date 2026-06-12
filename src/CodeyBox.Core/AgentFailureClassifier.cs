@@ -325,7 +325,8 @@ public static class AgentFailureClassifier
                 }
 
                 var message = ExtractTurnFailedMessage(root);
-                if (ContainsAny(message, TransientNetworkPatterns))
+                if (ContainsAny(message, TransientNetworkPatterns)
+                    || ContainsStructuredTurnFailureTimeout(message))
                     return true;
             }
             catch (JsonException)
@@ -336,6 +337,10 @@ public static class AgentFailureClassifier
 
         return false;
     }
+
+    private static bool ContainsStructuredTurnFailureTimeout(string? message) =>
+        !string.IsNullOrWhiteSpace(message)
+        && message.Contains("timeout", StringComparison.OrdinalIgnoreCase);
 
     private static string? ExtractTurnFailedMessage(JsonElement root)
     {

@@ -1073,9 +1073,71 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 "Work item {Id} exhausted transient auto-retry budget: {Reason}",
                 item.Id,
                 reason);
+            await PublishTransientExhaustedFailureAsync(failed, reason, ct);
         }
 
         return new TransientRetryAttemptResult("skipped:max-retries", reason);
+    }
+
+    private async Task PublishTransientExhaustedFailureAsync(
+        WorkItem failed,
+        string reason,
+        CancellationToken ct)
+    {
+        AuditLog.WorkItemFailed(failed.Id, failed.LastError ?? reason);
+
+        if (_webhooks is null)
+            return;
+
+        try
+        {
+            var project = _projects is null
+                ? null
+                : await _projects.GetAsync(failed.ProjectId, CancellationToken.None);
+            var revision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.failed",
+                WorkItem = failed,
+                Project = project,
+                PromptRevision = revision?.PromptRevision,
+                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                RevisionMatches = revision?.RevisionMatches,
+                Details = new
+                {
+                    workItemId = failed.Id.ToString(),
+                    failureKind = failed.FailureKind,
+                    reason,
+                    transientRetryAttempts = failed.TransientRetryAttempts,
+                },
+            }, CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Work item {Id} exhausted transient auto-retry budget, but failure webhook delivery failed",
+                failed.Id);
+        }
+    }
+
+    private async Task<TerminalRevisionDetails?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
+    {
+        if (!WorkItemDependencies.TerminalStates.Contains(item.State))
+            return null;
+
+        var iterations = await _store.GetIterationsAsync(item.Id, ct);
+        int? lastDispatched = iterations.Count == 0
+            ? null
+            : iterations.OrderByDescending(i => i.Iteration).First().PromptRevisionAtDispatch;
+        return new TerminalRevisionDetails(
+            PromptRevision: item.PromptRevision,
+            RevisionAtCompletion: lastDispatched,
+            RevisionMatches: lastDispatched is { } r ? r == item.PromptRevision : null);
     }
 
     private async Task<TransientRetryAttemptResult> PerformTransientRetryAsync(
