@@ -18,7 +18,7 @@ public sealed class FileSizeLimitsAuditor : IAuditor, IPluginInitializer
     public const string AuditorName = "codeybox:file-size-limits";
     private const string RootConfigSection = "CodeyBox:Auditors:FileSizeLimits";
     private const string HeadRef = "HEAD";
-    private static readonly TimeSpan GlobRegexTimeout = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan GlobRegexTimeout = TimeSpan.FromSeconds(15);
 
     private readonly IConfiguration? _configuration;
     private IConfigurationSection? _pluginScopedConfig;

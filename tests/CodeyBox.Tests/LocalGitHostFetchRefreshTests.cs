@@ -377,7 +377,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
-        
+
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions
             {
@@ -386,7 +386,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
                 SharedUpstreamMirrorDirectory = mirrorDir
             },
             NullLogger<LocalGitHost>.Instance);
-            
+
         var id = WorkItemId.New();
         var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
         var barePath = gitHost.GetRepoPath(repoId);
@@ -403,7 +403,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
 
         // EnsureRepository again should update from the mirror
         await gitHost.EnsureRepositoryAsync(id, seed, "main");
-        
+
         var bareTip = await RevParseAsync(barePath, "main");
         Assert.Equal(seedTip, bareTip);
     }
@@ -414,7 +414,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
-        
+
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions
             {
@@ -423,10 +423,10 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
                 SharedUpstreamMirrorDirectory = mirrorDir
             },
             NullLogger<LocalGitHost>.Instance);
-            
+
         var id = WorkItemId.New();
         var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
-        
+
         // Advancing main on seed
         await CommitToRepoAsync(seed, "after-mirror-fetch.txt", "after mirror fetch\n", "advance main for fetch test");
         var seedTip = await RevParseAsync(seed, "main");
@@ -437,7 +437,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
             seed,
             "main",
             new Dictionary<string, string>());
-            
+
         Assert.Equal(seedTip, resolvedTip);
 
         // Verify mirror tip is correct
@@ -455,7 +455,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
-        
+
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions
             {
@@ -473,7 +473,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         var sb = new System.Text.StringBuilder();
         foreach (var b in hashBytes) sb.Append(b.ToString("x2"));
         var mirrorRepoPath = Path.Combine(mirrorDir, sb.ToString() + ".git");
-        
+
         if (Directory.Exists(mirrorRepoPath))
         {
             Directory.Delete(mirrorRepoPath, recursive: true);
