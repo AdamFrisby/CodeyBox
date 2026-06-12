@@ -72,12 +72,6 @@ public sealed class LocalGitHost : IGitHost
             {
                 if (seedFromUrl is not null)
                 {
-                    if (_opts.EnableSharedUpstreamMirror)
-                    {
-                        var mirrorPath = GetMirrorPath(seedFromUrl);
-                        var metadataPath = path + ".mirror_metadata";
-                        await File.WriteAllTextAsync(metadataPath, Path.Combine(mirrorPath, "objects"), ct);
-                    }
                     await FetchUpstreamAsync(path, seedFromUrl, baseBranch, ct);
                 }
                 return repoId;
@@ -109,11 +103,15 @@ public sealed class LocalGitHost : IGitHost
                     else
                     {
                         _log.LogWarning("Clone from reference mirror failed (exit {Code}): {Error}. Falling back to direct clone from remote.", rc.ExitCode, ScrubCredentialMaterial(rc.Stderr));
+                        var metadataPath = path + ".mirror_metadata";
+                        try { File.Delete(metadataPath); } catch {}
                         rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
                     }
                 }
                 else
                 {
+                    var metadataPath = path + ".mirror_metadata";
+                    try { File.Delete(metadataPath); } catch {}
                     rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
                 }
 
@@ -395,6 +393,7 @@ public sealed class LocalGitHost : IGitHost
     public async Task<string> GetDefaultBranchAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);
+        SanitizeAlternates(path);
         using var repo = new Repository(path);
         var head = repo.Refs["HEAD"] as SymbolicReference;
         if (head?.Target?.CanonicalName is { } target && target.StartsWith("refs/heads/", StringComparison.Ordinal))
@@ -475,6 +474,7 @@ public sealed class LocalGitHost : IGitHost
                 if (fetch.ExitCode != 0)
                 {
                     _log.LogWarning("Fetch from mirror failed: {Error}. Falling back to direct remote fetch.", fetch.Stderr);
+                    try { File.Delete(metadataPath); } catch {}
                     fetch = await RunGitAsync(
                         workdir: path,
                         ct,
@@ -484,6 +484,8 @@ public sealed class LocalGitHost : IGitHost
             }
             else
             {
+                var metadataPath = path + ".mirror_metadata";
+                try { File.Delete(metadataPath); } catch {}
                 fetch = await RunGitAsync(
                     workdir: path,
                     ct,
@@ -493,6 +495,8 @@ public sealed class LocalGitHost : IGitHost
         }
         else
         {
+            var metadataPath = path + ".mirror_metadata";
+            try { File.Delete(metadataPath); } catch {}
             fetch = await RunGitAsync(
                 workdir: path,
                 ct,
@@ -651,6 +655,17 @@ public sealed class LocalGitHost : IGitHost
     }
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
+
+    public void SanitizeRepositoryAlternates(string repositoryId)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeAlternates(path);
+    }
+
+    public void SanitizeRepositoryAlternatesByPath(string path)
+    {
+        SanitizeAlternates(path);
+    }
 
     public async Task<GitMergeTreeResult> ComputeMergeTreeAsync(
         string repositoryId,
@@ -835,6 +850,7 @@ public sealed class LocalGitHost : IGitHost
 
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
+        SanitizeAlternates(path);
 
         var psi = new ProcessStartInfo
         {
@@ -1101,7 +1117,18 @@ public sealed class LocalGitHost : IGitHost
                     return;
                 }
                 _log.LogWarning("Fetch from mirror failed: {Error}. Falling back to direct fetch.", rcMirror.Stderr);
+                try { File.Delete(metadataPath); } catch {}
             }
+            else
+            {
+                var metadataPath = bareRepoPath + ".mirror_metadata";
+                try { File.Delete(metadataPath); } catch {}
+            }
+        }
+        else
+        {
+            var metadataPath = bareRepoPath + ".mirror_metadata";
+            try { File.Delete(metadataPath); } catch {}
         }
 
         var rc = await RunGitAsync(
@@ -1571,6 +1598,34 @@ public sealed class LocalGitHost : IGitHost
         {
             var gitDir = FindCommonGitDir(workdir);
             if (gitDir == null) return;
+
+            // Ensure gitDir is within the managed directories (RootDirectory or SharedUpstreamMirrorDirectory)
+            // to avoid mutating parent repositories we do not own.
+            var resolvedGitDir = Path.GetFullPath(gitDir);
+            var rootDir = Path.GetFullPath(_opts.RootDirectory);
+            var mirrorDir = !string.IsNullOrEmpty(_opts.SharedUpstreamMirrorDirectory)
+                ? (Path.IsPathRooted(_opts.SharedUpstreamMirrorDirectory)
+                    ? Path.GetFullPath(_opts.SharedUpstreamMirrorDirectory)
+                    : Path.GetFullPath(Path.Combine(_opts.RootDirectory, _opts.SharedUpstreamMirrorDirectory)))
+                : null;
+
+            var rootDirWithSlash = rootDir.EndsWith(Path.DirectorySeparatorChar) ? rootDir : rootDir + Path.DirectorySeparatorChar;
+
+            bool isManaged = resolvedGitDir.StartsWith(rootDirWithSlash, StringComparison.Ordinal) ||
+                             resolvedGitDir.Equals(rootDir, StringComparison.Ordinal);
+
+            if (mirrorDir != null)
+            {
+                var mirrorDirWithSlash = mirrorDir.EndsWith(Path.DirectorySeparatorChar) ? mirrorDir : mirrorDir + Path.DirectorySeparatorChar;
+                isManaged = isManaged ||
+                            resolvedGitDir.StartsWith(mirrorDirWithSlash, StringComparison.Ordinal) ||
+                            resolvedGitDir.Equals(mirrorDir, StringComparison.Ordinal);
+            }
+
+            if (!isManaged)
+            {
+                return;
+            }
 
             var alternatesPath = Path.Combine(gitDir, "objects", "info", "alternates");
             if (!File.Exists(alternatesPath)) return;
