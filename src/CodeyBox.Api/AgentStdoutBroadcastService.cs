@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -19,10 +20,17 @@ namespace CodeyBox.Api;
 public sealed class AgentStdoutBroadcastService : IStdoutBroadcaster, IAgentSupervisionNotifier, IDisposable
 {
     private readonly IHubContext<AgentStdoutHub> _hub;
+    private readonly ILogger<AgentStdoutBroadcastService> _log;
     private readonly ConcurrentDictionary<WorkItemId, StdoutRingBuffer> _buffers = new();
     private readonly ConcurrentDictionary<WorkItemId, WorkItemBatcher> _batchers = new();
 
-    public AgentStdoutBroadcastService(IHubContext<AgentStdoutHub> hub) => _hub = hub;
+    public AgentStdoutBroadcastService(
+        IHubContext<AgentStdoutHub> hub,
+        ILogger<AgentStdoutBroadcastService>? log = null)
+    {
+        _hub = hub;
+        _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentStdoutBroadcastService>.Instance;
+    }
 
     public void BroadcastChunk(WorkItemId workItemId, string phase, string chunk)
     {
@@ -78,9 +86,13 @@ public sealed class AgentStdoutBroadcastService : IStdoutBroadcaster, IAgentSupe
                 .SendAsync(method, payload, ct)
                 .ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
             // Best-effort: supervision clients are allowed to disconnect at any time.
+            _log.LogDebug(ex,
+                "Failed to broadcast supervision message {Method} for session {SessionId}",
+                method,
+                sessionId);
         }
     }
 

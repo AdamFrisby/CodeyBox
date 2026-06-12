@@ -1,3 +1,8 @@
+using System.Net;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Connections.Features;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.SignalR;
 using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
@@ -189,6 +194,69 @@ public sealed class AgentStdoutHubTests
         Assert.Contains("supervision:all", sent.Group);
         Assert.Contains("supervision:session:ags-session", sent.Group);
     }
+
+    [Fact]
+    public async Task Hub_ListSupervisionSessions_ForwardsQueryToService()
+    {
+        var service = new CapturingSupervisionService();
+        var hub = new AgentStdoutHub(service)
+        {
+            Context = new TestHubCallerContext("conn-list", new DefaultHttpContext()),
+            Groups = new FakeGroupManager(),
+        };
+
+        var page = await hub.ListSupervisionSessionsAsync(skip: 2, take: 3, outputTailMaxChars: 100, recentCommandsLimit: 4);
+
+        Assert.True(page.Enabled);
+        Assert.Equal(new AgentSupervisionListQuery(2, 3, true, 100, 4), service.LastQuery);
+    }
+
+    [Fact]
+    public async Task Hub_InjectSupervision_DerivesActorFromBearerAndRemoteEndpoint()
+    {
+        var service = new CapturingSupervisionService();
+        var http = new DefaultHttpContext();
+        http.Connection.RemoteIpAddress = IPAddress.Parse("203.0.113.10");
+        http.Request.Headers.Authorization = "Bearer signalr-test-token-that-is-long-enough";
+        var hub = new AgentStdoutHub(service)
+        {
+            Context = new TestHubCallerContext("conn-inject", http),
+            Groups = new FakeGroupManager(),
+        };
+
+        var receipt = await hub.InjectSupervisionAsync(
+            "ags-target",
+            new AgentSupervisionInjectionRequest("inspect", "client-claim"));
+
+        Assert.True(receipt.Accepted);
+        Assert.Equal("ags-target", service.LastSessionId);
+        Assert.NotNull(service.LastRequest);
+        Assert.StartsWith("apikey:", service.LastRequest!.Actor, StringComparison.Ordinal);
+        Assert.Contains("@203.0.113.10", service.LastRequest.Actor, StringComparison.Ordinal);
+        Assert.Contains("(client-claim)", service.LastRequest.Actor, StringComparison.Ordinal);
+        Assert.NotEqual("client-claim", service.LastRequest.Actor);
+    }
+
+    [Fact]
+    public async Task Hub_InjectSupervision_PrefersAuthenticatedPrincipal()
+    {
+        var service = new CapturingSupervisionService();
+        var http = new DefaultHttpContext();
+        var user = new ClaimsPrincipal(new ClaimsIdentity(
+            [new Claim(ClaimTypes.Name, "supervisor@example.invalid")],
+            "test"));
+        var hub = new AgentStdoutHub(service)
+        {
+            Context = new TestHubCallerContext("conn-user", http, user),
+            Groups = new FakeGroupManager(),
+        };
+
+        await hub.InjectSupervisionAsync(
+            "ags-target",
+            new AgentSupervisionInjectionRequest("inspect", null));
+
+        Assert.Equal("user:supervisor@example.invalid", service.LastRequest?.Actor);
+    }
 }
 
 // ── Fake SignalR infrastructure ───────────────────────────────────────────────
@@ -252,4 +320,61 @@ internal sealed class FakeGroupManager : IGroupManager
         => Task.CompletedTask;
     public Task RemoveFromGroupAsync(string connectionId, string groupName, CancellationToken ct = default)
         => Task.CompletedTask;
+}
+
+internal sealed class CapturingSupervisionService : IAgentSupervisionService
+{
+    public bool Enabled => true;
+    public AgentSupervisionListQuery? LastQuery { get; private set; }
+    public string? LastSessionId { get; private set; }
+    public AgentSupervisionInjectionRequest? LastRequest { get; private set; }
+
+    public Task<IAgentSupervisionSession?> TryStartSessionAsync(
+        AgentSupervisionSessionStart start,
+        CancellationToken ct = default) =>
+        Task.FromResult<IAgentSupervisionSession?>(null);
+
+    public Task<AgentSupervisionSessionPage> ListSessionsAsync(
+        AgentSupervisionListQuery query,
+        CancellationToken ct = default)
+    {
+        LastQuery = query;
+        return Task.FromResult(new AgentSupervisionSessionPage(true, 0, query.Skip ?? 0, 0, []));
+    }
+
+    public Task<AgentSupervisionInjectionReceipt> EnqueueInjectionAsync(
+        string sessionId,
+        AgentSupervisionInjectionRequest request,
+        CancellationToken ct = default)
+    {
+        LastSessionId = sessionId;
+        LastRequest = request;
+        return Task.FromResult(new AgentSupervisionInjectionReceipt(true, "accepted", "agi-test"));
+    }
+}
+
+internal sealed class TestHubCallerContext : HubCallerContext
+{
+    private readonly IFeatureCollection _features = new FeatureCollection();
+
+    public TestHubCallerContext(string connectionId, HttpContext httpContext, ClaimsPrincipal? user = null)
+    {
+        ConnectionId = connectionId;
+        User = user ?? new ClaimsPrincipal(new ClaimsIdentity());
+        _features.Set<IHttpContextFeature>(new TestHttpContextFeature(httpContext));
+    }
+
+    public override string ConnectionId { get; }
+    public override string? UserIdentifier => null;
+    public override ClaimsPrincipal? User { get; }
+    public override IDictionary<object, object?> Items { get; } = new Dictionary<object, object?>();
+    public override IFeatureCollection Features => _features;
+    public override CancellationToken ConnectionAborted => CancellationToken.None;
+    public override void Abort() { }
+}
+
+internal sealed class TestHttpContextFeature : IHttpContextFeature
+{
+    public TestHttpContextFeature(HttpContext httpContext) => HttpContext = httpContext;
+    public HttpContext? HttpContext { get; set; }
 }

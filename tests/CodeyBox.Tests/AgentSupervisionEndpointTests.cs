@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -122,7 +123,11 @@ public sealed class AgentSupervisionEndpointTests : IDisposable
     [Fact]
     public async Task Inject_ClosedSession_Returns409()
     {
-        _factory.SetEnabled(true);
+        _factory.SetOptions(new AgentSupervisionOptions
+        {
+            Enabled = true,
+            InjectionDrainIdleTimeoutMs = 0,
+        });
         var scope = await _factory.Supervision.TryStartSessionAsync(Start())
             ?? throw new InvalidOperationException("expected supervision scope");
 
@@ -165,16 +170,22 @@ public sealed class AgentSupervisionEndpointTests : IDisposable
         await using var scope = await _factory.Supervision.TryStartSessionAsync(Start())
             ?? throw new InvalidOperationException("expected supervision scope");
 
-        var resp = await _client.PostAsJsonAsync(
-            $"/agent-supervision/sessions/{scope.SessionId}/injections",
-            new AgentSupervisionInjectionRequest("inspect", "totally-trusted-name"));
+        using var req = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/agent-supervision/sessions/{scope.SessionId}/injections")
+        {
+            Content = JsonContent.Create(new AgentSupervisionInjectionRequest("inspect", "totally-trusted-name")),
+        };
+        req.Headers.Authorization = new AuthenticationHeaderValue(
+            "Bearer",
+            "endpoint-test-token-that-is-long-enough-to-fingerprint");
+        var resp = await _client.SendAsync(req);
         Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
 
-        var page = await _factory.Supervision.ListSessionsAsync(new AgentSupervisionListQuery());
-        Assert.NotEmpty(page.Sessions);
-        // We can't easily read injection actor here without exposing more
-        // surface, but Inject_NotFound check below proves the endpoint flows
-        // a populated actor through to the service.
+        var queued = Assert.Single(_factory.Notifier.QueuedInjections);
+        Assert.StartsWith("apikey:", queued.Actor, StringComparison.Ordinal);
+        Assert.Contains("totally-trusted-name", queued.Actor, StringComparison.Ordinal);
+        Assert.NotEqual("totally-trusted-name", queued.Actor);
     }
 
     [Fact]
@@ -234,10 +245,11 @@ internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program
     private AgentSupervisionOptions _options = new();
 
     public AgentSupervisionService Supervision { get; }
+    public RecordingEndpointSupervisionNotifier Notifier { get; } = new();
 
     public AgentSupervisionApiFactory()
     {
-        Supervision = new AgentSupervisionService(() => _options);
+        Supervision = new AgentSupervisionService(() => _options, Notifier);
     }
 
     public void SetEnabled(bool enabled) => _options.Enabled = enabled;
@@ -274,4 +286,29 @@ internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program
             try { File.Delete(_dbPath); } catch { }
         base.Dispose(disposing);
     }
+}
+
+internal sealed class RecordingEndpointSupervisionNotifier : IAgentSupervisionNotifier
+{
+    public List<AgentSupervisionInjectionEvent> QueuedInjections { get; } = [];
+
+    public Task SessionStartedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task SessionUpdatedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task SessionCompletedAsync(AgentSupervisionSessionSnapshot session, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task CodeyBoxCommandAsync(AgentSupervisionCommandEvent command, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task StdoutChunkAsync(AgentSupervisionStdoutEvent chunk, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task InjectionQueuedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default)
+    {
+        QueuedInjections.Add(injection);
+        return Task.CompletedTask;
+    }
+    public Task InjectionStartedAsync(AgentSupervisionInjectionEvent injection, CancellationToken ct = default) =>
+        Task.CompletedTask;
+    public Task InjectionCompletedAsync(AgentSupervisionInjectionCompletedEvent injection, CancellationToken ct = default) =>
+        Task.CompletedTask;
 }

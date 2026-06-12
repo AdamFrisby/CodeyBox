@@ -12,6 +12,7 @@ public sealed class AgentSupervisionOptions
     public int MaxOutputBufferChars { get; set; } = 128 * 1024;
     public int MaxInjectionChars { get; set; } = 8_192;
     public int InjectionQueueCapacity { get; set; } = 16;
+    public int InjectionDrainIdleTimeoutMs { get; set; } = 250;
     public int CompletedSessionRetentionSeconds { get; set; } = 300;
     public int MaxSessions { get; set; } = 512;
 
@@ -40,6 +41,8 @@ public sealed class AgentSupervisionOptions
             throw new InvalidOperationException("CodeyBox:AgentSupervision:MaxInjectionChars must be >= 128");
         if (InjectionQueueCapacity < 1)
             throw new InvalidOperationException("CodeyBox:AgentSupervision:InjectionQueueCapacity must be >= 1");
+        if (InjectionDrainIdleTimeoutMs < 0)
+            throw new InvalidOperationException("CodeyBox:AgentSupervision:InjectionDrainIdleTimeoutMs must be >= 0");
         if (CompletedSessionRetentionSeconds < 0)
             throw new InvalidOperationException("CodeyBox:AgentSupervision:CompletedSessionRetentionSeconds must be >= 0");
         if (MaxSessions < 1)
@@ -371,6 +374,7 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
 
             state.PendingInjections.Enqueue(injection);
             state.PendingCount++;
+            state.PendingInjectionSignal.TrySetResult();
         }
 
         AuditLog.AgentSupervisionInjectionQueued(
@@ -443,13 +447,36 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
     {
         ArgumentNullException.ThrowIfNull(runTurnAsync);
         var result = current;
-        while (TryBeginNextInjection(state, out var injection))
+        while (true)
         {
+            if (!TryBeginNextInjection(state, out var injection))
+            {
+                if (await WaitForPendingInjectionAsync(state, ct).ConfigureAwait(false))
+                    continue;
+                if (TryCloseInjectionQueueIfEmpty(state))
+                    break;
+                continue;
+            }
+
             ct.ThrowIfCancellationRequested();
             var prompt = BuildHumanInjectionPrompt(injection);
             await MarkInjectionStartedAsync(state, injection, ct).ConfigureAwait(false);
             await PublishCommandAsync(state, "human-injection", prompt, injection.InjectionId, ct).ConfigureAwait(false);
-            var turn = await runTurnAsync(new AgentSupervisionInjectionTurn(injection, prompt), ct).ConfigureAwait(false);
+            AgentResult turn;
+            try
+            {
+                turn = await runTurnAsync(new AgentSupervisionInjectionTurn(injection, prompt), ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                turn = new AgentResult(
+                    false,
+                    $"injection threw {ex.GetType().Name}: {ex.Message}",
+                    Stdout: null,
+                    Stderr: ex.ToString());
+                await MarkInjectionCompletedAsync(state, injection, turn, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
             await MarkInjectionCompletedAsync(state, injection, turn, ct).ConfigureAwait(false);
             result = MergeTurnResult(result, turn);
             if (!turn.Success)
@@ -471,9 +498,50 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
                 return true;
             }
 
-            state.AcceptingInjections = false;
             injection = null!;
             return false;
+        }
+    }
+
+    private async Task<bool> WaitForPendingInjectionAsync(
+        AgentSupervisionSessionState state,
+        CancellationToken ct)
+    {
+        var timeoutMs = CurrentOptions().InjectionDrainIdleTimeoutMs;
+        if (timeoutMs <= 0)
+            return false;
+
+        Task waitTask;
+        lock (state.Sync)
+        {
+            if (state.PendingCount > 0)
+                return true;
+            if (!state.AcceptingInjections)
+                return false;
+
+            state.PendingInjectionSignal = AgentSupervisionSessionState.CreatePendingInjectionSignal();
+            waitTask = state.PendingInjectionSignal.Task;
+        }
+
+        try
+        {
+            await waitTask.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs), ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryCloseInjectionQueueIfEmpty(AgentSupervisionSessionState state)
+    {
+        lock (state.Sync)
+        {
+            if (state.PendingCount > 0)
+                return false;
+            state.AcceptingInjections = false;
+            return true;
         }
     }
 
@@ -757,6 +825,10 @@ internal sealed class AgentSupervisionSessionState
     public bool AcceptingInjections { get; set; } = true;
     public Queue<AgentSupervisionInjection> PendingInjections { get; } = new();
     public int PendingCount { get; set; }
+    public TaskCompletionSource PendingInjectionSignal { get; set; } = CreatePendingInjectionSignal();
+
+    public static TaskCompletionSource CreatePendingInjectionSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public void AppendOutput(string chunk)
     {

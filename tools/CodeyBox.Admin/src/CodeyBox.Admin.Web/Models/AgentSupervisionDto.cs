@@ -26,6 +26,15 @@ public sealed class AgentSupervisionSessionDto
     public bool AcceptingInjections { get; set; }
     public int PendingInjections { get; set; }
     public string OutputTail { get; set; } = "";
+    public List<AgentSupervisionCommandRecordDto> RecentCommands { get; set; } = [];
+}
+
+public sealed class AgentSupervisionCommandRecordDto
+{
+    public string Kind { get; set; } = "";
+    public string? InjectionId { get; set; }
+    public DateTimeOffset SentAt { get; set; }
+    public string Prompt { get; set; } = "";
 }
 
 public sealed class AgentSupervisionInjectionRequestDto

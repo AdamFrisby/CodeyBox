@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.AspNetCore.SignalR;
 using CodeyBox.Orchestrator;
 
@@ -66,7 +68,9 @@ public sealed class AgentStdoutHub : Hub
         // supplied actor strings cannot be trusted because the bearer-token
         // auth layer does not bind a user identity to the connection.
         var clientLabel = string.IsNullOrWhiteSpace(request.Actor) ? null : request.Actor!.Trim();
-        var authoritative = $"signalr:{Context.ConnectionId}";
+        if (clientLabel is not null && clientLabel.Length > 80)
+            clientLabel = clientLabel[..80];
+        var authoritative = ResolveAuthoritativeActor();
         var actor = clientLabel is null ? authoritative : $"{authoritative} ({clientLabel})";
         return _supervision.EnqueueInjectionAsync(
             sessionId,
@@ -75,4 +79,34 @@ public sealed class AgentStdoutHub : Hub
     }
 
     internal static string SupervisionSessionGroup(string sessionId) => $"supervision:session:{sessionId}";
+
+    private string ResolveAuthoritativeActor()
+    {
+        var name = Context.User?.Identity?.Name;
+        if (!string.IsNullOrWhiteSpace(name))
+            return $"user:{name}";
+
+        var http = Context.GetHttpContext();
+        var ip = http?.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var fingerprint = http is null ? null : FingerprintAuth(http);
+        var principal = fingerprint is null
+            ? $"signalr:{Context.ConnectionId}@{ip}"
+            : $"apikey:{fingerprint}@{ip}";
+        return principal;
+    }
+
+    private static string? FingerprintAuth(HttpContext ctx)
+    {
+        if (!ctx.Request.Headers.TryGetValue("Authorization", out var values))
+            return null;
+        var raw = values.ToString();
+        const string prefix = "Bearer ";
+        if (!raw.StartsWith(prefix, StringComparison.Ordinal))
+            return null;
+        var token = raw[prefix.Length..].Trim();
+        if (token.Length == 0)
+            return null;
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+        return Convert.ToHexString(bytes.AsSpan(0, 6)).ToLowerInvariant();
+    }
 }

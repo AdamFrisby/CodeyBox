@@ -308,35 +308,37 @@ public sealed class AgenticConflictResolver
                     runner,
                     candidate,
                     sandbox,
-                    workingDirectory,
-                    attempt,
-                    ct);
-                var stdoutCallback = supervision?.WrapStdoutCallback(null);
+                        workingDirectory,
+                        attempt,
+                        ct);
+                Action<string>? stdoutCallback = null;
                 var captureStructuredStream = NeedsStructuredStreamForResume(runner);
                 try
                 {
-                    if (supervision is not null)
-                        await supervision.PublishCodeyBoxCommandAsync("autonomous", prompt, injectionId: null, ct);
-                    agentResult = await runner.RunAsync(
-                        sandbox,
-                        workingDirectory,
-                        prompt,
-                        candidate.Credential,
-                        candidate.ModelId,
-                        candidate.ReasoningMode,
-                        ct,
-                        stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: captureStructuredStream);
-                    if (supervision is not null)
-                    {
-                        var dispatcher = new SupervisedTurnDispatcher(
-                            runner, sandbox, workingDirectory, candidate.Credential,
-                            candidate.ModelId, candidate.ReasoningMode, stdoutCallback,
-                            captureStructuredStream: captureStructuredStream,
-                            promptPreprocessor: null);
-                        agentResult = await supervision.RunPendingInjectionsAsync(
-                            agentResult, dispatcher.RunInjectionTurnAsync, ct);
-                    }
+                    agentResult = supervision is null
+                        ? await runner.RunAsync(
+                            sandbox,
+                            workingDirectory,
+                            prompt,
+                            candidate.Credential,
+                            candidate.ModelId,
+                            candidate.ReasoningMode,
+                            ct,
+                            stdoutChunkCallback: stdoutCallback,
+                            captureStructuredStream: captureStructuredStream)
+                        : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                            runner,
+                            sandbox,
+                            workingDirectory,
+                            prompt,
+                            candidate.Credential,
+                            candidate.ModelId,
+                            candidate.ReasoningMode,
+                            supervision,
+                            stdoutCallback,
+                            captureStructuredStream,
+                            promptPreprocessor: null,
+                            ct);
                 }
                 catch (OperationCanceledException)
                 {

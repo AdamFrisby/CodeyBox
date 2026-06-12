@@ -93,11 +93,41 @@ public sealed class AgentSupervisionServiceTests
     }
 
     [Fact]
+    public async Task RunPendingInjectionsAsync_AuditsCompletionWhenTurnThrows()
+    {
+        var notifier = new RecordingSupervisionNotifier();
+        var service = new AgentSupervisionService(
+            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 },
+            notifier);
+        await using var scope = await service.TryStartSessionAsync(Start())
+            ?? throw new InvalidOperationException("expected supervision scope");
+        var receipt = await service.EnqueueInjectionAsync(
+            scope.SessionId,
+            new AgentSupervisionInjectionRequest("throw during dispatch", "alice"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            scope.RunPendingInjectionsAsync(
+                new AgentResult(true, "auto", null, null),
+                (_, _) => throw new InvalidOperationException("runner exploded")));
+
+        Assert.Equal("runner exploded", ex.Message);
+        var completed = Assert.Single(notifier.CompletedInjections);
+        Assert.Equal(receipt.InjectionId, completed.InjectionId);
+        Assert.False(completed.Success);
+        Assert.Contains("InvalidOperationException", completed.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Enabled_SurfacesSession_QueuesInjection_AndClosesIntakeWhenDrained()
     {
         var notifier = new RecordingSupervisionNotifier();
         var service = new AgentSupervisionService(
-            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 1 },
+            () => new AgentSupervisionOptions
+            {
+                Enabled = true,
+                InjectionQueueCapacity = 1,
+                InjectionDrainIdleTimeoutMs = 0,
+            },
             notifier);
 
         await using var scope = await service.TryStartSessionAsync(Start())
@@ -129,6 +159,40 @@ public sealed class AgentSupervisionServiceTests
         Assert.Contains(notifier.InjectionEvents, e => e.Method == "queued" && e.InjectionId == receipt.InjectionId);
         Assert.Contains(notifier.InjectionEvents, e => e.Method == "started" && e.InjectionId == receipt.InjectionId);
         Assert.Contains(notifier.CompletedInjections, e => e.InjectionId == receipt.InjectionId && e.Success);
+    }
+
+    [Fact]
+    public async Task RunPendingInjectionsAsync_AcceptsInjectionDuringIdleDrainWindow()
+    {
+        var service = new AgentSupervisionService(
+            () => new AgentSupervisionOptions
+            {
+                Enabled = true,
+                InjectionQueueCapacity = 4,
+                InjectionDrainIdleTimeoutMs = 500,
+            });
+        await using var scope = await service.TryStartSessionAsync(Start())
+            ?? throw new InvalidOperationException("expected supervision scope");
+
+        var dispatched = new List<string>();
+        var drain = scope.RunPendingInjectionsAsync(
+            new AgentResult(true, "auto", null, null),
+            (turn, _) =>
+            {
+                dispatched.Add(turn.Injection.Message);
+                return Task.FromResult(new AgentResult(true, "injection ok", null, null));
+            });
+
+        await Task.Delay(50);
+        var receipt = await service.EnqueueInjectionAsync(
+            scope.SessionId,
+            new AgentSupervisionInjectionRequest("arrived just after autonomous turn", "alice"));
+
+        var merged = await drain;
+
+        Assert.True(receipt.Accepted);
+        Assert.True(merged.Success);
+        Assert.Equal(["arrived just after autonomous turn"], dispatched);
     }
 
     [Fact]
@@ -184,6 +248,26 @@ public sealed class AgentSupervisionServiceTests
 
         Assert.False(receipt.Accepted);
         Assert.Equal("invalid", receipt.Status);
+    }
+
+    [Fact]
+    public async Task InjectionRejection_RejectsBlankSessionIdAndNullRequest()
+    {
+        var service = new AgentSupervisionService(() => new AgentSupervisionOptions { Enabled = true });
+
+        var blank = await service.EnqueueInjectionAsync(
+            " ",
+            new AgentSupervisionInjectionRequest("hello", "alice"));
+        var nullRequest = await service.EnqueueInjectionAsync(
+            "ags-missing",
+            null!);
+
+        Assert.False(blank.Accepted);
+        Assert.Equal("invalid", blank.Status);
+        Assert.Contains("sessionId", blank.Error);
+        Assert.False(nullRequest.Accepted);
+        Assert.Equal("invalid", nullRequest.Status);
+        Assert.Contains("request", nullRequest.Error);
     }
 
     [Fact]
@@ -323,6 +407,7 @@ public sealed class AgentSupervisionServiceTests
     [InlineData(nameof(AgentSupervisionOptions.MaxOutputBufferChars), 0)]
     [InlineData(nameof(AgentSupervisionOptions.MaxInjectionChars), 0)]
     [InlineData(nameof(AgentSupervisionOptions.InjectionQueueCapacity), 0)]
+    [InlineData(nameof(AgentSupervisionOptions.InjectionDrainIdleTimeoutMs), -1)]
     [InlineData(nameof(AgentSupervisionOptions.CompletedSessionRetentionSeconds), -1)]
     [InlineData(nameof(AgentSupervisionOptions.MaxSessions), 0)]
     [InlineData(nameof(AgentSupervisionOptions.MaxSessions), AgentSupervisionOptions.MaxSessionsCeiling + 1)]
@@ -337,6 +422,7 @@ public sealed class AgentSupervisionServiceTests
             case nameof(AgentSupervisionOptions.MaxOutputBufferChars): options.MaxOutputBufferChars = badValue; break;
             case nameof(AgentSupervisionOptions.MaxInjectionChars): options.MaxInjectionChars = badValue; break;
             case nameof(AgentSupervisionOptions.InjectionQueueCapacity): options.InjectionQueueCapacity = badValue; break;
+            case nameof(AgentSupervisionOptions.InjectionDrainIdleTimeoutMs): options.InjectionDrainIdleTimeoutMs = badValue; break;
             case nameof(AgentSupervisionOptions.CompletedSessionRetentionSeconds): options.CompletedSessionRetentionSeconds = badValue; break;
             case nameof(AgentSupervisionOptions.MaxSessions): options.MaxSessions = badValue; break;
             case nameof(AgentSupervisionOptions.RetainedCommandsPerSession): options.RetainedCommandsPerSession = badValue; break;

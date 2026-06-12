@@ -3,20 +3,15 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Dispatches a single supervised agent turn — applying optional prompt
-/// preprocessing and routing through <see cref="ISessionAgentRunner"/> when
-/// the supplied runner is session-capable, so human injections preserve the
-/// resumable-session/sanitisation invariants of session-aware runners
-/// (e.g. <c>ClaudeSessionWorker</c>'s ACP transport and thinking-block
-/// sanitiser). Falls back to <see cref="IAgentRunner.RunAsync"/> for
-/// stateless runners.
+/// Dispatches a single supervised agent turn for one-shot runners, applying
+/// optional prompt preprocessing before calling <see cref="IAgentRunner.RunAsync"/>.
 /// </summary>
 /// <remarks>
-/// The caller owns the sandbox lifecycle, so when a session-capable runner is
-/// used we wrap the sandbox in <see cref="NonDisposingSandbox"/> before
-/// handing it to <see cref="ISessionAgentRunner.OpenSessionAsync"/>. The
-/// session runner's <c>CloseSessionAsync</c> would otherwise dispose our
-/// caller's sandbox.
+/// Session-capable runners must be handled by
+/// <see cref="AgentSupervisionTurnRunner"/>, which owns the active
+/// <see cref="AgentSessionHandle"/> across the autonomous turn and queued
+/// injections. This dispatcher deliberately never opens a fresh native
+/// session for an injection turn.
 /// </remarks>
 public sealed class SupervisedTurnDispatcher
 {
@@ -54,11 +49,8 @@ public sealed class SupervisedTurnDispatcher
 
     /// <summary>
     /// Runs one injection turn. The supplied prompt is preprocessed (if a
-    /// preprocessor was wired in) and dispatched through the runner. For
-    /// <see cref="ISessionAgentRunner"/> implementations the dispatch path is
-    /// <c>OpenSessionAsync</c> → <c>SendTurnAsync</c> → <c>CloseSessionAsync</c>
-    /// over a non-disposing sandbox wrapper so the caller retains ownership
-    /// of the underlying sandbox.
+    /// preprocessor was wired in) and dispatched through the runner's one-shot
+    /// <see cref="IAgentRunner.RunAsync"/> contract.
     /// </summary>
     public async Task<AgentResult> RunInjectionTurnAsync(
         AgentSupervisionInjectionTurn turn,
@@ -68,34 +60,6 @@ public sealed class SupervisedTurnDispatcher
         var prompt = _promptPreprocessor is null
             ? turn.Prompt
             : await _promptPreprocessor(turn.Prompt, ct).ConfigureAwait(false);
-
-        if (_runner is ISessionAgentRunner sessionRunner)
-        {
-            var shielded = new NonDisposingSandbox(_sandbox);
-            var handle = await sessionRunner.OpenSessionAsync(
-                shielded, _workingDirectory, _credential, _modelId, _reasoningMode, ct)
-                .ConfigureAwait(false);
-            try
-            {
-                return await sessionRunner.SendTurnAsync(
-                    handle, prompt, ct, _stdoutCallback, _captureStructuredStream)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                try
-                {
-                    await sessionRunner.CloseSessionAsync(handle, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Best-effort cleanup. The session adapter may try to dispose
-                    // the sandbox here; NonDisposingSandbox neutralises that and
-                    // any other transport teardown failures are non-fatal to the
-                    // supervision injection result.
-                }
-            }
-        }
 
         return await _runner.RunAsync(
             _sandbox,

@@ -111,7 +111,8 @@ internal static class TestSupport
         IInVmSmokeGate? inVmSmokeGate = null,
         IAuditProgressStore? auditProgressOverride = null,
         bool cliSessionResumableAgent = false,
-        ICheckAndActCompletionRunner? checkCompletionRunner = null)
+        ICheckAndActCompletionRunner? checkCompletionRunner = null,
+        IAgentSupervisionService? agentSupervision = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -203,7 +204,8 @@ internal static class TestSupport
                 ? null
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
             auditProgress: auditProgressOverride ?? store,
-            checkCompletionRunner: checkCompletionRunner);
+            checkCompletionRunner: checkCompletionRunner,
+            agentSupervision: agentSupervision);
 
         return new TestPipeline(pipeline, store, agent, realGitHost, gitRoot, queue, involvement);
     }

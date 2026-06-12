@@ -133,7 +133,10 @@ else
             if (response is not null)
             {
                 foreach (var session in response.Sessions)
+                {
                     _sessions[session.SessionId] = session;
+                    SeedOutputFromSnapshot(session);
+                }
             }
             if (_selectedSessionId is null || !_sessions.ContainsKey(_selectedSessionId))
                 _selectedSessionId = _sessions.Values.OrderByDescending(s => s.StartedAt).FirstOrDefault()?.SessionId;
@@ -196,6 +199,7 @@ else
     private Task ApplySession(AgentSupervisionSessionDto session)
     {
         _sessions[session.SessionId] = session;
+        SeedOutputFromSnapshot(session);
         if (_selectedSessionId is null)
             _selectedSessionId = session.SessionId;
         return InvokeAsync(StateHasChanged);
@@ -229,7 +233,24 @@ else
     private string DisplayOutput(AgentSupervisionSessionDto session) =>
         _outputs.TryGetValue(session.SessionId, out var output) && !string.IsNullOrEmpty(output)
             ? output
-            : session.OutputTail;
+            : BuildSnapshotOutput(session);
+
+    private void SeedOutputFromSnapshot(AgentSupervisionSessionDto session)
+    {
+        if (_outputs.ContainsKey(session.SessionId))
+            return;
+        var seed = BuildSnapshotOutput(session);
+        if (!string.IsNullOrEmpty(seed))
+            _outputs[session.SessionId] = seed;
+    }
+
+    private static string BuildSnapshotOutput(AgentSupervisionSessionDto session)
+    {
+        var commands = session.RecentCommands
+            .OrderBy(c => c.SentAt)
+            .Select(c => $"\n[codeybox:{c.Kind}]\n{c.Prompt}\n");
+        return string.Concat(commands) + session.OutputTail;
+    }
 
     private void Append(string sessionId, string text)
     {
