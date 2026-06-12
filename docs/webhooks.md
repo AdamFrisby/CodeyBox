@@ -42,6 +42,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.waiting_for_agent_resume` | Work item parked because its only eligible agent is paused |
+| `work_item.waiting_for_transient_retry` | Work item parked for durable transient transport/network retry (see [Details](#waiting_for_transient_retry-details)) |
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
 | `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
 | `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
@@ -268,6 +269,29 @@ carry the affected item and its project:
 
 `retryFrom` identifies the phase the item should re-enter after the agent is
 resumed, such as `"work"`, `"audit"`, `"merge"`, or `"upstream"`.
+
+### `waiting_for_transient_retry` details
+
+When `event` is `work_item.waiting_for_transient_retry`, `workItem` and
+`project` carry the affected item and its project:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "phase": "work",
+    "agent": "claude",
+    "reason": "Agent claude reported transient transport failure during work",
+    "nextRetryAt": "2026-06-04T02:03:30.000+00:00",
+    "attempts": 0
+  }
+}
+```
+
+`nextRetryAt` is computed from `AutoRetryOnTransientFailure` backoff and
+jitter settings. Work-like failures leave the resume point unset internally so
+the retry path can auto-pick `audit` when the existing work branch already has
+commits ahead of base.
 
 ### `budget_deferred` details
 

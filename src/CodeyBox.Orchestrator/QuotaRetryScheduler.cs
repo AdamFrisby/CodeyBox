@@ -6,10 +6,10 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Hosted service that automatically retries work items that failed due to
-/// quota exhaustion, once quota is available again.
+/// Hosted service that automatically retries work items parked for quota reset
+/// or transient transport backoff.
 /// </summary>
-public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery
+public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorkerPoolQuotaRecovery, IWorkItemAutoRetryScheduler
 {
     // There is no provider-agnostic options-change callback on this class: the
     // live options enter through an accessor. While disabled, poll that
@@ -1054,6 +1054,25 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         string reason,
         CancellationToken ct)
     {
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is not null)
+        {
+            if (!IsTransientRetryPending(current))
+            {
+                _log.LogInformation(
+                    "Skipping transient retry exhaustion transition for work item {Id}; current state is {State} and failure kind is {FailureKind}",
+                    item.Id,
+                    current.State,
+                    current.FailureKind);
+                return new TransientRetryAttemptResult("skipped:not-transient", $"state={current.State}; failureKind={current.FailureKind}");
+            }
+
+            item = current with
+            {
+                TransientRetryFirstFailedAt = item.TransientRetryFirstFailedAt ?? current.TransientRetryFirstFailedAt,
+            };
+        }
+
         var failed = item.With(
             WorkItemState.Failed,
             $"transient network auto-retry exhausted ({reason}); operator retry required",
@@ -1063,9 +1082,12 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             TransientRetryFirstFailedAt = item.TransientRetryFirstFailedAt,
         };
 
-        var updated = await _store.TryUpdateIfStateAsync(failed, WorkItemState.Failed, ct);
-        if (!updated && item.State == WorkItemState.WaitingForTransientRetry)
-            updated = await _store.TryUpdateIfStateAsync(failed, WorkItemState.WaitingForTransientRetry, ct);
+        var updated = item.State switch
+        {
+            WorkItemState.Failed => await _store.TryUpdateIfStateAsync(failed, WorkItemState.Failed, ct),
+            WorkItemState.WaitingForTransientRetry => await _store.TryUpdateIfStateAsync(failed, WorkItemState.WaitingForTransientRetry, ct),
+            _ => false,
+        };
         if (updated)
         {
             CancelTargetedRetry(item.Id);
@@ -1359,7 +1381,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     /// Notifies the scheduler that a work item has failed with a quota error,
     /// so it can schedule a targeted retry.
     /// </summary>
-    public async Task NotifyQuotaFailureAsync(WorkItem item)
+    public async Task NotifyQuotaFailureAsync(WorkItem item, CancellationToken ct = default)
     {
         var retryOptions = CurrentRetryOptions;
         if (!retryOptions.Enabled) return;
@@ -1376,12 +1398,16 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         {
             try
             {
-                var project = await _projects.GetAsync(item.ProjectId, CancellationToken.None);
+                var project = await _projects.GetAsync(item.ProjectId, ct);
                 resetAt = await _router.ComputeEarliestExhaustedResetAsync(
                     item,
                     project,
-                    CancellationToken.None,
+                    ct,
                     RequiredCapabilityForRetry(item));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -1409,7 +1435,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         try
         {
             var updated = await _store.TryUpdateIfStateAsync(
-                item with { NextQuotaRetryAt = nextRetryAt }, item.State, CancellationToken.None);
+                item with { NextQuotaRetryAt = nextRetryAt }, item.State, ct);
             if (updated)
             {
                 ScheduleTargetedRetry(item.Id, nextRetryAt.Value);

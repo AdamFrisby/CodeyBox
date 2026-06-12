@@ -408,7 +408,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.Equal("transient", final.FailureKind);
-        Assert.Equal("work", final.TransientRetryFrom);
+        Assert.Null(final.TransientRetryFrom);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);

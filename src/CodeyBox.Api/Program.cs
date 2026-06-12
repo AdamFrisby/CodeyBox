@@ -2278,7 +2278,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<IStdoutBroadcaster>(),
     sp.GetService<IAgentStreamStore>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRetryScheduler>(),
+    sp.GetRequiredService<IWorkItemAutoRetryScheduler>(),
     sp.GetService<AgentClassRouter>(),
     sp.GetService<IAgentFallbackHistoryStore>(),
     sp.GetRequiredService<IQuotaFailureClassifier>(),
@@ -2356,6 +2356,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>()));
 builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(

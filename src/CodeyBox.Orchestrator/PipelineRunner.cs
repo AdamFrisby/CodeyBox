@@ -75,7 +75,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly AgentCostCalculator? _costCalculator;
     private readonly IStdoutBroadcaster? _stdoutBroadcaster;
     private readonly IAgentStreamStore? _agentStreams;
-    private readonly QuotaRetryScheduler? _retryScheduler;
+    private readonly IWorkItemAutoRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
@@ -224,7 +224,7 @@ public sealed class PipelineRunner : IPipelineRunner
         IStdoutBroadcaster? stdoutBroadcaster = null,
         IAgentStreamStore? agentStreams = null,
         IQuotaFailureStore? quotaFailures = null,
-        QuotaRetryScheduler? retryScheduler = null,
+        IWorkItemAutoRetryScheduler? retryScheduler = null,
         AgentClassRouter? classRouter = null,
         IAgentFallbackHistoryStore? fallbackHistory = null,
         IQuotaFailureClassifier? quotaClassifier = null,
@@ -13626,7 +13626,7 @@ Original merge-phase failure (for context):
             ? WellKnownCapabilities.Audit
             : null;
 
-    internal static string RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
+    internal static string? RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
     {
         "audit" => "audit",
         "rework" => "audit",
@@ -13634,8 +13634,16 @@ Original merge-phase failure (for context):
         "post-act-recheck" => "merge",
         "merge" => "merge",
         "upstream" => "upstream",
-        _ => AgentPauseResumeMapper.RetryFromForState(currentState),
+        _ => ExplicitTransientRetryFromForState(currentState),
     };
+
+    private static string? ExplicitTransientRetryFromForState(WorkItemState currentState)
+    {
+        var retryFrom = AgentPauseResumeMapper.RetryFromForState(currentState);
+        return string.Equals(retryFrom, "work", StringComparison.Ordinal)
+            ? null
+            : retryFrom;
+    }
 
     /// <summary>
     /// Maps the work item's current state to the phase string used when parking

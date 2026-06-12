@@ -73,8 +73,13 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.NotEqual(storedFirst.NextTransientRetryAt, storedSecond.NextTransientRetryAt);
     }
 
-    [Fact]
-    public async Task NotifyTransientFailure_AppliesDecorrelatedJitterWithinBaseAndTriplePreviousDelay()
+    [Theory]
+    [InlineData(0.0, 30)]
+    [InlineData(0.5, 60)]
+    [InlineData(1.0, 90)]
+    public async Task NotifyTransientFailure_AppliesDecorrelatedJitterWithinBaseAndTriplePreviousDelay(
+        double random,
+        int expectedDelaySeconds)
     {
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
         {
@@ -85,7 +90,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             MaxAutoRetriesPerWorkItem = 5,
             MaxElapsedTime = TimeSpan.FromHours(1),
             JitterMode = TransientRetryJitterMode.Decorrelated,
-        }, jitterRandom: () => 0.5);
+        }, jitterRandom: () => random);
         var item = NewTransientItem() with { TransientRetryAttempts = 1 };
         await fixture.Store.CreateAsync(item);
 
@@ -93,7 +98,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
 
         var stored = await fixture.Store.GetAsync(item.Id);
         Assert.NotNull(stored);
-        Assert.Equal(_time.GetUtcNow().AddSeconds(60), stored!.NextTransientRetryAt);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(expectedDelaySeconds), stored!.NextTransientRetryAt);
     }
 
     [Fact]

@@ -25,6 +25,9 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         using var factory = new QuotaRetrySchedulerWiringFactory(monitor);
 
         var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        Assert.Same(
+            scheduler,
+            factory.Services.GetRequiredService<IWorkItemAutoRetryScheduler>());
         var accessor = Assert.IsType<Func<AutoRetryOnQuotaFailureOptions>>(
             typeof(QuotaRetryScheduler)
                 .GetField("_autoRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!

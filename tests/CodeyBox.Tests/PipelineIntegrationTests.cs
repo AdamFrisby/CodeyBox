@@ -300,7 +300,7 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
         Assert.Equal("transient", final.FailureKind);
-        Assert.Equal("work", final.TransientRetryFrom);
+        Assert.Null(final.TransientRetryFrom);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
@@ -313,6 +313,50 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal("claude", root.GetProperty("agent").GetString());
         Assert.Equal(final.NextTransientRetryAt, root.GetProperty("nextRetryAt").GetDateTimeOffset());
         Assert.Equal(final.TransientRetryAttempts, root.GetProperty("attempts").GetInt32());
+    }
+
+    [Fact]
+    public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_AutoPicksAudit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+
+        var item = NewItem("feature/transient-prior-work");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "prior.txt",
+            "prior progress\n",
+            "prior progress");
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent transport failed",
+            Stdout: null,
+            Stderr: "request timed out while reading agent stream"));
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, parked!.State);
+        Assert.Null(parked.TransientRetryFrom);
+
+        time.Advance(TimeSpan.FromSeconds(31));
+        await RunTransientPeriodicSweepAsync(tp.RetryScheduler!);
+
+        var resumed = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+        Assert.Equal(1, resumed.TransientRetryAttempts);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -467,6 +511,14 @@ public sealed class PipelineIntegrationTests : IDisposable
     {
         var (_, stdout, _) = await TestSupport.RunGit(repoPath, "rev-parse", rev);
         return stdout.Trim();
+    }
+
+    private static async Task RunTransientPeriodicSweepAsync(QuotaRetryScheduler scheduler)
+    {
+        var method = typeof(QuotaRetryScheduler).GetMethod(
+            "RunTransientPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
     }
 
     private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()

@@ -77,6 +77,53 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ReworkAgentTransientFailure_ParksWaitingForTransientRetryFromAudit()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var auditor = new ScriptedAuditor(
+        [
+            new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs fix", "x")]),
+            new AuditOutcome(true, []),
+        ]);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        var workInvocations = 0;
+        tp.Agent.BeforeWorkAsync = (_, _, _) =>
+        {
+            workInvocations++;
+            if (workInvocations == 2)
+            {
+                tp.Agent.WorkResults.Enqueue(new AgentResult(
+                    Success: false,
+                    Summary: "rework transport failed",
+                    Stdout: null,
+                    Stderr: "Transport channel closed"));
+            }
+
+            return Task.CompletedTask;
+        };
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("audit", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
     public async Task SuccessfulAuditWithNoisyTransientOutput_DoesNotParkForTransientRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
