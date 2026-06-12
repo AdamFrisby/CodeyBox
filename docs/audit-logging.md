@@ -92,6 +92,7 @@ Audit-tier events additionally carry:
 |-------------|-------|-----------|------------|
 | `sandbox.created` | Info | `MultipassSandboxProvider.CreateAsync` | `VmName`, `NetworkProfile` |
 | `sandbox.launch_transient_retry` | Info | `MultipassSandboxProvider.CreateAsync` | `WorkItemId`, `Attempt`, `ErrorClass` |
+| `sandbox.agent_infra_failure` | Warning | `PipelineRunner` | `WorkItemId`, `Agent`, `Sandbox`, `Phase`, `Summary`, `Reason`. Missing agent binaries and runner prerequisite materialisation failures are sandbox/provisioning signals and do not increment the agent fast-fail breaker. |
 | `sandbox.disposed` | Info | `MultipassSandbox.DisposeAsync` | `VmName` |
 
 ### Audit phase

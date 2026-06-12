@@ -61,6 +61,107 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
     }
 
+    [Theory]
+    [InlineData("agent exited 127", "env: 'agy': No such file or directory")]
+    [InlineData("agent exited 127", "bash: codex: command not found")]
+    [InlineData("agent exited 127", "")]
+    [InlineData("exit 127", "command not found")]
+    public void Exit127BinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: stderr, stdout: null, summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("agent exited 1", "bwrap: execvp agy: No such file or directory")]
+    [InlineData("agent exited 1", "bwrap: execv codex: No such file or directory")]
+    public void SandboxWrapperBinaryLaunchFailures_Classified_AsInfrastructure(string summary, string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: stderr, stdout: null, summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void AggregateSummaryExit127Trail_DoesNotClassifySilentFinalCrash_AsInfrastructure()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: null,
+            summary: "agentic conflict resolution failed: agent exited 2 (attempts: " +
+                     "codex#1(agent failed: agent exited 127; stderr: env: 'codex': No such file or directory); " +
+                     "codex#2(agent failed: agent exited 2; stderr: ))");
+
+        Assert.NotEqual(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void Exit127BinaryLaunchFailure_InStdout_Classified_AsInfrastructure()
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: "bash: codex: command not found",
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    // Realistic non-binary filesystem ENOENT shapes that the broad
+    // "No such file or directory" pattern used to swallow. The Node.js fs
+    // syscall message and the GNU open-file ENOENT both carry the directory
+    // suffix verbatim, so a regression that re-introduced the broad pattern
+    // would silently flip a repo-level file-missing error into an
+    // infrastructure signal, hiding it from the work-item failure path.
+    [Theory]
+    [InlineData("ENOENT: no such file or directory, open 'foo.txt'")]
+    [InlineData("Error: ENOENT: no such file or directory, scandir '/work/src/missing'")]
+    [InlineData("fopen('foo.txt'): No such file or directory")]
+    public void Exit127NonBinaryFailure_RemainsNormal(string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: stderr,
+            stdout: null,
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    // POSIX /bin/sh emits "1: <name>: not found" rather than the bash
+    // "command not found" shape. The classifier must still catch this as a
+    // binary-launch failure (the sandbox is missing the agent binary) without
+    // matching a generic "Not Found" HTTP body.
+    [Theory]
+    [InlineData("/bin/sh: 1: agy: not found")]
+    [InlineData("sh: 1: codex: not found")]
+    public void Exit127PosixShellNotFound_Classified_AsInfrastructure(string stderr)
+    {
+        var c = AgentFailureClassifier.Classify(
+            stderr: stderr,
+            stdout: null,
+            summary: "agent exited 127");
+
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Theory]
+    [InlineData("failed to materialise codex auth: exit 1")]
+    [InlineData("failed to materialize cursor auth: exit 7")]
+    public void MaterialisationFailures_Classified_AsInfrastructure(string summary)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: "permission denied", stdout: null, summary: summary);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void PublicEnumValues_AreStable_ForPluginSdkCompatibility()
+    {
+        Assert.Equal(0, (int)AgentFailureKind.Normal);
+        Assert.Equal(1, (int)AgentFailureKind.QuotaExhausted);
+        Assert.Equal(2, (int)AgentFailureKind.TransientNetwork);
+        Assert.Equal(3, (int)AgentFailureKind.AuthError);
+        Assert.Equal(4, (int)AgentFailureKind.Unknown);
+        Assert.Equal(5, (int)AgentFailureKind.Infrastructure);
+    }
+
     [Fact]
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
@@ -113,6 +214,14 @@ public sealed class AgentFailureClassifierTests
         IAgentRunner runner = new ProbeOnlyRunner();
         var c = runner.ClassifyFailure(new AgentResult(false, "exit 1", "", "RESOURCE_EXHAUSTED"));
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void DefaultClassifyFailure_PassesSummaryToSharedClassifier()
+    {
+        IAgentRunner runner = new ProbeOnlyRunner();
+        var c = runner.ClassifyFailure(new AgentResult(false, "agent exited 127", "", ""));
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
     }
 
     private sealed class ProbeOnlyRunner : IAgentRunner

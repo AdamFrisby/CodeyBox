@@ -91,18 +91,67 @@ public static class AgentFailureClassifier
     };
 
     /// <summary>
+    /// Substrings that only become an infrastructure failure when paired with
+    /// an exit-127 summary. Each pattern carries enough syntactic context to
+    /// distinguish a shell binary-launch failure from a repository-level
+    /// filesystem error such as Node.js's
+    /// <c>ENOENT: no such file or directory, open 'foo.txt'</c> — a bare
+    /// "No such file or directory" match would conflate the two and silently
+    /// turn the latter into an infrastructure signal.
+    /// </summary>
+    public static readonly IReadOnlyList<string> BinaryNotFoundPatterns = new[]
+    {
+        // bash / zsh: "bash: codex: command not found"
+        "command not found",
+        // GNU coreutils env: "env: 'codex': No such file or directory" —
+        // the close-quote + ": No such file" sequence is the discriminator;
+        // Node's fs ENOENT shape is "ENOENT: no such file or directory, open '..."
+        // which never contains the close-quote-before-colon prefix.
+        "': No such file or directory",
+        // POSIX /bin/sh: "/bin/sh: 1: codex: not found"
+        ": not found",
+        // CodeyBox-side explicit signal raised by the in-VM smoke prober.
+        "not found in sandbox",
+    };
+
+    /// <summary>
+    /// Provider-level launch failures where the sandbox wrapper, not the
+    /// invoked shell, reports that the agent executable could not be exec'd.
+    /// These can surface as exit 1 (for example bubblewrap's own exit code)
+    /// rather than a shell-level 127, so they are intentionally checked
+    /// outside <see cref="IsExit127"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> BinaryLaunchFailurePatterns = new[]
+    {
+        "bwrap: execvp ",
+        "bwrap: execv ",
+    };
+
+    /// <summary>
     /// Classifies an agent failure. Returns <see cref="AgentFailureKind.Normal"/>
     /// when no exceptional shape was detected — i.e. the agent ran and reported
     /// a work-related failure (failed tests, refused task, malformed output).
     ///
     /// <para>
-    /// Order of checks is fixed: quota first (so a 429 in stderr is never
-    /// stolen by a generic "connection reset" hint somewhere else in the
+    /// Order of checks is fixed: prerequisite materialisation and exit-127
+    /// sandbox provisioning failures first, then quota (so a 429 in stderr is
+    /// never stolen by a generic "connection reset" hint somewhere else in the
     /// payload), then auth, then network. Never throws.
     /// </para>
     /// </summary>
-    public static AgentFailureClassification Classify(string? stderr, string? stdout = null)
+    public static AgentFailureClassification Classify(string? stderr, string? stdout = null) =>
+        Classify(stderr, stdout, summary: null);
+
+    public static AgentFailureClassification Classify(string? stderr, string? stdout, string? summary)
     {
+        if (IsMaterialisationFailure(summary))
+            return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent prerequisite materialisation failed");
+
+        if (IsBinaryNotFoundFailure(summary, stderr, stdout))
+        {
+            return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
+        }
+
         if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout))
             return new AgentFailureClassification(AgentFailureKind.Unknown, Reason: "no output captured");
 
@@ -117,6 +166,48 @@ public static class AgentFailureClassifier
 
         return new AgentFailureClassification(AgentFailureKind.Normal);
     }
+
+    private static bool IsBinaryNotFoundFailure(string? summary, string? stderr, string? stdout)
+    {
+        if (IsExit127(summary)
+            && (ContainsAny(stderr, BinaryNotFoundPatterns)
+                || ContainsAny(stdout, BinaryNotFoundPatterns)
+                || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
+        {
+            return true;
+        }
+
+        return IsSandboxWrapperBinaryLaunchFailure(stderr)
+            || IsSandboxWrapperBinaryLaunchFailure(stdout);
+    }
+
+    private static bool IsMaterialisationFailure(string? summary) =>
+        !string.IsNullOrWhiteSpace(summary)
+        && (summary.TrimStart().StartsWith("failed to materialise ", StringComparison.OrdinalIgnoreCase)
+            || summary.TrimStart().StartsWith("failed to materialize ", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsExit127(string? summary)
+    {
+        if (string.IsNullOrWhiteSpace(summary))
+            return false;
+
+        var trimmed = summary.Trim();
+        return StartsWithExit127Shape(trimmed, "agent exited 127")
+            || StartsWithExit127Shape(trimmed, "exit 127");
+    }
+
+    private static bool StartsWithExit127Shape(string haystack, string needle)
+    {
+        if (!haystack.StartsWith(needle, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var after = needle.Length;
+        return after >= haystack.Length || !char.IsLetterOrDigit(haystack[after]);
+    }
+
+    private static bool IsSandboxWrapperBinaryLaunchFailure(string? text) =>
+        ContainsAny(text, BinaryLaunchFailurePatterns)
+        && ContainsAny(text, ["No such file or directory"]);
 
     private static bool ContainsAny(string? haystack, IReadOnlyList<string> needles)
     {

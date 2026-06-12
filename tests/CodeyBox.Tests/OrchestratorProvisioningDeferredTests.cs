@@ -254,6 +254,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
     {
         private readonly IWorkItemStore _store;
         private readonly SandboxProvisioningDeferredException _exception;
+        private int _callCountInternal;
         private int _callCount;
         private WorkItemState? _secondCallState;
 
@@ -272,11 +273,12 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
-            var call = Interlocked.Increment(ref _callCount);
+            var call = Interlocked.Increment(ref _callCountInternal);
             if (call == 1)
             {
                 FirstCallAt = DateTimeOffset.UtcNow;
                 await _store.UpdateAsync(item.With(WorkItemState.Working), ct);
+                Volatile.Write(ref _callCount, 1);
                 throw _exception;
             }
 
@@ -285,6 +287,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                 SecondCallAt = DateTimeOffset.UtcNow;
                 _secondCallState = item.State;
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+                Volatile.Write(ref _callCount, 2);
             }
         }
     }
@@ -296,6 +299,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
         private readonly string _workBranch;
         private readonly SandboxProvisioningDeferredException _exception;
         private readonly string? _preemptCheckpoint;
+        private int _callCountInternal;
         private int _callCount;
 
         public ProvisioningDeferFromStateOncePipeline(
@@ -323,7 +327,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
-            var call = Interlocked.Increment(ref _callCount);
+            var call = Interlocked.Increment(ref _callCountInternal);
             if (call == 1)
             {
                 await _store.UpdateAsync(item with
@@ -337,6 +341,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                     PreemptCheckpoint = _preemptCheckpoint,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }, ct);
+                Volatile.Write(ref _callCount, 1);
                 throw _exception;
             }
 
@@ -350,6 +355,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
                 SecondCallPreemptedAt = item.PreemptedAt;
                 SecondCallPreemptCheckpoint = item.PreemptCheckpoint;
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
+                Volatile.Write(ref _callCount, 2);
             }
         }
     }
