@@ -2797,7 +2797,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var agentEndedAt = DateTimeOffset.UtcNow;
         var observedModelId = ResolveObservedModelId(runner, item.ModelId);
         var agentStartedAt = agentEndedAt.AddMilliseconds(-agentExecScope.ElapsedMs);
-        if (streamCapture is null)
+        if (!canCaptureStructuredStream)
             await EmitToolCallCountsAsync(runner.Kind, agentResult.Stdout, item.Id, agentPhase, agentExecScope.ElapsedMs, ct);
         await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
             runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
@@ -5031,7 +5031,7 @@ public sealed class PipelineRunner : IPipelineRunner
             startedAt,
             sw.Elapsed,
             timingScope.ElapsedMs,
-            streamCapture is not null);
+            canCaptureStructuredStream);
     }
 
     /// <summary>

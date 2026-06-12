@@ -229,9 +229,14 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         tp.Agent.StructuredStreamSupportResult = false;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("plaintext.txt", "plaintext\n"));
         // Plaintext stdout — no JSON framing, like a real opencode/agy run.
-        tp.Agent.StdoutChunks.Enqueue("starting opencode run\n");
-        tp.Agent.StdoutChunks.Enqueue("applied patch to plaintext.txt\n");
-        tp.Agent.StdoutChunks.Enqueue("done after 12.7s\n");
+        tp.Agent.StdoutChunkBatches.Enqueue([
+            "starting opencode run\n",
+            "applied patch to plaintext.txt\n",
+            "done after 12.7s\n",
+        ]);
+        tp.Agent.StdoutChunkBatches.Enqueue([
+            "plaintext merge chunk\n",
+        ]);
 
         var item = new WorkItem
         {
@@ -254,10 +259,59 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
         // plaintext stdout teed in.
         Assert.NotEmpty(tp.Agent.CaptureStructuredStreamCalls);
         Assert.All(tp.Agent.CaptureStructuredStreamCalls, Assert.False);
-        var workFile = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "work");
-        var contents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
-        Assert.Contains("starting opencode run", contents);
-        Assert.Contains("done after 12.7s", contents);
+        var files = await streamStore.ListAsync(item.Id);
+        var workFile = Assert.Single(files, f => f.Phase == "work");
+        var workContents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), workFile.FileName));
+        Assert.Contains("starting opencode run", workContents);
+        Assert.Contains("done after 12.7s", workContents);
+        var mergeFile = Assert.Single(files, f => f.Phase == "merge");
+        var mergeContents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), mergeFile.FileName));
+        Assert.Contains("plaintext merge chunk", mergeContents);
+    }
+
+    [Fact]
+    public async Task PipelineRunner_LlmAuditWhenStructuredStreamUnsupported_StillOpensPlaintextCaptureFile()
+    {
+        // Normal work-item LLM auditors use PipelineRunner.ExecAuditorAsync,
+        // not ReleaseService. Pin that branch separately: when the selected
+        // runner says structured stream-json is unavailable, the auditor must
+        // still receive a stdout capture callback and the persisted file must
+        // carry the plaintext chunks.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var streamStore = new AgentStreamStore(
+            new AgentStreamsOptions { Path = Path.Combine(_workspace, "streams-plaintext-audit") },
+            NullLogger<AgentStreamStore>.Instance);
+        var auditor = new PlaintextLlmAuditor();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxAuditIterations: 1,
+            agentStreams: streamStore);
+        tp.Agent.StructuredStreamSupportResult = false;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("plaintext-audit.txt", "plaintext\n"));
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "plaintext audit capture",
+            Prompt = "write a file",
+            WorkBranch = "feature/plaintext-audit-capture",
+            State = WorkItemState.Queued,
+            WorkTimeout = TimeSpan.FromMinutes(5),
+            MergeTimeout = TimeSpan.FromMinutes(5),
+        };
+        await tp.Store.CreateAsync(item);
+
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal([false], auditor.CaptureStructuredStreamCalls);
+        var auditFile = Assert.Single(await streamStore.ListAsync(item.Id), f => f.Phase == "audit-llm-plaintext:llm-review");
+        var auditContents = await File.ReadAllTextAsync(Path.Combine(streamStore.Options.Path, item.Id.ToString(), auditFile.FileName));
+        Assert.Contains("plaintext audit chunk", auditContents);
     }
 
     [Fact]
@@ -384,6 +438,28 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
             }
 
             return Task.FromResult(new AuditResult(true, []));
+        }
+    }
+
+    private sealed class PlaintextLlmAuditor : IAuditor
+    {
+        public string Name => "plaintext:llm-review";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public List<bool> CaptureStructuredStreamCalls { get; } = new();
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = ct;
+            CaptureStructuredStreamCalls.Add(context.CaptureStructuredStream);
+            context.StdoutChunkCallback?.Invoke("plaintext audit chunk\n");
+            return Task.FromResult(new AuditResult(true, [], RawOutput: "plaintext audit chunk\n"));
         }
     }
 

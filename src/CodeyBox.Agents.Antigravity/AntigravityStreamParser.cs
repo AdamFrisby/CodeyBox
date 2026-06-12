@@ -42,6 +42,9 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
         var type = FirstString(root, "type", "event", "name") ?? "unknown";
+        if (string.Equals(type, "codeybox.stderr", StringComparison.OrdinalIgnoreCase))
+            return base.ParseEvent(root);
+
         var timestamp = TryTimestamp(root);
         var starts = new List<ToolBuilder>();
         var results = new List<ToolResultBuilder>();

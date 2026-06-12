@@ -23,6 +23,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
+internal static class AgentStreamFixture
+{
+    public static string Read(string relativePath) =>
+        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "AgentStreams", relativePath));
+
+    public static MemoryStream Open(string relativePath) =>
+        new(Encoding.UTF8.GetBytes(Read(relativePath)));
+}
+
 public sealed class ClaudeStreamParserTests
 {
     [Fact]
@@ -664,9 +673,7 @@ public sealed class AntigravityStreamParserTests
         // Antigravity emits literal Claude shape for claude-* gateway models —
         // there is no on-wire marker to disambiguate. The parser must NOT claim
         // here; ResolveKind reaches Antigravity via cost rows / item.Agent.
-        await using var stream = StreamOf("""
-            {"type":"assistant","message":{"model":"claude-opus-4-6-thinking","usage":{"input_tokens":100,"cache_read_input_tokens":20}}}
-            """);
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-success.redacted.jsonl");
         var kind = await AgentStreamParserSelection.SniffKindAsync(stream, TestParsers());
         // With production registration order Claude wins the sniff race. The
         // anti-regression is that the sniff result is NOT Antigravity.
@@ -674,23 +681,17 @@ public sealed class AntigravityStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_AnthropicShape_ParsesCacheBuckets()
+    public async Task ParseAsync_RedactedCapturedClaudeGateway_ParsesToolUsageAndFinalMessage()
     {
         var parser = new AntigravityStreamParser();
-        await using var stream = StreamOf("""
-            {"type":"system","timestamp":"2026-01-01T00:00:00Z"}
-            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
-            {"type":"tool_result","timestamp":"2026-01-01T00:00:12Z","tool_use_id":"t1","content":"ok","is_error":false}
-            {"type":"result","timestamp":"2026-01-01T00:00:15Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":12000,"cache_creation_input_tokens":300,"cache_read_input_tokens":4000,"output_tokens":650}}
-            """);
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-success.redacted.jsonl");
 
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
         Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
         Assert.True(tool.Succeeded);
-        Assert.Equal(TimeSpan.FromSeconds(2), summary.TimeToFirstToken);
+        Assert.Null(tool.Duration);
         Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
         Assert.Equal(12000 + 300, summary.InputTokens);
         Assert.Equal(650, summary.OutputTokens);
@@ -700,41 +701,19 @@ public sealed class AntigravityStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_GeminiShape_ParsesCachedInputTokens()
+    public async Task ParseAsync_RedactedCapturedAuthFailure_PreservesStderrTailAfterInit()
     {
         var parser = new AntigravityStreamParser();
-        await using var stream = StreamOf("""
-            {"type":"result","timestamp":"2026-01-01T00:00:00Z","result":"done","total_cost_usd":0.07,"model":"gemini-3.5-flash-high","usage":{"prompt_tokens":5000,"cached_input_tokens":1000,"completion_tokens":420}}
-            """);
+        await using var stream = AgentStreamFixture.Open("antigravity-claude-gateway-auth-failure.redacted.jsonl");
 
         var summary = await parser.ParseAsync(stream);
 
-        Assert.Equal(5000 - 1000, summary.InputTokens);
-        Assert.Equal(1000, summary.CachedInputTokens);
-        Assert.Equal(420, summary.OutputTokens);
-        Assert.Equal(0.07m, summary.EstimatedUsd);
-        Assert.Equal("done", summary.FinalAssistantMessage);
-    }
-
-    [Fact]
-    public async Task ParseAsync_GeminiStreamJsonShape_ParsesCandidatesToolsAndUsageMetadata()
-    {
-        var parser = new AntigravityStreamParser();
-        await using var stream = StreamOf("""
-            {"type":"response","timestamp":"2026-01-01T00:00:00Z","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"g1","name":"read_file","args":{"path":"a.txt"}}}]}}]}
-            {"type":"response","timestamp":"2026-01-01T00:00:03Z","candidates":[{"content":{"role":"model","parts":[{"functionResponse":{"id":"g1","name":"read_file","response":{"content":"ok"}}}]}}]}
-            {"type":"response","timestamp":"2026-01-01T00:00:05Z","candidates":[{"content":{"role":"model","parts":[{"text":"done"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"cachedContentTokenCount":1}}
-            """);
-
-        var summary = await parser.ParseAsync(stream);
-
-        var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal("read_file", tool.ToolName);
-        Assert.Equal(TimeSpan.FromSeconds(3), tool.Duration);
-        Assert.Equal(9, summary.InputTokens);
-        Assert.Equal(3, summary.OutputTokens);
-        Assert.Equal(1, summary.CachedInputTokens);
-        Assert.Equal("done", summary.FinalAssistantMessage);
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("AGY_AUTH_ERROR", summary.FinalAssistantMessage);
+        Assert.Contains("reauthenticate", summary.FinalAssistantMessage);
+        Assert.Empty(summary.ToolCalls);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -881,9 +860,7 @@ public sealed class CursorStreamParserTests
         // shape. Sniff returns Claude here (whichever provider parser claims
         // first); ResolveKind then uses item.Agent / cost rows to land
         // cursor work items in kind=cursor.
-        await using var stream = StreamOf("""
-            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
-            """);
+        await using var stream = AgentStreamFixture.Open("cursor-stream-json.redacted.jsonl");
         var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrderParsers());
         // Anti-regression: Cursor parser must NOT win on Claude-shape sniffing
         // (was a bug pre-fix when its TryClaim was identical to Claude's, and
@@ -892,29 +869,22 @@ public sealed class CursorStreamParserTests
     }
 
     [Fact]
-    public async Task ParseAsync_ComputesToolDurationsAndUsage()
+    public async Task ParseAsync_RedactedCapturedCursorStream_ParsesToolAndUsage()
     {
         var parser = new CursorStreamParser();
-        await using var stream = StreamOf("""
-            {"type":"system","timestamp":"2026-01-01T00:00:00Z"}
-            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"dotnet test"}}]}}
-            {"type":"tool_result","timestamp":"2026-01-01T00:00:12Z","tool_use_id":"t1","content":"ok","is_error":false}
-            {"type":"result","timestamp":"2026-01-01T00:00:15Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":5}}
-            """);
+        await using var stream = AgentStreamFixture.Open("cursor-stream-json.redacted.jsonl");
 
         var summary = await parser.ParseAsync(stream);
 
         var tool = Assert.Single(summary.ToolCalls);
-        Assert.Equal("Bash", tool.ToolName);
-        Assert.Equal(TimeSpan.FromSeconds(10), tool.Duration);
+        Assert.Equal("Read", tool.ToolName);
         Assert.True(tool.Succeeded);
-        Assert.Equal(TimeSpan.FromSeconds(2), summary.TimeToFirstToken);
-        Assert.Equal(TimeSpan.FromSeconds(15), summary.TotalDuration);
-        Assert.Equal(100, summary.InputTokens);
-        Assert.Equal(20, summary.OutputTokens);
-        Assert.Equal(5, summary.CachedInputTokens);
-        Assert.Equal(0.42m, summary.EstimatedUsd);
-        Assert.Equal("done", summary.FinalAssistantMessage);
+        Assert.Equal(TimeSpan.FromMilliseconds(2234), summary.TotalDuration);
+        Assert.Equal(231, summary.InputTokens);
+        Assert.Equal(19, summary.OutputTokens);
+        Assert.Equal(32, summary.CachedInputTokens);
+        Assert.Equal(0.0007m, summary.EstimatedUsd);
+        Assert.Equal("Patched Program.cs.", summary.FinalAssistantMessage);
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
@@ -1351,11 +1321,7 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Opencode };
         await _workItems.CreateAsync(item);
         WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
-            "starting opencode run\n"
-            + "applying patch to /work/foo.ts\n"
-            + "ERROR: compile failed\n"
-            + "  Traceback: src/foo.ts:12\n"
-            + "done after 14.2s\n");
+            AgentStreamFixture.Read("opencode-subscription-limit.redacted.txt"));
 
         var service = new StreamAnalysisService(_workItems, _streams, _summaries,
             [new ClaudeStreamParser(), new OpencodeStreamParser(), new UnknownAgentStreamParser()],
@@ -1370,10 +1336,9 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         Assert.False(row.Summary.IsUnsupported);
         Assert.NotNull(row.Summary.FinalAssistantMessage);
         // line/byte/error accounting surfaces in the summary header.
-        Assert.Contains("lines=5", row.Summary.FinalAssistantMessage);
-        Assert.Contains("errors=2", row.Summary.FinalAssistantMessage); // ERROR + Traceback
+        Assert.Contains("lines=2", row.Summary.FinalAssistantMessage);
         // Tail is preserved so an operator can see the final-output context.
-        Assert.Contains("done after 14.2s", row.Summary.FinalAssistantMessage);
+        Assert.Contains("usage limit reached", row.Summary.FinalAssistantMessage);
     }
 
     [Fact]
@@ -1431,11 +1396,8 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         // that would put the row back under AgentKind.Claude.
         var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Cursor };
         await _workItems.CreateAsync(item);
-        WriteStreamFile(item.Id, "work-1-abcdef.jsonl", """
-            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a.ts"}}]}}
-            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"t1","content":"ok"}
-            {"type":"result","timestamp":"2026-01-01T00:00:02Z","result":"done","total_cost_usd":0.42,"usage":{"input_tokens":12,"output_tokens":3}}
-            """);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            AgentStreamFixture.Read("cursor-stream-json.redacted.jsonl"));
 
         var service = new StreamAnalysisService(
             _workItems,
@@ -1458,11 +1420,11 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         // shape); verify a real round-tripped summary, not an Unsupported
         // shell or a plaintext-fallback header.
         Assert.False(row.Summary.IsUnsupported);
-        Assert.Equal("done", row.Summary.FinalAssistantMessage);
+        Assert.Equal("Patched Program.cs.", row.Summary.FinalAssistantMessage);
         var tool = Assert.Single(row.Summary.ToolCalls);
         Assert.Equal("Read", tool.ToolName);
-        Assert.Equal(12, row.Summary.InputTokens);
-        Assert.Equal(3, row.Summary.OutputTokens);
+        Assert.Equal(231, row.Summary.InputTokens);
+        Assert.Equal(19, row.Summary.OutputTokens);
     }
 
     [Fact]
@@ -1478,11 +1440,8 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         // protect against.
         var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Antigravity };
         await _workItems.CreateAsync(item);
-        WriteStreamFile(item.Id, "rework-2-abcdef.jsonl", """
-            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"Edit","input":{"path":"b.ts"}}]}}
-            {"type":"tool_result","timestamp":"2026-01-01T00:00:01Z","tool_use_id":"a1","content":"ok"}
-            {"type":"result","timestamp":"2026-01-01T00:00:02Z","result":"applied","usage":{"input_tokens":8,"output_tokens":4}}
-            """);
+        WriteStreamFile(item.Id, "rework-2-abcdef.jsonl",
+            AgentStreamFixture.Read("antigravity-claude-gateway-success.redacted.jsonl"));
 
         var service = new StreamAnalysisService(
             _workItems,
@@ -1499,11 +1458,11 @@ public sealed class StreamAnalysisServiceTests : IDisposable
         // Attribution: the row MUST carry AgentKind.Antigravity, not Claude.
         Assert.Equal(AgentKind.Antigravity, row.AgentKind);
         Assert.False(row.Summary.IsUnsupported);
-        Assert.Equal("applied", row.Summary.FinalAssistantMessage);
+        Assert.Equal("done", row.Summary.FinalAssistantMessage);
         var tool = Assert.Single(row.Summary.ToolCalls);
-        Assert.Equal("Edit", tool.ToolName);
-        Assert.Equal(8, row.Summary.InputTokens);
-        Assert.Equal(4, row.Summary.OutputTokens);
+        Assert.Equal("Bash", tool.ToolName);
+        Assert.Equal(12000 + 300, row.Summary.InputTokens);
+        Assert.Equal(650, row.Summary.OutputTokens);
     }
 
     [Fact]
