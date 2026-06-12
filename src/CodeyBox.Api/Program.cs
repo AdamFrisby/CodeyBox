@@ -498,7 +498,12 @@ builder.Services.AddSingleton<LocalGitHost>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new LocalGitHost(
-        new LocalGitHostOptions { RootDirectory = opts.GitRootDirectory },
+        new LocalGitHostOptions
+        {
+            RootDirectory = opts.GitRootDirectory,
+            EnableSharedUpstreamMirror = opts.EnableSharedUpstreamMirror,
+            SharedUpstreamMirrorDirectory = opts.SharedUpstreamMirrorDirectory
+        },
         sp.GetRequiredService<ILogger<LocalGitHost>>());
 });
 builder.Services.AddSingleton<IGitHost>(sp => sp.GetRequiredService<LocalGitHost>());
@@ -3123,6 +3128,8 @@ namespace CodeyBox.Api
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
+        public bool EnableSharedUpstreamMirror { get; set; } = false;
+        public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 100;

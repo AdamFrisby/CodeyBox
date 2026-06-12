@@ -371,6 +371,130 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
         Assert.Equal(mainBefore, await RevParseAsync(barePath, "main"));
     }
 
+    [Fact]
+    public async Task ExistingBareRepo_SharedMirror_ClonesWithReferenceAndUsesAlternates()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+            
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        var barePath = gitHost.GetRepoPath(repoId);
+
+        // Verify alternates file was written and references the mirror
+        var alternatesPath = Path.Combine(barePath, "objects", "info", "alternates");
+        Assert.True(File.Exists(alternatesPath), "Alternates file should exist");
+        var alternatesContent = await File.ReadAllTextAsync(alternatesPath);
+        Assert.Contains(mirrorDir, alternatesContent);
+
+        // Advancing main on seed
+        await CommitToRepoAsync(seed, "after-mirror.txt", "after mirror\n", "advance main in seed");
+        var seedTip = await RevParseAsync(seed, "main");
+
+        // EnsureRepository again should update from the mirror
+        await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        
+        var bareTip = await RevParseAsync(barePath, "main");
+        Assert.Equal(seedTip, bareTip);
+    }
+
+    [Fact]
+    public async Task FetchUpstreamBranchAsync_SharedMirror_UsesLocalMirrorAndAvoidsNetwork()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+            
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+        
+        // Advancing main on seed
+        await CommitToRepoAsync(seed, "after-mirror-fetch.txt", "after mirror fetch\n", "advance main for fetch test");
+        var seedTip = await RevParseAsync(seed, "main");
+
+        // Call FetchUpstreamBranchAsync
+        var resolvedTip = await gitHost.FetchUpstreamBranchAsync(
+            repoId,
+            seed,
+            "main",
+            new Dictionary<string, string>());
+            
+        Assert.Equal(seedTip, resolvedTip);
+
+        // Verify mirror tip is correct
+        var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(seed));
+        var sb = new System.Text.StringBuilder();
+        foreach (var b in hashBytes) sb.Append(b.ToString("x2"));
+        var mirrorRepoPath = Path.Combine(mirrorDir, sb.ToString() + ".git");
+        var mirrorTip = await RevParseAsync(mirrorRepoPath, "main");
+        Assert.Equal(seedTip, mirrorTip);
+    }
+
+    [Fact]
+    public async Task SharedMirror_FallbackOnCorruption()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var mirrorDir = Path.Combine(_workspace, "mirrors-" + Guid.NewGuid().ToString("N")[..8]);
+        
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions
+            {
+                RootDirectory = gitRoot,
+                EnableSharedUpstreamMirror = true,
+                SharedUpstreamMirrorDirectory = mirrorDir
+            },
+            NullLogger<LocalGitHost>.Instance);
+
+        var id = WorkItemId.New();
+        var repoId = await gitHost.EnsureRepositoryAsync(id, seed, "main");
+
+        // Corrupt/delete the mirror repo directory
+        var hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(seed));
+        var sb = new System.Text.StringBuilder();
+        foreach (var b in hashBytes) sb.Append(b.ToString("x2"));
+        var mirrorRepoPath = Path.Combine(mirrorDir, sb.ToString() + ".git");
+        
+        if (Directory.Exists(mirrorRepoPath))
+        {
+            Directory.Delete(mirrorRepoPath, recursive: true);
+        }
+        Directory.CreateDirectory(mirrorRepoPath);
+        await File.WriteAllTextAsync(Path.Combine(mirrorRepoPath, "HEAD"), "this-is-corrupted");
+
+        // Now advance seed and fetch
+        await CommitToRepoAsync(seed, "corrupt-mirror-test.txt", "corrupt mirror test\n", "advance main after corruption");
+        var seedTip = await RevParseAsync(seed, "main");
+
+        // EnsureRepository or FetchUpstreamBranchAsync should fall back to direct remote fetch and succeed
+        var resolvedTip = await gitHost.FetchUpstreamBranchAsync(
+            repoId,
+            seed,
+            "main",
+            new Dictionary<string, string>());
+
+        Assert.Equal(seedTip, resolvedTip);
+    }
+
     private LocalGitHost CreateGitHost(ILogger<LocalGitHost>? logger = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);

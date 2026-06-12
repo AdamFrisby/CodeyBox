@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
@@ -79,13 +81,28 @@ public sealed class LocalGitHost : IGitHost
             Directory.CreateDirectory(path);
             if (seedFromUrl is not null)
             {
-                // git clone --bare -- <url> <path>
-                //
-                // The `--` separator stops git treating a URL like
-                // "--upload-pack=evil-cmd" as an option. ArgumentList.Add already
-                // prevents shell injection; the `--` defends against git's own
-                // option parser.
-                var rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
+                string? mirrorPath = null;
+                if (_opts.EnableSharedUpstreamMirror)
+                {
+                    mirrorPath = await GetOrCreateMirrorAsync(seedFromUrl, baseBranch, upstreamEnv: null, ct);
+                }
+
+                (int ExitCode, string Stdout, string Stderr) rc;
+                if (mirrorPath is not null && Directory.Exists(mirrorPath))
+                {
+                    _log.LogInformation("Cloning bare repo from {Url} with reference mirror at {MirrorPath}", ScrubCredentialMaterial(seedFromUrl), mirrorPath);
+                    rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--reference", mirrorPath, "--", seedFromUrl, path);
+                    if (rc.ExitCode != 0)
+                    {
+                        _log.LogWarning("Clone with reference mirror failed (exit {Code}): {Error}. Falling back to direct clone.", rc.ExitCode, ScrubCredentialMaterial(rc.Stderr));
+                        rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
+                    }
+                }
+                else
+                {
+                    rc = await RunGitAsync(workdir: _opts.RootDirectory, ct, "clone", "--bare", "--", seedFromUrl, path);
+                }
+
                 if (rc.ExitCode != 0)
                 {
                     Directory.Delete(path, recursive: true);
@@ -365,11 +382,45 @@ public sealed class LocalGitHost : IGitHost
         // Force-update local refs/heads/<branch> to upstream's tip — this is
         // the race-recovery path; we WANT to overwrite the local view because
         // we just discovered upstream has moved.
-        var fetch = await RunGitAsync(
-            workdir: path,
-            ct,
-            extraEnv: upstreamEnv,
-            "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+        (int ExitCode, string Stdout, string Stderr) fetch;
+        if (_opts.EnableSharedUpstreamMirror)
+        {
+            var mirrorPath = await GetOrCreateMirrorAsync(upstreamUrl, branch, upstreamEnv, ct);
+            if (mirrorPath is not null && Directory.Exists(mirrorPath))
+            {
+                _log.LogInformation("Fetching upstream branch '{Branch}' from local mirror {MirrorPath} for repo {RepoId}", branch, mirrorPath, repositoryId);
+                fetch = await RunGitAsync(
+                    workdir: path,
+                    ct,
+                    "fetch", "--no-tags", mirrorPath, $"+refs/heads/{branch}:refs/heads/{branch}");
+                if (fetch.ExitCode != 0)
+                {
+                    _log.LogWarning("Fetch from mirror failed: {Error}. Falling back to direct remote fetch.", fetch.Stderr);
+                    fetch = await RunGitAsync(
+                        workdir: path,
+                        ct,
+                        extraEnv: upstreamEnv,
+                        "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+                }
+            }
+            else
+            {
+                fetch = await RunGitAsync(
+                    workdir: path,
+                    ct,
+                    extraEnv: upstreamEnv,
+                    "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+            }
+        }
+        else
+        {
+            fetch = await RunGitAsync(
+                workdir: path,
+                ct,
+                extraEnv: upstreamEnv,
+                "fetch", "--no-tags", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+        }
+
         if (fetch.ExitCode != 0)
             throw new InvalidOperationException(
                 $"git fetch upstream branch '{branch}' failed: {fetch.Stderr}");
@@ -951,6 +1002,25 @@ public sealed class LocalGitHost : IGitHost
         }
 
         Validation.ValidateBranchName(branch, nameof(baseBranch));
+
+        if (_opts.EnableSharedUpstreamMirror)
+        {
+            var mirrorPath = await GetOrCreateMirrorAsync(seedFromUrl, branch, upstreamEnv: null, ct);
+            if (mirrorPath is not null && Directory.Exists(mirrorPath))
+            {
+                _log.LogInformation("Refreshing bare repo {Path} branch {Branch} from shared mirror {MirrorPath}", bareRepoPath, branch, mirrorPath);
+                var rcMirror = await RunGitAsync(
+                    workdir: bareRepoPath,
+                    ct,
+                    "fetch", "--no-tags", "--prune", mirrorPath, $"+refs/heads/{branch}:refs/heads/{branch}");
+                if (rcMirror.ExitCode == 0)
+                {
+                    return;
+                }
+                _log.LogWarning("Fetch from mirror failed: {Error}. Falling back to direct fetch.", rcMirror.Stderr);
+            }
+        }
+
         var rc = await RunGitAsync(
             workdir: bareRepoPath,
             ct,
@@ -1212,6 +1282,145 @@ public sealed class LocalGitHost : IGitHost
             ReleaseRepositoryLockReference(_path, state);
         }
     }
+
+    private async Task<string?> GetOrCreateMirrorAsync(
+        string upstreamUrl,
+        string? baseBranch,
+        IReadOnlyDictionary<string, string>? upstreamEnv,
+        CancellationToken ct)
+    {
+        var mirrorPath = GetMirrorPath(upstreamUrl);
+        var lease = await AcquireRepositoryLockAsync(mirrorPath, ct);
+        try
+        {
+            var branch = await ResolveMirrorBranchAsync(mirrorPath, upstreamUrl, baseBranch, upstreamEnv, ct);
+            if (branch is null)
+            {
+                _log.LogWarning("Shared mirror: failed to resolve branch to update for {Url}", ScrubCredentialMaterial(upstreamUrl));
+                return null;
+            }
+
+            if (!Directory.Exists(mirrorPath))
+            {
+                Directory.CreateDirectory(mirrorPath);
+                _log.LogInformation("Creating shared mirror repo at {Path} for {Url}", mirrorPath, ScrubCredentialMaterial(upstreamUrl));
+                var rc = await RunGitAsync(
+                    workdir: _opts.RootDirectory,
+                    ct,
+                    extraEnv: upstreamEnv,
+                    "clone", "--bare", "--", upstreamUrl, mirrorPath);
+                if (rc.ExitCode != 0)
+                {
+                    _log.LogWarning("Shared mirror clone failed (exit {Code}): {Error}", rc.ExitCode, ScrubCredentialMaterial(rc.Stderr));
+                    try { Directory.Delete(mirrorPath, recursive: true); } catch { }
+                    return null;
+                }
+
+                await RunGitAsync(mirrorPath, ct, "config", "gc.auto", "0");
+                await RunGitAsync(mirrorPath, ct, "config", "gc.pruneExpire", "never");
+            }
+            else
+            {
+                var remoteSha = await ResolveRemoteBranchShaAsync(upstreamUrl, branch, upstreamEnv, ct);
+                if (remoteSha is not null)
+                {
+                    var localShaRc = await RunGitAsync(
+                        workdir: mirrorPath,
+                        ct,
+                        "rev-parse", "--verify", "--quiet", $"refs/heads/{branch}^{{commit}}");
+                    var localSha = localShaRc.ExitCode == 0 ? localShaRc.Stdout.Trim() : null;
+
+                    if (localSha == remoteSha)
+                    {
+                        _log.LogDebug("Shared mirror up to date for {Url} branch {Branch} (SHA {Sha})", ScrubCredentialMaterial(upstreamUrl), branch, localSha);
+                        return mirrorPath;
+                    }
+                }
+
+                _log.LogInformation("Refreshing shared mirror repo at {Path} branch {Branch}", mirrorPath, branch);
+                var fetchRc = await RunGitAsync(
+                    workdir: mirrorPath,
+                    ct,
+                    extraEnv: upstreamEnv,
+                    "fetch", "--no-tags", "--prune", upstreamUrl, $"+refs/heads/{branch}:refs/heads/{branch}");
+                if (fetchRc.ExitCode != 0)
+                {
+                    _log.LogWarning("Shared mirror fetch failed (exit {Code}): {Error}", fetchRc.ExitCode, ScrubCredentialMaterial(fetchRc.Stderr));
+                }
+            }
+
+            return mirrorPath;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Error maintaining shared mirror for {Url}", ScrubCredentialMaterial(upstreamUrl));
+            return null;
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+    }
+
+    private async Task<string?> ResolveMirrorBranchAsync(
+        string mirrorPath,
+        string upstreamUrl,
+        string? baseBranch,
+        IReadOnlyDictionary<string, string>? upstreamEnv,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(baseBranch))
+            return baseBranch;
+
+        var workdir = Directory.Exists(mirrorPath) ? mirrorPath : _opts.RootDirectory;
+        var rc = await RunGitAsync(workdir, ct, upstreamEnv, "ls-remote", "--symref", upstreamUrl, "HEAD");
+        if (rc.ExitCode != 0)
+            return null;
+
+        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            const string prefix = "ref: refs/heads/";
+            if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+
+            var branch = line[prefix.Length..].Split('\t', 2)[0].Trim();
+            if (!string.IsNullOrWhiteSpace(branch))
+                return branch;
+        }
+
+        return null;
+    }
+
+    private async Task<string?> ResolveRemoteBranchShaAsync(
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string>? upstreamEnv,
+        CancellationToken ct)
+    {
+        var rc = await RunGitAsync(_opts.RootDirectory, ct, upstreamEnv, "ls-remote", upstreamUrl, $"refs/heads/{branch}");
+        if (rc.ExitCode != 0)
+            return null;
+
+        var parts = rc.Stdout.Split('\t', 2);
+        if (parts.Length > 0 && LooksLikeSha(parts[0].Trim()))
+            return parts[0].Trim();
+
+        return null;
+    }
+
+    private string GetMirrorPath(string upstreamUrl)
+    {
+        var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(upstreamUrl));
+        var sb = new StringBuilder();
+        foreach (var b in hashBytes)
+        {
+            sb.Append(b.ToString("x2"));
+        }
+        var mirrorDir = Path.IsPathRooted(_opts.SharedUpstreamMirrorDirectory)
+            ? _opts.SharedUpstreamMirrorDirectory
+            : Path.Combine(_opts.RootDirectory, _opts.SharedUpstreamMirrorDirectory);
+        return Path.Combine(mirrorDir, sb.ToString() + ".git");
+    }
 }
 
 internal interface ILocalGitProcess : IDisposable
@@ -1243,4 +1452,7 @@ public sealed record LocalGitHostOptions
     /// generating half a million paths.
     /// </summary>
     public int ListFilesEndingScannedPathCeiling { get; init; } = 500_000;
+
+    public bool EnableSharedUpstreamMirror { get; init; } = false;
+    public string SharedUpstreamMirrorDirectory { get; init; } = "_upstream-mirror";
 }

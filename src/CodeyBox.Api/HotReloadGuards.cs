@@ -70,6 +70,8 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             Check("CodeyBox:GitRootDirectory", _snapshot.GitRootDirectory, NormalizePath(options.GitRootDirectory), failures);
             Check("CodeyBox:AgentStreams:Path", _snapshot.AgentStreamsPath, NormalizePath(options.AgentStreams.Path), failures);
             Check("CodeyBox:WorkerPool:MaxConcurrentSandboxes", _snapshot.MaxConcurrentSandboxes, options.WorkerPool.MaxConcurrentSandboxes, failures);
+            Check("CodeyBox:EnableSharedUpstreamMirror", _snapshot.EnableSharedUpstreamMirror, options.EnableSharedUpstreamMirror, failures);
+            Check("CodeyBox:SharedUpstreamMirrorDirectory", _snapshot.SharedUpstreamMirrorDirectory, NormalizePath(options.SharedUpstreamMirrorDirectory), failures);
 
             return failures.Count == 0
                 ? ValidateOptionsResult.Success
@@ -82,7 +84,9 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         NormalizePath(options.StateDatabasePath),
         NormalizePath(options.GitRootDirectory),
         NormalizePath(options.AgentStreams.Path),
-        options.WorkerPool.MaxConcurrentSandboxes);
+        options.WorkerPool.MaxConcurrentSandboxes,
+        options.EnableSharedUpstreamMirror,
+        NormalizePath(options.SharedUpstreamMirrorDirectory));
 
     private static void Check(string field, string startup, string candidate, List<string> failures)
     {
@@ -97,6 +101,14 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         if (startup != candidate)
             failures.Add(
                 $"{field} cannot be changed at runtime (startup='{Format(startup)}', requested='{Format(candidate)}'). " +
+                "Restart CodeyBox to apply this change.");
+    }
+
+    private static void Check(string field, bool startup, bool candidate, List<string> failures)
+    {
+        if (startup != candidate)
+            failures.Add(
+                $"{field} cannot be changed at runtime (startup='{startup.ToString().ToLowerInvariant()}', requested='{candidate.ToString().ToLowerInvariant()}'). " +
                 "Restart CodeyBox to apply this change.");
     }
 
@@ -116,7 +128,9 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         string StateDatabasePath,
         string GitRootDirectory,
         string AgentStreamsPath,
-        int? MaxConcurrentSandboxes);
+        int? MaxConcurrentSandboxes,
+        bool EnableSharedUpstreamMirror,
+        string SharedUpstreamMirrorDirectory);
 }
 
 /// <summary>
