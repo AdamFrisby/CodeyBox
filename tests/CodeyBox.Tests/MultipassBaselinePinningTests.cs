@@ -468,6 +468,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 CancellationToken.None));
 
         Assert.Contains("baseline verification command (label 'antigravity') failed", ex.Message);
+        Assert.Contains("agy binary not runnable on sandbox PATH", ex.Message);
         var baselineName = Assert.Single(launchNames);
         Assert.Contains(baselineName, deleteNames);
         Assert.False(states.ContainsKey(baselineName));

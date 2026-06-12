@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using CodeyBox.Agents.Copilot;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -57,6 +58,28 @@ public sealed class BaselineVerificationProgramWiringTests
             string.Equals(c.Label, "antigravity", StringComparison.OrdinalIgnoreCase));
         Assert.Equal("agy", antigravity.Argv[0]);
         Assert.Equal("--version", antigravity.Argv[^1]);
+    }
+
+    [Fact]
+    public void Program_CopilotBaselineVerificationUsesRegisteredProbe_DespiteDefaultExemption()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:MultipassUseBaselineImages"] = "true",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+            ["CodeyBox:AgentClasses:0:Id"] = "copilot-class",
+            ["CodeyBox:AgentClasses:0:DisplayName"] = "Copilot Class",
+            ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "copilot",
+            ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+            ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "75",
+        });
+
+        var opts = ResolveLiveMultipassOptions(factory);
+
+        var copilot = opts.BaselineVerificationCommands.Single(c =>
+            string.Equals(c.Label, "copilot", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal([CopilotAgentRunner.DefaultBinary, "--version"], copilot.Argv);
     }
 
     [Fact]
