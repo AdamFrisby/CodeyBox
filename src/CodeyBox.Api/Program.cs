@@ -414,11 +414,34 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
         () =>
         {
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
             var multipassSandbox = live.MultipassSandbox ?? new MultipassSandboxConfig();
+            // Post-bake binary verification is only meaningful on the baseline-
+            // clone path. When baseline images are disabled the per-launch
+            // cloud-init flow exists no baseline to verify, so skip the build
+            // entirely — both to avoid unnecessary work and to keep ordinary
+            // Multipass provisioning insulated from any future bake-only fault
+            // in the builder.
+            //
+            // Smoke options are intentionally NOT passed here: the bake gate
+            // verifies durable image integrity and must run regardless of the
+            // runtime smoke toggles (CodeyBox:Smoke:Enabled,
+            // CodeyBox:Smoke:InVm:Enabled), which only govern dispatch-time
+            // routing. The exempt-list flows through InVmSmokeOptions because
+            // that is its existing configuration home; the builder reads only
+            // ExemptAgentsWithoutProbe from it.
+            var baselineVerificationCommands = live.MultipassUseBaselineImages
+                ? BaselineVerificationProbeBuilder.Build(
+                    live,
+                    projects,
+                    sp.GetServices<IInVmSmokeProbe>(),
+                    sp.GetService<InVmSmokeOptions>())
+                : Array.Empty<MultipassBaselineVerificationCommand>();
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
                 ExtraRuncmd = live.MultipassExtraRuncmd,
+                BaselineVerificationCommands = baselineVerificationCommands,
                 NetworkProfiles = live.SandboxNetworkProfiles,
                 UseBaselineImages = live.MultipassUseBaselineImages,
                 CloudInitReadyRetryAttempts = multipassSandbox.CloudInitReadyRetryAttempts,
@@ -1270,7 +1293,9 @@ builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
 
 // --- Credential smoke probes -------------------------------------------------
 // Registered as IEnumerable<IAgentSmokeProbe>; the gate resolves by Kind.
-// Copilot has no smoke probe: its auth surface is not directly probeable.
+// Copilot has no host-side credential smoke probe (its auth surface is not
+// directly probeable). The in-VM probe covers binary-presence verification,
+// see CopilotInVmSmokeProbe registered below.
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new ClaudeSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
@@ -1302,8 +1327,8 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
 // These exec the agent CLI inside a sandbox cloned from the active baseline,
 // catching exit-127 / auth-path failures the host-only probes above cannot see.
-// Copilot has no in-VM probe (no first-party CLI driven by this pipeline).
 builder.Services.AddSingleton<IInVmSmokeProbe, ClaudeInVmSmokeProbe>();
+builder.Services.AddSingleton<IInVmSmokeProbe, CopilotInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CodexInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, GeminiInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, CursorInVmSmokeProbe>();
@@ -1311,9 +1336,12 @@ builder.Services.AddSingleton<IInVmSmokeProbe, OpencodeInVmSmokeProbe>();
 builder.Services.AddSingleton<IInVmSmokeProbe, AntigravityInVmSmokeProbe>();
 // Startup guard (AC#1): bench any configured AgentClass member with no in-VM
 // probe (so a CLI-backed agent that would fail at first dispatch is routed past
-// at smoke time, not first dispatch). Agents with no sandbox CLI — copilot by
-// default, see InVmSmokeOptions.ExemptAgentsWithoutProbe — are warned but not
-// benched.
+// at smoke time, not first dispatch). Agents on
+// InVmSmokeOptions.ExemptAgentsWithoutProbe (the default still names copilot
+// to preserve back-compat for operators who haven't installed the copilot CLI
+// yet) are warned but not benched; a registered IInVmSmokeProbe — including
+// CopilotInVmSmokeProbe above — supersedes that exemption and is what actually
+// gets executed at probe time.
 builder.Services.AddHostedService<InVmSmokeProbeCoverageValidator>();
 
 // --- Model-list probes (used by AgentClassConfigValidator at startup) --------
@@ -3205,9 +3233,11 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Extra cloud-init YAML appended to the auto-generated network policy
-        /// when SandboxProvider=multipass. Use to install agent CLIs in the
-        /// VM at first boot (e.g. apt-installing nodejs and npm-installing
-        /// the agent CLI).
+        /// when SandboxProvider=multipass. Use only for top-level cloud-init
+        /// directives CodeyBox does not generate (e.g. <c>packages:</c> or
+        /// <c>apt:</c>). Use <see cref="MultipassExtraRuncmd"/> for install
+        /// commands; duplicate generated blocks such as <c>runcmd:</c> and
+        /// <c>write_files:</c> are rejected by the Multipass provider.
         /// </summary>
         public string? MultipassExtraCloudInit { get; set; }
 
@@ -3839,7 +3869,10 @@ namespace CodeyBox.Api
         /// <summary>
         /// Agents allowed to route without a registered in-VM smoke probe.
         /// Uncovered agents are otherwise benched at startup (AC#1). Defaults to
-        /// <c>copilot</c> when unset (no sandbox CLI). Set explicitly to override.
+        /// <c>copilot</c> when unset, preserving back-compat for operators who
+        /// have not yet installed the Copilot CLI in their baseline image —
+        /// when CopilotInVmSmokeProbe is registered the probe runs and the
+        /// exemption is unused. Set explicitly to override.
         /// </summary>
         public List<string>? ExemptAgentsWithoutProbe { get; set; }
     }

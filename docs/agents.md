@@ -41,7 +41,7 @@ the most common cause of fresh-class dispatch failures.
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
 | `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
-| `antigravity` | `curl -fsSL https://antigravity.google/install \| bash` (verify against the upstream installer at bake time; the agy binary is proprietary closed-source). Installs the `agy` CLI on `$PATH`. | Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. See [Antigravity quirks](#google-antigravity-cli-agy). |
+| `antigravity` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash -s -- --dir /usr/local/bin` | Installs the proprietary `agy` CLI on the non-login sandbox PATH. The installer resolves the current Linux payload from Google's Antigravity CLI updater manifest and verifies its SHA-512 before copying it. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. See [Antigravity quirks](#google-antigravity-cli-agy). |
 
 Verify each command against its upstream install docs at the time of baking —
 versions and install URLs change. After updating
@@ -623,8 +623,16 @@ Google AI subscription quota. The runner is registered as **light-duty
 overflow**, not a workhorse: AI Pro caps requests on a weekly window with
 up to a 7-day lockout on cap breach, so over-use is especially expensive.
 
-**Binary name:** `agy`. Install via the upstream installer command and
-verify the binary lands on `$PATH` after baking.
+**Binary name:** `agy`. Install via the upstream CLI installer:
+
+```sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin
+```
+
+The `--dir /usr/local/bin` flag matters in the sandbox baseline: CodeyBox
+execs non-login commands, so `~/.local/bin` may not be on PATH. The baseline
+bake verifies `agy --version` for configured Antigravity members before the
+image is marked ready to clone.
 
 **Non-interactive invocation:** `agy --print --dangerously-skip-permissions
 --model <gateway-model-id>` with the prompt on stdin (the sandbox is the

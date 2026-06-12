@@ -50,6 +50,161 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public void CloudInit_BaselineManifestRendersHashEntryIntoUserData()
+    {
+        var installer = "curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin";
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: null,
+            includeGraphicalInstall: false,
+            baselineInstallCommands: [installer]);
+
+        Assert.Contains("path: /var/lib/codeybox/baseline-install-commands.sh", cloudInit);
+
+        // Structural check: the cloud-init must be valid YAML AND the manifest
+        // entry must be nested inside the write_files content block, not just
+        // present as a substring. The original regression this test guards is
+        // an entry that *looked* present but rendered outside its intended
+        // block due to bad indentation — cloud-init silently drops it. The
+        // post-redactor design persists only step ordering and a SHA-256 of
+        // each configured command (the command text would otherwise leak
+        // operator secrets into the LLM-controlled clone disk), so we assert
+        // on the hash entry, not the installer string.
+        var manifest = ExtractWriteFilesEntryContent(cloudInit, "/var/lib/codeybox/baseline-install-commands.sh");
+        Assert.StartsWith("#!/bin/bash", manifest, StringComparison.Ordinal);
+        Assert.DoesNotContain(installer, manifest);
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var expected = Convert.ToHexString(
+            sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(installer))).ToLowerInvariant();
+        Assert.Contains($"sha256={expected}", manifest);
+    }
+
+    /// <summary>
+    /// Parses the rendered cloud-init as YAML, walks to <c>write_files</c>,
+    /// and returns the <c>content</c> field of the entry whose <c>path</c>
+    /// matches <paramref name="path"/>. Asserts that the document is a valid
+    /// cloud-config mapping and that the target entry exists. Used by the
+    /// baseline-install-manifest test to confirm the manifest is rendered as
+    /// a proper YAML block scalar inside <c>write_files</c>, not just as a
+    /// substring somewhere in the document.
+    /// </summary>
+    private static string ExtractWriteFilesEntryContent(string cloudInit, string path)
+    {
+        // Strip the leading "#cloud-config" header — it's a cloud-init marker
+        // comment, not a YAML directive, and YamlDotNet treats it like any
+        // other comment so the parse still works. We pass the full text in
+        // for fidelity (an indentation regression would still surface as a
+        // parse failure here).
+        using var reader = new StringReader(cloudInit);
+        var stream = new YamlDotNet.RepresentationModel.YamlStream();
+        stream.Load(reader);
+        Assert.Single(stream.Documents);
+        var root = Assert.IsType<YamlDotNet.RepresentationModel.YamlMappingNode>(stream.Documents[0].RootNode);
+
+        var writeFilesKey = new YamlDotNet.RepresentationModel.YamlScalarNode("write_files");
+        Assert.True(
+            root.Children.TryGetValue(writeFilesKey, out var writeFilesNode),
+            "cloud-init must contain a top-level write_files block");
+        var entries = Assert.IsType<YamlDotNet.RepresentationModel.YamlSequenceNode>(writeFilesNode);
+
+        var pathKey = new YamlDotNet.RepresentationModel.YamlScalarNode("path");
+        var contentKey = new YamlDotNet.RepresentationModel.YamlScalarNode("content");
+        foreach (var entry in entries.Children.OfType<YamlDotNet.RepresentationModel.YamlMappingNode>())
+        {
+            if (!entry.Children.TryGetValue(pathKey, out var pathNode))
+                continue;
+            if (pathNode is not YamlDotNet.RepresentationModel.YamlScalarNode pathScalar)
+                continue;
+            if (!string.Equals(pathScalar.Value, path, StringComparison.Ordinal))
+                continue;
+
+            Assert.True(
+                entry.Children.TryGetValue(contentKey, out var contentNode),
+                $"write_files entry for path '{path}' is missing a content field");
+            var contentScalar = Assert.IsType<YamlDotNet.RepresentationModel.YamlScalarNode>(contentNode);
+            return contentScalar.Value ?? string.Empty;
+        }
+
+        Assert.Fail($"no write_files entry found for path '{path}'");
+        return string.Empty;
+    }
+
+    [Fact]
+    public void CloudInit_BaselineManifestPersistsHashesNotCommandText()
+    {
+        // The manifest is persisted to /var/lib/codeybox/baseline-install-commands.sh
+        // inside the baked baseline, then inherited by every (LLM-controlled)
+        // clone. Raw install commands routinely carry registry tokens, basic-
+        // auth URLs, or env-assigned API keys — including QUOTED forms
+        // (`GITHUB_TOKEN="ghp_..."`, `--token 'npm_...'`) that a regex
+        // redactor cannot reliably scrub. We persist ONLY a SHA-256 of each
+        // configured command plus its step index; the command text itself is
+        // never written into the image.
+        var cmds = new[]
+        {
+            "npm install --registry https://my-registry.example/ --token=npm_abc123XYZdefSecretToken --save",
+            // Quoted env-var form — previously bypassed the redactor.
+            "GITHUB_TOKEN=\"ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee\" npm i -g something",
+            // Single-quoted CLI flag value — also bypassed the redactor.
+            "npm publish --token 'npm_QuotedSecretZ987YYY'",
+            "curl -fsSL https://user:p@ssword1@private.example/install.sh | bash",
+            "curl -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\" https://api.example/install",
+        };
+        var cloudInit = MultipassSandboxProvider.BuildCloudInit(
+            extraRuncmd: null,
+            extraCloudInit: null,
+            includeGraphicalInstall: false,
+            baselineInstallCommands: cmds);
+
+        var manifest = ExtractWriteFilesEntryContent(cloudInit, "/var/lib/codeybox/baseline-install-commands.sh");
+
+        // No secret material from any input — quoted or not — is in the manifest.
+        Assert.DoesNotContain("npm_abc123XYZdefSecretToken", manifest);
+        Assert.DoesNotContain("ghp_aaaaaaaabbbbbbbbccccccccddddddddeeee", manifest);
+        Assert.DoesNotContain("npm_QuotedSecretZ987YYY", manifest);
+        Assert.DoesNotContain("p@ssword1", manifest);
+        Assert.DoesNotContain("eyJhbGciOiJIUzI1NiJ9.payload.sig", manifest);
+        // Command text itself is not persisted — not even the non-secret prefix.
+        Assert.DoesNotContain("npm install --registry", manifest);
+        Assert.DoesNotContain("npm publish", manifest);
+        Assert.DoesNotContain("Authorization: Bearer", manifest);
+
+        // Each configured command appears as a step entry with its SHA-256.
+        for (var i = 0; i < cmds.Length; i++)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var expected = Convert.ToHexString(
+                sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(cmds[i]))).ToLowerInvariant();
+            Assert.Contains($"step {i + 1} (configured index {i + 1}) sha256={expected}", manifest);
+        }
+    }
+
+    [Theory]
+    // Bare keys must be rejected so a runcmd: / write_files: in the operator fragment
+    // doesn't duplicate (and silently clobber) CodeyBox's own generated block.
+    [InlineData("runcmd", "runcmd")]
+    [InlineData("write_files", "write_files")]
+    // YAML allows the same mapping key in quoted form; PyYAML parses both spellings
+    // to the same string, so the validator must too — otherwise an entry like
+    // "runcmd": slips past the text check and produces two top-level runcmd blocks,
+    // and the later-appended caller fragment wins. (This is the exact silent-drop
+    // shape that surfaced as the agy-installer regression on 2026-06-10.)
+    [InlineData("\"runcmd\"", "runcmd")]
+    [InlineData("'runcmd'", "runcmd")]
+    [InlineData("\"write_files\"", "write_files")]
+    [InlineData("'write_files'", "write_files")]
+    public void CloudInit_RejectsExtraCloudInitThatClobbersGeneratedTopLevelBlocks(string keySource, string expectedKey)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            MultipassSandboxProvider.BuildCloudInit(
+                extraRuncmd: [],
+                extraCloudInit: $"{keySource}:\n  - echo bad\n"));
+
+        Assert.Contains($"top-level '{expectedKey}'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MultipassExtraRuncmd", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CloudInit_InstallsTcpKeepaliveSysctlForSuspendResumeRecovery()
     {
         // R8-core: after a multipass suspend/start cycle the in-VM agent's
@@ -2022,6 +2177,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 return Task.FromResult(new ProcessRunResult(3, "", "schema validation failed: bad runcmd"));
             }
 
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
+                return Task.FromResult(new ProcessRunResult(0, "status: error\nschema validation failed: bad runcmd", ""));
+
             if (argv is [_, "delete", "--purge", var deleteName])
             {
                 deletedName = deleteName;
@@ -2052,6 +2210,132 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.False(
             Directory.Exists(Path.Combine(staging, launchedName!)),
             "staging directory for failed sandbox must be removed during cleanup");
+    }
+
+    [Fact]
+    public async Task CreateAsync_ThrowsAndCleansUpWhenCloudInitReportsDegraded()
+    {
+        var staging = Path.Combine(_workspace, "staging-cloud-init-degraded");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
+                return Task.FromResult(new ProcessRunResult(0, "status: degraded\ncloud-config failed schema validation", ""));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(stagingDirectory: staging, runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("cloud-config failed schema validation", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(launchedName, deletedName);
+    }
+
+    [Fact]
+    public async Task CreateAsync_DegradedDiagnostics_FallBackWhenLongStatusItselfFails()
+    {
+        // The fallback path inside ReadCloudInitLongStatusAsync — `cloud-init
+        // status --long` failing with nonzero — is the worst-case diagnostic
+        // shape: cloud-init couldn't even tell us what went wrong. The thrown
+        // message must still embed exit code / stdout / stderr from the failed
+        // diagnostic, instead of swallowing them and surfacing a bare
+        // "cloud-init degraded". The original failure (exit 2 "status:
+        // degraded") must also stay in the chain so an operator can tell that
+        // the long-status fallback is what was masking the real cause.
+        var staging = Path.Combine(_workspace, "staging-cloud-init-degraded-long-fail");
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        string? launchedName = null;
+        string? deletedName = null;
+
+        var runner = new RecordingMultipassRunner((argv, _, _) =>
+        {
+            if (argv is [_, "info", var infoName, "--format=csv"])
+            {
+                return states.TryGetValue(infoName, out var state)
+                    ? Task.FromResult(new ProcessRunResult(0, state, ""))
+                    : Task.FromResult(new ProcessRunResult(1, "", "not found"));
+            }
+
+            if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
+            {
+                launchedName = argv[3];
+                states[launchedName] = "Running";
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--wait"])
+                return Task.FromResult(new ProcessRunResult(2, "", "status: degraded"));
+
+            if (argv is [_, "exec", _, "--", "cloud-init", "status", "--long"])
+                return Task.FromResult(new ProcessRunResult(3, "partial status output", "permission denied"));
+
+            if (argv is [_, "delete", "--purge", var deleteName])
+            {
+                deletedName = deleteName;
+                states.TryRemove(deleteName, out _);
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+
+            return Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv)));
+        });
+
+        var provider = NewProvider(stagingDirectory: staging, runner: runner);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Network = new SandboxNetworkPolicy(),
+            WorkingDirectory = "/work",
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(spec, CancellationToken.None));
+
+        // The degraded-state framing must survive.
+        Assert.Contains("cloud-init degraded", ex.Message, StringComparison.Ordinal);
+        // The long-status failure framing AND its exit code / streams must be
+        // surfaced — otherwise an operator looking at a bake failure sees only
+        // "degraded" and never learns that the diagnostic itself broke.
+        Assert.Contains("cloud-init status --long failed (exit 3)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("partial status output", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("permission denied", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(launchedName, deletedName);
     }
 
     [Fact]

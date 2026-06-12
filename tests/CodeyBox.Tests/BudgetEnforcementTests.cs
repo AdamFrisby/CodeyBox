@@ -383,8 +383,14 @@ public sealed class BudgetEnforcementTests : IDisposable
         var successors = ids.Skip(1).ToArray();
 
         // Poll until every successor has been deferred under the initial
-        // snapshot value while the first item is still running.
-        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        // snapshot value while the first item is still running. The window is
+        // sized for loaded CI hosts: the runningDeadline above already grants
+        // the first item 30 s, and the dispatch loop has to walk each
+        // successor through enqueue → pickup → defer; a stingy 10 s window
+        // has been observed to expire on heavily-loaded test hosts even
+        // though the consumer-side logic is healthy. Match the
+        // running-deadline budget to stay coherent with the slowest path.
+        var deferDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
         while (!successors.All(svc.IsDeferredForTest)
                && DateTimeOffset.UtcNow < deferDeadline)
         {

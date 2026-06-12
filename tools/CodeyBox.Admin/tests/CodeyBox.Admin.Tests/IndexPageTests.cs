@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using CodeyBox.Admin.Web.Models;
 using CodeyBox.Admin.Web.Services;
 using IndexPage = CodeyBox.Admin.Web.Components.Pages.Index;
+using System.Linq;
 
 namespace CodeyBox.Admin.Tests;
 
@@ -29,7 +30,7 @@ public sealed class IndexPageTests : TestContext
     // tests use Queued/Failed/etc. which live under other tabs, so select "All"
     // (which shows every item regardless of state) before asserting on the table.
     private static void SelectAllTab(IRenderedComponent<IndexPage> cut) =>
-        cut.FindAll("button[role='tab']").Single(b => b.TextContent.Contains("All")).Click();
+        cut.FindAll("button.filter-chip").First(b => b.TextContent.Contains("All")).Click();
 
     [Fact]
     public void Index_RendersTableWhenItemsExist()
@@ -112,6 +113,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         // Cancel button only shown for non-terminal items
         Assert.DoesNotContain("cancel", cut.Markup);
@@ -139,6 +141,7 @@ public sealed class IndexPageTests : TestContext
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
         var cut = RenderComponent<IndexPage>();
+        SelectAllTab(cut);
 
         Assert.Contains("Working", cut.Markup);
         Assert.Contains("Done", cut.Markup);

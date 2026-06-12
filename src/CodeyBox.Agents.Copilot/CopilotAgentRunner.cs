@@ -12,7 +12,10 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 {
     public override AgentKind Kind => AgentKind.Copilot;
 
-    public string Binary { get; init; } = "copilot";
+    /// <summary>Default copilot binary name on the sandbox PATH. The in-VM smoke probe pins to this so the probe and runner can never drift.</summary>
+    public const string DefaultBinary = "copilot";
+
+    public string Binary { get; init; } = DefaultBinary;
 
     protected override AgentInvocation BuildInvocation(
         string prompt,

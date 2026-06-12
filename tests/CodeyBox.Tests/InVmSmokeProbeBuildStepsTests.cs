@@ -1,6 +1,7 @@
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
@@ -26,6 +27,7 @@ public sealed class InVmSmokeProbeBuildStepsTests
 
     [Theory]
     [InlineData("claude")]
+    [InlineData("copilot")]
     [InlineData("codex")]
     [InlineData("gemini")]
     [InlineData("antigravity")]
@@ -38,6 +40,7 @@ public sealed class InVmSmokeProbeBuildStepsTests
         (IInVmSmokeProbe Probe, string RunnerBinary, AgentKind ExpectedKind) cases = agent switch
         {
             "claude" => (new ClaudeInVmSmokeProbe(), ClaudeAgentRunner.DefaultBinary, AgentKind.Claude),
+            "copilot" => (new CopilotInVmSmokeProbe(), CopilotAgentRunner.DefaultBinary, AgentKind.Copilot),
             "codex" => (new CodexInVmSmokeProbe(), CodexAgentRunner.DefaultBinary, AgentKind.Codex),
             "gemini" => (new GeminiInVmSmokeProbe(), GeminiAgentRunner.DefaultBinary, AgentKind.Gemini),
             _ => (new AntigravityInVmSmokeProbe(), AntigravityAgentRunner.DefaultBinary, AgentKind.Antigravity),

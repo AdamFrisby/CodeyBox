@@ -1340,33 +1340,44 @@ git push origin HEAD:{refName}";
         string profileName,
         SandboxProfileFlavor flavor)
     {
+        var firstBootRuncmd = BuildFirstBootRuncmd(opts, flavor);
         // The cloud-init body matches what BakeBaselineAsync writes:
         // extraRuncmd=null, extraCloudInit=opts.ExtraCloudInit, startRouteService=true,
-        // includeGraphicalInstall=false. The install runcmds are listed
-        // separately (they run via multipass exec, not via cloud-init).
+        // includeGraphicalInstall=false, baselineInstallCommands=opts.ExtraRuncmd.
+        // The install commands are still listed separately because they run via
+        // multipass exec, not cloud-init runcmd.
         var cloudInit = BuildCloudInit(
             extraRuncmd: null,
             extraCloudInit: opts.ExtraCloudInit,
             flavor: flavor,
             startRouteService: true,
-            includeGraphicalInstall: false);
-        var firstBootRuncmd = BuildFirstBootRuncmd(opts, flavor);
+            includeGraphicalInstall: false,
+            baselineInstallCommands: opts.ExtraRuncmd);
         // Build a canonical, version-prefixed string. The 'v1' prefix lets
         // future schema changes invalidate every existing baseline without
         // ambiguity. Field separator is '|' which cannot appear in profile
         // names or flavor enum strings.
         var canon = string.Join("|", new[]
         {
-            "v1",
+            "v2",
             profileName,
             flavor.ToString(),
             cloudInit,
             string.Join("\n", firstBootRuncmd),
+            string.Join("\n", opts.BaselineVerificationCommands.Select(RenderBaselineVerificationCommandForHash)),
             opts.ExtraCloudInit ?? string.Empty,
         });
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
+
+    private static string RenderBaselineVerificationCommandForHash(MultipassBaselineVerificationCommand cmd) =>
+        string.Join("\u001f", new[]
+        {
+            cmd.Label,
+            string.Join("\u001e", cmd.Argv),
+            cmd.FailureHint ?? string.Empty,
+        });
 
     /// <inheritdoc/>
     public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
@@ -1466,9 +1477,11 @@ git push origin HEAD:{refName}";
             "Baking Multipass baseline {Name} for profile {Profile} on bridge {Bridge} — one-time, ~5-10 minutes",
             baselineName, profileName, bridge);
 
-        // Cloud-init for the baseline contains ONLY idempotent file-writes
-        // (exec wrapper, route systemd service). Caller-supplied install
-        // runcmds run via `multipass exec` AFTER launch instead. Why: when
+        var installCommands = BuildFirstBootRuncmd(opts, flavor);
+        // Cloud-init for the baseline contains idempotent file-writes
+        // (exec wrapper, route systemd service, plus a rendered operator
+        // install-command manifest for diagnostics). Install runcmds run via
+        // `multipass exec` AFTER launch instead. Why: when
         // we `multipass clone` the baseline, multipass assigns the clone a
         // fresh instance-id, so cloud-init thinks it's a brand-new instance
         // and re-runs every per-instance module including runcmd. Putting
@@ -1479,7 +1492,8 @@ git push origin HEAD:{refName}";
             extraCloudInit: opts.ExtraCloudInit,
             flavor: flavor,
             startRouteService: true,
-            includeGraphicalInstall: false);
+            includeGraphicalInstall: false,
+            baselineInstallCommands: opts.ExtraRuncmd);
         var stagingDir = Path.Combine(_stagingRoot, "_baseline-" + baselineName);
         Directory.CreateDirectory(stagingDir);
         TryChmod0700(stagingDir);
@@ -1522,7 +1536,6 @@ git push origin HEAD:{refName}";
 
             // Run the install commands now, via multipass exec under sudo.
             // Each entry in ExtraRuncmd is a single shell command.
-            var installCommands = BuildFirstBootRuncmd(opts, flavor);
             for (var i = 0; i < installCommands.Count; i++)
             {
                 var cmd = installCommands[i];
@@ -1540,6 +1553,8 @@ git push origin HEAD:{refName}";
                         $"stderr: {execRun.Stderr}\nstdout-tail: {(execRun.Stdout.Length > 1000 ? "…" + execRun.Stdout[^1000..] : execRun.Stdout)}");
                 }
             }
+
+            await VerifyBaselineRequiredBinariesAsync(opts, baselineName, workItemId, ct);
 
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped). Wait for the state to flip
@@ -1593,6 +1608,46 @@ git push origin HEAD:{refName}";
                 "Baseline bake for {Name} failed; delete --purge reported failure but inventory confirms the baseline is absent",
                 baselineName);
             throw;
+        }
+    }
+
+    private async Task VerifyBaselineRequiredBinariesAsync(
+        MultipassSandboxOptions opts,
+        string baselineName,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        if (opts.BaselineVerificationCommands.Count == 0)
+            return;
+
+        for (var i = 0; i < opts.BaselineVerificationCommands.Count; i++)
+        {
+            var check = opts.BaselineVerificationCommands[i];
+            if (check.Argv.Count == 0)
+                throw new InvalidOperationException(
+                    $"baseline verification command {i + 1} (label '{check.Label}') has empty argv");
+
+            var argv = new List<string> { opts.MultipassBinary, "exec", baselineName, "--" };
+            argv.AddRange(check.Argv);
+            _log.LogInformation(
+                "Baseline verification step {N}/{Total}: {Label} ({Command})",
+                i + 1,
+                opts.BaselineVerificationCommands.Count,
+                check.Label,
+                string.Join(" ", check.Argv));
+
+            var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
+            if (run.ExitCode != 0)
+            {
+                ThrowIfProvisioningRetryExhausted("exec", run);
+                var hint = string.IsNullOrWhiteSpace(check.FailureHint)
+                    ? "required baseline binary not runnable on sandbox PATH"
+                    : check.FailureHint;
+                throw new InvalidOperationException(
+                    $"baseline verification command (label '{check.Label}') failed (exit {run.ExitCode}): {hint}; " +
+                    $"argv: {string.Join(" ", check.Argv)}; stderr: {DiagnosticText(run.Stderr)}; " +
+                    $"stdout-tail: {DiagnosticText(Tail(run.Stdout, 1000))}");
+            }
         }
     }
 
@@ -1819,11 +1874,11 @@ git push origin HEAD:{refName}";
         //   1  = not run / status unavailable. This can be transient, and on
         //        some images the status command bails out even though userdata
         //        has been applied.
-        //   2  = degraded done (recoverable warnings — e.g. schema-validation
-        //        warnings on octal permissions that multipass re-emits as
-        //        decimal integers). The VM is still functional.
+        //   2  = degraded done. Treat as fatal: cloud-init schema validation
+        //        failures can drop user-data blocks while leaving a superficially
+        //        usable VM, which is worse than a failed bake.
         //   >2 = genuine error.
-        // We accept 0 and 2. Exit 1 gets a bounded retry, then a marker probe
+        // We accept only 0. Exit 1 gets a bounded retry, then a marker probe
         // before we decide the VM is actually unusable.
         var attempts = Math.Max(1, opts.CloudInitReadyRetryAttempts);
         var retryDelay = opts.CloudInitReadyRetryDelay < TimeSpan.Zero
@@ -1839,12 +1894,18 @@ git push origin HEAD:{refName}";
                 stdin: null, ct: ct, workItemId: workItemId);
             ThrowIfProvisioningRetryExhausted("exec", cloudInit);
 
-            if (cloudInit.ExitCode is 0 or 2)
+            if (cloudInit.ExitCode == 0)
                 return;
+
+            if (cloudInit.ExitCode == 2)
+                throw new InvalidOperationException(
+                    $"cloud-init degraded for multipass VM {name}: " +
+                    $"{await ReadCloudInitLongStatusAsync(opts, name, workItemId, ct)}");
 
             if (cloudInit.ExitCode != 1)
                 throw new InvalidOperationException(
-                    $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): {cloudInit.Stderr}");
+                    $"cloud-init failed for multipass VM {name} (exit {cloudInit.ExitCode}): " +
+                    $"{await ReadCloudInitLongStatusAsync(opts, name, workItemId, ct)}");
 
             if (attempt == attempts)
                 break;
@@ -1893,6 +1954,24 @@ test "$work" = present && test "$exec_wrapper" = present
             stdin: null, ct: ct, workItemId: workItemId);
     }
 
+    private async Task<string> ReadCloudInitLongStatusAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        var detail = await RunAsync(
+            opts,
+            [opts.MultipassBinary, "exec", name, "--", "cloud-init", "status", "--long"],
+            stdin: null, ct: ct, workItemId: workItemId);
+        ThrowIfProvisioningRetryExhausted("exec", detail);
+        var stdout = DiagnosticText(detail.Stdout);
+        var stderr = DiagnosticText(detail.Stderr);
+        return detail.ExitCode == 0
+            ? stdout
+            : $"cloud-init status --long failed (exit {detail.ExitCode}); stdout: {stdout}; stderr: {stderr}";
+    }
+
     private static string SingleLine(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return "";
@@ -1904,6 +1983,13 @@ test "$work" = present && test "$exec_wrapper" = present
     {
         var singleLine = SingleLine(value);
         return singleLine.Length == 0 ? "<empty>" : singleLine;
+    }
+
+    private static string Tail(string? value, int maxChars)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxChars)
+            return value ?? string.Empty;
+        return value[^maxChars..];
     }
 
     /// <summary>
@@ -2872,10 +2958,10 @@ test "$work" = present && test "$exec_wrapper" = present
     ///     route would be lost on the post-mount restart.
     ///   - Splices any caller-supplied <paramref name="extraRuncmd"/>
     ///     entries INTO our runcmd block (first-boot one-shots like apt
-    ///     install). Don't try to add a separate <c>runcmd:</c> via
-    ///     <paramref name="extraCloudInit"/> — cloud-init uses PyYAML, which
-    ///     keeps only the LAST occurrence of a duplicated top-level key,
-    ///     so a second runcmd block would clobber the orchestrator's runcmd.
+    ///     install). Don't try to add a separate generated top-level block
+    ///     such as <c>runcmd:</c> or <c>write_files:</c> via
+    ///     <paramref name="extraCloudInit"/> — duplicate top-level keys can
+    ///     clobber generated user-data, so they are rejected before launch.
     ///
     /// Egress filtering is NOT installed in the guest. It lives entirely
     /// on the host (nftables on the profile bridge — see
@@ -2889,14 +2975,19 @@ test "$work" = present && test "$exec_wrapper" = present
         string? extraCloudInit,
         SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
         bool startRouteService = true,
-        bool includeGraphicalInstall = true)
+        bool includeGraphicalInstall = true,
+        IReadOnlyList<string>? baselineInstallCommands = null)
     {
+        ValidateExtraCloudInitFragment(extraCloudInit);
         var wrapperIndented = string.Join("\n      ", ExecWrapperScript.Split('\n'));
         var routeScriptIndented = string.Join("\n      ", RouteSwapScript.Split('\n'));
         var graphicalXvfbIndented = string.Join("\n      ", GraphicalXvfbService.Split('\n'));
         var graphicalXfceIndented = string.Join("\n      ", GraphicalXfceService.Split('\n'));
         var graphicalVncIndented = string.Join("\n      ", GraphicalVncService.Split('\n'));
         var graphicalVncScriptIndented = string.Join("\n      ", GraphicalVncScript.Split('\n'));
+        var installManifestIndented = baselineInstallCommands is not null && baselineInstallCommands.Any(c => !string.IsNullOrWhiteSpace(c))
+            ? string.Join("\n      ", BuildBaselineInstallManifest(baselineInstallCommands).Split('\n'))
+            : null;
 
         var sb = new StringBuilder();
         sb.AppendLine("#cloud-config");
@@ -2953,6 +3044,13 @@ test "$work" = present && test "$exec_wrapper" = present
             sb.AppendLine("    content: |");
             sb.Append("      ").AppendLine(graphicalVncScriptIndented);
         }
+        if (installManifestIndented is not null)
+        {
+            sb.AppendLine("  - path: /var/lib/codeybox/baseline-install-commands.sh");
+            sb.AppendLine("    permissions: '0700'");
+            sb.AppendLine("    content: |");
+            sb.Append("      ").AppendLine(installManifestIndented);
+        }
         sb.AppendLine("runcmd:");
         // Enable the route service. --now runs it once immediately so the
         // first boot's traffic uses the profile bridge before any package
@@ -2982,6 +3080,124 @@ test "$work" = present && test "$exec_wrapper" = present
             sb.AppendLine(extraCloudInit);
         }
         return sb.ToString();
+    }
+
+    private static void ValidateExtraCloudInitFragment(string? extraCloudInit)
+    {
+        if (string.IsNullOrWhiteSpace(extraCloudInit))
+            return;
+
+        using var reader = new StringReader(extraCloudInit);
+        string? line;
+        var lineNumber = 0;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            lineNumber++;
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+            if (char.IsWhiteSpace(line[0]))
+                continue;
+
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith('#') || trimmed is "---" or "...")
+                continue;
+
+            if (!TryExtractTopLevelKey(trimmed, out var key))
+                continue;
+
+            if (key is "runcmd" or "write_files")
+            {
+                throw new InvalidOperationException(
+                    $"MultipassExtraCloudInit declares top-level '{key}' at line {lineNumber}; this would override " +
+                    $"CodeyBox's generated '{key}' block in cloud-init user-data. Put boot commands in " +
+                    "MultipassExtraRuncmd instead.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pulls the top-level YAML mapping key from <paramref name="trimmed"/> (a left-trimmed
+    /// line). Strips a single layer of double or single quotes so that the bare,
+    /// double-quoted (<c>"runcmd":</c>), and single-quoted (<c>'runcmd':</c>) spellings
+    /// all reduce to the same plain key before duplicate-block detection compares them.
+    /// Lines whose first quoted segment is not closed before the colon, or that have no
+    /// colon at all, are ignored (the duplicate check intentionally only flags plain
+    /// scalar keys — every cloud-init top-level block CodeyBox generates is one).
+    /// </summary>
+    private static bool TryExtractTopLevelKey(string trimmed, out string key)
+    {
+        key = string.Empty;
+        if (trimmed.Length == 0)
+            return false;
+
+        var first = trimmed[0];
+        if (first is '"' or '\'')
+        {
+            var close = trimmed.IndexOf(first, 1);
+            if (close <= 1)
+                return false;
+            var afterQuote = trimmed.AsSpan(close + 1).TrimStart();
+            if (afterQuote.Length == 0 || afterQuote[0] != ':')
+                return false;
+            key = trimmed.Substring(1, close - 1);
+            return true;
+        }
+
+        var colon = trimmed.IndexOf(':', StringComparison.Ordinal);
+        if (colon <= 0)
+            return false;
+
+        key = trimmed[..colon].Trim();
+        return key.Length > 0;
+    }
+
+    /// <summary>
+    /// Build the baseline-bake diagnostic manifest written into the baked
+    /// baseline image at <c>/var/lib/codeybox/baseline-install-commands.sh</c>.
+    /// <para>
+    /// The manifest carries ONLY step ordering and a SHA-256 fingerprint of
+    /// each configured command — it does NOT persist the command text. Raw
+    /// <see cref="MultipassSandboxOptions.ExtraRuncmd"/> entries routinely
+    /// carry operator-supplied registry tokens, basic-auth URLs, and
+    /// env-assigned API keys (including quoted forms like
+    /// <c>GITHUB_TOKEN="ghp_…"</c> or <c>--token 'npm_…'</c> that a regex
+    /// redactor cannot reliably scrub). The baked image is inherited by every
+    /// LLM-controlled clone, which has shell / tool access; a secret in the
+    /// manifest is recoverable from inside the VM. Persisting only hashes
+    /// removes the leak surface entirely while preserving the diagnostic value
+    /// — operators can hash their configured <c>MultipassExtraRuncmd</c>
+    /// entries with <c>sha256sum</c> and confirm step ordering by index.
+    /// </para>
+    /// </summary>
+    private static string BuildBaselineInstallManifest(IReadOnlyList<string> commands)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("#!/bin/bash");
+        sb.AppendLine("# Rendered by CodeyBox for baseline-bake diagnostics.");
+        sb.AppendLine("# Install commands run later via `multipass exec`, not from this file.");
+        sb.AppendLine("# Command text is intentionally NOT persisted: install commands can");
+        sb.AppendLine("# carry registry tokens / basic-auth URLs / API keys, and this file is");
+        sb.AppendLine("# inherited by every cloned (LLM-controlled) agent VM. Each step lists");
+        sb.AppendLine("# only the SHA-256 of the configured command; cross-check against");
+        sb.AppendLine("# `sha256sum` of MultipassExtraRuncmd entries in your CodeyBox config.");
+        var rendered = 0;
+        for (var i = 0; i < commands.Count; i++)
+        {
+            var cmd = commands[i];
+            if (string.IsNullOrWhiteSpace(cmd))
+                continue;
+            rendered++;
+            sb.AppendLine();
+            sb.AppendLine($"# step {rendered} (configured index {i + 1}) sha256={ComputeSha256Hex(cmd)}");
+        }
+        return sb.ToString();
+    }
+
+    private static string ComputeSha256Hex(string value)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     private static void AppendRuncmdCommand(StringBuilder sb, string cmd)
@@ -3699,6 +3915,19 @@ internal static class MultipassRetry
     }
 }
 
+/// <summary>
+/// A provider-neutral baseline-bake validation command: a one-shot in-VM command the
+/// provider runs against a freshly-baked baseline before it is stopped and reused as a
+/// clone source. <see cref="Label"/> is a human-readable identifier used only in log lines
+/// and error messages; the provider does not interpret it. Mapping from agent (or any
+/// other producer) to validation command lives in the composition layer — this record
+/// keeps the sandbox infrastructure layer free of agent-catalog semantics.
+/// </summary>
+public sealed record MultipassBaselineVerificationCommand(
+    string Label,
+    IReadOnlyList<string> Argv,
+    string? FailureHint = null);
+
 public sealed record MultipassSandboxOptions
 {
     public const int DefaultCloudInitReadyRetryAttempts = 3;
@@ -3731,13 +3960,23 @@ public sealed record MultipassSandboxOptions
     public IReadOnlyList<string> ExtraRuncmd { get; init; } = [];
 
     /// <summary>
+    /// Commands that must pass inside a freshly baked baseline before it is
+    /// stopped and reused as a clone source. The composition layer (e.g. the API)
+    /// is responsible for deciding what to validate; for the agent-CLI use case it
+    /// derives this list from configured AgentClass members so enabling a CLI-backed
+    /// agent fails the bake immediately if its binary is missing from PATH. The
+    /// sandbox layer itself only executes the commands and surfaces failures by
+    /// <see cref="MultipassBaselineVerificationCommand.Label"/>.
+    /// </summary>
+    public IReadOnlyList<MultipassBaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
+
+    /// <summary>
     /// Extra cloud-init YAML appended after the orchestrator's own
-    /// directives. Safe for non-runcmd keys (<c>packages:</c>,
-    /// <c>write_files:</c>, <c>apt:</c>, etc.). Do NOT use this to add a
-    /// <c>runcmd:</c> block — cloud-init's PyYAML parser keeps only the
-    /// last occurrence of a duplicated top-level key, so a second runcmd
-    /// would clobber the route swap. Use <see cref="ExtraRuncmd"/> for
-    /// boot-time commands.
+    /// directives. Safe for top-level keys CodeyBox does not generate
+    /// (<c>packages:</c>, <c>apt:</c>, etc.). Do NOT use this to add
+    /// <c>runcmd:</c> or <c>write_files:</c>; those would duplicate generated
+    /// top-level keys and are rejected before launch. Use
+    /// <see cref="ExtraRuncmd"/> for boot-time commands.
     /// </summary>
     public string? ExtraCloudInit { get; init; }
 

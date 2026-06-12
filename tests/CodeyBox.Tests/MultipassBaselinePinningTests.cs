@@ -134,6 +134,34 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public void ComposeBaselineNameFromLiveConfig_ChangesWhenVerificationProbesChange()
+    {
+        var noProbe = MakeOptions(["touch /opt/codeybox-hash"]);
+        var withProbe = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "--version"], "agy missing")]);
+        var withChangedArgv = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "version"], "agy missing")]);
+        var withChangedHint = MakeOptions(
+            ["touch /opt/codeybox-hash"],
+            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "--version"], "agy not runnable")]);
+
+        var noProbeName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            noProbe, "claude", SandboxProfileFlavor.Headless);
+        var withProbeName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withProbe, "claude", SandboxProfileFlavor.Headless);
+        var withChangedArgvName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withChangedArgv, "claude", SandboxProfileFlavor.Headless);
+        var withChangedHintName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            withChangedHint, "claude", SandboxProfileFlavor.Headless);
+
+        Assert.NotEqual(noProbeName, withProbeName);
+        Assert.NotEqual(withProbeName, withChangedArgvName);
+        Assert.NotEqual(withProbeName, withChangedHintName);
+    }
+
+    [Fact]
     public async Task EnsureBaselineImageAsync_WithPinnedBaselineRef_BakesPinnedName()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -284,6 +312,251 @@ public sealed class MultipassBaselinePinningTests : IDisposable
     }
 
     [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerifiesConfiguredAgentBinaries()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var verificationArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+        var multipassArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            baselineVerificationArgv: verificationArgv,
+            multipassArgv: multipassArgv);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        await ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+            "claude",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None);
+
+        var argv = Assert.Single(verificationArgv);
+        Assert.Equal(["agy", "--version"], argv);
+
+        var baselineName = Assert.Single(launchNames);
+        var calls = multipassArgv.ToArray();
+        var installIndex = Array.FindIndex(calls, argv =>
+            argv is [_, "exec", var name, "--", "sudo", "bash", "-c", ..]
+            && name == baselineName);
+        var verificationIndex = Array.FindIndex(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "agy", "--version"]));
+        var stopIndex = Array.FindIndex(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "stop", baselineName]));
+
+        Assert.True(installIndex >= 0, "baseline install command was not recorded");
+        Assert.True(verificationIndex > installIndex, "baseline verification must run after install commands");
+        Assert.True(stopIndex > verificationIndex, "baseline verification must run before the baseline is stopped");
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerificationRunsEveryCommandAndSecondFailurePurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+        var verificationArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+        var multipassArgv = new ConcurrentQueue<IReadOnlyList<string>>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            baselineVerificationArgv: verificationArgv,
+            failBaselineVerificationWhen: argv => argv.SequenceEqual(["codex", "--version"]),
+            multipassArgv: multipassArgv);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-multiple-verification"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                    new MultipassBaselineVerificationCommand(
+                        "codex",
+                        ["codex", "--version"],
+                        "codex binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command (label 'codex') failed", ex.Message);
+        var recordedVerification = verificationArgv.ToArray();
+        Assert.Equal(2, recordedVerification.Length);
+        Assert.Equal(new[] { "agy", "--version" }, recordedVerification[0]);
+        Assert.Equal(new[] { "codex", "--version" }, recordedVerification[1]);
+
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+
+        var calls = multipassArgv.ToArray();
+        Assert.Contains(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "agy", "--version"]));
+        Assert.Contains(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "exec", baselineName, "--", "codex", "--version"]));
+        Assert.DoesNotContain(calls, argv =>
+            argv.SequenceEqual(["/bin/false", "stop", baselineName]));
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_PostBakeVerificationFailure_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineVerification: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity-fail"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        "agy binary not runnable on sandbox PATH"),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command (label 'antigravity') failed", ex.Message);
+        Assert.Contains("agy binary not runnable on sandbox PATH", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task EnsureBaselineImageAsync_VerificationFailureWithoutHint_FallsBackToCanonicalDiagnostic(string? hint)
+    {
+        // VerifyBaselineRequiredBinariesAsync has a fallback branch that
+        // substitutes a canonical diagnostic when the command's FailureHint
+        // is null or whitespace. Without this coverage a typo'd fallback —
+        // or a swap of the branches — would not surface in CI, leaving
+        // operators staring at a missing diagnostic line.
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(
+            states,
+            infoQueries,
+            launchNames,
+            cloneSources,
+            deleteNames,
+            failBaselineVerification: true);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-antigravity-hintless"],
+                baselineVerificationCommands:
+                [
+                    new MultipassBaselineVerificationCommand(
+                        "antigravity",
+                        ["agy", "--version"],
+                        FailureHint: hint),
+                ]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command (label 'antigravity') failed", ex.Message);
+        Assert.Contains("required baseline binary not runnable on sandbox PATH", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+    }
+
+    [Fact]
+    public async Task EnsureBaselineImageAsync_EmptyBaselineVerificationArgv_PurgesPartialBaseline()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var infoQueries = new ConcurrentQueue<string>();
+        var launchNames = new ConcurrentQueue<string>();
+        var cloneSources = new ConcurrentQueue<string>();
+        var deleteNames = new ConcurrentQueue<string>();
+
+        var runner = NewRecordingRunner(states, infoQueries, launchNames, cloneSources, deleteNames);
+        var provider = new MultipassSandboxProvider(
+            MakeOptions(
+                ["touch /opt/codeybox-empty-probe"],
+                baselineVerificationCommands: [new MultipassBaselineVerificationCommand("broken", [])]),
+            NullLogger<MultipassSandboxProvider>.Instance,
+            null,
+            runner);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageProvisioner)provider).EnsureBaselineImageAsync(
+                "claude",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None));
+
+        Assert.Contains("baseline verification command 1 (label 'broken') has empty argv", ex.Message);
+        var baselineName = Assert.Single(launchNames);
+        Assert.Contains(baselineName, deleteNames);
+        Assert.False(states.ContainsKey(baselineName));
+    }
+
+    [Fact]
     public async Task CreateAsync_WithPinnedBaselineForDifferentProfile_FailsClosedBeforeClone()
     {
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -357,14 +630,17 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         Assert.Empty(launchNames);
     }
 
-    private MultipassSandboxOptions MakeOptions(IReadOnlyList<string> extraRuncmd) => new()
-    {
-        MultipassBinary = "/bin/false",
-        StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
-        NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
-        UseBaselineImages = true,
-        ExtraRuncmd = extraRuncmd,
-    };
+    private MultipassSandboxOptions MakeOptions(
+        IReadOnlyList<string> extraRuncmd,
+        IReadOnlyList<MultipassBaselineVerificationCommand>? baselineVerificationCommands = null) => new()
+        {
+            MultipassBinary = "/bin/false",
+            StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),
+            NetworkProfiles = new Dictionary<string, string> { ["claude"] = "cb-claude", ["audit"] = "cb-audit" },
+            UseBaselineImages = true,
+            ExtraRuncmd = extraRuncmd,
+            BaselineVerificationCommands = baselineVerificationCommands ?? [],
+        };
 
     /// <summary>
     /// Common runner: handles every multipass call the provider issues during
@@ -378,11 +654,16 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         ConcurrentQueue<string> cloneSources,
         ConcurrentQueue<string>? deleteNames = null,
         bool failBaselineInstall = false,
+        ConcurrentQueue<IReadOnlyList<string>>? baselineVerificationArgv = null,
+        bool failBaselineVerification = false,
+        Func<IReadOnlyList<string>, bool>? failBaselineVerificationWhen = null,
         bool failDeletePurge = false,
-        bool dropStateOnDeleteAttempt = false)
+        bool dropStateOnDeleteAttempt = false,
+        ConcurrentQueue<IReadOnlyList<string>>? multipassArgv = null)
     {
         return new RecordingMultipassRunner((argv, _, _) =>
         {
+            multipassArgv?.Enqueue(argv.ToArray());
             if (argv is [_, "info", var name, "--format=csv"])
             {
                 infoQueries.Enqueue(name);
@@ -412,6 +693,20 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 return Task.FromResult(failBaselineInstall
                     ? new ProcessRunResult(42, "", "install failed")
                     : new ProcessRunResult(0, "", ""));
+            }
+            if (argv.Count > 4
+                && argv[1] == "exec"
+                && argv[2].StartsWith("cb-baseline-", StringComparison.Ordinal)
+                && argv[3] == "--")
+            {
+                var commandArgv = argv.Skip(4).ToArray();
+                baselineVerificationArgv?.Enqueue(commandArgv);
+                var verificationFailed =
+                    failBaselineVerification
+                    || (failBaselineVerificationWhen?.Invoke(commandArgv) ?? false);
+                return Task.FromResult(verificationFailed
+                    ? new ProcessRunResult(127, "", commandArgv[0] + ": command not found")
+                    : new ProcessRunResult(0, "agy version 1.0.7", ""));
             }
             if (argv is [_, "stop", var stopName])
             {
