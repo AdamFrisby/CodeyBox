@@ -88,6 +88,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                 "usage_contract_version",
                 "ALTER TABLE work_item_costs ADD COLUMN usage_contract_version INTEGER NOT NULL DEFAULT 0;");
             MigrateLegacyInputTokensToFreshOnly();
+            RepairTokenCostRows();
 
             _insertCmd = _conn.CreateCommand();
             // usage_contract_version is hard-coded 1 here so the post-migration
@@ -391,7 +392,8 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         try
         {
             var target = await FindReconcileTargetAsync(row, ct).ConfigureAwait(false);
-            var usd = ResolveReconciledEstimatedUsd(row, target?.ModelId);
+            var modelId = await ResolveReconciledModelIdAsync(row, target?.ModelId, ct).ConfigureAwait(false);
+            var usd = ResolveReconciledEstimatedUsd(row, modelId);
 
             if (target is not null)
             {
@@ -402,12 +404,13 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                         cached_input_tokens = $cached,
                         output_tokens = $output,
                         estimated_usd = $usd,
+                        model_id = $model,
                         raw_metadata_json = $meta,
                         has_extracted_token_usage = 1,
                         usage_contract_version = 1
                     WHERE id = $target
                     """;
-                BindReconcile(update, row, usd);
+                BindReconcile(update, row, usd, modelId);
                 update.Parameters.AddWithValue("$target", target.Id);
                 var changed = await update.ExecuteNonQueryAsync(ct);
                 if (changed > 0)
@@ -422,11 +425,11 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
                      estimated_usd, started_at, ended_at, raw_metadata_json,
                      has_extracted_token_usage, usage_contract_version)
                 VALUES
-                    ($id, $wi, $phase, $iter, $kind, NULL, NULL,
+                    ($id, $wi, $phase, $iter, $kind, NULL, $model,
                      $input, $cached, $output, $usd, $started, $ended, $meta,
                      1, 1)
                 """;
-            BindReconcile(insert, row, usd);
+            BindReconcile(insert, row, usd, modelId);
             insert.Parameters.AddWithValue("$id", $"stream-{row.WorkItemId}-{row.FileName}");
             var ended = row.SummarisedAt;
             var started = ended - row.Summary.TotalDuration;
@@ -468,10 +471,30 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
             reader.IsDBNull(1) ? null : reader.GetString(1));
     }
 
+    private async Task<string?> ResolveReconciledModelIdAsync(
+        AgentStreamSummaryRow row,
+        string? targetModelId,
+        CancellationToken ct)
+    {
+        var modelId = NormalizeModelId(targetModelId);
+        if (modelId is not null)
+            return modelId;
+
+        modelId = await FindUsageModelIdAsync(
+            row.WorkItemId.ToString(),
+            row.AgentKind.Value,
+            CanonicalCostPhase(row.Phase),
+            ct).ConfigureAwait(false);
+        if (modelId is not null)
+            return modelId;
+
+        return _costCalculator?.ResolveDefaultModelId(row.AgentKind);
+    }
+
     private decimal ResolveReconciledEstimatedUsd(AgentStreamSummaryRow row, string? modelId)
     {
-        if (row.Summary.EstimatedUsd is { } streamUsd)
-            return Math.Max(0m, streamUsd);
+        if (row.Summary.EstimatedUsd is { } streamUsd && streamUsd > 0m)
+            return streamUsd;
 
         if (_costCalculator is null || !HasExtractedTokens(row.Summary))
             return 0m;
@@ -615,13 +638,86 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         cmd.ExecuteNonQuery();
     }
 
-    private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row, decimal estimatedUsd)
+    private void RepairTokenCostRows()
+    {
+        if (_costCalculator is null)
+            return;
+
+        var candidates = new List<CostRepairCandidate>();
+        using (var select = _conn.CreateCommand())
+        {
+            select.CommandText = """
+                SELECT id, work_item_id, phase, agent_kind, model_id,
+                       input_tokens, cached_input_tokens, output_tokens,
+                       estimated_usd
+                FROM work_item_costs
+                WHERE has_extracted_token_usage = 1
+                  AND (input_tokens > 0 OR cached_input_tokens > 0 OR output_tokens > 0)
+                  AND (model_id IS NULL OR TRIM(model_id) = '' OR estimated_usd <= 0)
+                """;
+
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                candidates.Add(new CostRepairCandidate(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.GetInt32(5),
+                    reader.GetInt32(6),
+                    reader.GetInt32(7),
+                    Convert.ToDecimal(reader.GetDouble(8))));
+            }
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var kind = new AgentKind(candidate.AgentKind);
+            var existingModelId = NormalizeModelId(candidate.ModelId);
+            var resolvedModelId = existingModelId
+                ?? FindUsageModelId(candidate.WorkItemId, candidate.AgentKind, CanonicalCostPhase(candidate.Phase))
+                ?? _costCalculator.ResolveDefaultModelId(kind);
+
+            var repairedUsd = candidate.EstimatedUsd;
+            var shouldReprice = candidate.EstimatedUsd <= 0m;
+            if (shouldReprice)
+            {
+                repairedUsd = Math.Max(0m, _costCalculator.Calculate(new AgentCostSnapshot(
+                    candidate.InputTokens,
+                    candidate.CachedInputTokens,
+                    candidate.OutputTokens,
+                    resolvedModelId), kind));
+            }
+
+            var shouldUpdateModel = existingModelId is null && resolvedModelId is not null;
+            var shouldUpdateUsd = shouldReprice && repairedUsd != candidate.EstimatedUsd;
+            if (!shouldUpdateModel && !shouldUpdateUsd)
+                continue;
+
+            using var update = _conn.CreateCommand();
+            update.CommandText = """
+                UPDATE work_item_costs
+                SET model_id = $model,
+                    estimated_usd = $usd
+                WHERE id = $id
+                """;
+            update.Parameters.AddWithValue("$model", resolvedModelId is not null ? resolvedModelId : DBNull.Value);
+            update.Parameters.AddWithValue("$usd", (double)repairedUsd);
+            update.Parameters.AddWithValue("$id", candidate.Id);
+            update.ExecuteNonQuery();
+        }
+    }
+
+    private static void BindReconcile(SqliteCommand cmd, AgentStreamSummaryRow row, decimal estimatedUsd, string? modelId)
     {
         BindReconcileIdentity(cmd, row);
         cmd.Parameters.AddWithValue("$input", row.Summary.InputTokens);
         cmd.Parameters.AddWithValue("$cached", row.Summary.CachedInputTokens);
         cmd.Parameters.AddWithValue("$output", row.Summary.OutputTokens);
         cmd.Parameters.AddWithValue("$usd", (double)estimatedUsd);
+        cmd.Parameters.AddWithValue("$model", modelId is not null ? modelId : DBNull.Value);
         cmd.Parameters.AddWithValue("$meta", $$"""{"source":"agent_stream_analyser","fileName":{{JsonSerializer.Serialize(row.FileName)}},"streamPhase":{{JsonSerializer.Serialize(row.Phase)}}}""");
     }
 
@@ -635,6 +731,109 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
     }
 
     private sealed record ReconcileTarget(string Id, string? ModelId);
+
+    private sealed record CostRepairCandidate(
+        string Id,
+        string WorkItemId,
+        string Phase,
+        string AgentKind,
+        string? ModelId,
+        int InputTokens,
+        int CachedInputTokens,
+        int OutputTokens,
+        decimal EstimatedUsd);
+
+    private async Task<string?> FindUsageModelIdAsync(
+        string workItemId,
+        string agentKind,
+        string phase,
+        CancellationToken ct)
+    {
+        if (!AgentUsageModelLookupAvailable())
+            return null;
+
+        using var cmd = CreateUsageModelLookupCommand(workItemId, agentKind, phase);
+        var value = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return NormalizeModelId(value as string);
+    }
+
+    private string? FindUsageModelId(string workItemId, string agentKind, string phase)
+    {
+        if (!AgentUsageModelLookupAvailable())
+            return null;
+
+        using var cmd = CreateUsageModelLookupCommand(workItemId, agentKind, phase);
+        return NormalizeModelId(cmd.ExecuteScalar() as string);
+    }
+
+    private SqliteCommand CreateUsageModelLookupCommand(string workItemId, string agentKind, string phase)
+    {
+        var cmd = _conn.CreateCommand();
+        if (AgentUsageColumnExists("phase"))
+        {
+            cmd.CommandText = """
+                SELECT model_id
+                FROM agent_usage_events
+                WHERE work_item_id = $wi
+                  AND agent_kind = $kind COLLATE NOCASE
+                  AND model_id IS NOT NULL
+                  AND TRIM(model_id) <> ''
+                  AND (phase IS NULL OR phase = $phase OR ($phase = 'audit' AND phase LIKE 'audit-llm-%'))
+                ORDER BY CASE WHEN phase = $phase THEN 0 WHEN phase IS NULL THEN 2 ELSE 1 END,
+                         time_utc DESC
+                LIMIT 1
+                """;
+        }
+        else
+        {
+            cmd.CommandText = """
+                SELECT model_id
+                FROM agent_usage_events
+                WHERE work_item_id = $wi
+                  AND agent_kind = $kind COLLATE NOCASE
+                  AND model_id IS NOT NULL
+                  AND TRIM(model_id) <> ''
+                ORDER BY time_utc DESC
+                LIMIT 1
+                """;
+        }
+
+        cmd.Parameters.AddWithValue("$wi", workItemId);
+        cmd.Parameters.AddWithValue("$kind", agentKind);
+        cmd.Parameters.AddWithValue("$phase", phase);
+        return cmd;
+    }
+
+    private bool AgentUsageModelLookupAvailable() =>
+        AgentUsageTableExists()
+        && AgentUsageColumnExists("work_item_id")
+        && AgentUsageColumnExists("agent_kind")
+        && AgentUsageColumnExists("model_id")
+        && AgentUsageColumnExists("time_utc");
+
+    private bool AgentUsageTableExists()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_usage_events' LIMIT 1;";
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private bool AgentUsageColumnExists(string columnName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(agent_usage_events);";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string? NormalizeModelId(string? modelId) =>
+        string.IsNullOrWhiteSpace(modelId) ? null : modelId.Trim();
 
     private static string CanonicalCostPhase(string phase) =>
         phase.StartsWith("audit-llm-", StringComparison.OrdinalIgnoreCase)

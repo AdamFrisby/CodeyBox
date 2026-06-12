@@ -79,20 +79,20 @@ public sealed class AgentPricingStartupTests : IClassFixture<AgentPricingStartup
     }
 
     [Fact]
-    public void AgentCostCalculator_NullCodexModel_UsesAgentDefaultsRate()
+    public void AgentCostCalculator_NullOpencodeModel_UsesAgentDefaultsProviderPrefixedRate()
     {
         using var scope = _factory.Services.CreateScope();
         var calculator = scope.ServiceProvider.GetRequiredService<AgentCostCalculator>();
 
         var snapshot = new AgentCostSnapshot(
             InputTokens: 1_000_000,
-            CachedInputTokens: 0,
-            OutputTokens: 0,
+            CachedInputTokens: 1_000_000,
+            OutputTokens: 1_000_000,
             ModelId: null);
 
-        var cost = calculator.Calculate(snapshot, AgentKind.Codex);
+        var cost = calculator.Calculate(snapshot, AgentKind.Opencode);
 
-        Assert.Equal(5.0m, cost);
+        Assert.Equal(0.0165m, cost);
     }
 
     [Fact]
@@ -159,6 +159,7 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:AgentDefaults:opencode"] = "deepseek-v4-flash",
             });
         });
         builder.ConfigureTestServices(services =>

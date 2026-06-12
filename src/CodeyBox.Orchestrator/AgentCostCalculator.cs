@@ -153,6 +153,12 @@ public sealed class AgentCostCalculator
         return decimal.Round(cost, 6);
     }
 
+    public string? ResolveDefaultModelId(AgentKind kind)
+    {
+        var defaultModelId = _defaultModels?.GetDefault(kind.Value);
+        return string.IsNullOrWhiteSpace(defaultModelId) ? null : defaultModelId;
+    }
+
     private ModelRateConfig? ResolveRate(AgentPricingOptions opts, AgentKind kind, string? modelId)
     {
         var agentKey = kind.Value;
@@ -160,7 +166,7 @@ public sealed class AgentCostCalculator
         // 1. Model-specific rate from config.
         if (!string.IsNullOrEmpty(modelId)
             && opts.Rates.TryGetValue(agentKey, out var modelMap)
-            && modelMap.TryGetValue(modelId, out var modelRate))
+            && TryGetConfiguredModelRate(modelMap, modelId, out var modelRate))
         {
             return modelRate;
         }
@@ -172,10 +178,10 @@ public sealed class AgentCostCalculator
         // 3. AgentDefaults-derived model rate from config. This covers
         // structured streams or human-readable footers that carry token counts
         // but omit the model id, while keeping the fallback generic per agent.
-        var defaultModelId = _defaultModels?.GetDefault(agentKey);
+        var defaultModelId = ResolveDefaultModelId(kind);
         if (!string.IsNullOrEmpty(defaultModelId)
             && opts.Rates.TryGetValue(agentKey, out var defaultModelMap)
-            && defaultModelMap.TryGetValue(defaultModelId, out var defaultModelRate))
+            && TryGetConfiguredModelRate(defaultModelMap, defaultModelId, out var defaultModelRate))
         {
             return defaultModelRate;
         }
@@ -185,6 +191,39 @@ public sealed class AgentCostCalculator
             return providerDefault;
 
         return null;
+    }
+
+    private static bool TryGetConfiguredModelRate(
+        IReadOnlyDictionary<string, ModelRateConfig> modelMap,
+        string modelId,
+        out ModelRateConfig rate)
+    {
+        if (modelMap.TryGetValue(modelId, out var exactRate))
+        {
+            rate = exactRate;
+            return true;
+        }
+
+        foreach (var (configuredModelId, configuredRate) in modelMap)
+        {
+            if (string.Equals(configuredModelId, modelId, StringComparison.OrdinalIgnoreCase))
+            {
+                rate = configuredRate;
+                return true;
+            }
+
+            var slash = configuredModelId.LastIndexOf('/');
+            if (slash >= 0
+                && slash < configuredModelId.Length - 1
+                && string.Equals(configuredModelId[(slash + 1)..], modelId, StringComparison.OrdinalIgnoreCase))
+            {
+                rate = configuredRate;
+                return true;
+            }
+        }
+
+        rate = null!;
+        return false;
     }
 
     /// <summary>
