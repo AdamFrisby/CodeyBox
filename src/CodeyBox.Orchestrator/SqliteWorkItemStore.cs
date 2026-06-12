@@ -1245,7 +1245,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT project_id, is_paused FROM project_queue_state";
+        // Column is `paused` — owned by SqliteQueueController.CREATE TABLE project_queue_state.
+        cmd.CommandText = "SELECT project_id, paused FROM project_queue_state";
         try
         {
             using var reader = await cmd.ExecuteReaderAsync(ct);

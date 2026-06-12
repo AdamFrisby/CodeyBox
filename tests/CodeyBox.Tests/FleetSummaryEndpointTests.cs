@@ -159,6 +159,26 @@ public sealed class FleetSummaryEndpointTests : IDisposable
         Assert.All(summaries!, r => Assert.False(r.IsPaused));
     }
 
+    // Regression: GetFleetPauseStatesAsync used to SELECT a non-existent
+    // `is_paused` column, returning HTTP 500 on every /fleet/summary call.
+    // The column is `paused`, owned by SqliteQueueController.
+    [Fact]
+    public async Task GetFleetSummary_PausedProject_ReflectedAsPaused()
+    {
+        var pauseResp = await _client.PostAsJsonAsync(
+            "/projects/proj-alpha/queue/pause",
+            new { reason = "regression test" });
+        Assert.Equal(HttpStatusCode.OK, pauseResp.StatusCode);
+
+        var resp = await _client.GetAsync("/fleet/summary");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var summaries = await resp.Content.ReadFromJsonAsync<List<FleetRow>>();
+        Assert.NotNull(summaries);
+        Assert.True(summaries.Single(r => r.ProjectId == "proj-alpha").IsPaused);
+        Assert.False(summaries.Single(r => r.ProjectId == "proj-beta").IsPaused);
+    }
+
     [Fact]
     public async Task GetFleetSummary_BudgetThresholdState_OkWhenCostStoreAvailable()
     {
