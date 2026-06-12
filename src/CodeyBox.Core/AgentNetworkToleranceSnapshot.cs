@@ -76,6 +76,11 @@ public sealed class AgentNetworkToleranceOptions
     public const int CodexDefaultStreamMaxRetries = 15;
 
     /// <summary>
+    /// Maximum retry count accepted by Codex CLI network retry knobs.
+    /// </summary>
+    public const int CodexMaximumRetries = 100;
+
+    /// <summary>
     /// Maximum Codex stream-idle timeout. Matches the maximum work-attempt
     /// timeout accepted by the API so one CLI wait cannot outlive the dispatch
     /// window.

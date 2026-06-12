@@ -38,13 +38,13 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 
             if (string.Equals(agent, AgentNetworkToleranceOptions.CodexAgentKind, StringComparison.OrdinalIgnoreCase))
             {
-                if (tolerance.RequestMaxRetries is < 0 or > 100)
+                if (tolerance.RequestMaxRetries is < 0 or > AgentNetworkToleranceOptions.CodexMaximumRetries)
                 {
-                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and 100");
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumRetries}");
                 }
-                if (tolerance.StreamMaxRetries is < 0 or > 100)
+                if (tolerance.StreamMaxRetries is < 0 or > AgentNetworkToleranceOptions.CodexMaximumRetries)
                 {
-                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and 100");
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumRetries}");
                 }
                 if (tolerance.StreamIdleTimeoutMs is < 0 or > AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs)
                 {

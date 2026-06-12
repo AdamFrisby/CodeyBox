@@ -21,9 +21,9 @@ internal static class SqliteConnectionDisposal
     /// </list>
     /// The connection is being discarded either way, so swallowing these races
     /// keeps the dispose contract clean; callers should still release every
-    /// other owned resource in a <c>finally</c>. <see cref="InvalidOperationException"/>
-    /// that does not originate inside the SQLite driver bubbles unchanged so
-    /// unrelated bugs stay visible.
+    /// other owned resource in a <c>finally</c>. Exceptions that do not
+    /// originate inside the SQLite driver bubble unchanged so unrelated bugs
+    /// stay visible.
     /// </summary>
     internal static void DisposeTolerantOfTeardownRace(IDisposable connection)
     {
@@ -31,7 +31,7 @@ internal static class SqliteConnectionDisposal
         {
             connection.Dispose();
         }
-        catch (NullReferenceException)
+        catch (NullReferenceException ex) when (IsSqliteTeardownRace(ex))
         {
             // Internal Sqlite teardown race; safe to ignore because the connection is being discarded.
         }

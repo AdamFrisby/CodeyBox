@@ -19,9 +19,9 @@ namespace CodeyBox.Tests;
 public sealed class SqliteConnectionDisposalTests
 {
     [Fact]
-    public void DisposeTolerantOfTeardownRace_SwallowsNullReferenceException()
+    public void DisposeTolerantOfTeardownRace_SwallowsSqliteNullReferenceException()
     {
-        var thrower = new ThrowingDisposable(new NullReferenceException("Object reference not set"));
+        var thrower = new ThrowingDisposable(MakeNullReferenceFromSqliteTeardown());
         SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower);
         Assert.True(thrower.DisposeCalled);
     }
@@ -52,6 +52,14 @@ public sealed class SqliteConnectionDisposalTests
             SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower));
     }
 
+    [Fact]
+    public void DisposeTolerantOfTeardownRace_LetsNonSqliteNullReferenceExceptionBubble()
+    {
+        var thrower = new ThrowingDisposable(new NullReferenceException("Object reference not set"));
+        Assert.Throws<NullReferenceException>(() =>
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower));
+    }
+
     /// <summary>
     /// Forges an <see cref="InvalidOperationException"/> whose
     /// <see cref="Exception.StackTrace"/> contains a
@@ -74,6 +82,18 @@ public sealed class SqliteConnectionDisposalTests
         }
     }
 
+    private static NullReferenceException MakeNullReferenceFromSqliteTeardown()
+    {
+        try
+        {
+            throw new MicrosoftDataSqliteSyntheticFrame().ThrowNullReference();
+        }
+        catch (NullReferenceException ex)
+        {
+            return ex;
+        }
+    }
+
     private sealed class MicrosoftDataSqliteSyntheticFrame
     {
         // The full class name is irrelevant; only the runtime-formatted stack
@@ -90,6 +110,16 @@ public sealed class SqliteConnectionDisposalTests
                 "   at Microsoft.Data.Sqlite.SqliteCommand.DisposePreparedStatements(Boolean disposing)\n" +
                 "   at Microsoft.Data.Sqlite.SqliteCommand.Dispose(Boolean disposing)\n");
             throw ioe;
+        }
+
+        public NullReferenceException ThrowNullReference()
+        {
+            var nre = new NullReferenceException("Object reference not set");
+            ExceptionDispatchInfoSetRemoteStackTrace(
+                nre,
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Close()\n" +
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Dispose(Boolean disposing)\n");
+            throw nre;
         }
 
         private static void ExceptionDispatchInfoSetRemoteStackTrace(Exception ex, string trace)

@@ -658,6 +658,7 @@ public sealed class ClaudeAcpTransportTests
     [Fact]
     public async Task AcpClaudeTransport_ApiTimeoutExtendsBridgeTurnTimeout()
     {
+        const int expectedTurnTimeoutSeconds = 1230;
         var sandbox = new BridgeSandbox();
         sandbox.NextBridgeOutput(new[]
         {
@@ -689,10 +690,41 @@ public sealed class ClaudeAcpTransportTests
         using var hello = JsonDocument.Parse(bridgeExec.Stdin!.Split('\n')[0]);
         var root = hello.RootElement;
         Assert.Equal("1200000", root.GetProperty("claudeEnv").GetProperty("API_TIMEOUT_MS").GetString());
-        Assert.Equal(
-            AcpClaudeTransport.ResolveTurnTimeoutSeconds(1_200_000),
-            root.GetProperty("turnTimeoutSeconds").GetInt32());
+        Assert.Equal(expectedTurnTimeoutSeconds, root.GetProperty("turnTimeoutSeconds").GetInt32());
         Assert.True(root.GetProperty("turnTimeoutSeconds").GetInt32() > AcpBridgeScript.TurnTimeoutSeconds);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ApiTimeoutUnsetKeepsDefaultBridgeTurnTimeout()
+    {
+        const int expectedTurnTimeoutSeconds = 900;
+        var sandbox = new BridgeSandbox();
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-timeout-default\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+        var transport = new AcpClaudeTransport();
+        var open = new ClaudeTransportOpenRequest(
+            sandbox, "/work", Credential: null, ModelId: null, ReasoningMode: null,
+            LocalSessionId: "local-timeout-default");
+        await using var session = await transport.OpenAsync(open, CancellationToken.None);
+
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.True(turn.Result.Success);
+        var bridgeExec = sandbox.BridgeExecs.Single();
+        Assert.True(bridgeExec.ExtraEnvironment is null || !bridgeExec.ExtraEnvironment.ContainsKey("API_TIMEOUT_MS"));
+
+        using var hello = JsonDocument.Parse(bridgeExec.Stdin!.Split('\n')[0]);
+        var root = hello.RootElement;
+        Assert.False(root.GetProperty("claudeEnv").TryGetProperty("API_TIMEOUT_MS", out _));
+        Assert.Equal(expectedTurnTimeoutSeconds, root.GetProperty("turnTimeoutSeconds").GetInt32());
     }
 
     [Fact]
