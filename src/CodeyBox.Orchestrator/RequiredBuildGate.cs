@@ -32,6 +32,12 @@ internal enum RequiredBuildPolicy
     DeferToAuditLoop,
 }
 
+internal enum RequiredBuildWorkPhaseOutcome
+{
+    PassedOrSkipped,
+    DeferredFailure,
+}
+
 /// <summary>
 /// Cohesive build-gate service that owns the entire required-build workflow:
 /// applicability probing, phase-specific enforcement (work / audit / merge),
@@ -141,7 +147,12 @@ internal sealed class RequiredBuildGate
     /// iteration (e.g. the resume-after-preempt rework path, which is
     /// immediately followed by <see cref="RunAuditLoopAsync"/>).</para>
     /// </summary>
-    public async Task EnforceForWorkPhaseAsync(
+    /// <returns>
+    /// <see cref="RequiredBuildWorkPhaseOutcome.DeferredFailure"/> only when
+    /// the build failed under <see cref="RequiredBuildPolicy.DeferToAuditLoop"/>;
+    /// otherwise <see cref="RequiredBuildWorkPhaseOutcome.PassedOrSkipped"/>.
+    /// </returns>
+    public async Task<RequiredBuildWorkPhaseOutcome> EnforceForWorkPhaseAsync(
         WorkItem item,
         Project project,
         string repoId,
@@ -154,10 +165,10 @@ internal sealed class RequiredBuildGate
         var result = await VerifyAsync(
             item, project, repoId, baseBranch, workBranch, phase: agentPhase, iteration: null, ct);
         if (result.Status != RequiredBuildVerificationStatus.Failed)
-            return;
+            return RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
 
         if (policy == RequiredBuildPolicy.DeferToAuditLoop)
-            return;
+            return RequiredBuildWorkPhaseOutcome.DeferredFailure;
 
         throw new RequiredBuildFailedException(
             $"{agentPhase} left the branch non-compiling: {BuildFailureSummary(result)}");

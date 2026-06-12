@@ -3493,8 +3493,15 @@ public sealed class PipelineRunner : IPipelineRunner
                     return agentResult.Stdout;
                 }
 
+                var buildOutcome = RequiredBuildWorkPhaseOutcome.PassedOrSkipped;
                 if (checkedOutExistingBranch)
-                    await _requiredBuildGate.EnforceForWorkPhaseAsync(item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
+                {
+                    buildOutcome = await _requiredBuildGate.EnforceForWorkPhaseAsync(
+                        item, project, repoId, baseBranch, branch, agentPhase, buildFailurePolicy, ct);
+                }
+
+                if (buildOutcome == RequiredBuildWorkPhaseOutcome.DeferredFailure)
+                    return agentResult.Stdout;
 
                 var msg = isInitial
                     ? "Agent produced no changes to commit"

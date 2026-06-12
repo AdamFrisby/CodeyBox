@@ -1142,6 +1142,72 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PostActReValidation_PostActReworkBreaksRequiredBuild_FailsBuildBeforeNextRecheck()
+    {
+        // Post-act rework is followed by another check verdict, not by the
+        // audit loop. A required-build failure produced here must therefore
+        // terminal-fail with failureKind=build at the actual pipeline call
+        // site. If this path accidentally used DeferToAuditLoop, the next
+        // check verdict below would be consumed and the broken branch could
+        // continue toward merge.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var requiredBuild = new SequencedRequiredBuildVerifier(
+            RequiredBuildVerificationResult.Passed(0, "work build ok"),
+            RequiredBuildVerificationResult.Passed(0, "audit build ok"),
+            RequiredBuildVerificationResult.Failed(
+                1,
+                "src/Broken.cs(1,1): error CS1061: 'Broken' does not contain a definition"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            maxAuditIterations: 3,
+            requiredBuildVerifier: requiredBuild);
+
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "initial yes", "high"));
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Check",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-postact-build",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Question = "Vulnerable?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var allItems = new List<WorkItem>();
+        await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
+        var followup = Assert.Single(allItems, i => i.OriginCheckWorkItemId == check.Id);
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("fix.cs", "v1"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(true, "still vulnerable", "high"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("build.fail", "broken\n"));
+        tp.Agent.CheckPlan.Enqueue(BuildVerdictStdout(false, "would pass if rechecked", "high"));
+
+        var checkInvocationsBefore = tp.Agent.CheckInvocations.Count;
+        await tp.Pipeline.RunAsync(followup, CancellationToken.None);
+
+        var finalFollowup = await tp.Store.GetAsync(followup.Id);
+        Assert.Equal(WorkItemState.Failed, finalFollowup!.State);
+        Assert.Equal("build", finalFollowup.FailureKind);
+        Assert.Contains("rework left the branch non-compiling", finalFollowup.LastError!);
+        Assert.Contains("error CS1061", finalFollowup.LastError!);
+        Assert.Equal(checkInvocationsBefore + 1, tp.Agent.CheckInvocations.Count);
+        Assert.Single(finalFollowup.ReCheckVerdicts);
+        Assert.Single(tp.Agent.CheckPlan);
+        Assert.Equal(3, requiredBuild.VerifyCalls);
+    }
+
+    [Fact]
     public async Task PostActReValidation_RegularItemWithoutOrigin_GatesSkipped_NoCheckInvocation()
     {
         // Sanity-pin: items without OriginCheckWorkItemId never trigger
@@ -1294,6 +1360,37 @@ public sealed class CheckAndActPipelineTests : IDisposable
             if (Results.Count == 0)
                 throw new InvalidOperationException("ScriptedCompletionRunner: ran out of completion results");
             return Task.FromResult(Results.Dequeue());
+        }
+    }
+
+    private sealed class SequencedRequiredBuildVerifier : IRequiredBuildVerifier
+    {
+        private readonly Queue<RequiredBuildVerificationResult> _results;
+
+        public SequencedRequiredBuildVerifier(params RequiredBuildVerificationResult[] results)
+            => _results = new Queue<RequiredBuildVerificationResult>(results);
+
+        public int VerifyCalls { get; private set; }
+
+        public Task<RequiredBuildProbeResult> ProbeAsync(
+            RequiredBuildProbeRequest request,
+            CancellationToken ct)
+        {
+            _ = request;
+            _ = ct;
+            return Task.FromResult(RequiredBuildProbeResult.Applies);
+        }
+
+        public Task<RequiredBuildVerificationResult> VerifyAsync(
+            RequiredBuildVerificationRequest request,
+            CancellationToken ct)
+        {
+            _ = request;
+            _ = ct;
+            VerifyCalls++;
+            if (_results.Count == 0)
+                return Task.FromResult(RequiredBuildVerificationResult.Passed(0, "ok"));
+            return Task.FromResult(_results.Dequeue());
         }
     }
 

@@ -245,12 +245,13 @@ the next audit iteration's build check picks it up as a blocking finding
 through the same `RunForAuditAsync` path, giving the loop another chance
 to converge within the existing `MaxIterations` budget.
 
-This unifies the rework-failure policy: an unsuccessful rework with
-iterations remaining loops back, it does not terminate. Only when the
-iteration budget is exhausted does the audit ceiling take over — parking
-the item at `NeedsOperatorInput` if convergence signals are visible (the
-blocking findings, fingerprints, or work-branch tip changed across
-iterations) or finishing at `AuditFailed` if no progress is detectable.
+This loop-back is scoped to required-build failures from audit-driven
+rework, including the case where the rework leaves an already
+non-compiling branch unchanged. Only when the iteration budget is
+exhausted does the audit ceiling take over — parking the item at
+`NeedsOperatorInput` if convergence signals are visible (the blocking
+findings, fingerprints, or work-branch tip changed across iterations) or
+finishing at `AuditFailed` if no progress is detectable.
 
 **Scope.** The loop-back applies to the rework path only — an initial
 work phase that leaves the branch non-compiling still terminal-fails

@@ -273,6 +273,8 @@ public sealed class RequiredBuildGateTests : IDisposable
             sandboxProvider: new PathInjectingSandboxProvider(fakeDotnet.Path, fakeDotnet.Environment));
 
         var item = NewItem("feature/rework-build-recover");
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
         // Call 1 (work): write initial.txt → compiles. WorkComplete.
         // Audit iter 1: OneTimeFailing fires (blocking). Build gate passes.
         //   → rework iter 2.
@@ -306,9 +308,27 @@ public sealed class RequiredBuildGateTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(3, callCount);
         // No terminal build-failure trail on the item.
         Assert.True(string.IsNullOrEmpty(final.LastError) || !final.LastError.Contains("non-compiling"),
             $"expected loop-back recovery, got LastError={final.LastError}");
+
+        var fixedFile = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:fixed.txt");
+        Assert.Equal(0, fixedFile.code);
+        Assert.Equal("fixed\n", fixedFile.stdout);
+        var deletedBuildFail = await TestSupport.RunGitNoThrow(barePath, "show", $"{item.WorkBranch}:build.fail");
+        Assert.NotEqual(0, deletedBuildFail.code);
+
+        var dispatches = await tp.Store.GetIterationsAsync(item.Id);
+        var workAttemptStartedAt = dispatches
+            .Single(i => i.Iteration == AuditProgressIterationNumbers.WorkPhase)
+            .DispatchedAt;
+        var progress = await tp.Store.GetAuditProgressAsync(item.Id, workAttemptStartedAt);
+        var buildFailureIteration = Assert.Single(progress, p => p.Iteration == 2);
+        Assert.Contains(
+            buildFailureIteration.BlockingFindingsDetails,
+            f => f.AuditorName == RequiredBuildGateIdentity.AuditorName
+                && f.Title.Contains("required build failed", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -356,14 +376,16 @@ public sealed class RequiredBuildGateTests : IDisposable
             RequiredBuildVerificationResult.Failed(1, "fake build error"));
         var gate = new RequiredBuildGate(verifier, TimeSpan.FromMinutes(5), persistReport: null);
 
-        // No exception → DeferToAuditLoop returns silently on failure.
-        await gate.EnforceForWorkPhaseAsync(
+        // No exception → DeferToAuditLoop returns a deferred build failure
+        // for the caller's next audit iteration to surface as a finding.
+        var outcome = await gate.EnforceForWorkPhaseAsync(
             item, project, repoId: "ignored",
             baseBranch: item.BaseBranch!, workBranch: item.WorkBranch!,
             agentPhase: "rework",
             policy: RequiredBuildPolicy.DeferToAuditLoop,
             ct: CancellationToken.None);
 
+        Assert.Equal(RequiredBuildWorkPhaseOutcome.DeferredFailure, outcome);
         Assert.Equal(1, verifier.VerifyCalls);
     }
 
@@ -1317,13 +1339,10 @@ public sealed class RequiredBuildGateTests : IDisposable
         // non-compiling rework at the budget ceiling regardless of
         // convergence — exactly the fail-if-no-progress half of the new
         // policy that needs to be pinned.
-        Assert.NotEqual(WorkItemState.AuditPassed, final!.State);
-        Assert.NotEqual(WorkItemState.Done, final.State);
-        Assert.NotEqual(WorkItemState.NeedsOperatorInput, final.State);
-        Assert.True(
-            final.State is WorkItemState.AuditFailed or WorkItemState.Failed,
-            $"expected AuditFailed or Failed (no-progress audit ceiling), got {final.State}");
-        Assert.Contains("required build failed", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.NotEqual("build", final.FailureKind);
+        Assert.Contains("Audit did not pass after 1 iterations", final.LastError!);
+        Assert.Contains("required build failed", final.LastError!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
