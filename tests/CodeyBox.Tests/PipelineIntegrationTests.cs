@@ -297,6 +297,39 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
         Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("work", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+    }
+
+    [Fact]
+    public async Task MergePhaseTransientAgentFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("agent.txt", "work complete\n"));
+        tp.Agent.MergeResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "merge transport failed",
+            Stdout: null,
+            Stderr: "Transport channel closed"));
+
+        var item = NewItem("feature/transient-merge");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("merge", final.TransientRetryFrom);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);

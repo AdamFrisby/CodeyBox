@@ -487,6 +487,7 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
+        Assert.Equal("conflict_rework", final.TransientRetryFrom);
         Assert.Equal(1, final.ConflictReworkAttempts);
 
         var conflictRow = Assert.Single(
@@ -494,6 +495,64 @@ public sealed class MergeConflictReworkTests : IDisposable
             r => r.Phase == "conflict_rework");
         Assert.Equal("failure:transient", conflictRow.Outcome);
         Assert.NotNull(conflictRow.EndedAt);
+    }
+
+    [Fact]
+    public async Task ConflictRework_TransientRetry_ReEntersConflictReworkDespiteReservedAttempt()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
+        var time = new ManualTimeProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        auditor.GitRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
+
+        tp.Agent.ConflictReworkPlan.Enqueue((_, _, _) => Task.FromResult(new AgentResult(
+            Success: false,
+            Summary: "transport closed",
+            Stdout: null,
+            Stderr: "Transport channel closed")));
+
+        var item = NewItem("codeybox/" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, parked!.State);
+        Assert.Equal(1, parked.ConflictReworkAttempts);
+        Assert.Equal("conflict_rework", parked.TransientRetryFrom);
+
+        time.Advance(TimeSpan.FromSeconds(31));
+        await RunTransientPeriodicSweepAsync(tp.RetryScheduler!);
+
+        var resumed = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.ReworkingForConflict, resumed!.State);
+        Assert.Equal(1, resumed.TransientRetryAttempts);
+        Assert.Equal(1, resumed.ConflictReworkAttempts);
+
+        tp.Agent.ConflictReworkPlan.Enqueue(async (sandbox, workDir, ct) =>
+        {
+            await WriteFileAsync(sandbox, workDir, "README.md", "main side\nwork side\n", ct);
+            await Run(sandbox, "git", "-C", workDir, "add", "README.md");
+            await Run(sandbox, "git", "-C", workDir,
+                "-c", "core.editor=true",
+                "-c", "sequence.editor=true",
+                "rebase", "--continue");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        await tp.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, final.ConflictReworkAttempts);
     }
 
     [Fact]
@@ -1004,6 +1063,14 @@ public sealed class MergeConflictReworkTests : IDisposable
         if (!r.Success)
             throw new InvalidOperationException(
                 $"sandbox command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}\n{r.Stdout}");
+    }
+
+    private static async Task RunTransientPeriodicSweepAsync(QuotaRetryScheduler scheduler)
+    {
+        var method = typeof(QuotaRetryScheduler).GetMethod(
+            "RunTransientPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        await (Task)method.Invoke(scheduler, [CancellationToken.None])!;
     }
 
     private static async Task WriteFileAsync(ISandbox sandbox, string workDir, string relPath, string content, CancellationToken ct)

@@ -165,6 +165,13 @@ public sealed record WorkItem
     public DateTimeOffset? TransientRetryFirstFailedAt { get; init; }
 
     /// <summary>
+    /// Pipeline entry point the transient retry scheduler should use when the
+    /// backoff delay expires. Values match the manual retry API plus
+    /// "conflict_rework" for merge-conflict repair retries.
+    /// </summary>
+    public string? TransientRetryFrom { get; init; }
+
+    /// <summary>
     /// Agent kind whose operator pause parked this item in
     /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
     /// <see cref="Agent"/> because later phases can be blocked by an audit,
@@ -612,6 +619,7 @@ public sealed record WorkItem
             QuotaRetryPhase = carriesQuotaRetry ? QuotaRetryPhase : null,
             NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
             TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
+            TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,
             // CancellationReason is only meaningful when transitioning to Cancelled.

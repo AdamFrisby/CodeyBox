@@ -42,6 +42,41 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditAgentTransientFailure_ParksWaitingForTransientRetry()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var time = new ManualTimeProvider();
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [new LlmTransientFailureAuditor()],
+            involvement: involvement,
+            transientRetryOptions: TransientRetryOptions(),
+            retryTimeProvider: time);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
+
+        var item = NewItem();
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
+        Assert.Equal("transient", final.FailureKind);
+        Assert.Equal("audit", final.TransientRetryFrom);
+        Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
+        Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
+        Assert.Equal(0, final.TransientRetryAttempts);
+
+        var auditRows = (await involvement.ListByWorkItemAsync(item.Id, CancellationToken.None))
+            .Where(r => r.Phase == "audit:llm-transient")
+            .ToArray();
+        Assert.NotEmpty(auditRows);
+        Assert.All(auditRows, r => Assert.Equal("failure:transient", r.Outcome));
+    }
+
+    [Fact]
     public async Task AuditFailsThenPassesAfterRework_ReachesDone()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2243,6 +2278,37 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         }
     }
 
+    private sealed class LlmTransientFailureAuditor : IAuditor
+    {
+        public string Name => "llm-transient";
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
+
+        public Task<AuditResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            AuditContext context,
+            CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            return Task.FromResult(new AuditResult(
+                Passed: false,
+                Findings:
+                [
+                    new AuditFinding(
+                        "llm-transient",
+                        AuditSeverity.Error,
+                        "review agent failed to run",
+                        "transient transport failure")
+                ],
+                AgentSummary: "request timed out",
+                AgentStderr: "request timed out while reading audit stream"));
+        }
+    }
+
     private sealed class DelegateAuditor : IAuditor
     {
         private readonly Func<ISandbox, AuditContext, CancellationToken, Task<AuditResult>> _body;
@@ -2759,5 +2825,16 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         BaseBranch = "main",
         WorkBranch = "feature/x",
         PushUpstream = false,
+    };
+
+    private static AutoRetryOnTransientFailureOptions TransientRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
     };
 }

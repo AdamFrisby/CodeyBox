@@ -1947,6 +1947,7 @@ internal static class WorkItemEndpoints
             NextTransientRetryAt: item.NextTransientRetryAt,
             TransientRetryAttempts: item.TransientRetryAttempts,
             TransientRetryFirstFailedAt: item.TransientRetryFirstFailedAt,
+            TransientRetryFrom: item.TransientRetryFrom,
             AgentPauseTarget: item.AgentPauseTarget?.Value,
             AgentPauseRetryFrom: item.AgentPauseRetryFrom,
             Usage: usage?.Iteration,
@@ -2346,6 +2347,7 @@ public sealed record WorkItemDto(
     DateTimeOffset? NextTransientRetryAt = null,
     int TransientRetryAttempts = 0,
     DateTimeOffset? TransientRetryFirstFailedAt = null,
+    string? TransientRetryFrom = null,
     string? AgentPauseTarget = null,
     string? AgentPauseRetryFrom = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

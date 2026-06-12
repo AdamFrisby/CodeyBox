@@ -152,6 +152,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN next_transient_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_first_failed_at TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_from TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_pause_target TEXT;");
             // Resume entry-point for WaitingForAgentResume rows. Separate from
             // quota_retry_from so agent-pause parking does not have to overload
@@ -423,7 +424,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
-                        next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at,
+                        next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, baseline_image_ref,
@@ -438,7 +439,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
-                        $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at,
+                        $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $baseline_image_ref,
@@ -560,6 +561,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -632,6 +634,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                    transient_retry_from = $transient_retry_from,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -1922,6 +1925,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$next_transient_retry_at", (object?)item.NextTransientRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_retry_attempts", item.TransientRetryAttempts);
         cmd.Parameters.AddWithValue("$transient_retry_first_failed_at", (object?)item.TransientRetryFirstFailedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$transient_retry_from", (object?)item.TransientRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_target", (object?)item.AgentPauseTarget?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_retry_from", (object?)item.AgentPauseRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
@@ -2002,6 +2006,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         NextTransientRetryAt = ReadNullableDateTimeOffset(r, "next_transient_retry_at"),
         TransientRetryAttempts = ReadInt32OrDefault(r, "transient_retry_attempts", defaultValue: 0),
         TransientRetryFirstFailedAt = ReadNullableDateTimeOffset(r, "transient_retry_first_failed_at"),
+        TransientRetryFrom = ReadNullableString(r, "transient_retry_from"),
         AgentPauseTarget = ReadNullableAgentKind(r, "agent_pause_target"),
         AgentPauseRetryFrom = ReadNullableString(r, "agent_pause_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),

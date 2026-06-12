@@ -1088,10 +1088,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             trigger,
             item.Id,
             item.TransientRetryAttempts + 1);
+        var retryFrom = string.IsNullOrWhiteSpace(item.TransientRetryFrom)
+            ? null
+            : NormalizeRetryFrom(item.TransientRetryFrom);
 
         var (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
             item,
-            from: null,
+            from: retryFrom,
             trigger: $"transient-{trigger}",
             autoRetryKind: WorkItemAutoRetryKind.Transient,
             ct: ct);
@@ -1119,7 +1122,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                         reason = "transient",
                         attemptNumber = updated?.TransientRetryAttempts ?? item.TransientRetryAttempts + 1,
                         triggeredBy = trigger,
-                        from = "auto",
+                        from = retryFrom ?? "auto",
                         actualFrom
                     }
                 }, CancellationToken.None);
@@ -1139,6 +1142,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
     {
         "audit" => "audit",
+        "conflict_rework" => "conflict_rework",
         "merge" => "merge",
         "upstream" => "upstream",
         _ => "work",

@@ -74,6 +74,29 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task NotifyTransientFailure_AppliesDecorrelatedJitterWithinBaseAndTriplePreviousDelay()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(5),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.Decorrelated,
+        }, jitterRandom: () => 0.5);
+        var item = NewTransientItem() with { TransientRetryAttempts = 1 };
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(_time.GetUtcNow().AddSeconds(60), stored!.NextTransientRetryAt);
+    }
+
+    [Fact]
     public async Task NotifyTransientFailure_AtAttemptCap_MarksTransientExhausted()
     {
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
@@ -242,6 +265,96 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task PeriodicSweep_WhenGlobalQueuePaused_DoesNotConsumeAttempt()
+    {
+        var queueController = new FakeQueueController(globalPaused: true);
+        using var fixture = BuildScheduler(EnabledRetryOptions(), queueController: queueController);
+        var item = NewTransientItem() with { NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1) };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenProjectQueuePaused_DoesNotConsumeAttempt()
+    {
+        var queueController = new FakeQueueController(projectPaused: true);
+        using var fixture = BuildScheduler(EnabledRetryOptions(), queueController: queueController);
+        var item = NewTransientItem() with { NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1) };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenProjectRepositoryMissing_DoesNotConsumeAttempt()
+    {
+        using var fixture = BuildScheduler(EnabledRetryOptions(), includeProjects: false);
+        var item = NewTransientItem() with { NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1) };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenProjectMissing_DoesNotConsumeAttempt()
+    {
+        using var fixture = BuildScheduler(
+            EnabledRetryOptions(),
+            projects: new InMemoryProjectRepository());
+        var item = NewTransientItem() with { NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1) };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenRetrierRejectsResume_DoesNotConsumeAttempt()
+    {
+        var gitHost = new RecordingGitHost { RepositoryExists = false };
+        using var fixture = BuildScheduler(EnabledRetryOptions(), gitHost: gitHost);
+        var item = NewTransientItem() with
+        {
+            WorkBranch = "codeybox/prior-work",
+            TransientRetryFrom = "audit",
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, stored!.State);
+        Assert.Equal(0, stored.TransientRetryAttempts);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
     public async Task NotifyTransientFailure_WhenDisabled_LeavesTransientFailureUnscheduled()
     {
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
@@ -356,19 +469,21 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         AutoRetryOnTransientFailureOptions transientOptions,
         RecordingGitHost? gitHost = null,
         IQueueController? queueController = null,
-        Func<double>? jitterRandom = null)
+        Func<double>? jitterRandom = null,
+        IProjectRepository? projects = null,
+        bool includeProjects = true)
     {
         var store = new SqliteWorkItemStore(Path.Combine(_workspace, $"state-{Guid.NewGuid():N}.db"));
         var queue = new InMemoryTaskQueue();
         gitHost ??= new RecordingGitHost();
         var retrier = new WorkItemRetrier(store, queue, gitHost, NullLogger<WorkItemRetrier>.Instance);
-        var projects = new InMemoryProjectRepository(new Project
+        projects ??= includeProjects ? new InMemoryProjectRepository(new Project
         {
             Id = TestProjectId,
             DisplayName = "Transient retry",
             RepositoryUrl = "file:///tmp/transient-retry",
             DefaultAgent = AgentKind.Claude,
-        });
+        }) : null;
         var opts = new OrchestratorOptions
         {
             AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions { Enabled = false },
@@ -408,6 +523,17 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         PushUpstream = false,
     };
 
+    private static AutoRetryOnTransientFailureOptions EnabledRetryOptions() => new()
+    {
+        Enabled = true,
+        BaseDelay = TimeSpan.FromSeconds(30),
+        MaxDelay = TimeSpan.FromMinutes(15),
+        Multiplier = 2,
+        MaxAutoRetriesPerWorkItem = 5,
+        MaxElapsedTime = TimeSpan.FromHours(1),
+        JitterMode = TransientRetryJitterMode.None,
+    };
+
     private async Task<bool> WaitForAsync(Func<Task<bool>> condition)
     {
         var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
@@ -437,6 +563,8 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     private sealed class RecordingGitHost : IGitHost
     {
         public bool Ahead { get; init; }
+        public bool RepositoryExists { get; init; } = true;
+        public bool BranchExists { get; init; } = true;
         public string? LastActualFrom { get; private set; }
 
         public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
@@ -464,10 +592,10 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             => Task.CompletedTask;
 
         public Task<bool> RepositoryExistsAsync(WorkItemId id, CancellationToken ct = default)
-            => Task.FromResult(true);
+            => Task.FromResult(RepositoryExists);
 
         public Task<bool> BranchExistsAsync(string repositoryId, string branch, CancellationToken ct = default)
-            => Task.FromResult(true);
+            => Task.FromResult(BranchExists);
 
         public Task<bool> BranchHasCommitsAheadAsync(
             string repositoryId,
@@ -485,5 +613,26 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             string workBranch,
             CancellationToken ct = default)
             => Task.FromResult((string.Empty, string.Empty));
+    }
+
+    private sealed class FakeQueueController : IQueueController
+    {
+        private readonly bool _projectPaused;
+
+        public FakeQueueController(bool globalPaused = false, bool projectPaused = false)
+        {
+            State = globalPaused ? QueueState.Paused : QueueState.Running;
+            _projectPaused = projectPaused;
+        }
+
+        public QueueState State { get; }
+        public DateTimeOffset? PausedAt => null;
+        public string? PausedReason => null;
+        public Task PauseAsync(string reason, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ResumeAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
+            => Task.FromResult<ProjectQueueState?>(new ProjectQueueState(projectId, _projectPaused, null, null));
     }
 }

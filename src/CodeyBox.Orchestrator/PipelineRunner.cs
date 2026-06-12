@@ -4715,6 +4715,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
         if (!result.Success)
         {
+            ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
             var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
             throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
         }
@@ -9593,6 +9594,8 @@ public sealed class PipelineRunner : IPipelineRunner
     {
         if (_quotaClassifier.Detect(kind, result.AgentStderr, result.AgentStdout) is not null)
             return "failure:quota";
+        if (AgentFailureClassifier.Classify(result.AgentStderr, result.AgentStdout).Kind == AgentFailureKind.TransientNetwork)
+            return "failure:transient";
         if (IsLlmAgentExecutionFailure(result))
             return "failure:agent";
         return "success";
@@ -13469,7 +13472,10 @@ Original merge-phase failure (for context):
             var next = current.With(
                 WorkItemState.WaitingForTransientRetry,
                 error,
-                failureKind: "transient");
+                failureKind: "transient") with
+            {
+                TransientRetryFrom = RetryFromForTransientPhase(phase, current.State),
+            };
 
             var updated = await _store.TryUpdateIfStateAsync(next, current.State, transitionCt);
             if (!updated)
@@ -13600,6 +13606,17 @@ Original merge-phase failure (for context):
         string.Equals(phase, "audit", StringComparison.OrdinalIgnoreCase)
             ? WellKnownCapabilities.Audit
             : null;
+
+    internal static string RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
+    {
+        "audit" => "audit",
+        "rework" => "audit",
+        ConflictReworkPhaseKey => "conflict_rework",
+        "post-act-recheck" => "merge",
+        "merge" => "merge",
+        "upstream" => "upstream",
+        _ => AgentPauseResumeMapper.RetryFromForState(currentState),
+    };
 
     /// <summary>
     /// Maps the work item's current state to the phase string used when parking

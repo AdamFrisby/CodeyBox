@@ -100,6 +100,7 @@ public sealed class WorkItemRetrier
             "work" => WorkItemState.Queued,
             "rework" => WorkItemState.WorkComplete,
             "audit" => WorkItemState.WorkComplete,
+            "conflict_rework" => WorkItemState.ReworkingForConflict,
             "merge" => WorkItemState.AuditPassed,
             "upstream" => WorkItemState.Merged,
             _ => (WorkItemState?)null,
@@ -154,7 +155,13 @@ public sealed class WorkItemRetrier
                 : item.QuotaRetryAttempts,
             TransientRetryAttempts = autoRetryKind == WorkItemAutoRetryKind.Transient
                 ? item.TransientRetryAttempts + 1
-                : item.TransientRetryAttempts,
+                : 0,
+            TransientRetryFirstFailedAt = autoRetryKind == WorkItemAutoRetryKind.Transient
+                ? item.TransientRetryFirstFailedAt
+                : null,
+            TransientRetryFrom = autoRetryKind == WorkItemAutoRetryKind.Transient
+                ? item.TransientRetryFrom
+                : null,
             TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
             StartedAt = null

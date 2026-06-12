@@ -111,6 +111,46 @@ public sealed class RetryWaitingForQuotaResetEndpointTests : IDisposable
     }
 
     [Fact]
+    public async Task Retry_WaitingForTransientRetry_TransitionsToQueuedAndClearsTransientRetryFields()
+    {
+        var item = WaitingTransientRetryItem();
+        await _factory.Store.CreateAsync(item);
+
+        var queue = _factory.Services.GetRequiredService<ITaskQueue>();
+        var resp = await _client.PostAsJsonAsync($"/workitems/{item.Id}/retry", new { from = "work" });
+
+        Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+        Assert.Equal(1, queue.Count);
+
+        var readBack = await _factory.Store.GetAsync(item.Id);
+        Assert.NotNull(readBack);
+        Assert.Equal(WorkItemState.Queued, readBack!.State);
+        Assert.Null(readBack.FailureKind);
+        Assert.Null(readBack.NextTransientRetryAt);
+        Assert.Null(readBack.TransientRetryFirstFailedAt);
+        Assert.Null(readBack.TransientRetryFrom);
+        Assert.Equal(0, readBack.TransientRetryAttempts);
+    }
+
+    [Fact]
+    public async Task GetWorkItem_WaitingForTransientRetry_IncludesTransientRetryFields()
+    {
+        var item = WaitingTransientRetryItem();
+        await _factory.Store.CreateAsync(item);
+
+        var dto = await _client.GetFromJsonAsync<WorkItemDtoForRetryTest>($"/workitems/{item.Id}");
+
+        Assert.NotNull(dto);
+        Assert.Equal(item.Id.ToString(), dto!.Id);
+        Assert.Equal("WaitingForTransientRetry", dto.State);
+        Assert.Equal("transient", dto.FailureKind);
+        Assert.Equal(item.NextTransientRetryAt, dto.NextTransientRetryAt);
+        Assert.Equal(item.TransientRetryAttempts, dto.TransientRetryAttempts);
+        Assert.Equal(item.TransientRetryFirstFailedAt, dto.TransientRetryFirstFailedAt);
+        Assert.Equal("merge", dto.TransientRetryFrom);
+    }
+
+    [Fact]
     public async Task Retry_AcceptedResponseBody_ReportsQueuedResumeState()
     {
         // The Accepted response carries `{ id, from, state }` — the state
@@ -155,5 +195,32 @@ public sealed class RetryWaitingForQuotaResetEndpointTests : IDisposable
         StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
     };
 
+    private static WorkItem WaitingTransientRetryItem()
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        return new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "transient",
+            Prompt = "p",
+            State = WorkItemState.WaitingForTransientRetry,
+            LastError = "Agent claude reported transient transport failure",
+            FailureKind = "transient",
+            NextTransientRetryAt = firstFailedAt.AddMinutes(5),
+            TransientRetryAttempts = 5,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryFrom = "merge",
+        };
+    }
+
     private sealed record RetryAcceptedBody(string Id, string From, string State);
+    private sealed record WorkItemDtoForRetryTest(
+        string Id,
+        string State,
+        string? FailureKind,
+        DateTimeOffset? NextTransientRetryAt,
+        int TransientRetryAttempts,
+        DateTimeOffset? TransientRetryFirstFailedAt,
+        string? TransientRetryFrom);
 }

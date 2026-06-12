@@ -409,6 +409,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
     public Queue<AgentResult> WorkResults { get; } = new();
+    public Queue<AgentResult> MergeResults { get; } = new();
     public Queue<Func<IReadOnlyList<ConflictResolverFile>, IReadOnlyDictionary<string, string>>> ConflictResolutionPlan { get; } = new();
     /// <summary>
     /// Handlers invoked when the scripted agent recognises the conflict-rework
@@ -442,6 +443,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// running out throws.
     /// </summary>
     public Queue<string> CheckPlan { get; } = new();
+    public Queue<AgentResult> CheckResults { get; } = new();
     public List<bool> CaptureStructuredStreamCalls { get; } = new();
     public Func<ISandbox, string, CancellationToken, Task>? BeforeWorkAsync { get; set; }
     public int StructuredStreamSupportProbeCount { get; private set; }
@@ -653,6 +655,14 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     {
         _ = ct;
         CheckInvocations.Add(prompt);
+        if (CheckResults.Count > 0)
+        {
+            var result = CheckResults.Dequeue();
+            if (!string.IsNullOrEmpty(result.Stdout))
+                stdoutChunkCallback?.Invoke(result.Stdout);
+            return Task.FromResult(result);
+        }
+
         if (CheckPlan.Count == 0)
             return Task.FromResult(new AgentResult(false, "ScriptedAgent: ran out of check-plan entries", null, null));
         var verdictStdout = CheckPlan.Dequeue();
@@ -804,6 +814,9 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
 
     private async Task<AgentResult> HandleMergeAsync(ISandbox sandbox, string workingDirectory, string prompt, CancellationToken ct)
     {
+        if (MergeResults.Count > 0)
+            return MergeResults.Dequeue();
+
         var strategy = _mergeStrategies.Count > 0 ? _mergeStrategies.Dequeue() : MergeStrategy.RealMerge;
         if (strategy == MergeStrategy.NoOp)
             return new AgentResult(true, "no-op", null, null);
