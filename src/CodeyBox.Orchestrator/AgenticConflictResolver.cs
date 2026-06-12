@@ -22,6 +22,13 @@ public sealed record AgenticConflictResolverOptions
     public int MaxIterations { get; init; } = 3;
 
     /// <summary>
+    /// Bounded retry cap per agent candidate during conflict resolution.
+    /// Walk candidates in quality-tier order, giving each candidate at most
+    /// this many attempts before escalating. Default 2 (1 fresh + 1 retry).
+    /// </summary>
+    public int MaxAttemptsPerAgent { get; init; } = 2;
+
+    /// <summary>
     /// When true, after marker/unmerged-path verification passes the resolver
     /// runs <see cref="BuildVerifyArgv"/> inside the sandbox and treats a
     /// non-zero exit as a resolution failure. Defaults to false — the merge
@@ -117,7 +124,14 @@ public sealed record AgenticConflictResolverCandidate(
     AgentCredential? Credential,
     string? ModelId = null,
     string? ReasoningMode = null,
-    string? AgentInstanceId = null);
+    string? AgentInstanceId = null,
+    int QualityScore = 100);
+
+public sealed record AgenticConflictCandidatesResult(
+    IReadOnlyList<AgenticConflictResolverCandidate> Candidates,
+    bool HasTransientlyUnavailableStrongerAgent = false,
+    string? DeferReason = null,
+    DateTimeOffset? EarliestResetAt = null);
 
 /// <summary>
 /// Resolves an in-sandbox mid-rebase/merge conflict by invoking the
@@ -200,6 +214,10 @@ public sealed class AgenticConflictResolver
 
         var options = _options.Current;
         var maxIterations = Math.Max(1, options.MaxIterations);
+        var maxAttemptsPerAgent = Math.Max(1, options.MaxAttemptsPerAgent);
+        var maxQuality = candidates.Max(c => c.QualityScore);
+        var triedStrongest = false;
+
         var attemptTrail = new List<string>();
         int totalIterations = 0;
         AgentResult? lastAgentResult = null;
@@ -210,7 +228,13 @@ public sealed class AgenticConflictResolver
 
         foreach (var candidate in candidates)
         {
+            if (totalIterations >= maxIterations)
+            {
+                break;
+            }
+
             var runner = candidate.Runner;
+            var isStrongest = candidate.QualityScore == maxQuality;
 
             // Cross-kind fallback: the sandbox was provisioned for whichever
             // runner the orchestrator pre-baked at create time. Writing this
@@ -237,16 +261,32 @@ public sealed class AgenticConflictResolver
                 }
             }
 
-            for (var attempt = 1; attempt <= maxIterations; attempt++)
+            for (var attempt = 1; attempt <= maxAttemptsPerAgent; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
+                if (totalIterations >= maxIterations)
+                {
+                    break;
+                }
+
+                // If this is a weaker candidate, and we haven't tried the strongest one yet,
+                // and we are about to use the last iteration, we skip this candidate's remaining attempts
+                // to save room for the strongest candidate.
+                if (!isStrongest && !triedStrongest && totalIterations >= maxIterations - 1)
+                {
+                    _log.LogInformation(
+                        "Agentic conflict resolver: skipping attempt {Attempt} for weaker candidate '{Agent}' (QualityScore {Score}) to reserve the final attempt for the strongest candidate (QualityScore {MaxScore})",
+                        attempt, runner.Kind.Value, candidate.QualityScore, maxQuality);
+                    break;
+                }
+
                 totalIterations++;
 
                 var prompt = BuildAgenticConflictResolverPrompt(
                     context,
                     conflictFiles,
                     attempt,
-                    maxIterations,
+                    maxAttemptsPerAgent,
                     lastVerificationError);
 
                 AgentResult agentResult;
@@ -270,10 +310,10 @@ public sealed class AgenticConflictResolver
                 {
                     _log.LogWarning(ex,
                         "Agentic conflict resolver: agent '{Agent}' threw on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir})",
-                        runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, workingDirectory);
+                        runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, workingDirectory);
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                        attempt, maxIterations,
+                        attempt, maxAttemptsPerAgent,
                         $"threw {ex.GetType().Name}: {ex.Message}",
                         stdoutTail: null,
                         stderrTail: Truncate(ex.ToString(), 4096));
@@ -288,6 +328,11 @@ public sealed class AgenticConflictResolver
                     break;
                 }
 
+                if (isStrongest)
+                {
+                    triedStrongest = true;
+                }
+
                 lastAgentResult = agentResult;
                 if (!agentResult.Success)
                 {
@@ -298,7 +343,7 @@ public sealed class AgenticConflictResolver
                     // here to see auth/network/CLI startup errors.
                     _log.LogWarning(
                         "Agentic conflict resolver: agent '{Agent}' reported failure on attempt {Attempt}/{Max} for {WorkItemId} (sandbox {Sandbox}, workdir {WorkDir}, model {Model}, reasoning {Reasoning}): {Summary}\n--- stdout (tail) ---\n{StdoutTail}\n--- stderr (tail) ---\n{StderrTail}",
-                        runner.Kind.Value, attempt, maxIterations, workItemId,
+                        runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId,
                         sandbox.Id, workingDirectory,
                         candidate.ModelId ?? "(default)", candidate.ReasoningMode ?? "(default)",
                         agentResult.Summary,
@@ -306,7 +351,7 @@ public sealed class AgenticConflictResolver
                         Truncate(agentResult.Stderr, 4096));
                     AuditLog.AgenticConflictResolverAttemptFailed(
                         workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                        attempt, maxIterations,
+                        attempt, maxAttemptsPerAgent,
                         agentResult.Summary,
                         stdoutTail: agentResult.Stdout,
                         stderrTail: agentResult.Stderr);
@@ -324,7 +369,7 @@ public sealed class AgenticConflictResolver
                 {
                     return new AgenticConflictResolverResult(
                         Success: true,
-                        Summary: $"resolved by '{runner.Kind.Value}' on attempt {attempt}/{maxIterations}",
+                        Summary: $"resolved by '{runner.Kind.Value}' on attempt {attempt}/{maxAttemptsPerAgent}",
                         ChosenRunner: runner,
                         ChosenCredential: candidate.Credential,
                         ConflictFiles: conflictFiles,
@@ -344,13 +389,13 @@ public sealed class AgenticConflictResolver
                     agentResult.Stderr);
                 AuditLog.AgenticConflictResolverAttemptFailed(
                     workItemId, runner.Kind, sandbox.Id, workingDirectory,
-                    attempt, maxIterations,
+                    attempt, maxAttemptsPerAgent,
                     $"verification: {verification.Reason}",
                     stdoutTail: agentResult.Stdout,
                     stderrTail: agentResult.Stderr);
                 _log.LogInformation(
                     "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
-                    runner.Kind.Value, attempt, maxIterations, workItemId, sandbox.Id, verification.Reason);
+                    runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, verification.Reason);
             }
         }
 

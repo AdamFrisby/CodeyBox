@@ -2017,6 +2017,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // The same list is reused for every conflict iteration within this
         // rebase.
         IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;
+        AgenticConflictCandidatesResult? candidateResult = null;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -2035,12 +2036,16 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                candidates ??= WrapPromptPreprocessedCandidates(
-                    await BuildAgenticConflictCandidatesAsync(item, project, runner, ct),
-                    item.Id,
-                    AgentPromptPhase.Merge,
-                    iteration: 1,
-                    project);
+                if (candidates is null)
+                {
+                    candidateResult = await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                    candidates = WrapPromptPreprocessedCandidates(
+                        candidateResult.Candidates,
+                        item.Id,
+                        AgentPromptPhase.Merge,
+                        iteration: 1,
+                        project);
+                }
 
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
@@ -2054,8 +2059,19 @@ public sealed class PipelineRunner : IPipelineRunner
                     conflictFiles.Add(path);
 
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
+                {
+                    if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
+                    {
+                        throw new AgentClassExhaustedException(
+                            item.AgentClassId ?? project.DefaultAgentClass ?? "default",
+                            "rebase",
+                            candidateResult.Candidates.Count,
+                            candidateResult.EarliestResetAt,
+                            candidateResult.DeferReason ?? "stronger agent(s) transiently unavailable");
+                    }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
+                }
 
                 chosenResolver = resolveResult.ChosenRunner;
                 chosenCredential = resolveResult.ChosenCredential;
@@ -2086,7 +2102,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // conflict failure — let it propagate so the catch in RunAsync
                 // surfaces failureKind=agent_unavailable instead of overwriting
                 // it as MergeConflictResolutionFailed.
-                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException)
+                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException or AgentClassExhaustedException)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",

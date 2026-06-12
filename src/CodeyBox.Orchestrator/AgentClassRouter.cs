@@ -954,6 +954,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return null;
     }
 
+    public IReadOnlyList<AgentMembership> GetClassMembers(string classId)
+    {
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return agentClass.Members;
+        return [];
+    }
+
     /// <summary>
     /// Returns the set of agent kinds in <paramref name="classId"/> that
     /// declare <paramref name="capability"/> in their
@@ -1240,7 +1248,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 : existing);
     }
 
-    private bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
+    public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
     {
         return TryGetExhaustedUntil(member, nowUtc, out _);
     }
