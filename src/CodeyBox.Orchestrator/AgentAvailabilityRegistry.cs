@@ -327,7 +327,7 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
 
     /// <summary>
     /// Benches <paramref name="kind"/> because a real runtime invocation was
-    /// corroborated as blocked on interactive authentication. This is not a
+    /// classified as blocked on interactive authentication. This is not a
     /// smoke probe result: it is stored under its own non-smoke source so
     /// dispatch still honors it when the operator disables smoke gating.
     /// </summary>
@@ -571,7 +571,7 @@ public interface IAgentAuthAvailabilityRegistry
 {
     /// <summary>
     /// Excludes <paramref name="kind"/> until an operator reset because a
-    /// runtime invocation was corroborated as needing interactive auth.
+    /// runtime invocation was classified as needing interactive auth.
     /// </summary>
     AvailabilityTransition MarkAuthRequired(AgentKind kind, string reason);
 }

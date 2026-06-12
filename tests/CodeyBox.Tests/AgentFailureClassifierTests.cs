@@ -152,7 +152,7 @@ public sealed class AgentFailureClassifierTests
     [Theory]
     [InlineData("not logged into opencode; run `opencode auth login`")]
     [InlineData("Please visit the URL to log in: https://accounts.google.com/o/oauth2/auth?client_id=redacted")]
-    public void AgentAuthFailureClassifier_DetectsDefaultStdoutPatterns_AsNonAuthoritative(string snippet)
+    public void AgentAuthFailureClassifier_DetectsDefaultStdoutPatterns_InStdout(string snippet)
     {
         var detection = new AgentAuthFailureClassifier().DetectDetailed(
             AgentKind.Opencode,

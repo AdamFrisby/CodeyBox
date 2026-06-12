@@ -747,8 +747,7 @@ public sealed class MergeConflictReworkTests : IDisposable
             seed,
             auditors: [auditor],
             webhookDispatcher: webhooks,
-            availabilityRegistry: availability,
-            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
+            availabilityRegistry: availability);
         auditor.GitRoot = tp.GitRoot;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work side\n"));
 

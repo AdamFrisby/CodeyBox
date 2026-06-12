@@ -2406,9 +2406,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mechanicalFixerInputProviders: sp.GetServices<IMechanicalFixerInputProvider>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
     authExclusionAvailability: sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
-    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
-    authCorroborationHostSmoke: sp.GetService<IHostSmokeProbeRunner>(),
-    authCorroborationInVmSmoke: sp.GetService<IInVmSmokeGate>()));
+    authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

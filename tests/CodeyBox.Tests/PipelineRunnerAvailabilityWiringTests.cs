@@ -420,16 +420,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithHostCorroboratedStdoutAuthPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var hostSmoke = HostSmokeProbeRunners.PersistentAuth();
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: hostSmoke);
+        using var fix = BuildPipeline(seed);
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
         fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: "not logged into opencode; run `opencode auth login`",
+            Stdout: transcript,
             Stderr: null));
 
         var item = NewItem(AgentKind.Codex);
@@ -440,7 +441,6 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Equal("infrastructure", final.FailureKind);
-        Assert.Equal(1, hostSmoke.CallCount);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -571,7 +571,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         // phase-name detector call there can't pass off the work-phase test
         // as full coverage.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
+        using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -613,7 +613,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public async Task MergePhaseAgenticResolver_WithAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth());
+        using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
 
@@ -677,7 +677,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_FailsItemWithoutGlobalExclusion()
+    public async Task StdoutOnlyAuthPrompt_WithoutCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
@@ -698,13 +698,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Contains("auth required from agent output", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.True(availability.Available);
+        Assert.False(availability.Available);
+        Assert.Contains("auth required from agent output", availability.Reason);
 
-        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_WithInVmAuthCorroboration_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task StdoutOnlyAuthPrompt_DoesNotNeedInVmCorroboration_ToExcludeAgentAndAlert()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new AuthCorroboratingInVmSmokeGate();
@@ -724,7 +728,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal("infrastructure", final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.Equal(0, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
@@ -1167,8 +1171,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
         SmokeOptionsSnapshot? smokeOptions = null,
-        IInVmSmokeGate? inVmSmokeGate = null,
-        IHostSmokeProbeRunner? authCorroborationHostSmoke = null)
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1229,8 +1232,6 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             }),
             availability: availability,
             authExclusionAvailability: availability,
-            authCorroborationHostSmoke: authCorroborationHostSmoke,
-            authCorroborationInVmSmoke: inVmSmokeGate,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
@@ -1316,9 +1317,6 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
     }
-
-    private static StaticHostSmokeProbeRunner PersistentAuthSmoke() =>
-        new(new AgentSmokeResult(false, "auth", TimeSpan.Zero, SmokeFailureCategory.Persistent));
 
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
     {

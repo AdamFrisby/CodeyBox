@@ -253,7 +253,6 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             requiredBuildVerifier: new TestRequiredBuildVerifier(
                 RequiredBuildProbeResult.Applies,
                 RequiredBuildVerificationResult.Passed(0, "ok")),
-            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth(),
             agentOverride: agent);
 
         var item = NewItem();
@@ -299,11 +298,13 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
-            auditors: [auditor],
+            auditors: TestAuditGates.WithPassedBuildAndTest(auditor),
             maxAuditIterations: 1,
             webhookDispatcher: webhooks,
             availabilityRegistry: availability,
-            authCorroborationHostSmoke: HostSmokeProbeRunners.PersistentAuth(),
+            requiredBuildVerifier: new TestRequiredBuildVerifier(
+                RequiredBuildProbeResult.Applies,
+                RequiredBuildVerificationResult.Passed(0, "ok")),
             agentOverride: agent);
 
         var item = NewItem();

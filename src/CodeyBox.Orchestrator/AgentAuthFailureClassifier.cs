@@ -18,9 +18,9 @@ public interface IAgentAuthFailureClassifier
 
     /// <summary>
     /// Returns the auth-required classification plus the stream that supplied
-    /// the evidence. Runtime breaker policy uses this to distinguish stderr
-    /// from stdout-only text, which can be model-controlled and must be
-    /// corroborated before it benches an agent globally.
+    /// the evidence. Runtime breaker policy treats a configured/default auth
+    /// signature on either stream as authoritative, but the detailed shape
+    /// remains useful for tests and diagnostics.
     /// </summary>
     AgentAuthFailureDetection? DetectDetailed(AgentKind kind, string? stderr, string? stdout);
 }

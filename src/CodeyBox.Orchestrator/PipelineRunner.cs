@@ -86,8 +86,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentAvailabilityRegistry? _availability;
     private readonly IAgentAuthAvailabilityRegistry? _authAvailability;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
-    private readonly IHostSmokeProbeRunner? _authCorroborationHostSmoke;
-    private readonly IInVmSmokeGate? _authCorroborationInVmSmoke;
     private readonly IAgentPauseController? _agentPauses;
     private readonly IAgentSupervisionService? _agentSupervision;
     private readonly IPreMergeVerifier? _preMergeVerifier;
@@ -286,9 +284,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IEnumerable<IMechanicalFixerInputProvider>? mechanicalFixerInputProviders = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
         ISmokeAvailabilityRegistry? authExclusionAvailability = null,
-        IAgentAuthAvailabilityRegistry? authAvailability = null,
-        IHostSmokeProbeRunner? authCorroborationHostSmoke = null,
-        IInVmSmokeGate? authCorroborationInVmSmoke = null)
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -366,8 +362,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ?? authExclusionAvailability as IAgentAuthAvailabilityRegistry
             ?? availability as IAgentAuthAvailabilityRegistry;
         _dispatchAvailability = dispatchAvailability;
-        _authCorroborationHostSmoke = authCorroborationHostSmoke;
-        _authCorroborationInVmSmoke = authCorroborationInVmSmoke;
         _agentPauses = agentPauseController;
         _agentSupervision = agentSupervision;
         _agentRunningCounters = agentRunningCounters;
@@ -5256,121 +5250,37 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         var reason = SingleLineSummary(
             $"auth required from agent output during {phase}: {detection.Classification.Reason ?? "login prompt matched"}");
-        var shouldExclude = await ShouldExcludeForAuthDetectionAsync(agent, detection, reason, CancellationToken.None);
+        AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
 
-        if (shouldExclude)
+        // AuthRequired is intentionally outside the smoke-gate taxonomy:
+        // if the operator disables the master smoke switch
+        // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
+        // exclusions are ignored at dispatch — but authoritative runtime
+        // login-prompt evidence means the binary is broken, so
+        // AuthRequired survives the smoke-disabled gate via
+        // AgentAvailabilityRegistry.IsNonSmokeExclusion.
+        var transition = _authAvailability?.MarkAuthRequired(agent, reason);
+
+        if (transition is null || transition.SourceChanged)
         {
-            AuditLog.AgentSmokeFailed(agent, reason, TimeSpan.Zero, SmokeFailureCategory.Persistent);
-
-            // AuthRequired is intentionally outside the smoke-gate taxonomy:
-            // if the operator disables the master smoke switch
-            // (CodeyBox:Smoke:Enabled=false), HostSmoke/InVmSmoke/MissingProbe
-            // exclusions are ignored at dispatch — but authoritative runtime
-            // login-prompt evidence means the binary is broken, so
-            // AuthRequired survives the smoke-disabled gate via
-            // AgentAvailabilityRegistry.IsNonSmokeExclusion.
-            var transition = _authAvailability?.MarkAuthRequired(agent, reason);
-
-            if (transition is null || transition.SourceChanged)
+            await _webhooks.PublishAsync(new WebhookEvent
             {
-                await _webhooks.PublishAsync(new WebhookEvent
+                Event = "agent.smoke_failed",
+                WorkItem = item,
+                Project = project,
+                Details = new AgentSmokeFailedDetails
                 {
-                    Event = "agent.smoke_failed",
-                    WorkItem = item,
-                    Project = project,
-                    Details = new AgentSmokeFailedDetails
-                    {
-                        AgentKind = agent.Value,
-                        Reason = reason,
-                        Category = SmokeFailureCategory.Persistent,
-                    },
-                }, CancellationToken.None);
-            }
-        }
-        else
-        {
-            _log.LogWarning(
-                "Auth-shaped stdout from agent {Agent} during {Phase} was not corroborated by host/in-VM smoke; failing item without globally excluding the agent: {Reason}",
-                agent.Value, phase, reason);
+                    AgentKind = agent.Value,
+                    Reason = reason,
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None);
         }
 
         if (throwOnMatch)
             throw new AgentAuthRequiredException(agent, phase, reason);
 
         return true;
-    }
-
-    private async Task<bool> ShouldExcludeForAuthDetectionAsync(
-        AgentKind agent,
-        AgentAuthFailureDetection detection,
-        string reason,
-        CancellationToken ct)
-    {
-        if (!detection.IsStdoutOnly)
-            return true;
-
-        if (_authCorroborationHostSmoke is not null)
-        {
-            AgentSmokeResult? hostResult = null;
-            try
-            {
-                hostResult = await _authCorroborationHostSmoke.ProbeAsync(agent, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogDebug(ex,
-                    "Host smoke corroboration for stdout auth evidence from {Agent} threw; treating as inconclusive",
-                    agent.Value);
-            }
-
-            if (hostResult is { Ok: false, Category: SmokeFailureCategory.Persistent })
-                return true;
-        }
-
-        if (_authCorroborationInVmSmoke is { Enabled: true })
-        {
-            AgentAvailability? inVmAvailability = null;
-            try
-            {
-                inVmAvailability = await _authCorroborationInVmSmoke.ForceProbeAsync(agent, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogDebug(ex,
-                    "In-VM smoke corroboration for stdout auth evidence from {Agent} threw; treating as inconclusive",
-                    agent.Value);
-            }
-
-            if (inVmAvailability is { Available: false }
-                && IsAuthShapedCorroboration(inVmAvailability.Reason))
-            {
-                return true;
-            }
-        }
-
-        _log.LogWarning(
-            "Suppressing global auth exclusion for agent {Agent}: stdout-only auth evidence is model-controlled and no non-model-controlled auth check corroborated it ({Reason})",
-            agent.Value, reason);
-        return false;
-    }
-
-    private static bool IsAuthShapedCorroboration(string? reason)
-    {
-        if (string.IsNullOrWhiteSpace(reason))
-            return false;
-
-        return reason.Contains("auth", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("credential", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("login", StringComparison.OrdinalIgnoreCase)
-            || reason.Contains("token", StringComparison.OrdinalIgnoreCase);
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(

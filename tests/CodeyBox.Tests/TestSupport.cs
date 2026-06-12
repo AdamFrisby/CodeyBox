@@ -119,8 +119,6 @@ internal static class TestSupport
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         IAgentInvolvementStore? involvement = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        IHostSmokeProbeRunner? authCorroborationHostSmoke = null,
-        IInVmSmokeGate? authCorroborationInVmSmoke = null,
         IAuditProgressStore? auditProgressOverride = null,
         bool cliSessionResumableAgent = false,
         ICheckAndActCompletionRunner? checkCompletionRunner = null,
@@ -309,9 +307,7 @@ internal static class TestSupport
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             mechanicalFixerComposer: mechanicalComposer,
-            mechanicalFixerInputProviders: mechanicalFixerInputProviders,
-            authCorroborationHostSmoke: authCorroborationHostSmoke,
-            authCorroborationInVmSmoke: authCorroborationInVmSmoke ?? inVmSmokeGate);
+            mechanicalFixerInputProviders: mechanicalFixerInputProviders);
 
         return new TestPipeline(
             pipeline,

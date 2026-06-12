@@ -763,7 +763,7 @@ public sealed class AgenticConflictResolver
         Truncate(RedactText(value), maxChars);
 
     private static string? RedactAuditTail(string? value) =>
-        value is null ? null : RawOutputRedactor.Redact(value);
+        value is null ? null : RedactAndTruncate(value, 4096);
 
     private static bool NeedsStructuredStreamForResume(IAgentRunner runner)
         => runner is ICliSessionResumableAgentRunner
