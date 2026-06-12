@@ -234,6 +234,57 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_DerivesNetworkToleranceProviderFromSlashQualifiedModelId()
+    {
+        var sandbox = new CapturingSandbox();
+        var networkTolerance = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new CodexAgentRunner(defaults: null, networkTolerance: networkTolerance);
+
+        await runner.RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            modelId: "anthropic/claude-sonnet-4-6");
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("model_providers.anthropic.request_max_retries=8", argv);
+        Assert.Contains("model_providers.anthropic.stream_max_retries=15", argv);
+        Assert.DoesNotContain("model_providers.openai.request_max_retries=8", argv);
+        Assert.DoesNotContain("model_providers.openai.stream_max_retries=15", argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_DerivesNetworkToleranceProviderFromSlashQualifiedDefaultModelId()
+    {
+        var sandbox = new CapturingSandbox();
+        var defaults = new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["codex"] = "anthropic/claude-sonnet-4-6",
+            });
+        var networkTolerance = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new CodexAgentRunner(defaults, networkTolerance);
+
+        await runner.RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            modelId: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("--model", argv);
+        Assert.Contains("anthropic/claude-sonnet-4-6", argv);
+        Assert.Contains("model_providers.anthropic.request_max_retries=8", argv);
+        Assert.Contains("model_providers.anthropic.stream_max_retries=15", argv);
+        Assert.DoesNotContain("model_providers.openai.request_max_retries=8", argv);
+        Assert.DoesNotContain("model_providers.openai.stream_max_retries=15", argv);
+    }
+
+    [Fact]
     public async Task RunAsync_DefaultModelId_NullWhenNoDefaultConfigured_NoModelFlag()
     {
         var sandbox = new CapturingSandbox();
@@ -258,7 +309,7 @@ public sealed class CodexAgentRunnerTests
             });
         var handler = new CapturingCodexHandler(HttpStatusCode.Unauthorized,
             """{"error":{"message":"placeholder rejected"}}""");
-        var runner = new CodexAgentRunner(defaults, new HttpClient(handler));
+        var runner = new CodexAgentRunner(defaults, networkTolerance: null, textOnlyHttp: new HttpClient(handler));
         var cred = new AgentCredential(AgentKind.Codex,
             new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
             new Dictionary<string, string>());

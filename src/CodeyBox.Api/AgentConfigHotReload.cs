@@ -30,6 +30,7 @@ namespace CodeyBox.Api;
 ///   snapshot cache — it recomputes from the live usage store on every call —
 ///   so the new windows take effect on the next gate/visibility read).</item>
 /// <item><c>CodeyBox:AgentDefaults</c> → <see cref="AgentDefaultsSnapshot.Replace"/>.</item>
+/// <item><c>CodeyBox:AgentNetworkTolerance</c> → <see cref="AgentNetworkToleranceSnapshot.Replace"/>.</item>
 /// <item><c>CodeyBox:AgentPauses</c> → <see cref="IAgentPauseController"/> config-owned
 ///   pause/resume reconciliation.</item>
 /// <item><c>CodeyBox:Smoke</c> → <see cref="SmokeOptionsSnapshot.Replace"/>
@@ -64,6 +65,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly IAgentBudgetConfigReloadable? _budgetReloader;
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
+    private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
     private readonly AgentCostCalculator? _costCalculator;
     private readonly AgentPricingState? _pricingState;
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
@@ -93,6 +95,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastBudgetDeferralRecheck = "";
     private string _lastSmoke = "";
     private string _lastAgentPauses = "";
+    private string _lastNetworkTolerance = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -104,6 +107,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         ILogger<AgentConfigHotReload> log,
         AgentDefaultsSnapshot? defaults = null,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null,
+        AgentNetworkToleranceSnapshot? networkTolerance = null,
         AgentCostCalculator? costCalculator = null,
         AgentPricingState? pricingState = null,
         IAgentBudgetConfigReloadable? budgetReloader = null,
@@ -130,6 +134,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _budgetReloader = budgetReloader;
         _defaults = defaults;
         _sanitizerConfig = sanitizerConfig;
+        _networkTolerance = networkTolerance;
         _costCalculator = costCalculator;
         _pricingState = pricingState;
         _incrementalRebase = incrementalRebase;
@@ -155,6 +160,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPricing = SerializePricing(initial.AgentPricing);
         _lastBudgets = SerializeBudgets(initial.AgentBudgets);
         _lastDefaults = SerializeDefaults(initial.AgentDefaults);
+        _lastNetworkTolerance = SerializeNetworkTolerance(initial.AgentNetworkTolerance);
         _lastIncrementalRebase = SerializeIncrementalRebase(initial.IncrementalRebase);
         _lastSanitizer = SerializeSanitizer(initial.ClaudeThinkingBlockSanitizer);
         _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
@@ -168,8 +174,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
         _subscription = _monitor.OnChange(OnConfigChanged);
         _log.LogInformation(
-            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen}",
-            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length, _lastSanitizer.Length);
+            "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen} tolerance={ToleranceLen}",
+            _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length, _lastSanitizer.Length, _lastNetworkTolerance.Length);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -195,6 +201,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyPricingIfChanged(opts);
             ApplyBudgetsIfChanged(opts);
             ApplyDefaultsIfChanged(opts);
+            ApplyNetworkToleranceIfChanged(opts);
             ApplyAgentPausesIfChanged(opts);
             ApplyIncrementalRebaseIfChanged(opts);
             ApplySanitizerIfChanged(opts);
@@ -609,6 +616,31 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         }
     }
 
+    private void ApplyNetworkToleranceIfChanged(CodeyBoxOptions opts)
+    {
+        if (_networkTolerance is null) return;
+
+        var next = SerializeNetworkTolerance(opts.AgentNetworkTolerance);
+        if (string.Equals(_lastNetworkTolerance, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastNetworkTolerance;
+        try
+        {
+            _networkTolerance.Replace(opts.AgentNetworkTolerance);
+            _lastNetworkTolerance = next;
+            AuditLog.ConfigReloaded("AgentNetworkTolerance", prev, next);
+            _log.LogInformation("Hot-reloaded AgentNetworkTolerance: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of AgentNetworkTolerance rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private void ApplySanitizerIfChanged(CodeyBoxOptions opts)
     {
         if (_sanitizerConfig is null) return;
@@ -756,6 +788,27 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                     .ToArray(),
             },
             JsonOpts);
+
+    private static string SerializeNetworkTolerance(Dictionary<string, AgentNetworkToleranceOptions?> tolerance) =>
+        JsonSerializer.Serialize(
+            tolerance.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    kv => kv.Key,
+                    kv => SerializeNetworkToleranceValue(kv.Value),
+                    StringComparer.OrdinalIgnoreCase),
+            JsonOpts);
+
+    private static object? SerializeNetworkToleranceValue(AgentNetworkToleranceOptions? value) =>
+        value is null
+            ? null
+            : new
+            {
+                value.RequestMaxRetries,
+                value.StreamMaxRetries,
+                value.StreamIdleTimeoutMs,
+                value.Provider,
+                value.ApiTimeoutMs,
+            };
 
     private static string SerializeDefaults(Dictionary<string, string?> defaults) =>
         JsonSerializer.Serialize(

@@ -307,6 +307,13 @@ want the agent's built-in tool-use prompts (you usually don't, inside a VM).
 xhigh | max`. `ReasoningMode` on the agent-class member is passed through
 verbatim; if it's unset the flag is omitted and the CLI's own default applies.
 
+**Network tolerance:** `CodeyBox:AgentNetworkTolerance:claude:ApiTimeoutMs`
+maps to Claude Code's `API_TIMEOUT_MS` environment variable. CodeyBox leaves
+it unset by default because raising the timeout helps slow large-context calls
+but also lengthens hangs on dead connections. Set it only when the operator
+chooses that tradeoff. Values are capped at 28,800,000 ms (480 minutes), the
+maximum work-attempt window accepted by the API.
+
 ### GitHub Copilot CLI
 Reads `GH_TOKEN` from the environment. **Important**: a generic
 `GH_TOKEN` grants the agent broad GitHub access, not just Copilot. Issue
@@ -317,6 +324,27 @@ that cannot push to your real repos. Sandbox network policy must
 ### OpenAI Codex CLI
 Reads `OPENAI_API_KEY`. The `--full-auto` flag skips Codex's per-edit
 confirmations — appropriate inside a sandbox.
+
+**Network tolerance:** Codex gets provider-scoped `-c` overrides from
+`CodeyBox:AgentNetworkTolerance:codex`. The shipped defaults are more
+tolerant than the vendor defaults:
+
+```json
+"AgentNetworkTolerance": {
+  "codex": {
+    "RequestMaxRetries": 8,
+    "StreamMaxRetries": 15
+  }
+}
+```
+
+`RequestMaxRetries` maps to `request_max_retries` and `StreamMaxRetries` maps
+to `stream_max_retries`; both are capped at 100. `StreamIdleTimeoutMs` is
+optional, maps to `stream_idle_timeout_ms` when configured, and is capped at
+28,800,000 ms (480 minutes), the maximum work-attempt window accepted by the
+API. `Provider` is optional and must match `[A-Za-z0-9_-]+`; when unset,
+CodeyBox derives the provider id from the effective model id and falls back to
+`openai`.
 
 ### Opencode CLI (`sst/opencode`)
 

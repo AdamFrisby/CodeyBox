@@ -15,6 +15,7 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 {
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
+    private int _disposed;
 
     public SqliteReleaseStore(string path)
     {
@@ -302,8 +303,17 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
 
     public void Dispose()
     {
-        _conn.Dispose();
-        _writeLock.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        try
+        {
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(_conn);
+        }
+        finally
+        {
+            _writeLock.Dispose();
+        }
     }
 
     private static void Bind(SqliteCommand cmd, Release r)

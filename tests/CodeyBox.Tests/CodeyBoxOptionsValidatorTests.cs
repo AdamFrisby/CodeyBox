@@ -282,6 +282,172 @@ public sealed class CodeyBoxOptionsValidatorTests
             result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData(-1, "must be between 0 and 100")]
+    [InlineData(101, "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexRequestMaxRetries(int value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            RequestMaxRetries = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(-1, "must be between 0 and 100")]
+    [InlineData(101, "must be between 0 and 100")]
+    public void Validate_RejectsInvalidCodexStreamMaxRetries(int value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            StreamMaxRetries = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(-1, "must be between 0 and")]
+    [InlineData(AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs + 1, "must be between 0 and")]
+    public void Validate_RejectsInvalidCodexStreamIdleTimeoutMs(int value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            StreamIdleTimeoutMs = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(-1, "must be between 0 and")]
+    [InlineData(AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs + 1, "must be between 0 and")]
+    public void Validate_RejectsInvalidClaudeApiTimeoutMs(int value, string expectedMessage)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
+        {
+            ApiTimeoutMs = value
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedMessage, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsValidAgentNetworkTolerance()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            RequestMaxRetries = 5,
+            StreamMaxRetries = 10,
+            StreamIdleTimeoutMs = 120000,
+            Provider = "azure"
+        };
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
+        {
+            ApiTimeoutMs = 30000
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEmptyAgentNetworkToleranceKey()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance[" "] = new AgentNetworkToleranceOptions();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance keys must not be empty", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsNullAgentNetworkToleranceBlock()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = null;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex must not be null", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsBlankCodexProvider()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            Provider = " ",
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex:Provider must not be empty", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("open.ai")]
+    [InlineData("openai=evil")]
+    [InlineData("open ai")]
+    [InlineData("openai\nnext")]
+    public void Validate_RejectsInvalidCodexProviderId(string provider)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            Provider = provider,
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:AgentNetworkTolerance:codex:Provider must match [A-Za-z0-9_-]+", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsNetworkToleranceTimeoutBoundaries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.AgentNetworkTolerance["codex"] = new AgentNetworkToleranceOptions
+        {
+            StreamIdleTimeoutMs = AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs,
+            Provider = "azure_openai-1",
+        };
+        options.AgentNetworkTolerance["claude"] = new AgentNetworkToleranceOptions
+        {
+            ApiTimeoutMs = AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs,
+        };
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_AcceptsValidAgentPauseEntry()
     {

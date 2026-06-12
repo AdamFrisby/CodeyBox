@@ -529,8 +529,9 @@ builder.Services.TryAddSingleton<CodeyBox.Agents.Claude.IClaudeSessionMetricsSin
 // ACP transport. Always registered so the operator can flip
 // CodeyBox:ClaudeSession:Transport=acp at runtime; the worker only opens an
 // ACP transport when the resolved config asks for it.
-builder.Services.AddSingleton<CodeyBox.Agents.Claude.AcpClaudeTransport>(_ =>
-    new CodeyBox.Agents.Claude.AcpClaudeTransport());
+builder.Services.AddSingleton<CodeyBox.Agents.Claude.AcpClaudeTransport>(sp =>
+    new CodeyBox.Agents.Claude.AcpClaudeTransport(
+        sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>()));
 builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
 {
     var runner = sp.GetServices<IAgentRunner>()
@@ -1177,6 +1178,16 @@ builder.Services.AddSingleton<CodeyBox.Core.AgentDefaultsSnapshot>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var dict = new Dictionary<string, string?>(opts.AgentDefaults, opts.AgentDefaults.Comparer);
     return new CodeyBox.Core.AgentDefaultsSnapshot(dict);
+});
+
+// AgentNetworkToleranceSnapshot — per-agent network tolerance options,
+// swappable by the hot-reload coordinator. Every runner reads through this
+// same instance so an operator edit to CodeyBox:AgentNetworkTolerance takes
+// effect on the next dispatched agent run without a process restart.
+builder.Services.AddSingleton<CodeyBox.Core.AgentNetworkToleranceSnapshot>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new CodeyBox.Core.AgentNetworkToleranceSnapshot(opts.AgentNetworkTolerance);
 });
 
 // ClaudeThinkingBlockSanitizerConfig — hot-reloadable toggle gating the
@@ -2348,6 +2359,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         sp.GetRequiredService<ILogger<AgentConfigHotReload>>(),
         defaults: sp.GetRequiredService<CodeyBox.Core.AgentDefaultsSnapshot>(),
         sanitizerConfig: sp.GetRequiredService<CodeyBox.Core.ClaudeThinkingBlockSanitizerConfig>(),
+        networkTolerance: sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
         costCalculator: sp.GetRequiredService<AgentCostCalculator>(),
         pricingState: pricingState,
         budgetReloader: sp.GetRequiredService<IAgentBudgetConfigReloadable>(),
@@ -3079,6 +3091,19 @@ namespace CodeyBox.Api
         /// </summary>
         public Dictionary<string, string?> AgentDefaults { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Per-agent network tolerance settings. Keyed by <c>AgentKind.Value</c>
+        /// (case-insensitive). The runner uses these values to override the CLI
+        /// network tolerance settings (e.g. retries, timeouts). Edits hot-reload via
+        /// <see cref="Core.AgentNetworkToleranceSnapshot"/> and take effect on the
+        /// next dispatched agent run. Defaults: Codex request retries = 8,
+        /// Codex stream retries = 15, Codex stream idle timeout unset, Claude
+        /// API timeout unset. Timeout values are capped at the API's maximum
+        /// work-attempt window (480 minutes).
+        /// </summary>
+        public Dictionary<string, AgentNetworkToleranceOptions?> AgentNetworkTolerance { get; set; } =
+            AgentNetworkToleranceOptions.DefaultByAgent();
 
         /// <summary>
         /// Operator-configured per-agent pauses. Keyed by agent kind value.

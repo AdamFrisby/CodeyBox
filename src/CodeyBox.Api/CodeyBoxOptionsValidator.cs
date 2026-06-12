@@ -23,6 +23,56 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxTemplateChecks must be between 1 and {CodeyBoxOptions.MaximumMaxTemplateChecks}");
         }
 
+        foreach (var (agent, tolerance) in options.AgentNetworkTolerance)
+        {
+            if (string.IsNullOrWhiteSpace(agent))
+            {
+                failures.Add("CodeyBox:AgentNetworkTolerance keys must not be empty");
+                continue;
+            }
+            if (tolerance is null)
+            {
+                failures.Add($"CodeyBox:AgentNetworkTolerance:{agent} must not be null");
+                continue;
+            }
+
+            if (string.Equals(agent, AgentNetworkToleranceOptions.CodexAgentKind, StringComparison.OrdinalIgnoreCase))
+            {
+                if (tolerance.RequestMaxRetries is < 0 or > AgentNetworkToleranceOptions.CodexMaximumRetries)
+                {
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:RequestMaxRetries must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumRetries}");
+                }
+                if (tolerance.StreamMaxRetries is < 0 or > AgentNetworkToleranceOptions.CodexMaximumRetries)
+                {
+                    failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:StreamMaxRetries must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumRetries}");
+                }
+                if (tolerance.StreamIdleTimeoutMs is < 0 or > AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs)
+                {
+                    failures.Add(
+                        $"CodeyBox:AgentNetworkTolerance:{agent}:StreamIdleTimeoutMs must be between 0 and {AgentNetworkToleranceOptions.CodexMaximumStreamIdleTimeoutMs}");
+                }
+                if (tolerance.Provider is not null)
+                {
+                    if (string.IsNullOrWhiteSpace(tolerance.Provider))
+                    {
+                        failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must not be empty");
+                    }
+                    else if (!AgentNetworkToleranceOptions.IsValidCodexProviderId(tolerance.Provider))
+                    {
+                        failures.Add($"CodeyBox:AgentNetworkTolerance:{agent}:Provider must match [A-Za-z0-9_-]+");
+                    }
+                }
+            }
+            else if (string.Equals(agent, AgentNetworkToleranceOptions.ClaudeAgentKind, StringComparison.OrdinalIgnoreCase))
+            {
+                if (tolerance.ApiTimeoutMs is < 0 or > AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs)
+                {
+                    failures.Add(
+                        $"CodeyBox:AgentNetworkTolerance:{agent}:ApiTimeoutMs must be between 0 and {AgentNetworkToleranceOptions.ClaudeMaximumApiTimeoutMs}");
+                }
+            }
+        }
+
         foreach (var (agent, pause) in options.AgentPauses)
         {
             if (string.IsNullOrWhiteSpace(agent))

@@ -22,11 +22,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
     private readonly HttpClient _textOnlyHttp;
 
-    public CodexAgentRunner() : this(defaults: null, textOnlyHttp: null) { }
+    public CodexAgentRunner() : this(defaults: null, networkTolerance: null, textOnlyHttp: null) { }
 
-    public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, textOnlyHttp: null) { }
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, networkTolerance: null, textOnlyHttp: null) { }
+
+    public CodexAgentRunner(AgentDefaultsSnapshot? defaults, AgentNetworkToleranceSnapshot? networkTolerance) : this(defaults, networkTolerance, textOnlyHttp: null) { }
 
     /// <summary>
     /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
@@ -34,9 +37,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
     /// path can be exercised offline without reaching api.openai.com.
     /// Production wiring uses the process-wide shared HttpClient.
     /// </summary>
-    internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, HttpClient? textOnlyHttp)
+    internal CodexAgentRunner(AgentDefaultsSnapshot? defaults, AgentNetworkToleranceSnapshot? networkTolerance, HttpClient? textOnlyHttp)
     {
         _defaults = defaults;
+        _networkTolerance = networkTolerance;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
 
@@ -234,6 +238,29 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             argv.Add("-c");
             argv.Add($"model_reasoning_effort={reasoningMode}");
         }
+
+        // Network tolerance overrides. The snapshot owns the documented
+        // CodeyBox defaults; this runner only maps the typed options onto the
+        // Codex CLI's provider-scoped config keys.
+        var tolerance = AgentNetworkToleranceOptions.WithCodexDefaults(
+            _networkTolerance?.GetTolerance(Kind.Value));
+        var reqRetries = tolerance.RequestMaxRetries!.Value;
+        var streamRetries = tolerance.StreamMaxRetries!.Value;
+
+        var providerId = ResolveProviderId(effectiveModel, tolerance.Provider);
+
+        argv.Add("-c");
+        argv.Add($"model_providers.{providerId}.request_max_retries={reqRetries}");
+
+        argv.Add("-c");
+        argv.Add($"model_providers.{providerId}.stream_max_retries={streamRetries}");
+
+        if (tolerance.StreamIdleTimeoutMs.HasValue)
+        {
+            argv.Add("-c");
+            argv.Add($"model_providers.{providerId}.stream_idle_timeout_ms={tolerance.StreamIdleTimeoutMs.Value}");
+        }
+
         // Pass the prompt via stdin rather than as a positional argv. Linux's
         // MAX_ARG_STRLEN is 128 KiB per single argv element; rework prompts that
         // include many audit findings can exceed that and surface as exit 126
@@ -316,4 +343,27 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
         return string.Concat(parts);
     }
+
+    private static string ResolveProviderId(string? effectiveModel, string? configuredProvider)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredProvider))
+        {
+            return ResolveSafeProviderId(configuredProvider);
+        }
+
+        if (!string.IsNullOrEmpty(effectiveModel))
+        {
+            var slashIdx = effectiveModel.IndexOf('/');
+            if (slashIdx > 0)
+            {
+                return ResolveSafeProviderId(effectiveModel.Substring(0, slashIdx));
+            }
+        }
+
+        return "openai";
+    }
+
+    private static string ResolveSafeProviderId(string providerId) =>
+        AgentNetworkToleranceOptions.IsValidCodexProviderId(providerId) ? providerId : "openai";
+
 }

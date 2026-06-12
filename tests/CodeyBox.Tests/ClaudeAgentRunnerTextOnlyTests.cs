@@ -50,7 +50,7 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
                 ["claude"] = defaultModel,
             });
         return new ClaudeAgentRunner(defaults, rotationPusher: null, sanitizerConfig: null,
-            textOnlyHttp: new HttpClient(handler));
+            networkTolerance: null, textOnlyHttp: new HttpClient(handler));
     }
 
     // ── Credential viability ──────────────────────────────────────────────────
