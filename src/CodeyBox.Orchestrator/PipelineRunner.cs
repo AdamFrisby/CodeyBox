@@ -141,6 +141,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IWorkItemQuestionStore? _questionStore;
     private readonly IQuotaFailureStore? _quotaFailures;
     private readonly IQuotaFailureClassifier _quotaClassifier;
+    private readonly IQuotaFailureAuditEmitter _quotaAuditEmitter;
     private readonly ITaskQueue? _taskQueue;
     private readonly OrchestratorOptions _orchestratorOptions;
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
@@ -249,11 +250,18 @@ public sealed class PipelineRunner : IPipelineRunner
             log.LogWarning(
                 "PipelineRunner constructed without an IQuotaFailureClassifier; " +
                 "quota-failure detection is disabled. Wire CompositeQuotaFailureClassifier in DI.");
-            _quotaClassifier = new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+            var fallback = new CompositeQuotaFailureClassifier(Array.Empty<IAgentQuotaFailureDetector>());
+            _quotaClassifier = fallback;
+            _quotaAuditEmitter = fallback;
         }
         else
         {
             _quotaClassifier = quotaClassifier;
+            // The orchestrator's composite implements both contracts; fall back
+            // to a no-op emitter when an alternative classifier was wired that
+            // only handles classification (test/fake setups).
+            _quotaAuditEmitter = quotaClassifier as IQuotaFailureAuditEmitter
+                ?? NullQuotaFailureAuditEmitter.Instance;
         }
         _toolCallCounters = toolCallCounters;
         _retryScheduler = retryScheduler;
@@ -2640,6 +2648,13 @@ public sealed class PipelineRunner : IPipelineRunner
             sandbox,
             prompt,
             ct);
+        // The runner's CLI-native session resume capability is independent of
+        // optional stream persistence: a transient agent crash should still be
+        // recoverable in the same sandbox even when AgentStreams is disabled.
+        // Force-enable the id-bearing output mode only when the runner's public
+        // resume contract says its session-id extractor needs structured output.
+        var needsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
+        var captureStructuredStream = streamCapture is not null || needsStreamForResume;
 
         AgentResult agentResult;
         using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -2657,7 +2672,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         stdoutChunkCallback: stdoutCallback)
                     : runner.RunAsync(sandbox, SandboxConventions.WorkDir, prompt, credential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                         stdoutChunkCallback: stdoutCallback,
-                        captureStructuredStream: streamCapture is not null);
+                        captureStructuredStream: captureStructuredStream);
                 var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                 if (completed != runTask)
                 {
@@ -2824,7 +2839,7 @@ public sealed class PipelineRunner : IPipelineRunner
             // Per-provider detector (registered as IQuotaFailureClassifier) inspects
             // stderr/stdout and structured stream events. Per-CLI classification +
             // reset-window parsing now live in the per-provider library.
-            _quotaClassifier.EmitAdvisoryAuditEvents(
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                 runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
             var detection = _quotaClassifier.Detect(runner.Kind, agentResult.Stderr, agentResult.Stdout);
             if (detection is not null)
@@ -2859,17 +2874,14 @@ public sealed class PipelineRunner : IPipelineRunner
                 projectId: item.ProjectId,
                 stdout: agentResult.Stdout);
 
-            // Truncate agent-controlled output to prevent unbounded content from
-            // reaching the audit log via the exception message chain.
-            const int MaxOutputBytes = 4096;
-            static string Truncate(string s) =>
-                s.Length <= MaxOutputBytes ? s : s[..MaxOutputBytes] + $"… [{s.Length - MaxOutputBytes} bytes truncated]";
-
+            // Redact and truncate agent-controlled output before it reaches
+            // LastError, audit persistence, webhooks, or API responses via the
+            // exception message chain.
             var detail = string.Join("\n",
                 new[] {
-                    $"Agent {runner.Kind} reported failure: {agentResult.Summary}",
-                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{Truncate(agentResult.Stderr)}" : null,
-                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{Truncate(agentResult.Stdout)}" : null,
+                    $"Agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                    !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
+                    !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
                 }.Where(s => s is not null));
             throw new InvalidOperationException(detail);
         }
@@ -3782,6 +3794,12 @@ public sealed class PipelineRunner : IPipelineRunner
         return string.IsNullOrEmpty(s) ? null : s.Length <= max ? s : "…" + s[^max..];
     }
 
+    private static string RedactAndTruncateAgentDetail(string s)
+    {
+        const int MaxOutputBytes = 4096;
+        return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
+    }
+
     /// <summary>
     /// Logs a truncated tail of agent stdout/stderr at Information level.
     /// Truncated because agent output can be tens of KB; the tail is
@@ -3794,6 +3812,12 @@ public sealed class PipelineRunner : IPipelineRunner
             "Agent {Kind} finished: success={Success} exit={Summary}\nstdout-tail:\n{StdoutTail}\nstderr-tail:\n{StderrTail}",
             kind.Value, result.Success, result.Summary, Display(Tail(result.Stdout)), Display(Tail(result.Stderr)));
     }
+
+    private static bool NeedsStructuredStreamForSessionResume(IAgentRunner runner)
+        => runner is ICliSessionResumableAgentRunner
+        {
+            RequiresStructuredStreamForSessionId: true,
+        };
 
     private async Task<AgentStreamCapture?> BeginAgentStreamCaptureAsync(
         WorkItemId workItemId,
@@ -4876,6 +4900,10 @@ public sealed class PipelineRunner : IPipelineRunner
         var stdoutCallback = auditor.Kind == "llm"
             ? BuildStdoutCallback(ctx.WorkItemId, auditPhase, streamCapture)
             : null;
+        // Force id-bearing structured output for resumable LLM auditors only
+        // when the runner's session-resume contract requires it (see work-phase
+        // comment).
+        var auditNeedsStreamForResume = auditor.Kind == "llm" && NeedsStructuredStreamForSessionResume(runner);
         // The work item's ModelId came from the AgentMembership picked for the
         // work agent kind. If audit cross-review picked a different kind, that
         // model id is vendor-specific and won't be valid for the audit runner —
@@ -4896,7 +4924,7 @@ public sealed class PipelineRunner : IPipelineRunner
             AuditRunner = promptRunner,
             AuditCredential = credential,
             StdoutChunkCallback = stdoutCallback,
-            CaptureStructuredStream = streamCapture is not null,
+            CaptureStructuredStream = streamCapture is not null || auditNeedsStreamForResume,
             ModelId = crossKind ? null : ctx.ModelId,
             ReasoningMode = ctx.ReasoningMode,
         };
@@ -5007,7 +5035,7 @@ public sealed class PipelineRunner : IPipelineRunner
         if (!needsCreds || (run.Result.AgentStderr is null && run.Result.AgentStdout is null))
             return;
 
-        _quotaClassifier.EmitAdvisoryAuditEvents(
+        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
             run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
         var quotaDetection = _quotaClassifier.Detect(
             run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
@@ -5751,11 +5779,12 @@ public sealed class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
-    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase)
-    /// or exceeds the configured per-attempt timeout, picks the next-best class
-    /// member, swaps the runner + ModelId + ReasoningMode on a trial copy of
-    /// the work item, and retries the same iteration. Quota failures also mark
-    /// the member exhausted in the router's in-process cache.
+    /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
+    /// exceeds the configured per-attempt timeout, or exhausts CLI-native session
+    /// resume attempts, picks the next-best class member, swaps the runner +
+    /// ModelId + ReasoningMode on a trial copy of the work item, and retries the
+    /// same iteration. Quota failures also mark the member exhausted in the
+    /// router's in-process cache.
     ///
     /// <para>
     /// When no class router is wired or the item has no agent class, the wrapper
@@ -5867,6 +5896,18 @@ public sealed class PipelineRunner : IPipelineRunner
                 outcome = "canceled";
                 throw;
             }
+            catch (AgentSessionResumeExhaustedException ex)
+            {
+                if (await TryConvertResumeExhaustionToQuotaAsync(runner, trialItem, ex, attemptCt)
+                    .ConfigureAwait(false) is { } quotaEx)
+                {
+                    await FinalizeInvolvementAsync(involvementId, "failure:quota");
+                    throw quotaEx;
+                }
+
+                await FinalizeInvolvementAsync(involvementId, "failure:agent");
+                throw;
+            }
             catch (Exception ex)
             {
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
@@ -5883,6 +5924,44 @@ public sealed class PipelineRunner : IPipelineRunner
                     new KeyValuePair<string, object?>("phase", phase),
                     new KeyValuePair<string, object?>("outcome", outcome));
             }
+        }
+
+        async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
+            IAgentRunner runner,
+            WorkItem trialItem,
+            AgentSessionResumeExhaustedException resumeEx,
+            CancellationToken token)
+        {
+            var last = resumeEx.LastResult;
+            _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                runner.Kind, last.Stderr, last.Stdout, phase, sandboxName: null);
+
+            var classification = _quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout);
+            if (classification is not
+                {
+                    Kind: QuotaFailureClassificationKind.Quota,
+                    Detection: { } detection,
+                })
+            {
+                return null;
+            }
+
+            await _quotaClassifier.RecordIfQuotaFailureAsync(
+                _quotaFailures,
+                runner.Kind,
+                ResolveObservedModelId(runner, trialItem.ModelId),
+                last.Summary,
+                last.Stderr,
+                DateTimeOffset.UtcNow,
+                _auditQuotaOptions.ObservedFailureRetention,
+                token,
+                projectId: trialItem.ProjectId,
+                stdout: last.Stdout).ConfigureAwait(false);
+
+            return new TerminalQuotaError(
+                detection.Kind,
+                $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}",
+                detection.ResetAt);
         }
 
         // Resolve the initial member from the work item's currently-selected agent.
@@ -5980,13 +6059,14 @@ public sealed class PipelineRunner : IPipelineRunner
 
         async Task MoveToNextMemberOrThrowAsync(
             string safeReason,
-            bool quotaExhausted,
+            AgentFallbackTrigger trigger,
             DateTimeOffset? quotaResetAt,
             Exception terminalException,
             bool smokeRejected = false,
             bool pausedRejected = false)
         {
-            var fallbackKind = quotaExhausted ? "quota" : pausedRejected ? "paused" : smokeRejected ? "smoke" : "timeout";
+            var quotaExhausted = trigger == AgentFallbackTrigger.Quota;
+            var fallbackKind = pausedRejected ? "paused" : smokeRejected ? "smoke" : FallbackMetricKind(trigger);
             if (pausedRejected)
                 pausedFallbackAgent ??= currentRunner.Kind;
             if (quotaExhausted)
@@ -6155,11 +6235,16 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (pausedRejected)
                     throw new AgentPausedException(phase, pausedFallbackAgent ?? currentMember.Agent, safeReason);
 
-                var timeoutPhase = phaseCancellation?.Phase ?? phase;
-                throw new PhaseCancellationException(
-                    timeoutPhase,
-                    CancellationSources.PhaseTimeout(timeoutPhase),
-                    terminalException);
+                if (trigger == AgentFallbackTrigger.Timeout)
+                {
+                    var timeoutPhase = phaseCancellation?.Phase ?? phase;
+                    throw new PhaseCancellationException(
+                        timeoutPhase,
+                        CancellationSources.PhaseTimeout(timeoutPhase),
+                        terminalException);
+                }
+
+                throw terminalException;
             }
 
             if (!_agents.TryGet(nextMember.Agent, out var nextRunner))
@@ -6173,7 +6258,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     toAgent: nextMember.Agent, toModel: nextMember.ModelId,
                     reason: safeReason);
             }
-            else
+            else if (trigger == AgentFallbackTrigger.Timeout)
             {
                 if (smokeRejected)
                 {
@@ -6197,6 +6282,14 @@ public sealed class PipelineRunner : IPipelineRunner
                         toAgent: nextMember.Agent, toModel: nextMember.ModelId,
                         reason: safeReason);
                 }
+            }
+            else
+            {
+                AuditLog.AgentResumeExhaustedFallback(
+                    item.Id, phase, iteration,
+                    fromAgent: currentMember.Agent, fromModel: currentMember.ModelId,
+                    toAgent: nextMember.Agent, toModel: nextMember.ModelId,
+                    reason: safeReason);
             }
             CodeyBoxMeters.AgentFallbacks.Add(1,
                 new KeyValuePair<string, object?>("from_agent", currentMember.Agent.Value),
@@ -6283,7 +6376,7 @@ public sealed class PipelineRunner : IPipelineRunner
                         smokeAvailability.Reason ?? AgentDispatchAvailability.PausedReasonPrefix);
                     await MoveToNextMemberOrThrowAsync(
                         pausedReason,
-                        quotaExhausted: false,
+                        AgentFallbackTrigger.Timeout,
                         quotaResetAt: null,
                         terminalException: new AgentPausedException(phase, currentRunner.Kind, pausedReason),
                         pausedRejected: true);
@@ -6294,7 +6387,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     $"smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: false,
+                    AgentFallbackTrigger.Timeout,
                     quotaResetAt: null,
                     terminalException: new AgentUnavailableException(
                         $"agent '{currentRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {safeReason}",
@@ -6315,7 +6408,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 var safeReason = SingleLineSummary(quotaEx.Message);
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: true,
+                    AgentFallbackTrigger.Quota,
                     quotaResetAt: quotaEx.ResetAt,
                     terminalException: quotaEx);
             }
@@ -6324,12 +6417,36 @@ public sealed class PipelineRunner : IPipelineRunner
                 var safeReason = SingleLineSummary(timeoutEx.Message);
                 await MoveToNextMemberOrThrowAsync(
                     safeReason,
-                    quotaExhausted: false,
+                    AgentFallbackTrigger.Timeout,
                     quotaResetAt: null,
                     terminalException: timeoutEx);
             }
+            catch (AgentSessionResumeExhaustedException resumeEx)
+            {
+                var safeReason = SingleLineSummary(resumeEx.Message);
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    AgentFallbackTrigger.ResumeExhausted,
+                    quotaResetAt: null,
+                    terminalException: resumeEx);
+            }
         }
     }
+
+    private enum AgentFallbackTrigger
+    {
+        Quota,
+        Timeout,
+        ResumeExhausted,
+    }
+
+    private static string FallbackMetricKind(AgentFallbackTrigger trigger) => trigger switch
+    {
+        AgentFallbackTrigger.Quota => "quota",
+        AgentFallbackTrigger.Timeout => "timeout",
+        AgentFallbackTrigger.ResumeExhausted => "resume_exhausted",
+        _ => "agent",
+    };
 
     /// <summary>
     /// Appends an in-progress <see cref="AgentInvolvement"/> row for the agent
@@ -6796,6 +6913,9 @@ public sealed class PipelineRunner : IPipelineRunner
                     : null;
                 mergeStructuredStreamCaptured = mergeStreamCapture is not null;
                 var mergeStdoutCallback = BuildStdoutCallback(item.Id, "merge", mergeStreamCapture);
+                // Decouple from AgentStreams when the runner's session-id
+                // extractor needs structured output (see work-phase comment).
+                var mergeNeedsStreamForResume = NeedsStructuredStreamForSessionResume(runner);
                 using var runnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 try
                 {
@@ -6803,7 +6923,7 @@ public sealed class PipelineRunner : IPipelineRunner
                     {
                         var runTask = runner.RunAsync(sandbox, SandboxConventions.WorkDir, mergePrompt, mergeCredential, item.ModelId, item.ReasoningMode, runnerCts.Token,
                             stdoutChunkCallback: mergeStdoutCallback,
-                            captureStructuredStream: mergeStreamCapture is not null);
+                            captureStructuredStream: mergeStreamCapture is not null || mergeNeedsStreamForResume);
                         var completed = await Task.WhenAny(runTask, WaitForCancellationAsync(hostShutdownToken));
                         if (completed != runTask)
                         {
@@ -6873,7 +6993,7 @@ public sealed class PipelineRunner : IPipelineRunner
             LogAgentOutput(_log, chosenMergeRunner.Kind, agentResult);
             if (!agentResult.Success)
             {
-                _quotaClassifier.EmitAdvisoryAuditEvents(
+                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
                 var detection = _quotaClassifier.Detect(chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout);
                 if (detection is not null)
@@ -6906,7 +7026,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                throw new InvalidOperationException($"Merge agent {chosenMergeRunner.Kind} reported failure: {agentResult.Summary}\n{agentResult.Stderr}");
+                var detail = string.Join("\n",
+                    new[] {
+                        $"Merge agent {chosenMergeRunner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                        !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
+                        !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
+                    }.Where(s => s is not null));
+                throw new InvalidOperationException(detail);
             }
 
             // Read suggestions.json before cleaning the working tree, then remove it
@@ -8567,7 +8693,8 @@ public sealed class PipelineRunner : IPipelineRunner
             {
                 agentResult = await runner.RunAsync(
                     sandbox, SandboxConventions.WorkDir, prompt, credential,
-                    item.ModelId, item.ReasoningMode, phase.Token);
+                    item.ModelId, item.ReasoningMode, phase.Token,
+                    captureStructuredStream: NeedsStructuredStreamForSessionResume(runner));
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {

@@ -137,6 +137,43 @@ public sealed record AgentResumeContext(
     string CheckpointRef,
     string ScratchpadArchivePath = ".codeybox/preempt-scratchpad.tgz");
 
+/// <summary>
+/// Optional capability for runners that drive a CLI with a native in-process
+/// session resume mode (for example <c>claude --resume &lt;id&gt;</c>).
+/// Distinct from <see cref="IResumableAgentRunner"/>, which restores
+/// checkpointed scratchpad state after host preemption.
+///
+/// <para>
+/// Implementations must declare whether their session-id extractor depends on
+/// id-bearing structured output, provide the extractor, and expose the quota
+/// gate classifier that blocks hard quota/rate failures. The concrete CLI
+/// invocation remains an agent-layer concern so Core consumers do not depend on
+/// argv/environment/stdin process-launch details.
+/// </para>
+/// </summary>
+public interface ICliSessionResumableAgentRunner : IAgentRunner
+{
+    /// <summary>
+    /// True when <see cref="TryExtractSessionId"/> is trustworthy only when
+    /// <see cref="IAgentRunner.RunAsync"/> was invoked with
+    /// <c>captureStructuredStream: true</c>.
+    /// </summary>
+    bool RequiresStructuredStreamForSessionId { get; }
+
+    /// <summary>
+    /// Classifier used to decide whether a failed run is safe to resume. Must be
+    /// non-null; missing quota classification must fail closed rather than
+    /// resume-hammering hard quota/rate failures.
+    /// </summary>
+    IQuotaFailureClassifier SessionResumeQuotaClassifier { get; }
+
+    /// <summary>
+    /// Extracts the native CLI session id from the captured stdout for a failed
+    /// run. Returns null when no usable id was emitted.
+    /// </summary>
+    string? TryExtractSessionId(string? stdout);
+}
+
 public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

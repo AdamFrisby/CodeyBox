@@ -41,6 +41,18 @@ public enum AgentFailureKind
 }
 
 /// <summary>
+/// More specific quota shape for <see cref="AgentFailureKind.QuotaExhausted"/>.
+/// Kept separate from <see cref="AgentFailureClassification.Reason"/> so
+/// policy decisions do not depend on free-form reason text.
+/// </summary>
+public enum AgentQuotaFailureKind
+{
+    None,
+    HardQuota,
+    SoftRateLimit,
+}
+
+/// <summary>
 /// Outcome of <see cref="IAgentRunner.ClassifyFailure"/> — the kind of failure
 /// plus an optional caller-friendly hint (reset window for quota, message for
 /// network/auth) the pipeline can surface in audit events without having to
@@ -49,4 +61,5 @@ public enum AgentFailureKind
 public sealed record AgentFailureClassification(
     AgentFailureKind Kind,
     DateTimeOffset? QuotaResetAt = null,
-    string? Reason = null);
+    string? Reason = null,
+    AgentQuotaFailureKind QuotaFailure = AgentQuotaFailureKind.None);

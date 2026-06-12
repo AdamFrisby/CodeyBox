@@ -170,6 +170,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
+        SessionResumeOptions.SetMaxResumeAttempts(initial.PipelineTuning.AgentSessionResumeMaxAttempts);
         await ApplyConfiguredAgentPausesAtStartupAsync(initial, cancellationToken);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
@@ -888,6 +889,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         {
             _pipelineTuning.Replace(opts.PipelineTuning);
             AgentSuspendResilience.SetMaxRetries(opts.PipelineTuning.AgentSuspendMaxRetries);
+            SessionResumeOptions.SetMaxResumeAttempts(opts.PipelineTuning.AgentSessionResumeMaxAttempts);
             _lastPipelineTuning = next;
             AuditLog.ConfigReloaded("PipelineTuning", prev, next);
             _log.LogInformation("Hot-reloaded PipelineTuning: {OldValue} → {NewValue}", prev, next);
@@ -936,6 +938,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MergeSandboxStagingRestoreAttempts,
                 opts.MaxQuestionsPerWorkItem,
                 opts.AgentSuspendMaxRetries,
+                opts.AgentSessionResumeMaxAttempts,
                 opts.AutoMergeRaceRecoveryMaxAttempts,
             },
             JsonOpts);

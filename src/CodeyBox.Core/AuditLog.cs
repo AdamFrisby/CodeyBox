@@ -444,6 +444,29 @@ public static class AuditLog
                 reason);
 
     /// <summary>
+    /// Emitted when CLI-native session resume was attempted up to the configured
+    /// bound and the pipeline retries the same iteration against the next class
+    /// member.
+    /// </summary>
+    public static void AgentResumeExhaustedFallback(
+        WorkItemId workItemId,
+        string phase,
+        int? iteration,
+        AgentKind fromAgent,
+        string? fromModel,
+        AgentKind toAgent,
+        string? toModel,
+        string reason) =>
+        Audit("agent.resume_exhausted_fallback")
+            .Warning(
+                "Mid-iteration resume-exhausted fallback: workItem={WorkItemId} phase={Phase} iteration={Iteration} " +
+                "from={FromAgent}/{FromModel} to={ToAgent}/{ToModel} reason={Reason}",
+                workItemId.ToString(), phase, iteration,
+                fromAgent.Value, fromModel ?? "(default)",
+                toAgent.Value, toModel ?? "(default)",
+                reason);
+
+    /// <summary>
     /// Emitted when every eligible class member returned QuotaExhausted within
     /// a single pickup, and the pipeline parked the item in WaitingForQuotaReset
     /// rather than transitioning it to Failed.
@@ -1127,6 +1150,20 @@ public static class AuditLog
             .Warning(
                 "Claude ACP transport degraded to print for session {SessionId}: {Reason}",
                 sessionId, reason);
+
+    /// <summary>
+    /// Emitted when the CLI-native session-resume liveness probe threw an
+    /// unexpected exception against the sandbox (a sandbox/provider bug, not
+    /// the agent itself). Surfaces the infrastructure problem rather than
+    /// hiding it as an ordinary non-resumable agent exit. The work item still
+    /// fails / re-drives, but operators can correlate the failure with the
+    /// underlying sandbox fault.
+    /// </summary>
+    public static void SessionResumeLivenessProbeFailed(AgentKind agent, string exceptionType, string message) =>
+        Audit("agent.session_resume_liveness_probe_failed")
+            .Warning(
+                "Session-resume liveness probe failed unexpectedly for {Agent}: {ExceptionType}: {Message}",
+                agent.Value, exceptionType, message);
 
     // ── Internal helper ──────────────────────────────────────────────────────
 

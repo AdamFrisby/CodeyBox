@@ -90,10 +90,28 @@ public sealed class AgentSuspendResilienceRetryTests
     [InlineData(52)]
     [InlineData(56)]
     [InlineData(92)]
+    [InlineData(137)]
     public void ShouldRetry_UnknownWithSuspendExitCodes_ReturnsTrueForSupportedAgents(int exitCode)
     {
         var classification = new AgentFailureClassification(AgentFailureKind.Unknown);
         Assert.True(AgentSuspendResilience.ShouldRetry(AgentKind.Claude, classification, exitCode));
+    }
+
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(52, true)]
+    [InlineData(56, true)]
+    [InlineData(92, true)]
+    [InlineData(0, false)]
+    [InlineData(2, false)]
+    [InlineData(51, false)]
+    [InlineData(57, false)]
+    [InlineData(91, false)]
+    [InlineData(93, false)]
+    [InlineData(137, true)]
+    public void IsSuspendRelatedExitCode_ReturnsExpectedBoundaryValues(int exitCode, bool expected)
+    {
+        Assert.Equal(expected, AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode));
     }
 
     [Fact]
@@ -130,7 +148,16 @@ public sealed class AgentSuspendResilienceRetryTests
         public string Id => "codeybox-retry-test";
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
-            => Task.FromResult(onExec());
+        {
+            if (exec.Argv.Count > 0
+                && exec.Argv[0] == "claude"
+                && exec.Argv.Contains("--help"))
+            {
+                return Task.FromResult(new SandboxExecResult(0, "--output-format stream-json --verbose", string.Empty));
+            }
+
+            return Task.FromResult(onExec());
+        }
 
         public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
             => throw new NotSupportedException();

@@ -72,7 +72,7 @@ public sealed class OpencodeAgentRunnerTests
         var modelIdx = argv.IndexOf("--model");
         Assert.True(modelIdx >= 0);
         Assert.Equal("anthropic/claude-sonnet-4-6", argv[modelIdx + 1]);
-        Assert.DoesNotContain(argv, a => a.StartsWith("deepseek/", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(argv, a => a.StartsWith("opencode-go/deepseek-", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

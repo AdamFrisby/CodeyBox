@@ -25,7 +25,7 @@ namespace CodeyBox.Agents.Claude;
 /// failure leaves the requested id untouched (best-effort, so we never
 /// degrade a working call).</para>
 /// </summary>
-public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
+public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
 
@@ -44,10 +44,11 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     private readonly ClaudeThinkingBlockSanitizerConfig? _sanitizerConfig;
     private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
     private readonly HttpClient _textOnlyHttp;
+    private readonly IQuotaFailureClassifier _sessionResumeQuotaClassifier;
 
-    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: null) { }
+    public ClaudeAgentRunner() : this(defaults: null, rotationPusher: null, sanitizerConfig: null, networkTolerance: null, quotaFailureClassifier: null) { }
 
-    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null, networkTolerance: null) { }
+    public ClaudeAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, rotationPusher: null, sanitizerConfig: null, networkTolerance: null, quotaFailureClassifier: null) { }
 
     /// <summary>
     /// Primary constructor.
@@ -68,20 +69,23 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// (e.g. when the hot-reload infrastructure isn't wired) defaults to
     /// enabled — see <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
     /// </param>
+    /// <param name="quotaFailureClassifier">
+    /// Shared quota classifier used for session-resume quota gating so recovery
+    /// policy stays aligned with the orchestrator's quota fallback handling.
+    /// </param>
     public ClaudeAgentRunner(
         AgentDefaultsSnapshot? defaults,
         IClaudeTokenRotationPusher? rotationPusher,
-        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null)
-        : this(defaults, rotationPusher, sanitizerConfig, networkTolerance: null, textOnlyHttp: null)
-    {
-    }
-
-    public ClaudeAgentRunner(
-        AgentDefaultsSnapshot? defaults,
-        IClaudeTokenRotationPusher? rotationPusher,
-        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
-        AgentNetworkToleranceSnapshot? networkTolerance)
-        : this(defaults, rotationPusher, sanitizerConfig, networkTolerance, textOnlyHttp: null)
+        ClaudeThinkingBlockSanitizerConfig? sanitizerConfig = null,
+        AgentNetworkToleranceSnapshot? networkTolerance = null,
+        IQuotaFailureClassifier? quotaFailureClassifier = null)
+        : this(
+            defaults: defaults,
+            rotationPusher: rotationPusher,
+            sanitizerConfig: sanitizerConfig,
+            networkTolerance: networkTolerance,
+            textOnlyHttp: null,
+            quotaFailureClassifier: quotaFailureClassifier)
     {
     }
 
@@ -96,13 +100,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         IClaudeTokenRotationPusher? rotationPusher,
         ClaudeThinkingBlockSanitizerConfig? sanitizerConfig,
         AgentNetworkToleranceSnapshot? networkTolerance,
-        HttpClient? textOnlyHttp)
+        HttpClient? textOnlyHttp,
+        IQuotaFailureClassifier? quotaFailureClassifier = null)
     {
         _defaults = defaults;
         _rotationPusher = rotationPusher;
         _sanitizerConfig = sanitizerConfig;
         _networkTolerance = networkTolerance;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
+        _sessionResumeQuotaClassifier = quotaFailureClassifier ?? ClaudeSessionResumeQuotaClassifier.Instance;
     }
 
     public override AgentKind Kind => AgentKind.Claude;
@@ -238,7 +244,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
         var structuredStreamSupported = !captureStructuredStream
             || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
-        var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
+        var effectiveUseStructuredStream = captureStructuredStream && structuredStreamSupported;
 
         var result = await base.RunAsync(
             sandbox,
@@ -249,20 +255,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             reasoningMode,
             ct,
             stdoutChunkCallback,
-            effectiveCaptureStructuredStream).ConfigureAwait(false);
+            effectiveUseStructuredStream).ConfigureAwait(false);
 
         result = await TryReactiveRetryAsync(
             sandbox, workingDirectory, prompt, credential, modelId, reasoningMode,
-            ct, stdoutChunkCallback, effectiveCaptureStructuredStream,
+            ct, stdoutChunkCallback, effectiveUseStructuredStream,
             result,
             resumeContext: null).ConfigureAwait(false);
 
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
-        var warning = $"Warning: Claude CLI at '{Binary}' does not support --output-format stream-json --verbose; structured stream capture was disabled.";
-        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
-        return result with { Stderr = stderr };
+        return WithStructuredStreamDisabledWarning(result);
     }
 
     public override async Task<AgentResult> RunResumedAsync(
@@ -277,7 +281,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         Action<string>? stdoutChunkCallback = null)
     {
         using var _ = _rotationPusher?.RegisterActiveSandbox(sandbox);
-        var result = await base.RunResumedAsync(
+        var structuredStreamSupported = await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+        var result = await RunResumedCoreAsync(
             sandbox,
             workingDirectory,
             prompt,
@@ -286,15 +291,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             modelId,
             reasoningMode,
             ct,
-            stdoutChunkCallback).ConfigureAwait(false);
+            stdoutChunkCallback,
+            captureStructuredStream: structuredStreamSupported).ConfigureAwait(false);
 
         result = await TryReactiveRetryAsync(
             sandbox, workingDirectory, prompt, credential, modelId, reasoningMode,
-            ct, stdoutChunkCallback, captureStructuredStream: false,
+            ct, stdoutChunkCallback, structuredStreamSupported,
             result,
             resumeContext: resume).ConfigureAwait(false);
 
-        return result;
+        return structuredStreamSupported
+            ? result
+            : WithStructuredStreamDisabledWarning(result);
     }
 
     /// <summary>
@@ -327,7 +335,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 // Sanitiser succeeded — retry the underlying invocation.
                 if (resumeContext is not null)
                 {
-                    result = await base.RunResumedAsync(
+                    result = await RunResumedCoreAsync(
                         sandbox,
                         workingDirectory,
                         prompt,
@@ -336,7 +344,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                         modelId,
                         reasoningMode,
                         ct,
-                        stdoutChunkCallback).ConfigureAwait(false);
+                        stdoutChunkCallback,
+                        captureStructuredStream).ConfigureAwait(false);
                 }
                 else
                 {
@@ -367,27 +376,76 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return result;
     }
 
+    private AgentResult WithStructuredStreamDisabledWarning(AgentResult result)
+    {
+        var warning = $"Warning: Claude CLI at '{Binary}' does not support --output-format stream-json --verbose; structured stream capture was disabled.";
+        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
+        return result with { Stderr = stderr };
+    }
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: false, captureStructuredStream);
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
 
     protected override AgentInvocation BuildResumeInvocation(
         string prompt,
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, resume: true, captureStructuredStream: false);
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
 
-    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, bool resume, bool captureStructuredStream)
+    /// <summary>
+    /// Claude emits the resumable CLI session id only in its structured
+    /// stream-json init event, so orchestrator call sites must force structured
+    /// output when they want crash recovery independent of AgentStreams.
+    /// </summary>
+    public bool RequiresStructuredStreamForSessionId => true;
+
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier => _sessionResumeQuotaClassifier;
+
+    /// <summary>
+    /// The Claude CLI prints a structured init event on its first stream-json
+    /// line: <c>{"type":"system","subtype":"init","session_id":"...", ...}</c>.
+    /// We pull the id from that line so a crashed run can be resumed in place
+    /// via <c>claude --resume &lt;id&gt;</c>. Robust to ordering / extra
+    /// whitespace and tolerant of <c>sessionId</c> camelCase that some CLI
+    /// builds use; returns <c>null</c> when no recognisable id is present.
+    /// </summary>
+    public string? TryExtractSessionId(string? stdout)
+        => ClaudeSessionIdExtractor.Extract(stdout);
+
+    /// <summary>
+    /// Builds the argv for a CLI-native session resume after a transient crash.
+    /// <c>claude --resume &lt;id&gt; --print</c> requires a non-empty stdin turn,
+    /// so the resumed process receives a short continuation instruction rather
+    /// than the original task prompt again. The conversation restored by the
+    /// CLI carries the original user prompt and in-progress context.
+    /// </summary>
+    protected override AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
-        _ = resume;
-        return BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: null, captureStructuredStream);
+        if (string.IsNullOrWhiteSpace(sessionId))
+            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
+        _ = prompt;
+        return BuildClaudeInvocation(SessionResumePrompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
     }
+
+    internal const string SessionResumePrompt =
+        "Continue from the restored session after the interrupted run. Do not restart completed work or repeat the original instructions.";
+
+    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, string? sessionIdForResume, bool captureStructuredStream)
+        => BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: sessionIdForResume, captureStructuredStream);
 
     /// <summary>
     /// Builds the claude CLI argv used by <see cref="ClaudeSessionWorker"/> for
@@ -403,16 +461,16 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         bool captureStructuredStream)
     {
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
+        {
+            argv.Add("--resume");
+            argv.Add(cliResumeSessionId);
+        }
         if (captureStructuredStream)
         {
             argv.Add("--output-format");
             argv.Add("stream-json");
             argv.Add("--verbose");
-        }
-        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
-        {
-            argv.Add("--resume");
-            argv.Add(cliResumeSessionId);
         }
         var effectiveModel = modelId ?? DefaultModelId;
         if (!string.IsNullOrEmpty(effectiveModel))
@@ -734,5 +792,32 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     {
         if (_networkTolerance == null) return null;
         return _networkTolerance.GetTolerance(Kind.Value)?.ApiTimeoutMs;
+    }
+
+    private sealed class ClaudeSessionResumeQuotaClassifier : IQuotaFailureClassifier
+    {
+        public static readonly ClaudeSessionResumeQuotaClassifier Instance = new();
+
+        private readonly ClaudeQuotaFailureDetector _detector = new();
+
+        private ClaudeSessionResumeQuotaClassifier() { }
+
+        public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+        {
+            if (agent != AgentKind.Claude || (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout)))
+                return QuotaFailureClassification.None;
+
+            if (_detector.IsTerminalNonQuotaCrash(stderr, stdout))
+                return QuotaFailureClassification.TerminalNonQuota;
+
+            var scopedStdout = _detector.ScopeStdoutForQuotaDetection(stdout);
+            var detection = _detector.Detect(stderr, scopedStdout);
+            return detection is null
+                ? QuotaFailureClassification.None
+                : QuotaFailureClassification.Quota(detection);
+        }
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => Classify(agent, stderr, stdout).Detection;
     }
 }

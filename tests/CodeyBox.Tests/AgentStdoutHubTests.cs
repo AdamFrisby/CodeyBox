@@ -59,6 +59,24 @@ public sealed class AgentStdoutHubTests
     }
 
     [Fact]
+    public void BroadcastChunk_RedactsSessionIdsBeforeStorage()
+    {
+        var (svc, _) = MakeSvc();
+        var id = WorkItemId.New();
+        const string SessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+
+        svc.BroadcastChunk(
+            id,
+            "work",
+            $$"""{"type":"system","subtype":"init","session_id":"{{SessionId}}"}""");
+
+        var tail = svc.GetTail(id);
+        Assert.NotNull(tail);
+        Assert.DoesNotContain(SessionId, tail);
+        Assert.Contains("\"session_id\":\"***\"", tail);
+    }
+
+    [Fact]
     public void BroadcastChunk_MultipleSeparateItems_IndependentBuffers()
     {
         var (svc, _) = MakeSvc();

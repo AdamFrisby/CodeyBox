@@ -53,6 +53,17 @@ public sealed class PipelineTuningOptions
     public int AgentSuspendMaxRetries { get; set; } = 1;
 
     /// <summary>
+    /// Maximum CLI-native session-resume retries the base agent runner will
+    /// attempt after a transient crash that captured a session id in stdout.
+    /// Applied by <see cref="Agents.SessionResumeOptions"/>. Default 2 — one
+    /// retry covers the typical 429 / OOM / SIGPIPE blip, the second exists
+    /// so a single mid-resume blip does not collapse the work item. Set to 0
+    /// to disable session resume (fall back to the legacy single-shot
+    /// re-invocation retry).
+    /// </summary>
+    public int AgentSessionResumeMaxAttempts { get; set; } = Agents.SessionResumeOptions.DefaultMaxResumeAttempts;
+
+    /// <summary>
     /// Maximum number of sequential auto-merge race recoveries the upstream-push
     /// loop will perform before parking the item. Each recovery costs a full LLM
     /// merge-phase re-invocation. When the upstream base is a moving target

@@ -24,9 +24,20 @@ public static class AgentSuspendResilience
 
     /// <summary>
     /// Exit codes commonly observed when an HTTP client gives up after a long
-    /// frozen TCP connection post-resume (curl 52/56, generic 1, npm-style 92).
+    /// frozen TCP connection post-resume (curl 52/56, generic 1, npm-style 92)
+    /// or when the sandbox kills an agent process mid-run (SIGKILL/OOM 137).
     /// </summary>
-    private static readonly HashSet<int> SuspendRelatedExitCodes = [1, 52, 56, 92];
+    private static readonly HashSet<int> SuspendRelatedExitCodes = [1, 52, 56, 92, 137];
+
+    /// <summary>
+    /// Returns true when <paramref name="exitCode"/> matches the set of exit
+    /// shapes the suspend-resilience retry treats as transient. Exposed so
+    /// the CLI-native session-resume path can apply the same allowlist (resume
+    /// is recovery for the same family of transient blips), keeping the two
+    /// recovery policies aligned.
+    /// </summary>
+    public static bool IsSuspendRelatedExitCode(int exitCode) =>
+        SuspendRelatedExitCodes.Contains(exitCode);
 
     /// <summary>
     /// All built-in agent CLIs routed through <see cref="CliAgentRunnerBase"/>.

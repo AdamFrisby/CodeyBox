@@ -109,7 +109,8 @@ internal static class TestSupport
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
         IAgentInvolvementStore? involvement = null,
         IInVmSmokeGate? inVmSmokeGate = null,
-        IAuditProgressStore? auditProgressOverride = null)
+        IAuditProgressStore? auditProgressOverride = null,
+        bool cliSessionResumableAgent = false)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -124,7 +125,10 @@ internal static class TestSupport
         IGitHost gitHost = gitHostDecorator?.Invoke(realGitHost) ?? realGitHost;
         var sandboxes = sandboxProvider ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var agent = new ScriptedAgent(mergeStrategy?.ToList() ?? [MergeStrategy.RealMerge]);
+        var mergeStrategies = mergeStrategy?.ToList() ?? [MergeStrategy.RealMerge];
+        ScriptedAgent agent = cliSessionResumableAgent
+            ? new CliSessionResumableScriptedAgent(mergeStrategies)
+            : new ScriptedAgent(mergeStrategies);
         var registry = new AgentRegistry([agent]);
         var auditorList = (auditors ?? []).ToList();
 
@@ -347,6 +351,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     /// assert the prompt scaffolding (forbidden actions, file list, etc.).
     /// </summary>
     public List<string> ConflictReworkPrompts { get; } = new();
+    public List<bool> ConflictReworkCaptureStructuredStreamCalls { get; } = new();
     public Queue<string> StdoutChunks { get; } = new();
     public Queue<IReadOnlyList<string>> StdoutChunkBatches { get; } = new();
     /// <summary>
@@ -537,6 +542,7 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
         if (prompt.Contains("# Conflict-resolution mode (third-line fallback)", StringComparison.Ordinal))
         {
             ConflictReworkPrompts.Add(prompt);
+            ConflictReworkCaptureStructuredStreamCalls.Add(captureStructuredStream);
             if (ConflictReworkPlan.Count == 0)
                 return new AgentResult(false, "ScriptedAgent: ran out of conflict-rework plan entries", null, null);
             var handler = ConflictReworkPlan.Dequeue();
@@ -728,6 +734,28 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
 
     [GeneratedRegex(@"merge branch `([^`]+)` into branch\s+`([^`]+)`", RegexOptions.CultureInvariant | RegexOptions.Singleline)]
     private static partial Regex MergePromptShape();
+}
+
+internal sealed class CliSessionResumableScriptedAgent(IEnumerable<MergeStrategy> mergeStrategies)
+    : ScriptedAgent(mergeStrategies), ICliSessionResumableAgentRunner
+{
+    public bool RequiresStructuredStreamForSessionId => true;
+
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier { get; } = new NoQuotaFailureClassifier();
+
+    public string? TryExtractSessionId(string? stdout)
+        => stdout is null || !stdout.Contains("scripted-session", StringComparison.Ordinal)
+            ? null
+            : "scripted-session";
+
+    private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
+    {
+        public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+            => QuotaFailureClassification.None;
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => null;
+    }
 }
 
 /// <summary>

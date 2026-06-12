@@ -120,12 +120,12 @@ public sealed class OpencodeCostExtractorTests
     [Fact]
     public void Json_WithModelField_RecordsModelId()
     {
-        var stdout = """{"model":"deepseek/deepseek-coder","usage":{"prompt_tokens":10,"completion_tokens":5}}""";
+        var stdout = """{"model":"opencode-go/deepseek-v4-flash","usage":{"prompt_tokens":10,"completion_tokens":5}}""";
 
         var result = Extractor.TryExtract(stdout, null);
 
         Assert.NotNull(result);
-        Assert.Equal("deepseek/deepseek-coder", result!.ModelId);
+        Assert.Equal("opencode-go/deepseek-v4-flash", result!.ModelId);
     }
 
     [Fact]

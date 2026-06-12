@@ -16,6 +16,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     public abstract AgentKind Kind { get; }
 
     /// <summary>
+    /// Sandbox CLI invocation built by concrete agent runners. This stays
+    /// protected so argv/environment/stdin details do not leak into Core's
+    /// domain/plugin-facing API.
+    /// </summary>
+    protected sealed record AgentInvocation(
+        IReadOnlyList<string> Argv,
+        IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
+        string? Stdin = null);
+
+    /// <summary>
     /// Build the argv to execute inside the sandbox for a given prompt. The
     /// prompt may be passed via argv, stdin, or a file; subclasses choose.
     /// </summary>
@@ -49,8 +59,24 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
-        => BuildInvocation(prompt, credential, modelId, reasoningMode);
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
+
+    /// <summary>
+    /// Build the invocation used to continue a crashed native CLI session in
+    /// the same sandbox. Only subclasses that implement
+    /// <see cref="ICliSessionResumableAgentRunner"/> should override this hook.
+    /// </summary>
+    protected virtual AgentInvocation BuildSessionResumeInvocation(
+        string sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+        => throw new NotSupportedException(
+            $"{Kind} declares CLI session resume but does not implement {nameof(BuildSessionResumeInvocation)}.");
 
     /// <summary>
     /// Gives subclasses a chance to materialise non-argv CLI prerequisites
@@ -85,7 +111,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         var invocation = BuildInvocation(prompt, credential, modelId, reasoningMode, captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sessionResumeContext: CreateSessionResumeContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream));
     }
 
     public virtual async Task<AgentResult> RunResumedAsync(
@@ -98,6 +130,32 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string? reasoningMode = null,
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null)
+        => await RunResumedCoreAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback,
+            captureStructuredStream: this is ICliSessionResumableAgentRunner
+            {
+                RequiresStructuredStreamForSessionId: true,
+            }).ConfigureAwait(false);
+
+    protected async Task<AgentResult> RunResumedCoreAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback,
+        bool captureStructuredStream)
     {
         await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
@@ -105,9 +163,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (preparation is not null)
             return preparation;
 
-        var invocation = BuildResumeInvocation(prompt, credential, resume, modelId, reasoningMode);
+        var invocation = BuildResumeInvocation(
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            captureStructuredStream);
         return await ExecuteWithSuspendResilienceAsync(
-            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
+            sandbox, workingDirectory, invocation, stdoutChunkCallback, ct,
+            sessionResumeContext: CreateSessionResumeContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream));
     }
 
     private async Task<AgentResult> ExecuteWithSuspendResilienceAsync(
@@ -115,27 +185,266 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentInvocation invocation,
         Action<string>? stdoutChunkCallback,
-        CancellationToken ct)
+        CancellationToken ct,
+        SessionResumeRebuildContext? sessionResumeContext = null)
     {
         var attempt = 0;
+        var resumeAttempts = 0;
+        var current = invocation;
         AgentResult? last = null;
-        while (attempt <= AgentSuspendResilience.MaxRetries)
+        // Tracked across the retry loop so a session id captured on attempt N
+        // can drive the rebuild on attempt N+1 even if attempt N+1 itself
+        // crashes before re-emitting the init event.
+        string? capturedSessionId = null;
+        while (true)
         {
             last = await ExecuteInvocationOnceAsync(
-                sandbox, workingDirectory, invocation, stdoutChunkCallback, ct);
-            if (last.Success || attempt >= AgentSuspendResilience.MaxRetries)
+                sandbox, workingDirectory, current, stdoutChunkCallback, ct);
+            if (last.Success)
                 return last;
+
+            // Session id extraction requires the CLI's structured (id-bearing)
+            // output mode: plain stdout on the model-controlled call paths
+            // could be spoofed with a fake init line, redirecting --resume
+            // to an attacker-chosen session. The orchestrator now enables
+            // CaptureStructuredStream for resumable runners independently of
+            // optional persistent stream logging (see ICliSessionResumableAgentRunner),
+            // so a transient crash is recoverable on the production work/
+            // audit/merge paths regardless of AgentStreams. Plain-stdout call
+            // sites (verdict-parser shortcuts) intentionally forgo resume to
+            // keep their stdout contract intact.
+            if (sessionResumeContext is not null
+                && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
+                    || sessionResumeContext.CaptureStructuredStream)
+                && sessionResumeContext.Capability.TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
+            {
+                capturedSessionId = freshId;
+            }
 
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
             var exitCode = ParseExitCodeFromSummary(last.Summary);
+
+            // Classify FIRST: a captured session id is not by itself a license
+            // to relaunch. Deterministic auth failures and terminal API crashes
+            // are excluded here / by the quota gate, while otherwise-unmatched
+            // non-zero exits are treated as resumable CLI crashes within the
+            // bounded budget.
+            if (sessionResumeContext is not null
+                && capturedSessionId is not null
+                && IsResumeEligibleFailure(classification, exitCode)
+                && SessionResumeQuotaGate.AllowsResume(
+                    sessionResumeContext.Capability.SessionResumeQuotaClassifier,
+                    Kind,
+                    last.Stderr,
+                    last.Stdout))
+            {
+                var maxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
+                if (resumeAttempts < maxResumeAttempts)
+                {
+                    var livenessProbe = await TryProbeResumeLivenessAsync(
+                        sandbox, workingDirectory, ct).ConfigureAwait(false);
+                    if (!livenessProbe.IsAlive)
+                        return WithLivenessProbeNote(last, livenessProbe);
+
+                    resumeAttempts++;
+                    current = BuildSessionResumeInvocation(
+                        capturedSessionId,
+                        sessionResumeContext.Prompt,
+                        sessionResumeContext.Credential,
+                        sessionResumeContext.ModelId,
+                        sessionResumeContext.ReasoningMode,
+                        sessionResumeContext.CaptureStructuredStream);
+                    continue;
+                }
+
+                if (maxResumeAttempts > 0)
+                    throw new AgentSessionResumeExhaustedException(Kind, maxResumeAttempts, last);
+            }
+
+            if (attempt >= AgentSuspendResilience.MaxRetries)
+                return last;
             if (!AgentSuspendResilience.ShouldRetry(Kind, classification, exitCode))
                 return last;
 
             attempt++;
+            // Fall through to the pre-resume single-shot retry shape only when
+            // native session resume was unavailable or disabled (no captured id,
+            // non-eligible failure, or MaxResumeAttempts=0). A positive resume
+            // budget that has been exhausted returns above so the same agent is
+            // not restarted from scratch in the same sandbox.
+            current = invocation;
+        }
+    }
+
+    /// <summary>
+    /// Resume in-place is the recovery for the transient agent-process crash
+    /// shapes the task spec calls out: OOM/SIGKILL/SIGPIPE/network blip and
+    /// CLI bugs that exit non-zero with no recognised failure pattern.
+    ///
+    /// <para>
+    /// Explicitly EXCLUDED:
+    /// <list type="bullet">
+    /// <item><see cref="AgentFailureKind.AuthError"/> — revoked/expired credentials
+    /// would re-fail the same way on resume; the orchestrator's auth recovery
+    /// path is the right escalation, not a same-session relaunch.</item>
+    /// <item>Hard quota exhaustion (account caps, RESOURCE_EXHAUSTED), and
+    /// rate limits with parsed reset windows — handled upstream by
+    /// <see cref="SessionResumeQuotaGate"/> which blocks these even when this
+    /// method allows the QuotaExhausted classification through.</item>
+    /// <item>Terminal non-quota API crashes (e.g. Claude 400 thinking-block) —
+    /// also blocked by the gate via the provider detector.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Normal classification + non-zero exit code is included because
+    /// the shared <see cref="AgentFailureClassifier"/> defaults to
+    /// <see cref="AgentFailureKind.Normal"/> for any non-matched pattern,
+    /// which conflates "agent reported a work refusal" with "process was
+    /// killed and emitted no recognised diagnostic." The task requires native
+    /// resume for generic CLI crashes, OOM/SIGKILL (usually exit 137), and
+    /// non-zero CLI bugs when a session id was captured; the bounded resume
+    /// budget keeps the cost of a misclassified refusal to a couple of retries
+    /// before the orchestrator fails over.
+    /// </para>
+    /// </summary>
+    private static bool IsResumeEligibleFailure(AgentFailureClassification classification, int exitCode)
+        => classification.Kind switch
+        {
+            AgentFailureKind.TransientNetwork => true,
+            AgentFailureKind.Unknown => AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode),
+            AgentFailureKind.Normal => exitCode != 0,
+            // Soft rate-limit/overload comes through as QuotaExhausted; the
+            // session-resume quota gate is the authoritative decision for
+            // that shape (it inspects the provider detector). Returning true
+            // here defers to that gate.
+            AgentFailureKind.QuotaExhausted => true,
+            AgentFailureKind.AuthError => false,
+            _ => false,
+        };
+
+    private async Task<ResumeLivenessProbeResult> TryProbeResumeLivenessAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct)
+    {
+        SandboxExecResult result;
+        try
+        {
+            result = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    """
+                    target=$1
+                    repo=$2
+                    [ -n "$target" ] || exit 1
+                    [ -n "$repo" ] || exit 1
+                    [ -d "$target" ] || exit 1
+                    [ -x "$target" ] || exit 1
+                    [ -w "$target" ] || exit 1
+                    [ -e "$target/.git" ] || exit 1
+                    git -C "$target" rev-parse --git-dir >/dev/null 2>&1 || exit 1
+                    git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 1
+                    [ -d "$repo" ] || exit 1
+                    [ -x "$repo" ] || exit 1
+                    [ -w "$repo" ] || exit 1
+                    [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = "true" ] || exit 1
+                    origin=$(git -C "$target" remote get-url origin 2>/dev/null) || exit 1
+                    case "$origin" in
+                        "$repo"|"$repo/"|file://"$repo"|file://"$repo/") ;;
+                        *) exit 1 ;;
+                    esac
+                    git -C "$target" ls-remote --exit-code origin HEAD >/dev/null 2>&1 || exit 1
+                    """,
+                    "codeybox-resume-liveness",
+                    workingDirectory,
+                    SandboxConventions.RepoDir,
+                ],
+                WorkingDirectory = "/",
+            }, ct).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Sandbox already torn down between the crashed run and the
+            // liveness check — VM is gone, resume cannot proceed in this
+            // sandbox, and re-drive in a fresh sandbox is the correct path.
+            return new ResumeLivenessProbeResult(IsAlive: false, FailureKind: "sandbox-disposed", FailureDetail: null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Sandbox/provider bug surfaced during the liveness exec.
+            // Surface the real failure rather than masking it as a generic
+            // non-resumable exit so an infrastructure problem doesn't look
+            // like an ordinary agent failure.
+            AuditLog.SessionResumeLivenessProbeFailed(Kind, ex.GetType().Name, ex.Message);
+            throw;
         }
 
-        return last!;
+        return result.Success
+            ? new ResumeLivenessProbeResult(IsAlive: true, FailureKind: null, FailureDetail: null)
+            : new ResumeLivenessProbeResult(
+                IsAlive: false,
+                FailureKind: "probe-exit-nonzero",
+                FailureDetail: $"exit {result.ExitCode}: {Tail(result.Stderr)}");
     }
+
+    private static AgentResult WithLivenessProbeNote(AgentResult original, ResumeLivenessProbeResult probe)
+    {
+        if (probe.FailureKind is null)
+            return original;
+
+        var note = probe.FailureDetail is null
+            ? $"resume liveness probe rejected ({probe.FailureKind})"
+            : $"resume liveness probe rejected ({probe.FailureKind}): {probe.FailureDetail}";
+        var stderr = string.IsNullOrEmpty(original.Stderr) ? note : $"{note}\n{original.Stderr}";
+        return original with { Stderr = stderr };
+    }
+
+    private static string Tail(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        const int max = 200;
+        return text.Length <= max ? text : text[^max..];
+    }
+
+    private readonly record struct ResumeLivenessProbeResult(bool IsAlive, string? FailureKind, string? FailureDetail);
+
+    private SessionResumeRebuildContext? CreateSessionResumeContext(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        bool captureStructuredStream)
+        => this is ICliSessionResumableAgentRunner capability
+            ? new SessionResumeRebuildContext(
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                captureStructuredStream,
+                capability)
+            : null;
+
+    /// <summary>
+    /// Inputs the suspend-resilience loop needs to rebuild a failed invocation
+    /// as a CLI-native session resume. The credential/model/reasoning are the
+    /// same the caller supplied to <see cref="RunAsync"/> / <see cref="RunResumedAsync"/>;
+    /// re-using them keeps the resumed call's auth / model identical to the
+    /// crashed run.
+    /// </summary>
+    private sealed record SessionResumeRebuildContext(
+        string Prompt,
+        AgentCredential? Credential,
+        string? ModelId,
+        string? ReasoningMode,
+        bool CaptureStructuredStream,
+        ICliSessionResumableAgentRunner Capability);
 
     private async Task<AgentResult> ExecuteInvocationOnceAsync(
         ISandbox sandbox,
@@ -786,8 +1095,4 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             .Remove(new KeyValuePair<string, string>(runKey, runId));
     }
 
-    protected sealed record AgentInvocation(
-        IReadOnlyList<string> Argv,
-        IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
-        string? Stdin = null);
 }

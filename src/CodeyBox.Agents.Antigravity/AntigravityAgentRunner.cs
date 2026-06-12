@@ -96,12 +96,14 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase
         AgentCredential? credential,
         AgentResumeContext resume,
         string? modelId = null,
-        string? reasoningMode = null)
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
     {
         // CheckpointRef can carry a specific conversation id captured at preempt
         // time (format "agy-conversation:<id>"). If absent, fall back to --continue
         // (most recent conversation) — strictly worse than a pinned id but matches
         // Claude's resume-without-id fallback for parity.
+        _ = captureStructuredStream;
         var id = TryParseConversationId(resume.CheckpointRef);
         return BuildAgyInvocation(
             prompt,

@@ -10,6 +10,8 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -21,7 +23,7 @@ namespace CodeyBox.Tests;
 /// item Failed. The 3-member exhaustion case parks the item in
 /// <see cref="WorkItemState.WaitingForQuotaReset"/>.
 /// </summary>
-[Collection("Pipeline integration")]
+[Collection("GlobalSerilog")]
 public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 {
     private readonly string _workspace;
@@ -130,6 +132,167 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var swap = Assert.Single(history, h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, swap.FromAgent);
+    }
+
+    [Fact]
+    public async Task Codex_ExhaustsSessionResume_FallsBackToClaude_EmitsAuditHistoryAndMetric()
+    {
+        var sink = new TestSink();
+        var previousLogger = Log.Logger;
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        try
+        {
+            var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+            using var fix = BuildPipeline(seed);
+
+            fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+                AgentKind.Codex,
+                maxResumeAttempts: 2,
+                new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+            fix.Claude.WorkPlan.Enqueue(new FileWrite("resume.txt", "recovered by fallback"));
+
+            using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+            var item = NewItem(initialAgent: AgentKind.Codex);
+            await fix.Store.CreateAsync(item);
+            await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+            var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+            Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+            Assert.True(fix.Codex.CallCount >= 1);
+            Assert.Equal(1, fix.Claude.CallCount);
+
+            var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+            var fallback = Assert.Single(history, h => h.Phase == "work");
+            Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+            Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+            Assert.Contains("exhausted 2 session resume", fallback.Reason);
+
+            var webhook = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.fallback");
+            var details = Assert.IsType<AgentFallbackDetails>(webhook.Details);
+            Assert.Equal("work", details.Phase);
+            Assert.Equal("codex", details.FromAgent);
+            Assert.Equal("claude", details.ToAgent);
+            Assert.Contains("exhausted 2 session resume", details.Reason);
+
+            Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                    ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "resume_exhausted"), ("phase", "work")),
+                "expected a codeybox.agent.fallbacks{kind=resume_exhausted} measurement for the resume-exhausted swap");
+
+            var audit = Assert.Single(sink.Events,
+                e => GetScalar<string>(e, "EventName") == "agent.resume_exhausted_fallback");
+            Assert.True(GetScalar<bool>(audit, "Audit"));
+            Assert.Equal(LogEventLevel.Warning, audit.Level);
+            Assert.Equal(item.Id.ToString(), GetScalar<string>(audit, "WorkItemId"));
+            Assert.Equal("work", GetScalar<string>(audit, "Phase"));
+            Assert.Null(GetScalar<int?>(audit, "Iteration"));
+            Assert.Equal("codex", GetScalar<string>(audit, "FromAgent"));
+            Assert.Equal("(default)", GetScalar<string>(audit, "FromModel"));
+            Assert.Equal("claude", GetScalar<string>(audit, "ToAgent"));
+            Assert.Equal("(default)", GetScalar<string>(audit, "ToModel"));
+            Assert.Contains("exhausted 2 session resume", GetScalar<string>(audit, "Reason"));
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+            Log.Logger = previousLogger;
+        }
+    }
+
+    [Fact]
+    public async Task Codex_ExhaustsSessionResumeWithQuotaLastResult_FallsBackAsQuotaAndRecordsObservedFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var quotaFailures = new InMemoryQuotaFailureStore();
+        using var fix = BuildPipeline(seed, quotaFailures: quotaFailures);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(false, "agent exited 1", null, "hit your usage limit")));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("resume-quota.txt", "recovered by quota fallback"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Done, finalItem!.State);
+
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "work")),
+            "resume exhaustion with quota-shaped LastResult must route through quota fallback, not resume_exhausted fallback");
+        Assert.Contains(AgentKind.Codex, fix.CodexProbe.MarkedExhausted);
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "work");
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Equal(AgentKind.Claude, fallback.ToAgent);
+        Assert.Contains("quota failure after exhausting session resume", fallback.Reason);
+
+        var observations = await quotaFailures.ListRecentAsync(
+            TimeSpan.FromHours(1),
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            CancellationToken.None);
+        var observation = Assert.Single(observations);
+        Assert.Equal(AgentKind.Codex, observation.Agent);
+        Assert.Equal(QuotaFailureKind.LimitReached, observation.FailureKind);
+        Assert.Equal(item.ProjectId, observation.ProjectId);
+    }
+
+    [Fact]
+    public async Task SoleMember_ExhaustsSessionResume_FailsCleanlyWithoutFallback()
+    {
+        // Companion guard for the nextMember == null path in
+        // MoveToNextMemberOrThrowAsync's ResumeExhausted branch. The sibling
+        // Codex_ExhaustsSessionResume_FallsBackToClaude_… test exercises the
+        // "fallback candidate exists → use it" branch; this test pins the
+        // "no candidate left" branch: the AgentSessionResumeExhaustedException
+        // must surface (NOT be silently swallowed, parked as quota, or
+        // re-tried against the same exhausted agent), and the item must reach
+        // a clean Failed terminal rather than spinning or stranding.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, singleMemberClass: true);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(false, "agent exited 1", null, "ECONNRESET")));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        // Clean Failed terminal — not Done (no successful recovery), not
+        // WaitingForQuotaReset (resume-exhausted is not a quota event), not
+        // stuck in a non-terminal state.
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        // failureKind comes from the catch (Exception) default branch — the
+        // resume-exhausted exception is not classified as quota or timeout.
+        Assert.NotEqual("quota", finalItem.FailureKind);
+        Assert.NotEqual("timeout", finalItem.FailureKind);
+
+        // Codex was the only member; no fallback attempt against any other
+        // agent could have occurred. The class chain MUST NOT have re-tried
+        // the same exhausted agent in a loop either.
+        Assert.Equal(1, fix.Codex.CallCount);
+
+        // No swap recorded because no candidate was available.
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.DoesNotContain(history, h => h.Phase == "work" && h.ToAgent is not null);
+
+        // No misleading "agent.fallback" webhook either: that event implies a
+        // successor agent took over; here the run terminated.
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.fallback");
     }
 
     [Fact]
@@ -711,6 +874,19 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(phase, r.Phase);
         Assert.Equal(iteration, r.Iteration);
         Assert.Equal(outcome, r.Outcome);
+    }
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int?) && sv.Value is int i)
+            return (T)(object)(int?)i;
+        if (typeof(T) == typeof(int?) && sv.Value is null)
+            return default;
+        return default;
     }
 
     [Fact]
@@ -1528,7 +1704,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         IInVmSmokeGate? inVmSmokeGate = null,
         QuotaRouterOptions? quotaOptions = null,
         AgentQuotaSnapshot? codexQuotaSnapshot = null,
-        AgentQuotaSnapshot? claudeQuotaSnapshot = null)
+        AgentQuotaSnapshot? claudeQuotaSnapshot = null,
+        bool singleMemberClass = false,
+        IQuotaFailureStore? quotaFailures = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1547,12 +1725,17 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         {
             Id = "frontier",
             DisplayName = "Frontier",
-            Members =
-            [
-                // Codex first by config-order tiebreak (same effective score).
-                new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
-                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
-            ],
+            Members = singleMemberClass
+                ?
+                [
+                    new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ]
+                :
+                [
+                    // Codex first by config-order tiebreak (same effective score).
+                    new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                ],
         };
 
         var auditorList = auditors ?? [];
@@ -1584,7 +1767,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             [frontier],
             [codexProbe, claudeProbe],
             resolvedQuotaOptions,
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            quotaFailures: quotaFailures);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
         var involvement = new InMemoryAgentInvolvementStore();
@@ -1609,6 +1793,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             classRouter: useClassRouter ? router : null,
             fallbackHistory: fallbackHistory,
             quotaClassifier: new CompositeQuotaFailureClassifier(new IAgentQuotaFailureDetector[] { new CodexQuotaFailureDetector(), new ClaudeQuotaFailureDetector() }),
+            quotaFailures: quotaFailures,
             involvement: involvementForPipeline,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             dispatchAvailability: inVmSmokeGate is null
@@ -2011,6 +2196,74 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         public void Dispose() => Store.Dispose();
     }
 
+    private sealed class InMemoryQuotaFailureStore : IQuotaFailureStore
+    {
+        private readonly List<QuotaFailureObservation> _observations = [];
+
+        public Task RecordAsync(
+            AgentKind agent,
+            string? modelId,
+            QuotaFailureKind kind,
+            DateTimeOffset observedAt,
+            CancellationToken ct = default)
+        {
+            _observations.Add(new QuotaFailureObservation(agent, modelId, kind, observedAt));
+            return Task.CompletedTask;
+        }
+
+        public Task RecordForProjectAsync(
+            AgentKind agent,
+            string? modelId,
+            ProjectId projectId,
+            QuotaFailureKind kind,
+            DateTimeOffset observedAt,
+            CancellationToken ct = default)
+        {
+            _observations.Add(new QuotaFailureObservation(agent, modelId, kind, observedAt, projectId));
+            return Task.CompletedTask;
+        }
+
+        public async Task<bool> HasRecentAsync(
+            AgentKind agent,
+            string? modelId,
+            TimeSpan window,
+            DateTimeOffset now,
+            CancellationToken ct = default) =>
+            await GetMostRecentAsync(agent, modelId, window, now, ct) is not null;
+
+        public Task<DateTimeOffset?> GetMostRecentAsync(
+            AgentKind agent,
+            string? modelId,
+            TimeSpan window,
+            DateTimeOffset now,
+            CancellationToken ct = default)
+        {
+            var latest = _observations
+                .Where(o => o.Agent == agent
+                    && string.Equals(o.ModelId, modelId, StringComparison.Ordinal)
+                    && o.ObservedAt <= now
+                    && now - o.ObservedAt <= window)
+                .Select(o => (DateTimeOffset?)o.ObservedAt)
+                .Max();
+            return Task.FromResult(latest);
+        }
+
+        public Task<IReadOnlyList<QuotaFailureObservation>> ListRecentAsync(
+            TimeSpan window,
+            DateTimeOffset now,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<QuotaFailureObservation>>(
+                _observations
+                    .Where(o => o.ObservedAt <= now && now - o.ObservedAt <= window)
+                    .ToList());
+
+        public Task PruneOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+        {
+            _observations.RemoveAll(o => o.ObservedAt < cutoff);
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class ThreeMemberFixture : IDisposable
     {
         public PipelineRunner Pipeline { get; }
@@ -2058,6 +2311,9 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
     public Queue<AgentResult> ScriptedFailures { get; } = new();
     public Queue<AgentResult> ReworkScriptedFailures { get; } = new();
     public Queue<AgentResult> MergeScriptedFailures { get; } = new();
+    public Queue<Exception> ScriptedExceptions { get; } = new();
+    public Queue<Exception> ReworkScriptedExceptions { get; } = new();
+    public Queue<Exception> MergeScriptedExceptions { get; } = new();
     public Queue<TimeSpan> WorkDelays { get; } = new();
     public Queue<TimeSpan> ReworkDelays { get; } = new();
     public Queue<TimeSpan> MergeDelays { get; } = new();
@@ -2095,6 +2351,8 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         {
             if (MergeDelays.Count > 0)
                 await Task.Delay(MergeDelays.Dequeue(), _timeProvider, ct);
+            if (MergeScriptedExceptions.Count > 0)
+                throw MergeScriptedExceptions.Dequeue();
             if (MergeScriptedFailures.Count > 0)
                 return MergeScriptedFailures.Dequeue();
 
@@ -2116,6 +2374,10 @@ internal sealed class ScriptableAgent : IAgentRunner, ITextOnlyAgentRunner
         if (delays.Count > 0)
             await Task.Delay(delays.Dequeue(), _timeProvider, ct);
 
+        if (isRework && ReworkScriptedExceptions.Count > 0)
+            throw ReworkScriptedExceptions.Dequeue();
+        if (!isRework && ScriptedExceptions.Count > 0)
+            throw ScriptedExceptions.Dequeue();
         if (isRework && ReworkScriptedFailures.Count > 0)
             return ReworkScriptedFailures.Dequeue();
         if (!isRework && ScriptedFailures.Count > 0)

@@ -16,6 +16,12 @@ public sealed class CompositeQuotaFailureClassifierTests
     ]);
 
     [Fact]
+    public void QuotaClassification_Quota_RejectsNullDetection()
+    {
+        Assert.Throws<ArgumentNullException>(() => QuotaFailureClassification.Quota(null!));
+    }
+
+    [Fact]
     public void Detect_DispatchesByAgentKind_ClaudeRateLimit()
     {
         var detection = _classifier.Detect(AgentKind.Claude, "rate_limit_exceeded", stdout: null);
@@ -98,6 +104,25 @@ public sealed class CompositeQuotaFailureClassifierTests
         Assert.Empty(claude.Calls);
     }
 
+    [Fact]
+    public async Task RecordIfQuotaFailureAsync_NullClassifier_ThrowsArgumentNullException()
+    {
+        IQuotaFailureClassifier classifier = null!;
+
+        var ex = await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            classifier.RecordIfQuotaFailureAsync(
+                store: null,
+                agent: AgentKind.Claude,
+                modelId: null,
+                summary: "agent exited 1",
+                stderr: "rate_limit_exceeded",
+                observedAt: DateTimeOffset.UtcNow,
+                retention: TimeSpan.FromMinutes(30),
+                ct: CancellationToken.None));
+
+        Assert.Equal("classifier", ex.ParamName);
+    }
+
     // ── IsAgentExited1Summary ───────────────────────────────────────────────
     //
     // The composite classifier's persistent-store gate requires an "agent
@@ -117,7 +142,7 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("agent exited 1: …<truncated tail>")]
     public void IsAgentExited1Summary_AcceptsBaseAndEnrichedForms(string summary)
     {
-        Assert.True(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+        Assert.True(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));
     }
 
     [Theory]
@@ -129,7 +154,7 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("failed to materialise gemini auth: exit 1")]
     public void IsAgentExited1Summary_RejectsOtherShapes(string? summary)
     {
-        Assert.False(CompositeQuotaFailureClassifier.IsAgentExited1Summary(summary));
+        Assert.False(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));
     }
 
     private sealed record AdvisoryCall(string? Stderr, string? Stdout, string Phase, string? SandboxName);

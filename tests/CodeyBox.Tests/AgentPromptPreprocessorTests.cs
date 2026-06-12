@@ -271,6 +271,27 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
+    public void PromptPreprocessingAgentRunner_ForwardsCliSessionResumeCapability()
+    {
+        var chain = new AgentPromptPreprocessorChain([new RecordingPreprocessor()]);
+        var inner = new RecordingResumableTextOnlyRunner();
+
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
+            inner,
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Rework,
+            1,
+            NewProject());
+
+        var resumable = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(wrapper);
+        Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        Assert.True(resumable.RequiresStructuredStreamForSessionId);
+        Assert.Same(inner.SessionResumeQuotaClassifier, resumable.SessionResumeQuotaClassifier);
+        Assert.Equal("wrapped-session", resumable.TryExtractSessionId("stdout"));
+    }
+
+    [Fact]
     public async Task ProjectRulesPreprocessor_TruncatesContentLargerThanCap()
     {
         var oversized = new string('a', (256 * 1024) + 10);
@@ -562,7 +583,7 @@ public sealed class AgentPromptPreprocessorTests
         }
     }
 
-    private sealed class RecordingTextOnlyRunner : ITextOnlyAgentRunner
+    private class RecordingTextOnlyRunner : ITextOnlyAgentRunner
     {
         public List<string> RunPrompts { get; } = [];
         public List<string> TextOnlyPrompts { get; } = [];
@@ -609,6 +630,29 @@ public sealed class AgentPromptPreprocessorTests
             _ = workingDirectory;
             TextOnlyPrompts.Add(prompt);
             return Task.FromResult(new TextOnlyAgentResult(true, "ok", "{}", null));
+        }
+    }
+
+    private sealed class RecordingResumableTextOnlyRunner
+        : RecordingTextOnlyRunner, ICliSessionResumableAgentRunner
+    {
+        public bool RequiresStructuredStreamForSessionId => true;
+
+        public IQuotaFailureClassifier SessionResumeQuotaClassifier { get; } = new NoQuotaFailureClassifier();
+
+        public string? TryExtractSessionId(string? stdout)
+        {
+            _ = stdout;
+            return "wrapped-session";
+        }
+
+        private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
+        {
+            public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+                => QuotaFailureClassification.None;
+
+            public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+                => null;
         }
     }
 

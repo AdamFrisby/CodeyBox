@@ -13,19 +13,36 @@ namespace CodeyBox.Tests;
 public sealed class AgentFailureClassifierTests
 {
     [Theory]
-    [InlineData("API Error: rate_limit_exceeded")]
-    [InlineData("rate limit exceeded")]
     [InlineData("[error] usage_limit reached: weekly cap")]
     [InlineData("hit your usage limit")]
+    [InlineData("hit your limit")]
     [InlineData("RESOURCE_EXHAUSTED")]
     [InlineData("quota exceeded for project")]
     [InlineData("[API Error: You have exhausted your capacity on this model.]")]
-    [InlineData("status 429 too many requests")]
-    [InlineData("HTTP 529")]
-    public void QuotaPatterns_Classified_AsQuotaExhausted(string snippet)
+    public void HardQuotaPatterns_Classified_AsHardQuota(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.HardQuota, c.QuotaFailure);
+        Assert.Equal(AgentFailureClassifier.HardQuotaReason, c.Reason);
+    }
+
+    [Theory]
+    [InlineData("API Error: rate_limit_exceeded")]
+    [InlineData("rate limit exceeded")]
+    [InlineData("status 429 too many requests")]
+    [InlineData("HTTP 529")]
+    [InlineData("HTTP 429")]
+    [InlineData("API Error: 429")]
+    [InlineData("status 529")]
+    [InlineData("overloaded_error")]
+    [InlineData("exceeded the rate limit")]
+    public void SoftRateLimitPatterns_Classified_AsSoftRateLimit(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.SoftRateLimit, c.QuotaFailure);
+        Assert.Equal(AgentFailureClassifier.SoftRateLimitReason, c.Reason);
     }
 
     [Theory]
@@ -37,6 +54,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Theory]
@@ -47,6 +65,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Theory]
@@ -59,17 +78,32 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.TransientNetwork, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
     public void Quota_BeatsNetwork_WhenBothPatternsPresent()
     {
         // A 429-with-ECONNRESET-tail must classify as quota — falling back to
-        // a different agent on a 429 is correct; trying again on the same one
-        // because we mistook it for a network blip wastes the operator's day.
+        // quota/rate handling is still correct even when the native session
+        // resume loop later chooses to spend its bounded soft-rate retry.
         var c = AgentFailureClassifier.Classify(
             stderr: "API rate_limit_exceeded\nECONNRESET while retrying");
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void QuotaClassification_SeparatesHardQuotaFromSoftRateLimitReason()
+    {
+        var hard = AgentFailureClassifier.Classify(stderr: "usage_limit reached");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, hard.Kind);
+        Assert.Equal(AgentFailureClassifier.HardQuotaReason, hard.Reason);
+        Assert.Equal(AgentQuotaFailureKind.HardQuota, hard.QuotaFailure);
+
+        var soft = AgentFailureClassifier.Classify(stderr: "API Error: 429 rate_limit_exceeded");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, soft.Kind);
+        Assert.Equal(AgentFailureClassifier.SoftRateLimitReason, soft.Reason);
+        Assert.Equal(AgentQuotaFailureKind.SoftRateLimit, soft.QuotaFailure);
     }
 
     [Fact]
@@ -90,6 +124,7 @@ public sealed class AgentFailureClassifierTests
         var c = AgentFailureClassifier.Classify(
             stderr: "API Error: 401 Unauthorized; subsequent ECONNRESET");
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
@@ -97,6 +132,7 @@ public sealed class AgentFailureClassifierTests
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: null);
         Assert.Equal(AgentFailureKind.Unknown, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]
@@ -105,6 +141,7 @@ public sealed class AgentFailureClassifierTests
         IAgentRunner runner = new ProbeOnlyRunner();
         var c = runner.ClassifyFailure(new AgentResult(true, "ok", "", null));
         Assert.Equal(AgentFailureKind.Normal, c.Kind);
+        Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
     [Fact]

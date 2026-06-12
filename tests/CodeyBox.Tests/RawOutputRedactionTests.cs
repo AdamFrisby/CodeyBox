@@ -57,6 +57,66 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_ClaudeSessionIdJsonProperty_IsReplaced()
+    {
+        const string SessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var result = RawOutputRedactor.Redact(
+            $$"""{"type":"system","subtype":"init","session_id":"{{SessionId}}"}""");
+
+        Assert.DoesNotContain(SessionId, result);
+        Assert.Contains("\"session_id\":\"***\"", result);
+    }
+
+    [Fact]
+    public void Redact_ClaudeCamelCaseSessionIdJsonProperty_IsReplaced()
+    {
+        const string SessionId = "c8e8171a-5c61-42e6-a633-936d2362886a";
+        var result = RawOutputRedactor.Redact(
+            $$"""{"type":"system","subtype":"init","sessionId":"{{SessionId}}"}""");
+
+        Assert.DoesNotContain(SessionId, result);
+        Assert.Contains("\"sessionId\":\"***\"", result);
+    }
+
+    [Fact]
+    public void Redact_PemPrivateKey_HeaderBodyAndFooterReplaced()
+    {
+        const string Pem =
+            "-----BEGIN RSA PRIVATE KEY-----\n" +
+            "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n" +
+            "KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwIDAQABAkEArZkfPGZSv7Tnp7c3pwSt\n" +
+            "-----END RSA PRIVATE KEY-----";
+        var result = RawOutputRedactor.Redact($"crash dump:\n{Pem}\ntrailing");
+
+        Assert.DoesNotContain("BEGIN", result);
+        Assert.DoesNotContain("END", result);
+        Assert.DoesNotContain("MIIBOgIB", result);
+        Assert.Contains("***", result);
+        Assert.Contains("trailing", result);
+    }
+
+    [Fact]
+    public void Redact_StripeTestKey_IsReplaced()
+    {
+        var result = RawOutputRedactor.Redact("Update the changelog without leaking sk_test_123456.");
+        Assert.DoesNotContain("sk_test_123456", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
+    public void Redact_SlackBotAppAndRefreshTokens_AreReplaced()
+    {
+        var result = RawOutputRedactor.Redact(
+            "bot=xoxb-1234567890-aaaa app=xoxa-2-1234567890-bbbb refresh=xoxr-1234567890-cccc session=xoxs-1234567890-dddd");
+
+        Assert.DoesNotContain("xoxb-", result);
+        Assert.DoesNotContain("xoxa-", result);
+        Assert.DoesNotContain("xoxr-", result);
+        Assert.DoesNotContain("xoxs-", result);
+        Assert.Contains("***", result);
+    }
+
+    [Fact]
     public void Redact_NoSecrets_ReturnsOriginal()
     {
         var input = "Build successful. 0 errors, 2 warnings.";
