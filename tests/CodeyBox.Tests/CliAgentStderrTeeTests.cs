@@ -129,6 +129,43 @@ public sealed class CliAgentStderrTeeTests
     }
 
     [Fact]
+    public async Task ExecuteInvocation_StructuredRun_BoundsHugeStderrLineToCapWithTruncationMarker()
+    {
+        // A CLI / tool the agent invoked can emit a very long stderr line
+        // without a newline (terminal control sequences, a JSON dump, a
+        // concatenated stack trace). The forwarder buffers per-line until
+        // newline; without a cap the in-memory StringBuilder grows
+        // unbounded before AgentStreamStore's on-disk size cap can
+        // engage. The cap keeps host memory bounded and the JSON envelope
+        // stamped with a recoverable truncation marker.
+        var hugeChunk = new string('x', 128 * 1024); // 128KB without newline
+        var sandbox = new CapturingTeeSandbox(
+            stdoutChunks: [],
+            stderrChunks: [hugeChunk, "\nrecovered\n"]);
+        var runner = new TestRunner();
+        var received = new List<string>();
+
+        await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            stdoutChunkCallback: chunk => received.Add(chunk),
+            captureStructuredStream: true);
+
+        Assert.Equal(2, received.Count);
+        using var firstDoc = JsonDocument.Parse(received[0].TrimEnd('\n'));
+        var firstText = firstDoc.RootElement.GetProperty("text").GetString();
+        Assert.NotNull(firstText);
+        // Cap is 64 KiB plus the truncation marker. Pre-fix the entire
+        // 128 KiB chunk would have been buffered and serialised verbatim.
+        Assert.True(firstText.Length < 80_000,
+            $"first stderr envelope was {firstText.Length} chars; expected bounded");
+        Assert.Contains("[...stderr line truncated]", firstText);
+        // The next line after the newline must still flush cleanly — the
+        // forwarder resets its overflow state on newline.
+        using var secondDoc = JsonDocument.Parse(received[1].TrimEnd('\n'));
+        Assert.Equal("recovered", secondDoc.RootElement.GetProperty("text").GetString());
+    }
+
+    [Fact]
     public async Task ExecuteInvocation_StructuredRun_FlushesTrailingStderrWithoutNewline()
     {
         // If the agent dies mid-write the final stderr line may lack a trailing

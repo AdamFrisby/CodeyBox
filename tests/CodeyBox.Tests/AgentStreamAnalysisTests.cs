@@ -6,6 +6,7 @@ using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Agents.Opencode;
@@ -252,6 +253,31 @@ public sealed class UnknownAgentStreamParserTests
         Assert.Contains("lines=5", summary.FinalAssistantMessage);
         Assert.Contains("first plaintext line", summary.FinalAssistantMessage);
         Assert.Contains("second plaintext line", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_PlaintextTailLineIsBoundedAgainstHugeLine()
+    {
+        // Agent output (including stderr that the runner tees verbatim
+        // through the plaintext path) is attacker-influenceable. A single
+        // very long line — terminal escapes, a JSON dump, a stack trace
+        // concatenated by a broken logger — must not balloon the persisted
+        // summary row. The per-line cap clamps each kept tail line.
+        var parser = new UnknownAgentStreamParser();
+        var started = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        var hugeLine = new string('x', 16_000);
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(hugeLine + "\nfinal short line\n"));
+
+        var summary = await parser.ParseAsync(stream, new AgentStreamParserContext(
+            started, started.AddSeconds(1), LineCount: null, SizeBytes: null));
+
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // Cap is 16 KiB joined tail + 2 KiB per line + truncation markers.
+        // Pre-cap the whole 16k line would have been concatenated verbatim.
+        Assert.True(summary.FinalAssistantMessage.Length < 20_000,
+            $"FinalAssistantMessage was {summary.FinalAssistantMessage.Length} chars; expected bounded");
+        Assert.Contains("[...truncated]", summary.FinalAssistantMessage);
+        Assert.Contains("final short line", summary.FinalAssistantMessage);
     }
 
     [Fact]
@@ -712,6 +738,129 @@ public sealed class AntigravityStreamParserTests
     }
 
     private static MemoryStream StreamOf(string text) => new(Encoding.UTF8.GetBytes(text));
+}
+
+public sealed class StderrEnvelopeFoldingTests
+{
+    [Fact]
+    public async Task ParseAsync_StreamWithSystemInitThenStderr_PreservesStderrTailInFinalMessage()
+    {
+        // Anti-regression for the completeness gap: a structured stream that
+        // recognises at least one event (system/init) but contains no
+        // provider final message must still surface the codeybox.stderr
+        // envelope diagnostics. Pre-fix, recognizedEventCount>0 short-
+        // circuited the plaintext fallback, so stderr was silently dropped
+        // from agent_stream_summaries — exactly the auth/usage-failure
+        // shape the rework was supposed to make visible.
+        var parser = new ClaudeStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"system","subtype":"init","timestamp":"2026-01-01T00:00:00Z"}
+            {"type":"codeybox.stderr","text":"Error: invalid_api_key"}
+            {"type":"codeybox.stderr","text":"Please reauthenticate with `claude auth login`."}
+            """));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("invalid_api_key", summary.FinalAssistantMessage);
+        Assert.Contains("reauthenticate", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StreamWithResultAndStderr_PreservesBothInFinalMessage()
+    {
+        // When the provider DID emit a final-result message (the happy
+        // path), the stderr tail must not clobber it: surface both so the
+        // operator still sees the provider's own message and any
+        // accompanying stderr diagnostics.
+        var parser = new ClaudeStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"result","timestamp":"2026-01-01T00:00:00Z","result":"all done","usage":{"input_tokens":1,"output_tokens":1}}
+            {"type":"codeybox.stderr","text":"warning: deprecated flag --foo"}
+            """));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        Assert.Contains("all done", summary.FinalAssistantMessage);
+        Assert.Contains("[stderr-tail]", summary.FinalAssistantMessage);
+        Assert.Contains("deprecated flag", summary.FinalAssistantMessage);
+    }
+
+    [Fact]
+    public async Task ParseAsync_StderrTailIsBoundedAgainstHugeEnvelope()
+    {
+        // An attacker-influenceable stderr line (long output from a
+        // compromised tool the agent invoked) must not balloon the
+        // persisted summary row. The stderr tail is capped independently
+        // of the raw capture file size.
+        var parser = new ClaudeStreamParser();
+        var hugeLine = new string('x', 32_000);
+        var envelope = JsonSerializer.Serialize(new { type = "codeybox.stderr", text = hugeLine });
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
+            + envelope + "\n"));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.False(summary.IsUnsupported);
+        Assert.NotNull(summary.FinalAssistantMessage);
+        // The persisted final message must remain bounded (cap is 8KB +
+        // header). 24KB would be the pre-cap size.
+        Assert.True(summary.FinalAssistantMessage.Length < 12_000,
+            $"FinalAssistantMessage was {summary.FinalAssistantMessage.Length} chars; expected bounded");
+        Assert.Contains("[...stderr truncated]", summary.FinalAssistantMessage);
+    }
+}
+
+public sealed class CopilotStreamParserTests
+{
+    private static IReadOnlyList<IAgentStreamParser> ProductionOrderParsers() =>
+    [
+        new ClaudeStreamParser(),
+        new CopilotStreamParser(),
+        new UnknownAgentStreamParser(),
+    ];
+
+    [Fact]
+    public async Task SniffKindAsync_DoesNotClaimAnyShape()
+    {
+        // Copilot CLI is plaintext-only — it never emits NDJSON shapes the
+        // sniffer could recognise. The parser is registered so ResolveKind
+        // canonicalises Copilot kind labels, but its TryClaim must stay
+        // permanently false: if it ever claimed something it would
+        // misattribute Claude/Cursor/etc. runs to Copilot.
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""
+            {"type":"assistant","message":{"role":"assistant","content":"hi"}}
+            """));
+        var kind = await AgentStreamParserSelection.SniffKindAsync(stream, ProductionOrderParsers());
+        Assert.NotEqual(AgentKind.Copilot, kind);
+    }
+
+    [Fact]
+    public async Task ParseAsync_PlaintextStream_ReturnsUnsupportedSoFallbackEngages()
+    {
+        // CopilotStreamParser deliberately inherits FlexibleAgentStreamParser
+        // without recognising any plaintext shape: a plain stdout capture
+        // contains zero recognised events, so ParseAsync returns
+        // IsUnsupported and the orchestrator's plaintext-fallback path
+        // re-runs the file. Without this parser registered at all, that
+        // same plaintext file would end up attributed to "unknown" — the
+        // failure mode this slot guards against.
+        var parser = new CopilotStreamParser();
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+            "copilot session start\n"
+            + "applying patch to foo.go\n"
+            + "session ended\n"));
+
+        var summary = await parser.ParseAsync(stream);
+
+        Assert.True(summary.IsUnsupported);
+        Assert.Equal(AgentKind.Copilot, parser.Kind);
+    }
 }
 
 public sealed class CursorStreamParserTests
@@ -1228,6 +1377,44 @@ public sealed class StreamAnalysisServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnalyzeRecentTerminalWorkItemsAsync_PlaintextFallback_RawNonJsonStreamForCopilot()
+    {
+        // Copilot is the second plaintext-only CLI in the matrix: its
+        // non-interactive mode emits plain stdout with no structured
+        // stream-json. The DI registration in Program.cs wires
+        // CopilotStreamParser specifically to keep these runs attributed
+        // to AgentKind.Copilot (instead of falling to "unknown") while
+        // letting StreamAnalysisService re-run the file through the
+        // plaintext-fallback summariser. Anti-regression: deleting the
+        // CopilotStreamParser registration or removing the parser class
+        // entirely would put the row back under "unknown".
+        var item = CreateItem(WorkItemState.Done) with { Agent = AgentKind.Copilot };
+        await _workItems.CreateAsync(item);
+        WriteStreamFile(item.Id, "work-1-abcdef.jsonl",
+            "copilot session start\n"
+            + "executing tool: read_file foo.go\n"
+            + "ERROR: token quota exceeded\n"
+            + "stack trace:\n"
+            + "session ended\n");
+
+        var service = new StreamAnalysisService(_workItems, _streams, _summaries,
+            [new ClaudeStreamParser(), new CopilotStreamParser(), new UnknownAgentStreamParser()],
+            NullLogger<StreamAnalysisService>.Instance,
+            _costs);
+
+        var count = await service.AnalyzeRecentTerminalWorkItemsAsync(DateTimeOffset.UtcNow, TimeSpan.FromHours(1));
+
+        Assert.Equal(1, count);
+        var row = Assert.Single(await _summaries.GetByWorkItemAsync(item.Id));
+        Assert.Equal(AgentKind.Copilot, row.AgentKind);
+        Assert.False(row.Summary.IsUnsupported);
+        Assert.NotNull(row.Summary.FinalAssistantMessage);
+        Assert.Contains("plaintext-fallback", row.Summary.FinalAssistantMessage);
+        Assert.Contains("lines=5", row.Summary.FinalAssistantMessage);
+        Assert.Contains("session ended", row.Summary.FinalAssistantMessage);
+    }
+
+    [Fact]
     public async Task AnalyzeRecentTerminalWorkItemsAsync_ClaudeShapedCursorRun_PersistsRowAsCursor()
     {
         // End-to-end persistence test for shared-shape attribution.
@@ -1407,6 +1594,7 @@ public sealed class AgentStreamParserProductionRegistrationTests
         Assert.Contains(AgentKind.Antigravity, resolvedKinds);
         Assert.Contains(AgentKind.Claude, resolvedKinds);
         Assert.Contains(AgentKind.Codex, resolvedKinds);
+        Assert.Contains(AgentKind.Copilot, resolvedKinds);
         Assert.Contains(AgentKind.Cursor, resolvedKinds);
         Assert.Contains(AgentKind.Gemini, resolvedKinds);
         Assert.Contains(AgentKind.Opencode, resolvedKinds);

@@ -161,11 +161,22 @@ the same callback. The envelope keeps stderr visible in the captured
 .jsonl (so auth/usage diagnostics that fire BEFORE any structured event
 is emitted — the failure mode that produced the antigravity
 observability black hole — are recoverable from post-mortem inspection)
-without ever interleaving non-JSON noise into the file. Provider parsers
-ignore `codeybox.stderr` because it is not in their recognised event
-vocabulary; when no real structured event is recognised, the run falls
-through to the plaintext summariser whose `errors=` count and tail
-naturally surface the envelope lines.
+without ever interleaving non-JSON noise into the file. The per-line
+buffer is bounded (64 KiB) so a CLI that emits a pathological newline-
+free line cannot grow host memory before the on-disk size cap engages;
+overflow is stamped with a recoverable `[...stderr line truncated]`
+marker.
+
+Provider parsers recognise the `codeybox.stderr` envelope type and fold
+each captured line into the summary's `FinalAssistantMessage` under a
+`[stderr-tail]` marker (capped at ~8 KiB so the persisted summary row
+cannot balloon with attacker-influenceable stderr output). This keeps
+stderr diagnostics visible even when the structured stream contains a
+few recognised events but no provider final message — the auth/usage
+failure shape where the stream begins with a normal `system/init` and
+then emits only stderr. When no structured event is recognised at all,
+the run falls through to the plaintext summariser whose `errors=` count
+and tail also surface the envelope lines.
 
 ### Tool-Auditor Files
 

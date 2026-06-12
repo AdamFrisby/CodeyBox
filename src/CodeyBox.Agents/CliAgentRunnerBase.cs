@@ -538,9 +538,22 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     {
         public const string EnvelopeType = "codeybox.stderr";
 
+        // A misbehaving CLI / tool can emit a single very long stderr line
+        // without a newline (terminal control sequences, JSON dumps, stack
+        // traces concatenated by a broken logger). The forwarder buffers
+        // stderr until newline so each emitted JSON envelope is one
+        // recoverable line — but without a cap that buffer grows unbounded
+        // in host process memory before the per-stream-file size cap can
+        // engage. Cap the buffered line; once exceeded we emit the buffered
+        // prefix with a truncation marker and discard the overflow until
+        // the next newline.
+        internal const int MaxBufferedLineChars = 64 * 1024;
+        internal const string LineTruncationMarker = "[...stderr line truncated]";
+
         private readonly Action<string> _downstream;
         private readonly StringBuilder _buffer = new();
         private readonly object _gate = new();
+        private bool _lineOverflowed;
 
         public StderrEnvelopeForwarder(Action<string> downstream)
         {
@@ -557,9 +570,25 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 foreach (var ch in chunk)
                 {
                     if (ch == '\n')
+                    {
                         FlushLocked();
-                    else if (ch != '\r')
-                        _buffer.Append(ch);
+                        continue;
+                    }
+
+                    if (ch == '\r')
+                        continue;
+
+                    if (_lineOverflowed)
+                        continue;
+
+                    if (_buffer.Length >= MaxBufferedLineChars)
+                    {
+                        _buffer.Append(LineTruncationMarker);
+                        _lineOverflowed = true;
+                        continue;
+                    }
+
+                    _buffer.Append(ch);
                 }
             }
         }
@@ -577,6 +606,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             var text = _buffer.ToString();
             _buffer.Clear();
+            _lineOverflowed = false;
             string envelope;
             try
             {
