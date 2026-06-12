@@ -256,6 +256,32 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_BuiltInOpenAiProvider_UsesTopLevelToleranceKeys_NotModelProvidersBlock()
+    {
+        // Regression: codex rejects a `model_providers.openai` block ("Built-in
+        // providers cannot be overridden"), so config.toml fails to load and the
+        // agent exits 1. A plain model id (no `provider/` prefix, no configured
+        // provider) resolves to the built-in `openai`, so the tolerances must be
+        // emitted as TOP-LEVEL config keys, never `model_providers.openai.*`.
+        var sandbox = new CapturingSandbox();
+        var networkTolerance = new AgentNetworkToleranceSnapshot(
+            new Dictionary<string, AgentNetworkToleranceOptions?>(StringComparer.OrdinalIgnoreCase));
+        var runner = new CodexAgentRunner(defaults: null, networkTolerance: networkTolerance);
+
+        await runner.RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            modelId: "gpt-5.5");
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        Assert.Contains("request_max_retries=8", argv);
+        Assert.Contains("stream_max_retries=15", argv);
+        Assert.DoesNotContain(argv, a => a.StartsWith("model_providers.openai.", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RunAsync_DerivesNetworkToleranceProviderFromSlashQualifiedDefaultModelId()
     {
         var sandbox = new CapturingSandbox();

@@ -320,16 +320,26 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
         var providerId = ResolveProviderId(effectiveModel, tolerance.Provider);
 
-        argv.Add("-c");
-        argv.Add($"model_providers.{providerId}.request_max_retries={reqRetries}");
+        // Codex rejects a `model_providers.<id>` block for its reserved built-in
+        // providers (e.g. `openai`) — "Built-in providers cannot be overridden" —
+        // so config.toml fails to load and the agent exits 1. For a built-in
+        // provider, set the tolerances via the equivalent TOP-LEVEL config keys
+        // (codex applies them globally); only genuinely custom providers get the
+        // provider-scoped `model_providers.<id>.` form.
+        var keyPrefix = IsReservedBuiltInCodexProvider(providerId)
+            ? string.Empty
+            : $"model_providers.{providerId}.";
 
         argv.Add("-c");
-        argv.Add($"model_providers.{providerId}.stream_max_retries={streamRetries}");
+        argv.Add($"{keyPrefix}request_max_retries={reqRetries}");
+
+        argv.Add("-c");
+        argv.Add($"{keyPrefix}stream_max_retries={streamRetries}");
 
         if (tolerance.StreamIdleTimeoutMs.HasValue)
         {
             argv.Add("-c");
-            argv.Add($"model_providers.{providerId}.stream_idle_timeout_ms={tolerance.StreamIdleTimeoutMs.Value}");
+            argv.Add($"{keyPrefix}stream_idle_timeout_ms={tolerance.StreamIdleTimeoutMs.Value}");
         }
 
         // Pass the prompt via stdin rather than as a positional argv. Linux's
@@ -446,6 +456,13 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     private static string ResolveSafeProviderId(string providerId) =>
         AgentNetworkToleranceOptions.IsValidCodexProviderId(providerId) ? providerId : "openai";
+
+    // Codex's built-in provider ids cannot be redefined via a `model_providers.<id>`
+    // block (config.toml load fails: "Built-in providers cannot be overridden").
+    // `openai` is the default/fallback id ResolveProviderId returns, so its retry/
+    // timeout tolerances must be set via the global top-level config keys instead.
+    private static bool IsReservedBuiltInCodexProvider(string providerId) =>
+        string.Equals(providerId, "openai", StringComparison.OrdinalIgnoreCase);
 
     private sealed class CodexSessionResumeQuotaClassifier : IQuotaFailureClassifier
     {
