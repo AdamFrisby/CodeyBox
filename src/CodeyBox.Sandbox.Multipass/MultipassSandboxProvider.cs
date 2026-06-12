@@ -1353,7 +1353,8 @@ git push origin HEAD:{refName}";
             startRouteService: true,
             includeGraphicalInstall: false,
             baselineInstallCommands: opts.ExtraRuncmd);
-        // Build a canonical, version-prefixed string. The 'v1' prefix lets
+        var seedsStr = string.Join(";", opts.PackageCacheSeeds.Select(s => $"{s.HostSourcePath}->{s.VmDestPath}({s.MaxSizeMB})"));
+        // Build a canonical, version-prefixed string. The 'v2' prefix lets
         // future schema changes invalidate every existing baseline without
         // ambiguity. Field separator is '|' which cannot appear in profile
         // names or flavor enum strings.
@@ -1366,6 +1367,7 @@ git push origin HEAD:{refName}";
             string.Join("\n", firstBootRuncmd),
             string.Join("\n", opts.BaselineVerificationCommands.Select(RenderBaselineVerificationCommandForHash)),
             opts.ExtraCloudInit ?? string.Empty,
+            seedsStr,
         });
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
@@ -1556,6 +1558,9 @@ git push origin HEAD:{refName}";
 
             await VerifyBaselineRequiredBinariesAsync(opts, baselineName, workItemId, ct);
 
+            // Seed package caches into the baseline VM before stopping it
+            await SeedPackageCachesAsync(opts, baselineName, stagingDir, workItemId, ct).ConfigureAwait(false);
+
             // Stop the baseline so `multipass clone` can use it as a source
             // (clone requires source stopped). Wait for the state to flip
             // so a subsequent clone doesn't race a still-Stopping VM.
@@ -1651,6 +1656,280 @@ git push origin HEAD:{refName}";
         }
     }
 
+    private async Task SeedPackageCachesAsync(
+        MultipassSandboxOptions opts,
+        string baselineName,
+        string stagingDir,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        if (opts.PackageCacheSeeds == null || opts.PackageCacheSeeds.Count == 0)
+        {
+            return;
+        }
+
+        _log.LogInformation("Seeding package caches into baseline VM {Name}...", baselineName);
+
+        foreach (var seed in opts.PackageCacheSeeds)
+        {
+            if (string.IsNullOrWhiteSpace(seed.HostSourcePath) || string.IsNullOrWhiteSpace(seed.VmDestPath))
+            {
+                continue;
+            }
+
+            var hostPath = ResolvePath(seed.HostSourcePath);
+            if (!Directory.Exists(hostPath) && !File.Exists(hostPath))
+            {
+                _log.LogWarning("Package cache seed host path '{HostPath}' does not exist. Skipping.", hostPath);
+                continue;
+            }
+
+            var vmDestPath = seed.VmDestPath;
+            _log.LogInformation("Seeding cache: host {HostPath} -> VM {VmDestPath}", hostPath, vmDestPath);
+
+            var uniqueId = Guid.NewGuid().ToString("N");
+            var seedStagingDir = Path.Combine(stagingDir, $"cache-seed-{uniqueId}");
+            Directory.CreateDirectory(seedStagingDir);
+
+            var hostTarPath = Path.Combine(stagingDir, $"cache-seed-{uniqueId}.tar");
+
+            try
+            {
+                bool hasFiles = false;
+                if (Directory.Exists(hostPath))
+                {
+                    long maxSizeBytes = -1;
+                    if (seed.MaxSizeMB.HasValue && seed.MaxSizeMB.Value > 0)
+                    {
+                        maxSizeBytes = (long)(seed.MaxSizeMB.Value * 1024 * 1024);
+                    }
+
+                    if (maxSizeBytes > 0)
+                    {
+                        CopyDirectoryWithCap(hostPath, seedStagingDir, maxSizeBytes);
+                    }
+                    else
+                    {
+                        CopyDirectoryRecursively(hostPath, seedStagingDir);
+                    }
+                    hasFiles = Directory.EnumerateFileSystemEntries(seedStagingDir).Any();
+                }
+                else if (File.Exists(hostPath))
+                {
+                    var destFilePath = Path.Combine(seedStagingDir, Path.GetFileName(hostPath));
+                    File.Copy(hostPath, destFilePath, overwrite: true);
+                    hasFiles = true;
+                }
+
+                if (!hasFiles)
+                {
+                    _log.LogWarning("No files to transfer for cache seed {HostPath}", hostPath);
+                    continue;
+                }
+
+                // 1. Tar the staging directory on the host
+                var tarArgv = new[] { "tar", "-cf", hostTarPath, "-C", seedStagingDir, "." };
+                var tarResult = await RunHostProcessAsync(tarArgv, ct, workItemId).ConfigureAwait(false);
+                if (tarResult.ExitCode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to tar package cache seed on host: {tarResult.Stderr}");
+                }
+
+                // 2. Create the destination directory in the VM
+                var mkdirResult = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "exec", baselineName, "--", "mkdir", "-p", vmDestPath],
+                    stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                if (mkdirResult.ExitCode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to create VM directory '{vmDestPath}': {mkdirResult.Stderr}");
+                }
+
+                // 3. Transfer the tarball
+                var vmTarName = $"cache-seed-{uniqueId}.tar";
+                var tx = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "transfer", hostTarPath, $"{baselineName}:{vmTarName}"],
+                    stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                if (tx.ExitCode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to transfer package cache seed tarball to VM: {tx.Stderr}");
+                }
+
+                // 4. Extract the tarball inside the VM
+                var extractResult = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "exec", baselineName, "--", "tar", "-xf", $"/home/ubuntu/{vmTarName}", "-C", vmDestPath],
+                    stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                if (extractResult.ExitCode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to extract package cache seed tarball inside VM: {extractResult.Stderr}");
+                }
+
+                // 5. Change ownership of the VM directory
+                var chownResult = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "chown", "-R", "ubuntu:ubuntu", vmDestPath],
+                    stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                if (chownResult.ExitCode != 0)
+                {
+                    throw new InvalidOperationException($"Failed to change VM directory ownership: {chownResult.Stderr}");
+                }
+
+                // 6. Clean up the tarball inside the VM
+                var rmResult = await RunAsync(
+                    opts,
+                    [opts.MultipassBinary, "exec", baselineName, "--", "rm", "-f", $"/home/ubuntu/{vmTarName}"],
+                    stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                if (rmResult.ExitCode != 0)
+                {
+                    _log.LogWarning("Failed to clean up VM tarball {TarName}: {Stderr}", vmTarName, rmResult.Stderr);
+                }
+            }
+            finally
+            {
+                // Clean up local temp files and directories
+                try
+                {
+                    if (Directory.Exists(seedStagingDir))
+                    {
+                        Directory.Delete(seedStagingDir, recursive: true);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to delete staging subdirectory {Dir}", seedStagingDir);
+                }
+
+                try
+                {
+                    if (File.Exists(hostTarPath))
+                    {
+                        File.Delete(hostTarPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to delete staging tarfile {File}", hostTarPath);
+                }
+            }
+        }
+    }
+
+    private static string ResolvePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return path;
+        if (path.StartsWith('~'))
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrEmpty(home))
+            {
+                home = Environment.GetEnvironmentVariable("HOME") ?? "/home/ubuntu";
+            }
+            path = Path.Combine(home, path[1..].TrimStart('/', '\\'));
+        }
+        return Environment.ExpandEnvironmentVariables(path);
+    }
+
+    private void CopyDirectoryRecursively(string sourceDir, string destDir)
+    {
+        Directory.CreateDirectory(destDir);
+        try
+        {
+            foreach (var file in Directory.GetFiles(sourceDir))
+            {
+                var destFile = Path.Combine(destDir, Path.GetFileName(file));
+                File.Copy(file, destFile, overwrite: true);
+            }
+            foreach (var dir in Directory.GetDirectories(sourceDir))
+            {
+                var destSubDir = Path.Combine(destDir, Path.GetFileName(dir));
+                CopyDirectoryRecursively(dir, destSubDir);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Error copying subdirectory {SourceDir} -> {DestDir}", sourceDir, destDir);
+        }
+    }
+
+    private void CopyDirectoryWithCap(string sourceDir, string destDir, long maxSizeBytes)
+    {
+        Directory.CreateDirectory(destDir);
+        try
+        {
+            var entries = new DirectoryInfo(sourceDir).GetFileSystemInfos();
+            var sortedEntries = entries.OrderByDescending(e => e.LastWriteTimeUtc).ToList();
+
+            long currentSize = 0;
+            foreach (var entry in sortedEntries)
+            {
+                long entrySize = GetSize(entry);
+                if (currentSize + entrySize > maxSizeBytes)
+                {
+                    _log.LogInformation("Size cap of {Max} bytes reached for cache seed {SourceDir}. Stopping copy.", maxSizeBytes, sourceDir);
+                    break;
+                }
+
+                var targetPath = Path.Combine(destDir, entry.Name);
+                if (entry is DirectoryInfo dirInfo)
+                {
+                    CopyDirectoryRecursively(dirInfo.FullName, targetPath);
+                }
+                else if (entry is FileInfo fileInfo)
+                {
+                    File.Copy(fileInfo.FullName, targetPath, overwrite: true);
+                }
+                currentSize += entrySize;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Error while copying directory with cap from {SourceDir} to {DestDir}", sourceDir, destDir);
+        }
+    }
+
+    private long GetSize(FileSystemInfo entry)
+    {
+        if (entry is FileInfo fileInfo)
+        {
+            return fileInfo.Length;
+        }
+        if (entry is DirectoryInfo dirInfo)
+        {
+            try
+            {
+                long size = 0;
+                foreach (var file in Directory.EnumerateFiles(dirInfo.FullName, "*", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        size += new FileInfo(file).Length;
+                    }
+                    catch
+                    {
+                        // Ignore files that are deleted or inaccessible
+                    }
+                }
+                return size;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Error calculating size for directory {Dir}", dirInfo.FullName);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    private async Task<ProcessRunResult> RunHostProcessAsync(
+        IReadOnlyList<string> argv,
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
+    {
+        var environment = BuildHostProcessEnvironment(workItemId);
+        return await _runner.RunAsync(argv, stdin: null, ct, environment: environment).ConfigureAwait(false);
+    }
     private async Task CloneFromBaselineAsync(
         MultipassSandboxOptions opts,
         string newName,
@@ -4142,6 +4421,21 @@ public sealed record MultipassSandboxOptions
     /// delay.
     /// </summary>
     public TimeSpan BootLaunchDelay { get; init; } = DefaultBootLaunchDelay;
+
+    /// <summary>
+    /// Configurable list of package cache seeds to copy from the host to the baseline VM at bake time.
+    /// </summary>
+    public IReadOnlyList<PackageCacheSeedOptions> PackageCacheSeeds { get; init; } = [];
+}
+
+/// <summary>
+/// Configuration for a package cache seed to be copied into the baseline VM.
+/// </summary>
+public sealed record PackageCacheSeedOptions
+{
+    public string HostSourcePath { get; init; } = string.Empty;
+    public string VmDestPath { get; init; } = string.Empty;
+    public double? MaxSizeMB { get; init; }
 }
 
 /// <summary>

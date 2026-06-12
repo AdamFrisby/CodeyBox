@@ -450,6 +450,12 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 MaxConcurrentBoots = multipassSandbox.MaxConcurrentBoots,
                 BootLaunchDelay = TimeSpan.FromMilliseconds(multipassSandbox.BootLaunchDelayMs),
                 DiskGuard = diskGuard,
+                PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
+                {
+                    HostSourcePath = s.HostSourcePath,
+                    VmDestPath = s.VmDestPath,
+                    MaxSizeMB = s.MaxSizeMB
+                }).ToList() ?? []
             };
         },
         loggerFactory.CreateLogger<MultipassSandboxProvider>(),
@@ -3295,6 +3301,11 @@ namespace CodeyBox.Api
         public bool MultipassUseBaselineImages { get; set; } = false;
 
         /// <summary>
+        /// Configurable list of package cache seeds to copy from the host to the baseline VM at bake time.
+        /// </summary>
+        public List<PackageCacheSeedConfig> MultipassPackageCacheSeeds { get; set; } = [];
+
+        /// <summary>
         /// Disk-guard preflight configuration. Enabled by default
         /// (<see cref="DiskGuardOptions.Enabled"/>=<c>true</c>,
         /// <see cref="DiskGuardOptions.MinFreeBytes"/>=10 GiB); every
@@ -3497,6 +3508,16 @@ namespace CodeyBox.Api
         /// Anthropic ships a fix.
         /// </summary>
         public bool Enabled { get; set; } = true;
+    }
+
+    /// <summary>
+    /// Configuration for a package cache seed to be copied into the baseline VM.
+    /// </summary>
+    public sealed class PackageCacheSeedConfig
+    {
+        public string HostSourcePath { get; set; } = string.Empty;
+        public string VmDestPath { get; set; } = string.Empty;
+        public double? MaxSizeMB { get; set; }
     }
 
     /// <summary>
