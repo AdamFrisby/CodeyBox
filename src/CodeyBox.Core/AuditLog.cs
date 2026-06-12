@@ -195,6 +195,15 @@ public static class AuditLog
     private static string TruncateAuditTail(string s) =>
         s.Length <= 2048 ? s : "…" + s[^2048..];
 
+    private static string AuditSingleLine(string? s, int maxLength = 512)
+    {
+        if (string.IsNullOrEmpty(s))
+            return "";
+
+        var normalized = s.Replace('\r', ' ').Replace('\n', ' ');
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "…";
+    }
+
     public static void AgentStuckDetected(AgentKind agent, string phase, TimeSpan stuckDuration) =>
         Audit("agent.stuck_detected")
             .Warning("Agent {Agent} stuck in phase {Phase} for {StuckSeconds}s with no CPU or network activity",
@@ -259,6 +268,18 @@ public static class AuditLog
             .Warning(
                 "Sandbox provisioning deferred for work item {WorkItemId}: provider={Provider} operation={Operation} errorClass={ErrorClass} resumeState={ResumeState} recheckIn={RecheckSeconds}s",
                 workItemId.ToString(), provider, operation, errorClass, resumeState, (long)recheckIn.TotalSeconds);
+
+    public static void SandboxAgentInfrastructureFailure(
+        WorkItemId workItemId,
+        AgentKind agent,
+        string sandboxName,
+        string phase,
+        string summary,
+        string? reason) =>
+        Audit("sandbox.agent_infra_failure")
+            .Warning(
+                "Agent infrastructure failure for work item {WorkItemId}: agent={Agent} sandbox={Sandbox} phase={Phase} summary={Summary} reason={Reason}",
+                workItemId.ToString(), agent.Value, sandboxName, phase, AuditSingleLine(summary), AuditSingleLine(reason));
 
     public static void SandboxDisposed(string vmName) =>
         Audit("sandbox.disposed")

@@ -28,8 +28,9 @@ public interface IAgentRunner
     /// Classifies a failed <see cref="AgentResult"/> into a structured
     /// <see cref="AgentFailureKind"/> so the pipeline can decide whether to
     /// retry the iteration against the next-best class member (quota), surface
-    /// a transient retry hint (network), or fail the work item (normal /
-    /// auth). The default implementation runs the shared
+    /// a transient retry hint (network), identify sandbox/provisioning defects
+    /// (infrastructure), or fail the work item (normal / auth). The default
+    /// implementation runs the shared
     /// <see cref="AgentFailureClassifier"/> heuristics; runners with
     /// CLI-specific failure shapes can override.
     /// </summary>
@@ -37,7 +38,7 @@ public interface IAgentRunner
     {
         if (result.Success)
             return new AgentFailureClassification(AgentFailureKind.Normal);
-        return AgentFailureClassifier.Classify(result.Stderr, result.Stdout);
+        return AgentFailureClassifier.Classify(result.Stderr, result.Stdout, result.Summary);
     }
 }
 

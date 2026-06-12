@@ -316,6 +316,47 @@ public sealed class AuditLogTests : IDisposable
     }
 
     [Fact]
+    public void SandboxAgentInfrastructureFailure_emits_sandbox_prefixed_event()
+    {
+        var workItemId = WorkItemId.New();
+
+        AuditLog.SandboxAgentInfrastructureFailure(
+            workItemId,
+            AgentKind.Codex,
+            "codeybox-vm-127",
+            "work",
+            "agent exited 127",
+            "agent binary was not found in the sandbox");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.True(GetScalar<bool>(evt, "Audit"));
+        Assert.Equal("sandbox.agent_infra_failure", GetScalar<string>(evt, "EventName"));
+        Assert.Equal(workItemId.ToString(), GetScalar<string>(evt, "WorkItemId"));
+        Assert.Equal("codex", GetScalar<string>(evt, "Agent"));
+        Assert.Equal("codeybox-vm-127", GetScalar<string>(evt, "Sandbox"));
+        Assert.Equal("work", GetScalar<string>(evt, "Phase"));
+        Assert.Equal("agent exited 127", GetScalar<string>(evt, "Summary"));
+        Assert.Equal("agent binary was not found in the sandbox", GetScalar<string>(evt, "Reason"));
+        Assert.Equal(LogEventLevel.Warning, evt.Level);
+    }
+
+    [Fact]
+    public void SandboxAgentInfrastructureFailure_normalizes_multiline_fields()
+    {
+        AuditLog.SandboxAgentInfrastructureFailure(
+            WorkItemId.New(),
+            AgentKind.Codex,
+            "codeybox-vm-127",
+            "work",
+            "agent exited 127\nnext line",
+            "binary missing\r\ninstall codex");
+
+        var evt = Assert.Single(_sink.Events);
+        Assert.Equal("agent exited 127 next line", GetScalar<string>(evt, "Summary"));
+        Assert.Equal("binary missing  install codex", GetScalar<string>(evt, "Reason"));
+    }
+
+    [Fact]
     public void AuditPassed_emits_audit_passed_event()
     {
         AuditLog.AuditPassed(2);
