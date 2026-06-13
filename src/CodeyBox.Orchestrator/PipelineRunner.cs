@@ -2017,6 +2017,7 @@ public sealed class PipelineRunner : IPipelineRunner
         // The same list is reused for every conflict iteration within this
         // rebase.
         IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;
+        AgenticConflictCandidatesResult? candidateResult = null;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -2035,12 +2036,16 @@ public sealed class PipelineRunner : IPipelineRunner
         {
             try
             {
-                candidates ??= WrapPromptPreprocessedCandidates(
-                    await BuildAgenticConflictCandidatesAsync(item, project, runner, ct),
-                    item.Id,
-                    AgentPromptPhase.Merge,
-                    iteration: 1,
-                    project);
+                if (candidates is null)
+                {
+                    candidateResult = await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                    candidates = WrapPromptPreprocessedCandidates(
+                        candidateResult.Candidates,
+                        item.Id,
+                        AgentPromptPhase.Merge,
+                        iteration: 1,
+                        project);
+                }
 
                 var resolveResult = await _agenticConflictResolver.ResolveAsync(
                     sandbox,
@@ -2054,8 +2059,19 @@ public sealed class PipelineRunner : IPipelineRunner
                     conflictFiles.Add(path);
 
                 if (!resolveResult.Success || resolveResult.ChosenRunner is null)
+                {
+                    if (candidateResult is { HasTransientlyUnavailableStrongerAgent: true })
+                    {
+                        throw new AgentClassExhaustedException(
+                            item.AgentClassId ?? project.DefaultAgentClass ?? "default",
+                            "rebase",
+                            candidateResult.Candidates.Count,
+                            candidateResult.EarliestResetAt,
+                            candidateResult.DeferReason ?? "stronger agent(s) transiently unavailable");
+                    }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
+                }
 
                 chosenResolver = resolveResult.ChosenRunner;
                 chosenCredential = resolveResult.ChosenCredential;
@@ -2086,7 +2102,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 // conflict failure — let it propagate so the catch in RunAsync
                 // surfaces failureKind=agent_unavailable instead of overwriting
                 // it as MergeConflictResolutionFailed.
-                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException)
+                if (ex is MergeConflictResolutionFailedException or AgentUnavailableException or AgentPausedException or AgentClassExhaustedException)
                     throw;
                 throw new MergeConflictResolutionFailedException(
                     $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' failed with conflicts; work branch left at original tip {oldTip}: {ex.Message}",
@@ -2117,7 +2133,7 @@ public sealed class PipelineRunner : IPipelineRunner
     /// report the real cause, such as quota exhaustion, rather than a generic
     /// credential failure.
     /// </summary>
-    internal async Task<IReadOnlyList<AgenticConflictResolverCandidate>> BuildAgenticConflictCandidatesAsync(
+    internal async Task<AgenticConflictCandidatesResult> BuildAgenticConflictCandidatesAsync(
         WorkItem item,
         Project project,
         IAgentRunner primaryRunner,
@@ -2128,6 +2144,7 @@ public sealed class PipelineRunner : IPipelineRunner
         var seenMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipReasons = new List<string>();
         var collected = new List<AgenticConflictResolverCandidate>();
+        var transientUnavailableList = new List<(int QualityScore, string Reason, DateTimeOffset? ResetAt)>();
         (AgentKind Agent, string Reason)? pausedCandidate = null;
         var quotaRejectedCount = 0;
         var resolverSmokePhase = operation == AgenticConflictResolverOperation.Merge ? "merge" : "rebase";
@@ -2247,7 +2264,35 @@ public sealed class PipelineRunner : IPipelineRunner
                     ? GetCapSafe(firstMemberForCap)
                     : GetCapSafe(first.Runner.Kind));
         }
-        return ordered;
+
+        var maxCollectedScore = collected.Count > 0 ? collected.Max(c => c.QualityScore) : -1;
+        var strongerTransientAgents = transientUnavailableList
+            .Where(t => t.QualityScore > maxCollectedScore)
+            .ToList();
+
+        string? deferReason = null;
+        DateTimeOffset? earliestResetAt = null;
+        if (strongerTransientAgents.Count > 0)
+        {
+            var bestStronger = strongerTransientAgents.OrderByDescending(t => t.QualityScore).First();
+            deferReason = bestStronger.Reason;
+
+            var resetTimes = strongerTransientAgents
+                .Select(t => t.ResetAt)
+                .Where(r => r.HasValue)
+                .Select(r => r!.Value)
+                .ToList();
+            if (resetTimes.Count > 0)
+            {
+                earliestResetAt = resetTimes.Min();
+            }
+        }
+
+        return new AgenticConflictCandidatesResult(
+            ordered,
+            HasTransientlyUnavailableStrongerAgent: strongerTransientAgents.Count > 0,
+            DeferReason: deferReason,
+            EarliestResetAt: earliestResetAt);
 
         async Task<string?> TryAddAsync(
             IAgentRunner candidate,
@@ -2275,6 +2320,7 @@ public sealed class PipelineRunner : IPipelineRunner
 
                 var reason = $"{candidate.Kind.Value}: smoke gate: {availabilityReason}";
                 skipReasons.Add(reason);
+                transientUnavailableList.Add((quotaMember.QualityScore, reason, null));
                 return reason;
             }
 
@@ -2284,6 +2330,20 @@ public sealed class PipelineRunner : IPipelineRunner
                 var reason = $"{candidate.Kind.Value}: {quotaReason}";
                 skipReasons.Add(reason);
                 quotaRejectedCount++;
+
+                DateTimeOffset? resetAt = null;
+                if (_quotaProbesByKind is not null && _quotaProbesByKind.TryGetValue(candidate.Kind, out var probe))
+                {
+                    try
+                    {
+                        var snapshot = await probe.GetAvailabilityAsync(quotaMember, token);
+                        var probeQuota = QuotaGatePolicy.ResolveMemberQuota(snapshot, quotaMember);
+                        resetAt = probeQuota.ResetAt;
+                    }
+                    catch { }
+                }
+
+                transientUnavailableList.Add((quotaMember.QualityScore, reason, resetAt));
                 return reason;
             }
 
@@ -2293,7 +2353,8 @@ public sealed class PipelineRunner : IPipelineRunner
                 credential,
                 modelId,
                 reasoningMode,
-                quotaMember.RouteKey));
+                quotaMember.RouteKey,
+                quotaMember.QualityScore));
             return null;
         }
 
@@ -6918,9 +6979,10 @@ public sealed class PipelineRunner : IPipelineRunner
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
+                    var candidateResult = await BuildAgenticConflictCandidatesAsync(
+                        item, project, runner, ct, AgenticConflictResolverOperation.Merge);
                     var candidates = WrapPromptPreprocessedCandidates(
-                        await BuildAgenticConflictCandidatesAsync(
-                            item, project, runner, ct, AgenticConflictResolverOperation.Merge),
+                        candidateResult.Candidates,
                         item.Id,
                         AgentPromptPhase.Merge,
                         iteration: 1,
