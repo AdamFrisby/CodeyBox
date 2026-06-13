@@ -36,6 +36,14 @@ public interface IAuditor
     bool CanShortCircuitOnBlockingFinding => false;
 
     /// <summary>
+    /// Optional constructive self-review guidance to append to the work-phase
+    /// prompt for agents. Null when the auditor opts out of contributing
+    /// checklist instructions.
+    /// </summary>
+    string? SelfReviewGuidance => null;
+
+
+    /// <summary>
     /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
     /// </summary>
     Task<AuditResult> RunAsync(

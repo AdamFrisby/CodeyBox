@@ -2543,12 +2543,13 @@ public sealed class PipelineRunner : IPipelineRunner
                 sb.Append($"\n- `{string.Join(' ', argv)}`");
         }
 
-        // Post-work self-review pointer. Deliberately a POINTER, not the audit
-        // criteria themselves — the worker must read the checklists only AFTER
-        // its functional work is done, so the audit dimensions don't pollute the
-        // initial work context before the code is functional. No-ops when the
-        // target repo has no docs/post-work-checks/ folder.
-        sb.Append("\n\nOnce you're done working and the build passes, review the tasks in `docs/post-work-checks/*.md` (only if that folder exists in this repository), and amend your work to pass these checks without changing the original work request's requirements. Read these only after your functional work is complete — do not let them reshape the task.");
+        // Post-work self-review checklist composed at runtime from active auditors.
+        var checklist = SelfReviewChecklistComposer.Compose(auditors);
+        if (!string.IsNullOrWhiteSpace(checklist))
+        {
+            sb.Append("\n\nOnce you're done working and the build passes, review your changes against the following self-review checklist before committing. Read these only after your functional work is complete — do not let them reshape the task:\n\n");
+            sb.Append(checklist);
+        }
 
         if (allowAgentQuestions)
         {

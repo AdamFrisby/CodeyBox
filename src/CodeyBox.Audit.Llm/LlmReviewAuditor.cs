@@ -38,6 +38,78 @@ public sealed class LlmReviewAuditor : IAuditor
     public string Kind => "llm";
     public AuditCapabilities Required => AuditCapabilities.AgentCredentials | AuditCapabilities.Network;
 
+    public string? SelfReviewGuidance
+    {
+        get
+        {
+            if (Name.Contains("cheating", StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (Name.Contains("architecture", StringComparison.OrdinalIgnoreCase))
+                return ArchitectureGuidance;
+            if (Name.Contains("completeness", StringComparison.OrdinalIgnoreCase))
+                return CompletenessGuidance;
+            if (Name.Contains("quality", StringComparison.OrdinalIgnoreCase))
+                return QualityGuidance;
+            if (Name.Contains("security", StringComparison.OrdinalIgnoreCase))
+                return SecurityGuidance;
+            if (Name.Contains("tests:meaningfulness", StringComparison.OrdinalIgnoreCase) ||
+                Name.Contains("tests", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Name.Contains("mutation", StringComparison.OrdinalIgnoreCase))
+                    return null;
+                return TestsGuidance;
+            }
+            return null;
+        }
+    }
+
+    private const string ArchitectureGuidance = """
+- **Loose-coupling violations**: concrete types appearing in cross-module method signatures where an interface already exists.
+- **New direct dependencies** that should have gone through an existing abstraction.
+- **God objects / classes** accumulating unrelated responsibilities.
+- **Layering violations** (e.g. domain code referencing infrastructure).
+- **Public APIs that leak internal types.**
+""";
+
+    private const string CompletenessGuidance = """
+- **TODO / FIXME / XXX markers** added in this change.
+- **New functionality without corresponding tests.**
+- **Half-finished implementations** (functions that return early, swallowed branches).
+- **Public functions whose docstrings/comments describe behaviour the code doesn't implement.**
+- **Test files that were renamed or deleted instead of fixed.**
+""";
+
+    private const string QualityGuidance = """
+- **Dead code** (unreachable branches, unused functions/imports).
+- **Magic numbers** and unexplained literal constants.
+- **Unclear or misleading names**; abbreviations a new reader couldn't expand.
+- **Error handling at boundaries** that swallows or rethrows incorrectly.
+- **Duplicated logic** that should be a single helper.
+- **Comments that describe WHAT instead of WHY.**
+""";
+
+    private const string SecurityGuidance = """
+- **Injection (SQL, Command, LDAP, NoSQL, XPath, Template, Header)**: No user input concatenated into queries, process commands, or template rendering.
+- **Output Encoding / XSS**: Proper encoding of user inputs in dynamic HTML/DOM sinks.
+- **Validation & Business Logic**: Guard against negative values, integer overflows, sign-flips, and TOCTOU.
+- **API / Web Service**: State-changing handlers must not respond to GET; avoid mass assignment.
+- **File Handling**: Path traversal validation (canonicalisation & containment check) and unrestricted upload prevention.
+- **Authentication & Sessions**: Endpoints must require authentication; secure passwords/session tokens; check JWT signature.
+- **Authorization / IDOR**: Verify caller ownership/roles for all state-changing or data access routes.
+- **Cryptography**: No hardcoded secrets/keys/salts; do not use weak algorithms (MD5/SHA1/DES/RC4); use AEAD where needed.
+- **SSRF**: Block cloud metadata/localhost/internal IP ranges for user-supplied URLs.
+- **Resource Exhaustion**: Limit unbounded loops/recursion; set request size limits.
+- **Data Protection**: Zero hardcoded secrets; do not leak PII/secrets in logs/telemetry.
+""";
+
+    private const string TestsGuidance = """
+- **Adequacy**: Ensure each new public class, function, endpoint, and error path has at least one test.
+- **Meaningfulness**: Avoid implementation-mirroring, pure-mock tests, no-assertion tests, and trivially-true assertions.
+- **Edge cases & failures**: Cover boundaries, empty, null, unicode, timeouts, network errors, and resource exhaustion.
+- **Heuristic**: Ask yourself: "if I introduced a plausible bug (off-by-one, inverted condition, forgotten null check), would this test catch it?"
+""";
+
+
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         // Make audit/ directory available for the agent's structured output.

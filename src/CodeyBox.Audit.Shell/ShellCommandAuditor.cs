@@ -31,6 +31,20 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     public AuditCapabilities Required => AuditCapabilities.None;
     public bool CanShortCircuitOnBlockingFinding => _opts.CanShortCircuitOnBlockingFinding;
 
+    public string? SelfReviewGuidance
+    {
+        get
+        {
+            if (Name.Contains("build", StringComparison.OrdinalIgnoreCase) ||
+                Name.Contains("format", StringComparison.OrdinalIgnoreCase))
+            {
+                return "run build (warnings-as-errors) + formatter before committing";
+            }
+            return null;
+        }
+    }
+
+
     /// <summary>
     /// The argv this auditor invokes. Exposed so the work-phase prompt builder
     /// can advise the agent to run these checks itself before committing,

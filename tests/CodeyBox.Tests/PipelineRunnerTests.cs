@@ -283,6 +283,73 @@ public sealed class PipelineRunnerTests
         public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ___, CancellationToken ____ = default)
             => Task.FromResult(new AuditResult(true, []));
     }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_RespectsExcludedAndCustomAuditors()
+    {
+        IReadOnlyList<IAuditor> activeAuditors =
+        [
+            new GuidanceAuditor("architecture:llm-review", "Loose-coupling violations: concrete types appearing in cross-module method signatures where an interface exists"),
+            new GuidanceAuditor("custom:review", "Verify custom API contract rules.")
+        ];
+
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+
+        // Checklist should contain architecture guidance
+        Assert.Contains("Loose-coupling violations", prompt);
+        // Checklist should contain the custom auditor's guidance
+        Assert.Contains("Verify custom API contract rules.", prompt);
+        // Checklist should NOT contain quality guidance since it was excluded/not composed
+        Assert.DoesNotContain("Dead code (unreachable branches", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_CheatingAuditorOptedOut()
+    {
+        var opts = new CodeyBox.Audit.Llm.LlmReviewAuditorOptions
+        {
+            Name = "cheating:llm-review",
+            Agent = null!,
+            ReviewFocus = "",
+            FrameTemplate = ""
+        };
+        var cheatingLlm = new CodeyBox.Audit.Llm.LlmReviewAuditor(opts);
+
+        Assert.Null(cheatingLlm.SelfReviewGuidance);
+
+        IReadOnlyList<IAuditor> activeAuditors = [cheatingLlm];
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+
+        // Checklist should be empty because cheating opted out
+        Assert.DoesNotContain("following self-review checklist before committing", prompt);
+    }
+
+    [Fact]
+    public void BuildInitialWorkPrompt_SelfReviewChecklist_NewAuditorGuidanceFlowsIn()
+    {
+        var newAuditor = new GuidanceAuditor("new-style:auditor", "- **New Auditor Standard**: Ensure dynamic checks work.");
+        IReadOnlyList<IAuditor> activeAuditors = [newAuditor];
+
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("do work", auditors: activeAuditors);
+
+        Assert.Contains("Once you're done working and the build passes, review your changes against the following self-review checklist before committing", prompt);
+        Assert.Contains("New Auditor Standard", prompt);
+    }
+
+    private sealed class GuidanceAuditor : IAuditor
+    {
+        public GuidanceAuditor(string name, string? guidance)
+        {
+            Name = name;
+            SelfReviewGuidance = guidance;
+        }
+        public string Name { get; }
+        public string Kind => "llm";
+        public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+        public string? SelfReviewGuidance { get; }
+        public Task<AuditResult> RunAsync(ISandbox _, string __, AuditContext ___, CancellationToken ____ = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
 }
 
 /// <summary>
