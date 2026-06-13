@@ -78,29 +78,40 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             }
         };
 
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         var calls = new ConcurrentQueue<IReadOnlyList<string>>();
         var runner = new RecordingMultipassRunner((argv, _, _) =>
         {
             calls.Enqueue(argv);
 
-            // Simulate command responses to get baseline bake to succeed:
-            // info, launch, exec, stop, info (WaitForStopped), etc.
             if (argv.Contains("info"))
             {
-                // To mock the VM status being Stopped or Running appropriately
-                if (argv.Contains("stop"))
+                var name = argv.ElementAtOrDefault(2);
+                if (name != null && states.TryGetValue(name, out var state))
                 {
-                    return Task.FromResult(new ProcessRunResult(0, "Name,State,IPv4\nbaseline-name,Stopped,1.2.3.4", ""));
+                    return Task.FromResult(new ProcessRunResult(0, $"Name,State,IPv4\n{name},{state},1.2.3.4", ""));
                 }
-                // When called at start to see if VM exists: return exit code 1 to say it does not exist
-                // so BakeBaselineAsync is triggered.
-                if (calls.Count(c => c.Contains("info")) == 1)
-                {
-                    return Task.FromResult(new ProcessRunResult(1, "", "does not exist"));
-                }
-                return Task.FromResult(new ProcessRunResult(0, "Name,State,IPv4\nbaseline-name,Stopped,1.2.3.4", ""));
+                return Task.FromResult(new ProcessRunResult(1, "", "does not exist"));
             }
-            if (argv.Contains("launch") || argv.Contains("exec") || argv.Contains("transfer") || argv.Contains("stop"))
+            if (argv.Contains("launch"))
+            {
+                var nameIndex = argv.ToList().IndexOf("--name");
+                if (nameIndex >= 0 && nameIndex + 1 < argv.Count)
+                {
+                    states[argv[nameIndex + 1]] = "Running";
+                }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv.Contains("stop"))
+            {
+                var stopName = argv.ElementAtOrDefault(2);
+                if (stopName != null)
+                {
+                    states[stopName] = "Stopped";
+                }
+                return Task.FromResult(new ProcessRunResult(0, "", ""));
+            }
+            if (argv.Contains("exec") || argv.Contains("transfer"))
             {
                 return Task.FromResult(new ProcessRunResult(0, "", ""));
             }
