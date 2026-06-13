@@ -85,6 +85,7 @@ public sealed class PipelineRunner : IPipelineRunner
     private readonly IPreMergeVerifier? _preMergeVerifier;
     private readonly IRequiredBuildVerifier _requiredBuildVerifier;
     private readonly ICheckAndActCompletionRunner? _checkCompletionRunner;
+    private readonly IReadOnlyDictionary<AgentKind, IAgentStreamParser> _parsers;
     // Bounded post-agent transition cap. Wraps Transition/TransitionFailed so a
     // hang in store.UpdateAsync (sqlite write contention) or
     // webhooks.PublishAsync (slow remote sink) fails the item within bounded
@@ -269,7 +270,8 @@ public sealed class PipelineRunner : IPipelineRunner
         // when no snapshotting is needed (or in tests that don't assert on
         // the persisted shape).
         Func<AgentSessionHandle, AgentSessionHandle>? sessionHandleSnapshot = null,
-        CancellationRegistry? cancellationRegistry = null)
+        CancellationRegistry? cancellationRegistry = null,
+        IEnumerable<IAgentStreamParser>? streamParsers = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -383,6 +385,8 @@ public sealed class PipelineRunner : IPipelineRunner
             _requiredBuildVerifier,
             _opts.RequiredBuildVerificationTimeout,
             _auditReports is null ? null : PersistAuditReportAsync);
+        _parsers = (streamParsers ?? Array.Empty<IAgentStreamParser>())
+            .ToDictionary(p => p.Kind, p => p);
     }
 
     private readonly RequiredBuildGate _requiredBuildGate;
@@ -3016,48 +3020,73 @@ public sealed class PipelineRunner : IPipelineRunner
             if (useClaudeSession && !resumingPreempt)
                 await sessionLifecycle!.RefreshCredentialAsync(credential, ct);
 
-            if (!skipClone)
+            // Sandbox-reuse handoff path: when the work tree from the
+            // previous agent's run is still on disk (WorkSandboxContext
+            // with SkipCleanup), skip both clone and branch checkout so
+            // the fallback agent inherits the prior agent's commits.
+            // Session-mode rework already handles its own skip via the
+            // skipClone branch below.
+            var gitDirExists = !skipClone && !useClaudeSession && (await sandbox.ExecAsync(new SandboxExec
             {
-                TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
-                    activitySource: CodeyBoxActivities.Sandbox, log: _log);
-                await using (cloneScope)
+                Argv = ["test", "-d", $"{SandboxConventions.WorkDir}/.git"]
+            }, ct)).Success;
+
+            var checkedOutExistingBranch = false;
+
+            if (gitDirExists)
+            {
+                _log.LogInformation("Work directory exists with git repository inside sandbox; skipping clone and checkout.");
+                if (resumingPreempt)
                 {
-                    await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                    var preemptCheckpoint = item.PreemptCheckpoint!;
+                    prompt = BuildResumePrompt(prompt, preemptCheckpoint);
                 }
-                CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
             }
             else
             {
-                // Session-mode rework turn: the clone from the prior turn is
-                // still on disk. Refresh against origin so any incremental
-                // rebase that ran between iterations lands in the work tree
-                // before the agent looks at it.
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
-            }
-            var checkedOutExistingBranch = false;
-            if (resumingPreempt)
-            {
-                var preemptCheckpoint = item.PreemptCheckpoint!;
-                var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
-                checkedOutExistingBranch = true;
-                prompt = BuildResumePrompt(prompt, preemptCheckpoint);
-            }
-            else if (isInitial)
-            {
-                if (await OriginBranchExistsAsync(sandbox, branch, ct))
+                if (!skipClone)
+                {
+                    TimingScope cloneScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.clone_into_sandbox",
+                        activitySource: CodeyBoxActivities.Sandbox, log: _log);
+                    await using (cloneScope)
+                    {
+                        await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
+                    }
+                    CodeyBoxMeters.SandboxLifecycle.Record(cloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
+                }
+                else
+                {
+                    // Session-mode rework turn: the clone from the prior turn is
+                    // still on disk. Refresh against origin so any incremental
+                    // rebase that ran between iterations lands in the work tree
+                    // before the agent looks at it.
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin");
+                }
+
+                if (resumingPreempt)
+                {
+                    var preemptCheckpoint = item.PreemptCheckpoint!;
+                    var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
+                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
+                    checkedOutExistingBranch = true;
+                    prompt = BuildResumePrompt(prompt, preemptCheckpoint);
+                }
+                else if (isInitial)
+                {
+                    if (await OriginBranchExistsAsync(sandbox, branch, ct))
+                    {
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                        checkedOutExistingBranch = true;
+                    }
+                    else
+                        await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
+                }
+                else
                 {
                     await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
                     checkedOutExistingBranch = true;
                 }
-                else
-                    await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{baseBranch}");
-            }
-            else
-            {
-                await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
-                checkedOutExistingBranch = true;
             }
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
@@ -7702,6 +7731,22 @@ public sealed class PipelineRunner : IPipelineRunner
                 new KeyValuePair<string, object?>("kind", fallbackKind),
                 new KeyValuePair<string, object?>("phase", phase));
 
+            // Seeding handoff brief when falling back to a DIFFERENT agent.
+            string? handoffBrief = null;
+            if (_pipelineTuning.Current.EnableHandoffSeeding && nextMember.Agent != currentMember.Agent)
+            {
+                var activeSandbox = WorkSandboxContext.Current?.ActiveSandbox;
+                handoffBrief = await BuildHandoffBriefAsync(item, phase, iteration, currentMember.Agent, activeSandbox, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(handoffBrief))
+                {
+                    _log.LogInformation("Handoff brief constructed for {WorkItemId}; seeding into fallback agent {ToAgent} prompt.", item.Id, nextMember.Agent.Value);
+                    if (WorkSandboxContext.Current is not null)
+                    {
+                        WorkSandboxContext.Current.SkipCleanup = true;
+                    }
+                }
+            }
+
             // Trial item carries the new Agent / ModelId / ReasoningMode so webhook
             // consumers that read WorkItem.Agent see the agent actually being run.
             var trialItem = item with
@@ -7710,6 +7755,7 @@ public sealed class PipelineRunner : IPipelineRunner
                 AgentInstanceId = nextMember.RouteKey,
                 ModelId = nextMember.ModelId,
                 ReasoningMode = nextMember.ReasoningMode,
+                Prompt = !string.IsNullOrEmpty(handoffBrief) ? (handoffBrief + "\n\n" + item.Prompt) : item.Prompt,
             };
 
             if (_fallbackHistory is not null)

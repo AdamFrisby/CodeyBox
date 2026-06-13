@@ -91,27 +91,36 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _reuseCount++;
             _log.LogInformation("Reusing existing warm sandbox (Reuse count: {Count}/{Limit}).", _reuseCount, options.MaxSandboxReuses);
             // Clean the work directory of the reused sandbox before passing it back
-            try
+            if (!SkipCleanup)
             {
-                await _activeSandbox.ExecAsync(new SandboxExec
+                try
                 {
-                    Argv = ["rm", "-rf", SandboxConventions.WorkDir]
-                }, ct);
+                    await _activeSandbox.ExecAsync(new SandboxExec
+                    {
+                        Argv = ["rm", "-rf", SandboxConventions.WorkDir]
+                    }, ct);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to clean work directory in reused sandbox; recreating sandbox instead.");
+                    await DisposeActiveSandboxAsync();
+                    _activeSandbox = await _provider.CreateAsync(spec, ct);
+                    _activeBaselineImageRef = spec.BaselineImageRef;
+                    _createdAt = DateTimeOffset.UtcNow;
+                    _reuseCount = 0;
+                    return Wrap(_activeSandbox, this);
+                }
             }
-            catch (Exception ex)
+            else
             {
-                _log.LogWarning(ex, "Failed to clean work directory in reused sandbox; recreating sandbox instead.");
-                await DisposeActiveSandboxAsync();
-                _activeSandbox = await _provider.CreateAsync(spec, ct);
-                _activeBaselineImageRef = spec.BaselineImageRef;
-                _createdAt = DateTimeOffset.UtcNow;
-                _reuseCount = 0;
-                return Wrap(_activeSandbox, this);
+                _log.LogInformation("Skipping work directory cleanup in reused sandbox due to SkipCleanup.");
             }
 
             return Wrap(_activeSandbox, this);
         }
     }
+
+    public bool SkipCleanup { get; set; }
 
     private async Task DisposeActiveSandboxAsync()
     {

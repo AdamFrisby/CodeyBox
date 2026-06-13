@@ -105,6 +105,12 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public bool AuditShortCircuitEnabled { get; set; } = true;
 
+    /// <summary>
+    /// Whether to build and seed a handoff brief when falling back to a different agent.
+    /// Default true.
+    /// </summary>
+    public bool EnableHandoffSeeding { get; set; } = true;
+
     public void Validate()
     {
         if (MaxSandboxReuses < 1)
