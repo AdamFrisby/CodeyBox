@@ -2243,6 +2243,7 @@ public sealed class AgentConfigHotReloadTests
                 MaxQuestionsPerWorkItem = 10,
                 AgentSuspendMaxRetries = 1,
                 AgentSessionResumeMaxAttempts = 4,
+                AuditShortCircuitEnabled = true,
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -2252,6 +2253,7 @@ public sealed class AgentConfigHotReloadTests
             MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
+            AuditShortCircuitEnabled = initial.PipelineTuning.AuditShortCircuitEnabled,
         });
 
         var router = new AgentClassRouter(
@@ -2280,6 +2282,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.True(snapshot.Current.AuditShortCircuitEnabled);
 
             // SetMaxRetries / SetMaxResumeAttempts are called on start; verify
             // the process-wide runner knobs were initialised.
@@ -2294,11 +2297,13 @@ public sealed class AgentConfigHotReloadTests
                     MaxQuestionsPerWorkItem = 20,
                     AgentSuspendMaxRetries = 3,
                     AgentSessionResumeMaxAttempts = 6,
+                    AuditShortCircuitEnabled = false,
                 },
             });
             Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.False(snapshot.Current.AuditShortCircuitEnabled);
             Assert.Equal(3, AgentSuspendResilience.MaxRetries);
             Assert.Equal(6, SessionResumeOptions.MaxResumeAttempts);
 
@@ -2328,6 +2333,7 @@ public sealed class AgentConfigHotReloadTests
             AgentSuspendMaxRetries = 1,
             AgentSessionResumeMaxAttempts = 4,
             AutoMergeRaceRecoveryMaxAttempts = 3,
+            AuditShortCircuitEnabled = true,
         };
         var initial = new CodeyBoxOptions { PipelineTuning = initialTuning };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -2341,6 +2347,7 @@ public sealed class AgentConfigHotReloadTests
             AgentSuspendMaxRetries = initialTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initialTuning.AgentSessionResumeMaxAttempts,
             AutoMergeRaceRecoveryMaxAttempts = initialTuning.AutoMergeRaceRecoveryMaxAttempts,
+            AuditShortCircuitEnabled = initialTuning.AuditShortCircuitEnabled,
         });
 
         var router = new AgentClassRouter(

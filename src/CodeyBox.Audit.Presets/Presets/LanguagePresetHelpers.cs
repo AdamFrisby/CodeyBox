@@ -10,6 +10,7 @@ internal static class LanguagePresetHelpers
         string markerDescription,
         string markerScript,
         string name,
+        bool canShortCircuitOnBlockingFinding = false,
         params string[] argv)
         => new LanguagePresetAuditor(
             language,
@@ -20,6 +21,7 @@ internal static class LanguagePresetHelpers
                 Name = name,
                 Argv = argv,
                 ResultClassifier = ResultClassifierFor(language, name, argv),
+                CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
             }));
 
     public static IAuditor ShellScript(
@@ -29,7 +31,8 @@ internal static class LanguagePresetHelpers
         string name,
         string script,
         string? toolName = null,
-        bool? treatExit127AsMissingTool = null)
+        bool? treatExit127AsMissingTool = null,
+        bool canShortCircuitOnBlockingFinding = false)
         => new LanguagePresetAuditor(
             language,
             markerDescription,
@@ -40,6 +43,7 @@ internal static class LanguagePresetHelpers
                 Argv = ["sh", "-c", script],
                 ToolName = toolName,
                 TreatExit127AsMissingTool = treatExit127AsMissingTool,
+                CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
             }));
 
     private static IShellCommandResultClassifier? ResultClassifierFor(
