@@ -130,9 +130,15 @@ public sealed class PipelineRunnerPromptRevisionTests : IDisposable
         SqliteWorkItemStore? storeRef = null;
         var auditor = new PromptMutatingAuditor(() => storeRef!);
 
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EnableSandboxReuse = false
+        });
+
         using var tp = TestSupport.BuildPipeline(_workspace, seed,
             sandboxProvider: sandboxes,
-            auditors: [auditor], maxAuditIterations: 2);
+            auditors: [auditor], maxAuditIterations: 2,
+            pipelineTuning: tuning);
         storeRef = tp.Store;
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("rework.txt", "v2\n"));
