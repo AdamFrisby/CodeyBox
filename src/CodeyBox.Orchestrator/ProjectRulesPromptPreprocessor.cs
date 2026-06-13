@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
@@ -15,6 +16,14 @@ namespace CodeyBox.Orchestrator;
 public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
 {
     private const int MaxRulesBytes = 256 * 1024;
+
+    // Lines that look like our fence delimiter (`---...`) or a markdown
+    // header (`## ...`) are neutralised so a committer can't break out of
+    // the BEGIN/END PROJECT RULES fence or impersonate the "## Agent prompt"
+    // header that follows.
+    private static readonly Regex StructuralLine = new(
+        @"^[ \t]*(---+.*|##+\s.*)$",
+        RegexOptions.Multiline | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly IOptionsMonitor<AgentPromptPreprocessingOptions> _options;
     private readonly ILogger<ProjectRulesPromptPreprocessor> _log;
@@ -72,13 +81,15 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
         if (string.IsNullOrWhiteSpace(rules))
             return prompt;
 
+        var sanitisedRules = NeutraliseStructuralDelimiters(rules.TrimEnd());
+
         return $$"""
             ## Project rules (must follow)
 
             Loaded from `{{path}}`.
 
             --- BEGIN PROJECT RULES ---
-            {{rules.TrimEnd()}}
+            {{sanitisedRules}}
             --- END PROJECT RULES ---
 
             ## Agent prompt
@@ -86,6 +97,9 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
             {{prompt}}
             """;
     }
+
+    private static string NeutraliseStructuralDelimiters(string text) =>
+        StructuralLine.Replace(text, "​$&");
 
     private static string? NormalizeRulesPath(string? path)
     {
