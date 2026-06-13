@@ -90,7 +90,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stdout: "agent printed a startup banner before exiting",
             stderr: "missing ANTHROPIC_API_KEY; refusing to run");
         var resolver = new AgenticConflictResolver(
-            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
             NullLogger<AgenticConflictResolver>.Instance);
 
         var workItemId = WorkItemId.New();
@@ -128,7 +128,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stdout: "claimed resolution complete",
             stderr: "warning: incomplete model output");
         var resolver = new AgenticConflictResolver(
-            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
             NullLogger<AgenticConflictResolver>.Instance);
 
         var workItemId = WorkItemId.New();
